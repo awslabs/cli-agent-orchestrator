@@ -85,6 +85,348 @@ class TestGetStatusEventInbox:
         assert sm.get_status("t1") == TerminalStatus.UNKNOWN
 
 
+class TestStaleProcessingCapturePane:
+    """Live incident regression (2026-08-02, app.workain.ai, harness-control#617/#618
+    investigation): a terminal that goes genuinely idle can leave get_status() reporting
+    PROCESSING forever, because the cheap re-check re-derives from the SAME rolling buffer that
+    stopped changing the moment the process stopped emitting output. These pin the fresh
+    capture-pane fallback that self-heals this without waiting for a manual nudge.
+
+    Round-2 review fixes (call-me-ram, gutosantos82) added two more gates on top of the original
+    rate limit:
+    1. The fallback only even attempts once the buffer has gone quiet for
+       STALE_PROCESSING_BUFFER_QUIET_S -- most tests below set _buffer_changed_at to a value far
+       in the past directly, rather than mocking the `time` module wholesale, since real
+       time.monotonic() is always far more than a few seconds past its arbitrary reference point.
+    2. A single capture-pane read is not trusted on its own -- it must be confirmed by a second,
+       matching read (STALE_PROCESSING_CAPTURE_INTERVAL_S apart) before being honored.
+    """
+
+    @staticmethod
+    def _quiet_since():
+        """A _buffer_changed_at value old enough to satisfy the quiet gate unconditionally."""
+        return -1000.0
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_stale_processing_self_heals_via_capture_pane_after_two_confirming_reads(
+        self, mock_pm, mock_get_backend
+    ):
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.return_value = "the real pane -- idle composer, fully rendered"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        # Empty buffer -- as if the process stopped emitting output entirely, exactly the shape
+        # that leaves the cheap re-check (which requires a truthy buffer) unable to help at all.
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        # First read: a genuine ready candidate, but a single sample is never trusted -- must NOT
+        # self-heal yet (see the class docstring on why a lone capture can catch an Ink repaint
+        # mid-clear/rewrite and read the wrong turn's response box).
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert backend.get_history.call_count == 1
+
+        # Second, matching read confirms it. Reset the internal rate-limit gate directly instead
+        # of waiting out STALE_PROCESSING_CAPTURE_INTERVAL_S for real.
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        assert backend.get_history.call_count == 2
+        provider.get_status.assert_called_with("the real pane -- idle composer, fully rendered")
+        # Self-healing must actually update the latched status, not just this one return value --
+        # otherwise the very next poll would go right back through the same stale path.
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_differing_second_read_never_confirms(self, mock_pm, mock_get_backend):
+        """Two DIFFERENT ready candidates in a row must never be honored -- only two
+        IDENTICAL consecutive reads count as confirmed."""
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.return_value = "some pane content"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        provider.get_status.return_value = TerminalStatus.IDLE
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING  # 1st read: pending=IDLE
+
+        sm._last_stale_capture_check["t1"] = None
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING  # 2nd read differs -> not
+        # confirmed; pending is now COMPLETED, not IDLE
+
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert backend.get_history.call_count == 2
+
+        # A THIRD read matching the second (COMPLETED) now confirms it.
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_capture_pane_still_processing_stays_processing_no_crash(
+        self, mock_pm, mock_get_backend
+    ):
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.return_value = "• Working (12s • esc to interrupt)"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_capture_pane_read_failure_stays_processing_no_crash(self, mock_pm, mock_get_backend):
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.side_effect = RuntimeError("tmux not reachable")
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        provider.get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_no_provider_stays_processing_and_skips_capture_pane_entirely(
+        self, mock_pm, mock_get_backend
+    ):
+        mock_pm.get_provider.return_value = None
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        backend.get_history.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_get_provider_raising_stays_processing_no_crash(self, mock_pm, mock_get_backend):
+        # get_provider() raises (not returns None) for a terminal it no longer recognizes --
+        # matches get_status()'s own event-inbox branch, which already defends against this.
+        mock_pm.get_provider.side_effect = ValueError("terminal not in db")
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        backend.get_history.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_capture_pane_fallback_is_rate_limited(self, mock_pm, mock_get_backend):
+        # get_status() is a hot path (every poll, across the whole fleet) -- the capture-pane
+        # fallback is a real tmux subprocess call and must not fire on every single poll while a
+        # terminal is stuck. Two calls back-to-back (real time.monotonic(), so well within the
+        # rate-limit window) must only shell out once.
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.return_value = "still working"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        sm.get_status("t1")
+        sm.get_status("t1")
+
+        backend.get_history.assert_called_once()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_capture_pane_fallback_retried_after_rate_limit_window(self, mock_pm, mock_get_backend):
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.return_value = "still working"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        sm.get_status("t1")
+        # Simulate the rate-limit window having elapsed for real, without a real sleep.
+        sm._last_stale_capture_check["t1"] = None
+        sm.get_status("t1")
+
+        assert backend.get_history.call_count == 2
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_buffer_recheck_resolving_skips_capture_pane_entirely(self, mock_pm, mock_get_backend):
+        # When the existing cheap buffer re-check already resolves the status, the (more
+        # expensive) capture-pane fallback must not run at all -- no regression in the common
+        # case where the original mechanism already worked.
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "a real, non-empty buffer that resolves cleanly"
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        backend.get_history.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_recently_changed_buffer_skips_capture_pane_entirely(self, mock_pm, mock_get_backend):
+        """Round-2 review fix (call-me-ram): a terminal mid-burst -- new chunks still actively
+        arriving -- is not the stuck case this fallback exists for. Without the buffer-quiet
+        gate, this would shell out to a real tmux subprocess on every ~3s poll for the ENTIRE
+        duration of every ordinary busy turn, not just when genuinely stuck."""
+        import time as time_module
+
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.return_value = "some content"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        # A chunk "just arrived" -- well within STALE_PROCESSING_BUFFER_QUIET_S.
+        sm._buffer_changed_at["t1"] = time_module.monotonic()
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        backend.get_history.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_no_buffer_changed_at_recorded_skips_capture_pane_entirely(
+        self, mock_pm, mock_get_backend
+    ):
+        """A terminal that has never had _process_chunk record a change (e.g. buffer set
+        directly, or a very old code path) must not be treated as "quiet since forever" --
+        the gate requires a real recorded quiet duration, not the absence of one."""
+        provider = MagicMock()
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        # _buffer_changed_at deliberately left unset.
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        backend.get_history.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_toctou_stale_capture_discarded_if_status_changed_meanwhile(
+        self, mock_pm, mock_get_backend
+    ):
+        """Round-2 review fix (call-me-ram): the capture-pane read runs OUTSIDE the lock (a real
+        subprocess call, seconds not microseconds). If the real pipeline independently resolves
+        the terminal to something else WHILE that read is in flight, the stale capture result
+        must be discarded rather than applied over the fresher, real status."""
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+        # Pre-seed the pending candidate as already-confirmed-eligible: same value on both of
+        # the two reads _fresh_capture_pane_status will see, via a stubbed provider.
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = provider
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.return_value = "idle pane"
+        mock_get_backend.return_value = backend
+
+        # First read establishes the pending candidate.
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        sm._last_stale_capture_check["t1"] = None
+
+        # Simulate the real pipeline resolving this terminal to ERROR WHILE the second,
+        # confirming capture-pane read is "in flight" -- mutate _last_status from inside the
+        # mocked backend call, which is where the real (slow, unlocked) subprocess call happens.
+        def mutate_then_return_history(*args, **kwargs):
+            sm._last_status["t1"] = TerminalStatus.ERROR
+            return "idle pane"
+
+        backend.get_history.side_effect = mutate_then_return_history
+
+        result = sm.get_status("t1")
+
+        # The stale IDLE confirmation must be discarded, not applied over the real ERROR that
+        # arrived while the capture-pane read was in flight.
+        assert result == TerminalStatus.ERROR
+        assert sm._last_status["t1"] == TerminalStatus.ERROR
+
+
 class TestScreenDetection:
     """Rendered-screen detection should fail soft and keep monitoring alive."""
 

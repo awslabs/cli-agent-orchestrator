@@ -169,6 +169,12 @@ async def wait_until_status(
     it returns the pushed pipeline status, and for event-inbox backends (herdr)
     it derives status on demand from the provider's native status. So this poll
     works for both backends without special-casing here.
+
+    get_status() can occasionally shell out to a real tmux capture-pane subprocess (the
+    stale-PROCESSING fallback in status_monitor.py) or to a herdr CLI call -- offload each poll
+    via asyncio.to_thread so that blocking I/O can't fork/exec on the shared event loop. Matches
+    the existing pattern at GET /terminals/{id} (api/main.py), which wraps the same call for the
+    identical reason.
     """
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -179,7 +185,7 @@ async def wait_until_status(
     )
     start = time.time()
     while time.time() - start < timeout:
-        current = status_monitor.get_status(terminal_id)
+        current = await asyncio.to_thread(status_monitor.get_status, terminal_id)
         if current in targets:
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
