@@ -6,7 +6,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs, launch
+from cli_agent_orchestrator.cli.commands.launch import (
+    _CREATE_OVERHEAD_MARGIN,
+    _READINESS_WAIT_TIMEOUT,
+    _create_session_timeout,
+    _effective_init_timeout,
+    _parse_env_pairs,
+    launch,
+)
 
 # ── Backend auto-detection (issue #308) ──────────────────────────────
 
@@ -962,3 +969,307 @@ def test_launch_rejects_blocked_env_prefix_before_calling_api():
         assert result.exit_code != 0
         assert "blocked prefix" in result.output
         mock_post.assert_not_called()
+
+
+# ── POST /sessions read budget (caom-7it) ─────────────────────────────
+
+
+def test_launch_create_session_timeout_covers_provider_init():
+    """``POST /sessions`` must be given a read budget that covers server-side
+    provider init, not the 30s ``mcp_request_timeout`` meant for tool calls.
+
+    Regression guard for caom-7it: ``POST /sessions`` runs the provider's full
+    ``initialize()`` inline server-side. Under the old 30s budget a slow codex
+    cold start outlived the client, ``requests`` raised ``ReadTimeout``, and
+    ``launch`` reported "Failed to connect to cao-server" — so the
+    create-then-send flow never ran and MESSAGE was silently never delivered
+    even though a healthy session and terminal existed.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {
+            "mcp_request_timeout": 30,
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 20,
+        }
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        # 2 * provider_init_timeout + startup_prompt_handler_timeout +
+        # _CREATE_OVERHEAD_MARGIN = 60 + 60 + 20 + 30 = 170.
+        # The old behaviour passed mcp_request_timeout (30) here.
+        assert mock_post.call_args.kwargs["timeout"] == 170
+
+
+def test_launch_create_session_timeout_never_below_readiness_wait():
+    """The create budget must not undercut the readiness wait that follows it.
+
+    If ``POST /sessions`` gave up sooner than the CLI's own
+    ``_READINESS_WAIT_TIMEOUT`` poll is willing to wait, the create call would
+    abandon work the very next step still expects to complete — the same
+    silent-drop shape as caom-7it. Small configured init timeouts must floor at
+    the readiness wait rather than shrink below it.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {
+            "mcp_request_timeout": 30,
+            "provider_init_timeout": 5,
+            "startup_prompt_handler_timeout": 1,
+        }
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["timeout"] == _READINESS_WAIT_TIMEOUT
+
+
+def test_launch_create_session_timeout_scales_with_configured_init_timeout():
+    """An operator who raises ``provider_init_timeout`` for a slow host must get
+    a proportionally larger create budget — otherwise widening the server-side
+    allowance has no effect on the client that gives up first."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {
+            "mcp_request_timeout": 30,
+            "provider_init_timeout": 180,
+            "startup_prompt_handler_timeout": 45,
+        }
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        # 2 * 180 + 45 + _CREATE_OVERHEAD_MARGIN = 435.
+        assert mock_post.call_args.kwargs["timeout"] == 435
+
+
+def test_launch_headless_message_send_still_uses_mcp_request_timeout():
+    """Only the create call gets the widened budget. The follow-up ``/input``
+    and ``/output`` calls are ordinary requests and must keep using
+    ``mcp_request_timeout`` — widening those would mask a genuinely hung
+    server instead of tolerating a slow one-time init."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {
+            "mcp_request_timeout": 30,
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 20,
+        }
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "task done"}
+        mock_get.side_effect = [poll_resp, output_resp]
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--headless", "--yolo", "do something"],
+        )
+
+        assert result.exit_code == 0
+        create_call, input_call = mock_post.call_args_list
+        assert create_call.kwargs["timeout"] == 170
+        assert input_call.kwargs["timeout"] == 30
+        assert mock_get.call_args_list[-1].kwargs["timeout"] == 30
+
+
+# ── Per-profile init-timeout override + overhead margin (caom-7it review) ──
+
+
+def _profile(provider_init_timeout=None):
+    """Minimal stand-in for a loaded AgentProfile."""
+    profile = MagicMock()
+    profile.provider_init_timeout = provider_init_timeout
+    return profile
+
+
+@pytest.mark.parametrize(
+    "override,expected",
+    [
+        # No override: the global governs.
+        (None, 60),
+        # Raised override: the profile's larger cap governs (claude_code and
+        # friends resolve it via BaseProvider.get_init_timeout).
+        (180, 180),
+        # LOWERED override: the global still governs, because codex/copilot_cli
+        # read the global setting directly and would outlive a smaller budget.
+        (10, 60),
+    ],
+)
+def test_effective_init_timeout_takes_max_of_global_and_profile(override, expected):
+    """The client must bound whichever init timeout the server will actually use.
+
+    Providers disagree on the source: claude_code/antigravity_cli/kimi_cli honour
+    the per-profile ``provider_init_timeout`` override, while codex/copilot_cli
+    read the global setting. Only the max of the two covers both, so a raised
+    override widens the budget and a lowered one cannot shrink it below what a
+    global-reading provider will still spend.
+    """
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+        return_value=_profile(override),
+    ):
+        assert _effective_init_timeout("test-agent", {"provider_init_timeout": 60}) == expected
+
+
+def test_effective_init_timeout_falls_back_when_profile_unloadable():
+    """An unloadable profile must fall back to the global, not fail the launch.
+
+    This value is only a timeout hint; the authoritative profile load happens
+    server-side and reports its own errors. Matches ``get_init_timeout``'s
+    no-profile behaviour.
+    """
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+        side_effect=FileNotFoundError("no such profile"),
+    ):
+        assert _effective_init_timeout("missing-agent", {"provider_init_timeout": 60}) == 60
+
+
+def test_launch_create_session_timeout_honours_profile_init_timeout_override():
+    """A profile that raises ``provider_init_timeout`` must widen the CREATE budget.
+
+    The original caom-7it bug, reintroduced: the profile override exists so a
+    containerized profile whose wrapped CLI takes far longer can declare a
+    longer init cap. With the client budgeting only the global 60s, such a
+    profile runs server-side for up to 2*180+20 while the client gives up at
+    170s — ReadTimeout, "Failed to connect to cao-server", MESSAGE dropped
+    again, for exactly the slow profiles the override exists to serve.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+            return_value=_profile(provider_init_timeout=180),
+        ),
+    ):
+        mock_settings.return_value = {
+            "mcp_request_timeout": 30,
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 20,
+        }
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "slow-container-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        # 2 * 180 (profile override, not the global 60) + 20 + 30 = 410.
+        # Budgeting the global would have given 170 and dropped the message.
+        assert mock_post.call_args.kwargs["timeout"] == 410
+
+
+def test_launch_create_session_timeout_exceeds_worst_case_server_path():
+    """The budget must beat the server's worst case, including unbudgeted steps.
+
+    Neither init-timeout window covers pane creation (which runs BEFORE
+    ``initialize()``), codex's ``await asyncio.sleep(2.0)`` warm-up, send_keys
+    latency, or the tail of a 1s poll interval. The reviewer's worked example on
+    a 60/20 config summed to ~141s server-side against a 140s client budget —
+    a timeout with no margin at all. Model that path and require the budget to
+    clear it.
+    """
+    settings = {"provider_init_timeout": 60, "startup_prompt_handler_timeout": 20}
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+        return_value=_profile(None),
+    ):
+        budget = _create_session_timeout(settings, "test-agent")
+
+    create_pane = 3  # create_session/create_window, before initialize()
+    wait_for_shell = 58  # just under its own cap
+    warmup = 2  # codex.py's asyncio.sleep(2.0)
+    send_and_poll = 1  # send_keys + poll-interval tail
+    trust_prompt = 18
+    wait_until_status = 59
+    worst_case = (
+        create_pane + wait_for_shell + warmup + send_and_poll + trust_prompt + wait_until_status
+    )
+
+    assert worst_case == 141, "worked example drifted; re-derive the margin"
+    assert (
+        budget > worst_case
+    ), f"create budget {budget}s does not cover worst-case server path {worst_case}s"
+
+
+def test_create_session_timeout_survives_partial_settings():
+    """A settings.json missing ``startup_prompt_handler_timeout`` must not crash.
+
+    Defense in depth for a hand-edited partial settings file: a KeyError here
+    would abort the launch before the request is even sent.
+    """
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+        return_value=_profile(None),
+    ):
+        budget = _create_session_timeout({"provider_init_timeout": 60}, "test-agent")
+
+    # Falls back to the settings_service default of 20.
+    assert budget == 2 * 60 + 20 + _CREATE_OVERHEAD_MARGIN

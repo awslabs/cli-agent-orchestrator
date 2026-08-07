@@ -50,6 +50,96 @@ _FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
 )
 _FORWARDED_ENV_MAX_VALUE_BYTES = 2048
 
+# How long the CLI waits for a freshly created terminal to report ready before
+# attaching / sending MESSAGE. Also the FLOOR on the ``POST /sessions`` read
+# budget (see ``_create_session_timeout``): the two must not disagree about how
+# long provider init is allowed to take, or the create call gives up on work
+# the very next step is still willing to wait for.
+_READINESS_WAIT_TIMEOUT = 120
+
+# Slack added to the create budget on top of the two init-timeout windows.
+# Server-side, ``POST /sessions`` also spends time that NEITHER init timeout
+# bounds: pane/window creation runs BEFORE ``initialize()``
+# (``terminal_service.create_session``/``create_window``), and inside
+# ``initialize()`` there are fixed unbudgeted gaps — e.g. codex's
+# ``await asyncio.sleep(2.0)`` shell warm-up, plus send_keys latency and the
+# tail of a 1s poll interval on either side of each bounded wait. Without this,
+# the sum of those steps could exceed the budget even when the client and
+# server agree exactly on the init timeouts (a 60/20 config leaves the client
+# at 140s against a worst-case ~141s server path), reopening the same
+# silent-drop hole this constant's neighbours exist to close.
+_CREATE_OVERHEAD_MARGIN = 30
+
+
+def _effective_init_timeout(agent_profile, settings):
+    """Largest ``provider_init_timeout`` the server might apply for this launch.
+
+    Providers do NOT agree on where this value comes from, so the client cannot
+    assume either source: ``claude_code``/``antigravity_cli``/``kimi_cli`` route
+    through ``BaseProvider.get_init_timeout(profile)``, which prefers the
+    profile's own ``provider_init_timeout`` override (that override exists so a
+    containerized profile whose wrapped CLI is slow can raise its init cap
+    without touching global config), while ``codex``/``copilot_cli`` read the
+    global setting directly. Take the MAX of the two: it is the only bound
+    guaranteed to cover whichever the target provider actually uses, and being
+    generous here only ever costs an unused ceiling on a request that succeeds
+    or fails on its own long before it.
+
+    A profile that cannot be loaded (missing / malformed) falls back to the
+    global value, matching ``get_init_timeout``'s own no-profile behaviour.
+    """
+    global_timeout = int(settings["provider_init_timeout"])
+    try:
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        override = load_agent_profile(agent_profile).provider_init_timeout
+    except Exception:
+        # Deliberately broad: this is a timeout hint, never a reason to fail a
+        # launch the server would have accepted. The real profile load happens
+        # server-side and reports its own errors.
+        return global_timeout
+    if override is None:
+        return global_timeout
+    return max(global_timeout, int(override))
+
+
+def _create_session_timeout(settings, agent_profile=None):
+    """Read budget for ``POST /sessions``, which initializes the provider inline.
+
+    ``POST /sessions`` runs the provider's FULL ``initialize()`` synchronously
+    server-side (``session_service.create_session`` -> ``create_terminal`` ->
+    ``await provider_instance.initialize()``), so this request's read budget has
+    to cover ``provider_init_timeout`` — NOT the generic ``mcp_request_timeout``
+    (30s) meant for ordinary tool calls.
+
+    With the 30s budget, a slow provider cold start (codex with MCP servers, on
+    a container, under a concurrent fan-out) outlived the client: ``requests``
+    raised ``ReadTimeout``, ``launch`` turned that into "Failed to connect to
+    cao-server", and the create-then-send flow below never ran — so MESSAGE was
+    silently never delivered even though the session, the terminal, and a
+    healthy idle TUI all existed server-side. Nothing retried, because from the
+    server's point of view the launch had succeeded.
+
+    Server-side, the init timeout applies TWICE per init — once to
+    ``wait_for_shell``, again to the final ``wait_until_status`` — with the
+    startup-prompt/trust-dialog handler in between, so cover the sum rather
+    than a single init timeout, plus ``_CREATE_OVERHEAD_MARGIN`` for the steps
+    neither window bounds. The init timeout is resolved per-launch via
+    ``_effective_init_timeout``, so a profile that raises its own cap widens
+    this budget with it instead of leaving the client to give up first.
+
+    ``settings.get`` for the handler timeout: a hand-edited partial
+    settings.json that omits the key must not turn a widened budget into a
+    ``KeyError`` traceback at launch.
+    """
+    init_timeout = _effective_init_timeout(agent_profile, settings)
+    return max(
+        2 * init_timeout
+        + int(settings.get("startup_prompt_handler_timeout", 20))
+        + _CREATE_OVERHEAD_MARGIN,
+        _READINESS_WAIT_TIMEOUT,
+    )
+
 
 def _parse_env_pairs(pairs):
     """Parse repeated ``KEY=VALUE`` entries into a dict, validating each.
@@ -297,8 +387,11 @@ def launch(
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.
         # See issue #248.
-        request_timeout = get_server_settings()["mcp_request_timeout"]
-        post_kwargs: dict = {"params": params, "timeout": request_timeout}
+        settings = get_server_settings()
+        post_kwargs: dict = {
+            "params": params,
+            "timeout": _create_session_timeout(settings, agents),
+        }
         if forwarded_env:
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
@@ -324,13 +417,14 @@ def launch(
             ready = wait_until_terminal_status(
                 terminal["id"],
                 {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
+                timeout=_READINESS_WAIT_TIMEOUT,
             )
             if not ready:
                 click.echo(
                     click.style(
-                        f"  Warning: {terminal['id']} did not reach idle within 120s — "
-                        "attaching anyway; input may be unreliable until init completes.",
+                        f"  Warning: {terminal['id']} did not reach idle within "
+                        f"{_READINESS_WAIT_TIMEOUT}s — attaching anyway; input may be "
+                        "unreliable until init completes.",
                         fg="yellow",
                     )
                 )
@@ -339,17 +433,17 @@ def launch(
             ready = wait_until_terminal_status(
                 terminal["id"],
                 {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
+                timeout=_READINESS_WAIT_TIMEOUT,
             )
             if not ready:
                 raise click.ClickException(
-                    f"Conductor {terminal['id']} did not become ready within 120s"
+                    f"Conductor {terminal['id']} did not become ready within "
+                    f"{_READINESS_WAIT_TIMEOUT}s"
                 )
-            request_timeout = get_server_settings()["mcp_request_timeout"]
             response = requests.post(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/input",
                 params={"message": message},
-                timeout=request_timeout,
+                timeout=settings["mcp_request_timeout"],
             )
             response.raise_for_status()
             time.sleep(3)
@@ -357,11 +451,10 @@ def launch(
                 click.echo(f"Message sent to {terminal['name']}. Running in background.")
                 return
             poll_until_done(terminal["id"], timeout=300)
-            request_timeout = get_server_settings()["mcp_request_timeout"]
             output_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
-                timeout=request_timeout,
+                timeout=settings["mcp_request_timeout"],
             )
             output_resp.raise_for_status()
             output = output_resp.json().get("output", "")
