@@ -136,6 +136,27 @@ def _require_text(value: Any, *, field: str) -> str:
     return value
 
 
+def normalise_session_name(value: Any) -> str:
+    """The key every entry point must agree on.
+
+    A session created as ``repair`` runs as ``cao-repair``: the launch path
+    prepends the prefix after the caller has handed over the bare name, and
+    every in-repo caller of ``POST /sessions`` passes it unnormalised.
+    Storing declared state under whatever the caller happened to type
+    would silently split one session across two rows, and both defences in
+    this subsystem read only one of them.
+
+    Concretely, without this a stop on ``repair`` writes a row the boot
+    reconcile never finds when it looks up ``cao-repair``, so it collects
+    the forwarded env of the very session that was hibernated — the exact
+    failure ``reconcile_session_env``'s exemption exists to prevent.
+    """
+    from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+    name = _require_text(value, field="session_name")
+    return name if name.startswith(SESSION_PREFIX) else f"{SESSION_PREFIX}{name}"
+
+
 def _row_dict(row: Any) -> dict[str, Any]:
     return {
         "session_name": row.session_name,
@@ -200,7 +221,7 @@ def describe(session_name: str) -> dict[str, Any]:
     declared, therefore suppressed". Both are wrong; a session whose state
     cannot be read must look like a session that needs watching.
     """
-    session_name = _require_text(session_name, field="session_name")
+    session_name = normalise_session_name(session_name)
     try:
         with database.SessionLocal() as db:
             if not _table_present(db):
@@ -372,7 +393,7 @@ def declare(
     would restore to, so it has its own entry point rather than being a
     value somebody can pass here by accident.
     """
-    session_name = _require_text(session_name, field="session_name")
+    session_name = normalise_session_name(session_name)
     declared_by = _require_text(declared_by, field="declared_by")
     if lifecycle not in LIFECYCLES:
         raise SessionLifecycleInvalid(
@@ -414,7 +435,7 @@ def request_pause(
     marshal, so an unsettled pause is already visible to the thing whose
     job it is to notice.
     """
-    session_name = _require_text(session_name, field="session_name")
+    session_name = normalise_session_name(session_name)
     requested_by = _require_text(requested_by, field="requested_by")
     if not isinstance(deadline_seconds, int) or deadline_seconds <= 0:
         raise SessionLifecycleInvalid(
@@ -460,7 +481,7 @@ def settle_pause(
     or answering a request that was already cancelled, and both should be
     visible rather than absorbed.
     """
-    session_name = _require_text(session_name, field="session_name")
+    session_name = normalise_session_name(session_name)
     declared_by = _require_text(declared_by, field="declared_by")
 
     def _derive(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -528,7 +549,7 @@ def stop(
     restore target — resuming into it would restart a deadline nobody is
     waiting on — so a session stopped mid-settle restores to ``working``.
     """
-    session_name = _require_text(session_name, field="session_name")
+    session_name = normalise_session_name(session_name)
     declared_by = _require_text(declared_by, field="declared_by")
     if restore_to is not None and restore_to not in RESTORE_TARGETS:
         raise SessionLifecycleInvalid(
@@ -574,7 +595,7 @@ def set_archived(
     complete. It forces a stop, recording the pre-stop lifecycle as
     ``restore_to``, so an unarchived session comes back as what it was.
     """
-    session_name = _require_text(session_name, field="session_name")
+    session_name = normalise_session_name(session_name)
     declared_by = _require_text(declared_by, field="declared_by")
     if not archived:
         return _write(
@@ -619,7 +640,7 @@ def set_kind(
     the normal condition for a curator, and a health model that cannot
     tell them apart produces a false alarm every six hours forever.
     """
-    session_name = _require_text(session_name, field="session_name")
+    session_name = normalise_session_name(session_name)
     declared_by = _require_text(declared_by, field="declared_by")
     if kind not in KINDS:
         raise SessionLifecycleInvalid(f"kind must be one of {sorted(KINDS)}; got {kind!r}")
@@ -637,7 +658,7 @@ def forget(session_name: str) -> bool:
     not inherit a stranger's declaration. Returns whether a row was
     removed.
     """
-    session_name = _require_text(session_name, field="session_name")
+    session_name = normalise_session_name(session_name)
     try:
         with database.SessionLocal() as db:
             if not _table_present(db):

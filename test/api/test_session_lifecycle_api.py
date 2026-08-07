@@ -28,6 +28,24 @@ def db(tmp_path, monkeypatch):
 
 
 class TestReads:
+    def test_the_suppression_verdict_travels_with_the_record(self, client):
+        """So the conductor never keeps a second copy of the suppressing set.
+
+        A drifted copy over there fails toward a marshal that stays quiet,
+        which is the failure nobody notices.
+        """
+        payload = client.get(f"/sessions/{SESSION}/lifecycle").json()
+        assert payload["suppresses_marshal"] is False
+        sl.declare(SESSION, sl.COMPLETE, declared_by="supervisor")
+        assert client.get(f"/sessions/{SESSION}/lifecycle").json()["suppresses_marshal"] is True
+
+    def test_a_pausing_session_reports_not_suppressed_and_its_overdue_flag(self, client):
+        sl.request_pause(SESSION, requested_by="colin", deadline_seconds=1)
+        payload = client.get(f"/sessions/{SESSION}/lifecycle").json()
+        assert payload["lifecycle"] == "pausing"
+        assert payload["suppresses_marshal"] is False
+        assert "pause_overdue" in payload
+
     def test_an_undeclared_session_reads_as_working_rather_than_404(self, client):
         response = client.get(f"/sessions/{SESSION}/lifecycle")
         assert response.status_code == 200
@@ -205,10 +223,30 @@ class TestKindAndArchive:
         sl.declare(SESSION, sl.COMPLETE, declared_by="supervisor")
         payload = client.post(
             f"/sessions/{SESSION}/lifecycle/archived",
-            json={"archived": True, "declared_by": "colin"},
+            json={"archived": True, "declared_by": "colin", "acknowledged_one_way": True},
         ).json()
         assert payload["archived"] is True
         assert payload["restore_to"] == "complete"
+
+    def test_archiving_carries_a_stops_obligations(self, client):
+        """It reaches the same state as /stop and must not be the cheap door."""
+        response = client.post(
+            f"/sessions/{SESSION}/lifecycle/archived",
+            json={"archived": True, "declared_by": "colin"},
+        )
+        assert response.status_code == 400
+        assert "stop-impact" in response.json()["detail"]
+        assert sl.describe(SESSION)["lifecycle"] == "working"
+
+    def test_unarchiving_needs_no_acknowledgement(self, client):
+        """Clearing a flag collects nothing."""
+        sl.set_archived(SESSION, True, declared_by="colin")
+        response = client.post(
+            f"/sessions/{SESSION}/lifecycle/archived",
+            json={"archived": False, "declared_by": "colin"},
+        )
+        assert response.status_code == 200
+        assert response.json()["archived"] is False
 
 
 class TestScopes:

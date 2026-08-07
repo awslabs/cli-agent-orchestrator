@@ -279,6 +279,29 @@ def _is_native_tui(terminal_id: str) -> bool:
         return False
 
 
+def _is_pause_like(record: Dict[str, Any]) -> bool:
+    """Whether a declared state should mute the wedge flag.
+
+    ``paused`` always does: the panes are frozen on purpose.
+
+    ``pausing`` does only until its deadline. Nothing leaves ``pausing``
+    automatically — the supervisor has to settle it — so an unbounded gate
+    would mute the flag forever on a supervisor that died mid-settle, which
+    is precisely the case the spec sends back to the marshal on expiry. The
+    numbers make it concrete: the wedge join needs 20 minutes quiet and 30
+    inactive, against a default pause deadline of 60, so an unbounded gate
+    does useful work for half an hour and is wrong without bound after it.
+    """
+    from cli_agent_orchestrator.services import session_lifecycle
+
+    lifecycle = record.get("lifecycle")
+    if lifecycle == session_lifecycle.PAUSED:
+        return True
+    if lifecycle != session_lifecycle.PAUSING:
+        return False
+    return not session_lifecycle.pause_is_overdue(record)
+
+
 def _session_paused(row: Dict[str, Any]) -> bool:
     """Whether this row's session was declared paused.
 
@@ -291,10 +314,7 @@ def _session_paused(row: Dict[str, Any]) -> bool:
     name = row.get("tmux_session")
     if not isinstance(name, str) or not name:
         return False
-    return session_lifecycle.describe(name)["lifecycle"] in (
-        session_lifecycle.PAUSED,
-        session_lifecycle.PAUSING,
-    )
+    return _is_pause_like(session_lifecycle.describe(name))
 
 
 def project_row(
@@ -400,10 +420,7 @@ def project_session(session_name: str) -> List[Dict[str, Any]]:
     from cli_agent_orchestrator.services import session_lifecycle
 
     # Read once per pass rather than once per terminal.
-    session_paused = session_lifecycle.describe(session_name)["lifecycle"] in (
-        session_lifecycle.PAUSED,
-        session_lifecycle.PAUSING,
-    )
+    session_paused = _is_pause_like(session_lifecycle.describe(session_name))
     panes = _observed_panes()
     projected = []
     for row in list_terminals_by_session(session_name):

@@ -365,3 +365,71 @@ class TestTheDefencesAgainstSilentLoss:
                 provider="mock_cli", agent_profile="developer", session_name=SESSION
             )
         assert "is stopped" not in str(excinfo.value)
+
+
+class TestTheKeyEveryEntryPointAgreesOn:
+    """A session created as `repair` runs as `cao-repair`.
+
+    The launch path prepends the prefix after the caller hands over a bare
+    name, and every in-repo caller passes it unnormalised. Keying declared
+    state on whatever was typed splits one session across two rows — and
+    both defences in this subsystem then read the wrong one.
+    """
+
+    def test_a_bare_name_and_a_prefixed_name_are_one_session(self):
+        sl.stop("p1-closure", declared_by="colin")
+        assert sl.describe("cao-p1-closure")["lifecycle"] == sl.STOPPED
+        assert len(sl.list_sessions()) == 1
+
+    def test_a_bare_name_stop_is_seen_by_the_env_retention(self, monkeypatch):
+        """Otherwise the hibernated session's env is collected anyway."""
+        from cli_agent_orchestrator.services import session_env, terminal_service
+
+        sl.stop("p1-closure", declared_by="colin")
+        seen: dict[str, bool] = {}
+
+        def _fake(predicate):
+            seen["retained"] = predicate("cao-p1-closure")
+            return {"removed": [], "failed": []}
+
+        class _Backend:
+            @staticmethod
+            def session_exists(_n: str) -> bool:
+                return False
+
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: _Backend())
+        monkeypatch.setattr(session_env, "reconcile_session_env", _fake)
+        terminal_service.reconcile_session_env()
+        assert seen["retained"] is True
+
+    def test_a_bare_name_stop_blocks_a_prefixed_recreate(self):
+        sl.stop("p1-closure", declared_by="colin")
+        assert sl.describe(SESSION)["lifecycle"] == sl.STOPPED
+
+
+class TestADeletedSessionLeavesNoDeclaration:
+    def test_deleting_forgets_the_declaration(self, monkeypatch):
+        """A reused name must not inherit a stranger's suppressor."""
+        from cli_agent_orchestrator.services import session_service
+
+        sl.declare(SESSION, sl.COMPLETE, declared_by="supervisor")
+
+        class _Backend:
+            @staticmethod
+            def session_exists(_n: str) -> bool:
+                return False
+
+            @staticmethod
+            def kill_session(_n: str) -> None:
+                return None
+
+        monkeypatch.setattr(session_service, "get_backend", lambda: _Backend())
+        monkeypatch.setattr(session_service, "list_terminals_by_session", lambda _n: [])
+        monkeypatch.setattr(session_service, "clear_session_env", lambda _n: None)
+        try:
+            session_service.delete_session(SESSION)
+        except Exception:
+            pass  # the teardown path has other collaborators; the forget is what matters
+        record = sl.describe(SESSION)
+        assert record["declared"] is False
+        assert sl.suppresses_marshal(SESSION)[0] is False

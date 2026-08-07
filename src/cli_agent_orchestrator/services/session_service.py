@@ -68,8 +68,8 @@ async def create_session(
         if declared["lifecycle"] == session_lifecycle.STOPPED:
             raise ValueError(
                 f"session {session_name!r} is stopped and still holds what a resume would "
-                f"restore ({declared['restore_to']!r}); resume it, or release the name with "
-                "`cao session forget` before reusing it"
+                f"restore ({declared['restore_to']!r}); delete the session to release the "
+                "name, or pick another"
             )
 
     if provider is None:
@@ -209,6 +209,18 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 raise RuntimeError(
                     "session deletion held because terminal cleanup failed: " f"{terminal_errors}"
                 )
+
+        # A deleted session must not leave its declaration behind. A later
+        # session taking the name would inherit a stranger's `complete` or
+        # `paused` — and both of those are marshal suppressors, so a
+        # brand-new live campaign would start out invisible to the thing
+        # whose job is to notice it wedging.
+        try:
+            from cli_agent_orchestrator.services import session_lifecycle
+
+            session_lifecycle.forget(session_name)
+        except Exception as exc:  # noqa: BLE001 - deletion must still complete
+            logger.warning("Could not forget the declared state of %s: %s", session_name, exc)
 
         # Re-check under the session claim: a concurrent create cannot add a
         # replacement window between this observation and kill_session.

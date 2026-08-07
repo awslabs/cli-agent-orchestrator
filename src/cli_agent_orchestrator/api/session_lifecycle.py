@@ -115,8 +115,17 @@ class StopBody(StrictBody):
 
 
 class ArchiveBody(StrictBody):
+    """Archiving forces a stop, so it carries a stop's obligations.
+
+    It reached the same `stopped` state as `/lifecycle/stop` while asking
+    for less: write scope instead of admin, and no acknowledgement. One
+    resulting state behind two different gates is how an operator learns
+    to reach it by the cheap door.
+    """
+
     archived: bool
     declared_by: str = Field(min_length=1, max_length=200)
+    acknowledged_one_way: bool = False
     note: Optional[str] = Field(default=None, max_length=2000)
     expected_epoch: Optional[int] = Field(default=None, ge=0)
 
@@ -161,8 +170,20 @@ async def get_session_lifecycle(
     Never 404s. Every session that has ever run predates this table, and an
     undeclared session is a working one rather than a missing one — the
     default has to be the answer that keeps the marshal watching.
+
+    Carries the suppression verdict rather than leaving each caller to
+    re-derive it from ``lifecycle``. The conductor is the caller that
+    matters, and a second copy of the suppressing set living over there
+    would drift from this one silently — in the direction of a marshal
+    that stays quiet, which is the failure nobody notices.
     """
-    return await asyncio.to_thread(sl.describe, session_name)
+    record = await asyncio.to_thread(sl.describe, session_name)
+    suppressed, _ = await asyncio.to_thread(sl.suppresses_marshal, session_name)
+    return {
+        **record,
+        "suppresses_marshal": suppressed,
+        "pause_overdue": sl.pause_is_overdue(record),
+    }
 
 
 @router.get("/sessions/{session_name}/stop-impact")
@@ -299,9 +320,23 @@ async def stop_session_lifecycle(
 async def set_session_archived(
     session_name: str,
     body: ArchiveBody,
-    _scopes: List[str] = _WRITE,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
-    """Hide or unhide a session without losing what it was."""
+    """Hide or unhide a session without losing what it was.
+
+    Archiving forces a stop and is therefore gated exactly as stopping is.
+    Un-archiving only clears the flag — it does not restore the lifecycle,
+    because that is resume's job and resume would have to relaunch panes
+    this route never collected.
+    """
+    if body.archived and not body.acknowledged_one_way:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "archiving forces a stop, which is currently one-way for every worker; read "
+                f"GET /sessions/{session_name}/stop-impact and set acknowledged_one_way"
+            ),
+        )
     try:
         return await asyncio.to_thread(
             sl.set_archived,
