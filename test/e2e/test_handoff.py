@@ -359,3 +359,24 @@ class TestAntigravityCliHandoff:
             ),
             content_keywords=["square", "return", "def"],
         )
+
+
+@pytest.mark.e2e
+class TestOmpHandoff:
+    """OMP reaches completed state and returns only each latest response."""
+
+    def test_handoff_simple_function(self, require_omp):
+        _run_handoff_test(
+            provider="omp",
+            agent_profile="developer",
+            task_message="Create a Python function greet(name). Output only the function code.",
+            content_keywords=["greet", "def"],
+        )
+
+    def test_handoff_second_task(self, require_omp):
+        _run_handoff_test(
+            provider="omp",
+            agent_profile="developer",
+            task_message="Create a Python function square(n). Output only the function code.",
+            content_keywords=["square", "def"],
+        )

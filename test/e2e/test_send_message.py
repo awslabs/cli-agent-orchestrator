@@ -300,3 +300,9 @@ class TestAntigravityCliSendMessage:
     def test_send_message_to_inbox(self, require_antigravity):
         """Send a message to another Antigravity CLI terminal's inbox and verify delivery."""
         _run_send_message_test(provider="antigravity_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestOmpSendMessage:
+    def test_send_message_to_inbox(self, require_omp):
+        _run_send_message_test(provider="omp", agent_profile="developer")

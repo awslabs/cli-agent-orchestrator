@@ -123,6 +123,21 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
             )
             payload = Path(m.group(1), "system.md").read_text(encoding="utf-8")
             source = f"kimi system.md ({m.group(1)})"
+        elif provider == "omp":
+            # OMP receives CAO context from a private --append-system-prompt
+            # file. The launch command exposes the path, while its contents do
+            # not appear in TUI scrollback after startup.
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            assert resp.status_code == 200
+            window_name = resp.json()["name"]
+            scrollback = _capture_full_scrollback(actual_session, window_name, join_wrapped=True)
+            match = re.search(r"--append-system-prompt\s+(\S+)", scrollback)
+            assert match, (
+                "OMP --append-system-prompt file not found in tmux scrollback. "
+                f"First 500 chars: {scrollback[:500]}"
+            )
+            payload = Path(match.group(1)).read_text(encoding="utf-8")
+            source = f"OMP context file ({match.group(1)})"
         else:
             # Capture the full tmux scrollback (capture-pane -S - reads from the
             # very start of the buffer so the initial CLI command with the
@@ -187,6 +202,12 @@ class TestAntigravityCliSkills:
     def test_skill_catalog_injected(self, require_antigravity):
         """Antigravity CLI terminal command contains the injected skill catalog."""
         _run_skill_injection_test(provider="antigravity_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestOmpSkills:
+    def test_skill_catalog_is_appended(self, require_omp):
+        _run_skill_injection_test(provider="omp", agent_profile="developer")
 
 
 # ---------------------------------------------------------------------------

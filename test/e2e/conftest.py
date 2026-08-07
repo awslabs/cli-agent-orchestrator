@@ -111,6 +111,13 @@ def require_opencode():
 
 
 @pytest.fixture()
+def require_omp():
+    """Skip test if OMP is not available and authenticated locally."""
+    if not _cli_available("omp"):
+        pytest.skip("OMP CLI not installed")
+
+
+@pytest.fixture()
 def require_hermes():
     """Skip test if Hermes CLI is not available."""
     if not _cli_available("hermes"):
