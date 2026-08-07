@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - force fast-uri 3.1.5 in aidlc-portfolio examples (#551) (#552)
+- make session teardown atomic so tmux and the terminal registry can no longer diverge (#498). `delete_session` previously trusted a pre-loop liveness reading and an unverified `kill_session` result, so a session could survive while its registry rows were deleted (orphaned tmux session) or vice versa (ghost rows that later misattributed a reused session name). Now: session creation and session teardown are mutually exclusive per session *name* (a concurrent launch can no longer interleave with a teardown of the same name), `kill_session` returns True only once the session is confirmed gone, and registry rows are deleted only *after* that confirmation. **Error-contract change:** a teardown whose tmux kill cannot be confirmed now raises (surfaced as HTTP 500 on `DELETE /sessions/{name}`) instead of reporting success — the registry rows are left intact and the operation is safe to re-run, which reconciles the survivor. Backend authors: `TerminalBackend.kill_session` must not return True for a merely-dispatched kill
 
 
 ### Other
