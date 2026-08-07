@@ -50,6 +50,14 @@ def test_short_name_override_wins_over_legacy_wire_name(monkeypatch):
     assert pc.version_enforcement_mode("kimi_cli") == pc.VERSION_ENFORCEMENT_OPEN
 
 
+@pytest.mark.parametrize("wire_provider", ["codex", "kimi_cli", "claude_code", "muse_cli"])
+def test_wire_provider_inherits_open_default_without_override(monkeypatch, wire_provider):
+    """Wire identifiers must not silently fall back to strict mode."""
+    for suffix in ("CODEX", "KIMI", "CLAUDE", "MUSE", "KIMI_CLI", "CLAUDE_CODE", "MUSE_CLI"):
+        monkeypatch.delenv(f"CAO_PROVIDER_VERSION_ENFORCEMENT_{suffix}", raising=False)
+    assert pc.version_enforcement_mode(wire_provider) == pc.VERSION_ENFORCEMENT_OPEN
+
+
 @pytest.mark.parametrize("provider", ["codex", "kimi", "claude", "muse"])
 def test_unparseable_versions_remain_fail_closed(provider):
     with pytest.raises(pc.ProviderVersionDrift):

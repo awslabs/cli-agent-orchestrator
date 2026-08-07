@@ -97,6 +97,16 @@ _VERSION_ENV_SUFFIX: dict[str, str] = {
     PROVIDER_MUSE_CLI: "MUSE",
 }
 
+# The launch layer uses wire identifiers, while the default policy table is
+# intentionally keyed by the short provider vocabulary.  Normalize both at
+# this boundary so a wire launch inherits the same open-by-default policy
+# when no temporary environment override is present.
+_VERSION_POLICY_KEY: dict[str, str] = {
+    PROVIDER_KIMI_CLI: PROVIDER_KIMI,
+    PROVIDER_CLAUDE_CODE: PROVIDER_CLAUDE,
+    PROVIDER_MUSE_CLI: PROVIDER_MUSE,
+}
+
 #: The single *current* pin per provider: the version a fresh mint/proof
 #: is expected to run, and the one a receipt records when it cannot read a
 #: more specific fact.  ``SUPPORTED_VERSIONS`` below is the acceptance
@@ -263,7 +273,8 @@ def version_enforcement_mode(provider: str) -> str:
             override = os.environ.get(f"CAO_PROVIDER_VERSION_ENFORCEMENT_{wire_suffix}")
     if override in (VERSION_ENFORCEMENT_STRICT, VERSION_ENFORCEMENT_OPEN):
         return override
-    return VERSION_ENFORCEMENT_MODE.get(provider, VERSION_ENFORCEMENT_STRICT)
+    policy_key = _VERSION_POLICY_KEY.get(provider, provider)
+    return VERSION_ENFORCEMENT_MODE.get(policy_key, VERSION_ENFORCEMENT_STRICT)
 
 
 # The sole accepted pre-turn native-identity source per provider.
