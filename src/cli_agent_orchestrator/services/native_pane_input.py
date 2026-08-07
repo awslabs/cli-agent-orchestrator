@@ -532,11 +532,6 @@ class ComposerObservationPin:
     evidence: str
 
 
-# The prompt glyphs a composer draws before the operator-typed text.  They are
-# stripped when extracting the text for an exact digest comparison.
-_COMPOSER_PROMPT_GLYPHS = ">›❯"
-
-
 _CODEX_OBSERVATION_EVIDENCE = (
     "live-verified on the installed Codex CLI 0.146.0 (cond-0324): the last "
     "'›' prompt row and any wrapped rows before the following blank separator "
@@ -595,12 +590,10 @@ def composer_observation_pin_for(
     )
 
 
-# Composer chrome: the box-drawing verticals and prompt glyphs a composer
-# draws *around* the text it holds.  They sit between the fragments of a
-# wrapped line, so matching without dropping them would split every wrap
-# at its border.  They are stripped from the captured rows and from the
-# control text alike, so a text that genuinely contains one still matches
-# its own rendering.
+# Composer chrome is removed only at the pinned frame boundaries below.  Do
+# not remove arbitrary prompt-looking characters from the payload: a valid
+# control may contain them, and doing so would make two different payloads
+# hash alike.
 _COMPOSER_CHROME_CHARS = "│┃>›"
 
 
@@ -1101,50 +1094,48 @@ def _codex_composer_empty(styled_rows: Sequence[str]) -> Optional[bool]:
     return True
 
 
-_COMPOSER_BOX_DRAWING = "╭╮╰╯─└┘┌┐"
-
-
-def _strip_composer_text(text: str) -> str:
-    """``text`` with composer chrome and surrounding whitespace removed."""
-    chrome = _COMPOSER_CHROME_CHARS + _COMPOSER_PROMPT_GLYPHS + _COMPOSER_BOX_DRAWING
-    stripped = "".join(char for char in text if char not in chrome)
-    return stripped.strip()
-
-
 def _kimi_composer_text(rows: Sequence[str]) -> Optional[str]:
-    """The normalized operator-typed text inside the last Kimi composer box."""
+    """Exact text in a single, unambiguous Kimi composer row."""
     content = _kimi_composer_box_rows(rows)
-    if content is None:
+    if content is None or len(content) != 1:
         return None
-    parts: list[str] = []
-    for index, row in enumerate(content):
-        text = _strip_composer_text(row)
-        if index == 0:
-            text = text.lstrip()
-        if text:
-            parts.append(text)
-    return _normalised("".join(parts)) if parts else ""
+    row = content[0]
+    prompt_at = row.find(">")
+    if prompt_at < 0:
+        return None
+    payload = row[prompt_at + 1 :]
+    if payload.startswith(" "):
+        payload = payload[1:]
+    # The pinned box contributes one right-padding cell.  A second trailing
+    # cell would be indistinguishable from user-supplied trailing whitespace,
+    # so reject that ambiguous case instead of hashing a guess.
+    if payload.endswith(" "):
+        payload = payload[:-1]
+    if payload != payload.strip():
+        return None
+    return payload
 
 
 def _claude_composer_text(rows: Sequence[str]) -> Optional[str]:
-    """The normalized operator-typed text inside the last Claude prompt box."""
+    """Exact text in a single, unambiguous Claude composer row."""
     rule_indices = [i for i, text in enumerate(rows) if _CLAUDE_BOX_RULE.match(text)]
     if len(rule_indices) < 2:
         return None
     content = rows[rule_indices[-2] + 1 : rule_indices[-1]]
-    if not content:
+    if len(content) != 1:
         return None
     first = content[0]
     prompt_at = first.find(_CLAUDE_PROMPT_GLYPH)
     if prompt_at == -1:
         return None
-    parts = [_strip_composer_text(first[prompt_at + 1 :])]
-    parts.extend(_strip_composer_text(row) for row in content[1:])
-    return _normalised("".join(parts))
+    payload = first[prompt_at + 1 :]
+    if payload.startswith(" "):
+        payload = payload[1:]
+    return payload if payload == payload.strip() else None
 
 
 def _codex_composer_text(rows: Sequence[str]) -> Optional[str]:
-    """The normalized operator-typed text inside the last Codex prompt region."""
+    """Exact text in a single, unambiguous Codex prompt row."""
     prompt_row = next(
         (index for index in range(len(rows) - 1, -1, -1) if "›" in rows[index]),
         None,
@@ -1158,27 +1149,26 @@ def _codex_composer_text(rows: Sequence[str]) -> Optional[str]:
     if separator is None:
         return None
     content = rows[prompt_row:separator]
+    if len(content) != 1:
+        return None
     first = content[0]
     prompt_at = first.find("›")
     if prompt_at == -1:
         return None
-    parts = [_strip_composer_text(first[prompt_at + 1 :])]
-    parts.extend(_strip_composer_text(row) for row in content[1:])
-    return _normalised("".join(parts))
+    payload = first[prompt_at + 1 :]
+    if payload.startswith(" "):
+        payload = payload[1:]
+    return payload if payload == payload.strip() else None
 
 
 def extract_composer_text(
     rows: Sequence[str], pin: ComposerObservationPin
 ) -> Optional[str]:
-    """The normalized text held in the pinned composer region, or None.
+    """The exact text held in the pinned composer region, or ``None``.
 
-    The normalization removes whitespace and composer chrome, because the
-    composer may reflow the text (wrap, indent, box-pad) without changing
-    what the operator typed.  Both the caller's expected digest and this
-    extraction use the same normalization, so the comparison is exact over
-    the characters that cannot move.  A text whose meaning depends on
-    preserved whitespace will not match and will be reported as not observed
-    — the fail-closed outcome for a region this pin cannot prove exactly.
+    Only an unwrapped, one-row payload with unambiguous frame padding is
+    returned.  Wrapped or whitespace-ambiguous captures fail closed so the
+    conductor's raw UTF-8 fingerprint remains authoritative.
     """
     if pin.rule == _RULE_KIMI_COMPOSER_BOX:
         return _kimi_composer_text(rows)

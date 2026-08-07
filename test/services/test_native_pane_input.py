@@ -54,6 +54,12 @@ def test_extract_composer_text_for_codex():
     assert _sha256(extracted) == _sha256(TEXT)
 
 
+def test_extract_composer_text_preserves_internal_whitespace():
+    text = "tell worker: use  two spaces"
+    rows = ["transcript row", f"› {text}", "", "  footer/status"]
+    assert extract_composer_text(rows, _codex_pin()) == text
+
+
 def test_extract_composer_text_for_kimi():
     rows = [
         "transcript row",
@@ -69,6 +75,13 @@ def test_extract_composer_text_for_kimi():
 def test_extract_composer_text_returns_none_when_region_unreadable():
     rows = ["no composer here"]
     assert extract_composer_text(rows, _codex_pin()) is None
+
+
+def test_extract_composer_text_refuses_wrapped_or_ambiguous_rows():
+    wrapped = ["transcript row", "› first", "second", "", "footer/status"]
+    trailing = ["transcript row", "› text ", "", "footer/status"]
+    assert extract_composer_text(wrapped, _codex_pin()) is None
+    assert extract_composer_text(trailing, _codex_pin()) is None
 
 
 def test_composer_observation_pin_is_build_exact():

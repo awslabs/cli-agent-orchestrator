@@ -209,12 +209,11 @@ route for this purpose.
   `unknown`), `content_sha256` and `content_bytes` only when
   `observed: true`, and `evidence_ref`.  Raw composer text is never
   returned or logged.  Typed refusals carry `refusal: {reason, detail}`.
-- The extracted text is normalized by removing composer chrome, prompt
-  glyphs, box-drawing characters, and whitespace, because the composer
-  may reflow the text without changing the characters that cannot move.
-  A control text whose exact meaning depends on preserved whitespace is
-  therefore fail-closed: it will not match and will be reported as not
-  observed.
+- The extractor returns a digest only for an unwrapped, single-row payload
+  whose frame padding is unambiguous.  It preserves internal whitespace and
+  prompt-like payload characters.  Wrapped or leading/trailing-whitespace-
+  ambiguous captures fail closed rather than inventing a canonical payload;
+  the conductor's raw UTF-8 fingerprint remains authoritative.
 
 ### 1.3 Event → tmux mapping (deployed)
 
