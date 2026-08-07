@@ -41,8 +41,8 @@ from cli_agent_orchestrator.clients.database import (
     report_terminal_missing_from_every_store,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services.pane_observer import observer
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services.pane_observer import observer
 
 logger = logging.getLogger(__name__)
 
@@ -220,8 +220,9 @@ def _inactive_seconds(row: Dict[str, Any]) -> Optional[float]:
     if raw is None:
         return None
     try:
-        moment = raw if isinstance(raw, datetime.datetime) else \
-            datetime.datetime.fromisoformat(str(raw))
+        moment = (
+            raw if isinstance(raw, datetime.datetime) else datetime.datetime.fromisoformat(str(raw))
+        )
     except (TypeError, ValueError):
         return None
     if moment.tzinfo is None:
@@ -232,6 +233,7 @@ def _inactive_seconds(row: Dict[str, Any]) -> Optional[float]:
 def _fused_status(row: Dict[str, Any], *, native_tui: bool):
     """Fuse every available signal for one LIVE terminal."""
     from cli_agent_orchestrator.services import status_fusion as sf
+
     terminal_id = row["id"]
     lines, unchanged_for = observer.observe(row.get("pane_id"))
 

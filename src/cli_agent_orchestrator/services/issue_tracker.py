@@ -213,7 +213,9 @@ def _validate_prefix(prefix: str) -> str:
 def _validate_choice(value: str, allowed: Sequence[str], label: str) -> str:
     text = str(value or "").strip()
     if text not in allowed:
-        raise TrackerError("invalid", f"invalid {label} {text!r}: expected one of {', '.join(allowed)}")
+        raise TrackerError(
+            "invalid", f"invalid {label} {text!r}: expected one of {', '.join(allowed)}"
+        )
     return text
 
 
@@ -281,7 +283,9 @@ def _path_contains(scope: str, candidate: str) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _project_row(row: TrackerProjectModel, *, counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+def _project_row(
+    row: TrackerProjectModel, *, counts: Optional[Dict[str, int]] = None
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "id": row.id,
         "name": row.name,
@@ -318,7 +322,10 @@ def create_project(
     prefix = _validate_prefix(issue_prefix) if issue_prefix else _default_prefix(slug)
 
     prepared = [
-        (normalise_scope_value(s.get("kind", ""), s.get("value", "")), _validate_choice(s.get("kind", ""), SCOPE_KINDS, "scope kind"))
+        (
+            normalise_scope_value(s.get("kind", ""), s.get("value", "")),
+            _validate_choice(s.get("kind", ""), SCOPE_KINDS, "scope kind"),
+        )
         for s in (scopes or [])
     ]
     # Two scopes in ONE request that normalise to the same value used to reach
@@ -327,9 +334,7 @@ def create_project(
     seen_values = set()
     for value, _kind in prepared:
         if value in seen_values:
-            raise TrackerError(
-                "conflict", f"scope {value!r} is listed twice in this request"
-            )
+            raise TrackerError("conflict", f"scope {value!r} is listed twice in this request")
         seen_values.add(value)
 
     with SessionLocal() as db:
@@ -465,7 +470,14 @@ def get_project(project_id: str) -> Dict[str, Any]:
         )
         total = sum(int(v) for v in by_status.values())
         open_count = sum(int(v) for k, v in by_status.items() if k not in TERMINAL_STATUSES)
-        payload = _project_row(row, counts={"total": total, "open": open_count, "by_status": {k: int(v) for k, v in by_status.items()}})
+        payload = _project_row(
+            row,
+            counts={
+                "total": total,
+                "open": open_count,
+                "by_status": {k: int(v) for k, v in by_status.items()},
+            },
+        )
         payload["scopes"] = [
             {"id": s.id, "kind": s.kind, "value": s.value, "created_at": _iso(s.created_at)}
             for s in scopes
@@ -609,7 +621,9 @@ def list_scopes(project_id: Optional[str] = None) -> List[Dict[str, Any]]:
         query = db.query(TrackerScopeModel)
         if project_id:
             query = query.filter(TrackerScopeModel.project_id == _validate_slug(project_id))
-        rows = query.order_by(TrackerScopeModel.project_id.asc(), TrackerScopeModel.kind.asc()).all()
+        rows = query.order_by(
+            TrackerScopeModel.project_id.asc(), TrackerScopeModel.kind.asc()
+        ).all()
         return [
             {
                 "id": r.id,
@@ -696,9 +710,7 @@ def resolve_project(
 
         if cwd:
             resolved = normalise_scope_value("path", cwd)
-            candidates = (
-                db.query(TrackerScopeModel).filter(TrackerScopeModel.kind == "path").all()
-            )
+            candidates = db.query(TrackerScopeModel).filter(TrackerScopeModel.kind == "path").all()
             # Longest scope wins: a project registered on
             # ~/Projects/cao-conductor/gateway is more specific than one
             # registered on ~/Projects, and the specific answer is the one the
@@ -716,7 +728,9 @@ def resolve_project(
             canonical = _normalise_remote(remote)
             row = (
                 db.query(TrackerScopeModel)
-                .filter(TrackerScopeModel.kind == "git_remote", TrackerScopeModel.value == canonical)
+                .filter(
+                    TrackerScopeModel.kind == "git_remote", TrackerScopeModel.value == canonical
+                )
                 .first()
             )
             if row is not None:
@@ -1209,7 +1223,9 @@ def delete_comment(key: str, comment_id: int) -> Dict[str, Any]:
         return {"id": int(comment_id), "deleted": True}
 
 
-def add_link(from_key: str, *, to_key: str, kind: str, actor: Optional[str] = None) -> Dict[str, Any]:
+def add_link(
+    from_key: str, *, to_key: str, kind: str, actor: Optional[str] = None
+) -> Dict[str, Any]:
     """Relate two issues."""
     from_key = str(from_key or "").strip().lower()
     to_key = str(to_key or "").strip().lower()
@@ -1218,7 +1234,10 @@ def add_link(from_key: str, *, to_key: str, kind: str, actor: Optional[str] = No
         raise TrackerError("invalid", "an issue cannot link to itself")
     with SessionLocal() as db:
         for candidate in (from_key, to_key):
-            if db.query(TrackerIssueModel).filter(TrackerIssueModel.key == candidate).first() is None:
+            if (
+                db.query(TrackerIssueModel).filter(TrackerIssueModel.key == candidate).first()
+                is None
+            ):
                 raise TrackerError("not-found", f"no such issue: {candidate}")
         existing = (
             db.query(TrackerLinkModel)
@@ -1230,7 +1249,13 @@ def add_link(from_key: str, *, to_key: str, kind: str, actor: Optional[str] = No
             .first()
         )
         if existing is not None:
-            return {"id": existing.id, "from_key": from_key, "to_key": to_key, "kind": kind, "created": False}
+            return {
+                "id": existing.id,
+                "from_key": from_key,
+                "to_key": to_key,
+                "kind": kind,
+                "created": False,
+            }
         row = TrackerLinkModel(from_key=from_key, to_key=to_key, kind=kind)
         db.add(row)
         db.add(
@@ -1250,7 +1275,11 @@ def remove_link(link_id: int, *, actor: Optional[str] = None) -> Dict[str, Any]:
             raise TrackerError("not-found", f"no such link: {link_id}")
         db.add(
             TrackerEventModel(
-                issue_key=row.from_key, actor=actor, kind="unlink", field=row.kind, old_value=row.to_key
+                issue_key=row.from_key,
+                actor=actor,
+                kind="unlink",
+                field=row.kind,
+                old_value=row.to_key,
             )
         )
         db.delete(row)
@@ -1313,8 +1342,7 @@ def render_markdown(project_id: str, *, open_only: bool = True) -> str:
     lines = [
         f"# {'Open' if open_only else 'All'} issues — {project['name']}",
         "",
-        f"Rendered from the CAO issue tracker. Project id `{project['id']}`; "
-        f"{total} issue(s).",
+        f"Rendered from the CAO issue tracker. Project id `{project['id']}`; " f"{total} issue(s).",
         "",
         "---",
         "",

@@ -183,7 +183,9 @@ def project_resolve(cwd, session, alias, project_id, as_json):
         if got["project_id"] is None:
             click.echo("no project registered for this filing site")
         else:
-            click.echo(f"{got['project_id']}  (matched by {got['matched_by']}: {got['matched_value']})")
+            click.echo(
+                f"{got['project_id']}  (matched by {got['matched_by']}: {got['matched_value']})"
+            )
 
     _emit(got, as_json, render)
 
@@ -262,7 +264,9 @@ def issue():
 @click.option("--project", "project_id", default=None, help="explicit project (skips resolution)")
 @click.option("--cwd", default=None, help="filing site (default: this directory)")
 @click.option("--session", "session_name", default=None)
-@click.option("--alias", default=None, help="a project_id-kind scope value, e.g. a conductor campaign name")
+@click.option(
+    "--alias", default=None, help="a project_id-kind scope value, e.g. a conductor campaign name"
+)
 @click.option("--severity", type=click.Choice(tracker.SEVERITIES), default="unset")
 @click.option("--status", type=click.Choice(tracker.STATUSES), default="open")
 @click.option("--component", default=None)
@@ -274,8 +278,23 @@ def issue():
 @click.option("--key", default=None, help="explicit issue key (migration only)")
 @click.option("--json", "as_json", is_flag=True)
 def issue_file(
-    title, body, body_file, project_id, cwd, session_name, alias, severity, status,
-    component, reporter, assignee, labels, failing_command, evidence, key, as_json,
+    title,
+    body,
+    body_file,
+    project_id,
+    cwd,
+    session_name,
+    alias,
+    severity,
+    status,
+    component,
+    reporter,
+    assignee,
+    labels,
+    failing_command,
+    evidence,
+    key,
+    as_json,
 ):
     """File an issue against a project."""
     if body_file:
@@ -325,8 +344,19 @@ def issue_file(
 )
 @click.option("--json", "as_json", is_flag=True)
 def issue_list(
-    project_id, statuses, severities, component, assignee, reporter, label,
-    query, open_only, limit, offset, order, as_json,
+    project_id,
+    statuses,
+    severities,
+    component,
+    assignee,
+    reporter,
+    label,
+    query,
+    open_only,
+    limit,
+    offset,
+    order,
+    as_json,
 ):
     """List issues."""
     try:
@@ -352,7 +382,9 @@ def issue_list(
             click.echo(_issue_line(row))
         shown = len(page["issues"])
         if shown < page["total"]:
-            click.echo(f"-- showing {page['offset'] + 1}-{page['offset'] + shown} of {page['total']}")
+            click.echo(
+                f"-- showing {page['offset'] + 1}-{page['offset'] + shown} of {page['total']}"
+            )
         else:
             click.echo(f"-- {page['total']} issue(s)")
 
@@ -374,7 +406,15 @@ def issue_show(issue_key, as_json):
         click.echo(f"{row['key']} — {severity}{row['title']}")
         click.echo(f"  project:   {row['project_id']}")
         click.echo(f"  status:    {row['status']}")
-        for field in ("component", "reporter", "assignee", "failing_command", "evidence", "resolution", "duplicate_of"):
+        for field in (
+            "component",
+            "reporter",
+            "assignee",
+            "failing_command",
+            "evidence",
+            "resolution",
+            "duplicate_of",
+        ):
             if row.get(field):
                 click.echo(f"  {field + ':':<12}{row[field]}")
         if row["labels"]:
@@ -411,7 +451,9 @@ def issue_show(issue_key, as_json):
 @click.option("--evidence", default=None)
 @click.option("--resolution", default=None)
 @click.option("--duplicate-of", default=None)
-@click.option("--actor", default=None, help="who is making this change (recorded in the audit trail)")
+@click.option(
+    "--actor", default=None, help="who is making this change (recorded in the audit trail)"
+)
 @click.option("--json", "as_json", is_flag=True)
 def issue_edit(issue_key, body_file, labels, actor, as_json, **fields):
     """Change one or more fields. Only the options you pass are applied."""
@@ -517,7 +559,11 @@ def issue_stats(project_id, as_json):
 
     def render(row):
         click.echo(f"{row['open']} open / {row['total']} total")
-        for heading, key in (("status", "by_status"), ("severity", "by_severity"), ("component", "by_component")):
+        for heading, key in (
+            ("status", "by_status"),
+            ("severity", "by_severity"),
+            ("component", "by_component"),
+        ):
             click.echo(f"  by {heading}:")
             for name, count in sorted(row[key].items(), key=lambda kv: (-kv[1], kv[0])):
                 click.echo(f"    {name:<14} {count}")

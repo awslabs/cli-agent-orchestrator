@@ -217,7 +217,9 @@ class TestFieldMapping:
         assert built["severity"] == "P0"
 
     def test_a_space_separated_severity_prefix_is_read(self):
-        text = "## cond-0104 — P1 native v2 admission boot-gate 409\n\n- **status:** closed\n\nbody\n"
+        text = (
+            "## cond-0104 — P1 native v2 admission boot-gate 409\n\n- **status:** closed\n\nbody\n"
+        )
         built = importer.build_issue(
             importer.parse_ledger(text)[0], project_id="cao-system", default_status="closed"
         )
