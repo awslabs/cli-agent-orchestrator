@@ -201,10 +201,16 @@ def release_if_owner_gone(
 ) -> dict[str, Any]:
     """Release one attachment, but only on a proven-absent owner.
 
-    Returns an outcome dict in every case, including refusal, so a caller
-    sweeping hundreds of rows gets a per-row account rather than an
-    exception it has to interpret.  The one thing that is *not* caught is
-    a caller's own programming error: an invalid record raises.
+    Returns an outcome dict in every case — released, skipped, refused, or
+    errored — so a caller sweeping hundreds of rows gets a per-row account
+    rather than an exception it has to interpret.  Nothing escapes.
+
+    That includes the unexpected.  One malformed row must not abort a
+    sweep over every other row: an ``execution_mode`` this build no longer
+    recognises raises ``ExecutionModeInvalid``, which is not a
+    ``NativeAttachmentError`` and would otherwise take the whole pass down
+    — leaving the operator with a partial run and no report saying which
+    rows were even examined.
     """
     owner = record.get("owner") or {}
     outcome: dict[str, Any] = {
@@ -231,19 +237,19 @@ def release_if_owner_gone(
         outcome.update(action="skipped", reason=observed["disposition"], detail=observed["detail"])
         return outcome
 
-    proof = native_attachment.no_survivor_proof(
-        provider=record["provider"],
-        native_session_id=record["native_session_id"],
-        terminal_id=owner["terminal_id"],
-        generation=owner["generation"],
-        execution_mode=owner["execution_mode"],
-        pane_id=owner.get("pane_id"),
-        process_identity=owner.get("process_identity"),
-        survivors=observed["survivors"],
-        observed_at=observed["observed_at"],
-        observer=observed["observer"],
-    )
     try:
+        proof = native_attachment.no_survivor_proof(
+            provider=record["provider"],
+            native_session_id=record["native_session_id"],
+            terminal_id=owner["terminal_id"],
+            generation=owner["generation"],
+            execution_mode=owner["execution_mode"],
+            pane_id=owner.get("pane_id"),
+            process_identity=owner.get("process_identity"),
+            survivors=observed["survivors"],
+            observed_at=observed["observed_at"],
+            observer=observed["observer"],
+        )
         released = native_attachment.release(
             provider=record["provider"],
             native_session_id=record["native_session_id"],
@@ -258,6 +264,15 @@ def release_if_owner_gone(
         # than overwriting whoever won.  Report it and move on; forcing
         # would be the double-attach this whole module guards against.
         outcome.update(action="refused", reason=exc.code, detail=str(exc))
+        return outcome
+    except Exception as exc:  # noqa: BLE001 - one bad row must not end the pass
+        logger.warning(
+            "Could not resolve the %s claim on session %s: %s",
+            record.get("provider"),
+            record.get("native_session_id"),
+            exc,
+        )
+        outcome.update(action="errored", reason=type(exc).__name__, detail=str(exc))
         return outcome
     outcome.update(action="released", reason=OWNER_GONE, state=released["state"])
     return outcome

@@ -405,3 +405,44 @@ class TestOperatorFreeze:
             live_survivors=observation["survivors"],
         )
         assert result["state"] == na.DETACHED
+
+
+class TestOneBadRowDoesNotEndThePass:
+    """A sweep is a batch operation over rows nobody validated on the way in.
+
+    The store enforces its vocabulary at write time, but a build that
+    changes that vocabulary — or a row written by an older one — turns a
+    read into a raise. Letting that escape would give an operator a partial
+    run and no report saying which rows were even examined.
+    """
+
+    def test_a_row_that_cannot_be_proved_is_recorded_not_raised(self, monkeypatch):
+        _attach(pid=_reaped_pid())
+
+        def _no_longer_valid(**_kwargs):
+            raise RuntimeError("execution mode 'native_tui' is no longer recognised")
+
+        monkeypatch.setattr(na, "no_survivor_proof", _no_longer_valid)
+        outcome = recovery.release_if_owner_gone(na.get(PROVIDER, SESSION))
+        assert outcome["action"] == "errored"
+        assert outcome["reason"] == "RuntimeError"
+        assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED
+
+    def test_the_sweep_finishes_and_reports_every_other_row(self, monkeypatch):
+        _attach(pid=_reaped_pid(), session="bad-row", terminal_id="t-bad")
+        _attach(pid=_reaped_pid(), session="good-row", terminal_id="t-good")
+
+        real = na.no_survivor_proof
+
+        def _selective(**kwargs):
+            if kwargs["native_session_id"] == "bad-row":
+                raise RuntimeError("unrecognised")
+            return real(**kwargs)
+
+        monkeypatch.setattr(na, "no_survivor_proof", _selective)
+        report = recovery.sweep(apply=True)
+        assert report["examined"] == 2
+        assert report["counts"]["released"] == 1
+        assert report["counts"]["errored"] == 1
+        assert na.get(PROVIDER, "good-row")["state"] == na.DETACHED
+        assert na.get(PROVIDER, "bad-row")["state"] == na.ATTACHED
