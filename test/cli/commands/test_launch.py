@@ -1254,9 +1254,9 @@ def test_launch_create_session_timeout_exceeds_worst_case_server_path():
     )
 
     assert worst_case == 141, "worked example drifted; re-derive the margin"
-    assert budget > worst_case, (
-        f"create budget {budget}s does not cover worst-case server path {worst_case}s"
-    )
+    assert (
+        budget > worst_case
+    ), f"create budget {budget}s does not cover worst-case server path {worst_case}s"
 
 
 def test_create_session_timeout_survives_partial_settings():
