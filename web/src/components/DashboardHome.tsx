@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useStore } from '../store'
-import { api, Annotation, AnnotationsResponse, TerminalMeta } from '../api'
+import { api, Annotation, AnnotationsResponse, SessionLifecycle, TerminalMeta } from '../api'
 import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, ArrowDownUp } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
@@ -86,6 +86,44 @@ interface SessionWithTerminals {
   name: string
   status: string
   terminals: TerminalMeta[]
+  // What the session DECLARED it is doing. A different dimension from
+  // `status` (tmux attach state) and from a terminal's `lifecycle_state`
+  // (observed liveness); all three carry disjoint value sets and must
+  // never be rendered as one field.
+  lifecycle?: SessionLifecycle | null
+}
+
+// Only a declared state renders. An undeclared session — which is every
+// session that predates the feature — shows nothing rather than a
+// meaningless "working" badge on every card in the fleet.
+const LIFECYCLE_PILL: Record<string, { label: string; className: string }> = {
+  pausing: { label: 'pausing', className: 'bg-amber-500/15 text-amber-300 border-amber-500/30' },
+  paused: { label: 'paused', className: 'bg-sky-500/15 text-sky-300 border-sky-500/30' },
+  complete: { label: 'complete', className: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' },
+  stopped: { label: 'stopped', className: 'bg-gray-500/15 text-gray-400 border-gray-500/30' },
+}
+
+function SessionLifecyclePill({ lifecycle }: { lifecycle?: SessionLifecycle | null }) {
+  if (!lifecycle || !lifecycle.declared) return null
+  const pill = LIFECYCLE_PILL[lifecycle.lifecycle]
+  if (!pill) return null
+  // An overdue pause is the one case where the declared state is actively
+  // misleading on its own: the fleet was asked to settle and nobody did,
+  // and the spec hands that session back to the marshal rather than
+  // treating it as quiet. Say so on the card.
+  const overdue = lifecycle.lifecycle === 'pausing' && lifecycle.pause_overdue
+  return (
+    <span
+      className={`text-[10px] px-1.5 py-0.5 rounded border font-mono ${overdue ? 'bg-red-500/15 text-red-300 border-red-500/30' : pill.className}`}
+      title={
+        overdue
+          ? 'pause requested but never settled — this session is back in the fire marshal\'s domain'
+          : `declared by ${lifecycle.declared_by ?? 'unknown'}`
+      }
+    >
+      {overdue ? 'pause overdue' : pill.label}
+    </span>
+  )
 }
 
 export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => void }) {
@@ -170,10 +208,17 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         const sessionDetails = await Promise.all(
           sessions.map(async s => {
             try {
-              const detail = await api.getSession(s.name)
-              return { name: s.name, status: s.status, terminals: detail.terminals || [] }
+              const [detail, lifecycle] = await Promise.all([
+                api.getSession(s.name),
+                // Never rejects for an undeclared session — it answers
+                // `working`. A failure here must not blank the card, so the
+                // whole thing degrades to "no declaration" rather than
+                // dropping the terminals too.
+                api.getSessionLifecycle(s.name).catch(() => null),
+              ])
+              return { name: s.name, status: s.status, terminals: detail.terminals || [], lifecycle }
             } catch {
-              return { name: s.name, status: s.status, terminals: [] }
+              return { name: s.name, status: s.status, terminals: [], lifecycle: null }
             }
           })
         )
@@ -698,6 +743,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                         <Users size={14} className="text-emerald-400" />
                         <span className="text-sm font-mono text-gray-200">{session.name}</span>
                         <span className="text-xs text-gray-500">{session.terminals.length} agent{session.terminals.length !== 1 ? 's' : ''}</span>
+                        <SessionLifecyclePill lifecycle={session.lifecycle} />
                         {/* Session filters survive a collapsed card (by design,
                             keyed by session name), so the card says when it is
                             holding rows back out of view. */}

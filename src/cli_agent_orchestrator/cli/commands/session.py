@@ -294,3 +294,213 @@ def send(session_name, message, terminal_id, is_async, timeout):
 
     if interrupted:
         sys.exit(130)
+
+
+# --------------------------------------------------------------------------
+# lifecycle
+# --------------------------------------------------------------------------
+#
+# Over HTTP like the rest of this group, unlike `cao issue` and
+# `cao attachment` which call their services directly. The reason differs:
+# those exist to be usable when the server is the broken thing, whereas
+# declaring a session paused is meaningless without a server — the supervisor
+# that has to settle the fleet lives behind it.
+
+
+def _lifecycle_url(session_name: str, *suffix: str) -> str:
+    parts = "/".join(suffix)
+    tail = f"/{parts}" if parts else ""
+    return f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/lifecycle{tail}"
+
+
+def _lifecycle_post(session_name: str, *suffix: str, **payload):
+    response = requests.post(_lifecycle_url(session_name, *suffix), json=payload)
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            detail = response.json().get("detail") or ""
+        except Exception:  # noqa: BLE001 - a non-JSON body is still worth showing
+            detail = response.text.strip()
+        raise click.ClickException(f"{response.status_code}: {detail}")
+    return response.json()
+
+
+def _render(record: dict) -> None:
+    click.echo(f"{record['session_name']}  {record['lifecycle']}")
+    if record.get("restore_to"):
+        click.echo(f"  restores to     {record['restore_to']}")
+    if record.get("archived"):
+        click.echo("  archived        yes")
+    click.echo(f"  kind            {record.get('kind')}")
+    if record.get("declared_by"):
+        click.echo(f"  declared by     {record['declared_by']}")
+    if record.get("pause_deadline_at"):
+        overdue = " (OVERDUE)" if record.get("pause_overdue") else ""
+        click.echo(f"  pause deadline  {record['pause_deadline_at']}{overdue}")
+    if record.get("suppresses_marshal"):
+        click.echo("  the fire marshal will not fire on this session")
+
+
+@session.command(name="lifecycle")
+@click.argument("session_name")
+@click.option("--json", "as_json", is_flag=True)
+def session_lifecycle_show(session_name, as_json):
+    """Show what a session has declared it is doing."""
+    try:
+        response = requests.get(_lifecycle_url(session_name))
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    record = response.json()
+    click.echo(json.dumps(record, indent=2)) if as_json else _render(record)
+
+
+@session.command(name="complete")
+@click.argument("session_name")
+@click.option("--by", "declared_by", required=True, help="Who is declaring this. Recorded.")
+@click.option("--note", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def session_complete(session_name, declared_by, note, as_json):
+    """Declare a session's goal achieved.
+
+    A declaration, not a teardown: nothing is collected and no worker is
+    retired. A mistaken `complete` that tore the fleet down would destroy
+    the evidence needed to tell that it was mistaken.
+    """
+    record = _lifecycle_post(session_name, declared_by=declared_by, lifecycle="complete", note=note)
+    click.echo(json.dumps(record, indent=2)) if as_json else _render(record)
+
+
+@session.command(name="pause")
+@click.argument("session_name")
+@click.option("--by", "requested_by", required=True, help="Who is asking. Recorded.")
+@click.option(
+    "--deadline-seconds",
+    default=None,
+    type=int,
+    help="How long the supervisor has to settle before the session returns to the marshal.",
+)
+@click.option("--note", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def session_pause(session_name, requested_by, deadline_seconds, note, as_json):
+    """Ask for a pause. Does not grant one.
+
+    The session enters `pausing` immediately. Only the supervisor can say
+    the fleet actually settled, because only the supervisor knows whether
+    the work is at a resumable boundary — so this returns before the pause
+    is real, and `cao session lifecycle` is how you watch for it.
+    """
+    payload = {"requested_by": requested_by, "note": note}
+    if deadline_seconds is not None:
+        payload["deadline_seconds"] = deadline_seconds
+    record = _lifecycle_post(session_name, "pause-request", **payload)
+    if not as_json:
+        click.echo("pause requested; waiting for the supervisor to settle the fleet")
+    click.echo(json.dumps(record, indent=2)) if as_json else _render(record)
+
+
+@session.command(name="pause-settled")
+@click.argument("session_name")
+@click.option("--by", "declared_by", required=True, help="The supervisor declaring this.")
+@click.option("--note", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def session_pause_settled(session_name, declared_by, note, as_json):
+    """The supervisor's half: the fleet is settled, the session is paused."""
+    record = _lifecycle_post(session_name, "pause-settled", declared_by=declared_by, note=note)
+    click.echo(json.dumps(record, indent=2)) if as_json else _render(record)
+
+
+@session.command(name="resume")
+@click.argument("session_name")
+@click.option("--by", "declared_by", required=True)
+@click.option("--note", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def session_resume_working(session_name, declared_by, note, as_json):
+    """Return a paused session to `working`.
+
+    Only meaningful for a *paused* session, whose panes are still live. A
+    `stopped` session has no panes to return to and needs a resume path
+    that does not exist yet for any provider.
+    """
+    record = _lifecycle_post(session_name, declared_by=declared_by, lifecycle="working", note=note)
+    click.echo(json.dumps(record, indent=2)) if as_json else _render(record)
+
+
+@session.command(name="stop-impact")
+@click.argument("session_name")
+@click.option("--json", "as_json", is_flag=True)
+def session_stop_impact(session_name, as_json):
+    """What stopping this session would cost, per live worker."""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/stop-impact"
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    impact = response.json()
+    if as_json:
+        click.echo(json.dumps(impact, indent=2))
+        return
+    _render_impact(impact)
+
+
+def _render_impact(impact: dict) -> None:
+    click.echo(f"{impact['live_workers']} live worker(s)")
+    if impact.get("unreadable"):
+        click.echo(f"  could not be read: {impact['unreadable']}")
+        return
+    if impact["not_resumable"]:
+        click.echo("\nwill NOT come back:")
+        for worker in impact["not_resumable"]:
+            profile = worker.get("agent_profile") or "-"
+            click.echo(
+                f"  {worker['terminal_id']:<12} {worker['provider']:<14} {profile:<16} "
+                f"{worker['reason']}"
+            )
+    if impact["resumable"]:
+        click.echo("\nstructurally resumable:")
+        for worker in impact["resumable"]:
+            click.echo(f"  {worker['terminal_id']:<12} {worker['provider']}")
+    if not impact.get("resume_machinery_available", False):
+        click.echo(f"\n{impact['resume_machinery_reason']}")
+
+
+@session.command(name="stop")
+@click.argument("session_name")
+@click.option("--by", "declared_by", required=True)
+@click.option("--note", default=None)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.option("--json", "as_json", is_flag=True)
+def session_stop(session_name, declared_by, note, yes, as_json):
+    """Record that a session's panes have been collected.
+
+    Shows what will not come back before asking. Proceeding is allowed;
+    proceeding unknowingly is not — a command called stop must never
+    silently be a delete.
+
+    Records the declaration only. Collecting the panes is a separate act,
+    so a stop recorded without one leaves a visibly wrong record rather
+    than a silently half-torn-down session.
+    """
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/stop-impact"
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    impact = response.json()
+
+    if not yes:
+        _render_impact(impact)
+        click.confirm(f"\nRecord {session_name} as stopped?", abort=True)
+
+    record = _lifecycle_post(
+        session_name,
+        "stop",
+        declared_by=declared_by,
+        acknowledged_one_way=True,
+        note=note,
+    )
+    click.echo(json.dumps(record, indent=2)) if as_json else _render(record)
