@@ -82,6 +82,21 @@ VERSION_ENFORCEMENT_MODE: dict[str, str] = {
     PROVIDER_MUSE: VERSION_ENFORCEMENT_OPEN,
 }
 
+# Runtime configuration is documented in the short provider vocabulary
+# (``KIMI``, ``CLAUDE``, ``MUSE``), while managed-launch requests use the wire
+# vocabulary (``kimi_cli``, ``claude_code``, ``muse_cli``).  Keep one explicit
+# mapping at this boundary so a strict override cannot be silently ignored when
+# a launch reaches the wire-facing path.
+_VERSION_ENV_SUFFIX: dict[str, str] = {
+    PROVIDER_CODEX: "CODEX",
+    PROVIDER_KIMI: "KIMI",
+    PROVIDER_KIMI_CLI: "KIMI",
+    PROVIDER_CLAUDE: "CLAUDE",
+    PROVIDER_CLAUDE_CODE: "CLAUDE",
+    PROVIDER_MUSE: "MUSE",
+    PROVIDER_MUSE_CLI: "MUSE",
+}
+
 #: The single *current* pin per provider: the version a fresh mint/proof
 #: is expected to run, and the one a receipt records when it cannot read a
 #: more specific fact.  ``SUPPORTED_VERSIONS`` below is the acceptance
@@ -236,8 +251,16 @@ def version_enforcement_mode(provider: str) -> str:
     ``CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI=strict`` to restore exact-pin
     fail-closed behaviour without a code change.
     """
-    env_var = f"CAO_PROVIDER_VERSION_ENFORCEMENT_{provider.upper()}"
+    suffix = _VERSION_ENV_SUFFIX.get(provider, provider.upper())
+    env_var = f"CAO_PROVIDER_VERSION_ENFORCEMENT_{suffix}"
     override = os.environ.get(env_var)
+    # Preserve compatibility with callers that configured the wire spelling
+    # before the short-name policy was documented.  The short-name variable
+    # wins if both are present, so one provider has one deterministic setting.
+    if override not in (VERSION_ENFORCEMENT_STRICT, VERSION_ENFORCEMENT_OPEN):
+        wire_suffix = provider.upper()
+        if wire_suffix != suffix:
+            override = os.environ.get(f"CAO_PROVIDER_VERSION_ENFORCEMENT_{wire_suffix}")
     if override in (VERSION_ENFORCEMENT_STRICT, VERSION_ENFORCEMENT_OPEN):
         return override
     return VERSION_ENFORCEMENT_MODE.get(provider, VERSION_ENFORCEMENT_STRICT)
