@@ -32,6 +32,10 @@ export default defineConfig({
       '/control-input': { target: 'http://localhost:9889', changeOrigin: true },
       '/operator-message': { target: 'http://localhost:9889', changeOrigin: true },
       '/annotations': { target: 'http://localhost:9889', changeOrigin: true },
+      // Without this the Projects tab works when cao-server serves the built
+      // bundle (same origin) and is entirely dead under `npm run dev`, where
+      // every tracker call 404s against the Vite dev server instead.
+      '/tracker': { target: 'http://localhost:9889', changeOrigin: true },
     },
   },
 })
