@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 import click
 
+from cli_agent_orchestrator.clients.database import ensure_tracker_schema
 from cli_agent_orchestrator.services import issue_tracker as tracker
 from cli_agent_orchestrator.services.issue_tracker import TrackerError
 
@@ -52,6 +53,8 @@ def _issue_line(issue: Dict[str, Any]) -> str:
 @click.group()
 def project():
     """Manage tracker projects (a name, its scopes, and its issue log)."""
+    # No server means no lifespan, so the schema is this process's job.
+    ensure_tracker_schema()
 
 
 @project.command(name="list")
@@ -249,6 +252,7 @@ def scope_rm(project_id, scope_id, as_json):
 @click.group()
 def issue():
     """File, search and edit issues."""
+    ensure_tracker_schema()
 
 
 @issue.command(name="file")
@@ -372,7 +376,7 @@ def issue_show(issue_key, as_json):
         click.echo(f"  status:    {row['status']}")
         for field in ("component", "reporter", "assignee", "failing_command", "evidence", "resolution", "duplicate_of"):
             if row.get(field):
-                click.echo(f"  {field + ':':<11}{row[field]}")
+                click.echo(f"  {field + ':':<12}{row[field]}")
         if row["labels"]:
             click.echo(f"  labels:    {', '.join(row['labels'])}")
         click.echo(f"  filed:     {row['created_at']}")

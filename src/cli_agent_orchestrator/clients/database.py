@@ -815,6 +815,38 @@ _V2_ORM_TABLE_NAMES = frozenset(
 )
 
 
+_TRACKER_ORM_TABLE_NAMES = frozenset(
+    {
+        TrackerProjectModel.__tablename__,
+        TrackerScopeModel.__tablename__,
+        TrackerIssueModel.__tablename__,
+        TrackerCommentModel.__tablename__,
+        TrackerEventModel.__tablename__,
+        TrackerLinkModel.__tablename__,
+    }
+)
+
+
+def ensure_tracker_schema() -> None:
+    """Create the issue-tracker tables if they are absent.
+
+    For callers that reach the tracker WITHOUT a running server — `cao issue`
+    and `cao project`. The API gets its schema from ``init_db`` in the app
+    lifespan; the CLI has no lifespan, so on a fresh state root every tracker
+    command died with a raw SQLAlchemy traceback about a missing table.
+
+    Deliberately narrower than ``init_db``: it creates these six tables and
+    runs no migrations. ``init_db`` includes a gated migration that can refuse
+    to proceed, and an issue is filed exactly when something else is already
+    broken — "cannot record the defect because an unrelated schema gate
+    refused" is the worst possible time for that refusal.
+    """
+    Base.metadata.create_all(
+        bind=engine,
+        tables=[t for t in Base.metadata.sorted_tables if t.name in _TRACKER_ORM_TABLE_NAMES],
+    )
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
