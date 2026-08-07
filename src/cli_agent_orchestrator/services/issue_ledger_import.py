@@ -172,7 +172,9 @@ def parse_ledger(text: str) -> List[Dict[str, Any]]:
     return entries
 
 
-def _resolve_status(prose: Optional[str], default_status: str) -> Tuple[str, List[str], Optional[str]]:
+def _resolve_status(
+    prose: Optional[str], default_status: str
+) -> Tuple[str, List[str], Optional[str]]:
     """Map a free-text ledger status onto (status, labels, resolution)."""
     if not prose:
         return default_status, [], None

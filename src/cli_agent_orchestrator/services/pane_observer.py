@@ -91,8 +91,10 @@ class PaneObserver:
         try:
             proc = subprocess.run(
                 [tmux_binary(), "capture-pane", "-p", "-t", pane_id],
-                capture_output=True, text=True,
-                timeout=self._timeout, check=False,
+                capture_output=True,
+                text=True,
+                timeout=self._timeout,
+                check=False,
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             logger.debug("capture-pane %s failed: %s", pane_id, exc)
@@ -132,7 +134,8 @@ class PaneObserver:
                 cached.lines = lines
                 return lines, now - cached.first_seen
             self._samples[pane_id] = _Sample(
-                digest=digest, first_seen=now, last_checked=now, lines=lines)
+                digest=digest, first_seen=now, last_checked=now, lines=lines
+            )
         # First sight of this content: the clock starts now and there is no
         # duration to report yet.
         return lines, None if cached is None else 0.0

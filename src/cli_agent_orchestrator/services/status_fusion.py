@@ -269,8 +269,7 @@ def fuse(
         return FusedStatus(
             status=TerminalStatus.UNKNOWN,
             confidence="none",
-            reason="every classifier that should have been able to read this "
-                   "terminal failed to",
+            reason="every classifier that should have been able to read this " "terminal failed to",
             signals=signals,
         )
 
@@ -345,8 +344,9 @@ def liveness_signal(
             detail="no prior sample to compare against",
         )
     if previous_digest != current_digest:
-        return Signal("liveness", value=0, state="available",
-                      detail="pane changed since the previous sample")
+        return Signal(
+            "liveness", value=0, state="available", detail="pane changed since the previous sample"
+        )
     return Signal("liveness", value=int(unchanged_for_seconds), state="available")
 
 
@@ -369,6 +369,5 @@ def fifo_signal(status: Any, *, monitored: bool) -> Signal:
         return Signal("fifo", state="absent", detail="native TUI: no FIFO stream exists")
     resolved = _as_status(status)
     if resolved is None or resolved == TerminalStatus.UNKNOWN:
-        return Signal("fifo", state="absent",
-                      detail="stream classifier matched no pattern yet")
+        return Signal("fifo", state="absent", detail="stream classifier matched no pattern yet")
     return Signal("fifo", value=resolved, state="available")
