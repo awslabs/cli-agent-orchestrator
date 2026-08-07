@@ -882,6 +882,7 @@ def adjudication(
     operator: str,
     observed_at: str,
     observation: Mapping[str, Any],
+    attests_live_process_is_not_the_owner: bool = False,
 ) -> dict[str, Any]:
     """Build one operator's answer to a frozen attachment.
 
@@ -916,6 +917,8 @@ def adjudication(
         raise NativeAttachmentInvalid(f"detail must be at most 500 characters; got {len(detail)}")
     if not isinstance(observation, Mapping):
         raise NativeAttachmentInvalid("observation must be a mapping")
+    if attests_live_process_is_not_the_owner not in (True, False):
+        raise NativeAttachmentInvalid("attests_live_process_is_not_the_owner must be a bool")
     return {
         "schema": ADJUDICATION_SCHEMA,
         "outcome": outcome,
@@ -924,6 +927,10 @@ def adjudication(
         "operator": _require_text(operator, field="operator"),
         "observed_at": _require_text(observed_at, field="observed_at"),
         "observation": dict(observation),
+        # A separate assertion from the outcome, because it is about a
+        # different thing: the outcome says the owner is gone, this says
+        # the process still bearing its pid is somebody else.
+        "attests_live_process_is_not_the_owner": bool(attests_live_process_is_not_the_owner),
     }
 
 
@@ -943,7 +950,13 @@ def _assert_adjudication_replay_matches(stored: Any, incoming: Mapping[str, Any]
         )
     differing = [
         field
-        for field in ("outcome", "evidence_sha256", "detail", "operator")
+        for field in (
+            "outcome",
+            "evidence_sha256",
+            "detail",
+            "operator",
+            "attests_live_process_is_not_the_owner",
+        )
         if stored.get(field) != incoming.get(field)
     ]
     if differing:
@@ -962,21 +975,31 @@ def _assert_adjudication_replay_matches(stored: Any, incoming: Mapping[str, Any]
 RECYCLED_PID_ATTESTATION = "operator_attests_live_pid_is_not_the_recorded_owner"
 
 
-def _attestation_excludes(row: Any, survivors: list[Any]) -> bool:
-    """True when a recorded operator attestation covers every survivor found.
+def _attestation_excludes(row: Any, record: Mapping[str, Any], survivors: list[Any]) -> bool:
+    """True when the operator's attestation covers every survivor found.
 
-    Only ever consulted for a frozen row, and only for survivors whose
-    start marker differs from the one on record — the exact evidence the
-    attestation is about.  A survivor whose marker *matches* is the
-    recorded owner, alive, and no attestation makes that releasable.
+    The attestation lives on the adjudication — the decision — rather than
+    on the freeze that classified the row.  It was on the freeze first,
+    and that was wrong in a way with a concrete cost: ``mark_ambiguous``
+    preserves the *first* reason, so a row already frozen by its launcher
+    (an unverifiable pane, say) that also happened to have a recycled pid
+    silently dropped the attestation and could then never be adjudicated
+    at all while the stranger process lived.
+
+    A survivor counts as excluded only when its marker was actually read
+    and genuinely differs.  An unreadable marker is ``None``, which is
+    unequal to anything — treating that as "different" would let an
+    attestation about a recycled pid release an owner nobody could
+    identify either way.  A marker that *matches* is the recorded owner,
+    alive, and no attestation makes that releasable.
     """
-    if not isinstance(row.ambiguity_reason, str):
-        return False
-    if not row.ambiguity_reason.startswith(RECYCLED_PID_ATTESTATION):
+    if record.get("attests_live_process_is_not_the_owner") is not True:
         return False
     recorded = (_parse_json(row.owner_process_identity_json) or {}).get("start_marker")
     return all(
-        isinstance(survivor, Mapping) and survivor.get("start_marker") != recorded
+        isinstance(survivor, Mapping)
+        and isinstance(survivor.get("start_marker"), str)
+        and survivor["start_marker"] != recorded
         for survivor in survivors
     )
 
@@ -1060,7 +1083,7 @@ def adjudicate(
                     f"the observation was taken at epoch {observed_epoch}; the adjudication "
                     "describes an owner this row no longer has"
                 )
-            if live_survivors and not _attestation_excludes(row, live_survivors):
+            if live_survivors and not _attestation_excludes(row, validated, live_survivors):
                 raise NativeAttachmentConflict(
                     f"the frozen owner of {provider} session {native_session_id} is still "
                     f"observably alive ({len(live_survivors)} survivor(s)); an operator may "

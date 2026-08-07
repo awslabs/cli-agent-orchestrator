@@ -230,11 +230,21 @@ adjudication that follows sees an empty survivor list and hands the
 session away underneath it. That is the double-attach this whole document
 is about, reached through the command meant to repair it.
 
-The recycled-pid attestation records both markers verbatim in the freeze
-reason, and `adjudicate` will then accept a survivor whose marker differs
-from the recorded one — and only that survivor. A survivor bearing the
-*recorded* marker is the owner itself, and no attestation makes that
-releasable.
+The recycled-pid attestation is made twice, and on purpose in two places.
+`freeze --pid-is-recycled` is what lets a live-but-differing owner be
+classified as unresolvable at all; `adjudicate --pid-is-recycled` is what
+lets the decision be made past a live pid. The second is what
+`adjudicate` actually reads, because `mark_ambiguous` preserves the
+*first* freeze reason — so a row its launcher had already frozen for an
+unrelated reason would silently drop an attestation attached to a later
+freeze, and could then never be adjudicated while the stranger lived.
+
+It is accepted only for a survivor whose marker was genuinely **read**
+and genuinely differs. An unreadable marker is `None`, which is unequal
+to everything; treating that as "different" would let an attestation
+about a recycled pid release an owner nobody could identify either way.
+And a survivor bearing the *recorded* marker is the owner itself, which
+no attestation makes releasable.
 
 `adjudicate`'s veto is on a process actually **seen** running, not on the
 survivor list alone. `observe_owner` puts a conservative placeholder in

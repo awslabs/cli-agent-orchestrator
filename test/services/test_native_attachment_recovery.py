@@ -568,11 +568,69 @@ class TestTheRecycledPidHasAValve:
                 operator="colin",
                 observed_at=observation["observed_at"],
                 observation=observation,
+                attests_live_process_is_not_the_owner=True,
             ),
             live_survivors=observation["survivors"],
             observed_epoch=record["epoch"],
         )
         assert result["state"] == na.DETACHED
+
+    def test_an_already_frozen_row_can_still_be_attested(self):
+        """`mark_ambiguous` preserves the FIRST reason.
+
+        With the attestation on the freeze, a row its launcher had already
+        frozen for an unrelated reason silently dropped it and could then
+        never be adjudicated while the stranger process lived. The
+        attestation belongs on the decision, not the classification.
+        """
+        _attach(pid=os.getpid(), marker="Thu Jan  1 00:00:00 1970")
+        na.mark_ambiguous(
+            provider=PROVIDER, native_session_id=SESSION, reason="pane_render_mismatch"
+        )
+        record = na.get(PROVIDER, SESSION)
+        assert record["ambiguity_reason"] == "pane_render_mismatch"
+        observation = recovery.observe_owner(record)
+        result = na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=na.adjudication(
+                outcome=na.ADJUDICATION_OUTCOME_OWNER_GONE,
+                evidence_sha256="a" * 64,
+                detail="checked argv; unrelated process",
+                operator="colin",
+                observed_at=observation["observed_at"],
+                observation=observation,
+                attests_live_process_is_not_the_owner=True,
+            ),
+            live_survivors=recovery.survivors_blocking_adjudication(observation),
+            observed_epoch=record["epoch"],
+        )
+        assert result["state"] == na.DETACHED
+
+    def test_an_unreadable_live_marker_is_not_a_difference(self, monkeypatch):
+        """`None` is unequal to anything, and that is not evidence."""
+        _attach(pid=os.getpid(), marker="Thu Jan  1 00:00:00 1970")
+        na.mark_ambiguous(provider=PROVIDER, native_session_id=SESSION, reason="render mismatch")
+        monkeypatch.setattr(recovery, "_live_start_marker", lambda pid: None)
+        record = na.get(PROVIDER, SESSION)
+        observation = recovery.observe_owner(record)
+        assert observation["start_marker_verdict"] == "unreadable"
+        with pytest.raises(na.NativeAttachmentConflict, match="observably alive"):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record=na.adjudication(
+                    outcome=na.ADJUDICATION_OUTCOME_OWNER_GONE,
+                    evidence_sha256="a" * 64,
+                    detail="x",
+                    operator="colin",
+                    observed_at=observation["observed_at"],
+                    observation=observation,
+                    attests_live_process_is_not_the_owner=True,
+                ),
+                live_survivors=recovery.survivors_blocking_adjudication(observation),
+                observed_epoch=record["epoch"],
+            )
 
     def test_an_owner_alive_under_its_own_marker_is_refused_even_attested(self):
         """No attestation makes the recorded owner, running, releasable.
@@ -839,3 +897,43 @@ class TestARetainedProofIsNotThisClaimsProof:
         assert reclaimed["state"] == na.DECLARED
         assert reclaimed["release_proof"] is not None
         assert reclaimed["release_proof"]["terminal_id"] == TERMINAL
+
+
+class TestTheGraceWaitDeclinesToBlockAnEventLoop:
+    """Previous-round fix: the blocking sleep must not run on a loop.
+
+    Removing the guard failed zero tests, which is the same shape as the
+    defect this whole change is about.
+    """
+
+    def test_the_wait_is_skipped_when_a_loop_is_running(self):
+        import asyncio
+        import time as _time
+
+        recovery.TEARDOWN_GRACE_SECONDS = 5.0
+        try:
+            _attach(pid=os.getpid())
+
+            async def _run():
+                started = _time.monotonic()
+                outcomes = recovery.release_owned_by_terminal(TERMINAL)
+                return _time.monotonic() - started, outcomes
+
+            elapsed, outcomes = asyncio.run(_run())
+        finally:
+            recovery.TEARDOWN_GRACE_SECONDS = 2.0
+        assert elapsed < 2.0, "the grace wait blocked the event loop"
+        assert outcomes[0]["action"] == "skipped"
+
+    def test_the_wait_does_run_off_a_loop(self):
+        import time as _time
+
+        recovery.TEARDOWN_GRACE_SECONDS = 0.4
+        try:
+            _attach(pid=os.getpid())
+            started = _time.monotonic()
+            recovery.release_owned_by_terminal(TERMINAL)
+            elapsed = _time.monotonic() - started
+        finally:
+            recovery.TEARDOWN_GRACE_SECONDS = 2.0
+        assert elapsed >= 0.4, "the grace wait did not happen at all"

@@ -295,6 +295,16 @@ def attachment_freeze(provider, native_session_id, operator, detail, attest_recy
     default=None,
     help="The digest itself, when the evidence is not a local file.",
 )
+@click.option(
+    "--pid-is-recycled",
+    "attest_recycled",
+    is_flag=True,
+    help=(
+        "Attest that the process still bearing the recorded pid is somebody else. "
+        "Required to decide past a live pid, and accepted only when its start marker "
+        "was read and genuinely differs from the recorded one."
+    ),
+)
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
 @click.option("--json", "as_json", is_flag=True)
 def attachment_adjudicate(
@@ -304,6 +314,7 @@ def attachment_adjudicate(
     detail,
     evidence_path,
     evidence_sha256,
+    attest_recycled,
     yes,
     as_json,
 ):
@@ -380,6 +391,7 @@ def attachment_adjudicate(
                 operator=operator,
                 observed_at=observation["observed_at"],
                 observation=observation,
+                attests_live_process_is_not_the_owner=attest_recycled,
             ),
             live_survivors=recovery.survivors_blocking_adjudication(observation),
             observed_epoch=record["epoch"],

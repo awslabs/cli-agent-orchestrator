@@ -53,9 +53,13 @@ _STATUS_FOR_CODE = {
 
 
 def _http(exc: na.NativeAttachmentError) -> HTTPException:
+    # First line only, matching the CLI. A store failure wraps the driver's
+    # exception, and SQLAlchemy renders that as a readable sentence followed
+    # by the entire generated query — which is noise in a JSON error body and,
+    # on a 503, tells a client the schema of a table it could not read.
     return HTTPException(
         status_code=_STATUS_FOR_CODE.get(exc.code, status.HTTP_400_BAD_REQUEST),
-        detail=str(exc),
+        detail=str(exc).splitlines()[0],
     )
 
 
@@ -91,6 +95,14 @@ class AdjudicationBody(StrictBody):
     evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     detail: str = Field(min_length=1, max_length=500)
     operator: str = Field(min_length=1, max_length=200)
+    attests_live_process_is_not_the_owner: bool = Field(
+        default=False,
+        description=(
+            "Attest that the process still bearing the recorded pid is somebody else. "
+            "Required to decide past a live pid, and accepted only when its start marker "
+            "was read and genuinely differs from the recorded one."
+        ),
+    )
 
 
 @router.get("/native-attachments")
@@ -237,6 +249,7 @@ async def adjudicate_native_attachment(
                 operator=body.operator,
                 observed_at=observation["observed_at"],
                 observation=observation,
+                attests_live_process_is_not_the_owner=body.attests_live_process_is_not_the_owner,
             ),
             live_survivors=recovery.survivors_blocking_adjudication(observation),
             observed_epoch=record["epoch"],
