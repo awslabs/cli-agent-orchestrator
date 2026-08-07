@@ -128,16 +128,18 @@ def tmux(monkeypatch):
     monkeypatch.setattr(
         service,
         "_managed_identity",
-        lambda terminal_id: {
-            "reservation_id": "res-1",
-            "generation": GENERATION,
-            "execution_mode": EXECUTION_MODE_NATIVE_TUI,
-            "native_session_id": "native-sess-1",
-            "provider_process_id": f"{PANE_PID}@marker-1",
-            "provider_version": "0.146.0",
-        }
-        if terminal_id == TERMINAL
-        else None,
+        lambda terminal_id: (
+            {
+                "reservation_id": "res-1",
+                "generation": GENERATION,
+                "execution_mode": EXECUTION_MODE_NATIVE_TUI,
+                "native_session_id": "native-sess-1",
+                "provider_process_id": f"{PANE_PID}@marker-1",
+                "provider_version": "0.146.0",
+            }
+            if terminal_id == TERMINAL
+            else None
+        ),
     )
     return client
 
@@ -181,22 +183,27 @@ class TestCapabilityAdvertisement:
     ):
         body = client.get(f"/terminals/{TERMINAL}/control-identity").json()
         assert body["control_input"]["composer_observation"]["supported"] is True
-        assert body["control_input"]["composer_observation"]["protocol"] == COMPOSER_OBSERVATION_PROTOCOL
+        assert (
+            body["control_input"]["composer_observation"]["protocol"]
+            == COMPOSER_OBSERVATION_PROTOCOL
+        )
 
     def test_an_unpinned_build_does_not_advertise_the_route(self, client, tmux, monkeypatch):
         monkeypatch.setattr(
             service,
             "_managed_identity",
-            lambda terminal_id: {
-                "reservation_id": "res-1",
-                "generation": GENERATION,
-                "execution_mode": EXECUTION_MODE_NATIVE_TUI,
-                "native_session_id": "native-sess-1",
-                "provider_process_id": f"{PANE_PID}@marker-1",
-                "provider_version": "0.145.0",
-            }
-            if terminal_id == TERMINAL
-            else None,
+            lambda terminal_id: (
+                {
+                    "reservation_id": "res-1",
+                    "generation": GENERATION,
+                    "execution_mode": EXECUTION_MODE_NATIVE_TUI,
+                    "native_session_id": "native-sess-1",
+                    "provider_process_id": f"{PANE_PID}@marker-1",
+                    "provider_version": "0.145.0",
+                }
+                if terminal_id == TERMINAL
+                else None
+            ),
         )
         body = client.get(f"/terminals/{TERMINAL}/control-identity").json()
         assert body["control_input"]["composer_observation"]["supported"] is False
@@ -205,16 +212,18 @@ class TestCapabilityAdvertisement:
         monkeypatch.setattr(
             service,
             "_managed_identity",
-            lambda terminal_id: {
-                "reservation_id": "res-1",
-                "generation": GENERATION,
-                "execution_mode": "acp",
-                "native_session_id": "native-sess-1",
-                "provider_process_id": f"{PANE_PID}@marker-1",
-                "provider_version": "0.146.0",
-            }
-            if terminal_id == TERMINAL
-            else None,
+            lambda terminal_id: (
+                {
+                    "reservation_id": "res-1",
+                    "generation": GENERATION,
+                    "execution_mode": "acp",
+                    "native_session_id": "native-sess-1",
+                    "provider_process_id": f"{PANE_PID}@marker-1",
+                    "provider_version": "0.146.0",
+                }
+                if terminal_id == TERMINAL
+                else None
+            ),
         )
         body = client.get(f"/terminals/{TERMINAL}/control-identity").json()
         assert body["control_input"]["composer_observation"]["supported"] is False
@@ -223,7 +232,9 @@ class TestCapabilityAdvertisement:
 class TestPositiveObservation:
     """The exact expected text is observed in the pinned composer region."""
 
-    def test_a_matching_digest_and_byte_length_returns_observed_true(self, client, tmux, monkeypatch):
+    def test_a_matching_digest_and_byte_length_returns_observed_true(
+        self, client, tmux, monkeypatch
+    ):
         monkeypatch.setattr(
             native_pane_input,
             "capture_pane_screen",
@@ -328,16 +339,18 @@ class TestIdentityRefusal:
         monkeypatch.setattr(
             service,
             "_managed_identity",
-            lambda terminal_id: {
-                "reservation_id": "res-1",
-                "generation": GENERATION,
-                "execution_mode": EXECUTION_MODE_NATIVE_TUI,
-                "native_session_id": "native-sess-1",
-                "provider_process_id": f"{PANE_PID}@marker-1",
-                "provider_version": "0.146.0",
-            }
-            if terminal_id == TERMINAL
-            else None,
+            lambda terminal_id: (
+                {
+                    "reservation_id": "res-1",
+                    "generation": GENERATION,
+                    "execution_mode": EXECUTION_MODE_NATIVE_TUI,
+                    "native_session_id": "native-sess-1",
+                    "provider_process_id": f"{PANE_PID}@marker-1",
+                    "provider_version": "0.146.0",
+                }
+                if terminal_id == TERMINAL
+                else None
+            ),
         )
         response = _get(client, sha256=_sha256(TEXT), bytes_=len(TEXT.encode("utf-8")))
         assert response.status_code == 409
@@ -430,16 +443,18 @@ class TestUnsupportedProvider:
         monkeypatch.setattr(
             service,
             "_managed_identity",
-            lambda terminal_id: {
-                "reservation_id": "res-1",
-                "generation": GENERATION,
-                "execution_mode": EXECUTION_MODE_NATIVE_TUI,
-                "native_session_id": "native-sess-1",
-                "provider_process_id": f"{PANE_PID}@marker-1",
-                "provider_version": "0.1.0",
-            }
-            if terminal_id == TERMINAL
-            else None,
+            lambda terminal_id: (
+                {
+                    "reservation_id": "res-1",
+                    "generation": GENERATION,
+                    "execution_mode": EXECUTION_MODE_NATIVE_TUI,
+                    "native_session_id": "native-sess-1",
+                    "provider_process_id": f"{PANE_PID}@marker-1",
+                    "provider_version": "0.1.0",
+                }
+                if terminal_id == TERMINAL
+                else None
+            ),
         )
         response = _get(client, sha256=_sha256(TEXT), bytes_=len(TEXT.encode("utf-8")))
         assert response.status_code == 409

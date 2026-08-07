@@ -1161,9 +1161,7 @@ def _codex_composer_text(rows: Sequence[str]) -> Optional[str]:
     return payload if payload == payload.strip() else None
 
 
-def extract_composer_text(
-    rows: Sequence[str], pin: ComposerObservationPin
-) -> Optional[str]:
+def extract_composer_text(rows: Sequence[str], pin: ComposerObservationPin) -> Optional[str]:
     """The exact text held in the pinned composer region, or ``None``.
 
     Only an unwrapped, one-row payload with unambiguous frame padding is

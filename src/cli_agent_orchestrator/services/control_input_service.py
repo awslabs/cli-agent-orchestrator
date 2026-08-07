@@ -4760,13 +4760,9 @@ def _validate_expected_digest(value: Any) -> str:
 
 def _validate_expected_bytes(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ComposerObservationRequestInvalid(
-            "expected_text_bytes must be a positive integer"
-        )
+        raise ComposerObservationRequestInvalid("expected_text_bytes must be a positive integer")
     if value <= 0:
-        raise ComposerObservationRequestInvalid(
-            "expected_text_bytes must be a positive integer"
-        )
+        raise ComposerObservationRequestInvalid("expected_text_bytes must be a positive integer")
     return value
 
 
@@ -4965,9 +4961,7 @@ def observe_composer(
                 # The text is visibly resting in the composer.  This is a
                 # positive observation that it is unsubmitted; we do not infer
                 # provider submission from the capture.
-                evidence_ref = native_pane_input.submission_evidence_ref(
-                    resolved.pane_id, rows
-                )
+                evidence_ref = native_pane_input.submission_evidence_ref(resolved.pane_id, rows)
                 return ComposerObservationResult(
                     observed=True,
                     terminal_id=resolved.terminal_id,
