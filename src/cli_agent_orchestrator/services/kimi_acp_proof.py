@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from cli_agent_orchestrator.services import provider_contracts
 from cli_agent_orchestrator.services.durable_publish import publish_immutable
 from cli_agent_orchestrator.services.provider_contracts import (
     PROVIDER_KIMI,

@@ -269,13 +269,13 @@ def test_bind_refused_before_ready(isolated_memory_db, worktree, tmp_path, monke
     assert not isinstance(raised.value, ManagedLaunchConflict)
 
 
-def test_bind_receipt_version_drift_refused(isolated_memory_db, worktree, tmp_path, monkeypatch):
+def test_bind_receipt_unproven_version_refused(isolated_memory_db, worktree, tmp_path, monkeypatch):
     request = _reserve_request(worktree, tmp_path)
     record, _ = v2.reserve(request)
     v2.claim_launch(record["reservation_id"])
     receipt = _ready_bridge_state(record, monkeypatch)
     receipt["provider_version"] = "0.144.6"
-    with pytest.raises(ManagedLaunchConflict, match="drift"):
+    with pytest.raises(ManagedLaunchConflict, match="native readiness proof is unavailable"):
         v2.bind_native(record["reservation_id"], _bind_request(record))
 
 

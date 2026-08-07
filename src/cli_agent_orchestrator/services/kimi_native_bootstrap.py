@@ -170,6 +170,14 @@ def _validate_binary(binary: str, binary_sha256: str, version_output: str) -> st
             f"kimi binary {path!r} has digest {observed} but the pin says {expected}; "
             "refusing to mint a session against an unpinned binary"
         )
+    # Open mode permits a semver-shaped update to reach the launch boundary,
+    # while strict mode remains an explicit operator rollback after a
+    # reproduced regression.  Either way, the native identity proof below
+    # still requires an exact stage-verified build.
+    try:
+        check_pinned_version(PROVIDER_KIMI, version_output)
+    except ProviderContractError as exc:
+        raise KimiBootstrapInvalid(str(exc)) from exc
     if not provider_contracts.is_proven_version(PROVIDER_KIMI, version_output):
         raise KimiBootstrapInvalid(
             "Kimi native session proof is unavailable for this provider build; "
