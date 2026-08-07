@@ -50,9 +50,9 @@ logger = logging.getLogger(__name__)
 # rendered through a whole turn, the spinner alternates ◇/◆ and reads
 # "Thinking (Ns · esc to interrupt)", and reply continuations are 2-space
 # indented bare lines under a single ◆ lead).
-IDLE_PROMPT_PATTERN = r"⟩\s*$"          # input prompt line (rendered all turn)
+IDLE_PROMPT_PATTERN = r"⟩\s*$"  # input prompt line (rendered all turn)
 IDLE_PROMPT_PATTERN_LOG = r"⟩"
-SPINNER_PATTERN = r"esc to interrupt"    # in-flight marker (◇/◆ Thinking…)
+SPINNER_PATTERN = r"esc to interrupt"  # in-flight marker (◇/◆ Thinking…)
 ERROR_PATTERN = r"(crash report written|Traceback \(most recent call last\))"
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*[A-Za-z]"
 # The lead of a real reply bullet: "◆ text", but never a spinner line.
@@ -133,6 +133,7 @@ class MuseCliProvider(BaseProvider):
 
         # Arm the StatusMonitor stickiness gate before the launch keystrokes.
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         status_monitor.notify_input_sent(self.terminal_id)
 
         command = self._build_command()
@@ -202,7 +203,7 @@ class MuseCliProvider(BaseProvider):
         if last_idx == -1:
             raise ValueError("No Muse Code response found in script output")
         parts = [re.sub(r"^◆[ \t]+", "", lines[last_idx]).strip()]
-        for line in lines[last_idx + 1:]:
+        for line in lines[last_idx + 1 :]:
             if re.match(r"^[ \t]{2}\S", line) and "Voice input" not in line:
                 parts.append(line.strip())
             else:

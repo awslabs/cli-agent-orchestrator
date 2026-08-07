@@ -82,7 +82,10 @@ class TestManagerDispatch:
     def test_create_provider_dispatch(self):
         manager = ProviderManager()
         provider = manager.create_provider(
-            "muse_cli", "term-1", "sess", "win",
+            "muse_cli",
+            "term-1",
+            "sess",
+            "win",
             agent_profile="implementer-muse",
             allowed_tools=["@builtin", "execute_bash"],
             expected_model="muse-spark-1.2",

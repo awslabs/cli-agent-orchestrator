@@ -60,6 +60,10 @@ class TestTuiBinderRegistration:
     def test_binder_builds_and_verifies(self):
         sid = _uuid()
         binder = native_tui_launch._ARGV_BINDERS["muse_cli"]
-        argv = binder["build"](session_id=sid, binary="muse", extra_args=None,
-                               launch_kind=native_tui_launch.LAUNCH_KIND_NEW)
+        argv = binder["build"](
+            session_id=sid,
+            binary="muse",
+            extra_args=None,
+            launch_kind=native_tui_launch.LAUNCH_KIND_NEW,
+        )
         assert binder["binds_exactly"](argv, sid)

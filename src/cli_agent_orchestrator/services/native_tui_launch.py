@@ -77,10 +77,16 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, NoReturn, Optional, Protocol, Sequence
 
-from cli_agent_orchestrator.services import claude_native_launch, codex_native_launch
+from cli_agent_orchestrator.services import (
+    claude_native_launch,
+    codex_native_launch,
+)
 from cli_agent_orchestrator.services import execution_mode as em
-from cli_agent_orchestrator.services import kimi_native_launch, muse_native_launch
-from cli_agent_orchestrator.services import native_attachment
+from cli_agent_orchestrator.services import (
+    kimi_native_launch,
+    muse_native_launch,
+    native_attachment,
+)
 
 LAUNCH_SCHEMA = "cao-native-tui-launch-v1"
 OBSERVATION_SCHEMA = "cao-native-tui-pane-observation-v1"
@@ -1069,7 +1075,9 @@ def _muse_argv(
     # therefore re-run the exec command bound to the minted session id.
     try:
         return muse_native_launch.build_launch_argv(
-            session_id=session_id, muse_binary=binary, extra_args=extra_args,
+            session_id=session_id,
+            muse_binary=binary,
+            extra_args=extra_args,
         )
     except muse_native_launch.MuseNativeLaunchError as exc:
         raise NativeLaunchInvalid(str(exc)) from exc
