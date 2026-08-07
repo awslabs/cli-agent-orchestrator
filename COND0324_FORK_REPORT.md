@@ -1,7 +1,7 @@
 # COND-0324 fork-side report
 
 - Base: `d42375743a637cc3b7eb8afa3e7bc1c5ec98dd80`
-- Current head: `1963331e55e850fdeccade4ccf9f4f19c28afe35`
+- Current head: `f54e006` (exact PR head; report commit is included)
 - PR: https://github.com/colindmurray/cli-agent-orchestrator/pull/74
 
 ## Scope
@@ -25,6 +25,11 @@ closed.
 - Related control, input, inbox, terminal, and provider suites: 777 passed,
   1 skipped
 - PR CI is running; no merge or deployment has been performed.
+
+The final commit also normalizes Black/isort formatting in four pre-existing
+Muse/native-launch files. The exact base failed the repository's Code Quality
+job on those files before this feature; the formatting-only commit makes that
+baseline gateable without changing behavior.
 
 ## Limitations
 
