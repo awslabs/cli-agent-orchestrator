@@ -15,8 +15,8 @@ from click.testing import CliRunner
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.cli.commands import issue as issue_cli
+from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.services import issue_tracker as tracker
 
 
@@ -53,8 +53,20 @@ def run(runner, group, *args):
 
 class TestProjectCommands:
     def test_create_then_show(self, runner, repo):
-        run(runner, issue_cli.project, "create", "CAO System", "--id", "cao-system",
-            "--prefix", "cond", "--path", str(repo), "--session", "cao-p1-closure")
+        run(
+            runner,
+            issue_cli.project,
+            "create",
+            "CAO System",
+            "--id",
+            "cao-system",
+            "--prefix",
+            "cond",
+            "--path",
+            str(repo),
+            "--session",
+            "cao-p1-closure",
+        )
         out = run(runner, issue_cli.project, "show", "cao-system")
         assert "cond-NNNN" in out
         assert str(repo) in out
@@ -82,8 +94,17 @@ class TestProjectCommands:
 
     def test_export_renders_markdown(self, runner, repo, tmp_path):
         run(runner, issue_cli.project, "create", "P", "--id", "p", "--prefix", "pp")
-        run(runner, issue_cli.issue, "file", "--title", "a defect", "--project", "p",
-            "--severity", "P2")
+        run(
+            runner,
+            issue_cli.issue,
+            "file",
+            "--title",
+            "a defect",
+            "--project",
+            "p",
+            "--severity",
+            "P2",
+        )
         out = run(runner, issue_cli.project, "export", "p")
         assert "## pp-0001 — [P2] a defect" in out
 
@@ -91,26 +112,66 @@ class TestProjectCommands:
 class TestIssueCommands:
     @pytest.fixture(autouse=True)
     def project(self, runner, repo):
-        run(runner, issue_cli.project, "create", "CAO System", "--id", "cao-system",
-            "--prefix", "cond", "--path", str(repo))
+        run(
+            runner,
+            issue_cli.project,
+            "create",
+            "CAO System",
+            "--id",
+            "cao-system",
+            "--prefix",
+            "cond",
+            "--path",
+            str(repo),
+        )
 
     def test_file_resolves_from_cwd(self, runner, repo):
-        out = run(runner, issue_cli.issue, "file", "--title", "spawn crashed",
-                  "--cwd", str(repo / "conduct"))
+        out = run(
+            runner,
+            issue_cli.issue,
+            "file",
+            "--title",
+            "spawn crashed",
+            "--cwd",
+            str(repo / "conduct"),
+        )
         assert "cond-0001" in out
         assert "cao-system" in out
 
     def test_file_into_an_unregistered_directory_fails_loudly(self, runner, tmp_path):
-        result = runner.invoke(issue_cli.issue, ["file", "--title", "orphan",
-                                                 "--cwd", str(tmp_path / "nowhere")])
+        result = runner.invoke(
+            issue_cli.issue, ["file", "--title", "orphan", "--cwd", str(tmp_path / "nowhere")]
+        )
         assert result.exit_code == 1
         assert "[unresolved]" in result.output
 
     def test_the_full_lifecycle(self, runner):
-        run(runner, issue_cli.issue, "file", "--title", "a defect", "--project", "cao-system",
-            "--severity", "P2", "--component", "conduct", "--label", "noisy")
+        run(
+            runner,
+            issue_cli.issue,
+            "file",
+            "--title",
+            "a defect",
+            "--project",
+            "cao-system",
+            "--severity",
+            "P2",
+            "--component",
+            "conduct",
+            "--label",
+            "noisy",
+        )
         run(runner, issue_cli.issue, "edit", "cond-0001", "--assignee", "terra", "--actor", "colin")
-        run(runner, issue_cli.issue, "comment", "cond-0001", "--body", "reproduced", "--author", "colin")
+        run(
+            runner,
+            issue_cli.issue,
+            "comment",
+            "cond-0001",
+            "--body",
+            "reproduced",
+            "--author",
+            "colin",
+        )
         run(runner, issue_cli.issue, "close", "cond-0001", "--resolution", "fixed in #12")
         out = run(runner, issue_cli.issue, "show", "cond-0001")
         assert "status:    closed" in out
@@ -124,21 +185,54 @@ class TestIssueCommands:
         assert "nothing to change" in result.output
 
     def test_list_filters(self, runner):
-        run(runner, issue_cli.issue, "file", "--title", "high", "--project", "cao-system", "--severity", "P1")
-        run(runner, issue_cli.issue, "file", "--title", "low", "--project", "cao-system", "--severity", "P4")
+        run(
+            runner,
+            issue_cli.issue,
+            "file",
+            "--title",
+            "high",
+            "--project",
+            "cao-system",
+            "--severity",
+            "P1",
+        )
+        run(
+            runner,
+            issue_cli.issue,
+            "file",
+            "--title",
+            "low",
+            "--project",
+            "cao-system",
+            "--severity",
+            "P4",
+        )
         out = run(runner, issue_cli.issue, "list", "--project", "cao-system", "--severity", "P1")
         assert "high" in out
         assert "low" not in out
 
     def test_an_invalid_severity_is_rejected_by_the_parser(self, runner):
-        result = runner.invoke(issue_cli.issue, ["file", "--title", "x", "--project", "cao-system",
-                                                 "--severity", "P9"])
+        result = runner.invoke(
+            issue_cli.issue, ["file", "--title", "x", "--project", "cao-system", "--severity", "P9"]
+        )
         assert result.exit_code != 0
         assert "P9" in result.output
 
     def test_stats_break_down_the_project(self, runner):
-        run(runner, issue_cli.issue, "file", "--title", "a", "--project", "cao-system", "--severity", "P1")
-        payload = json.loads(run(runner, issue_cli.issue, "stats", "--project", "cao-system", "--json"))
+        run(
+            runner,
+            issue_cli.issue,
+            "file",
+            "--title",
+            "a",
+            "--project",
+            "cao-system",
+            "--severity",
+            "P1",
+        )
+        payload = json.loads(
+            run(runner, issue_cli.issue, "stats", "--project", "cao-system", "--json")
+        )
         assert payload["by_severity"]["P1"] == 1
 
     def test_rm_requires_confirmation(self, runner):
@@ -166,7 +260,9 @@ class TestLedgerImportCommand:
 
     def test_dry_run_writes_nothing(self, runner, ledger):
         run(runner, issue_cli.project, "create", "P", "--id", "p", "--prefix", "cond")
-        out = run(runner, issue_cli.issue, "import-ledger", str(ledger), "--project", "p", "--dry-run")
+        out = run(
+            runner, issue_cli.issue, "import-ledger", str(ledger), "--project", "p", "--dry-run"
+        )
         assert "would import 1" in out
         assert tracker.list_issues(project_id="p")["total"] == 0
 

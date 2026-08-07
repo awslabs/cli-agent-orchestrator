@@ -69,13 +69,9 @@ class TestProjectCreation:
         assert exc.value.code == "conflict"
 
     def test_a_rejected_scope_leaves_no_half_built_project(self, tmp_path):
-        tracker.create_project(
-            name="First", scopes=[{"kind": "path", "value": str(tmp_path)}]
-        )
+        tracker.create_project(name="First", scopes=[{"kind": "path", "value": str(tmp_path)}])
         with pytest.raises(TrackerError):
-            tracker.create_project(
-                name="Second", scopes=[{"kind": "path", "value": str(tmp_path)}]
-            )
+            tracker.create_project(name="Second", scopes=[{"kind": "path", "value": str(tmp_path)}])
         assert [p["id"] for p in tracker.list_projects()] == ["first"]
 
 

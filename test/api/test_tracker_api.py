@@ -96,14 +96,18 @@ class TestResolveRouting:
             "matched_value": "cao-p1-closure",
         }
 
-    def test_resolve_reports_no_match_as_a_null_project_not_an_error(self, client, project, tmp_path):
+    def test_resolve_reports_no_match_as_a_null_project_not_an_error(
+        self, client, project, tmp_path
+    ):
         body = client.get(
             "/tracker/projects/resolve", params={"cwd": str(tmp_path / "elsewhere")}
         ).json()
         assert body["project_id"] is None
 
     def test_resolve_with_an_unknown_explicit_project_is_404(self, client):
-        assert client.get("/tracker/projects/resolve", params={"project": "nope"}).status_code == 404
+        assert (
+            client.get("/tracker/projects/resolve", params={"project": "nope"}).status_code == 404
+        )
 
 
 class TestScopeRoutes:
@@ -159,7 +163,8 @@ class TestIssueRoutes:
         _issue(client, title="two", severity="P3", component="conduct")
         _issue(client, title="three", severity="P1", component="fork")
         body = client.get(
-            "/tracker/issues", params={"project_id": "cao-system", "severity": "P1", "component": "conduct"}
+            "/tracker/issues",
+            params={"project_id": "cao-system", "severity": "P1", "component": "conduct"},
         ).json()
         assert [i["title"] for i in body["issues"]] == ["one"]
 
@@ -174,7 +179,9 @@ class TestIssueRoutes:
 class TestPatchSemantics:
     def test_an_absent_field_is_untouched(self, client, project):
         issue = _issue(client, assignee="terra", severity="P2")
-        body = client.patch(f"/tracker/issues/{issue['key']}", json={"status": "in-progress"}).json()
+        body = client.patch(
+            f"/tracker/issues/{issue['key']}", json={"status": "in-progress"}
+        ).json()
         assert (body["assignee"], body["severity"]) == ("terra", "P2")
 
     def test_an_empty_string_clears_a_field(self, client, project):
@@ -191,7 +198,9 @@ class TestPatchSemantics:
 
     def test_the_actor_is_recorded_and_not_treated_as_a_field(self, client, project):
         issue = _issue(client)
-        client.patch(f"/tracker/issues/{issue['key']}", json={"status": "blocked", "actor": "colin"})
+        client.patch(
+            f"/tracker/issues/{issue['key']}", json={"status": "blocked", "actor": "colin"}
+        )
         events = client.get(f"/tracker/issues/{issue['key']}").json()["events"]
         field_events = [e for e in events if e["kind"] == "field"]
         assert [(e["field"], e["actor"]) for e in field_events] == [("status", "colin")]
@@ -200,10 +209,13 @@ class TestPatchSemantics:
 class TestCommentsAndLinksRoutes:
     def test_a_comment_round_trips(self, client, project):
         issue = _issue(client)
-        assert client.post(
-            f"/tracker/issues/{issue['key']}/comments",
-            json={"body": "reproduced", "author": "colin"},
-        ).status_code == 201
+        assert (
+            client.post(
+                f"/tracker/issues/{issue['key']}/comments",
+                json={"body": "reproduced", "author": "colin"},
+            ).status_code
+            == 201
+        )
         detail = client.get(f"/tracker/issues/{issue['key']}").json()
         assert [c["body"] for c in detail["comments"]] == ["reproduced"]
 
@@ -260,7 +272,10 @@ class TestUnknownFieldsAreRefused:
 
     def test_a_misspelled_field_is_refused(self, client, project):
         issue = _issue(client)
-        assert client.patch(f"/tracker/issues/{issue['key']}", json={"assigne": "x"}).status_code == 422
+        assert (
+            client.patch(f"/tracker/issues/{issue['key']}", json={"assigne": "x"}).status_code
+            == 422
+        )
 
     def test_an_unknown_field_on_create_is_refused(self, client, project):
         response = client.post(

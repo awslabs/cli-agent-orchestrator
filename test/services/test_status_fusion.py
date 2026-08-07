@@ -48,8 +48,11 @@ class TestLifecyclePrecedence:
     def test_a_stale_screen_cannot_resurrect_a_dead_pane(self):
         # capture-pane against a dead pane can still return the last frame the
         # emulator held; believing it would report a worker that is not there.
-        out = _fuse(lifecycle="dead", screen=_sig("screen", TerminalStatus.PROCESSING),
-                    fifo=_sig("fifo", TerminalStatus.PROCESSING))
+        out = _fuse(
+            lifecycle="dead",
+            screen=_sig("screen", TerminalStatus.PROCESSING),
+            fifo=_sig("fifo", TerminalStatus.PROCESSING),
+        )
         assert out.status == TerminalStatus.UNKNOWN
 
 
@@ -93,8 +96,7 @@ class TestWedgeJoin:
     def test_thresholds_are_generous_by_default(self):
         # A model can think without emitting. Ten quiet minutes must not
         # invite an operator to kill live work.
-        out = self._wedge(liveness=_sig("liveness", 600),
-                          activity=_sig("activity", 600))
+        out = self._wedge(liveness=_sig("liveness", 600), activity=_sig("activity", 600))
         assert out.wedged is False
 
     def test_both_clocks_must_agree(self):
@@ -104,14 +106,18 @@ class TestWedgeJoin:
         assert out.wedged is False
 
     def test_a_fifo_working_claim_can_also_be_contradicted(self):
-        out = self._wedge(screen=_sig("screen", state="absent"),
-                          fifo=_sig("fifo", TerminalStatus.PROCESSING))
+        out = self._wedge(
+            screen=_sig("screen", state="absent"), fifo=_sig("fifo", TerminalStatus.PROCESSING)
+        )
         assert out.wedged is True
 
     def test_thresholds_are_injectable(self):
-        out = self._wedge(liveness=_sig("liveness", 90),
-                          activity=_sig("activity", 90),
-                          wedged_quiet_seconds=60, wedged_inactive_seconds=60)
+        out = self._wedge(
+            liveness=_sig("liveness", 90),
+            activity=_sig("activity", 90),
+            wedged_quiet_seconds=60,
+            wedged_inactive_seconds=60,
+        )
         assert out.wedged is True
 
 
@@ -119,8 +125,9 @@ class TestClassifierPrecedence:
     def test_fifo_beats_screen(self):
         # The stream detector sees bytes rather than a composited frame, so a
         # redraw cannot have evicted the marker it needed.
-        out = _fuse(fifo=_sig("fifo", TerminalStatus.IDLE),
-                    screen=_sig("screen", TerminalStatus.COMPLETED))
+        out = _fuse(
+            fifo=_sig("fifo", TerminalStatus.IDLE), screen=_sig("screen", TerminalStatus.COMPLETED)
+        )
         assert out.status == TerminalStatus.IDLE
         assert "output stream" in out.reason
 
@@ -131,8 +138,7 @@ class TestClassifierPrecedence:
         assert out.confidence == "medium"
 
     def test_a_corroborating_liveness_sample_raises_confidence(self):
-        out = _fuse(screen=_sig("screen", TerminalStatus.COMPLETED),
-                    liveness=_sig("liveness", 120))
+        out = _fuse(screen=_sig("screen", TerminalStatus.COMPLETED), liveness=_sig("liveness", 120))
         assert out.confidence == "high"
 
     def test_nothing_available_is_not_fifo_monitored_not_a_guess(self):
