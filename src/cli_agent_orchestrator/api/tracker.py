@@ -17,7 +17,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -58,12 +58,25 @@ def _http(exc: tracker.TrackerError) -> HTTPException:
 # --------------------------------------------------------------------------
 
 
-class ScopeBody(BaseModel):
+class StrictBody(BaseModel):
+    """Reject unknown fields instead of ignoring them.
+
+    Pydantic's default is to drop what it does not recognise, which turns a
+    misspelled or non-editable field into a silent no-op answered with 200 —
+    `PATCH {"project_id": "other"}` looked like it moved an issue between
+    projects and did nothing at all. A 422 naming the field is the only answer
+    a client can act on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ScopeBody(StrictBody):
     kind: str
     value: str
 
 
-class ProjectCreateBody(BaseModel):
+class ProjectCreateBody(StrictBody):
     name: str
     id: Optional[str] = None
     description: str = ""
@@ -71,14 +84,14 @@ class ProjectCreateBody(BaseModel):
     scopes: List[ScopeBody] = Field(default_factory=list)
 
 
-class ProjectUpdateBody(BaseModel):
+class ProjectUpdateBody(StrictBody):
     name: Optional[str] = None
     description: Optional[str] = None
     status: Optional[str] = None
     issue_prefix: Optional[str] = None
 
 
-class IssueCreateBody(BaseModel):
+class IssueCreateBody(StrictBody):
     title: str
     project_id: Optional[str] = None
     body: str = ""
@@ -94,11 +107,12 @@ class IssueCreateBody(BaseModel):
     terminal_id: Optional[str] = None
     source_path: Optional[str] = None
     cwd: Optional[str] = None
+    alias: Optional[str] = None
     key: Optional[str] = None
     origin: str = "api"
 
 
-class IssueUpdateBody(BaseModel):
+class IssueUpdateBody(StrictBody):
     """Every field optional; only the ones present are applied.
 
     ``model_fields_set`` distinguishes "not sent" from "sent as null", which is
@@ -121,12 +135,12 @@ class IssueUpdateBody(BaseModel):
     actor: Optional[str] = None
 
 
-class CommentBody(BaseModel):
+class CommentBody(StrictBody):
     body: str
     author: Optional[str] = None
 
 
-class LinkBody(BaseModel):
+class LinkBody(StrictBody):
     to_key: str
     kind: str
     actor: Optional[str] = None
@@ -183,6 +197,7 @@ async def create_project(
 async def resolve_project(
     project: Optional[str] = Query(None),
     session: Optional[str] = Query(None),
+    alias: Optional[str] = Query(None, description="a project_id-kind scope value"),
     cwd: Optional[str] = Query(None),
     git_remote: Optional[str] = Query(None),
     _scopes: List[str] = _READ,
@@ -195,7 +210,7 @@ async def resolve_project(
     """
     try:
         return tracker.resolve_project(
-            project=project, session=session, cwd=cwd, git_remote=git_remote
+            project=project, session=session, alias=alias, cwd=cwd, git_remote=git_remote
         ).as_dict()
     except tracker.TrackerError as exc:
         raise _http(exc) from exc
@@ -354,6 +369,7 @@ async def create_issue(
             terminal_id=body.terminal_id,
             source_path=body.source_path,
             cwd=body.cwd,
+            alias=body.alias,
             key=body.key,
             origin=body.origin,
         )

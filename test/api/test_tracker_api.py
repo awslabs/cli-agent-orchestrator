@@ -241,3 +241,41 @@ class TestVocabularyAndExport:
         response = client.get("/tracker/projects/cao-system/export")
         assert response.headers["content-type"].startswith("text/markdown")
         assert "## cond-0001 — [P2] event-mirror traceback" in response.text
+
+
+class TestUnknownFieldsAreRefused:
+    """An unknown field is a 422 naming it, never a silently ignored 200.
+
+    Pydantic drops what it does not recognise by default, so
+    `PATCH {"project_id": "other"}` looked like it moved an issue between
+    projects and did nothing at all — a 200 for an operation that never
+    happened.
+    """
+
+    def test_patching_a_non_editable_field_is_refused(self, client, project):
+        issue = _issue(client)
+        response = client.patch(f"/tracker/issues/{issue['key']}", json={"project_id": "other"})
+        assert response.status_code == 422
+        assert "project_id" in response.text
+
+    def test_a_misspelled_field_is_refused(self, client, project):
+        issue = _issue(client)
+        assert client.patch(f"/tracker/issues/{issue['key']}", json={"assigne": "x"}).status_code == 422
+
+    def test_an_unknown_field_on_create_is_refused(self, client, project):
+        response = client.post(
+            "/tracker/issues", json={"project_id": "cao-system", "title": "x", "sevrity": "P1"}
+        )
+        assert response.status_code == 422
+
+    def test_an_out_of_range_limit_is_refused_not_truncated(self, client, project):
+        # Silently returning 500 of 100000 requested rows reads as "that was
+        # everything".
+        assert client.get("/tracker/issues?limit=100000").status_code == 422
+
+    def test_a_prefix_already_in_use_is_409(self, client, project):
+        response = client.post(
+            "/tracker/projects", json={"name": "Other", "id": "other", "issue_prefix": "cond"}
+        )
+        assert response.status_code == 409
+        assert "cao-system" in response.json()["detail"]

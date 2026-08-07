@@ -325,6 +325,7 @@ def create_project(
     with SessionLocal() as db:
         if db.get(TrackerProjectModel, slug) is not None:
             raise TrackerError("conflict", f"project {slug!r} already exists")
+        _assert_prefix_free(db, prefix, owner=slug)
         for value, _kind in prepared:
             clash = db.query(TrackerScopeModel).filter(TrackerScopeModel.value == value).first()
             if clash is not None:
@@ -346,6 +347,29 @@ def create_project(
         db.commit()
         db.refresh(row)
         return _project_row(row)
+
+
+def _assert_prefix_free(db: Any, prefix: str, *, owner: str) -> None:
+    """Refuse a key prefix another project already uses.
+
+    Issue keys are unique across the whole installation, not per project, so
+    that `cond-0242` in a commit message, a report or an evidence path means
+    exactly one thing. Two projects sharing a prefix would therefore collide at
+    key-allocation time with a confusing "issue already exists" from a project
+    the caller never mentioned. Refusing here moves that failure to the moment
+    somebody chooses the prefix, where it is actionable.
+    """
+    clash = (
+        db.query(TrackerProjectModel)
+        .filter(TrackerProjectModel.issue_prefix == prefix, TrackerProjectModel.id != owner)
+        .first()
+    )
+    if clash is not None:
+        raise TrackerError(
+            "conflict",
+            f"issue prefix {prefix!r} is already used by project {clash.id!r}; "
+            "issue keys are unique across the installation, so each project needs its own",
+        )
 
 
 def _default_prefix(slug: str) -> str:
@@ -447,7 +471,9 @@ def update_project(
         if status is not None:
             row.status = _validate_choice(status, PROJECT_STATUSES, "project status")
         if issue_prefix is not None:
-            row.issue_prefix = _validate_prefix(issue_prefix)
+            candidate = _validate_prefix(issue_prefix)
+            _assert_prefix_free(db, candidate, owner=slug)
+            row.issue_prefix = candidate
         db.commit()
         db.refresh(row)
         return _project_row(row)
@@ -595,10 +621,17 @@ def resolve_project(
     *,
     project: Optional[str] = None,
     session: Optional[str] = None,
+    alias: Optional[str] = None,
     cwd: Optional[str] = None,
     git_remote: Optional[str] = None,
 ) -> Resolution:
     """Resolve a filing site to a project.
+
+    ``alias`` matches a ``project_id``-kind scope: an identifier from some
+    other system that names this project — a conductor campaign name, a CAO
+    memory project id. It ranks just under ``session`` because, like a session,
+    it is something the caller stated rather than something inferred from where
+    a process happens to be running.
 
     Returns an *unmatched* Resolution rather than raising when nothing matches:
     "which project is this?" has a legitimate answer of "none registered", and
@@ -620,6 +653,15 @@ def resolve_project(
             )
             if row is not None:
                 return Resolution(row.project_id, "session", row.value)
+
+        if alias:
+            row = (
+                db.query(TrackerScopeModel)
+                .filter(TrackerScopeModel.kind == "project_id", TrackerScopeModel.value == alias)
+                .first()
+            )
+            if row is not None:
+                return Resolution(row.project_id, "alias", row.value)
 
         if cwd:
             resolved = normalise_scope_value("path", cwd)
@@ -755,6 +797,7 @@ def create_issue(
     key: Optional[str] = None,
     created_at: Optional[datetime] = None,
     cwd: Optional[str] = None,
+    alias: Optional[str] = None,
 ) -> Dict[str, Any]:
     """File an issue.
 
@@ -776,7 +819,9 @@ def create_issue(
     severity = _validate_choice(severity, SEVERITIES, "severity")
     label_list = normalise_labels(labels)
 
-    resolution = resolve_project(project=project_id, session=session_name, cwd=cwd or source_path)
+    resolution = resolve_project(
+        project=project_id, session=session_name, alias=alias, cwd=cwd or source_path
+    )
     if resolution.project_id is None:
         raise TrackerError(
             "unresolved",

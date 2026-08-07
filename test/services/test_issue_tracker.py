@@ -497,3 +497,36 @@ class TestStats:
         assert got["total"] == 2
         assert got["by_severity"]["P1"] == 2
         assert sorted(got["by_component"]) == ["conduct", "fork"]
+
+
+class TestPrefixUniqueness:
+    """Issue keys are unique across the installation, not per project.
+
+    `cond-0242` appears in commit messages, reports and evidence paths, so it
+    has to mean one thing. Two projects sharing a prefix would collide at
+    key-allocation time with a conflict naming a project the caller never
+    mentioned — found by importing a 208-entry ledger into a second project
+    that also used `cond`.
+    """
+
+    def test_a_second_project_cannot_claim_a_used_prefix(self, cao_system):
+        with pytest.raises(TrackerError) as exc:
+            tracker.create_project(name="Other", project_id="other", issue_prefix="cond")
+        assert exc.value.code == "conflict"
+        assert "cao-system" in exc.value.message
+
+    def test_a_project_cannot_be_renamed_onto_a_used_prefix(self, cao_system):
+        tracker.create_project(name="Other", project_id="other", issue_prefix="oth")
+        with pytest.raises(TrackerError):
+            tracker.update_project("other", issue_prefix="cond")
+
+    def test_a_project_may_keep_its_own_prefix_through_an_unrelated_edit(self, cao_system):
+        # The uniqueness check must exclude the project being edited, or every
+        # rename would refuse itself.
+        updated = tracker.update_project("cao-system", issue_prefix="cond", name="Renamed")
+        assert updated["issue_prefix"] == "cond"
+
+    def test_a_freed_prefix_can_be_reclaimed(self, cao_system):
+        tracker.delete_project("cao-system", force=True)
+        reclaimed = tracker.create_project(name="Successor", project_id="succ", issue_prefix="cond")
+        assert reclaimed["issue_prefix"] == "cond"

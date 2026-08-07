@@ -164,13 +164,14 @@ def project_delete(project_id, force, as_json):
 @project.command(name="resolve")
 @click.option("--cwd", default=None, help="directory to resolve (default: this one)")
 @click.option("--session", default=None)
+@click.option("--alias", default=None)
 @click.option("--project", "project_id", default=None)
 @click.option("--json", "as_json", is_flag=True)
-def project_resolve(cwd, session, project_id, as_json):
+def project_resolve(cwd, session, alias, project_id, as_json):
     """Answer which project an issue filed here would belong to."""
     try:
         got = tracker.resolve_project(
-            project=project_id, session=session, cwd=cwd or os.getcwd()
+            project=project_id, session=session, alias=alias, cwd=cwd or os.getcwd()
         ).as_dict()
     except TrackerError as exc:
         _fail(exc)
@@ -257,6 +258,7 @@ def issue():
 @click.option("--project", "project_id", default=None, help="explicit project (skips resolution)")
 @click.option("--cwd", default=None, help="filing site (default: this directory)")
 @click.option("--session", "session_name", default=None)
+@click.option("--alias", default=None, help="a project_id-kind scope value, e.g. a conductor campaign name")
 @click.option("--severity", type=click.Choice(tracker.SEVERITIES), default="unset")
 @click.option("--status", type=click.Choice(tracker.STATUSES), default="open")
 @click.option("--component", default=None)
@@ -268,7 +270,7 @@ def issue():
 @click.option("--key", default=None, help="explicit issue key (migration only)")
 @click.option("--json", "as_json", is_flag=True)
 def issue_file(
-    title, body, body_file, project_id, cwd, session_name, severity, status,
+    title, body, body_file, project_id, cwd, session_name, alias, severity, status,
     component, reporter, assignee, labels, failing_command, evidence, key, as_json,
 ):
     """File an issue against a project."""
@@ -291,6 +293,7 @@ def issue_file(
             session_name=session_name,
             source_path=cwd or os.getcwd(),
             cwd=cwd or os.getcwd(),
+            alias=alias,
             key=key,
             origin="cli",
         )
