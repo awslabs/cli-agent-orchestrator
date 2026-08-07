@@ -71,10 +71,11 @@ def run_identity_proof(
     binary = Path(kimi_binary)
     if os.path.realpath(binary) != str(binary) or not binary.is_file():
         raise KimiAcpProofError("kimi binary must be a canonical absolute file")
-    try:
-        check_pinned_version(PROVIDER_KIMI, version_output)
-    except ProviderVersionDrift as exc:
-        raise KimiAcpProofError(str(exc)) from exc
+    if not provider_contracts.is_proven_version(PROVIDER_KIMI, version_output):
+        raise KimiAcpProofError(
+            "Kimi ACP identity proof is unavailable for this provider build; "
+            "stage-verify it before enabling resume identity"
+        )
     outcome = acp_driver(binary)
     if not isinstance(outcome, dict) or outcome.get("resumed") is not True:
         raise KimiAcpProofError("installed CLI did not resume the exact ACP session after kill")
@@ -159,7 +160,7 @@ def load_valid_proof(
 ) -> Optional[dict[str, Any]]:
     """The durable proof receipt iff it is valid for the current binary.
 
-    Valid requires: the pinned version matches, the receipt sits at its
+    Valid requires: the exact proven version matches, the receipt sits at its
     immutable content address, its binary digest/path match the current
     pinned binary, and it carries authenticated ACP
     session/new→kill→session/load exchange evidence for one exact
@@ -167,7 +168,8 @@ def load_valid_proof(
     """
     state = Path(state_dir)
     try:
-        check_pinned_version(PROVIDER_KIMI, version_output)
+        if not provider_contracts.is_proven_version(PROVIDER_KIMI, version_output):
+            return None
         binary_digest = hashlib.sha256(Path(kimi_binary).read_bytes()).hexdigest()
     except (ProviderVersionDrift, OSError):
         return None

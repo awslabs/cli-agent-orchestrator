@@ -1,16 +1,17 @@
-"""Pinned provider session/resume contracts (Codex, Claude, Kimi).
+"""Provider version and native-session contracts.
 
-Each provider has exactly one pinned pre-turn native-identity source and
-an exact set of accepted resume forms.  No provider may use a "newest"
-or implicit-current-session shortcut, a completion-only hint as launch
-authority, or a non-resumable mode.
+Each provider has one attested pre-turn native-identity source and an exact
+set of accepted resume forms. Routine launch admission is open by default so
+an ordinary CLI update does not freeze a campaign. Native identity, control,
+route, and resume capabilities remain exact-build claims: an unproven build
+cannot inherit a neighbouring build's evidence. An operator may temporarily
+restore exact-set launch enforcement after reproducing a provider regression.
 
-Invariant: resume acceptance requires the exact pinned form for the
-exact pinned provider version; installed-version drift fails closed
-(outcome 41) until the pinned binary is stage-verified.  Claude's
-native id is a canonical UUID and is shape-validated.  Capability
-claims derive only from provider-specific, version-checked receipts —
-never from caller-supplied booleans.
+No provider may use a "newest" or implicit-current-session shortcut, a
+completion-only hint as launch authority, or a non-resumable mode. Claude's
+native id is a canonical UUID and is shape-validated. Capability claims derive
+only from provider-specific, version-checked receipts — never from
+caller-supplied booleans.
 
 Failure mode prevented: ``--continue``/``--last``/newest-session forms
 bind whatever session happens to be newest — after any other session
@@ -25,6 +26,7 @@ ambient or recency-derived one.
 
 from __future__ import annotations
 
+import os
 import re
 import uuid as _uuid_module
 from dataclasses import dataclass
@@ -48,13 +50,48 @@ PROVIDER_KIMI_CLI = "kimi_cli"
 PROVIDER_CLAUDE_CODE = "claude_code"
 PROVIDER_MUSE_CLI = "muse_cli"
 
+#: Version-enforcement modes for the provider-version policy.
+#:
+#: ``strict``  exact-set membership in ``SUPPORTED_VERSIONS``: the version
+#:             must be a build that has been read and proven.  This is an
+#:             explicit operator choice for a reproduced regression or a
+#:             rollout that must remain on a known-good binary.
+#: ``open``    any non-empty semver-shaped version is accepted at the
+#:             launch identity boundary.  The exact ``SUPPORTED_VERSIONS``
+#:             tuple still gates feature-specific authority (native
+#:             control, rendered-session proof, steer/composer, image,
+#:             resume, route authority).  Open mode is used when the
+#:             provider has passed compatibility checks for a current
+#:             build and we want normal future updates to keep launching
+#:             without waiting for a manual pin, while advanced
+#:             capabilities stay fail-closed until a build is proven.
+VERSION_ENFORCEMENT_STRICT = "strict"
+VERSION_ENFORCEMENT_OPEN = "open"
+
+#: The default enforcement mode per provider.  All providers are open by
+#: default: routine CLI updates should not freeze admission merely because a
+#: version table has not caught up.  Exact pins remain an explicit, reversible
+#: operator choice for a reproduced regression, while feature-specific
+#: authority stays gated by the exact proven-build tables below.
+#: The mode can be overridden per-provider at runtime with
+#: ``CAO_PROVIDER_VERSION_ENFORCEMENT_<PROVIDER>=strict|open``.
+VERSION_ENFORCEMENT_MODE: dict[str, str] = {
+    PROVIDER_CODEX: VERSION_ENFORCEMENT_OPEN,
+    PROVIDER_KIMI: VERSION_ENFORCEMENT_OPEN,
+    PROVIDER_CLAUDE: VERSION_ENFORCEMENT_OPEN,
+    PROVIDER_MUSE: VERSION_ENFORCEMENT_OPEN,
+}
+
 #: The single *current* pin per provider: the version a fresh mint/proof
 #: is expected to run, and the one a receipt records when it cannot read a
 #: more specific fact.  ``SUPPORTED_VERSIONS`` below is the acceptance
-#: authority; this map is the representative head of each accepted tuple.
+#: authority for feature-specific capabilities; this map is the
+#: representative head of each accepted tuple.  In open mode the pin is
+#: advisory for launch identity — it names the build that is known-good
+#: today, not a hard ceiling.
 PINNED_VERSIONS = {
     PROVIDER_CODEX: "0.146.0",
-    PROVIDER_KIMI: "0.33.0",
+    PROVIDER_KIMI: "0.34.0",
     PROVIDER_CLAUDE: "2.1.220",
     PROVIDER_MUSE: "0.1.0",
 }
@@ -62,9 +99,21 @@ PINNED_VERSIONS = {
 #: Every exact version accepted for a provider, current first.  A tuple of
 #: exact strings, never a range: which builds are proven is a fact about
 #: each specific build, and a range would silently assert something about
-#: builds nobody has read.  Kimi accepts ``0.33.0`` (cond-0315: the
-#: provider's supported background updater installed it over 0.32.0
-#: mid-verification — ``~/.kimi-code/updates/`` ``rollout.log``
+#: builds nobody has read.
+#:
+#: Kimi accepts ``0.34.0`` (cond-0331: the generic provider-version policy
+#: moves Kimi to open launch admission so normal future updates do not trip
+#: stale launch breakers before task bytes. The installed 0.34.0 bundle was
+#: inspected at SHA-256
+#: ``d3e781774e7a95f71e9d813e2cda95486d15db73712b3e821dd4a357b0511d8c``;
+#: source inspection found the observed composer, paste, steer, process-title
+#: and session-option facts, and a bounded private-TUI probe rendered its
+#: exact version/session header. A durable ACP kill/load proof was *not*
+#: established, so resume and route authority remain gated by the exact proof
+#: table rather than inferred from this observation), retains ``0.33.0``
+#: (cond-0315: the provider's
+#: supported background updater installed it over 0.32.0 mid-verification
+#: — ``~/.kimi-code/updates/`` ``rollout.log``
 #: ``startup-cache reason:"eligible"`` at 2026-08-05T09:54:47Z,
 #: ``install.json.lastSuccess`` at 09:54:49Z — and every gate refused it
 #: fail-closed; the installed 0.33.0 bundle ``main.mjs`` sha256
@@ -110,7 +159,7 @@ PINNED_VERSIONS = {
 #: bundle comparison proved the composer, paste-burst, and steer-chord
 #: facts byte-identical).  Image delivery authority stays pinned to
 #: ``0.29.2`` alone — no image block is advertised for ``0.30.0``,
-#: ``0.31.0``, ``0.32.0``, or ``0.33.0``.
+#: ``0.31.0``, ``0.32.0``, ``0.33.0``, or ``0.34.0``.
 #:
 #: Claude accepts only ``2.1.220``, the stage-verified installed build
 #: (``versions/2.1.220`` sha256
@@ -125,9 +174,16 @@ PINNED_VERSIONS = {
 #: ``config/read``, ``thread/start``, ``turn/start``, and ``turn/interrupt``.
 #: Their required request and consumed response fields are unchanged; the
 #: observed differences are property ordering or additive optional fields.
+#:
+#: In open-enforcement mode (Kimi) a launch may succeed against any
+#: non-empty semver-shaped version, but the exact set below still gates
+#: feature-specific authority: native control, rendered-session proof,
+#: steer/composer, image delivery, resume, and route authority.  An
+#: unproven build therefore launches with no advanced capabilities rather
+#: than inheriting them from a neighbour.
 SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
     PROVIDER_CODEX: ("0.146.0",),
-    PROVIDER_KIMI: ("0.33.0", "0.32.0", "0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0"),
+    PROVIDER_KIMI: ("0.34.0", "0.33.0", "0.32.0", "0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0"),
     PROVIDER_CLAUDE: ("2.1.220",),
     PROVIDER_MUSE: ("0.1.0",),
 }
@@ -167,6 +223,24 @@ def version_probe_timeout(provider: str) -> float:
     runway cannot silently widen another's.
     """
     return VERSION_PROBE_TIMEOUTS.get(provider, VERSION_PROBE_TIMEOUT_SECONDS)
+
+
+def version_enforcement_mode(provider: str) -> str:
+    """The active enforcement mode for ``provider``.
+
+    Defaults come from :data:`VERSION_ENFORCEMENT_MODE`.  Each provider can
+    be forced back to strict exact pins at runtime by setting
+    ``CAO_PROVIDER_VERSION_ENFORCEMENT_<PROVIDER>=strict`` (or forward to
+    open with ``=open``).  This is the generic re-enable/rollback path: if
+    a future Kimi build causes a reproducible regression, set
+    ``CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI=strict`` to restore exact-pin
+    fail-closed behaviour without a code change.
+    """
+    env_var = f"CAO_PROVIDER_VERSION_ENFORCEMENT_{provider.upper()}"
+    override = os.environ.get(env_var)
+    if override in (VERSION_ENFORCEMENT_STRICT, VERSION_ENFORCEMENT_OPEN):
+        return override
+    return VERSION_ENFORCEMENT_MODE.get(provider, VERSION_ENFORCEMENT_STRICT)
 
 
 # The sole accepted pre-turn native-identity source per provider.
@@ -454,24 +528,48 @@ def normalized_version(installed_version: str) -> str:
 
 
 def check_pinned_version(provider: str, installed_version: str) -> None:
-    """Fail closed unless the installed version is an accepted exact pin.
+    """Fail closed unless the installed version satisfies the provider policy.
 
-    Acceptance is exact-set membership, never a range: a provider may
-    accept more than one build (Kimi retains ``0.29.1`` and ``0.29.0``
-    alongside the current ``0.29.2``), but every accepted version is a
-    build that has been read and proven, not a bound guessing at ones
-    that have not.
+    In open mode any provider accepts a non-empty semver-shaped observed
+    version at the launch identity boundary.  In strict mode the version
+    must be an exact member of ``SUPPORTED_VERSIONS``.  Unknown providers
+    and unparseable versions always fail closed.  Open admission does not
+    grant native control, resume, route, or other advanced authority; those
+    call sites must use :func:`is_proven_version`.
     """
-    accepted = SUPPORTED_VERSIONS.get(provider)
-    if accepted is None:
+    if provider not in SUPPORTED_VERSIONS:
         raise ProviderContractError(f"unknown provider: {provider!r}")
     normalized = normalized_version(installed_version)
+    if not normalized:
+        raise ProviderVersionDrift(
+            f"{provider} version unparseable: {installed_version.strip()!r}; "
+            "resume refuses (41) until a stage-verified pinned binary is installed"
+        )
+    if version_enforcement_mode(provider) == VERSION_ENFORCEMENT_OPEN:
+        return
+    accepted = SUPPORTED_VERSIONS[provider]
     if normalized not in accepted:
         raise ProviderVersionDrift(
             f"{provider} version drift: accepted {list(accepted)}, installed "
             f"{installed_version.strip()!r}; resume refuses (41) until a "
             "stage-verified pinned binary is installed"
         )
+
+
+def is_proven_version(provider: str, installed_version: str | None) -> bool:
+    """Return whether an exact build has evidence for advanced authority.
+
+    This intentionally ignores the launch enforcement mode.  A provider may
+    be admitted in open mode so routine CLI updates do not stall a campaign,
+    but a new build must not inherit a neighbouring build's native-session,
+    control, resume, or route proof.  Callers at those capability boundaries
+    use this exact predicate and fail closed until the new build is tested and
+    added to ``SUPPORTED_VERSIONS``.
+    """
+    if provider not in SUPPORTED_VERSIONS or not isinstance(installed_version, str):
+        return False
+    normalized = normalized_version(installed_version)
+    return bool(normalized and normalized in SUPPORTED_VERSIONS[provider])
 
 
 def native_id_source(provider: str) -> str:
@@ -656,14 +754,16 @@ def validate_route_proof(
 
 
 def _version_matches(provider: str, installed_version: Optional[str]) -> bool:
-    """True only when the installed version is known and matches the pin."""
+    """True only when the installed version has exact feature proof.
+
+    Open launch enforcement deliberately accepts a semver-shaped update, but
+    resume identity is a capability claim and may not inherit a neighbouring
+    build's evidence.  Keep this predicate exact-set based even when
+    ``check_pinned_version`` is open.
+    """
     if installed_version is None:
         return False
-    try:
-        check_pinned_version(provider, installed_version)
-    except ProviderVersionDrift:
-        return False
-    return True
+    return is_proven_version(provider, installed_version)
 
 
 def resume_status(

@@ -104,6 +104,7 @@ def test_capability_handshake_is_exact_and_versioned(client):
                     "executable": "codex",
                     "pinned_version": "0.146.0",
                     "supported_versions": ["0.146.0"],
+                        "version_enforcement": "open",
                 },
                 "claude_code": {
                     "supported": True,
@@ -114,14 +115,16 @@ def test_capability_handshake_is_exact_and_versioned(client):
                     "executable": "claude",
                     "pinned_version": "2.1.220",
                     "supported_versions": ["2.1.220"],
+                        "version_enforcement": "open",
                 },
                 "kimi_cli": {
                     "supported": True,
                     "id_source": "acp_session_new",
                     "readiness_receipt_kind": "kimi-native-tui-attached",
                     "executable": "kimi",
-                    "pinned_version": "0.33.0",
+                    "pinned_version": "0.34.0",
                     "supported_versions": [
+                        "0.34.0",
                         "0.33.0",
                         "0.32.0",
                         "0.31.0",
@@ -130,6 +133,7 @@ def test_capability_handshake_is_exact_and_versioned(client):
                         "0.29.1",
                         "0.29.0",
                     ],
+                    "version_enforcement": "open",
                 },
             },
         },

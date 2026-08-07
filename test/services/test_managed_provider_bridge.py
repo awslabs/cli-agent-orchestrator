@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+from cli_agent_orchestrator.services import provider_contracts
 
 
 def _request(tmp_path, *, provider="codex", model="gpt-5.6-sol", effort="xhigh"):
@@ -156,22 +157,31 @@ def test_codex_version_gate_accepts_exact_0146_0(tmp_path, monkeypatch):
     executable = _fake_codex_executable(tmp_path, request, "codex-cli 0.146.0")
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     session = bridge._ProviderSession(request)
-    assert session._version(str(executable), bridge.SUPPORTED_CODEX_VERSION) == "codex-cli 0.146.0"
+    assert session._version(str(executable), provider_contracts.PROVIDER_CODEX) == "codex-cli 0.146.0"
 
 
 @pytest.mark.parametrize(
     "banner",
-    ["codex-cli 0.145.0", "codex-cli 0.146.1", "codex 0.146.0"],
+    ["codex-cli 0.145.0", "codex-cli 0.146.1", "codex 0.145.0"],
 )
-def test_codex_version_gate_fails_closed_off_pin(tmp_path, monkeypatch, banner):
-    # The retired pin, an adjacent patch, and a renamed banner all fail
-    # closed — the gate is exact, never a range, minimum, or prefix match.
+def test_codex_version_gate_accepts_semver_updates(tmp_path, monkeypatch, banner):
+    # Open enforcement accepts semver-shaped updates at launch.  Exact
+    # feature authority remains build-specific in the capability tables.
     request = _request(tmp_path)
     executable = _fake_codex_executable(tmp_path, request, banner)
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     session = bridge._ProviderSession(request)
-    with pytest.raises(bridge.BridgeError, match="unsupported provider version"):
-        session._version(str(executable), bridge.SUPPORTED_CODEX_VERSION)
+    assert session._version(str(executable), provider_contracts.PROVIDER_CODEX) == banner
+
+
+def test_codex_version_gate_accepts_banner_with_pinned_semver(tmp_path, monkeypatch):
+    # The bridge now normalizes the banner the same way check_pinned_version
+    # does, so any banner containing the pinned semver is accepted.
+    request = _request(tmp_path)
+    executable = _fake_codex_executable(tmp_path, request, "codex 0.146.0")
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+    session = bridge._ProviderSession(request)
+    assert session._version(str(executable), provider_contracts.PROVIDER_CODEX) == "codex 0.146.0"
 
 
 def _version_probe_run(observed, *, banner, slow_seconds=None):
@@ -272,7 +282,7 @@ def test_kimi_bridge_version_gate_observes_under_the_provider_bounded_deadline(
         "subprocess.run",
         _version_probe_run(observed, banner="0.31.0\n", slow_seconds=12.0),
     )
-    version = session._version(request["provider_executable"], bridge.SUPPORTED_KIMI_VERSIONS)
+    version = session._version(request["provider_executable"], provider_contracts.PROVIDER_KIMI)
     assert version == "0.31.0"
     assert observed["timeout"] == 20.0
 
@@ -285,7 +295,7 @@ def test_codex_bridge_version_gate_keeps_the_generic_deadline(tmp_path, monkeypa
     monkeypatch.setattr(
         "subprocess.run", _version_probe_run(observed, banner="codex-cli 0.146.0\n")
     )
-    version = session._version(request["provider_executable"], (bridge.SUPPORTED_CODEX_VERSION,))
+    version = session._version(request["provider_executable"], provider_contracts.PROVIDER_CODEX)
     assert version == "codex-cli 0.146.0"
     assert observed["timeout"] == 5.0
 
@@ -303,7 +313,7 @@ def test_bridge_version_gate_fails_closed_on_digest_drift_before_any_probe(tmp_p
 
     monkeypatch.setattr("subprocess.run", forbidden_run)
     with pytest.raises(bridge.BridgeError, match="digest changed after reservation"):
-        session._version(request["provider_executable"], bridge.SUPPORTED_KIMI_VERSIONS)
+        session._version(request["provider_executable"], provider_contracts.PROVIDER_KIMI)
 
 
 class _KimiRpc:

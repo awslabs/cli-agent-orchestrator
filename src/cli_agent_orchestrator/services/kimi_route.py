@@ -14,9 +14,11 @@ from typing import Any, Optional, cast
 from cli_agent_orchestrator.services import provider_contracts
 from cli_agent_orchestrator.services.provider_contracts import PROVIDER_KIMI, SUPPORTED_VERSIONS
 
-#: Exact Kimi builds this probe accepts, current first — never a range.
-#: 0.29.1 and 0.29.0 are retained alongside 0.29.2 for already-minted
-#: sessions.
+#: Exact Kimi builds this probe accepts for route-authority purposes,
+#: current first — never a range.  The launch identity boundary is governed
+#: by :func:`provider_contracts.check_pinned_version`, which is open for
+#: Kimi; the route probe still insists on a proven build because a route
+#: receipt proves feature-specific authority.
 SUPPORTED_KIMI_VERSIONS = SUPPORTED_VERSIONS[PROVIDER_KIMI]
 PROBE_VERSION = "kimi-acp-route-v1"
 

@@ -1,9 +1,10 @@
-"""The exact pinned argv for resuming a Kimi session into a native TUI.
+"""The exact argv for resuming a proven Kimi session into a native TUI.
 
-The installed Kimi Code resume option (0.29.0, 0.29.1, and 0.29.2,
-verified byte-identical) is ``-S, --session [id]`` with an **optional**
-argument: given an id it resumes that session, and given *no* id it
-opens an interactive picker instead.
+The Kimi Code resume option is ``-S, --session [id]`` with an **optional**
+argument: given an id it resumes that session, and given *no* id it opens an
+interactive picker instead. The launch policy may admit a newer semver build,
+but this module is used only after that build's native-session behavior has
+been independently proven and added to the exact capability table.
 
 That optionality is the hazard this module exists to remove.  A resume
 that loses its session id does not fail — it launches a picker, and
@@ -343,6 +344,15 @@ _KIMI_0330_RENDERED_EVIDENCE = (
     "proof)."
 )
 
+_KIMI_0340_RENDERED_EVIDENCE = (
+    "Kimi Code 0.34.0 dist/main.mjs sha256 "
+    "d3e781774e7a95f71e9d813e2cda95486d15db73712b3e821dd4a357b0511d8c; "
+    "source inspection found process.title='kimi-code' and the native header "
+    "infoLines; a private-tmux capture after ACP session/new rendered exactly "
+    "one Directory, Session, Model, and Version 0.34.0 line, with the Session "
+    "matching the minted id and Directory matching the canonical worktree."
+)
+
 #: Per-build rendered-header session proofs.  A build is present only when its
 #: post-parse process-title rewrite *and* its native header layout were both
 #: read, so the proof never silently applies to a build nobody has examined.
@@ -365,6 +375,11 @@ _RENDERED_SESSION_PROVEN_BUILDS: dict[str, RenderedSessionProof] = {
         provider="kimi_cli",
         rule=RULE_KIMI_NATIVE_HEADER,
         evidence=_KIMI_0330_RENDERED_EVIDENCE,
+    ),
+    "0.34.0": RenderedSessionProof(
+        provider="kimi_cli",
+        rule=RULE_KIMI_NATIVE_HEADER,
+        evidence=_KIMI_0340_RENDERED_EVIDENCE,
     ),
 }
 

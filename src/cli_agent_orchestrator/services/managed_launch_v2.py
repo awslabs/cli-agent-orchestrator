@@ -1102,10 +1102,12 @@ def native_tui_capabilities() -> dict[str, Any]:
             "readiness_receipt_kind": _NATIVE_TUI_READINESS_RECEIPT_KINDS[provider],
             "executable": executable,
             "pinned_version": contracts.PINNED_VERSIONS[executable],
-            # The exact accepted set, not a range: acceptance is exact-set
-            # membership, and publishing a range would invite a consumer
-            # to interpolate builds nobody has verified.
+            # The exact accepted set, not a range: this is the list of
+            # proven builds that carry feature-specific authority.  In open
+            # enforcement mode a launch may also accept any semver-shaped
+            # version, but unproven builds get no advanced capabilities.
             "supported_versions": list(contracts.SUPPORTED_VERSIONS[executable]),
+            "version_enforcement": contracts.version_enforcement_mode(executable),
         }
     return {"schema_version": NATIVE_TUI_CAPABILITY_SCHEMA_VERSION, "providers": providers}
 
@@ -2094,10 +2096,13 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
             "readiness receipt is not bound to the exact v2 reservation: "
             + _canonical_json(mismatches)
         )
-    try:
-        check_pinned_version(_PINNED_PROVIDER[row.provider], receipt["provider_version"])
-    except ProviderContractError as exc:
-        raise ManagedLaunchConflict(str(exc)) from exc
+    if not provider_contracts.is_proven_version(
+        _PINNED_PROVIDER[row.provider], receipt["provider_version"]
+    ):
+        raise ManagedLaunchConflict(
+            "native readiness proof is unavailable for this provider build; "
+            "stage-verify it before native bind"
+        )
 
 
 def bind_native(reservation_id: str, request: ManagedLaunchV2BindRequest) -> dict[str, Any]:
@@ -3906,7 +3911,17 @@ def _mint_claude_native_session(
         glm_native_launch,
     )
 
-    check_pinned_version(_PINNED_PROVIDER["claude_code"], version_output)
+    # Open launch admission permits a newly installed semver build, but a
+    # native Claude session id/readiness claim is an advanced capability.  Do
+    # not mint an identity for an unproven build and accidentally inherit the
+    # previous build's hook semantics.
+    if not provider_contracts.is_proven_version(
+        _PINNED_PROVIDER["claude_code"], version_output
+    ):
+        raise ManagedLaunchConflict(
+            "Claude native session proof is unavailable for this provider build; "
+            "stage-verify it before enabling native identity"
+        )
 
     # Pinned before the id is minted, for the same reason the version is:
     # an unpinnable model is a refusal, and refusing after minting would

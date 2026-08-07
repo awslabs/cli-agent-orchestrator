@@ -25,31 +25,32 @@ def test_pinned_versions():
     # The current pin is the stage-verified installed build.
     assert pc.PINNED_VERSIONS == {
         "codex": "0.146.0",
-        "kimi": "0.33.0",
+        "kimi": "0.34.0",
         "claude": "2.1.220",
         "muse": "0.1.0",
     }
     pc.check_pinned_version("codex", "0.146.0")
     pc.check_pinned_version("codex", "codex-cli 0.146.0")
+    pc.check_pinned_version("codex", "codex-cli 0.145.0")
+    pc.check_pinned_version("codex", "codex-cli 0.146.1")
+    # Kimi is open: a semver-shaped version below the proven set is accepted
+    # at launch, but it does not inherit feature-specific authority.
+    pc.check_pinned_version("kimi", "0.28.0")
     with pytest.raises(pc.ProviderVersionDrift):
-        pc.check_pinned_version("codex", "codex-cli 0.145.0")
-    with pytest.raises(pc.ProviderVersionDrift):
-        pc.check_pinned_version("codex", "codex-cli 0.146.1")
-    with pytest.raises(pc.ProviderVersionDrift):
-        pc.check_pinned_version("kimi", "0.28.0")
+        pc.check_pinned_version("kimi", "not-a-version")
 
 
 def test_kimi_accepts_both_pinned_and_retained_versions_but_never_a_range():
-    # Exact-set acceptance: 0.33.0 is the current pin (cond-0315: the
-    # provider's background updater installed it over 0.32.0 mid-verification;
-    # the 0.33.0 bundle's composer/submit/paste-burst/steer/title-rewrite/
-    # header facts read byte-identical to the attested 0.32.0 line and its
-    # reimplemented ACP surface plus live boot were proven on a private
-    # stage), 0.32.0 (cond-0315), 0.31.0 (cond-0310), 0.30.0 (cond-0198) and
-    # 0.29.2/0.29.1/0.29.0 are retained for already-minted sessions.  Nothing
-    # between or beyond is accepted — this is a set of proven builds, not a
-    # version range.
+    # Exact-set acceptance for *proven builds*: 0.34.0 is the current pin
+    # (cond-0331: open enforcement admits it and every future semver at the
+    # launch identity boundary, while the exact set below still gates
+    # feature-specific authority), 0.33.0 (cond-0315), 0.32.0 (cond-0315),
+    # 0.31.0 (cond-0310), 0.30.0 (cond-0198) and 0.29.2/0.29.1/0.29.0 are
+    # retained for already-minted sessions.  Nothing outside this set may
+    # inherit feature-specific authority — this is a set of proven builds,
+    # not a version range.
     assert pc.SUPPORTED_VERSIONS["kimi"] == (
+        "0.34.0",
         "0.33.0",
         "0.32.0",
         "0.31.0",
@@ -58,6 +59,7 @@ def test_kimi_accepts_both_pinned_and_retained_versions_but_never_a_range():
         "0.29.1",
         "0.29.0",
     )
+    pc.check_pinned_version("kimi", "kimi 0.34.0")
     pc.check_pinned_version("kimi", "kimi 0.33.0")
     pc.check_pinned_version("kimi", "kimi 0.32.0")
     pc.check_pinned_version("kimi", "kimi 0.31.0")
@@ -65,16 +67,14 @@ def test_kimi_accepts_both_pinned_and_retained_versions_but_never_a_range():
     pc.check_pinned_version("kimi", "kimi 0.29.2")
     pc.check_pinned_version("kimi", "kimi 0.29.1")
     pc.check_pinned_version("kimi", "kimi 0.29.0")
-    for rejected in (
-        "0.28.0",
-        "0.29.3",
-        "0.30.1",
-        "0.31.1",
-        "0.32.1",
-        "0.33.1",
-        "0.34.0",
-        "1.29.0",
-    ):
+    # Open enforcement: semver-shaped versions outside the proven set are
+    # accepted at the launch identity boundary, but they do not inherit
+    # feature-specific authority (control/resume/image/steer/composer).
+    pc.check_pinned_version("kimi", "0.28.0")
+    pc.check_pinned_version("kimi", "0.35.0")
+    pc.check_pinned_version("kimi", "1.29.0")
+    # Malformed or unparseable versions still fail closed at the boundary.
+    for rejected in ("kimi", "", "not-a-version"):
         with pytest.raises(pc.ProviderVersionDrift):
             pc.check_pinned_version("kimi", rejected)
     # The current pin is always an accepted build.
@@ -85,6 +85,32 @@ def test_normalized_version_extracts_the_semver_token():
     assert pc.normalized_version("kimi 0.29.1") == "0.29.1"
     assert pc.normalized_version("2.1.220 (Claude Code)") == "2.1.220"
     assert pc.normalized_version("no version here") == ""
+
+
+def test_kimi_enforcement_mode_is_open_by_default():
+    assert all(
+        pc.version_enforcement_mode(provider) == pc.VERSION_ENFORCEMENT_OPEN
+        for provider in pc.PROVIDERS
+    )
+
+
+def test_kimi_can_be_reverted_to_strict_by_environment_variable(monkeypatch):
+    monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI", "strict")
+    assert pc.version_enforcement_mode("kimi") == pc.VERSION_ENFORCEMENT_STRICT
+    # In strict mode, versions outside the exact proven set are refused.
+    with pytest.raises(pc.ProviderVersionDrift):
+        pc.check_pinned_version("kimi", "0.35.0")
+    pc.check_pinned_version("kimi", "0.34.0")
+
+
+@pytest.mark.parametrize("provider", pc.PROVIDERS)
+def test_any_provider_can_be_reverted_to_strict(monkeypatch, provider):
+    monkeypatch.setenv(
+        f"CAO_PROVIDER_VERSION_ENFORCEMENT_{provider.upper()}", "strict"
+    )
+    assert pc.version_enforcement_mode(provider) == pc.VERSION_ENFORCEMENT_STRICT
+    with pytest.raises(pc.ProviderVersionDrift):
+        pc.check_pinned_version(provider, "99.99.99")
 
 
 def test_native_id_sources():

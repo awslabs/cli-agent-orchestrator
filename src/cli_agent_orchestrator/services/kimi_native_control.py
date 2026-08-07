@@ -390,6 +390,27 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
             "0.32.0 bundle facts (bundle read per cond-0315)"
         ),
     },
+    # 0.34.0 is admitted as a separately verified build, not as a hard-only
+    # pin.  The installed bundle (sha256
+    # d3e781774e7a95f71e9d813e2cda95486d15db73712b3e821dd4a357b0511d8c)
+    # exposes the newline/submit and paste-burst facts at the same source
+    # seam as the prior proven line, and its steer binding is present.  A
+    # private-tmux capture also rendered the exact ACP-minted session id,
+    # bound directory, and Version 0.34.0 header.  These are explicit
+    # observations for this build; future builds do not inherit them.
+    "0.34.0": {
+        "keystroke": "C-j",
+        "burst_reset_keystroke": "End",
+        "submit_settle_seconds": 0.25,
+        "normalization": NORMALIZATION_JOIN_LF_THEN_TRIM,
+        "evidence": (
+            "Kimi Code 0.34.0 dist/main.mjs sha256 "
+            "d3e781774e7a95f71e9d813e2cda95486d15db73712b3e821dd4a357b0511d8c; "
+            "source inspection found the provider newline/submit, paste-burst, "
+            "and steer bindings; a private-tmux capture after ACP session/new "
+            "rendered the exact session id, bound directory, and Version 0.34.0"
+        ),
+    },
 }
 
 #: The steer chords proven for each pinned Kimi build.  Distinct from
@@ -424,6 +445,10 @@ _PROVEN_STEER_CHORDS: dict[str, frozenset[str]] = {
     # dispatch is byte-identical to the npm-published 0.32.0 bundle (bundle
     # read per cond-0315; sha256 keyed in _PROVEN_COMPOSER_NEWLINE).
     "0.33.0": frozenset({"C-s"}),
+    # Key.ctrl("s") exists in the installed 0.34.0 bundle; this is a
+    # build-specific source observation, not an inheritance rule for future
+    # versions.
+    "0.34.0": frozenset({"C-s"}),
 }
 
 

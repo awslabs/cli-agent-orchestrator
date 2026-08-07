@@ -170,10 +170,11 @@ def _validate_binary(binary: str, binary_sha256: str, version_output: str) -> st
             f"kimi binary {path!r} has digest {observed} but the pin says {expected}; "
             "refusing to mint a session against an unpinned binary"
         )
-    try:
-        check_pinned_version(PROVIDER_KIMI, version_output)
-    except ProviderContractError as exc:
-        raise KimiBootstrapInvalid(str(exc)) from exc
+    if not provider_contracts.is_proven_version(PROVIDER_KIMI, version_output):
+        raise KimiBootstrapInvalid(
+            "Kimi native session proof is unavailable for this provider build; "
+            "stage-verify it before enabling native identity"
+        )
     return observed
 
 

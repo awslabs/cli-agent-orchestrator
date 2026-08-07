@@ -542,11 +542,11 @@ class TestCapabilityAdvertisement:
         claude = v2.native_tui_capabilities()["providers"]["claude_code"]
         assert claude["supported_versions"] == [PINNED]
         assert claude["pinned_version"] == PINNED
+        assert claude["version_enforcement"] == provider_contracts.VERSION_ENFORCEMENT_OPEN
         assert provider_contracts.SUPPORTED_VERSIONS["claude"] == (PINNED,)
 
-    def test_a_drifted_build_fails_closed(self):
-        with pytest.raises(provider_contracts.ProviderVersionDrift):
-            provider_contracts.check_pinned_version("claude", "2.1.219 (Claude Code)")
+    def test_a_semver_drift_launches_but_unproven_features_remain_gated(self):
+        provider_contracts.check_pinned_version("claude", "2.1.219 (Claude Code)")
         provider_contracts.check_pinned_version("claude", f"{PINNED} (Claude Code)")
 
 

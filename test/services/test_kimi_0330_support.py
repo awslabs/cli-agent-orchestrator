@@ -1,4 +1,4 @@
-"""Exact Kimi Code 0.33.0 support as the current stage-verified build (cond-0315).
+"""Exact Kimi Code 0.33.0 support as a retained stage-verified build (cond-0315).
 
 The operator's binary self-updated a second time — 0.32.0 to 0.33.0 — during
 the 0.32.0 stage verification itself: the provider's supported background
@@ -94,17 +94,31 @@ def test_check_pinned_version_accepts_the_stage_verified_0330(banner):
     pc.check_pinned_version("kimi", banner)
 
 
-@pytest.mark.parametrize("bad", ["0.32.1", "0.33.1", "0.34.0", "1.0.0", "kimi", ""])
-def test_check_pinned_version_still_refuses_unknown_and_future_builds(bad):
-    # 0.33.0's admission is exact-set membership, never a range: the builds
-    # adjacent to it were not read and stay refused.
+@pytest.mark.parametrize("bad", ["kimi", ""])
+def test_check_pinned_version_still_refuses_unknown_and_unparseable_builds(bad):
+    # In open enforcement, unparseable banners fail closed.  Semver-shaped
+    # versions outside the proven set are accepted at the launch boundary
+    # but do not inherit feature-specific authority.
     with pytest.raises(pc.ProviderVersionDrift):
         pc.check_pinned_version("kimi", bad)
 
 
-def test_0330_is_the_current_pin_and_every_attested_build_is_retained():
-    assert pc.PINNED_VERSIONS["kimi"] == PIN_0330
+@pytest.mark.parametrize("version", ["0.32.1", "0.33.1", "1.0.0"])
+def test_semver_neighbours_launch_but_get_no_composer_authority(version):
+    pc.check_pinned_version("kimi", version)
+    plan = knc.plan_composer_keystrokes("line one\nline two", provider_version=version)
+    assert plan["deliverable"] is False
+    assert version in plan["undeliverable_reason"]
+    assert knc.steer_chords(version) == frozenset()
+
+
+def test_0330_is_a_retained_proven_build_and_every_attested_build_is_kept():
+    # 0.34.0 is the current pin under the cond-0331 open policy; 0.33.0
+    # remains a proven build and keeps every capability it was verified for.
+    assert pc.PINNED_VERSIONS["kimi"] == "0.34.0"
+    assert PIN_0330 in pc.SUPPORTED_VERSIONS["kimi"]
     assert pc.SUPPORTED_VERSIONS["kimi"] == (
+        "0.34.0",
         PIN_0330,
         "0.32.0",
         "0.31.0",
