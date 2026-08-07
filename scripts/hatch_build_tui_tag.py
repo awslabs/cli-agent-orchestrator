@@ -79,6 +79,12 @@ So ``autobuild_binary()`` runs ``scripts/build_tui.py build`` when no binary is 
 a working ``cao tui`` a property of the BUILD rather than of the release pipeline. It degrades
 quietly — no cargo, or a failed compile, means a pure wheel and the existing clear message from
 ``cao tui``, never a failed install. See that function's docstring for why None, not raise.
+
+A failed build also DISCARDS whatever it staged before failing (``_discard_new_binaries``).
+That is not tidiness: ``build_tui.py`` copies the binary into place and only afterwards
+asserts the size ceiling, and hatchling's ``artifacts`` glob packages that directory
+independently of this hook — so a leftover rejected binary would be bundled into the wheel
+and would flip the tag, overturning the build's own rejection.
 """
 
 from __future__ import annotations
@@ -119,6 +125,13 @@ AUTOBUILD_ENV = "CAO_TUI_AUTOBUILD"
 # Relative to the project root — the staging script this hook shells out to.
 BUILD_SCRIPT_RELATIVE = "scripts/build_tui.py"
 
+# Wall-clock ceiling on the cargo build this hook triggers. Generous on purpose: a cold
+# `cargo build --release --locked` on a slow runner, fetching the whole registry, is measured
+# in minutes, and a timeout that fires on a merely-slow machine would silently ship wheels
+# with no TUI. The ceiling exists for a HUNG build (a stalled network fetch, a wedged linker),
+# which would otherwise hang `pip install` indefinitely with no output.
+BUILD_TIMEOUT_SECONDS = 900
+
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
@@ -147,6 +160,38 @@ def staged_binaries(root: str) -> List[Path]:
     if not package_dir.is_dir():
         return []
     return sorted(p for p in package_dir.glob(f"{BINARY_STEM}*") if p.is_file())
+
+
+def _discard_new_binaries(root: str, preexisting: List[Path]) -> None:
+    """Remove staged TUI binaries that were NOT there before the build ran.
+
+    Called on every non-success path of ``autobuild_binary``. Returning None is not enough
+    on its own: ``build_tui.py build`` copies the binary into the staging directory and only
+    AFTERWARDS asserts the artifacts glob and NFR-2's 10 MB size ceiling, so it can exit
+    non-zero with a fully staged binary sitting on disk. Meanwhile the wheel's ``artifacts``
+    glob in pyproject.toml matches that directory during hatchling's own file collection —
+    it does not consult this hook. So a rejected leftover would be BUNDLED into the wheel,
+    and ``resolve_build_data``'s rescan would additionally flip the tag to platform-specific
+    for a payload the build had refused. Deleting it is what makes the graceful path actually
+    produce a pure wheel.
+
+    ``preexisting`` is compared by path, so a binary staged by cibuildwheel's ``before-build``
+    (or by a developer's explicit ``build_tui.py build``) is never touched — this only ever
+    unwinds what THIS invocation created.
+    """
+    keep = {p.resolve() for p in preexisting}
+    for candidate in staged_binaries(root):
+        if candidate.resolve() in keep:
+            continue
+        try:
+            candidate.unlink()
+        except OSError as exc:
+            # Best effort. Warn rather than raise: an undeletable leftover must not turn a
+            # gracefully-degraded build into a failed install, and the wheel it produces is
+            # wrong in a way the operator can see (a platform tag), not silently.
+            print(f"warning: could not remove rejected {candidate.name}: {exc}")
+        else:
+            print(f"discarded {candidate.name} left behind by the failed build")
 
 
 def autobuild_binary(root: str) -> Optional[Path]:
@@ -211,11 +256,30 @@ def autobuild_binary(root: str) -> Optional[Path]:
         )
         return None
 
+    # Recorded BEFORE the build so every failure path below can distinguish "this build
+    # staged it and then rejected it" (discard) from "it was already there" (never touch).
+    preexisting = staged_binaries(root)
+
     print(f"building the TUI binary ({script.name} build) — this needs cargo and may take a minute")
     try:
-        result = subprocess.run([sys.executable, str(script), "build"], cwd=root, check=False)
+        result = subprocess.run(
+            [sys.executable, str(script), "build"],
+            cwd=root,
+            check=False,
+            timeout=BUILD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # A hung cargo (a stalled registry fetch, a wedged linker) must not hang `pip install`
+        # forever. Bounded, then degraded like any other failure.
+        print(
+            f"{script.name} build exceeded {BUILD_TIMEOUT_SECONDS}s and was terminated — "
+            "building without the bundled TUI binary. `cao tui` will report it is unavailable."
+        )
+        _discard_new_binaries(root, preexisting)
+        return None
     except OSError as exc:
         print(f"could not run {script}: {exc} — building without the bundled TUI binary")
+        _discard_new_binaries(root, preexisting)
         return None
 
     if result.returncode != 0:
@@ -224,6 +288,10 @@ def autobuild_binary(root: str) -> Optional[Path]:
             f"{script.name} build failed (exit {result.returncode}) — building without the "
             "bundled TUI binary. `cao tui` will report it is unavailable."
         )
+        # The build may have copied the binary into place before failing its own size/glob
+        # assertions. Leaving it would let hatchling's artifacts glob package a payload the
+        # build rejected. See _discard_new_binaries.
+        _discard_new_binaries(root, preexisting)
         return None
 
     staged = staged_binaries(root)

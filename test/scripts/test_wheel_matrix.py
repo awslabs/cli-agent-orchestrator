@@ -17,6 +17,7 @@ otherwise — see `test_wheel_matrix_documents_unverified_platforms`.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -277,6 +278,32 @@ class TestPlatformTagSelection:
 
 
 class TestAutobuildStagesTheBinary:
+    @pytest.fixture(autouse=True)
+    def _hermetic(self, monkeypatch):
+        """Isolate the hook from the host toolchain and the ambient environment.
+
+        Both halves are load-bearing, and both were real defects:
+
+        * ``cargo`` is FAKED PRESENT by default. Without this, every happy-path case here
+          silently inverted on a machine with no Rust toolchain — ``autobuild_binary`` returned
+          None at its ``shutil.which`` guard and the test failed for a reason that has nothing
+          to do with the hook. Measured: two failures in a cargo-less environment. What these
+          tests own is the hook's contract with ``build_tui.py`` (is it invoked, is its exit
+          code honoured, is its output adopted or discarded) — never whether the host can
+          compile Rust. A case that needs the ABSENT-cargo path overrides this explicitly.
+        * All THREE controlling env vars are cleared. ``CAO_TUI_AUTOBUILD`` gates the build,
+          and ``CAO_TUI_PLATFORM_WHEEL`` / ``CIBUILDWHEEL`` change ``resolve_build_data``'s
+          decision — a runner exporting any of them (cibuildwheel exports ``CIBUILDWHEEL=1``
+          for every build it drives) would rewrite these tests' meaning. A test whose verdict
+          depends on the shell that launched pytest is not a guard.
+
+        The stand-in ``build_tui.py`` is a plain Python script, so a faked ``which`` never
+        causes a real cargo invocation.
+        """
+        monkeypatch.setattr(hatch_hook.shutil, "which", lambda name: f"/usr/bin/{name}")
+        for var in (hatch_hook.AUTOBUILD_ENV, hatch_hook.FORCE_ENV, hatch_hook.CIBUILDWHEEL_ENV):
+            monkeypatch.delenv(var, raising=False)
+
     @staticmethod
     def _fake_build_script(root: Path, body: str) -> Path:
         """Write a stand-in scripts/build_tui.py at ``root``.
@@ -367,6 +394,11 @@ class TestAutobuildStagesTheBinary:
         exits 1) passes even if the exit-code check is deleted entirely, because there is no
         binary to find either way. Mutation-verified — replacing the ``returncode`` check with
         ``if False`` leaves that version GREEN and this one RED.
+
+        Returning None is necessary but NOT sufficient, which is the second assertion: the
+        wheel's ``artifacts`` glob collects that directory during hatchling's own file walk and
+        never consults this hook, so a leftover left on disk would be packaged into the wheel
+        no matter what this function returned. The rejected file must be GONE.
         """
         self._fake_build_script(
             tmp_path,
@@ -381,6 +413,92 @@ class TestAutobuildStagesTheBinary:
         assert (
             hatch_hook.autobuild_binary(str(tmp_path)) is None
         ), "a build that exited non-zero must not have its leftover binary adopted"
+        assert not (tmp_path / "src" / "cli_agent_orchestrator" / "cao-tui").exists(), (
+            "the rejected binary is still on disk — hatchling's artifacts glob would package "
+            "it into the wheel regardless of what this hook returned"
+        )
+
+    def test_a_rejected_leftover_does_not_tag_the_wheel_for_a_platform(self, tmp_path):
+        """The same defect one level up, where it actually reaches the wheel.
+
+        ``resolve_build_data`` RESCANS the staging directory after autobuilding, so before the
+        discard existed a build that staged ``cao-tui`` and then exited 101 produced
+        ``py3-none-<platform>`` with ``pure_python`` false — a platform wheel built around a
+        payload the build had refused. Asserting the pure-wheel outcome (not just that the file
+        is gone) is what ties the cleanup to the tag decision it exists to protect.
+        """
+        self._fake_build_script(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pkg = pathlib.Path(sys.argv[0]).resolve().parents[1] / 'src' / "
+            "'cli_agent_orchestrator'\n"
+            "pkg.mkdir(parents=True, exist_ok=True)\n"
+            "(pkg / 'cao-tui').write_bytes(b'OVER THE SIZE CEILING')\n"
+            "sys.exit(101)\n",
+        )
+
+        build_data = _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+
+        assert "tag" not in build_data, "a rejected build must leave hatchling's default tag"
+        assert build_data["pure_python"] is True
+        assert not (tmp_path / "src" / "cli_agent_orchestrator" / "cao-tui").exists()
+
+    def test_a_preexisting_binary_survives_a_failed_build(self, tmp_path):
+        """The discard must unwind only what THIS invocation staged.
+
+        The guard rails the cleanup: cibuildwheel stages via ``before-build``, and a developer
+        may stage explicitly. A blanket "delete every binary on any failure" would destroy that
+        input — and under cibuildwheel it would convert a release build into
+        ``resolve_build_data``'s hard "no binary is staged" error. So the pre-existing file is
+        passed through untouched even though the build it triggered failed.
+        """
+        _stage_binary(tmp_path)
+        original = (tmp_path / "src" / "cli_agent_orchestrator" / "cao-tui").read_bytes()
+        self._fake_build_script(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pkg = pathlib.Path(sys.argv[0]).resolve().parents[1] / 'src' / "
+            "'cli_agent_orchestrator'\n"
+            "(pkg / 'cao-tui.exe').write_bytes(b'REJECTED')\n"
+            "sys.exit(101)\n",
+        )
+
+        # Called directly: resolve_build_data would skip the build entirely (a binary is
+        # already staged), which is a different guard — tested separately above.
+        assert hatch_hook.autobuild_binary(str(tmp_path)) is None
+
+        staged_dir = tmp_path / "src" / "cli_agent_orchestrator"
+        assert (
+            staged_dir.joinpath("cao-tui").read_bytes() == original
+        ), "the cleanup deleted a binary it did not stage"
+        assert not staged_dir.joinpath("cao-tui.exe").exists(), "the rejected leftover survived"
+
+    def test_a_hung_build_is_bounded_and_degrades(self, tmp_path, monkeypatch):
+        """A wedged cargo must not hang `pip install` forever.
+
+        ``subprocess.run`` without a timeout waits indefinitely, so a stalled registry fetch or
+        a wedged linker would hang the install with no output and no way out but Ctrl-C. The
+        timeout is raised here rather than waited on: what is under test is that the hook PASSES
+        a timeout and treats expiry as one more graceful-degradation path — including
+        discarding anything the killed build had already staged.
+        """
+        self._fake_build_script(tmp_path, "pass\n")
+        pkg = tmp_path / "src" / "cli_agent_orchestrator"
+        pkg.mkdir(parents=True, exist_ok=True)
+
+        def _hang(*args, **kwargs):
+            assert kwargs.get("timeout") == hatch_hook.BUILD_TIMEOUT_SECONDS, (
+                "the hook invoked the build script with no timeout — a hung cargo would hang "
+                "the install indefinitely"
+            )
+            # A build killed mid-flight can leave a partial copy behind.
+            (pkg / "cao-tui").write_bytes(b"PARTIAL")
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+        monkeypatch.setattr(hatch_hook.subprocess, "run", _hang)
+
+        assert hatch_hook.autobuild_binary(str(tmp_path)) is None
+        assert not (pkg / "cao-tui").exists(), "a timed-out build's partial output was kept"
 
     def test_install_still_succeeds_when_the_cargo_build_fails(self, tmp_path):
         """A compile error in the crate must not make `pip install` impossible either.
