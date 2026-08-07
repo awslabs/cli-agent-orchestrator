@@ -190,6 +190,14 @@ def _roll_back_backend_create_locked(
     flight, and that original failure is the one the caller must see.
     """
     if created_session:
+        # `finally`, not a following statement: the env mapping must be dropped
+        # however the kill turns out — including when it raises a BaseException
+        # (KeyboardInterrupt/SystemExit), which `except Exception` does not catch.
+        # Sequencing these as two independent try blocks skipped the clear on
+        # exactly that path, leaving a forwarded secret in the process-global map
+        # keyed to a session name that is gone and may later be reused.
+        # `finally` still lets a BaseException propagate, which is what we want:
+        # a Ctrl-C must not be swallowed here.
         try:
             if not get_backend().kill_session(session_name):
                 # Falsy means the backend could not confirm the kill (or found
@@ -201,13 +209,11 @@ def _roll_back_backend_create_locked(
                 )
         except Exception:
             logger.exception(f"Rollback: failed to kill session {session_name}")
-        # Deliberately outside the kill's try: the env mapping must be dropped
-        # even when the kill failed, or a secret outlives the session it was
-        # forwarded to.
-        try:
-            clear_session_env(session_name)
-        except Exception:
-            logger.exception(f"Rollback: failed to clear session env for {session_name}")
+        finally:
+            try:
+                clear_session_env(session_name)
+            except Exception:
+                logger.exception(f"Rollback: failed to clear session env for {session_name}")
     else:
         try:
             if not get_backend().kill_window(session_name, window_name):
