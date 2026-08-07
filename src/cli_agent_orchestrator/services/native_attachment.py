@@ -790,6 +790,7 @@ def mark_ambiguous(
     provider: str,
     native_session_id: str,
     reason: str,
+    expected_epoch: Optional[int] = None,
 ) -> dict[str, Any]:
     """Freeze the attachment, preserving its owner, forever.
 
@@ -798,11 +799,23 @@ def mark_ambiguous(
     requiring it to name the owner would either be unanswerable or invite
     a guess.  Recovery and the owner itself both reach this the same way.
 
-    The recorded owner is preserved and the row never leaves this state
-    through this module: a frozen attachment blocks every future claim on
-    the session, which is the intended outcome.  Releasing it would hand
-    the session to a new attacher while a possible survivor still holds
-    it.
+    The recorded owner is preserved, and the only way out is
+    :func:`adjudicate`, which requires a named human.  A frozen attachment
+    blocks every future claim on the session, which is the intended
+    outcome.  Releasing it automatically would hand the session to a new
+    attacher while a possible survivor still holds it.
+
+    ``expected_epoch`` binds the freeze to a row somebody *observed*, and
+    is optional because the two kinds of caller differ.  An owner freezing
+    its own row — a launch that could not verify its pane — must succeed
+    regardless of what else has happened, and has no epoch to name.  A
+    caller that first looked at the row and then decided it was freezable
+    is in a different position: between the look and the write the owner
+    can die, a sweep can release the row, and a new launch can claim it,
+    at which point an unbound freeze lands on a live launch that published
+    no identity yet — blocking its ``mark_attached`` while its process
+    keeps running, which is the precondition for exactly the double-attach
+    this module exists to prevent.
     """
     provider = _require_text(provider, field="provider")
     native_session_id = _require_text(native_session_id, field="native_session_id")
@@ -821,6 +834,12 @@ def mark_ambiguous(
                 raise NativeAttachmentConflict(
                     f"{provider} session {native_session_id} is detached with a recorded "
                     "no-survivor proof; there is no owner to freeze"
+                )
+            if expected_epoch is not None and row.epoch != expected_epoch:
+                raise NativeAttachmentConflict(
+                    f"{provider} session {native_session_id} moved to epoch {row.epoch} since "
+                    f"it was observed at epoch {expected_epoch}; the freeze describes an owner "
+                    "this row no longer has"
                 )
 
             observed_epoch = row.epoch

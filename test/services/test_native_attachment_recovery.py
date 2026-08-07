@@ -756,3 +756,86 @@ class TestTheGraceLoopDoesNotForkPsFortyTimes:
         cheap = recovery.observe_owner(record, read_marker=False)
         assert cheap["disposition"] == recovery.OWNER_ALIVE
         assert cheap["start_marker_verdict"] == "not-read"
+
+
+class TestTheFreezeIsBoundToTheRowItObserved:
+    """The same hole `adjudicate` had, on its sibling.
+
+    `mark_ambiguous` takes no owner, so without an epoch a freeze decided
+    against one row can land on whatever is there when it writes — and the
+    dangerous landing is a launch that has claimed the session but not yet
+    published an identity, which the freeze then blocks while its process
+    keeps running.
+    """
+
+    def test_a_row_that_moved_since_the_observation_is_refused(self, monkeypatch):
+        _attach(pid=os.getpid())
+        monkeypatch.setattr(recovery, "_pid_state", lambda pid: recovery.OWNER_UNOBSERVABLE)
+        stale_record = na.get(PROVIDER, SESSION)
+
+        real_mark = na.mark_ambiguous
+
+        def _race_then_freeze(**kwargs):
+            # The observed owner dies, a sweep releases it, and a new launch
+            # claims the session — all between the look and the write.
+            monkeypatch.setattr(recovery, "_pid_state", lambda pid: recovery.OWNER_GONE)
+            recovery.release_if_owner_gone(na.get(PROVIDER, SESSION))
+            na.declare(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                terminal_id="newowner",
+                generation="newgen",
+                execution_mode="native_tui",
+                intent=_intent(),
+            )
+            return real_mark(**kwargs)
+
+        monkeypatch.setattr(na, "mark_ambiguous", _race_then_freeze)
+        with pytest.raises(na.NativeAttachmentConflict, match="moved to epoch"):
+            recovery.freeze_for_adjudication(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                operator="colin",
+                detail="process table will not answer",
+            )
+        current = na.get(PROVIDER, SESSION)
+        assert current["state"] == na.DECLARED
+        assert current["owner"]["terminal_id"] == "newowner"
+
+    def test_an_owner_freezing_its_own_row_stays_unbound(self):
+        """A launch that could not verify its pane must freeze regardless."""
+        import inspect
+
+        assert inspect.signature(na.mark_ambiguous).parameters["expected_epoch"].default is None
+        _attach(pid=os.getpid())
+        assert (
+            na.mark_ambiguous(
+                provider=PROVIDER, native_session_id=SESSION, reason="pane unreadable"
+            )["state"]
+            == na.AMBIGUOUS
+        )
+
+
+class TestARetainedProofIsNotThisClaimsProof:
+    """A re-acquire keeps the prior proof deliberately — it is evidence.
+
+    The record shape is unchanged, because it is a contract several readers
+    depend on. What changed is the rendering: on a live claim that proof
+    describes a *different* owner, and printing it unlabelled reads as
+    "this claim was released", which is the opposite of true.
+    """
+
+    def test_the_record_still_carries_the_prior_proof(self):
+        recovery.release_if_owner_gone(_attach(pid=_reaped_pid()))
+        na.declare(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            terminal_id="ffffffff",
+            generation="99999999",
+            execution_mode="native_tui",
+            intent=_intent(),
+        )
+        reclaimed = na.get(PROVIDER, SESSION)
+        assert reclaimed["state"] == na.DECLARED
+        assert reclaimed["release_proof"] is not None
+        assert reclaimed["release_proof"]["terminal_id"] == TERMINAL

@@ -506,6 +506,7 @@ def freeze_for_adjudication(
         provider=provider,
         native_session_id=native_session_id,
         reason=reason,
+        expected_epoch=record["epoch"],
     )
 
 

@@ -370,3 +370,31 @@ class TestAVirginInstall:
         assert len(result.output.strip().splitlines()) == 1
         assert "no such table" in result.output
         assert "SELECT" not in result.output
+
+
+class TestARetainedProofIsLabelled:
+    def test_a_live_claim_shows_the_prior_proof_as_previous(self):
+        """On a re-acquired row the retained proof describes a different owner."""
+        record = _attach(pid=_reaped_pid())
+        from cli_agent_orchestrator.services import native_attachment_recovery as recovery
+
+        recovery.release_if_owner_gone(record)
+        na.declare(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            terminal_id="ffffffff",
+            generation="99999999",
+            execution_mode="native_tui",
+            intent=_intent(),
+        )
+        result = CliRunner().invoke(attachment_cli.attachment, ["show", PROVIDER, SESSION])
+        assert "previously released by" in result.output
+
+    def test_a_detached_claim_shows_it_plainly(self):
+        recovery_mod = __import__(
+            "cli_agent_orchestrator.services.native_attachment_recovery",
+            fromlist=["release_if_owner_gone"],
+        )
+        recovery_mod.release_if_owner_gone(_attach(pid=_reaped_pid()))
+        result = CliRunner().invoke(attachment_cli.attachment, ["list", "--state", "detached"])
+        assert result.exit_code == 0

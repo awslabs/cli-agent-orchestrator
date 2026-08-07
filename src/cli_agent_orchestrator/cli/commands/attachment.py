@@ -150,7 +150,12 @@ def attachment_show(provider, native_session_id, observe, as_json):
         if row.get("ambiguity_reason"):
             click.echo(f"frozen because    {row['ambiguity_reason']}")
         if row.get("release_proof"):
-            click.echo(f"released by       {row['release_proof'].get('schema')}")
+            # A re-acquired row keeps the *previous* incarnation's proof —
+            # deliberately, as evidence — so on a live claim this line
+            # describes a different owner. Printing it unlabelled reads as
+            # "this claim was released", which is the opposite of true.
+            label = "released by" if row["state"] == na.DETACHED else "previously released by"
+            click.echo(f"{label:<17} {row['release_proof'].get('schema')}")
         observation = row.get("observation")
         if observation:
             click.echo(f"\nowner is          {observation['disposition']}")
