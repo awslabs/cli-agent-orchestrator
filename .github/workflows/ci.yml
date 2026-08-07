@@ -665,6 +665,31 @@ jobs:
           ignore-unfixed: true
           exit-code: '1'
 
+      # FR-8: the SARIF step above writes findings to a FILE, so a failing scan
+      # logs an exit code and names nothing — diagnosing #568 took an out-of-band
+      # `gh api .../code-scanning/alerts` call to learn what had failed. This step
+      # re-runs the same scan in table format so the finding appears in the log.
+      #
+      # `if: failure()` — runs only when the gate above fails, so a green run pays
+      # nothing. `exit-code: '0'` — this step must not be the one that fails the
+      # job; the gate above already did, and a second failure would obscure which
+      # step is authoritative.
+      #
+      # No `severity:` input, matching the effective gate: trivy-action's
+      # entrypoint.sh unsets TRIVY_SEVERITY whenever format is sarif, so the step
+      # above scans at ALL severities. Passing CRITICAL,HIGH here would print a
+      # narrower set than the one that failed the build — and could print NOTHING
+      # while the job is red.
+      - name: Show Trivy findings in the log
+        if: failure()
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # v0.35.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          ignore-unfixed: true
+          exit-code: '0'
+
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL finding

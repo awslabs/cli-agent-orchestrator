@@ -256,7 +256,7 @@ Create a pull request on GitHub. CI will automatically run tests and code qualit
 Runs on all pushes to `main` and all PRs targeting `main`:
 - **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, mypy
-- **Security scan**: Trivy vulnerability scanner (CRITICAL/HIGH)
+- **Security scan**: Trivy filesystem scan — fails on a finding of **any** severity (see [SECURITY.md](SECURITY.md#running-security-scans-locally) for why the workflow's `CRITICAL,HIGH` input is ignored)
 - **Dependency review**: License and vulnerability checks on PRs
 
 ### Provider-Specific Workflows (path-triggered)
