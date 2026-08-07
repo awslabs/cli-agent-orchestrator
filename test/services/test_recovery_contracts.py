@@ -23,7 +23,12 @@ from cli_agent_orchestrator.services.recovery_capabilities import build_capabili
 
 def test_pinned_versions():
     # The current pin is the stage-verified installed build.
-    assert pc.PINNED_VERSIONS == {"codex": "0.146.0", "kimi": "0.33.0", "claude": "2.1.220"}
+    assert pc.PINNED_VERSIONS == {
+        "codex": "0.146.0",
+        "kimi": "0.33.0",
+        "claude": "2.1.220",
+        "muse": "0.1.0",
+    }
     pc.check_pinned_version("codex", "0.146.0")
     pc.check_pinned_version("codex", "codex-cli 0.146.0")
     with pytest.raises(pc.ProviderVersionDrift):
