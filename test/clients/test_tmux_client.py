@@ -61,6 +61,7 @@ class TestCreateSession:
 
         assert result == "my-window"
         tmux.server.new_session.assert_called_once()
+        mock_session.set_option.assert_called_once_with("mouse", "on")
 
     def test_create_session_window_name_none(self, tmux, tmp_path):
         mock_window = MagicMock()

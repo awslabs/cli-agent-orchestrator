@@ -190,6 +190,13 @@ class TmuxClient:
                 x=220,
                 y=50,
             )
+            # Keep mouse-wheel input inside tmux.  With mouse mode disabled,
+            # tmux forwards wheel events to the foreground application as Up/
+            # Down keys, which makes shells and agent TUIs navigate their
+            # command history instead of entering copy mode to scroll output.
+            # This is a session option, so it does not change the user's other
+            # tmux sessions or their global tmux configuration.
+            session.set_option("mouse", "on")
             logger.info(
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
             )
