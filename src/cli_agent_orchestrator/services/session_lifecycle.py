@@ -449,6 +449,15 @@ def request_pause(
                 f"session {session_name} is {record['lifecycle']!r}; there is no running fleet "
                 "to settle"
             )
+        if record["lifecycle"] == PAUSING and record.get("pause_deadline_at"):
+            # A re-request keeps the ORIGINAL deadline. Restarting it would
+            # make the bound defeatable by retry — an operator pressing the
+            # button again, or a UI that re-sends, would postpone the moment
+            # the session goes back to the marshal indefinitely.
+            return {
+                "pause_requested_at": record["pause_requested_at"],
+                "pause_deadline_at": record["pause_deadline_at"],
+            }
         return {}
 
     return _write(
@@ -519,11 +528,15 @@ def pause_is_overdue(record: Mapping[str, Any], *, now: Optional[datetime] = Non
         return False
     deadline = record.get("pause_deadline_at")
     if not isinstance(deadline, str):
-        return False
+        # A `pausing` row with no readable deadline is already wrong, and
+        # the two ways to be wrong are not symmetric: reporting it not-overdue
+        # keeps the wedge flag muted forever, which is the failure this
+        # deadline exists to bound. Overdue is the safe reading.
+        return True
     try:
         parsed = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
     except ValueError:
-        return False
+        return True
     if parsed.tzinfo is None:  # pragma: no cover - written with an explicit Z
         parsed = parsed.replace(tzinfo=timezone.utc)
     return (now or datetime.now(timezone.utc)) > parsed

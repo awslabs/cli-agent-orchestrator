@@ -181,17 +181,24 @@ class TestStopIsGatedOnAnAcknowledgement:
 
 
 class TestStopImpactIsComputed:
-    def test_it_reports_that_nothing_can_be_resumed_today(self, client, monkeypatch):
-        """The honest answer, and the one a provider table would not give."""
+    def _rows(self, monkeypatch, rows):
         from cli_agent_orchestrator.services import terminal_projection
 
-        monkeypatch.setattr(
-            terminal_projection,
-            "live_terminals",
-            lambda name: [
-                {"terminal_id": "a1", "provider": "claude_code"},
-                {"terminal_id": "b2", "provider": "muse_cli"},
-                {"terminal_id": "c3", "provider": "codex", "native_session_id": "x"},
+        monkeypatch.setattr(terminal_projection, "project_session", lambda name: rows)
+
+    def test_it_reports_that_nothing_can_be_resumed_today(self, client, monkeypatch):
+        """The honest answer, and the one a provider table would not give."""
+        self._rows(
+            monkeypatch,
+            [
+                {"terminal_id": "a1", "provider": "claude_code", "lifecycle_state": "live"},
+                {"terminal_id": "b2", "provider": "muse_cli", "lifecycle_state": "live"},
+                {
+                    "terminal_id": "c3",
+                    "provider": "codex",
+                    "native_session_id": "x",
+                    "lifecycle_state": "live",
+                },
             ],
         )
         payload = client.get(f"/sessions/{SESSION}/stop-impact").json()
@@ -202,6 +209,62 @@ class TestStopImpactIsComputed:
         assert reasons["muse_cli"] == "provider-has-no-resume-path"
         assert reasons["claude_code"] == "no-recorded-native-session-id"
         assert reasons["codex"] == "provider-version-drifted-from-pin"
+
+    def test_a_worker_whose_liveness_cannot_be_read_is_a_loss(self, client, monkeypatch):
+        """ "Not live" and "we could not look" are different facts.
+
+        A tmux server that cannot be read makes every row unobservable —
+        and that is exactly when somebody reaches for stop. Answering
+        "0 workers" there would be this module's own failure mode reached
+        through its own filter.
+        """
+        self._rows(
+            monkeypatch,
+            [
+                {
+                    "terminal_id": "a1",
+                    "provider": "codex",
+                    "lifecycle_state": "unknown-liveness",
+                    "lifecycle_reason": "tmux server could not be read",
+                }
+            ],
+        )
+        payload = client.get(f"/sessions/{SESSION}/stop-impact").json()
+        assert payload["live_workers"] == 1
+        assert payload["not_resumable"][0]["reason"] == "liveness-could-not-be-observed"
+        assert "tmux server" in payload["not_resumable"][0]["detail"]
+
+    def test_a_dead_pane_is_not_counted_as_a_loss(self, client, monkeypatch):
+        """It is already gone; naming it would inflate what is being accepted."""
+        self._rows(
+            monkeypatch,
+            [
+                {"terminal_id": "a1", "provider": "codex", "lifecycle_state": "dead"},
+                {"terminal_id": "b2", "provider": "codex", "lifecycle_state": "superseded"},
+            ],
+        )
+        assert client.get(f"/sessions/{SESSION}/stop-impact").json()["live_workers"] == 0
+
+    def test_the_impact_resolves_the_same_session_the_stop_records(self, client, monkeypatch):
+        """The bare name reads zero workers; the write normalises and stops the real one.
+
+        The dialog would say nothing will be lost, the operator would agree,
+        and a live fleet would be silenced to the marshal on the strength
+        of it.
+        """
+        seen: list[str] = []
+
+        from cli_agent_orchestrator.services import terminal_projection
+
+        def _record(name):
+            seen.append(name)
+            return [{"terminal_id": "a1", "provider": "codex", "lifecycle_state": "live"}]
+
+        monkeypatch.setattr(terminal_projection, "project_session", _record)
+        payload = client.get("/sessions/p1-closure/stop-impact").json()
+        assert seen == [SESSION], "the read resolved a different session than the write would"
+        assert payload["session_name"] == SESSION
+        assert payload["live_workers"] == 1
 
 
 class TestKindAndArchive:

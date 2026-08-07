@@ -433,3 +433,26 @@ class TestADeletedSessionLeavesNoDeclaration:
         record = sl.describe(SESSION)
         assert record["declared"] is False
         assert sl.suppresses_marshal(SESSION)[0] is False
+
+
+class TestTheDeadlineCannotBeDefeated:
+    def test_a_repeated_request_keeps_the_original_deadline(self):
+        """Otherwise the bound is defeatable by pressing the button again."""
+        first = sl.request_pause(SESSION, requested_by="colin", deadline_seconds=60)
+        again = sl.request_pause(SESSION, requested_by="colin", deadline_seconds=86400)
+        assert again["pause_deadline_at"] == first["pause_deadline_at"]
+
+    @pytest.mark.parametrize("deadline", [None, "", "not-a-timestamp"])
+    def test_an_unreadable_deadline_reads_as_overdue(self, deadline):
+        """The two ways to be wrong are not symmetric.
+
+        Reporting not-overdue keeps the wedge flag muted forever, which is
+        exactly what the deadline exists to bound.
+        """
+        assert sl.pause_is_overdue({"lifecycle": sl.PAUSING, "pause_deadline_at": deadline}) is True
+
+    def test_a_settled_pause_clears_the_deadline(self):
+        sl.request_pause(SESSION, requested_by="colin")
+        settled = sl.settle_pause(SESSION, declared_by="supervisor")
+        assert settled["pause_deadline_at"] is None
+        assert sl.pause_is_overdue(settled) is False

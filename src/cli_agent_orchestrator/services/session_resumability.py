@@ -59,6 +59,10 @@ REASON_NO_RECORDED_SESSION = "no-recorded-native-session-id"
 REASON_VERSION_DRIFT = "provider-version-drifted-from-pin"
 REASON_CLAIM_FROZEN = "native-session-claim-frozen"
 REASON_UNKNOWN_PROVIDER = "provider-not-recognised"
+#: The pane could not be observed at all. Counted as a loss rather than
+#: skipped: "not live" and "we could not look" are different facts, and
+#: only the first means the worker is already gone.
+REASON_LIVENESS_UNKNOWN = "liveness-could-not-be-observed"
 
 #: True while no provider has a working resume path in production. Read
 #: from the code rather than asserted: the route exists and refuses.
@@ -208,14 +212,30 @@ def stop_impact(
 ) -> dict[str, Any]:
     """What stopping this session would cost, in the operator's terms.
 
-    Counts live workers only. A dead pane is already gone and naming it in
-    a confirmation would inflate the loss an operator is being asked to
-    accept, which trains them to click through it.
-    """
-    from cli_agent_orchestrator.services import terminal_projection
+    **Normalises the session name**, because terminal rows carry the
+    prefixed form and the write path normalises too. Without it a bare
+    name reads zero workers here and the stop that follows lands on the
+    real session: the dialog says nothing will be lost, the operator
+    agrees, and a fleet of live workers is silenced to the marshal on the
+    strength of it.
 
+    A **dead** pane is excluded — already gone, and naming it would
+    inflate the loss an operator is being asked to accept, which trains
+    them to click through the dialog.
+
+    A pane whose liveness could **not be observed** is included as a loss,
+    with its own reason. That is the opposite call from ``dead``, for the
+    reason this module exists: "not live" and "we could not look" are
+    different facts. A tmux server that cannot be read makes *every* row
+    unobservable — and that is exactly when somebody reaches for stop — so
+    reporting "0 workers" there would be this module's own failure mode,
+    reached through its own filter.
+    """
+    from cli_agent_orchestrator.services import session_lifecycle, terminal_projection
+
+    session_name = session_lifecycle.normalise_session_name(session_name)
     try:
-        rows = terminal_projection.live_terminals(session_name)
+        rows = terminal_projection.project_session(session_name)
     except Exception as exc:  # noqa: BLE001
         return {
             "session_name": session_name,
@@ -227,7 +247,26 @@ def stop_impact(
             "resume_machinery_reason": RESUME_MACHINERY_ABSENT_REASON,
         }
 
-    verdicts = [worker_resumability(row, installed_versions=installed_versions) for row in rows]
+    verdicts: list[dict[str, Any]] = []
+    for row in rows:
+        state = row.get("lifecycle_state")
+        if state in terminal_projection.ATTACHABLE_LIFECYCLE_STATES:
+            verdicts.append(worker_resumability(row, installed_versions=installed_versions))
+        elif state not in (
+            terminal_projection.LIFECYCLE_DEAD,
+            terminal_projection.LIFECYCLE_SUPERSEDED,
+        ):
+            verdicts.append(
+                {
+                    "terminal_id": row.get("terminal_id") or row.get("id"),
+                    "provider": row.get("provider"),
+                    "agent_profile": row.get("agent_profile"),
+                    "native_session_id": row.get("native_session_id"),
+                    "resumable": False,
+                    "reason": REASON_LIVENESS_UNKNOWN,
+                    "detail": row.get("lifecycle_reason") or state,
+                }
+            )
     not_resumable = [v for v in verdicts if not v["resumable"]]
     return {
         "session_name": session_name,

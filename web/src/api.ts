@@ -652,14 +652,12 @@ export const api = {
   // fire marshal's suppression has to fail toward watching.
   getSessionLifecycle: (name: string) =>
     fetchJSON<SessionLifecycle>(`/sessions/${encodeURIComponent(name)}/lifecycle`),
+  // Only what the dashboard actually calls. The write wrappers were added
+  // ahead of the controls that would use them, which is the same shape as
+  // the defect this branch exists to fix — a tested surface nothing invokes.
+  // They come back with the buttons.
   getStopImpact: (name: string) =>
     fetchJSON<StopImpact>(`/sessions/${encodeURIComponent(name)}/stop-impact`),
-  declareSessionLifecycle: (name: string, body: { lifecycle: 'working' | 'complete'; declared_by: string; note?: string }) =>
-    fetchJSON<SessionLifecycle>(`/sessions/${encodeURIComponent(name)}/lifecycle`, { method: 'POST', body: JSON.stringify(body) }),
-  requestSessionPause: (name: string, body: { requested_by: string; note?: string }) =>
-    fetchJSON<SessionLifecycle>(`/sessions/${encodeURIComponent(name)}/lifecycle/pause-request`, { method: 'POST', body: JSON.stringify(body) }),
-  stopSession: (name: string, body: { declared_by: string; acknowledged_one_way: true; note?: string }) =>
-    fetchJSON<SessionLifecycle>(`/sessions/${encodeURIComponent(name)}/lifecycle/stop`, { method: 'POST', body: JSON.stringify(body) }),
 
   // Conductor annotations (§9.5). The route takes no parameters — that is the
   // security property, not an omission — and never errors: an absent or

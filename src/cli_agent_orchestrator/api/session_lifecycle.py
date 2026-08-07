@@ -177,11 +177,16 @@ async def get_session_lifecycle(
     would drift from this one silently — in the direction of a marshal
     that stays quiet, which is the failure nobody notices.
     """
+    # One read, then derive. Reading twice would let the verdict describe a
+    # different version of the row than the record it is attached to — a
+    # small window, and the wrong half of it is a payload that says
+    # `pausing` and `suppresses_marshal: true`.
     record = await asyncio.to_thread(sl.describe, session_name)
-    suppressed, _ = await asyncio.to_thread(sl.suppresses_marshal, session_name)
     return {
         **record,
-        "suppresses_marshal": suppressed,
+        "suppresses_marshal": (
+            False if record.get("unreadable") else record["lifecycle"] in sl.MARSHAL_SUPPRESSING
+        ),
         "pause_overdue": sl.pause_is_overdue(record),
     }
 
