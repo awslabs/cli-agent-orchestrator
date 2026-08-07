@@ -4,6 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 import click
 
+from cli_agent_orchestrator.cli.commands.attachment import attachment
 from cli_agent_orchestrator.cli.commands.config import config
 from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.info import info
@@ -54,6 +55,7 @@ cli.add_command(workflow)
 cli.add_command(update)
 cli.add_command(project)
 cli.add_command(issue)
+cli.add_command(attachment)
 
 
 if __name__ == "__main__":
