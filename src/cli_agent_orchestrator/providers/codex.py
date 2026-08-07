@@ -2,12 +2,15 @@
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -84,6 +87,28 @@ TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
 TRUST_PROMPT_PATTERN_V2 = r"Do you trust the contents of this directory\?"
 TRUST_PROMPT_FOOTER = r"Press enter to continue"
+
+# First-run auth menu, shown when no OpenAI/Codex credentials are configured yet:
+#   Welcome to Codex, OpenAI's command-line coding agent
+#   Sign in with ChatGPT to use Codex as part of your paid plan
+#   or connect an API key for usage-based billing
+#   > 1. Sign in with ChatGPT
+#     2. Sign in with Device Code
+#     3. Provide your own API key
+#   Press enter to continue
+# Unlike the trust/update-available dialogs above, this one cannot be auto-dismissed --
+# it requires a real human to actually complete OAuth or supply a real API key, which is
+# squarely an operator task, not something this provider can or should fabricate. Before
+# this was recognized, `initialize()`'s own wait_until_status(..., {IDLE, COMPLETED}, ...)
+# had no way to ever succeed for an account with no credentials configured yet: the pane
+# would sit at this exact, correctly-rendered screen -- process alive, output real, nothing
+# actually broken -- but never reach IDLE/COMPLETED, so the 60s init timeout would always
+# fire and CAO would tear the terminal down before an operator had any real chance to open
+# the session and complete login themselves. Bottom-anchored (last 15 lines) requiring BOTH
+# the menu text and the footer together, same shape as TRUST_PROMPT_PATTERN_V2 immediately
+# above, to avoid a false match on this text surviving in scrollback from earlier output.
+LOGIN_MENU_PATTERN = r"Sign in with ChatGPT"
+LOGIN_MENU_FOOTER = TRUST_PROMPT_FOOTER
 
 # Startup "Update available!" dialog. Codex shows this at startup when a newer
 # release exists, with a numbered menu whose cursor default is option 1:
@@ -325,6 +350,30 @@ class CodexProvider(BaseProvider):
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
 
+    @property
+    def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+        """The first-run login/auth menu consumes pasted text as a menu selection.
+
+        Now that ``initialize()`` accepts ``WAITING_USER_ANSWER`` as a successful init
+        outcome (for a credential-less account parked on the login menu), an assign/handoff
+        launch that lands there must not have its orchestrated task text pasted into the
+        live menu -- it would be read as an option selection, not delivered as a task.
+        Opting in (matching hermes.py/antigravity_cli.py) makes terminal_service's send_input
+        guard hold orchestrated delivery until the prompt clears, while still allowing an
+        explicit answer_user_prompt call through.
+        """
+        return True
+
+    def _developer_instructions_file_path(self) -> Path:
+        """Path of this terminal's developer_instructions temp file.
+
+        Single source of truth for the path -- both `_build_codex_command` (which
+        writes it) and `cleanup` (which removes it) call this instead of each
+        re-deriving the same `CAO_HOME_DIR / "tmp" / f"{...}.codex_developer_instructions"`
+        expression independently, which would let the two silently drift apart.
+        """
+        return CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
+
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
 
@@ -360,6 +409,11 @@ class CodexProvider(BaseProvider):
         if resolved_model:
             command_parts.extend(["--model", resolved_model])
 
+        # Set below, only when there is a non-empty system_prompt to inject -- appended, raw and
+        # deliberately unquoted by shlex, after the shlex.join() of everything else at the very
+        # end of this method. See the long comment at its assignment site for why.
+        developer_instructions_fragment: Optional[str] = None
+
         if profile is not None:
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
@@ -380,9 +434,76 @@ class CodexProvider(BaseProvider):
                 # Escape backslashes, double quotes, and newlines for TOML basic string.
                 # Newlines must become literal \n to prevent tmux send_keys from
                 # splitting the command across multiple lines.
-                command_parts.extend(
-                    ["-c", f"developer_instructions={_toml_scalar(system_prompt)}"]
+                #
+                # The escaped value is written to a CAO-owned temp file and referenced via a
+                # shell command substitution ($(cat <file>)) instead of being inlined directly,
+                # so the LAUNCH LINE ITSELF (what actually gets typed/pasted into the tmux pane)
+                # stays short regardless of how long the instructions text is. A real profile
+                # combining a security preamble, the caller's own system prompt, and the full
+                # skill-list prompt (see _apply_skill_prompt) commonly produces several KB of
+                # escaped text -- observed live at 8+KB. At launch time the pane is still a bare
+                # shell (codex has not started yet), which correctly does not get bracketed-paste
+                # framing (see clients/tmux.py's BRACKETED_PASTE_INCOMPATIBLE_SHELLS) since a bare
+                # shell does not understand those escape sequences. But WITHOUT that framing, a
+                # single pasted/typed line longer than the tty's canonical-mode line-length limit
+                # (MAX_CANON, 4096 bytes on Linux) is silently truncated/dropped by the kernel's
+                # tty line discipline before the shell ever sees a complete, valid command --
+                # this manifests as the shell hanging at an unclosed-quote continuation prompt
+                # forever (confirmed live: zero codex process ever spawned under the pane's shell,
+                # even after an explicit trailing Enter), until CAO's own init-timeout eventually
+                # fires with a generic "Codex initialization timed out" that gives no hint of the
+                # real cause. $(cat <file>) is expanded internally by the shell BEFORE exec'ing
+                # codex -- that internal expansion is not subject to the tty's per-line INPUT
+                # limit at all, only the typed/pasted command line is. Wrapped in double quotes
+                # (not left bare, not single-quoted) so the substitution still happens (command
+                # substitution is disabled inside single quotes) while word-splitting/globbing of
+                # the substituted content is suppressed (it is not inside single quotes either).
+                # The file's own content is `_toml_scalar`'s output verbatim, already including
+                # its own surrounding TOML double-quotes -- appended as a raw, deliberately
+                # UNquoted-by-shlex fragment after the main shlex.join() below (shlex.join would
+                # otherwise single-quote the whole "developer_instructions=$(cat ...)" fragment as
+                # one opaque token, disabling the substitution it depends on).
+                #
+                # Same underlying instructions/skills length problem does not affect Claude Code
+                # or Kimi CLI providers -- both already write the system prompt to a temp file and
+                # pass a short file-path flag instead of inlining it (see claude_code.py's
+                # --append-system-prompt-file, kimi_cli.py's system_prompt_path: YAML field).
+                # Codex has no direct equivalent of that "arbitrary absolute path" flag (its only
+                # file-loading mechanism, --profile, resolves names relative to $CODEX_HOME, which
+                # this provider has no reliable way to resolve per-account from here) -- this
+                # command-substitution approach reaches the same practical outcome (a short launch
+                # line) without needing that.
+                #
+                # Deliberate, documented shell-scope trade-off (not an oversight): $(...) command
+                # substitution is POSIX and works identically on every shell CAO's own
+                # BRACKETED_PASTE_INCOMPATIBLE_SHELLS (constants.py) already tracks as a shell
+                # class *except* csh/tcsh, which use `cmd` backticks instead and do not recognize
+                # `$(` as substitution syntax at all -- launching codex from a pane whose bare
+                # shell is csh/tcsh would break outright with this fragment malformed/rejected by
+                # the shell, not merely degrade. bash/zsh/dash/sh/ksh/mksh/ash/fish are all fine.
+                # No code here detects or special-cases the pane's shell before writing this
+                # fragment (unlike BRACKETED_PASTE_INCOMPATIBLE_SHELLS' own runtime
+                # #{pane_current_command} probe) -- csh/tcsh support, if ever needed, is scoped
+                # out of this fix rather than silently assumed to already work.
+                #
+                # Not covering here (disclosed, not silently assumed away): the other -c overrides
+                # below (per-MCP-server config, codexConfig) are NOT routed through this same
+                # mechanism and remain inlined directly -- they are typically far smaller than
+                # developer_instructions, but a profile configuring many MCP servers could in
+                # theory still accumulate enough inline -c overrides to hit the same limit. Left
+                # as a known, scoped-out follow-up rather than expanding this fix's surface.
+                developer_instructions_file = self._developer_instructions_file_path()
+                developer_instructions_file.parent.mkdir(parents=True, exist_ok=True)
+                # Open with mode 0o600 baked into the O_CREAT call itself (rather than
+                # write_text() followed by a separate chmod()) so the file is never
+                # briefly world/group-readable between creation and permission-tightening --
+                # the permissions are correct from the very first byte written.
+                fd = os.open(
+                    developer_instructions_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
                 )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(_toml_scalar(system_prompt))
+                developer_instructions_fragment = f'-c "developer_instructions=$(cat {shlex.quote(str(developer_instructions_file))})"'
 
             # Add MCP servers via -c config overrides (per-session, no global config changes).
             # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
@@ -450,7 +571,10 @@ class CodexProvider(BaseProvider):
         # wins even if a profile sets check_for_update_on_startup=true.
         command_parts.extend(["-c", "check_for_update_on_startup=false"])
 
-        return shlex.join(command_parts)
+        command = shlex.join(command_parts)
+        if developer_instructions_fragment is not None:
+            command = f"{command} {developer_instructions_fragment}"
+        return command
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Dismiss startup prompts that block readiness.
@@ -587,9 +711,25 @@ class CodexProvider(BaseProvider):
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         await self._handle_trust_prompt(timeout=20.0)
 
+        # WAITING_USER_ANSWER is included here specifically for the first-run login/auth
+        # menu (see LOGIN_MENU_PATTERN's own comment) — an account with no credentials
+        # configured yet is a real, expected state at this exact point (trust/update
+        # dialogs above are already auto-dismissed by _handle_trust_prompt, so nothing
+        # else should legitimately produce WAITING_USER_ANSWER this early), not a failure.
+        # Without this, initialize() had no way to ever succeed for such an account: the
+        # pane would sit at a correctly-rendered, fully-alive login screen forever without
+        # reaching IDLE/COMPLETED, and CAO would tear the terminal down on every single
+        # attempt before an operator had any real chance to open the session and complete
+        # login themselves.
+        #
+        # CodexProvider now overrides `blocks_orchestrated_input_while_waiting_user_answer`
+        # (see the property above) specifically so this WAITING_USER_ANSWER init-success
+        # path can't let an assign/handoff paste the orchestrated task into the live login
+        # menu -- the same composition hazard PR #539's review flagged for ClaudeCodeProvider's
+        # own choice-prompt widening, fixed here the same way rather than left open.
         if not await wait_until_status(
             self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=float(get_server_settings()["provider_init_timeout"]),
             polling_interval=1.0,
         ):
@@ -677,6 +817,15 @@ class CodexProvider(BaseProvider):
         # where a queued message or blind Enter could select "Update now".
         # Eager inbox delivery is not a vector: accepts_input_while_processing=False.
         if _has_update_dialog_in_bottom(clean_output):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # First-run login/auth menu (no credentials configured yet). Bottom-anchored like
+        # trust-v2, same reasoning. See LOGIN_MENU_PATTERN's own comment for why this can't
+        # be auto-dismissed the way trust/update dialogs are, and why classifying it here
+        # (rather than leaving it unrecognized) matters for initialize()'s own timeout.
+        if re.search(LOGIN_MENU_PATTERN, bottom_region) and re.search(
+            LOGIN_MENU_FOOTER, bottom_region
+        ):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.
@@ -872,3 +1021,11 @@ class CodexProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Codex CLI provider."""
         self._initialized = False
+        # Remove the developer_instructions temp file written by _build_codex_command, if any --
+        # same convention claude_code.py's own cleanup() uses for its analogous .prompt file.
+        # Path comes from _developer_instructions_file_path() (single source of truth shared
+        # with _build_codex_command) so the write site and the cleanup site can't drift apart.
+        try:
+            self._developer_instructions_file_path().unlink(missing_ok=True)
+        except OSError:
+            pass

@@ -19,6 +19,7 @@ Terminal Workflow:
 
 import asyncio
 import logging
+import os
 import re
 import threading
 import time
@@ -61,6 +62,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services import worktree_service
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -180,6 +182,7 @@ async def create_terminal(
     engine: Optional[KiroEngine | str] = None,
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -217,6 +220,13 @@ async def create_terminal(
             (e.g. MCP handoff/assign's own `model` parameter) pin a specific
             model for one worker without needing a dedicated agent profile.
             None = behavior unchanged (profile.model, if any, still applies).
+        use_worktree: If True, provision an isolated ``git worktree`` (issue
+            #100) for this terminal instead of using ``working_directory`` as
+            given -- resolves the repo root from ``working_directory`` (or the
+            server's own cwd when unset), creates a fresh worktree on its own
+            branch there, and overrides ``working_directory`` to the new
+            worktree path before the tmux session/window is created. Requires
+            the resolved directory to actually be inside a git repository.
 
     Returns:
         Terminal object with all metadata populated
@@ -235,6 +245,11 @@ async def create_terminal(
     # new one, but had no equivalent for a window added to a session that
     # already existed — see the `except` block.
     window_created = False
+    # Reassigned to the resolved repo root once a worktree is actually created
+    # below (Step 1b), so the failure-cleanup path (the `except` block) knows
+    # whether there is a worktree to roll back too. Still None if Step 1b never
+    # ran (use_worktree=False) or itself failed before create_worktree returned.
+    worktree_repo_root: Optional[str] = None
     try:
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
         # resource. A KAS request must probe then fail closed with no window,
@@ -299,6 +314,28 @@ async def create_terminal(
             session_name = generate_session_name()
 
         window_name = generate_window_name(agent_profile)
+
+        # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
+        # the tmux session/window below consumes `working_directory` -- the
+        # worktree's own path REPLACES whatever `working_directory` was given
+        # (explicit or caller-inherited), so the terminal always launches inside
+        # its own isolated checkout rather than the shared one it would
+        # otherwise have used.
+        if use_worktree:
+            # `find_repo_root`/`create_worktree` are synchronous `subprocess.run`
+            # calls (a full worktree checkout can take seconds to tens of
+            # seconds on a large repo); `create_terminal` is awaited directly on
+            # the shared event loop, so running them in-line here would freeze
+            # every other cao-server request (status monitor ticks, inbox
+            # delivery, unrelated terminal calls) for the duration. Offload to a
+            # thread, same posture as `delete_terminal`'s own blocking subprocess
+            # work (see its `run_in_executor` call site in api/main.py).
+            worktree_repo_root = await asyncio.to_thread(
+                worktree_service.find_repo_root, working_directory or os.getcwd()
+            )
+            working_directory = await asyncio.to_thread(
+                worktree_service.create_worktree, worktree_repo_root, terminal_id
+            )
 
         # Step 2: Create tmux session or window
         if new_session:
@@ -563,6 +600,18 @@ async def create_terminal(
                 get_backend().kill_window(session_name, window_name)
             except Exception:
                 pass  # Ignore cleanup errors
+        if worktree_repo_root is not None:
+            # A worktree WAS created (Step 1b succeeded) before some later step
+            # failed -- roll it back too, same best-effort posture as everything
+            # else in this block. Without this, a provider-init timeout (or any
+            # later failure) on a worktree-backed terminal would leave an orphan
+            # worktree + branch behind with no CAO-side record pointing at it.
+            # Offloaded to a thread for the same reason Step 1b's create is:
+            # `git worktree remove` is a blocking subprocess call and this
+            # `except` block still runs on the shared event loop.
+            await asyncio.to_thread(
+                worktree_service.remove_worktree, worktree_repo_root, terminal_id
+            )
         raise
 
 
@@ -1432,6 +1481,22 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         metadata = get_terminal_metadata(terminal_id)
 
         if metadata:
+            # Read the pane's live working directory BEFORE kill_window below
+            # destroys the pane. Single read, reused for two purposes: the
+            # scrollback snapshot below, and issue #100 Phase 1's worktree
+            # cleanup (recognizing a worktree-backed terminal from its live
+            # cwd alone -- there is no separate CAO-side record of which
+            # terminals are worktree-backed). Best-effort: a read failure
+            # means the snapshot's working_directory field is None and no
+            # worktree cleanup runs below.
+            live_working_directory = None
+            try:
+                live_working_directory = get_backend().get_pane_working_directory(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
@@ -1452,9 +1517,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                     "window_name": metadata["tmux_window"],
                     "agent_profile": metadata.get("agent_profile"),
                     "provider": metadata["provider"],
-                    "working_directory": get_backend().get_pane_working_directory(
-                        metadata["tmux_session"], metadata["tmux_window"]
-                    ),
+                    "working_directory": live_working_directory,
                     "allowed_tools": metadata.get("allowed_tools"),
                     "caller_id": metadata.get("caller_id"),
                 }
@@ -1488,6 +1551,30 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+
+            # issue #100 Phase 1: if this terminal was worktree-backed (its live
+            # cwd matched the CAO-managed worktree path shape), remove the
+            # worktree + branch now that the process using it is gone.
+            # `remove_worktree` is itself best-effort/never-raises, matching
+            # every other step in this teardown.
+            #
+            # The parsed terminal_id MUST match the terminal actually being
+            # deleted here, not just "some" CAO worktree path. Without this
+            # guard: a worktree-backed terminal A (cwd
+            # .../.cao/worktrees/A) can spawn a non-worktree terminal B with
+            # working_directory explicitly set to A's cwd (handoff/assign
+            # both accept an explicit working_directory, and "here" -- the
+            # caller's own directory -- is a common choice). Deleting B --
+            # including handoff's automatic success teardown -- would then
+            # read B's pane cwd (== A's worktree path), parse terminal_id
+            # "A" out of it, and force-remove A's still-running worktree.
+            # Mismatched parses now fall through as a no-op leak (Phase 3
+            # territory) instead of destroying another terminal's checkout.
+            parsed = worktree_service.parse_worktree_path(live_working_directory)
+            if parsed is not None:
+                worktree_repo_root, worktree_terminal_id = parsed
+                if worktree_terminal_id == terminal_id:
+                    worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)

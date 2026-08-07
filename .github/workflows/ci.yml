@@ -387,6 +387,249 @@ jobs:
         # Non-zero exit fails the job; the script cleans up the server on exit.
         run: ./examples/ag-ui/ag-ui-stock-client-live/run.sh
 
+  # =======================================================================================
+  # RUST TUI (issue #321, unit `rust-ci`). THE FIRST JOB IN ci.yml THAT INSPECTS THE RUST
+  # CRATE AT ALL — measured before this change: `cargo` appeared in only
+  # publish-to-pypi.yml, never here.
+  #
+  # So until this job existed, the crate's 46 tests across 6 targets were green ONLY because
+  # they had been run by hand. Nothing in CI would have noticed a regression, a clippy
+  # warning, a cargo-deny advisory, or an FFI dependency appearing in the graph.
+  #
+  # ALSO THIS FILE'S FIRST NON-LINUX RUNNER. `wheel-matrix` added macOS/Windows runners to
+  # the publish workflow; every `runs-on:` in ci.yml was ubuntu-latest.
+  # =======================================================================================
+  rust:
+    name: Rust TUI (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    # TS-2 and team.md: every job running a pty test carries an explicit `timeout-minutes`.
+    # ci.yml had ZERO before this job (the 6 in the repo are all wheel-matrix's, in the
+    # publish workflow), so a deadlocked pty test would have burned the 6-hour default with
+    # no diagnosis.
+    #
+    # 20 minutes is chosen against measurement, not by feel. Locally, from a COLD target dir:
+    # 9.6s to build all six test targets, 8.0s to build-and-run the suite, and the pty target
+    # itself takes 2.12s. A cold CI runner with no cargo cache is slower — toolchain install,
+    # crate downloads, and a debug build of 39 crates — but that is a minutes-scale budget,
+    # not a tens-of-minutes one. 20 minutes leaves roughly an order of magnitude of headroom
+    # over the measured cost while still failing a genuine hang fast.
+    #
+    # Deliberately NOT `timeout(1)` around the test command: that coreutils binary is absent
+    # on some developer machines (hit three times while building this unit) and cannot be
+    # assumed on a runner image either. `timeout-minutes` is the harness-level bound, and the
+    # pty harness carries its own per-read deadline as the inner one. (#321)
+    timeout-minutes: 20
+    strategy:
+      # TS-1 / interview Q4: pty buffering, EOF semantics, and drain ordering differ between
+      # Darwin and Linux, and macOS arm64 is the development platform — so LINUX IS THE
+      # UNTESTED HALF and this job is what finally exercises it.
+      #
+      # `fail-fast: false` for the same reason wheel-matrix uses it: knowing WHICH platform
+      # fails is the diagnostic value of a matrix whose second leg has never run.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS arm64
+          - os: ubuntu-latest
+            label: Linux x86_64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # SHA-pinned, not `@stable` (SR-5, interview Q10): `stable` is a mutable BRANCH on this
+      # action's repo, so `@stable` re-resolves on every run and is unreviewable supply chain.
+      # The toolchain channel is selected by the `toolchain` input, which is what `@stable`
+      # actually did. Same pin wheel-matrix resolved, reused rather than re-resolved.
+      #
+      # `components: rustfmt, clippy` is REQUIRED, not decorative: this action installs with
+      # `--profile minimal`, which ships neither. Without them `cargo fmt`/`cargo clippy`
+      # would fail as unknown subcommands — a red job for the wrong reason.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable @ 2026-07-16
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      # The no-FFI check below is a Python script, so Python is provisioned EXPLICITLY rather
+      # than relying on whatever the runner image happens to preinstall. That is the same
+      # class of mistake as assuming `timeout(1)` exists — a tool that is present on one
+      # machine and absent on another, discovered only when the gate fails for the wrong
+      # reason. GitHub's images do ship Python, but the version differs across the macOS and
+      # Ubuntu images and is not contractual.
+      #
+      # Same SHA pin `wheel-matrix` resolved for the smoke-test job, reused rather than
+      # re-resolved (SR-5). (#321)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      # ---------------------------------------------------------------------------------
+      # BLOCKING GATE 1 — formatting. Mirrors black/isort's `--check` posture for Python.
+      # ---------------------------------------------------------------------------------
+      - name: cargo fmt --check
+        working-directory: tui
+        run: cargo fmt --check
+
+      # ---------------------------------------------------------------------------------
+      # BLOCKING GATE 2 — clippy.
+      #
+      # `--all-targets` IS LOAD-BEARING AND MUST NOT BE "SIMPLIFIED" AWAY.
+      #
+      # team.md affirms `cargo clippy -- -D warnings`. The bare form lints only the default
+      # target selection and SKIPS TEST TARGETS — so every one of this crate's integration
+      # tests (tests/pty.rs, tests/endpoint_contract.rs, tests/hermeticity_tripwire.rs,
+      # tests/no_backend_attach_call.rs, tests/binary_exits_zero.rs) would escape the gate
+      # entirely. That was discovered while linting a new integration test in
+      # `skeleton-crate`: the bare command passed on code the `--all-targets` form rejected.
+      #
+      # This is a deliberate CORRECTION to an affirmed practice, not an embellishment of it.
+      # Do not drop `--all-targets` to match the letter of team.md — the affirmed form is
+      # insufficient, and the test code is where a pty harness's unwrap-heavy mistakes live.
+      #
+      # `--locked` (TS-2, interview Q7) so a clippy run cannot quietly re-resolve the graph.
+      # The escape hatch for a genuine false positive stays per-site: `#[allow(lint_name)]`
+      # plus an issue-number comment (SR-3) — never a global relaxation here. (#321)
+      # ---------------------------------------------------------------------------------
+      - name: cargo clippy (--all-targets so TEST code is linted too)
+        working-directory: tui
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # ---------------------------------------------------------------------------------
+      # THE TESTS — 46 across 6 targets, including the real-pty harness.
+      #
+      # `--locked` so the build FAILS if Cargo.lock would change (TS-2). Cargo.lock is
+      # committed, and without --locked a silent re-resolution would mean CI tested a
+      # different graph than the one under review.
+      #
+      # This is the step whose Linux half has never run. The pty tests assert real terminal
+      # behaviour — isatty, TIOCSWINSZ resize, non-UTF-8 byte passthrough, SIGTERM->SIGKILL
+      # escalation, and a concurrent drain that must not deadlock — and every one of those
+      # differs in detail between Darwin and Linux. (#321)
+      # ---------------------------------------------------------------------------------
+      - name: Assert no Python-FFI crate in the dependency graph (FR-5.2)
+        # Ordered BEFORE `cargo test` and marked `if: always()` deliberately. It used to run
+        # AFTER the tests with no condition, so a test failure -- which happened on EVERY PR,
+        # since no cao-server was started -- meant FR-5.2's no-FFI gate NEVER EXECUTED. A red
+        # job is loud; a gate that never ran is not. Found by the ss12a reviewer for
+        # skeleton-endpoint-verify. (#321)
+        if: always()
+        run: python scripts/assert_no_ffi.py --manifest-path tui/Cargo.toml
+
+      # The three live-contract tests in tui/tests/endpoint_contract.rs call a REAL cao-server;
+      # they are the deliberate hermeticity exemption. Without a server they fail on
+      # `Connection refused` on every PR (verified: with CAO_API_PORT=19999 they FAIL rather than
+      # skip, which is correct BR-7 behaviour and is why this gap was visible at all).
+      #
+      # `uv sync` is required because this job installs Python but NOT the project — it had
+      # `setup-python` and no `uv sync`, so `cao-server` did not exist here at all. (#321)
+      # This job runs `uv` but had NO `setup-uv` — it was the only uv-using job in the workflow
+      # without it, so `uv sync` would fail with `uv: command not found`. Caught by comparing every
+      # job's setup-uv presence against its uv usage rather than assuming the toolchain was there.
+      # NOTE: `@v4` is a MUTABLE tag, matching the three pre-existing setup-uv call sites in this
+      # file. The affirmed SHA-pinning rule covers actions THIS INTENT adds; pinning here while the
+      # other three stay on @v4 would be inconsistent without pinning all four. Flagged in
+      # ci-config.md as a follow-up rather than half-applied. (#321)
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install the Python project (provides cao-server for the live contract test)
+        run: uv sync --all-extras --dev
+
+      - name: Start cao-server and wait for readiness
+        # Poll /health rather than `sleep N`: a fixed sleep is either flaky or slow, and /health is
+        # the same endpoint the TUI itself probes. 30 x 1s matches the readiness cap the TUI uses.
+        # `timeout(1)` is NOT used — it does not exist on macOS runners by default. (#321)
+        run: |
+          # The PID IS recorded and IS read — by the teardown step below. An earlier revision
+          # wrote /tmp/cao-server.pid that nothing read, and the revision after that dropped the
+          # file entirely on the reasoning that "the runner is ephemeral and torn down with the
+          # job, so a cleanup step would be ceremony."
+          #
+          # THAT REASONING WAS WRONG, and the first CI run is what proved it: `setup-uv`'s
+          # POST-JOB step runs before the runner is torn down, and on macOS it hung for exactly
+          # 300s in `uv cache prune --ci` and then failed the job with exit 2 — after all 8 pty
+          # tests had PASSED. The job's own teardown line names the culprit: "Terminate orphan
+          # process: pid (12288) (Python)". The server was still running while the post step tried
+          # to prune the cache underneath it.
+          #
+          # Linux passed this step only by luck: its uv cache RESTORED, and `setup-uv` skips the
+          # prune-and-save path entirely on a cache hit. macOS missed ("Failed to restore: Cache
+          # service responded with 400"), took the prune path, and hit the contention. So this is
+          # a cache-miss-only failure on BOTH platforms, not a Darwin quirk — which is why the fix
+          # is an explicit shutdown rather than a platform condition. (#321)
+          uv run cao-server &
+          echo "$!" > "${RUNNER_TEMP}/cao-server.pid"
+          for i in $(seq 1 30); do
+            if curl -sf "http://127.0.0.1:9889/health" >/dev/null 2>&1; then
+              echo "cao-server ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "cao-server did not become ready within 30s" >&2
+          exit 1
+
+      - name: cargo test --locked
+        working-directory: tui
+        run: cargo test --locked
+
+      # `if: always()` so the server is stopped even when the tests FAIL. Without it a red test
+      # run would leave the server up and turn one honest failure into two — the test failure plus
+      # a post-job cache error that has nothing to do with the change under review.
+      #
+      # Kills the process GROUP (`-PID`), not just the recorded pid: `uv run cao-server` is a
+      # parent `uv` process that execs the server as a child, and the Linux teardown listed BOTH
+      # ("pid (3510) (uv)", "pid (3517) (cao-server)"). Killing only the recorded pid would leave
+      # the other alive and holding the cache — the exact condition this step exists to remove.
+      #
+      # Never fails the job: `|| true` on every kill and `exit 0` at the end. A cleanup step that
+      # can fail is a second way for a green build to go red, and "the server had already exited"
+      # is not a defect. (#321)
+      - name: Stop cao-server before the post-job cache steps run
+        if: always()
+        run: |
+          pidfile="${RUNNER_TEMP}/cao-server.pid"
+          if [ ! -f "$pidfile" ]; then
+            echo "no pidfile at $pidfile; cao-server was never started"
+            exit 0
+          fi
+          pid="$(cat "$pidfile")"
+          # SIGTERM the group, give it a moment, then SIGKILL whatever ignored it. Mirrors the
+          # pty harness's own escalation rather than inventing a second shutdown policy.
+          kill -TERM "-${pid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+          for _ in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          kill -KILL "-${pid}" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+          rm -f "$pidfile"
+          echo "cao-server stopped"
+          exit 0
+
+      # ---------------------------------------------------------------------------------
+      # THE NO-FFI GATE (FR-5.2, SR-4, T-10) — hard gate, on BOTH platforms.
+      #
+      # T-10 forbids linking the TUI against the Python runtime: the boundary is subprocess
+      # for CLI invocation and HTTP for server reads. The affirmed rule requires this be a
+      # DETERMINISTIC dependency-graph check rather than a code-review convention, because an
+      # FFI crate does not arrive as a reviewable line in Cargo.toml — it arrives several
+      # levels down a transitive chain in a diff that shows only Cargo.lock churn.
+      #
+      # PROVEN ABLE TO FAIL, not assumed: `pyo3 = "0.22"` was planted in tui/Cargo.toml, the
+      # graph re-resolved (39 -> 53 crates), and the check rejected it — naming both `pyo3`
+      # and the transitively-pulled `pyo3-ffi` — before Cargo.toml/Cargo.lock were restored
+      # byte-identically. test/test_no_ffi_guard.py keeps that property asserted in the Python
+      # suite, since the live proof mutates the lockfile and cannot run in CI.
+      #
+      # Runs on both platforms deliberately: cargo-deny's own [bans] section carries an
+      # independent implementation of the same ban, but that job is a Docker action and
+      # therefore Linux-only. This step is the macOS coverage. (#321)
+      # ---------------------------------------------------------------------------------
+      # `python`, not `python3`: actions/setup-python puts `python` on PATH on every platform,
+      # and this matches how publish-to-pypi.yml already invokes scripts/assert_wheel_matrix.py.
+      # No `working-directory` — the script takes a repo-root-relative --manifest-path.
   security:
     name: Security Scan
     runs-on: ubuntu-latest
@@ -402,6 +645,15 @@ jobs:
         run: |
           uv export --format requirements-txt > requirements.txt
 
+      # SR-4 (interview Q1): `exit-code: 1` makes this job FAIL on a CRITICAL/HIGH finding.
+      # Before this, the step had no exit-code, so it uploaded SARIF and continued — meaning
+      # "Security Scan passed" attested that a scan COMPLETED, not that it was clean. The
+      # rest of the repo already treats scanners as gates: secret-scan.yml passes
+      # `--exit-code 1` to gitleaks at both :68 and :82. This closes the inconsistency
+      # rather than introducing a new policy. (#321)
+      #
+      # SARIF is still produced and uploaded (see the next step's `if: always()`), so the
+      # Security tab keeps its history even on a failing run.
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # v0.69.3
         with:
@@ -411,9 +663,13 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          exit-code: '1'
 
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
+        # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL finding
+        # would fail the scan step and SKIP the upload, hiding the very finding that failed
+        # the build from the Security tab.
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
@@ -439,3 +695,31 @@ jobs:
 # processed when the default setup is enabled") and fail uploads. To widen the
 # query suite beyond the default, toggle default setup off in
 # Settings → Code security → CodeQL default setup and re-add a workflow job.
+#
+# ---------------------------------------------------------------------------------------
+# RUST SAST IS AN ACCEPTED, NAMED GAP — considered and declined, not forgotten (SR-6,
+# interview Q6; issue #321).
+#
+# There is deliberately NO Rust static-analysis/scanning job in this file. The reason is the
+# constraint recorded immediately above: CodeQL here runs via default setup, and a
+# workflow-based scanning job that uploads SARIF conflicts with it and fails the upload. So
+# adding one would not buy Rust SAST — it would break the analysis that already runs.
+#
+# What covers the Rust code instead, and it is genuinely less than SAST:
+#   - `cargo clippy --locked --all-targets -- -D warnings` (the `rust` job) — a hard gate,
+#     linting TEST targets as well as the binary. The per-site escape hatch is
+#     `#[allow(lint_name)]` plus an issue-number comment (SR-3), never a global relaxation.
+#   - `#![forbid(unsafe_code)]` at tui/src/main.rs line 1 — memory-safety classes that SAST
+#     would hunt for cannot be expressed in this crate at all. It is a compile-time refusal,
+#     not a warning.
+#   - `cargo-deny` (.github/workflows/cargo-deny.yml) — RustSec advisories over the whole
+#     resolved graph, weekly as well as per-PR. That is dependency CVE coverage, which is a
+#     different axis from first-party static analysis.
+#
+# WHAT REMAINS UNCOVERED: first-party Rust logic flaws — taint flow into a subprocess argv,
+# an injection path through a constructed command, a TOCTOU on a file the TUI writes. clippy
+# is a lint pass, not a dataflow analysis, and will not find those. Unit `rust-ci` treats this
+# as an accepted gap rather than papering over it; to close it, toggle CodeQL default setup off
+# (Rust is supported by CodeQL) and add a single advanced-configuration job covering Python and
+# Rust together.
+# ---------------------------------------------------------------------------------------

@@ -183,6 +183,7 @@ def _create_terminal(
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -207,6 +208,11 @@ def _create_terminal(
             ahead of the agent profile's own static model field (where the
             resolved provider supports it). Honored by both the existing-
             session and new-session branches.
+        use_worktree: If True, the created terminal gets an isolated git
+            worktree (issue #100 Phase 1) instead of sharing
+            ``working_directory`` as given. Only meaningful on the
+            existing-session (assign) branch below -- the new-session branch
+            has no live caller today.
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -268,6 +274,8 @@ def _create_terminal(
             params["engine"] = engine
         if model is not None:
             params["model"] = model
+        if use_worktree:
+            params["use_worktree"] = "true"
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -713,6 +721,7 @@ async def _handoff_impl(
     working_directory: Optional[str] = None,
     engine: Optional[str] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -775,6 +784,7 @@ async def _handoff_impl(
             "prompt": shaped_message,
             "teardown": True,
             "timeout": float(timeout),
+            "use_worktree": use_worktree,
         }
         if ctx.session_name:
             payload["session_name"] = ctx.session_name
@@ -890,6 +900,19 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        use_worktree: bool = Field(
+            default=False,
+            description=(
+                "If true, provision an isolated git worktree for this handoff instead of "
+                "sharing the supervisor's working directory -- the worktree checkout is "
+                "created on its own branch from the target repo's current HEAD. At "
+                "teardown, the checkout's working-tree contents are always discarded, but "
+                "the branch is only deleted if it has no unmerged commits -- commit AND "
+                "merge/push results before finishing if you need them kept. Requires the "
+                "resolved working directory (explicit or inherited) to be inside a git "
+                "repository."
+            ),
+        ),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -919,6 +942,20 @@ if ENABLE_WORKING_DIRECTORY:
         - You can pin a specific model via the model parameter, without needing a
           dedicated agent profile -- not honored by every provider
 
+        ## Isolated worktrees (use_worktree)
+
+        - Set use_worktree=true to give this handoff its own git worktree instead of
+          sharing the supervisor's (or working_directory's) checkout -- closes the
+          "parallel agents editing the same branch/files" race.
+        - The worktree is created from the resolved directory's repo, on its own
+          branch, and torn down when the handoff's terminal is torn down (success or
+          failure): the checkout's working-tree contents are always discarded, but the
+          branch is only deleted if it has no unmerged commits. Commit AND merge/push
+          any results you need kept before the handoff completes -- an uncommitted or
+          unmerged result is not preserved.
+        - Requires the resolved working directory to actually be inside a git
+          repository; otherwise the handoff fails with a clear error.
+
         ## Requirements
 
         - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
@@ -931,12 +968,19 @@ if ENABLE_WORKING_DIRECTORY:
             timeout: Maximum wait time in seconds
             working_directory: Optional directory path where agent should execute
             model: Optional model override (not honored by every provider)
+            use_worktree: If true, isolate this handoff in its own git worktree
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
         return await _handoff_impl(
-            agent_profile, message, timeout, working_directory, engine=engine, model=model
+            agent_profile,
+            message,
+            timeout,
+            working_directory,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
         )
 
 else:
@@ -957,6 +1001,18 @@ else:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        use_worktree: bool = Field(
+            default=False,
+            description=(
+                "If true, provision an isolated git worktree for this handoff instead of "
+                "sharing the supervisor's working directory -- the worktree checkout is "
+                "created on its own branch from the target repo's current HEAD. At "
+                "teardown, the checkout's working-tree contents are always discarded, but "
+                "the branch is only deleted if it has no unmerged commits -- commit AND "
+                "merge/push results before finishing if you need them kept. Requires the "
+                "supervisor's current directory to be inside a git repository."
+            ),
+        ),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -979,6 +1035,17 @@ else:
         - You can pin a specific model via the model parameter, without needing a
           dedicated agent profile -- not honored by every provider
 
+        ## Isolated worktrees (use_worktree)
+
+        - Set use_worktree=true to give this handoff its own git worktree instead of
+          sharing the supervisor's checkout -- closes the "parallel agents editing the
+          same branch/files" race.
+        - Torn down when the handoff's terminal is torn down: the checkout's
+          working-tree contents are always discarded, but the branch is only deleted if
+          it has no unmerged commits. Commit AND merge/push any results you need kept
+          before the handoff completes.
+        - Requires the supervisor's current directory to be inside a git repository.
+
         ## Requirements
 
         - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
@@ -989,12 +1056,19 @@ else:
             message: The task/message to send
             timeout: Maximum wait time in seconds
             model: Optional model override (not honored by every provider)
+            use_worktree: If true, isolate this handoff in its own git worktree
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
         return await _handoff_impl(
-            agent_profile, message, timeout, None, engine=engine, model=model
+            agent_profile,
+            message,
+            timeout,
+            None,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
         )
 
 
@@ -1005,6 +1079,7 @@ def _assign_impl(
     working_directory: Optional[str] = None,
     engine: Optional[str] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1065,6 +1140,7 @@ def _assign_impl(
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
+            use_worktree=use_worktree,
         )
 
         return {
@@ -1126,6 +1202,17 @@ Example message: "Analyze the logs. When done, send results back to terminal ee3
 - You can pin a specific model for this one worker via the model parameter, without
   needing a dedicated agent profile -- not honored by every provider
 
+## Isolated worktrees (use_worktree)
+
+- Set use_worktree=true to give this worker its own git worktree instead of sharing
+  the supervisor's checkout -- closes the "parallel agents editing the same
+  branch/files" race.
+- The worktree is created on its own branch. When you call delete_terminal on the
+  worker, the checkout's working-tree contents are always discarded, but the branch
+  is only deleted if it has no unmerged commits -- commit AND merge/push results
+  before deleting the worker if you need them kept.
+- Requires the resolved working directory to be inside a git repository.
+
 ## Cleanup
 
 When you are done with an assigned terminal (received results or no longer need it),
@@ -1141,6 +1228,7 @@ Args:
 
     desc += """
     model: Optional model override for the worker (not honored by every provider)
+    use_worktree: If true, isolate this worker in its own git worktree
 
 Returns:
     Dict with success status, worker terminal_id, and message"""
@@ -1172,8 +1260,26 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        use_worktree: bool = Field(
+            default=False,
+            description=(
+                "If true, provision an isolated git worktree for this worker instead of "
+                "sharing the supervisor's working directory. At teardown (delete_terminal), "
+                "the checkout's working-tree contents are always discarded, but the branch "
+                "is only deleted if it has no unmerged commits -- commit AND merge/push "
+                "results before deleting the worker if you need them kept. Requires the "
+                "resolved working directory to be inside a git repository."
+            ),
+        ),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, working_directory, engine=engine, model=model)
+        return _assign_impl(
+            agent_profile,
+            message,
+            working_directory,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
+        )
 
 else:
 
@@ -1187,8 +1293,26 @@ else:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        use_worktree: bool = Field(
+            default=False,
+            description=(
+                "If true, provision an isolated git worktree for this worker instead of "
+                "sharing the supervisor's working directory. At teardown (delete_terminal), "
+                "the checkout's working-tree contents are always discarded, but the branch "
+                "is only deleted if it has no unmerged commits -- commit AND merge/push "
+                "results before deleting the worker if you need them kept. Requires the "
+                "supervisor's current directory to be inside a git repository."
+            ),
+        ),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, None, engine=engine, model=model)
+        return _assign_impl(
+            agent_profile,
+            message,
+            None,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
+        )
 
 
 # Implementation function for send_message

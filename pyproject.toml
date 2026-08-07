@@ -44,6 +44,19 @@ dependencies = [
     # JWKS). The [crypto] extra pulls in `cryptography` for RSA signature
     # verification and provides `jwt.PyJWKClient`. See spec task 9.1 research note.
     "pyjwt[crypto]>=2.8.0",
+    # Floor on the TRANSITIVE `cryptography` that `pyjwt[crypto]` pulls in. Two HIGH
+    # advisories affect the 48.0.1 the lockfile had resolved: GHSA-g6cj-pr64-35w5
+    # (CVE-2026-69247, PKCS#7 Bleichenbacher oracle, fixed in 50.0.0) and
+    # GHSA-jwv3-5hgf-82ww (CVE-2026-69249, exponential cert path-building, fixed in
+    # 49.0.0). Neither reaches this codebase's own call path — only `jwt.PyJWKClient`
+    # RSA verification is used — but Trivy's CRITICAL/HIGH gate is repo-wide, and
+    # PR #547 makes that gate blocking (`exit-code: 1`), so an unpatched transitive
+    # dep now fails CI rather than merely appearing in the Security tab.
+    #
+    # Declared as a DIRECT floor because a transitive pin cannot be expressed any
+    # other way: `pyjwt[crypto]` itself only requires `cryptography>=3.4`, so a bare
+    # `uv lock --upgrade-package` would drift back down on the next unrelated relock.
+    "cryptography>=50.0.0",
     "jsonschema>=4.25",
     "jinja2>=3.1.0",
     # Obsidian graph sink (Issue #348) imports yaml at module top; declare it
@@ -100,6 +113,146 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/cli_agent_orchestrator", "src/cao_workflow"]
 
+# Tag the wheel for the platform its bundled Rust binary targets, instead of the
+# py3-none-any that hatchling emits by default. This is issue #321's wheel-tag defect:
+# a wheel measured at py3-none-any while carrying a `Mach-O 64-bit arm64` executable
+# installs cleanly on Linux and Windows and only fails when the operator runs `cao tui`.
+#
+# It is a HOOK and not a config key because hatchling exposes no config key: `infer_tag`
+# and `pure_python` live only in `build_data`, which is reachable solely from a build
+# hook's initialize(). See scripts/hatch_build_tui_tag.py for the source citations.
+#
+# The hook is INERT when no binary is staged, so `uv build` without a Rust toolchain
+# still produces the pure-Python wheel every existing workflow expects. (#321)
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "scripts/hatch_build_tui_tag.py"
+
+# ---------------------------------------------------------------------------------------
+# cibuildwheel — per-platform wheels for the bundled Rust TUI binary (issue #321).
+#
+# WHY THIS EXISTS: `cao tui` ships a compiled `cao-tui` executable inside the wheel. A
+# single py3-none-any wheel claims to run everywhere, so pip installs it on platforms the
+# binary cannot execute on. Per-platform wheels make pip REFUSE an incompatible wheel
+# rather than install a broken one — that refusal is the whole feature.
+#
+# The 4 targets (interview Q2): macOS arm64, macOS x86_64, Linux x86_64, Windows AMD64.
+# Each is built on its own runner in publish-to-pypi.yml; this repo had ZERO non-Linux
+# runners before this change (measured: 25 of 25 `runs-on:` were ubuntu-latest).
+# ---------------------------------------------------------------------------------------
+[tool.cibuildwheel]
+# ONE wheel per platform, not one per Python version. The wheel contains a Rust binary and
+# pure Python — no CPython C extension — so it is ABI-independent and a single cp310 build
+# per platform serves 3.10 through 3.14. cibuildwheel then reuses that wheel for the other
+# interpreters via find_compatible_wheel() (util/packaging.py:145), which matches on the
+# `py3` interpreter tag and the platform, so the reused wheel is still TESTED on each.
+# Building 5 identical wheels per platform would just be 5x the CI minutes.
+build = "cp310-*"
+
+# Trim the build set to the architectures we actually ship and test. Left at the default
+# `auto`, Linux would also attempt i686 and macOS could produce universal2 — platforms no
+# CI job would execute, which is the "built but never run" failure SR-1 forbids.
+archs = ["auto64"]
+
+# musllinux (Alpine) is NOT built. It would need a separate musl Rust target, and no CI job
+# here executes Alpine, so shipping one would be an unexercised wheel. An Alpine operator
+# gets a clean "no matching distribution" from pip — the correct, loud outcome — rather
+# than a wheel whose binary is dynamically linked against glibc. (#321)
+skip = ["*-musllinux_*"]
+
+# Stage the Rust binary BEFORE hatchling evaluates the artifacts glob. Ordering is
+# load-bearing: hatchling treats a glob matching nothing as a SILENT no-op (defect D1's
+# failure mode), so a binary produced after the build would be absent from the wheel while
+# every job reported success. build_tui.py is the existing staging step from the
+# skeleton-wheel-bundle unit — reused, not reimplemented; it runs
+# `cargo build --release --locked` and then asserts its own glob is non-empty.
+before-build = "python {project}/scripts/build_tui.py build"
+
+# SR-1 + NFR-2, in ONE script that receives the wheel path. It (a) asserts the wheel's tag
+# is platform-specific and not py3-none-any, (b) asserts the bundled binary is under the
+# 10 MB ceiling, and (c) RUNS `cao tui` from the installed wheel.
+#
+# Running the binary is the point: `cao --help` would pass with no binary in the wheel at
+# all, and an import check would pass with a binary built for the wrong architecture. Only
+# an exec proves the artifact works on the platform it was built for — "a wheel for a
+# platform on which no CI job has built or executed" is the failure SR-1 forbids, and here
+# it would reach operators.
+#
+# cibuildwheel runs this INSIDE a venv that already has the wheel installed, in a scratch
+# cwd, with {wheel} substituted (platforms/macos.py:762-789). No `repair-wheel-command` is
+# used: that hook must PRODUCE a wheel in dest_dir, so overloading it with an assertion
+# would mean hand-rolling the copy — and auditwheel/delocate have nothing to do here
+# anyway, since `cao-tui` is a standalone executable, not a linked extension module. (#321)
+test-command = "python {project}/scripts/smoke_test_wheel.py --wheel {wheel} --max-binary-bytes 10485760"
+
+# macOS AND Windows need NO platform-specific keys, and deliberately have no
+# `[tool.cibuildwheel.macos]` / `[...windows]` table: an empty table holding only comments
+# reads like active configuration while setting nothing, so the notes live here instead.
+#
+# - Neither has a build container, so `before-build` runs on the host and needs cargo on
+#   PATH. The publish workflow installs it with a SHA-pinned dtolnay/rust-toolchain step
+#   before invoking cibuildwheel (skipped on Linux, where the toolchain must go INSIDE the
+#   container — see `[tool.cibuildwheel.linux] before-all`).
+# - `repair-wheel-command` is NOT overridden, so cibuildwheel's platform DEFAULT runs
+#   (`delocate-wheel --require-archs {delocate_archs}` on macOS, `delvewheel repair` on
+#   Windows). Those tools vendor shared libraries by inspecting a wheel's extension modules,
+#   and there are none here — `cao-tui` is a standalone executable, not a linked `.so`/`.pyd`
+#   (verified: the built wheel contains zero `.so`/`.pyd` files, and the binary links only
+#   `/usr/lib/libSystem.B.dylib`).
+#
+#   The default was left in place rather than blanked because it was MEASURED to be
+#   beneficial, not merely harmless: run against the real wheel, `delocate-wheel` exits 0 and
+#   retags `macosx_26_0_arm64` -> `macosx_11_0_arm64`, widening the wheel's compatibility from
+#   "macOS 26+" to "macOS 11+". The bundled binary survives byte-identical (409,232 bytes,
+#   still `Mach-O 64-bit executable arm64`) and the smoke test passes on the repaired wheel.
+#   Blanking this would have shipped a needlessly narrow macOS floor. (#321)
+#
+# THE macOS x86_64 WHEEL IS CROSS-COMPILED, AND THAT HAS A CONSEQUENCE.
+# GitHub's `macos-latest` is arm64; the x86_64 labels (`macos-15-intel`, `*-large`) are
+# separate images. cibuildwheel drives the cross-build by setting ARCHFLAGS and
+# _PYTHON_HOST_PLATFORM per build identifier; hatchling's tag inference honours both
+# (verified locally: ARCHFLAGS='-arch x86_64' yields a `macosx_*_x86_64` tag), and
+# scripts/build_tui.py maps the same ARCHFLAGS to `--target x86_64-apple-darwin`.
+#
+# CONSEQUENCE, stated rather than glossed: an x86_64 binary cannot be EXECUTED on an arm64
+# runner without Rosetta, so cibuildwheel skips that arch's test and only warns
+# (platforms/macos.py:659-688). The macOS x86_64 wheel is therefore BUILT but NOT executed by
+# this configuration — exactly the state SR-1 names as unacceptable for a shipped wheel. It
+# is recorded as an explicitly UNVERIFIED platform rather than assumed good; closing it needs
+# a native x86_64 runner. (#321)
+
+[tool.cibuildwheel.linux]
+# The manylinux CONTAINER has no Rust toolchain, and `before-build` runs inside it — so
+# rustup is installed in `before-all`, which runs once per container rather than once per
+# wheel. Same `stable` channel the pinned dtolnay action selects on the other platforms.
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+# `repair-wheel-command` is NOT overridden here either, so cibuildwheel's Linux default
+# `auditwheel repair` runs — and that turns out to be REQUIRED, not incidental.
+#
+# hatchling infers the raw `linux_x86_64` platform tag, which PyPI REJECTS outright (it
+# accepts only `manylinux_*`/`musllinux_*`). auditwheel is what retags it. Verified by
+# running the real thing inside `quay.io/pypa/manylinux_2_28_x86_64` against a wheel carrying
+# a genuine ELF binary:
+#
+#   Previous filename tags: linux_x86_64
+#   New filename tags:      manylinux_2_28_x86_64
+#   Previous WHEEL info tags: py3-none-linux_x86_64
+#   New WHEEL info tags:      py3-none-manylinux_2_28_x86_64   (exit 0)
+#
+# Two things this measurement pinned down that were NOT obvious:
+#   * auditwheel EXITS 1 with "This does not look like a platform wheel, no ELF executable or
+#     shared library file ... found" when the wheel has no ELF member. It accepts a standalone
+#     ELF EXECUTABLE — it does not require a linked `.so` — so `cao-tui` qualifies. But this
+#     is also why the Linux leg genuinely depends on `before-all` having produced a Linux
+#     binary: a wheel built without it fails repair rather than shipping untagged.
+#   * `patchelf` must be on PATH; it is present in the manylinux image and absent on a plain
+#     macOS host, which is why this could only be measured inside the container.
+#
+# STILL UNVERIFIED and CI's to prove: the above used a stand-in ELF, because no Linux
+# `cao-tui` has been cross-compiled on this machine. That auditwheel accepts a REAL
+# rust-built `cao-tui` and that the resulting glibc floor is `2_28` are both CI's to confirm.
+# (#321)
+
 [tool.hatch.build]
 artifacts = [
     "src/cli_agent_orchestrator/web_ui/**",
@@ -109,6 +262,21 @@ artifacts = [
     # Vanilla topology widget bundle (committed; no build step) served at
     # /widgets/topology/ and as the cao://widget/topology MCP resource.
     "src/cli_agent_orchestrator/ext_apps/static/**",
+    # Compiled Rust TUI binary, built from the root sibling `tui/` crate by
+    # `scripts/build_tui.py` (cargo build --release) and copied here so the wheel
+    # carries it. `cao tui` locates it back out via importlib.resources, the same
+    # way api/main.py:3697 locates web_ui/.
+    #
+    # WHY THIS GLOB EXISTS — do not delete it as dead config: the path it points at
+    # is gitignored build output, so it is absent from a fresh checkout and looks
+    # unused. Without this line hatchling excludes the binary and the wheel ships
+    # WITHOUT a TUI while every build and publish job still reports success.
+    #
+    # The trailing `*` covers the Windows `.exe` suffix; cargo emits `cao-tui` on
+    # every other platform. Asserted non-empty before publishing by
+    # `scripts/build_tui.py check --wheel dist/` — an artifacts glob that matches
+    # nothing is a SILENT no-op in hatchling, which is defect D1's failure mode. (#321)
+    "src/cli_agent_orchestrator/cao-tui*",
 ]
 
 [dependency-groups]

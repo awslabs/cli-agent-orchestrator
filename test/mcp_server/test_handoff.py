@@ -215,6 +215,33 @@ class TestHandoffOutcomes:
         # The single combined call requests server-side teardown.
         assert mock_requests.post.call_args[1]["json"]["teardown"] is True
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_use_worktree_defaults_to_false_in_the_payload(self, mock_provider, _nudge):
+        """issue #100 Phase 1: unconditionally present in the payload (unlike
+        the Optional fields above) so the server always sees an explicit
+        value, matching RunStepRequest's own unconditional default."""
+        mock_provider.return_value = _ctx("kiro_cli")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert mock_requests.post.call_args[1]["json"]["use_worktree"] is False
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_use_worktree_true_reaches_the_payload(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("kiro_cli")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            asyncio.run(_handoff_impl("developer", "Do task", use_worktree=True))
+
+        assert mock_requests.post.call_args[1]["json"]["use_worktree"] is True
+
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_endpoint_504_maps_to_timeout_result(self, mock_provider):
         """A 504 (worker ran long) becomes a timeout failure and reads the live
