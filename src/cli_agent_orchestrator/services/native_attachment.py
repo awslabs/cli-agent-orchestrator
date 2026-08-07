@@ -30,10 +30,15 @@ State machine::
   the exact published process identity, and an *empty, present* survivor
   observation.  Releasing on a hopeful "probably dead" is what lets a
   survivor and its replacement write to one session.
-- **Ambiguity freezes and never releases.**  When ownership cannot be
-  resolved, the owner is preserved and the row becomes terminal for
-  automation.  A human resolves it.  Auto-releasing an ambiguous row is
-  exactly the double-attach this module exists to prevent.
+- **Ambiguity freezes and never releases *automatically*.**  When
+  ownership cannot be resolved, the owner is preserved and the row
+  becomes terminal for automation.  Auto-releasing an ambiguous row is
+  exactly the double-attach this module exists to prevent.  A human
+  resolves it, through :func:`adjudicate` — the single path out, which
+  requires a named operator and re-refuses an owner still observably
+  alive.  Until that function existed the sentence "a human resolves it"
+  described no reachable code, and the only valve was editing the
+  database by hand.
 
 Every transition is a compare-and-swap on ``(key, epoch, exact owner)``
 and bumps ``epoch``, so a lost update is refused rather than silently
@@ -92,6 +97,19 @@ ACQUISITION_METHODS = frozenset(
 
 INTENT_SCHEMA = "cao-native-attachment-intent-v1"
 NO_SURVIVOR_PROOF_SCHEMA = "cao-native-attachment-no-survivor-v1"
+#: An operator's adjudication of a frozen row.  Deliberately a *different*
+#: schema from the machine-checked no-survivor proof, and stored in the same
+#: column, so a later reader can always tell which kind of evidence detached
+#: a session.  Collapsing the two would make a human's judgement call
+#: indistinguishable from an observed absence.
+ADJUDICATION_SCHEMA = "cao-native-attachment-adjudication-v1"
+
+#: The one outcome an operator may assert.  A closed literal rather than
+#: free text: "the owner is gone" is the only claim that licenses handing
+#: the session to a new attacher, and a typo must not be able to spell
+#: something weaker that still passes.
+ADJUDICATION_OUTCOME_OWNER_GONE = "owner-proven-gone"
+ADJUDICATION_OUTCOMES = frozenset({ADJUDICATION_OUTCOME_OWNER_GONE})
 
 
 class NativeAttachmentError(RuntimeError):
@@ -834,6 +852,235 @@ def mark_ambiguous(
         raise
     except Exception as exc:  # noqa: BLE001 - fail closed
         raise NativeAttachmentUnavailable(f"native attachment freeze failed: {exc}") from exc
+
+
+def adjudication(
+    *,
+    outcome: str,
+    evidence_sha256: str,
+    detail: str,
+    operator: str,
+    observed_at: str,
+    observation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one operator's answer to a frozen attachment.
+
+    This is the human analogue of :func:`no_survivor_proof`, and it is
+    deliberately *not* that function.  A no-survivor proof asserts an
+    observation: the exact published process was looked for and was not
+    there.  A frozen row is frozen precisely because that observation
+    could not be made — most of them never published an identity at all —
+    so a human cannot produce one, and letting them submit one anyway
+    would put a guess into a field that every later reader treats as
+    machine-checked fact.
+
+    What the operator supplies instead is accountability: a closed
+    ``outcome`` they must name exactly, a digest of the evidence they
+    looked at, a bounded free-text ``detail`` explaining the call, and
+    their own name.  ``observation`` is whatever the system could still
+    see at adjudication time, recorded verbatim so a later reader can
+    judge the call rather than only read its conclusion.
+    """
+    if outcome not in ADJUDICATION_OUTCOMES:
+        raise NativeAttachmentInvalid(
+            f"outcome must be one of {sorted(ADJUDICATION_OUTCOMES)}; got {outcome!r}"
+        )
+    evidence_sha256 = _require_text(evidence_sha256, field="evidence_sha256")
+    if len(evidence_sha256) != 64 or any(c not in "0123456789abcdef" for c in evidence_sha256):
+        raise NativeAttachmentInvalid(
+            "evidence_sha256 must be 64 lowercase hex characters; an adjudication whose "
+            "evidence cannot be identified later is an unattributable release"
+        )
+    detail = _require_text(detail, field="detail")
+    if len(detail) > 500:
+        raise NativeAttachmentInvalid(f"detail must be at most 500 characters; got {len(detail)}")
+    if not isinstance(observation, Mapping):
+        raise NativeAttachmentInvalid("observation must be a mapping")
+    return {
+        "schema": ADJUDICATION_SCHEMA,
+        "outcome": outcome,
+        "evidence_sha256": evidence_sha256,
+        "detail": detail,
+        "operator": _require_text(operator, field="operator"),
+        "observed_at": _require_text(observed_at, field="observed_at"),
+        "observation": dict(observation),
+    }
+
+
+def _assert_adjudication_replay_matches(stored: Any, incoming: Mapping[str, Any]) -> None:
+    """Refuse a replay that says something different from the stored record.
+
+    Re-submitting the same adjudication is ordinary: an operator retries, a
+    request is delivered twice.  Re-submitting a *different* one against an
+    already-detached row is not, and silently accepting it would let the
+    second caller believe their reasoning is what released the session when
+    the first caller's is what is on record.
+    """
+    if not isinstance(stored, Mapping) or stored.get("schema") != ADJUDICATION_SCHEMA:
+        raise NativeAttachmentConflict(
+            "this attachment was already detached by a no-survivor proof rather than an "
+            "adjudication; there is nothing frozen left to adjudicate"
+        )
+    differing = [
+        field
+        for field in ("outcome", "evidence_sha256", "detail", "operator")
+        if stored.get(field) != incoming.get(field)
+    ]
+    if differing:
+        raise NativeAttachmentConflict(
+            f"adjudication replay contradicts the stored record; differing {differing}"
+        )
+
+
+def adjudicate(
+    *,
+    provider: str,
+    native_session_id: str,
+    record: Mapping[str, Any],
+    live_survivors: Optional[list[Any]] = None,
+) -> dict[str, Any]:
+    """The one path out of ``ambiguous``, and it is not automation.
+
+    ``mark_ambiguous`` is terminal for every machine in this system.  It
+    has to be: a frozen row is one whose ownership could not be resolved,
+    and a program that resolves it anyway has simply lowered the standard
+    of proof rather than met it.  But "a human resolves it" was, until
+    this function, a sentence describing nothing — no route, no command,
+    and :func:`release` refuses a frozen row at ``_guard_frozen`` before
+    it ever looks at a proof.  The absence had a cost: every frozen
+    session on an install stayed unresumable forever.
+
+    ``live_survivors`` is the caller's *fresh* observation, and it is
+    required to be present.  When the frozen owner published a process
+    identity, an observer must go and look again before a human is
+    allowed to override the freeze; a non-empty list refuses here.  When
+    no identity was ever published — the common case, because most rows
+    freeze before ``mark_attached`` — an honest observer can still only
+    report an empty list, and it is the ``record``'s digest, detail and
+    operator name that carry the decision.  That asymmetry is the point:
+    the machine keeps its veto over an owner it can still see, and gives
+    up only the judgement it was never able to make.
+    """
+    provider = _require_text(provider, field="provider")
+    native_session_id = _require_text(native_session_id, field="native_session_id")
+    if not isinstance(record, Mapping) or record.get("schema") != ADJUDICATION_SCHEMA:
+        raise NativeAttachmentInvalid(
+            f"record must be built by adjudication (schema {ADJUDICATION_SCHEMA!r}); "
+            "an unvalidated adjudication cannot release a frozen session"
+        )
+    if not isinstance(live_survivors, list):
+        raise NativeAttachmentInvalid(
+            "adjudication requires a present live_survivors observation; an absent one is "
+            "indistinguishable from never having looked, which is how the row froze"
+        )
+    validated = dict(record)
+
+    try:
+        with database.SessionLocal() as db:
+            row = _fetch(db, provider, native_session_id)
+            if row is None:
+                raise NativeAttachmentNotFound(
+                    f"no attachment declared for {provider} session {native_session_id}"
+                )
+            if row.state == DETACHED:
+                _assert_adjudication_replay_matches(_parse_json(row.release_proof_json), validated)
+                return _row_dict(row)
+            if row.state != AMBIGUOUS:
+                raise NativeAttachmentConflict(
+                    f"{provider} session {native_session_id} is {row.state!r}, not "
+                    f"{AMBIGUOUS!r}; a live attachment is released by proving its owner gone, "
+                    "not by adjudicating it"
+                )
+            if live_survivors:
+                raise NativeAttachmentConflict(
+                    f"the frozen owner of {provider} session {native_session_id} is still "
+                    f"observably alive ({len(live_survivors)} survivor(s)); an operator may "
+                    "resolve an unresponsive owner, never a running one"
+                )
+
+            observed_epoch = row.epoch
+            updated = (
+                db.query(database.NativeSessionAttachmentModel)
+                .filter(
+                    database.NativeSessionAttachmentModel.provider == provider,
+                    database.NativeSessionAttachmentModel.native_session_id == native_session_id,
+                    database.NativeSessionAttachmentModel.epoch == observed_epoch,
+                    database.NativeSessionAttachmentModel.state == AMBIGUOUS,
+                )
+                .update(
+                    {
+                        "state": DETACHED,
+                        "release_proof_json": _canonical(validated),
+                        "epoch": observed_epoch + 1,
+                        "updated_at": _now(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if updated != 1:
+                current = _fetch(db, provider, native_session_id)
+                raise NativeAttachmentConflict(
+                    f"concurrent modification of {provider} session {native_session_id}; "
+                    f"expected epoch {observed_epoch}, now {current.epoch} "
+                    f"in state {current.state!r}"
+                )
+            return _row_dict(_fetch(db, provider, native_session_id))
+    except NativeAttachmentError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        raise NativeAttachmentUnavailable(f"native attachment adjudication failed: {exc}") from exc
+
+
+def list_attachments(
+    *,
+    states: Optional[frozenset[str]] = None,
+    providers: Optional[frozenset[str]] = None,
+    owner_terminal_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Every attachment matching the filters, oldest claim first.
+
+    The store had no enumerator at all, which is why the leak this
+    function exists to expose could run for two weeks unseen: ``get`` and
+    ``is_held`` both require you to already know the ``(provider,
+    native_session_id)`` you are asking about, so nothing could answer
+    "what is still held?" — the only question an operator or a sweeper
+    actually has.
+
+    Ordered by ``created_at`` so a reader sees the oldest unresolved
+    claim first; that is the one most likely to be an orphan and least
+    likely to be a launch in flight.
+    """
+    if states is not None:
+        unknown = sorted(set(states) - ATTACHMENT_STATES)
+        if unknown:
+            raise NativeAttachmentInvalid(
+                f"unknown attachment state(s) {unknown}; expected a subset of "
+                f"{sorted(ATTACHMENT_STATES)}"
+            )
+    try:
+        with database.SessionLocal() as db:
+            query = db.query(database.NativeSessionAttachmentModel)
+            if states is not None:
+                query = query.filter(
+                    database.NativeSessionAttachmentModel.state.in_(sorted(states))
+                )
+            if providers is not None:
+                query = query.filter(
+                    database.NativeSessionAttachmentModel.provider.in_(sorted(providers))
+                )
+            if owner_terminal_id is not None:
+                query = query.filter(
+                    database.NativeSessionAttachmentModel.owner_terminal_id == owner_terminal_id
+                )
+            rows = query.order_by(
+                database.NativeSessionAttachmentModel.created_at,
+                database.NativeSessionAttachmentModel.provider,
+                database.NativeSessionAttachmentModel.native_session_id,
+            ).all()
+            return [_row_dict(row) for row in rows]
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        raise NativeAttachmentUnavailable(f"native attachment listing failed: {exc}") from exc
 
 
 def get(provider: str, native_session_id: str) -> Optional[dict[str, Any]]:

@@ -163,23 +163,29 @@ and a stale one can "forge a survivor — or, worse, forge a *no*-survivor."
 Session resume must go through this path for every worker it relaunches. It is
 the reason resume is safe at all.
 
-### 4.2 The gap: nothing adjudicates an ambiguous attachment
+### 4.2 Claims are released, and an unresponsive owner can be adjudicated
 
-An unresponsive or unknown owner puts the attachment into `ambiguous`, which is
-deliberately frozen: it "preserves the owner and is never auto-released." That
-is the correct default — automation must not steal a session it cannot prove is
-dead.
+Closed by `docs/native-session-claims.md`. Two things were wrong, and the
+second was hiding behind the first.
 
-But `mark_ambiguous` and `release` are service functions with **no operator-
-facing path**: no API route, no CLI command, and `release` requires a
-no-survivor proof that nothing constructs for a human. So the case that most
-needs resolving — "this old agent is not responding and I want its session
-back" — currently has no valve short of editing the database.
+**`release()` had no production caller at all.** Every claim the system ever
+took stayed live: 258 rows on the reference install, every one at the same
+epoch, not one carrying a release proof. Since `declare()` refuses a live
+owner, that made every provider-native session on that install unresumable —
+so resume could not have worked even for the providers that support it.
+Teardown now closes the claim it opened, and a sweep closes the ones lost to
+a server exiting, which runs no teardown at all.
 
-Needed: an adjudication surface that shows who holds the session, what evidence
-exists that the owner is gone, and records the operator's acknowledgement as the
-release proof. Resuming past a live owner stays refused; resuming past an
-*unresponsive* one becomes possible, deliberately, with a name attached.
+Only a **provably absent pid** releases anything. A live owner is held, and
+so is one whose start marker merely disagrees — the marker is naive local
+wall-clock, and treating a mismatch as a recycled pid would turn a daylight
+-saving rollover into a mass release of running workers.
+
+**Ambiguity stays frozen against automation, and now has a human valve.**
+`cao attachment adjudicate` records who decided, what evidence they looked
+at, and what the system could still see, under a schema distinct from the
+machine proof. Resuming past a live owner stays refused; resuming past an
+*unresponsive* one is possible, deliberately, with a name attached.
 
 ---
 
@@ -257,7 +263,8 @@ Filed as issues against the `cao-system` project when the tracker goes live.
 
 | item | why deferred |
 |---|---|
-| Operator adjudication for an `ambiguous` native-session attachment (§4.2) | in scope for cutover if session stop/resume ships; the service side already exists, only the surface is missing |
+| ~~Operator adjudication for an `ambiguous` native-session attachment (§4.2)~~ | **shipped** — `cao attachment adjudicate`, and the release wiring underneath it that turned out to be missing entirely |
+| A dashboard surface for session claims | the CLI and API exist; nothing renders them, and `run_manifest._attachment_projection` drops the two fields an adjudicating human needs |
 | Memory curator as a shared service, with a responsiveness health model | needs a health contract of its own; the `kind` field unblocks it |
 | Relaunching a historical agent into a new session from the Agents tab, with session-id autocomplete | UI plus a resume path for non-managed launches |
 | Session forking | interacts with resume identity; `validate_resume_argv` explicitly forbids `--fork-session` today |

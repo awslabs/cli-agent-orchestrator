@@ -3307,6 +3307,41 @@ def _delete_terminal_claimed(
         # Cleanup provider state and database record
         _recheck_teardown_claim()
         provider_manager.cleanup_provider(terminal_id)
+        # Close this terminal's claim on its provider-native session.  The
+        # claim is exclusive and keyed by the provider's own session id, so
+        # one that outlives its terminal makes that session permanently
+        # unresumable — a later attach is refused by an owner that no longer
+        # exists.  This runs after the window kill because that is the first
+        # moment the owning process can be observed absent, and before the
+        # row delete so it is still inside the generation claim.
+        #
+        # Never raised.  The window is already killed and the row is about to
+        # go; failing here would abort a teardown part-way and leave worse
+        # state than the claim it was trying to resolve.
+        _recheck_teardown_claim()
+        try:
+            from cli_agent_orchestrator.services import native_attachment_recovery
+
+            for outcome in native_attachment_recovery.release_owned_by_terminal(
+                terminal_id, generation=expected_generation
+            ):
+                if outcome["action"] == "released":
+                    logger.info(
+                        "Released the %s session claim held by terminal %s",
+                        outcome["provider"],
+                        terminal_id,
+                    )
+                else:
+                    logger.warning(
+                        "Terminal %s was torn down while still holding %s session %s (%s): %s",
+                        terminal_id,
+                        outcome["provider"],
+                        outcome["native_session_id"],
+                        outcome["reason"],
+                        outcome.get("detail", ""),
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to resolve native session claims for {terminal_id}: {e}")
         _recheck_teardown_claim()
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)

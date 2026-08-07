@@ -42,6 +42,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from cli_agent_orchestrator.api.attachments import router as native_attachments_router
 from cli_agent_orchestrator.api.tracker import router as tracker_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -138,6 +139,7 @@ from cli_agent_orchestrator.services import (
     managed_launch,
     managed_launch_v2,
     model_turn_receipt_contract,
+    native_attachment_recovery,
     operator_message_service,
     recovery_capabilities,
     secret_gate,
@@ -698,6 +700,18 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("session-env reconcile failed", exc_info=True)
 
+    # Restart recovery: release provider-session claims whose owning process
+    # died with the previous server. Teardown resolves the claims it is
+    # present for, and a server exit runs no teardown at all — that gap is
+    # what left every native session on an install unresumable. Boot is the
+    # cleanest moment to close it: those pids are gone for good, while the
+    # panes that genuinely survived the restart still hold live processes and
+    # are refused on exactly the same test.
+    try:
+        await asyncio.to_thread(native_attachment_recovery.sweep_at_startup)
+    except Exception:
+        logger.warning("native attachment sweep failed", exc_info=True)
+
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
     # provider-specific wakeup path with a unified delivery engine.
     opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
@@ -838,6 +852,7 @@ app.add_middleware(
 # Project-scoped issue tracking lives in its own module rather than inline
 # here; see api/tracker.py.
 app.include_router(tracker_router)
+app.include_router(native_attachments_router)
 
 
 @app.exception_handler(RequestValidationError)

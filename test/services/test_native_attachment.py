@@ -630,3 +630,232 @@ class TestStoreFailsClosed:
         with pytest.raises(em.ExecutionModeInvalid):
             _declare(execution_mode="native")
         assert na.get(PROVIDER, SESSION) is None
+
+
+def _adjudication(**overrides) -> dict:
+    fields = {
+        "outcome": na.ADJUDICATION_OUTCOME_OWNER_GONE,
+        "evidence_sha256": "a" * 64,
+        "detail": "pane and process both gone for six days; scrollback archived",
+        "operator": "colin",
+        "observed_at": "2026-08-07T00:00:00Z",
+        "observation": {"disposition": "unpublished"},
+    }
+    fields.update(overrides)
+    return na.adjudication(**fields)
+
+
+class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
+    """The valve the module's own docstring promised and did not have.
+
+    "A human resolves it" described no reachable code: `release` refuses a
+    frozen row before it looks at a proof, `mark_ambiguous` has no inverse,
+    and nothing exposed either one. So every frozen session on an install
+    stayed unresumable, and the only remedy was editing the database.
+
+    What must stay true is that this is not automation with a nicer name.
+    It records who decided and what they saw, it refuses an owner still
+    observably alive, and its evidence is stored under a schema no machine
+    proof uses.
+    """
+
+    def _freeze(self) -> dict:
+        _declare()
+        return na.mark_ambiguous(
+            provider=PROVIDER, native_session_id=SESSION, reason="pane_create_outcome_unknown"
+        )
+
+    def test_release_still_refuses_a_frozen_attachment(self):
+        record = self._freeze()
+        with pytest.raises(na.NativeAttachmentConflict):
+            na.release(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                proof=_proof(record),
+                **_owner(record),
+            )
+
+    def test_adjudication_moves_a_frozen_row_to_detached(self):
+        self._freeze()
+        result = na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=_adjudication(),
+            live_survivors=[],
+        )
+        assert result["state"] == na.DETACHED
+
+    def test_an_adjudicated_session_can_be_claimed_again(self):
+        self._freeze()
+        na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=_adjudication(),
+            live_survivors=[],
+        )
+        _, acquired = _declare(terminal_id="ffffffff", generation="99999999")
+        assert acquired is True
+
+    def test_a_still_living_owner_is_refused_even_by_an_operator(self):
+        self._freeze()
+        with pytest.raises(na.NativeAttachmentConflict):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record=_adjudication(),
+                live_survivors=[{"pid": 4242, "start_marker": "Jul24 00:00:00"}],
+            )
+        assert na.get(PROVIDER, SESSION)["state"] == na.AMBIGUOUS
+
+    def test_an_absent_survivor_observation_is_refused(self):
+        """Omitting the observation is how the row froze in the first place."""
+        self._freeze()
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record=_adjudication(),
+                live_survivors=None,
+            )
+
+    def test_the_owner_and_the_freeze_reason_are_preserved(self):
+        """The record of what happened outlives the decision to move past it."""
+        frozen = self._freeze()
+        result = na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=_adjudication(),
+            live_survivors=[],
+        )
+        assert result["owner"] == frozen["owner"]
+        assert result["ambiguity_reason"] == "pane_create_outcome_unknown"
+        assert result["epoch"] == frozen["epoch"] + 1
+
+    def test_the_stored_evidence_is_distinguishable_from_a_machine_proof(self):
+        self._freeze()
+        na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=_adjudication(),
+            live_survivors=[],
+        )
+        stored = na.get(PROVIDER, SESSION)["release_proof"]
+        assert stored["schema"] == na.ADJUDICATION_SCHEMA
+        assert stored["schema"] != na.NO_SURVIVOR_PROOF_SCHEMA
+        assert stored["operator"] == "colin"
+
+    def test_an_identical_replay_is_idempotent(self):
+        self._freeze()
+        first = na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=_adjudication(),
+            live_survivors=[],
+        )
+        second = na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=_adjudication(),
+            live_survivors=[],
+        )
+        assert second == first
+
+    def test_a_contradicting_replay_is_a_conflict(self):
+        """Two people must not both believe their reasoning is on record."""
+        self._freeze()
+        na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=_adjudication(),
+            live_survivors=[],
+        )
+        with pytest.raises(na.NativeAttachmentConflict):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record=_adjudication(operator="someone-else"),
+                live_survivors=[],
+            )
+
+    def test_a_machine_released_row_has_nothing_to_adjudicate(self):
+        record = _advance_to_attached()
+        na.release(
+            provider=PROVIDER, native_session_id=SESSION, proof=_proof(record), **_owner(record)
+        )
+        with pytest.raises(na.NativeAttachmentConflict):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record=_adjudication(),
+                live_survivors=[],
+            )
+
+    @pytest.mark.parametrize("state", [na.DECLARED, na.STARTING, na.ATTACHED, na.DRAINING])
+    def test_a_live_attachment_is_released_by_proof_not_by_adjudication(self, state):
+        record, _ = _declare()
+        owner = _owner(record)
+        if state != na.DECLARED:
+            na.mark_starting(provider=PROVIDER, native_session_id=SESSION, **owner)
+        if state in (na.ATTACHED, na.DRAINING):
+            na.mark_attached(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                process_identity=na.process_identity(pid=4242, start_marker="Jul24 00:00:00"),
+                **owner,
+            )
+        if state == na.DRAINING:
+            na.mark_draining(provider=PROVIDER, native_session_id=SESSION, **owner)
+        with pytest.raises(na.NativeAttachmentConflict):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record=_adjudication(),
+                live_survivors=[],
+            )
+
+    def test_an_unvalidated_record_cannot_release_a_frozen_session(self):
+        self._freeze()
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record={"outcome": "owner-proven-gone"},
+                live_survivors=[],
+            )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"outcome": "probably-fine"},
+            {"evidence_sha256": "not-a-digest"},
+            {"evidence_sha256": "A" * 64},
+            {"detail": ""},
+            {"detail": "x" * 501},
+            {"operator": ""},
+        ],
+    )
+    def test_an_unattributable_adjudication_is_refused_before_the_store(self, overrides):
+        with pytest.raises(na.NativeAttachmentInvalid):
+            _adjudication(**overrides)
+
+
+class TestListingTheHeldSessions:
+    """Nothing could answer "what is still held?" — which is why a two-week
+    leak of every claim on an install went unseen."""
+
+    def test_listing_filters_by_state(self):
+        _advance_to_attached()
+        assert [r["state"] for r in na.list_attachments(states=frozenset({na.ATTACHED}))] == [
+            na.ATTACHED
+        ]
+        assert na.list_attachments(states=frozenset({na.AMBIGUOUS})) == []
+
+    def test_listing_filters_by_owner_terminal(self):
+        _advance_to_attached()
+        assert len(na.list_attachments(owner_terminal_id="44dda40b")) == 1
+        assert na.list_attachments(owner_terminal_id="somebody-else") == []
+
+    def test_an_unknown_state_is_refused_rather_than_matching_nothing(self):
+        """A typo that returns an empty list reads as "nothing is held"."""
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.list_attachments(states=frozenset({"detatched"}))

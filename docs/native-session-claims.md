@@ -1,0 +1,222 @@
+# Native session claims: holding one, and giving it back
+
+A provider-native session — a Kimi session id, a Codex conversation, a
+Claude Code session — is a single-writer resource. Two processes attached
+to one of them interleave their turns into a single transcript and corrupt
+both histories, and nothing downstream detects it, because each
+attachment's own receipts look perfectly consistent.
+
+`services/native_attachment.py` is the only way to acquire one. This
+document is about the other half: giving it back.
+
+---
+
+## 1. What was wrong
+
+`native_attachment.release()` was implemented, documented, and covered by
+fourteen unit tests. It had **zero production call sites**. Its only
+non-test mention anywhere in `src/` was a sentence in a docstring.
+
+So every claim the system ever took stayed in a live state forever. On the
+install this was found on:
+
+| | |
+|---|---|
+| attachment rows | 258 |
+| `attached` | 251 |
+| `ambiguous` | 7 |
+| `detached` | **0** |
+| rows carrying a `release_proof_json` | **0** |
+| distinct `epoch` values | **1** (every row at `epoch = 2`) |
+
+`release()` bumps the epoch and writes the proof, so a table where every
+row sits at the declare→starting→attached epoch with no proof is direct
+on-disk evidence that it never ran once in fourteen days.
+
+The consequence is not cosmetic. `declare()` refuses a live owner, so
+**every provider-native session on that install was permanently
+unresumable** — the claim outlived the process, the terminal row, and in
+most cases the tmux server.
+
+A store that only ever acquires is not a lock. It is a leak with a
+conflict check on it.
+
+---
+
+## 2. What decides that an owner is gone
+
+One thing, and deliberately only one: `os.kill(pid, 0)` raising
+`ProcessLookupError`.
+
+Everything else — alive, alive under a different start marker, unreadable,
+or never published at all — holds the claim exactly where it is.
+
+### Why the start marker never decides
+
+Ownership is `(pid, start_marker)`, never a bare pid, because pids are
+recycled and a stale one can "forge a survivor — or, worse, forge a
+*no*-survivor." That reasoning is right, and it does not mean the marker
+should be part of the release test.
+
+The stored marker is raw `ps -o lstart=` output: naive local wall-clock,
+rendered in the writing process's timezone and locale, with BSD's
+two-space padding before a single-digit day.
+
+```
+{"pid": 21063, "start_marker": "Sat Jul 25 15:08:27 2026"}
+```
+
+A rule of the form *"pid alive but the marker differs → the pid was
+recycled → release"* reads a DST rollover, a `TZ` change, or a locale
+change as evidence that a **live** owner is a stranger, and hands its
+session to a second attacher. That is the exact failure the module calls
+"worse", reached by the mechanism meant to prevent it.
+
+`ProcessLookupError` has no such dependency. An absent pid is absent in
+every timezone.
+
+The marker is still read and still recorded — it is what tells an operator
+whether a live pid is plausibly the original owner. It just never decides
+anything.
+
+### What that costs
+
+On the install this was found on, of 251 published identities:
+
+| observation | rows | outcome |
+|---|---|---|
+| pid absent | 231 | released |
+| pid alive, marker matches | 19 | held — genuinely running workers |
+| pid alive, marker differs | 1 | held — really a recycled pid |
+
+The nineteen are real. They were cross-confirmed three ways: matching
+`lstart`, the exact `native_session_id` in sixteen of the nineteen command
+lines, and a currently-existing tmux pane whose `pane_pid` equals the
+stored pid.
+
+**All nineteen look like orphans if you ask the wrong question.** Not one
+of their owning terminals still exists in the `terminals` table. A cleanup
+that decided orphanhood by "is the owner still in the terminals table?"
+would have released nineteen live sessions.
+
+The recycled-pid row is the price: its true owner is dead, but automation
+cannot prove that without trusting the marker, so it stays claimed until a
+human adjudicates it. Unresolved is survivable. A forged no-survivor is
+not.
+
+### Signals that are *not* survivor oracles
+
+| signal | why not |
+|---|---|
+| presence in `terminals` | says all 258 are orphans, including the 19 live ones |
+| `managed_launch_v2_terminals.v2_lifecycle_state` | 46 rows say `live`; 19 are |
+| `owner_pane_id` exists in tmux | pane ids recycle — 62 rows point at a live pane, 19 are its occupant |
+| `native_tui_launch._process_field` returning `None` | means *either* "pid gone" *or* "`ps` could not be run" |
+
+That last one matters most. A no-survivor proof must be an observation
+that was actually made; "we did not look" must never be recorded as
+"nothing is there".
+
+### A claim with no published identity is never released
+
+`declare()` journals the claim *before* the provider process exists. A row
+with no `process_identity` is either a launch in flight or a crash during
+one, and nothing observable tells those apart. The sweep counts them and
+releases none.
+
+---
+
+## 3. Where claims get resolved
+
+### Terminal teardown
+
+`terminal_service._delete_terminal_claimed` is the funnel every deliberate
+teardown passes through. The release runs after the window kill — the
+first moment the owner can be observed absent — and before the row is
+deleted, so it is still inside the generation claim.
+
+`kill-window` sends SIGHUP and returns; the provider still gets to shut
+itself down. Teardown therefore waits briefly, and only while the answer
+is still "alive", for the process to leave the table.
+
+It never raises. The window is already killed and the row is about to go;
+aborting there would leave worse state than the claim it was resolving.
+
+**An owner that outlives its own generation is frozen**, not left quietly
+attached. The pane is gone and the provider is not — a real anomaly — and
+freezing puts it somewhere an operator can see it. A teardown that was
+given only a terminal id freezes nothing: an id can name a replacement
+incarnation, and freezing on that evidence would take a live session out
+of circulation for existing.
+
+### The sweep
+
+Teardown can only resolve claims it is present for. The largest single
+producer of lost claims is the **server exiting**, which runs no teardown
+at all: there is no shutdown hook that enumerates terminals, and the tmux
+backend has no boot-time adjudication. Every one of those claims outlives
+both its process and the row pointing at it.
+
+```
+cao attachment sweep              # report; changes nothing
+cao attachment sweep --apply      # release the provably gone
+```
+
+At boot the server runs the same pass **in report-only mode** and logs the
+command when it finds something. Set `CAO_ATTACHMENT_SWEEP_ON_BOOT=apply`
+to let it act.
+
+The default is conservative for a specific reason: entering this
+application's lifespan is something a *test* does, and two tests in this
+repository do it without stubbing the recovery steps. A boot sweep that
+mutated by default would release rows out of an operator's real database
+as a side effect of running `pytest`.
+
+### Operator adjudication
+
+`mark_ambiguous` freezes a claim whose ownership could not be resolved,
+and the module is emphatic that automation must never undo that:
+auto-releasing an ambiguous row *is* the double-attach it exists to
+prevent.
+
+It also said "a human resolves it" — and no human could. `release()`
+refuses a frozen row before it looks at a proof, `mark_ambiguous` had no
+inverse, and neither had an API route or a CLI command. The only valve was
+editing the database by hand.
+
+```
+cao attachment show kimi_cli session_04c87e57
+cao attachment adjudicate kimi_cli session_04c87e57 \
+    --operator colin \
+    --detail "pane and process both gone for six days" \
+    --evidence ./ps-output.txt
+```
+
+The adjudication is stored under its own schema —
+`cao-native-attachment-adjudication-v1`, not the no-survivor schema — so a
+later reader can always tell a human's judgement from an observed absence.
+It records who decided, a digest of what they looked at, a bounded reason,
+and whatever the system could still see at that moment.
+
+**A live owner is refused here exactly as it is everywhere else.** An
+operator may resolve an unresponsive owner, never a running one. The
+observation is taken server-side rather than accepted from the caller: the
+one party with a motive to release a session should not also supply the
+evidence that doing so is safe.
+
+---
+
+## 4. Known gaps
+
+- **Paths outside the teardown funnel.** The retention sweeper, the
+  session-scoped bulk delete, and the `create_terminal` failure rollback
+  delete terminal rows directly. Today only the v2 launch path records a
+  native session id, so their exposure is theoretical — but the sweep is
+  what covers them, not the wiring.
+- **The recycled-pid row.** One row on the reference install has a dead
+  owner that automation will never release, because proving it requires
+  trusting the marker. It needs adjudication.
+- **No web surface.** The dashboard shows nothing about session claims.
+  `run_manifest._attachment_projection` renders most of an operator view
+  and has no callers; it drops `process_identity` and `pane_id`, which are
+  the two fields an adjudicating human most needs.
