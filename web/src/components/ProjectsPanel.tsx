@@ -1,0 +1,1027 @@
+import { useState, useEffect, useCallback, useMemo } from 'react'
+import {
+  api, ApiError, TrackerProject, TrackerIssue, TrackerIssuePage, TrackerVocabulary, TrackerScope,
+} from '../api'
+import { useStore } from '../store'
+import { ConfirmModal } from './ConfirmModal'
+import {
+  FolderGit2, Plus, Search, Trash2, X, Loader2, Archive, ChevronRight, MessageSquare,
+  History, Link2, Save, FileDown, CircleDot, CheckCircle2,
+} from 'lucide-react'
+
+/**
+ * Projects + issue tracker.
+ *
+ * A project here is a declared grouping — one name over many directories,
+ * sessions and git remotes — so the header leads with its SCOPES rather than
+ * with a single path. Getting a scope wrong is how issues end up filed in the
+ * wrong log, and the only way to notice is to see the whole set at once.
+ *
+ * Every enumeration (statuses, severities, scope kinds, link kinds) is fetched
+ * from /tracker/vocabulary rather than hard-coded, so a dropdown can never
+ * offer a value the server will reject.
+ */
+
+const SEVERITY_CLASS: Record<string, string> = {
+  P0: 'bg-red-500/15 text-red-300 border-red-500/30',
+  P1: 'bg-orange-500/15 text-orange-300 border-orange-500/30',
+  P2: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+  P3: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
+  P4: 'bg-slate-500/15 text-slate-300 border-slate-500/30',
+  unset: 'bg-gray-700/40 text-gray-400 border-gray-600/40',
+}
+
+const STATUS_CLASS: Record<string, string> = {
+  open: 'bg-emerald-500/15 text-emerald-300',
+  triage: 'bg-violet-500/15 text-violet-300',
+  'in-progress': 'bg-blue-500/15 text-blue-300',
+  blocked: 'bg-red-500/15 text-red-300',
+  resolved: 'bg-teal-500/15 text-teal-300',
+  closed: 'bg-gray-600/30 text-gray-400',
+  wontfix: 'bg-gray-600/30 text-gray-400',
+  duplicate: 'bg-gray-600/30 text-gray-400',
+}
+
+const PAGE_SIZE = 50
+
+function errorText(err: unknown): string {
+  const api = err as ApiError
+  return api?.detail || api?.message || String(err)
+}
+
+function shortDate(iso: string | null): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 10)
+}
+
+function Pill({ text, className }: { text: string; className: string }) {
+  return <span className={`px-1.5 py-0.5 rounded text-[11px] font-medium border border-transparent ${className}`}>{text}</span>
+}
+
+// ---------------------------------------------------------------------------
+
+export function ProjectsPanel() {
+  const { showSnackbar } = useStore()
+
+  const [vocab, setVocab] = useState<TrackerVocabulary | null>(null)
+  const [projects, setProjects] = useState<TrackerProject[]>([])
+  const [activeId, setActiveId] = useState<string | null>(null)
+  const [project, setProject] = useState<TrackerProject | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  const [page, setPage] = useState<TrackerIssuePage | null>(null)
+  const [issuesLoading, setIssuesLoading] = useState(false)
+  const [selectedKey, setSelectedKey] = useState<string | null>(null)
+
+  const [query, setQuery] = useState('')
+  const [statusFilter, setStatusFilter] = useState<string[]>([])
+  const [severityFilter, setSeverityFilter] = useState<string[]>([])
+  const [openOnly, setOpenOnly] = useState(true)
+  const [offset, setOffset] = useState(0)
+
+  const [showNewProject, setShowNewProject] = useState(false)
+  const [showNewIssue, setShowNewIssue] = useState(false)
+  const [showScopes, setShowScopes] = useState(false)
+  const [pendingArchive, setPendingArchive] = useState<TrackerProject | null>(null)
+
+  const loadProjects = useCallback(async (preferId?: string) => {
+    try {
+      const rows = await api.listTrackerProjects(true)
+      setProjects(rows)
+      setActiveId(current => preferId ?? current ?? (rows.length ? rows[0].id : null))
+    } catch (err) {
+      showSnackbar({ type: 'error', message: `Could not load projects: ${errorText(err)}` })
+    } finally {
+      setLoading(false)
+    }
+  }, [showSnackbar])
+
+  useEffect(() => {
+    api.getTrackerVocabulary().then(setVocab).catch(() => {})
+    loadProjects()
+  }, [loadProjects])
+
+  useEffect(() => {
+    if (!activeId) { setProject(null); return }
+    api.getTrackerProject(activeId).then(setProject).catch(() => setProject(null))
+  }, [activeId])
+
+  const loadIssues = useCallback(async () => {
+    if (!activeId) { setPage(null); return }
+    setIssuesLoading(true)
+    try {
+      const result = await api.listTrackerIssues({
+        projectId: activeId,
+        q: query.trim() || undefined,
+        status: statusFilter.length ? statusFilter : undefined,
+        severity: severityFilter.length ? severityFilter : undefined,
+        openOnly,
+        limit: PAGE_SIZE,
+        offset,
+        order: 'severity',
+      })
+      setPage(result)
+    } catch (err) {
+      showSnackbar({ type: 'error', message: `Could not load issues: ${errorText(err)}` })
+      setPage(null)
+    } finally {
+      setIssuesLoading(false)
+    }
+  }, [activeId, query, statusFilter, severityFilter, openOnly, offset, showSnackbar])
+
+  useEffect(() => { loadIssues() }, [loadIssues])
+  // A filter change invalidates the current page number, not just its contents.
+  useEffect(() => { setOffset(0) }, [activeId, query, statusFilter, severityFilter, openOnly])
+
+  const refreshAfterIssueChange = useCallback(async () => {
+    await loadIssues()
+    if (activeId) api.getTrackerProject(activeId).then(setProject).catch(() => {})
+    api.listTrackerProjects(true).then(setProjects).catch(() => {})
+  }, [loadIssues, activeId])
+
+  const toggle = (list: string[], value: string, set: (next: string[]) => void) =>
+    set(list.includes(value) ? list.filter(v => v !== value) : [...list, value])
+
+  if (loading) {
+    return <div className="text-gray-500 text-sm py-12 text-center">Loading projects…</div>
+  }
+
+  return (
+    <div className="flex gap-6 items-start">
+      {/* Project rail */}
+      <aside className="w-60 shrink-0 space-y-2">
+        <button
+          onClick={() => setShowNewProject(true)}
+          className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors"
+        >
+          <Plus size={15} /> New project
+        </button>
+        {projects.length === 0 && (
+          <p className="text-xs text-gray-500 px-1 py-3">
+            No projects yet. A project groups any number of directories, tmux sessions and git
+            remotes under one issue log.
+          </p>
+        )}
+        {projects.map(p => (
+          <button
+            key={p.id}
+            onClick={() => { setActiveId(p.id); setSelectedKey(null) }}
+            className={`w-full text-left px-3 py-2 rounded-lg border transition-colors ${
+              activeId === p.id
+                ? 'bg-gray-800 border-emerald-600/50'
+                : 'bg-gray-900/50 border-gray-800 hover:border-gray-700'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <FolderGit2 size={14} className={activeId === p.id ? 'text-emerald-400' : 'text-gray-500'} />
+              <span className="text-sm text-gray-200 truncate">{p.name}</span>
+              {p.status === 'archived' && <Archive size={12} className="text-gray-600 shrink-0" />}
+            </div>
+            <div className="text-[11px] text-gray-500 mt-0.5 pl-6">
+              {p.counts?.open ?? 0} open / {p.counts?.total ?? 0}
+            </div>
+          </button>
+        ))}
+      </aside>
+
+      {/* Project detail */}
+      <section className="flex-1 min-w-0">
+        {!project && (
+          <div className="text-gray-500 text-sm py-12 text-center">
+            Select a project, or create one to start an issue log.
+          </div>
+        )}
+
+        {project && (
+          <>
+            <ProjectHeader
+              project={project}
+              onToggleScopes={() => setShowScopes(v => !v)}
+              scopesOpen={showScopes}
+              onArchive={() => setPendingArchive(project)}
+              onChanged={async () => { await loadProjects(project.id); const fresh = await api.getTrackerProject(project.id); setProject(fresh) }}
+            />
+
+            {showScopes && vocab && (
+              <ScopeEditor
+                project={project}
+                kinds={vocab.scope_kinds}
+                onChanged={async () => setProject(await api.getTrackerProject(project.id))}
+              />
+            )}
+
+            {/* Filters */}
+            <div className="mt-4 space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative flex-1 min-w-[220px]">
+                  <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+                  <input
+                    value={query}
+                    onChange={e => setQuery(e.target.value)}
+                    placeholder="Search title, body, key or failing command"
+                    aria-label="Search issues"
+                    className="w-full pl-9 pr-3 py-2 rounded-lg bg-gray-900 border border-gray-800 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-emerald-600/50"
+                  />
+                </div>
+                <label className="flex items-center gap-2 text-xs text-gray-400 px-2">
+                  <input type="checkbox" checked={openOnly} onChange={e => setOpenOnly(e.target.checked)} className="accent-emerald-600" />
+                  Open only
+                </label>
+                <button
+                  onClick={() => setShowNewIssue(true)}
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors"
+                >
+                  <Plus size={15} /> Log issue
+                </button>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                {(vocab?.severities ?? []).map(s => (
+                  <button
+                    key={s}
+                    onClick={() => toggle(severityFilter, s, setSeverityFilter)}
+                    className={`px-2 py-0.5 rounded text-[11px] border transition-colors ${
+                      severityFilter.includes(s)
+                        ? SEVERITY_CLASS[s] ?? SEVERITY_CLASS.unset
+                        : 'border-gray-800 text-gray-500 hover:text-gray-300'
+                    }`}
+                  >
+                    {s}
+                  </button>
+                ))}
+                <span className="w-px bg-gray-800 mx-1" />
+                {(vocab?.statuses ?? []).map(s => (
+                  <button
+                    key={s}
+                    onClick={() => toggle(statusFilter, s, setStatusFilter)}
+                    className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+                      statusFilter.includes(s)
+                        ? STATUS_CLASS[s] ?? 'bg-gray-700 text-gray-200'
+                        : 'text-gray-500 hover:text-gray-300'
+                    }`}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Issue list */}
+            <div className="mt-4 rounded-lg border border-gray-800 overflow-hidden">
+              {issuesLoading && (
+                <div className="px-4 py-8 text-center text-sm text-gray-500 flex items-center justify-center gap-2">
+                  <Loader2 size={14} className="animate-spin" /> Loading issues…
+                </div>
+              )}
+              {!issuesLoading && page && page.issues.length === 0 && (
+                <div className="px-4 py-8 text-center text-sm text-gray-500">No issues match these filters.</div>
+              )}
+              {!issuesLoading && page?.issues.map(issue => (
+                <div key={issue.key} className="border-b border-gray-800/70 last:border-b-0">
+                  <button
+                    onClick={() => setSelectedKey(selectedKey === issue.key ? null : issue.key)}
+                    aria-expanded={selectedKey === issue.key}
+                    className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-gray-900/60 transition-colors"
+                  >
+                    <ChevronRight
+                      size={14}
+                      className={`text-gray-600 shrink-0 transition-transform ${selectedKey === issue.key ? 'rotate-90' : ''}`}
+                    />
+                    <code className="text-xs text-gray-500 w-24 shrink-0">{issue.key}</code>
+                    <Pill text={issue.severity} className={SEVERITY_CLASS[issue.severity] ?? SEVERITY_CLASS.unset} />
+                    <Pill text={issue.status} className={STATUS_CLASS[issue.status] ?? 'bg-gray-700/40 text-gray-300'} />
+                    <span className="text-sm text-gray-200 truncate flex-1">{issue.title}</span>
+                    {issue.component && <span className="text-[11px] text-gray-500 shrink-0">{issue.component}</span>}
+                    <span className="text-[11px] text-gray-600 shrink-0 w-20 text-right">{shortDate(issue.created_at)}</span>
+                  </button>
+                  {selectedKey === issue.key && vocab && (
+                    <IssueDetail
+                      issueKey={issue.key}
+                      vocab={vocab}
+                      onChanged={refreshAfterIssueChange}
+                      onDeleted={() => { setSelectedKey(null); refreshAfterIssueChange() }}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {page && page.total > PAGE_SIZE && (
+              <div className="flex items-center justify-between mt-3 text-xs text-gray-500">
+                <span>
+                  {page.offset + 1}–{Math.min(page.offset + page.issues.length, page.total)} of {page.total}
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    disabled={offset === 0}
+                    onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                    className="px-2 py-1 rounded border border-gray-800 disabled:opacity-30 hover:border-gray-700"
+                  >
+                    Previous
+                  </button>
+                  <button
+                    disabled={offset + PAGE_SIZE >= page.total}
+                    onClick={() => setOffset(offset + PAGE_SIZE)}
+                    className="px-2 py-1 rounded border border-gray-800 disabled:opacity-30 hover:border-gray-700"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </section>
+
+      {showNewProject && vocab && (
+        <NewProjectModal
+          kinds={vocab.scope_kinds}
+          onClose={() => setShowNewProject(false)}
+          onCreated={async id => { setShowNewProject(false); await loadProjects(id); setSelectedKey(null) }}
+        />
+      )}
+
+      {showNewIssue && project && vocab && (
+        <NewIssueModal
+          project={project}
+          vocab={vocab}
+          onClose={() => setShowNewIssue(false)}
+          onCreated={async key => { setShowNewIssue(false); setSelectedKey(key); await refreshAfterIssueChange() }}
+        />
+      )}
+
+      <ConfirmModal
+        open={pendingArchive !== null}
+        title="Archive project"
+        message="Archiving hides the project from the default list. Its issues are kept and stay searchable."
+        details={pendingArchive ? [{ label: 'Project', value: pendingArchive.name }] : undefined}
+        confirmLabel="Archive"
+        variant="warning"
+        onCancel={() => setPendingArchive(null)}
+        onConfirm={async () => {
+          const target = pendingArchive!
+          setPendingArchive(null)
+          try {
+            await api.updateTrackerProject(target.id, { status: 'archived' })
+            await loadProjects(target.id)
+            setProject(await api.getTrackerProject(target.id))
+            showSnackbar({ type: 'success', message: `${target.name} archived` })
+          } catch (err) {
+            showSnackbar({ type: 'error', message: errorText(err) })
+          }
+        }}
+      />
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+
+function ProjectHeader({
+  project, onToggleScopes, scopesOpen, onArchive, onChanged,
+}: {
+  project: TrackerProject
+  onToggleScopes: () => void
+  scopesOpen: boolean
+  onArchive: () => void
+  onChanged: () => Promise<void>
+}) {
+  const { showSnackbar } = useStore()
+  const [editing, setEditing] = useState(false)
+  const [name, setName] = useState(project.name)
+  const [description, setDescription] = useState(project.description)
+
+  useEffect(() => { setName(project.name); setDescription(project.description) }, [project.id, project.name, project.description])
+
+  const save = async () => {
+    try {
+      await api.updateTrackerProject(project.id, { name, description })
+      setEditing(false)
+      await onChanged()
+      showSnackbar({ type: 'success', message: 'Project updated' })
+    } catch (err) {
+      showSnackbar({ type: 'error', message: errorText(err) })
+    }
+  }
+
+  const scopeCount = project.scopes?.length ?? 0
+
+  return (
+    <header className="rounded-lg border border-gray-800 bg-gray-900/40 p-4">
+      {editing ? (
+        <div className="space-y-2">
+          <input
+            value={name}
+            onChange={e => setName(e.target.value)}
+            aria-label="Project name"
+            className="w-full px-3 py-2 rounded bg-gray-900 border border-gray-700 text-sm text-gray-100"
+          />
+          <textarea
+            value={description}
+            onChange={e => setDescription(e.target.value)}
+            aria-label="Project description"
+            rows={2}
+            className="w-full px-3 py-2 rounded bg-gray-900 border border-gray-700 text-sm text-gray-300"
+          />
+          <div className="flex gap-2">
+            <button onClick={save} className="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs">Save</button>
+            <button onClick={() => setEditing(false)} className="px-3 py-1.5 rounded border border-gray-700 text-xs text-gray-400">Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                {project.name}
+                {project.status === 'archived' && (
+                  <span className="text-[11px] px-1.5 py-0.5 rounded bg-gray-700 text-gray-300">archived</span>
+                )}
+              </h2>
+              <p className="text-xs text-gray-500 mt-0.5">
+                <code>{project.id}</code> · keys <code>{project.issue_prefix}-NNNN</code> ·{' '}
+                {project.counts?.open ?? 0} open of {project.counts?.total ?? 0}
+              </p>
+              {project.description && <p className="text-sm text-gray-400 mt-2">{project.description}</p>}
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <a
+                href={`/tracker/projects/${encodeURIComponent(project.id)}/export`}
+                target="_blank"
+                rel="noreferrer"
+                title="Render the issue log as markdown"
+                className="p-2 rounded hover:bg-gray-800 text-gray-400 hover:text-gray-200"
+              >
+                <FileDown size={15} />
+              </a>
+              <button onClick={() => setEditing(true)} className="px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-800">
+                Edit
+              </button>
+              {project.status !== 'archived' && (
+                <button onClick={onArchive} title="Archive project" className="p-2 rounded hover:bg-gray-800 text-gray-500 hover:text-gray-300">
+                  <Archive size={15} />
+                </button>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={onToggleScopes}
+            className="mt-3 text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1.5"
+          >
+            <ChevronRight size={12} className={`transition-transform ${scopesOpen ? 'rotate-90' : ''}`} />
+            {scopeCount} scope{scopeCount === 1 ? '' : 's'} — the paths, sessions and remotes that file here
+          </button>
+        </>
+      )}
+    </header>
+  )
+}
+
+// ---------------------------------------------------------------------------
+
+function ScopeEditor({
+  project, kinds, onChanged,
+}: { project: TrackerProject; kinds: string[]; onChanged: () => Promise<void> }) {
+  const { showSnackbar } = useStore()
+  const [kind, setKind] = useState(kinds[0] ?? 'path')
+  const [value, setValue] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const add = async () => {
+    if (!value.trim()) return
+    setBusy(true)
+    try {
+      const row = await api.addTrackerScope(project.id, { kind, value: value.trim() })
+      setValue('')
+      await onChanged()
+      showSnackbar({
+        type: row.created ? 'success' : 'info',
+        message: row.created ? `Added ${row.kind} scope` : 'That scope was already registered here',
+      })
+    } catch (err) {
+      // A 409 names the project that already owns the value — the most useful
+      // thing the operator can be told, so it is surfaced verbatim.
+      showSnackbar({ type: 'error', message: errorText(err) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remove = async (scope: TrackerScope) => {
+    try {
+      await api.removeTrackerScope(project.id, scope.id)
+      await onChanged()
+    } catch (err) {
+      showSnackbar({ type: 'error', message: errorText(err) })
+    }
+  }
+
+  return (
+    <div className="mt-2 rounded-lg border border-gray-800 bg-gray-900/20 p-3 space-y-2">
+      {(project.scopes ?? []).map(scope => (
+        <div key={scope.id} className="flex items-center gap-2 text-xs">
+          <span className="w-20 shrink-0 text-gray-500">{scope.kind}</span>
+          <code className="flex-1 truncate text-gray-300">{scope.value}</code>
+          <button onClick={() => remove(scope)} title="Remove scope" className="p-1 rounded text-gray-600 hover:text-red-400">
+            <X size={13} />
+          </button>
+        </div>
+      ))}
+      <div className="flex items-center gap-2 pt-1">
+        <select
+          value={kind}
+          onChange={e => setKind(e.target.value)}
+          aria-label="Scope kind"
+          className="px-2 py-1.5 rounded bg-gray-900 border border-gray-700 text-xs text-gray-300"
+        >
+          {kinds.map(k => <option key={k} value={k}>{k}</option>)}
+        </select>
+        <input
+          value={value}
+          onChange={e => setValue(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') add() }}
+          placeholder={kind === 'path' ? '/Users/you/Projects/repo' : kind === 'session' ? 'cao-p1-closure' : 'github.com/owner/repo'}
+          aria-label="Scope value"
+          className="flex-1 px-2 py-1.5 rounded bg-gray-900 border border-gray-700 text-xs text-gray-200 placeholder-gray-600"
+        />
+        <button
+          onClick={add}
+          disabled={busy || !value.trim()}
+          className="px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-xs text-gray-200 disabled:opacity-40"
+        >
+          Add
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+
+const EDITABLE_TEXT: Array<{ field: keyof TrackerIssue; label: string; mono?: boolean }> = [
+  { field: 'component', label: 'Component' },
+  { field: 'assignee', label: 'Assignee' },
+  { field: 'reporter', label: 'Reporter' },
+  { field: 'failing_command', label: 'Failing command', mono: true },
+  { field: 'evidence', label: 'Evidence', mono: true },
+  { field: 'resolution', label: 'Resolution' },
+]
+
+function IssueDetail({
+  issueKey, vocab, onChanged, onDeleted,
+}: {
+  issueKey: string
+  vocab: TrackerVocabulary
+  onChanged: () => Promise<void>
+  onDeleted: () => void
+}) {
+  const { showSnackbar } = useStore()
+  const [issue, setIssue] = useState<TrackerIssue | null>(null)
+  const [draft, setDraft] = useState<Record<string, string>>({})
+  const [labelText, setLabelText] = useState('')
+  const [comment, setComment] = useState('')
+  const [showHistory, setShowHistory] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState(false)
+
+  const load = useCallback(async () => {
+    try {
+      const row = await api.getTrackerIssue(issueKey)
+      setIssue(row)
+      setDraft({
+        title: row.title,
+        body: row.body,
+        component: row.component ?? '',
+        assignee: row.assignee ?? '',
+        reporter: row.reporter ?? '',
+        failing_command: row.failing_command ?? '',
+        evidence: row.evidence ?? '',
+        resolution: row.resolution ?? '',
+      })
+      setLabelText(row.labels.join(', '))
+    } catch (err) {
+      showSnackbar({ type: 'error', message: errorText(err) })
+    }
+  }, [issueKey, showSnackbar])
+
+  useEffect(() => { load() }, [load])
+
+  // Only fields the operator actually touched are sent. An unchanged field
+  // omitted from the PATCH writes no audit event, which keeps the history a
+  // record of decisions rather than of page visits.
+  const dirty = useMemo(() => {
+    if (!issue) return {}
+    const changes: Record<string, unknown> = {}
+    for (const [field, value] of Object.entries(draft)) {
+      const current = (issue as unknown as Record<string, unknown>)[field]
+      if ((current ?? '') !== value) changes[field] = value
+    }
+    const labels = labelText.split(',').map(s => s.trim()).filter(Boolean)
+    if (labels.join(' ') !== issue.labels.join(' ')) changes.labels = labels
+    return changes
+  }, [issue, draft, labelText])
+
+  const hasChanges = Object.keys(dirty).length > 0
+
+  const patch = async (extra?: Record<string, unknown>) => {
+    setSaving(true)
+    try {
+      await api.updateTrackerIssue(issueKey, { ...dirty, ...extra, actor: 'dashboard' })
+      await load()
+      await onChanged()
+      showSnackbar({ type: 'success', message: `${issueKey} updated` })
+    } catch (err) {
+      showSnackbar({ type: 'error', message: errorText(err) })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const postComment = async () => {
+    if (!comment.trim()) return
+    try {
+      await api.addTrackerComment(issueKey, { body: comment, author: 'dashboard' })
+      setComment('')
+      await load()
+    } catch (err) {
+      showSnackbar({ type: 'error', message: errorText(err) })
+    }
+  }
+
+  if (!issue) {
+    return <div className="px-10 py-4 text-xs text-gray-600">Loading {issueKey}…</div>
+  }
+
+  const isTerminal = vocab.terminal_statuses.includes(issue.status)
+
+  return (
+    <div className="px-10 py-4 bg-gray-950/50 border-t border-gray-800/70 space-y-4">
+      <input
+        value={draft.title ?? ''}
+        onChange={e => setDraft({ ...draft, title: e.target.value })}
+        aria-label="Issue title"
+        className="w-full px-3 py-2 rounded bg-gray-900 border border-gray-800 text-sm text-gray-100 focus:outline-none focus:border-emerald-600/50"
+      />
+
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          value={issue.status}
+          onChange={e => patch({ status: e.target.value })}
+          aria-label="Status"
+          className="px-2 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-200"
+        >
+          {vocab.statuses.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <select
+          value={issue.severity}
+          onChange={e => patch({ severity: e.target.value })}
+          aria-label="Severity"
+          className="px-2 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-200"
+        >
+          {vocab.severities.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <span className="text-[11px] text-gray-600 flex items-center gap-1.5">
+          {isTerminal ? <CheckCircle2 size={12} /> : <CircleDot size={12} />}
+          filed {shortDate(issue.created_at)}
+          {issue.closed_at && ` · closed ${shortDate(issue.closed_at)}`}
+          {issue.origin === 'migration' && ' · migrated from the markdown ledger'}
+        </span>
+        <span className="flex-1" />
+        <button
+          onClick={() => setShowHistory(v => !v)}
+          title="Audit trail"
+          className="p-1.5 rounded text-gray-500 hover:text-gray-300 hover:bg-gray-800"
+        >
+          <History size={14} />
+        </button>
+        <button
+          onClick={() => setPendingDelete(true)}
+          title="Delete issue"
+          className="p-1.5 rounded text-gray-600 hover:text-red-400 hover:bg-gray-800"
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+
+      <textarea
+        value={draft.body ?? ''}
+        onChange={e => setDraft({ ...draft, body: e.target.value })}
+        rows={6}
+        aria-label="Issue body"
+        className="w-full px-3 py-2 rounded bg-gray-900 border border-gray-800 text-sm text-gray-300 font-mono leading-relaxed focus:outline-none focus:border-emerald-600/50"
+      />
+
+      <div className="grid grid-cols-2 gap-3">
+        {EDITABLE_TEXT.map(({ field, label, mono }) => (
+          <label key={field as string} className="block">
+            <span className="text-[11px] uppercase tracking-wide text-gray-600">{label}</span>
+            <input
+              value={draft[field as string] ?? ''}
+              onChange={e => setDraft({ ...draft, [field as string]: e.target.value })}
+              aria-label={label}
+              className={`mt-1 w-full px-2 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-200 ${mono ? 'font-mono' : ''}`}
+            />
+          </label>
+        ))}
+        <label className="block col-span-2">
+          <span className="text-[11px] uppercase tracking-wide text-gray-600">Labels (comma separated)</span>
+          <input
+            value={labelText}
+            onChange={e => setLabelText(e.target.value)}
+            aria-label="Labels"
+            className="mt-1 w-full px-2 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-200"
+          />
+        </label>
+      </div>
+
+      {hasChanges && (
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => patch()}
+            disabled={saving}
+            className="flex items-center gap-2 px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs disabled:opacity-50"
+          >
+            {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
+            Save {Object.keys(dirty).length} change{Object.keys(dirty).length === 1 ? '' : 's'}
+          </button>
+          <button onClick={load} className="px-3 py-1.5 rounded border border-gray-800 text-xs text-gray-400">
+            Discard
+          </button>
+        </div>
+      )}
+
+      {issue.links && issue.links.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {issue.links.map(link => (
+            <span key={link.id} className="inline-flex items-center gap-1.5 text-[11px] text-gray-400 px-2 py-1 rounded bg-gray-900 border border-gray-800">
+              <Link2 size={11} />
+              {link.from_key === issue.key ? `${link.kind} ${link.to_key}` : `${link.from_key} ${link.kind} this`}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {(issue.comments ?? []).map(c => (
+          <div key={c.id} className="rounded bg-gray-900/60 border border-gray-800 px-3 py-2">
+            <div className="text-[11px] text-gray-600">{c.author ?? 'unknown'} · {shortDate(c.created_at)}</div>
+            <div className="text-xs text-gray-300 whitespace-pre-wrap mt-1">{c.body}</div>
+          </div>
+        ))}
+        <div className="flex gap-2">
+          <input
+            value={comment}
+            onChange={e => setComment(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) postComment() }}
+            placeholder="Add a comment"
+            aria-label="Add a comment"
+            className="flex-1 px-3 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-200 placeholder-gray-600"
+          />
+          <button
+            onClick={postComment}
+            disabled={!comment.trim()}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-xs text-gray-200 disabled:opacity-40"
+          >
+            <MessageSquare size={13} /> Comment
+          </button>
+        </div>
+      </div>
+
+      {showHistory && (
+        <ol className="space-y-1 border-t border-gray-800 pt-3">
+          {(issue.events ?? []).map(event => (
+            <li key={event.id} className="text-[11px] text-gray-500 font-mono">
+              {shortDate(event.created_at)} · {event.actor ?? 'unknown'} ·{' '}
+              {event.kind === 'field'
+                ? `${event.field}: ${event.old_value ?? '∅'} → ${event.new_value ?? '∅'}`
+                : `${event.kind}${event.new_value ? `: ${event.new_value.slice(0, 60)}` : ''}`}
+            </li>
+          ))}
+        </ol>
+      )}
+
+      <ConfirmModal
+        open={pendingDelete}
+        title={`Delete ${issue.key}`}
+        message="This removes the issue and every comment, link and audit event attached to it. The key is never reissued."
+        details={[{ label: 'Title', value: issue.title }]}
+        confirmLabel="Delete"
+        onCancel={() => setPendingDelete(false)}
+        onConfirm={async () => {
+          setPendingDelete(false)
+          try {
+            await api.deleteTrackerIssue(issue.key)
+            showSnackbar({ type: 'success', message: `${issue.key} deleted` })
+            onDeleted()
+          } catch (err) {
+            showSnackbar({ type: 'error', message: errorText(err) })
+          }
+        }}
+      />
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+
+function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [onClose])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-label={title}
+        onClick={e => e.stopPropagation()}
+        className="w-full max-w-lg rounded-xl border border-gray-800 bg-gray-900 shadow-2xl"
+      >
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-800">
+          <h3 className="text-sm font-semibold text-white">{title}</h3>
+          <button onClick={onClose} aria-label="Close" className="p-1 rounded text-gray-500 hover:text-gray-200">
+            <X size={16} />
+          </button>
+        </div>
+        <div className="p-5 space-y-3 max-h-[70vh] overflow-y-auto">{children}</div>
+      </div>
+    </div>
+  )
+}
+
+function NewProjectModal({
+  kinds, onClose, onCreated,
+}: { kinds: string[]; onClose: () => void; onCreated: (id: string) => void }) {
+  const { showSnackbar } = useStore()
+  const [name, setName] = useState('')
+  const [id, setId] = useState('')
+  const [prefix, setPrefix] = useState('')
+  const [description, setDescription] = useState('')
+  const [scopes, setScopes] = useState<Array<{ kind: string; value: string }>>([])
+  const [kind, setKind] = useState(kinds[0] ?? 'path')
+  const [value, setValue] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const create = async () => {
+    setBusy(true)
+    try {
+      const created = await api.createTrackerProject({
+        name,
+        id: id.trim() || undefined,
+        issue_prefix: prefix.trim() || undefined,
+        description,
+        scopes,
+      })
+      showSnackbar({ type: 'success', message: `Created ${created.id}` })
+      onCreated(created.id)
+    } catch (err) {
+      showSnackbar({ type: 'error', message: errorText(err) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal title="New project" onClose={onClose}>
+      <label className="block">
+        <span className="text-[11px] uppercase tracking-wide text-gray-500">Name</span>
+        <input value={name} onChange={e => setName(e.target.value)} aria-label="Name"
+          placeholder="CAO System"
+          className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-sm text-gray-100" />
+      </label>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block">
+          <span className="text-[11px] uppercase tracking-wide text-gray-500">Id (optional)</span>
+          <input value={id} onChange={e => setId(e.target.value)} aria-label="Id" placeholder="derived from the name"
+            className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-sm text-gray-100 font-mono" />
+        </label>
+        <label className="block">
+          <span className="text-[11px] uppercase tracking-wide text-gray-500">Key prefix (optional)</span>
+          <input value={prefix} onChange={e => setPrefix(e.target.value)} aria-label="Key prefix" placeholder="cond"
+            className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-sm text-gray-100 font-mono" />
+        </label>
+      </div>
+      <label className="block">
+        <span className="text-[11px] uppercase tracking-wide text-gray-500">Description</span>
+        <textarea value={description} onChange={e => setDescription(e.target.value)} rows={2} aria-label="Description"
+          className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-sm text-gray-300" />
+      </label>
+
+      <div className="space-y-1.5">
+        <span className="text-[11px] uppercase tracking-wide text-gray-500">Scopes</span>
+        {scopes.map((s, i) => (
+          <div key={i} className="flex items-center gap-2 text-xs">
+            <span className="w-20 text-gray-500">{s.kind}</span>
+            <code className="flex-1 truncate text-gray-300">{s.value}</code>
+            <button onClick={() => setScopes(scopes.filter((_, j) => j !== i))} aria-label="Remove"
+              className="p-1 text-gray-600 hover:text-red-400"><X size={12} /></button>
+          </div>
+        ))}
+        <div className="flex gap-2">
+          <select value={kind} onChange={e => setKind(e.target.value)} aria-label="Scope kind"
+            className="px-2 py-1.5 rounded bg-gray-950 border border-gray-800 text-xs text-gray-300">
+            {kinds.map(k => <option key={k} value={k}>{k}</option>)}
+          </select>
+          <input value={value} onChange={e => setValue(e.target.value)} aria-label="Scope value"
+            onKeyDown={e => { if (e.key === 'Enter' && value.trim()) { setScopes([...scopes, { kind, value: value.trim() }]); setValue('') } }}
+            placeholder="/Users/you/Projects/repo"
+            className="flex-1 px-2 py-1.5 rounded bg-gray-950 border border-gray-800 text-xs text-gray-200 placeholder-gray-600" />
+          <button
+            onClick={() => { if (value.trim()) { setScopes([...scopes, { kind, value: value.trim() }]); setValue('') } }}
+            className="px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-xs text-gray-200">Add</button>
+        </div>
+      </div>
+
+      <button onClick={create} disabled={busy || !name.trim()}
+        className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-sm disabled:opacity-50">
+        {busy && <Loader2 size={14} className="animate-spin" />} Create project
+      </button>
+    </Modal>
+  )
+}
+
+function NewIssueModal({
+  project, vocab, onClose, onCreated,
+}: {
+  project: TrackerProject
+  vocab: TrackerVocabulary
+  onClose: () => void
+  onCreated: (key: string) => void
+}) {
+  const { showSnackbar } = useStore()
+  const [title, setTitle] = useState('')
+  const [body, setBody] = useState('')
+  const [severity, setSeverity] = useState('unset')
+  const [component, setComponent] = useState('')
+  const [failingCommand, setFailingCommand] = useState('')
+  const [evidence, setEvidence] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const create = async () => {
+    setBusy(true)
+    try {
+      const created = await api.createTrackerIssue({
+        project_id: project.id,
+        title,
+        body,
+        severity,
+        component: component.trim() || undefined,
+        failing_command: failingCommand.trim() || undefined,
+        evidence: evidence.trim() || undefined,
+        reporter: 'dashboard',
+      })
+      showSnackbar({ type: 'success', message: `Filed ${created.key}` })
+      onCreated(created.key)
+    } catch (err) {
+      showSnackbar({ type: 'error', message: errorText(err) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal title={`Log an issue against ${project.name}`} onClose={onClose}>
+      <label className="block">
+        <span className="text-[11px] uppercase tracking-wide text-gray-500">Title</span>
+        <input value={title} onChange={e => setTitle(e.target.value)} aria-label="Title"
+          className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-sm text-gray-100" />
+      </label>
+      <label className="block">
+        <span className="text-[11px] uppercase tracking-wide text-gray-500">What happened</span>
+        <textarea value={body} onChange={e => setBody(e.target.value)} rows={5} aria-label="Body"
+          className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-sm text-gray-300" />
+      </label>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block">
+          <span className="text-[11px] uppercase tracking-wide text-gray-500">Severity</span>
+          <select value={severity} onChange={e => setSeverity(e.target.value)} aria-label="Severity"
+            className="mt-1 w-full px-2 py-2 rounded bg-gray-950 border border-gray-800 text-sm text-gray-200">
+            {vocab.severities.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </label>
+        <label className="block">
+          <span className="text-[11px] uppercase tracking-wide text-gray-500">Component</span>
+          <input value={component} onChange={e => setComponent(e.target.value)} aria-label="Component"
+            className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-sm text-gray-200" />
+        </label>
+      </div>
+      <label className="block">
+        <span className="text-[11px] uppercase tracking-wide text-gray-500">Failing command</span>
+        <input value={failingCommand} onChange={e => setFailingCommand(e.target.value)} aria-label="Failing command"
+          className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-xs text-gray-200 font-mono" />
+      </label>
+      <label className="block">
+        <span className="text-[11px] uppercase tracking-wide text-gray-500">Evidence path</span>
+        <input value={evidence} onChange={e => setEvidence(e.target.value)} aria-label="Evidence"
+          className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-xs text-gray-200 font-mono" />
+      </label>
+      <button onClick={create} disabled={busy || !title.trim()}
+        className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-sm disabled:opacity-50">
+        {busy && <Loader2 size={14} className="animate-spin" />} File issue
+      </button>
+    </Modal>
+  )
+}

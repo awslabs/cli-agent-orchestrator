@@ -221,6 +221,43 @@ Then open http://localhost:9889.
 
 For hot-reload dev mode, remote access over SSH, and rebuilding the frontend from source (only these require Node.js), see [docs/web-ui.md](docs/web-ui.md). For frontend architecture, see [web/README.md](web/README.md).
 
+## Projects & issues
+
+A **project** is a declared grouping: one name over any number of directories,
+tmux sessions and git remotes, with one issue log. That shape exists because a
+long-running system rarely lives in one checkout — a project spanning two
+repositories plus their worktrees plus a rotating cast of sessions should have
+one issue list, not one per place that happened to notice a defect.
+
+```bash
+cao project create "CAO System" --id cao-system --prefix cond \
+  --path ~/Projects/cao-conductor \
+  --path ~/Projects/cli-agent-orchestrator \
+  --session cao-p1-closure
+
+cao issue file --title "collect rejects a closed duplicate run" \
+  --body "..." --severity P2 --component conduct
+
+cao issue list --project cao-system --open
+cao project resolve            # which project would an issue filed here belong to?
+cao project export cao-system  # render the log as markdown
+```
+
+Filing resolves the project from where you are: explicit id, then session, then
+campaign alias, then directory, then git remote. A filing site that resolves to
+no project is refused rather than dropped into a default bucket. Issue keys
+(`cond-0242`) are unique across the installation and are never reissued, so a
+key quoted in a commit message or an evidence path keeps meaning one thing.
+
+The **Projects** tab in the web dashboard renders the same data and edits it
+live — change status and severity while triaging, log an issue you just
+noticed, and manage the scopes that decide where filings land. Every change
+writes an audit event naming the actor.
+
+Existing markdown ledgers import with their ids, filing dates, severities and
+reporters intact (`cao issue import-ledger OPEN_ISSUES.md --project <id>`), and
+the markdown becomes a rendered export rather than a second source of truth.
+
 ## MCP Apps — host-rendered fleet UI
 
 Beyond the browser dashboard, CAO can render its fleet UI **inside an MCP App-capable host** (Claude / Claude Desktop, ChatGPT, VS Code GitHub Copilot, Microsoft 365 Copilot, Goose, Postman, MCPJam, Archestra.AI — see the [client matrix](https://modelcontextprotocol.io/extensions/client-matrix)) using the [MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview) extension (SEP-1865) — so you observe and steer agents without leaving your chat host. It ships three single-file views (`ui://cao/dashboard`, `ui://cao/agent`, `ui://cao/event-stream`) plus a build-free topology widget, backed by an in-process event ring buffer and a single audited `submit_command` mutation path.
