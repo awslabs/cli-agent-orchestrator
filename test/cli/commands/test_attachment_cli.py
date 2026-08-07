@@ -332,3 +332,41 @@ class TestOperatorFreeze:
         )
         assert result.exit_code == 1
         assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED
+
+
+class TestAVirginInstall:
+    """The first thing an operator runs is `list`, possibly before any server.
+
+    The table is created by the migration ladder at server start, so a store
+    no server has touched has no table — and therefore, demonstrably, no
+    claims. Reporting that as a failure sends someone hunting a broken
+    database when the honest answer is "nothing is held".
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_table(self, tmp_path, monkeypatch):
+        engine = create_engine(f"sqlite:///{tmp_path}/empty.db")
+        monkeypatch.setattr(na.database, "SessionLocal", sessionmaker(bind=engine))
+        return engine
+
+    def test_listing_an_uncreated_store_is_empty_not_an_error(self):
+        result = CliRunner().invoke(attachment_cli.attachment, ["list"])
+        assert result.exit_code == 0
+        assert "no attachments match" in result.output
+
+    def test_sweeping_an_uncreated_store_examines_nothing(self):
+        result = CliRunner().invoke(attachment_cli.attachment, ["sweep"])
+        assert result.exit_code == 0
+        assert "examined=0" in result.output
+
+    def test_a_store_failure_reports_one_readable_line(self):
+        """SQLAlchemy renders a driver error followed by the entire query.
+
+        Fourteen column aliases of generated SQL is not a refusal an operator
+        can act on; the sentence in front of it is.
+        """
+        result = CliRunner().invoke(attachment_cli.attachment, ["show", "kimi_cli", "abc"])
+        assert result.exit_code == 1
+        assert len(result.output.strip().splitlines()) == 1
+        assert "no such table" in result.output
+        assert "SELECT" not in result.output

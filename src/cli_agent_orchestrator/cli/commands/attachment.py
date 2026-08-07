@@ -30,8 +30,15 @@ from cli_agent_orchestrator.services import native_attachment_recovery as recove
 
 
 def _fail(exc: na.NativeAttachmentError) -> None:
-    """Report a refusal on stderr and exit non-zero, keeping its classification."""
-    click.echo(f"error [{exc.code}]: {exc}", err=True)
+    """Report a refusal on stderr and exit non-zero, keeping its classification.
+
+    Only the first line. A store failure wraps the driver's exception, and
+    SQLAlchemy renders that as a readable sentence followed by the entire
+    generated SQL — fourteen column aliases of it. The sentence is the part
+    an operator can act on; burying it under the query is how a legible
+    refusal becomes an unreadable one.
+    """
+    click.echo(f"error [{exc.code}]: {str(exc).splitlines()[0]}", err=True)
     sys.exit(1)
 
 

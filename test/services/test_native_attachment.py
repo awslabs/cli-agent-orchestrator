@@ -859,3 +859,25 @@ class TestListingTheHeldSessions:
         """A typo that returns an empty list reads as "nothing is held"."""
         with pytest.raises(na.NativeAttachmentInvalid):
             na.list_attachments(states=frozenset({"detatched"}))
+
+
+class TestAnAbsentTableIsNoClaims:
+    def test_listing_a_store_no_server_has_created_is_empty(self, tmp_path, monkeypatch):
+        """Not a relaxation of fail-closed: the migration ladder creates this
+        table at server start, so its absence proves no claim was ever taken."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        engine = create_engine(f"sqlite:///{tmp_path}/empty.db")
+        monkeypatch.setattr(na.database, "SessionLocal", sessionmaker(bind=engine))
+        assert na.list_attachments() == []
+
+    def test_a_table_that_exists_but_cannot_be_read_still_raises(self, monkeypatch):
+        """A different fact, and it must not be reported as "nothing is held"."""
+
+        def _broken():
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(na.database, "SessionLocal", _broken)
+        with pytest.raises(na.NativeAttachmentUnavailable):
+            na.list_attachments()

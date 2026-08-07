@@ -51,6 +51,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, cast
 
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import IntegrityError
 
 from cli_agent_orchestrator.clients import database
@@ -1050,6 +1051,14 @@ def list_attachments(
     Ordered by ``created_at`` so a reader sees the oldest unresolved
     claim first; that is the one most likely to be an orphan and least
     likely to be a launch in flight.
+
+    An **absent table** returns an empty list rather than raising, and
+    that is not a relaxation of the fail-closed rule the rest of this
+    module follows.  The table is created by the migration ladder at
+    server start, so its absence means no server has ever run against
+    this store — and therefore that no claim has ever been taken.  Empty
+    is the true answer, not a degraded one.  A table that exists and
+    cannot be read still raises, because that is a different fact.
     """
     if states is not None:
         unknown = sorted(set(states) - ATTACHMENT_STATES)
@@ -1060,6 +1069,9 @@ def list_attachments(
             )
     try:
         with database.SessionLocal() as db:
+            table = database.NativeSessionAttachmentModel.__tablename__
+            if not sa_inspect(db.get_bind()).has_table(table):
+                return []
             query = db.query(database.NativeSessionAttachmentModel)
             if states is not None:
                 query = query.filter(
