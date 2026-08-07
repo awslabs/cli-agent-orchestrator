@@ -1895,9 +1895,7 @@ class _ProviderSession:
         try:
             provider_contracts.check_pinned_version(provider, actual)
         except provider_contracts.ProviderContractError as exc:
-            raise BridgeError(
-                f"unsupported provider version {actual!r}: {exc}"
-            ) from exc
+            raise BridgeError(f"unsupported provider version {actual!r}: {exc}") from exc
         return actual
 
     def _initialize_codex(self) -> dict[str, Any]:

@@ -54,9 +54,7 @@ def _validate_binary(binary: str, digest: str, version_output: str) -> str:
         raise CodexBootstrapError(
             f"codex binary digest changed: expected {digest}, observed {observed}"
         )
-    if not provider_contracts.is_proven_version(
-        provider_contracts.PROVIDER_CODEX, version_output
-    ):
+    if not provider_contracts.is_proven_version(provider_contracts.PROVIDER_CODEX, version_output):
         raise CodexBootstrapError(
             "Codex native session proof is unavailable for this provider build; "
             "stage-verify it before enabling native identity"

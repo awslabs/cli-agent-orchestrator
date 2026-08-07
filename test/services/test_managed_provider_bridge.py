@@ -157,7 +157,9 @@ def test_codex_version_gate_accepts_exact_0146_0(tmp_path, monkeypatch):
     executable = _fake_codex_executable(tmp_path, request, "codex-cli 0.146.0")
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     session = bridge._ProviderSession(request)
-    assert session._version(str(executable), provider_contracts.PROVIDER_CODEX) == "codex-cli 0.146.0"
+    assert (
+        session._version(str(executable), provider_contracts.PROVIDER_CODEX) == "codex-cli 0.146.0"
+    )
 
 
 @pytest.mark.parametrize(

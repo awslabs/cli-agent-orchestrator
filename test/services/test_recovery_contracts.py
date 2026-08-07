@@ -105,9 +105,7 @@ def test_kimi_can_be_reverted_to_strict_by_environment_variable(monkeypatch):
 
 @pytest.mark.parametrize("provider", pc.PROVIDERS)
 def test_any_provider_can_be_reverted_to_strict(monkeypatch, provider):
-    monkeypatch.setenv(
-        f"CAO_PROVIDER_VERSION_ENFORCEMENT_{provider.upper()}", "strict"
-    )
+    monkeypatch.setenv(f"CAO_PROVIDER_VERSION_ENFORCEMENT_{provider.upper()}", "strict")
     assert pc.version_enforcement_mode(provider) == pc.VERSION_ENFORCEMENT_STRICT
     with pytest.raises(pc.ProviderVersionDrift):
         pc.check_pinned_version(provider, "99.99.99")

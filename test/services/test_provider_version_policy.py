@@ -16,9 +16,7 @@ def test_all_providers_admit_future_semver_at_launch_boundary(provider):
     ("provider", "env_suffix"),
     [("codex", "CODEX"), ("kimi", "KIMI"), ("claude", "CLAUDE"), ("muse", "MUSE")],
 )
-def test_all_providers_can_restore_strict_exact_enforcement(
-    monkeypatch, provider, env_suffix
-):
+def test_all_providers_can_restore_strict_exact_enforcement(monkeypatch, provider, env_suffix):
     monkeypatch.setenv(f"CAO_PROVIDER_VERSION_ENFORCEMENT_{env_suffix}", "strict")
     assert pc.version_enforcement_mode(provider) == pc.VERSION_ENFORCEMENT_STRICT
     with pytest.raises(pc.ProviderVersionDrift):
@@ -29,4 +27,3 @@ def test_all_providers_can_restore_strict_exact_enforcement(
 def test_unparseable_versions_remain_fail_closed(provider):
     with pytest.raises(pc.ProviderVersionDrift):
         pc.check_pinned_version(provider, "not-a-version")
-

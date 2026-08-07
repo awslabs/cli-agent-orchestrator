@@ -3915,9 +3915,7 @@ def _mint_claude_native_session(
     # native Claude session id/readiness claim is an advanced capability.  Do
     # not mint an identity for an unproven build and accidentally inherit the
     # previous build's hook semantics.
-    if not provider_contracts.is_proven_version(
-        _PINNED_PROVIDER["claude_code"], version_output
-    ):
+    if not provider_contracts.is_proven_version(_PINNED_PROVIDER["claude_code"], version_output):
         raise ManagedLaunchConflict(
             "Claude native session proof is unavailable for this provider build; "
             "stage-verify it before enabling native identity"
