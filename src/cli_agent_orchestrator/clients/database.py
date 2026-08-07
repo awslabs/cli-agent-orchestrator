@@ -283,6 +283,152 @@ class ProjectAliasModel(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow)
 
 
+class TrackerProjectModel(Base):
+    """A named project: the unit an issue log belongs to.
+
+    Deliberately separate from ``ProjectAliasModel``. That table is the memory
+    subsystem's *identity cache* — written opportunistically and automatically
+    by ``resolve_project_id`` so a renamed directory keeps recalling its own
+    memories. Folding tracker scopes into it would silently merge memory
+    recall between two repos the moment somebody grouped them under one issue
+    log, which is a side effect nobody asked for and nobody would notice.
+
+    A tracker project is the opposite: it is *declared*, spans whatever set of
+    repos, directories and sessions its owner says it spans, and carries no
+    authority over memory scoping at all.
+    """
+
+    __tablename__ = "tracker_projects"
+
+    # Slug, e.g. "cao-system". Stable across renames of ``name``, because it
+    # is what issue keys and scope rows are joined on.
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=False, default="", server_default="")
+    # "active" | "archived". Archived projects keep their issues and stay
+    # resolvable — archiving hides a project from default listings, it is not
+    # a delete.
+    status = Column(String, nullable=False, default="active", server_default="active")
+    # Issue key prefix, e.g. "cond" produces cond-0242. Held per project so
+    # the migrated conductor ledger keeps its historical ids verbatim.
+    issue_prefix = Column(String, nullable=False, default="issue", server_default="issue")
+    # Monotonic allocation counter. Never decremented, including when the
+    # highest-numbered issue is deleted: a recycled key would silently repoint
+    # every external reference (a commit message, an evidence path, a report)
+    # at a different defect.
+    next_issue_number = Column(Integer, nullable=False, default=1, server_default="1")
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class TrackerScopeModel(Base):
+    """One identifier that resolves to a tracker project.
+
+    ``value`` is unique across ALL kinds, not per-kind. A working directory
+    that resolved to two projects would make ``conduct issue file`` file into
+    an arbitrary one of them, and the caller could not tell which — so the
+    ambiguity is refused at write time instead of resolved by luck at read
+    time.
+    """
+
+    __tablename__ = "tracker_scopes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String, nullable=False, index=True)
+    # "path" | "session" | "git_remote" | "project_id"
+    kind = Column(String, nullable=False)
+    value = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (UniqueConstraint("value", name="uq_tracker_scope_value"),)
+
+
+class TrackerIssueModel(Base):
+    """One issue.
+
+    ``key`` (``cond-0242``) is the identity every other surface quotes, so it
+    is the unique column and the foreign key comments/events/links join on —
+    the integer ``id`` is a row number, not an identifier anyone should learn.
+    """
+
+    __tablename__ = "tracker_issues"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String, nullable=False, unique=True, index=True)
+    project_id = Column(String, nullable=False, index=True)
+    title = Column(String, nullable=False)
+    body = Column(Text, nullable=False, default="", server_default="")
+    status = Column(String, nullable=False, default="open", server_default="open", index=True)
+    severity = Column(String, nullable=False, default="unset", server_default="unset")
+    # Free-form sub-scope inside a project ("conduct", "fork", "dashboard").
+    component = Column(String, nullable=True)
+    reporter = Column(String, nullable=True)
+    assignee = Column(String, nullable=True)
+    labels = Column(Text, nullable=False, default="[]", server_default="[]")  # JSON array
+    failing_command = Column(Text, nullable=True)
+    evidence = Column(Text, nullable=True)
+    resolution = Column(Text, nullable=True)
+    # Where it was filed from. Recorded as evidence, never as identity — a
+    # session can be renamed and a worktree can be deleted.
+    session_name = Column(String, nullable=True)
+    terminal_id = Column(String, nullable=True)
+    source_path = Column(Text, nullable=True)
+    duplicate_of = Column(String, nullable=True)
+    # "cli" | "api" | "dashboard" | "migration"
+    origin = Column(String, nullable=False, default="api", server_default="api")
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class TrackerCommentModel(Base):
+    """A comment on an issue."""
+
+    __tablename__ = "tracker_issue_comments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    issue_key = Column(String, nullable=False, index=True)
+    author = Column(String, nullable=True)
+    body = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+
+
+class TrackerEventModel(Base):
+    """Append-only audit trail for one issue.
+
+    The ledger this replaces was append-only on disk, and that property is the
+    reason anyone trusted it. A mutable row in a database is a downgrade
+    unless every mutation leaves a record, so every field change writes here.
+    """
+
+    __tablename__ = "tracker_issue_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    issue_key = Column(String, nullable=False, index=True)
+    actor = Column(String, nullable=True)
+    # "created" | "field" | "comment" | "link" | "unlink"
+    kind = Column(String, nullable=False)
+    field = Column(String, nullable=True)
+    old_value = Column(Text, nullable=True)
+    new_value = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+
+
+class TrackerLinkModel(Base):
+    """A directed relationship between two issues."""
+
+    __tablename__ = "tracker_issue_links"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    from_key = Column(String, nullable=False, index=True)
+    to_key = Column(String, nullable=False, index=True)
+    # "blocks" | "relates" | "duplicates" | "caused-by"
+    kind = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (UniqueConstraint("from_key", "to_key", "kind", name="uq_tracker_link"),)
+
+
 class SessionEnvModel(Base):
     """SQLAlchemy model for persisted per-session forwarded env vars (issue #248).
 

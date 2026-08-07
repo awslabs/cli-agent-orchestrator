@@ -42,6 +42,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from cli_agent_orchestrator.api.tracker import router as tracker_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -833,6 +834,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Project-scoped issue tracking lives in its own module rather than inline
+# here; see api/tracker.py.
+app.include_router(tracker_router)
 
 
 @app.exception_handler(RequestValidationError)
