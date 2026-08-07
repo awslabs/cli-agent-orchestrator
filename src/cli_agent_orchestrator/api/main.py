@@ -3100,6 +3100,60 @@ async def get_terminal_control_identity(
     return body
 
 
+class ComposerObservationRequest(BaseModel):
+    """Expected composer content for a read-only observation."""
+
+    expected_text_sha256: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        description="SHA-256 of the expected composer text, 64 lowercase hex chars",
+    )
+    expected_text_bytes: int = Field(
+        ...,
+        gt=0,
+        description="Byte length of the expected composer text, positive integer",
+    )
+
+
+@app.get("/terminals/{terminal_id}/composer-observation")
+async def get_terminal_composer_observation(
+    terminal_id: TerminalId,
+    params: Annotated[ComposerObservationRequest, Query()],
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """Read whether the exact expected text is resting in the provider composer.
+
+    A read-only, identity-bound observation of the pinned composer region.
+    Returns ``observed=true`` only when the exact expected digest and byte
+    length are proven in the pinned composer region and submission is not
+    proven to have occurred.  Never returns raw composer text.
+    """
+    try:
+        result = await asyncio.to_thread(
+            control_input_service.observe_composer,
+            terminal_id,
+            params.expected_text_sha256,
+            params.expected_text_bytes,
+        )
+    except control_input_service.ComposerObservationRequestInvalid as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    except Exception as exc:
+        logger.exception("composer-observation failed unexpectedly")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "protocol": control_input_service.COMPOSER_OBSERVATION_PROTOCOL,
+                "observed": False,
+                "error": f"unexpected failure: {type(exc).__name__}",
+            },
+        )
+    return JSONResponse(status_code=result.http_status, content=result.as_response())
+
+
 class ParseNotationRequest(BaseModel):
     """One macro notation string to resolve through the pinned grammar."""
 
