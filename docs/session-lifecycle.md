@@ -142,6 +142,45 @@ hibernate must never silently be a one-way door.
 Resume relaunches each resumable worker against its recorded native session id
 and sends the supervisor a resumption bump.
 
+### 4.1 One owner per provider session
+
+Two agents resuming the same native session interleave their turns into one
+transcript and corrupt both histories. **CAO already prevents this**, and the
+existing guard is stronger than a naive one:
+
+`NativeSessionAttachmentModel` is keyed `(provider, native_session_id)`, so
+exactly one owner holds a provider session regardless of how many terminals,
+generations or execution modes reference it. `_refuse_live_owner` raises
+`NativeAttachmentConflict` on a second acquirer. The owner tuple includes
+`execution_mode` specifically so an ACP bridge and a native TUI can never both
+hold one session — "refused rather than silently multiplexed." The claim is
+written *before* provider launch, so a crash leaves a durable record to
+adjudicate rather than a phantom.
+
+Ownership is `(pid, start_marker)`, never a bare pid, because pids are recycled
+and a stale one can "forge a survivor — or, worse, forge a *no*-survivor."
+
+Session resume must go through this path for every worker it relaunches. It is
+the reason resume is safe at all.
+
+### 4.2 The gap: nothing adjudicates an ambiguous attachment
+
+An unresponsive or unknown owner puts the attachment into `ambiguous`, which is
+deliberately frozen: it "preserves the owner and is never auto-released." That
+is the correct default — automation must not steal a session it cannot prove is
+dead.
+
+But `mark_ambiguous` and `release` are service functions with **no operator-
+facing path**: no API route, no CLI command, and `release` requires a
+no-survivor proof that nothing constructs for a human. So the case that most
+needs resolving — "this old agent is not responding and I want its session
+back" — currently has no valve short of editing the database.
+
+Needed: an adjudication surface that shows who holds the session, what evidence
+exists that the owner is gone, and records the operator's acknowledgement as the
+release proof. Resuming past a live owner stays refused; resuming past an
+*unresponsive* one becomes possible, deliberately, with a name attached.
+
 ---
 
 ## 5. Waiting, and why it is not yet safe
@@ -218,6 +257,7 @@ Filed as issues against the `cao-system` project when the tracker goes live.
 
 | item | why deferred |
 |---|---|
+| Operator adjudication for an `ambiguous` native-session attachment (§4.2) | in scope for cutover if session stop/resume ships; the service side already exists, only the surface is missing |
 | Memory curator as a shared service, with a responsiveness health model | needs a health contract of its own; the `kind` field unblocks it |
 | Relaunching a historical agent into a new session from the Agents tab, with session-id autocomplete | UI plus a resume path for non-managed launches |
 | Session forking | interacts with resume identity; `validate_resume_argv` explicitly forbids `--fork-session` today |
