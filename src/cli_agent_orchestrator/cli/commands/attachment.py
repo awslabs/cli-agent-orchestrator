@@ -192,6 +192,46 @@ def attachment_sweep(do_apply, as_json):
     _emit(report, as_json, render)
 
 
+@attachment.command(name="freeze")
+@click.argument("provider")
+@click.argument("native_session_id")
+@click.option("--operator", required=True, help="Who is making this call. Recorded permanently.")
+@click.option("--detail", required=True, help="Why the owner cannot be determined.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+@click.option("--json", "as_json", is_flag=True)
+def attachment_freeze(provider, native_session_id, operator, detail, yes, as_json):
+    """Declare a claim's ownership unresolvable, so it can be adjudicated.
+
+    Only needed for a claim the sweep can never settle — an owner the
+    process table will not answer for. A provably-gone owner is released
+    by the sweep and does not need this; a running one is refused.
+
+    This is deliberately the first of two steps. Freezing says "I cannot
+    determine this". Adjudicating says "I have decided anyway".
+    """
+    if not yes:
+        click.confirm(
+            f"Freeze {provider} session {native_session_id} as unresolvable, on {operator}'s name?",
+            abort=True,
+        )
+    try:
+        result = recovery.freeze_for_adjudication(
+            provider=provider,
+            native_session_id=native_session_id,
+            operator=operator,
+            detail=detail,
+        )
+    except na.NativeAttachmentError as exc:
+        _fail(exc)
+        return
+
+    def render(row):
+        click.echo(f"{row['provider']} session {row['native_session_id']} is now {row['state']}")
+        click.echo(f"frozen because    {row['ambiguity_reason']}")
+
+    _emit(result, as_json, render)
+
+
 @attachment.command(name="adjudicate")
 @click.argument("provider")
 @click.argument("native_session_id")

@@ -161,6 +161,37 @@ async def get_native_attachment(
     return payload
 
 
+class FreezeBody(StrictBody):
+    """A named operator declaring one claim's ownership unresolvable."""
+
+    detail: str = Field(min_length=1, max_length=500)
+    operator: str = Field(min_length=1, max_length=200)
+
+
+@router.post("/native-attachments/{provider}/{native_session_id}/freeze")
+async def freeze_native_attachment(
+    provider: str,
+    native_session_id: str,
+    body: FreezeBody,
+    _scopes: List[str] = _ADMIN,
+) -> Dict[str, Any]:
+    """Move a claim the sweep can never settle into the adjudicable state.
+
+    The first of two deliberate steps. A provably-gone owner is released
+    by the sweep and never needs this; a running one is refused.
+    """
+    try:
+        return await asyncio.to_thread(
+            recovery.freeze_for_adjudication,
+            provider=provider,
+            native_session_id=native_session_id,
+            operator=body.operator,
+            detail=body.detail,
+        )
+    except na.NativeAttachmentError as exc:
+        raise _http(exc)
+
+
 @router.post("/native-attachments/{provider}/{native_session_id}/adjudicate")
 async def adjudicate_native_attachment(
     provider: str,

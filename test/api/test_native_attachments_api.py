@@ -219,4 +219,43 @@ class TestScopes:
             else:
                 assert SCOPE_READ in scopes, route.path
             checked += 1
-        assert checked == 4
+        assert checked == 5
+
+
+class TestFreezeRoute:
+    def test_an_unobservable_owner_can_be_frozen_for_adjudication(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import native_attachment_recovery as recovery
+
+        _attach(pid=os.getpid())
+        monkeypatch.setattr(recovery, "_pid_state", lambda pid: recovery.OWNER_UNOBSERVABLE)
+        response = client.post(
+            f"/native-attachments/{PROVIDER}/{SESSION}/freeze",
+            json={"operator": "colin", "detail": "process table will not answer"},
+        )
+        assert response.status_code == 200
+        assert response.json()["state"] == na.AMBIGUOUS
+
+    def test_a_running_owner_cannot_be_frozen(self, client):
+        _attach(pid=os.getpid())
+        response = client.post(
+            f"/native-attachments/{PROVIDER}/{SESSION}/freeze",
+            json={"operator": "colin", "detail": "I want it back"},
+        )
+        assert response.status_code == 409
+        assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED
+
+    def test_a_provably_gone_owner_is_pointed_at_the_sweep(self, client):
+        _attach(pid=_reaped_pid())
+        response = client.post(
+            f"/native-attachments/{PROVIDER}/{SESSION}/freeze",
+            json={"operator": "colin", "detail": "looks dead"},
+        )
+        assert response.status_code == 409
+        assert "sweep" in response.json()["detail"]
+
+    def test_an_unattributable_freeze_is_refused(self, client):
+        _attach(pid=os.getpid())
+        response = client.post(
+            f"/native-attachments/{PROVIDER}/{SESSION}/freeze", json={"detail": "no name"}
+        )
+        assert response.status_code == 422

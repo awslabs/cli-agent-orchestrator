@@ -24,6 +24,7 @@ import pytest
 
 from cli_agent_orchestrator.services import native_attachment as na
 from cli_agent_orchestrator.services import native_attachment_recovery as recovery
+from cli_agent_orchestrator.services import native_tui_launch
 from cli_agent_orchestrator.services.terminal_service import delete_terminal
 from cli_agent_orchestrator.utils.terminal import managed_window_name
 
@@ -62,6 +63,7 @@ def _attach(
     session: str = SESSION,
     terminal_id: str = TERMINAL,
     generation: str = GENERATION,
+    marker: str = "Fri Aug  7 12:51:19 2026",
 ) -> dict:
     owner = {
         "terminal_id": terminal_id,
@@ -86,7 +88,7 @@ def _attach(
     return na.mark_attached(
         provider=PROVIDER,
         native_session_id=session,
-        process_identity=na.process_identity(pid=pid, start_marker="Fri Aug  7 12:51:19 2026"),
+        process_identity=na.process_identity(pid=pid, start_marker=marker),
         **owner,
     )
 
@@ -222,18 +224,41 @@ class TestGenerationScopedTeardown:
         assert na.get(PROVIDER, "gen-a")["state"] == na.DETACHED
         assert na.get(PROVIDER, "gen-b")["state"] == na.ATTACHED
 
-    def test_an_owner_that_outlives_its_own_generation_is_frozen_not_ignored(self):
-        """The pane is gone and the provider is not: a real anomaly.
+    def test_an_owner_that_outlives_its_own_generation_is_left_attached(self):
+        """Not frozen. Freezing was the first design here and it was wrong.
 
-        Freezing puts it where an operator can see and adjudicate it,
-        instead of adding one more invisible row to the pile this work
-        exists to drain.
+        `mark_ambiguous` is terminal for automation, so freezing would turn
+        a state the sweep resolves on its own — the provider dies a second
+        later, the next sweep releases it — into one that permanently needs
+        a human. It also mislabels the evidence: "frozen" means ownership
+        could not be determined, and here it was determined exactly.
         """
         _attach(pid=os.getpid())
         assert self._teardown() is True
-        stored = na.get(PROVIDER, SESSION)
-        assert stored["state"] == na.AMBIGUOUS
-        assert stored["ambiguity_reason"] == "owner_process_survived_terminal_teardown"
+        assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED
+
+    def test_a_later_sweep_releases_what_teardown_had_to_leave(self):
+        """End to end, with a real process: the reason leaving it costs nothing.
+
+        Teardown finds the provider still running and holds the claim. The
+        provider then exits, and the next sweep releases it — no human, no
+        frozen row, no permanent orphan.
+        """
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            marker = native_tui_launch._process_field(child.pid, "lstart=")
+            assert marker, "could not read the child's start marker"
+            _attach(pid=child.pid, marker=marker)
+
+            assert self._teardown() is True
+            assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED
+            assert recovery.sweep(apply=True)["counts"].get("released", 0) == 0
+        finally:
+            child.kill()
+            child.wait()
+
+        assert recovery.sweep(apply=True)["counts"]["released"] == 1
+        assert na.get(PROVIDER, SESSION)["state"] == na.DETACHED
 
 
 class TestTheWiringExists:

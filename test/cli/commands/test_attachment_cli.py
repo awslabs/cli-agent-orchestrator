@@ -281,3 +281,54 @@ class TestTheGroupIsUsableWhenTheServerIsNot:
         source = inspect.getsource(attachment_cli)
         assert "requests" not in source
         assert "API_BASE_URL" not in source
+
+
+class TestOperatorFreeze:
+    def test_freezing_then_adjudicating_composes(self, monkeypatch):
+        from cli_agent_orchestrator.services import native_attachment_recovery as recovery
+
+        _attach(pid=os.getpid())
+        monkeypatch.setattr(recovery, "_pid_state", lambda pid: recovery.OWNER_UNOBSERVABLE)
+        frozen = CliRunner().invoke(
+            attachment_cli.attachment,
+            [
+                "freeze",
+                PROVIDER,
+                SESSION,
+                "--operator",
+                "colin",
+                "--detail",
+                "process table will not answer",
+                "--yes",
+            ],
+        )
+        assert frozen.exit_code == 0
+        assert na.get(PROVIDER, SESSION)["state"] == na.AMBIGUOUS
+
+        monkeypatch.setattr(recovery, "_pid_state", lambda pid: recovery.OWNER_GONE)
+        decided = CliRunner().invoke(
+            attachment_cli.attachment,
+            [
+                "adjudicate",
+                PROVIDER,
+                SESSION,
+                "--operator",
+                "colin",
+                "--detail",
+                "host rebooted; nothing survived",
+                "--evidence-sha256",
+                "f" * 64,
+                "--yes",
+            ],
+        )
+        assert decided.exit_code == 0
+        assert na.get(PROVIDER, SESSION)["state"] == na.DETACHED
+
+    def test_freezing_a_running_owner_is_refused(self):
+        _attach(pid=os.getpid())
+        result = CliRunner().invoke(
+            attachment_cli.attachment,
+            ["freeze", PROVIDER, SESSION, "--operator", "colin", "--detail", "x", "--yes"],
+        )
+        assert result.exit_code == 1
+        assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED

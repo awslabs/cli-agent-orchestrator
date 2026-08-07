@@ -278,20 +278,20 @@ def release_owned_by_terminal(
     process very much alive.  This waits — briefly, and only while the
     answer is still "alive" — for it to leave the process table.
 
-    When the caller names the exact ``generation``, an owner that
-    outlives its own terminal is frozen rather than left quietly
-    attached.  It is a real anomaly — the pane is gone and the provider
-    is not — and freezing puts it where an operator can see and
-    adjudicate it, instead of adding one more invisible row to the pile
-    this module exists to drain.
+    An owner that is still alive when the grace expires is **left
+    attached**, not frozen.  Freezing was the first design here and it was
+    wrong: ``mark_ambiguous`` is terminal for automation, so it would
+    convert a state the sweep can resolve on its own — the provider dies a
+    second later, or a minute later, and the next sweep releases it — into
+    one that permanently requires a human.  It also mislabels the
+    evidence.  "Frozen" means ownership could not be determined; here it
+    was determined exactly, and the answer was "still running".
 
-    When the caller does *not* name a generation, nothing is frozen.  A
-    bare teardown identifies a terminal id, and a terminal id can name a
-    replacement incarnation; freezing on that evidence would take a
-    live, working session out of circulation to punish it for existing.
-    Releasing is still safe in that case for the same reason it is
-    everywhere else — a live owner's pid is alive, so it is never the
-    one released.
+    Nothing is lost by leaving it: the claim is listed, the sweep reports
+    it every pass, and the release happens the moment the process is
+    actually gone.  An operator who needs it back sooner can freeze it
+    deliberately and adjudicate — two named steps, rather than teardown
+    guessing on their behalf.
     """
     records = [
         record
@@ -305,14 +305,7 @@ def release_owned_by_terminal(
     outcomes: list[dict[str, Any]] = []
     for record in records:
         observed = _observe_until_gone(record, grace_seconds=grace_seconds)
-        outcome = release_if_owner_gone(record, observation=observed)
-        if (
-            generation is not None
-            and outcome["action"] != "released"
-            and observed["disposition"] in (OWNER_ALIVE, OWNER_UNOBSERVABLE)
-        ):
-            outcome["frozen"] = _freeze_survivor(record, observed)
-        outcomes.append(outcome)
+        outcomes.append(release_if_owner_gone(record, observation=observed))
     return outcomes
 
 
@@ -330,36 +323,62 @@ def _observe_until_gone(record: Mapping[str, Any], *, grace_seconds: float) -> d
     return observed
 
 
-def _freeze_survivor(record: Mapping[str, Any], observation: Mapping[str, Any]) -> Optional[str]:
-    """Freeze an attachment whose owner outlived its terminal.
+#: Why an operator froze a claim by hand.  ``mark_ambiguous`` does not
+#: validate its reason against the launch-time vocabulary, so this is a
+#: convention like the others — but it must be distinguishable from them:
+#: every existing reason describes something the *launcher* could not
+#: verify, and this one describes a deliberate human act.
+OPERATOR_FREEZE_REASON = "operator_declared_owner_unresolvable"
 
-    Never raises into teardown.  Teardown has already killed the window
-    and is about to delete the row; an exception here would abort that
-    part-way and leave worse state than the claim it was trying to
-    resolve.  The established pairing at the one existing site that
-    touches an attachment during cleanup does the same — it collects the
-    failure rather than raising it.
+
+def freeze_for_adjudication(
+    *,
+    provider: str,
+    native_session_id: str,
+    operator: str,
+    detail: str,
+) -> dict[str, Any]:
+    """Move a stuck live claim into the state a human can adjudicate.
+
+    ``adjudicate`` deliberately only accepts a frozen row, and teardown
+    deliberately never freezes one.  That leaves a real gap: a claim whose
+    owner can never be observed — a pid the process table will not answer
+    for, a provider wedged forever — stays ``attached``, and the sweep
+    reports it every pass without ever resolving it.  There would be no
+    operator path at all.
+
+    This is that path, and it is two steps on purpose.  Freezing says "I
+    cannot determine this"; adjudicating says "I have decided anyway".
+    Collapsing them into one command would let the second sentence be
+    spoken without the first ever having been true.
+
+    An owner that is observably **alive** is refused.  A running process
+    is not an unresolvable ownership question — it is an answered one, and
+    the answer is no.
     """
-    reason = (
-        "owner_process_survived_terminal_teardown"
-        if observation["disposition"] == OWNER_ALIVE
-        else "owner_process_unobservable_at_terminal_teardown"
+    record = native_attachment.get(provider, native_session_id)
+    if record is None:
+        raise native_attachment.NativeAttachmentNotFound(
+            f"no attachment declared for {provider} session {native_session_id}"
+        )
+    observation = observe_owner(record)
+    if observation["disposition"] == OWNER_ALIVE:
+        raise native_attachment.NativeAttachmentConflict(
+            f"the owner of {provider} session {native_session_id} is running "
+            f"({observation['detail']}); a live owner is not an unresolvable "
+            "ownership question and is refused"
+        )
+    if observation["disposition"] == OWNER_GONE:
+        raise native_attachment.NativeAttachmentConflict(
+            f"the owner of {provider} session {native_session_id} is provably gone; "
+            "release it with `cao attachment sweep --apply` rather than freezing it "
+            "for a judgement call nobody needs to make"
+        )
+    return native_attachment.mark_ambiguous(
+        provider=provider,
+        native_session_id=native_session_id,
+        reason=f"{OPERATOR_FREEZE_REASON}: {operator}: {detail}",
     )
-    try:
-        native_attachment.mark_ambiguous(
-            provider=record["provider"],
-            native_session_id=record["native_session_id"],
-            reason=reason,
-        )
-    except native_attachment.NativeAttachmentError as exc:
-        logger.warning(
-            "Could not freeze the surviving attachment for %s session %s: %s",
-            record["provider"],
-            record["native_session_id"],
-            exc,
-        )
-        return None
-    return reason
 
 
 def sweep(*, apply: bool = False) -> dict[str, Any]:

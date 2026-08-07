@@ -142,12 +142,17 @@ is still "alive", for the process to leave the table.
 It never raises. The window is already killed and the row is about to go;
 aborting there would leave worse state than the claim it was resolving.
 
-**An owner that outlives its own generation is frozen**, not left quietly
-attached. The pane is gone and the provider is not — a real anomaly — and
-freezing puts it somewhere an operator can see it. A teardown that was
-given only a terminal id freezes nothing: an id can name a replacement
-incarnation, and freezing on that evidence would take a live session out
-of circulation for existing.
+**An owner still alive when the grace expires is left attached**, not
+frozen. Freezing was the first design here and it was wrong twice over.
+`mark_ambiguous` is terminal for automation, so it would convert a state
+the sweep resolves on its own — the provider exits a second later, or a
+minute later, and the next sweep releases it — into one that permanently
+requires a human. And it mislabels the evidence: "frozen" means ownership
+could not be determined, and here it was determined exactly, with the
+answer "still running".
+
+Nothing is lost by leaving it. The claim is listed, the sweep reports it
+every pass, and the release happens the moment the process is gone.
 
 ### The sweep
 
@@ -172,7 +177,7 @@ repository do it without stubbing the recovery steps. A boot sweep that
 mutated by default would release rows out of an operator's real database
 as a side effect of running `pytest`.
 
-### Operator adjudication
+### Operator freeze, then adjudication
 
 `mark_ambiguous` freezes a claim whose ownership could not be resolved,
 and the module is emphatic that automation must never undo that:
@@ -191,6 +196,22 @@ cao attachment adjudicate kimi_cli session_04c87e57 \
     --detail "pane and process both gone for six days" \
     --evidence ./ps-output.txt
 ```
+
+A claim that is *not* frozen but that the sweep can never settle — an
+owner the process table will not answer for, a provider wedged forever —
+has to be declared unresolvable first:
+
+```
+cao attachment freeze kimi_cli session_04c87e57 \
+    --operator colin --detail "process table will not answer for pid 21063"
+```
+
+Two steps, on purpose. Freezing says "I cannot determine this";
+adjudicating says "I have decided anyway". Collapsing them would let the
+second sentence be spoken without the first ever having been true. A
+provably-gone owner is refused here and pointed at the sweep, and a
+running one is refused outright — a live process is an answered ownership
+question, not an open one.
 
 The adjudication is stored under its own schema —
 `cao-native-attachment-adjudication-v1`, not the no-survivor schema — so a
@@ -215,7 +236,7 @@ evidence that doing so is safe.
   what covers them, not the wiring.
 - **The recycled-pid row.** One row on the reference install has a dead
   owner that automation will never release, because proving it requires
-  trusting the marker. It needs adjudication.
+  trusting the marker. It needs `freeze` then `adjudicate`.
 - **No web surface.** The dashboard shows nothing about session claims.
   `run_manifest._attachment_projection` renders most of an operator view
   and has no callers; it drops `process_identity` and `pane_id`, which are

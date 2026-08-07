@@ -305,3 +305,103 @@ class TestTheBootSweepDoesNotMutateByDefault:
         _attach(pid=_reaped_pid())
         assert recovery.sweep_at_startup()["applied"] is False
         assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED
+
+
+class TestOperatorFreeze:
+    """The bridge between "the sweep can never settle this" and adjudication.
+
+    `adjudicate` only accepts a frozen row and teardown never freezes one,
+    so without this a claim whose owner can never be observed would stay
+    attached forever with no operator path at all.
+    """
+
+    def test_an_unobservable_owner_can_be_declared_unresolvable(self, monkeypatch):
+        _attach(pid=os.getpid())
+        monkeypatch.setattr(recovery, "_pid_state", lambda pid: recovery.OWNER_UNOBSERVABLE)
+        result = recovery.freeze_for_adjudication(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            operator="colin",
+            detail="process table will not answer for this pid",
+        )
+        assert result["state"] == na.AMBIGUOUS
+        assert result["ambiguity_reason"].startswith(recovery.OPERATOR_FREEZE_REASON)
+        assert "colin" in result["ambiguity_reason"]
+
+    def test_a_claim_with_no_published_identity_can_be_declared_unresolvable(self):
+        na.declare(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            terminal_id=TERMINAL,
+            generation=GENERATION,
+            execution_mode="native_tui",
+            intent=_intent(),
+        )
+        result = recovery.freeze_for_adjudication(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            operator="colin",
+            detail="launch crashed before publishing an identity",
+        )
+        assert result["state"] == na.AMBIGUOUS
+
+    def test_a_running_owner_is_refused(self):
+        """A live process is an answered ownership question, not an open one."""
+        _attach(pid=os.getpid())
+        with pytest.raises(na.NativeAttachmentConflict):
+            recovery.freeze_for_adjudication(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                operator="colin",
+                detail="I want it back",
+            )
+        assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED
+
+    def test_a_provably_gone_owner_is_refused_and_pointed_at_the_sweep(self):
+        """Freezing here would invent a judgement call nobody needs to make."""
+        _attach(pid=_reaped_pid())
+        with pytest.raises(na.NativeAttachmentConflict, match="sweep --apply"):
+            recovery.freeze_for_adjudication(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                operator="colin",
+                detail="looks dead to me",
+            )
+        assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED
+
+    def test_an_unclaimed_session_is_not_found(self):
+        with pytest.raises(na.NativeAttachmentNotFound):
+            recovery.freeze_for_adjudication(
+                provider=PROVIDER,
+                native_session_id="never-claimed",
+                operator="colin",
+                detail="x",
+            )
+
+    def test_the_frozen_row_is_then_adjudicable(self, monkeypatch):
+        """The two steps compose: declare unresolvable, then decide."""
+        _attach(pid=os.getpid())
+        monkeypatch.setattr(recovery, "_pid_state", lambda pid: recovery.OWNER_UNOBSERVABLE)
+        recovery.freeze_for_adjudication(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            operator="colin",
+            detail="process table will not answer",
+        )
+        monkeypatch.setattr(recovery, "_pid_state", lambda pid: recovery.OWNER_GONE)
+        record = na.get(PROVIDER, SESSION)
+        observation = recovery.observe_owner(record)
+        result = na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=na.adjudication(
+                outcome=na.ADJUDICATION_OUTCOME_OWNER_GONE,
+                evidence_sha256="e" * 64,
+                detail="host rebooted; nothing survived",
+                operator="colin",
+                observed_at=observation["observed_at"],
+                observation=observation,
+            ),
+            live_survivors=observation["survivors"],
+        )
+        assert result["state"] == na.DETACHED
