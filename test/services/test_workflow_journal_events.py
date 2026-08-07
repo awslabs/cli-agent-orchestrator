@@ -567,3 +567,86 @@ def test_healthy_run_declares_no_phantom_leading_gap():
     rows, gaps = workflow_journal.read_events_with_gaps("r1")
     assert [r.seq for r in rows] == [1, 2, 3]
     assert gaps == [], f"phantom gap on a healthy run: {gaps}"
+
+
+# ---------------------------------------------------------------------------
+# PR #526 review round 3 — BLOCKING: a NEGATIVE replay cursor fabricated a gap.
+#
+# `read_events_with_gaps` seeded `prev = after_seq` verbatim, so a negative cursor
+# on a perfectly healthy, lossless run declared a phantom loss:
+#     after_seq=-5  on seqs 1..3  ->  (after_seq=-5, before_seq=1,
+#                                      missing_count=5, reason="append_failed")
+# That inverts this module's central contract — a declared gap must mean an event
+# was ACTUALLY lost. The reader now clamps to 0.
+#
+# The clamp lives in the reader (not only behind the route's ge=0 bound) because
+# the reader is SHARED: both arms of /events plus /compare and /diagnostics call
+# it. These tests drive the reader directly, so they hold regardless of the route.
+# ---------------------------------------------------------------------------
+def _seed_healthy_run(run_id: str = "healthy") -> None:
+    """A lossless run: seqs 1..3 all landed, high-water agrees, state terminal."""
+    _seed_run_state(run_id, "completed")
+    for seq in (1, 2, 3):
+        workflow_journal.append_event(
+            run_id, seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water(run_id, 3)
+
+
+@pytest.mark.parametrize("cursor", [-1, -5, -100])
+def test_negative_cursor_declares_no_phantom_gap_on_a_healthy_run(cursor: int):
+    """THE regression test (FR-2.2/FR-2.3). RED before the clamp: the pre-fix reader
+    returned a GapMarker with missing_count == abs(cursor) for each of these."""
+    _seed_healthy_run()
+
+    rows, gaps = workflow_journal.read_events_with_gaps("healthy", cursor)
+
+    assert [r.seq for r in rows] == [1, 2, 3]
+    assert gaps == [], f"phantom gap fabricated from cursor {cursor}: {gaps}"
+
+
+@pytest.mark.parametrize("cursor", [-1, -5, -100])
+def test_clamped_negative_cursor_agrees_with_a_from_start_read(cursor: int):
+    """The clamp target is 0 — exactly what the from-start branch seeds — so a
+    clamped negative cursor and `after_seq=None` must agree. Clamping to None
+    instead would pass this for the healthy shape and FAIL the total-loss test
+    below, which is why both exist."""
+    _seed_healthy_run()
+
+    from_start_rows, from_start_gaps = workflow_journal.read_events_with_gaps("healthy")
+    clamped_rows, clamped_gaps = workflow_journal.read_events_with_gaps("healthy", cursor)
+
+    assert [r.seq for r in clamped_rows] == [r.seq for r in from_start_rows]
+    assert clamped_gaps == from_start_gaps
+
+
+def test_clamp_does_not_hide_a_total_loss_run():
+    """The clamp must not silence a REAL hole. A run whose every append was
+    swallowed (high-water 3, zero rows) still declares its trailing loss on a
+    negative cursor. Clamping to None would skip the trailing block and turn this
+    GREEN-but-wrong — reintroducing the defect an earlier round fixed."""
+    _seed_run_state("lost", "completed")
+    workflow_journal.persist_high_water("lost", 3)
+
+    rows, gaps = workflow_journal.read_events_with_gaps("lost", -5)
+
+    assert rows == []
+    assert len(gaps) == 1
+    assert gaps[0].missing_count == 3
+    assert gaps[0].reason == "append_failed_trailing"
+
+
+def test_negative_cursor_still_declares_a_real_interior_gap():
+    """A clamped cursor must not suppress an interior hole either: seq 2 swallowed,
+    1 and 3 landed -> the gap is still declared."""
+    _seed_run_state("interior", "completed")
+    for seq in (1, 3):
+        workflow_journal.append_event(
+            "interior", seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water("interior", 3)
+
+    rows, gaps = workflow_journal.read_events_with_gaps("interior", -5)
+
+    assert [r.seq for r in rows] == [1, 3]
+    assert [(g.after_seq, g.before_seq, g.missing_count) for g in gaps] == [(1, 3, 1)]

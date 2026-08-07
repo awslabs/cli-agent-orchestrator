@@ -2,9 +2,10 @@
 // (#504 / U8, FR-7.3). Read-only, offset-ranged (U5) to the event's captured
 // byte window, with a tail fallback when no byte window exists.
 //
-// THE #769 SEAM — graceful degradation, THREE branches:
+// THE NULL-OFFSET SEAM — graceful degradation, THREE branches:
 //   Events' `terminal_offset_start` / `terminal_offset_len` are currently ALWAYS
-//   null (offset-capture emission is the unresolved #769 decision).
+//   null: offset-capture emission is not wired yet (it needs a byte-position
+//   API on the terminal log writer that does not exist today).
 //     1. offsets present (non-null start AND len) -> fetch the U5 range API and
 //        render the exact byte window.
 //     2. offsets null BUT the event names a `terminal_id` -> fetch the
@@ -15,7 +16,7 @@
 //     3. no `terminal_id` at all -> the documented sync-pending state. There is
 //        genuinely nothing to fetch: no terminal to read from.
 //   It NEVER crashes and NEVER shows a silent blank. Forward-compatible: the
-//   moment #769 wires offset capture, branch 1 takes over with ZERO change here.
+//   moment offset capture is wired, branch 1 takes over with ZERO change here.
 //   See the paired tests asserting ALL THREE branches.
 
 import { useState, useEffect } from 'react'
@@ -122,10 +123,9 @@ export function SyncedTerminalPane({ event }: SyncedTerminalPaneProps) {
       >
         <div className="flex items-center gap-2 text-sm text-gray-400">
           <Clock size={16} className="text-gray-500 shrink-0" aria-hidden="true" />
-          {/* No issue link here: this pane previously linked to
-              github.com/anthropics/cli-agent-orchestrator/issues/769 — the wrong
-              org (the repo is awslabs/) and not a real issue number. Rather than
-              guess a replacement, state the condition plainly. */}
+          {/* Deliberately NO issue link: the number this pane once cited did not
+              exist, under an org that was not this repo's. State the condition
+              plainly instead of citing a tracker id that cannot be verified. */}
           <span>
             Terminal output sync pending — this event names no terminal, so there
             is nothing to read.

@@ -1,7 +1,7 @@
 // RunDetail — the selected run's inspection + playback surface (#504 / U8).
 // Composes: StepSummary, WorkflowTimeline (playback transport + scrubber +
 // declared-gap segments), SyncedTerminalPane (offset-synced to the selected
-// event, degrading gracefully on the #769 null-offset seam), FailureDetail,
+// event, degrading gracefully on the null-offset seam), FailureDetail,
 // RunComparison, and the diagnostics/delete actions. Live-follows the SSE
 // stream while the run is non-terminal.
 
@@ -127,7 +127,7 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
         />
       </div>
 
-      {/* Synced terminal (the #769 graceful-degrade seam) */}
+      {/* Synced terminal (the null-offset graceful-degrade seam) */}
       <SyncedTerminalPane event={selectedEvent} />
 
       {/* Comparison */}

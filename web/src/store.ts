@@ -45,6 +45,12 @@ interface Store {
   // position into `wfEvents`; `followConnected` reflects the live SSE stream.
   workflowRuns: RunSummaryRow[]
   selectedRun: RunInspection | null
+  // The run id the CURRENT selection is for, set synchronously the moment
+  // `selectWorkflowRun` is called — before its awaits. It is the request-generation
+  // token that lets an in-flight fetch tell whether it is still the live selection
+  // (PR #526 review round 3). Distinct from `selectedRun?.run_id`, which is null
+  // while a fetch is in flight and therefore useless as a guard.
+  selectedRunId: string | null
   wfEvents: WorkflowEvent[]
   wfGaps: GapMarker[]
   selectedIndex: number
@@ -74,6 +80,7 @@ export const useStore = create<Store>((set, get) => ({
 
   workflowRuns: [],
   selectedRun: null,
+  selectedRunId: null,
   wfEvents: [],
   wfGaps: [],
   selectedIndex: 0,
@@ -179,12 +186,26 @@ export const useStore = create<Store>((set, get) => ({
     }
     // Reset the playback view before loading a new run so stale events/gaps
     // from the previously selected run never bleed into the new timeline.
-    set({ selectedRun: null, wfEvents: [], wfGaps: [], selectedIndex: 0, followConnected: false })
+    // `selectedRunId` is set HERE, synchronously before the awaits below, so it is
+    // the request-generation token both branches compare against.
+    set({
+      selectedRun: null,
+      selectedRunId: runId,
+      wfEvents: [],
+      wfGaps: [],
+      selectedIndex: 0,
+      followConnected: false,
+    })
     try {
       const [inspection, page] = await Promise.all([
         api.inspectWorkflowRun(runId),
         api.getWorkflowRunEvents(runId),
       ])
+      // STALE-RESPONSE GUARD (PR #526 review round 3). Selecting run A then quickly
+      // run B leaves two fetches in flight; without this, whichever RESOLVES last
+      // wins, so A's response can overwrite B's and leave the detail pane and the
+      // live-follow keyed to different runs. Bail before touching state.
+      if (get().selectedRunId !== runId) return
       set({
         selectedRun: inspection,
         wfEvents: page.events,
@@ -194,6 +215,11 @@ export const useStore = create<Store>((set, get) => ({
         selectedIndex: Math.max(0, page.events.length - 1),
       })
     } catch (e: any) {
+      // The SAME guard on the error path, which is not symmetric decoration: this
+      // branch clears `selectedRun` and raises a snackbar, so a FAILED fetch for A
+      // arriving after B succeeded would blank B's loaded detail pane and blame it
+      // for an error that belongs to a run the user already navigated away from.
+      if (get().selectedRunId !== runId) return
       set({ selectedRun: null })
       get().showSnackbar({ type: 'error', message: e?.message || 'Failed to load run' })
     }
@@ -206,7 +232,16 @@ export const useStore = create<Store>((set, get) => ({
       // Dedupe by seq (a reconnect can replay the boundary event); keep the
       // list seq-ordered. seq is the sole ordering authority (never ts).
       if (state.wfEvents.some(e => e.seq === event.seq)) return state
-      const events = [...state.wfEvents, event].sort((a, b) => a.seq - b.seq)
+      // ORDERED INSERT, not append-then-sort. The list is already sorted, so the
+      // arrival position is found by scanning from the END — an SSE frame is almost
+      // always the newest event, making the common case O(1) instead of the
+      // O(n log n) full re-sort this ran on EVERY frame (a live follow re-sorted
+      // the whole timeline hundreds of times). Out-of-order arrival still lands
+      // correctly: the scan walks back to the right slot.
+      const events = [...state.wfEvents]
+      let i = events.length
+      while (i > 0 && events[i - 1].seq > event.seq) i--
+      events.splice(i, 0, event)
       return { wfEvents: events }
     }),
 
@@ -234,6 +269,9 @@ export const useStore = create<Store>((set, get) => ({
   clearSelectedRun: () =>
     set({
       selectedRun: null,
+      // Cleared too, so an in-flight fetch for the run being closed cannot resolve
+      // afterwards and re-populate a pane the user has dismissed.
+      selectedRunId: null,
       wfEvents: [],
       wfGaps: [],
       selectedIndex: 0,

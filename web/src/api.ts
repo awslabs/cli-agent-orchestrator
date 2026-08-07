@@ -210,7 +210,7 @@ export interface GraphExportResult {
 /**
  * One durable event row (server EventRow, workflow_journal.py — all 21 columns).
  * `seq` is the SOLE ordering authority (never order by `ts`). The two
- * `terminal_offset_*` fields are the #769 seam: currently ALWAYS null until
+ * `terminal_offset_*` fields are the null-offset seam: currently ALWAYS null until
  * offset-capture emission is wired — SyncedTerminalPane degrades gracefully
  * on null and lights up unchanged the moment they populate.
  */
@@ -538,7 +538,7 @@ export const api = {
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null
-  // terminal_offset_start/len (the #769 seam). `length` is capped server-side.
+  // terminal_offset_start/len (the null-offset seam). `length` is capped server-side.
   getTerminalOutputRange: (terminalId: string, offset: number, length: number) =>
     fetchJSON<TerminalOutputRange>(
       `/terminals/${encodeURIComponent(terminalId)}/output/range?offset=${offset}&length=${length}`,

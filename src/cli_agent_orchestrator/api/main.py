@@ -501,6 +501,10 @@ class StepInspection(BaseModel):
     ``step_id``) so the existing endpoint's step contract is preserved
     byte-for-byte and only ADDED to (BR-2). A pre-U1 row surfaces the additive
     columns as ``None``.
+
+    ``output_json`` and ``error`` carry the step's FULL text and are NOT gated by
+    ``workflow_journal_capture_output`` — see the payload-posture note on
+    ``get_workflow_run_endpoint`` before adding a consumer or a log line.
     """
 
     id: str
@@ -687,8 +691,13 @@ class BundleExcerpt(BaseModel):
 
     Present ONLY when output capture is enabled (BR-9): each excerpt is the
     step's output passed through U7's capture gate + the ``sanitize_output``
-    cap-and-mark redactor (NFR-SEC-4/6). With capture disabled (the default), the
+    cap-and-mark SANITIZER (NFR-SEC-4/6). With capture disabled (the default), the
     bundle carries NO excerpts — metadata + references only.
+
+    "Sanitizer", NOT "redactor": ``sanitize_output`` performs transport hygiene —
+    control-character stripping and size capping with a truncation marker. It does
+    NOT detect or remove secrets. A credential inside a step's output survives it
+    verbatim. The excerpt is retention-safe in SIZE, not in CONTENT.
     """
 
     step_id: str
@@ -699,7 +708,9 @@ class DiagnosticBundle(BaseModel):
     """A run's troubleshooting export bundle (FR-9, domain-entities DiagnosticBundle).
 
     Contains EVERY FR-9.1 section (BR-3): the spec identifier + content hash, the
-    redacted inputs (BR-4), the ordered event timeline with declared gaps, the
+    SANITIZED inputs (BR-4 — size-capped and control-char-stripped, NOT
+    secret-redacted: a credential passed as a workflow input comes back verbatim),
+    the ordered event timeline with declared gaps, the
     step outcomes + structured errors, provider/agent/engine environment metadata,
     terminal + artifact references (BR-2), and retention-safe excerpts (BR-5,
     capture-gated per BR-9). Reconstructable from the durable journal ALONE
@@ -3656,6 +3667,34 @@ async def get_workflow_run_endpoint(
     Consequence for #505: its CLI/MCP status/result clients read this route (plus
     ``/events`` and ``/compare``) and must present a token carrying
     ``cao:read``/``cao:write``/``cao:admin`` once auth is enabled.
+
+    PAYLOAD POSTURE CHANGED AT THIS PATH — read this before adding a caller
+    (PR #526 review round 3, FR-4). Before the #504/#505 integration this path was
+    answered by #505's ``RunStatus`` snapshot, which is documented payload-FREE:
+    "Carries no per-step output or prompt (B3-SD-3)" —
+    ``models/workflow_runtime.py``. The superseding ``RunInspection`` above is
+    payload-BEARING. The union-superset resolution that merged the two handlers
+    preserved every ``RunStatus`` field byte-compatibly, but it also widened what
+    this route DISCLOSES, and that widening is deliberate (it is the enriched
+    inspect feature FR-5.1 asks for) — not an oversight.
+
+    Two consequences a reader must not have to infer:
+
+    1. ``workflow_journal_capture_output`` does NOT govern these fields. That flag
+       gates only the event-log output digest and the ``/diagnostics`` excerpts.
+       ``_journal_step`` persists ``output_json`` and ``error`` on EVERY step
+       transition regardless of it, because the resume path and
+       ``{{steps.<id>.output.<field>}}`` templating read them back. So with capture
+       at its default OFF, this route still returns step output and error verbatim.
+    2. The ONLY protection is the scope dependency above, and it is INERT in the
+       default deployment: with ``CAO_AUTH_ENABLED`` unset, ``require_any_scope``
+       returns the full scope set and enforces nothing. A local CAO server therefore
+       serves step output and error text to any caller that can reach the port.
+
+    Deliberately documented rather than further gated: stripping the fields removes
+    the feature, and gating them behind the capture flag would break resume and
+    templating. If a stricter posture is wanted, it belongs in a change that also
+    covers #505's CLI/MCP consumers of this route.
     """
     from cli_agent_orchestrator.services import workflow_journal, workflow_service
 
@@ -3663,13 +3702,23 @@ async def get_workflow_run_endpoint(
     #     KeyError -> 404 on a never-acked / corrupt-snapshot run (BR-7). This is
     #     the field set #505 reads; it is reused verbatim, never weakened.
     try:
-        status_snapshot = workflow_service.get_run_status(run_id)
+        # OFF-LOOP too: on a registry cache miss this reads the journal itself
+        # (the cold-read fallback / _rebuild_record_from_journal), so it is a
+        # synchronous sqlite call on the same footing as the enrichment reads below.
+        status_snapshot = await asyncio.to_thread(workflow_service.get_run_status, run_id)
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
 
     # (2) Durable enrichment sources (journal-authoritative, no registry needed).
-    run_row = workflow_journal.get_run(run_id)
-    step_rows = {row.step_id: row for row in workflow_journal.get_steps(run_id)}
+    #     OFF-LOOP: the journal DAL is synchronous sqlite, so every call runs in a
+    #     worker thread. This route is `async def`, so a bare call would block the
+    #     single event loop for the whole read — including the 250 ms SSE followers
+    #     (``_EVENTS_FOLLOW_POLL_INTERVAL_S``). Matches the SSE and DELETE arms,
+    #     which already wrap the same functions.
+    run_row = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    step_rows = {
+        row.step_id: row for row in await asyncio.to_thread(workflow_journal.get_steps, run_id)
+    }
 
     # (3) Per-step UNION: the authoritative (id, state, attempts) baseline from
     #     the snapshot drives ordering and liveness; the durable StepRow columns
@@ -3994,10 +4043,15 @@ async def get_workflow_run_events_endpoint(
     request: Request,
     after_seq: Optional[int] = Query(
         default=None,
+        ge=0,
         description=(
             "Replay cursor: return only events with seq strictly greater than "
             "this value. Omitted -> from the start of the timeline. Takes "
-            "precedence over the Last-Event-ID header on the SSE stream (BR-3)."
+            "precedence over the Last-Event-ID header on the SSE stream (BR-3). "
+            "Must be >= 0: seqs start at 1, so 0 is the from-start cursor and a "
+            "negative value is meaningless. Bounded here (422) because an "
+            "unbounded negative cursor USED TO fabricate a phantom gap on a "
+            "healthy run; the reader also clamps defensively (BR-4)."
         ),
     ),
     limit: Optional[int] = Query(
@@ -4087,8 +4141,13 @@ async def get_workflow_run_events_endpoint(
             media_type="text/event-stream",
         )
 
-    # BATCH arm — unchanged from U3 (byte-behavior-identical for existing callers).
-    events, gaps = workflow_journal.read_events_with_gaps(run_id, after_seq)
+    # BATCH arm — byte-behavior-identical for existing callers. The DAL call runs
+    # OFF-LOOP (synchronous sqlite in an `async def`); the SSE arm above already
+    # wraps the same function, so leaving this one bare made the two arms of ONE
+    # route disagree on event-loop discipline.
+    events, gaps = await asyncio.to_thread(
+        workflow_journal.read_events_with_gaps, run_id, after_seq
+    )
     if limit is not None and len(events) > limit:
         events = events[:limit]
         # Gaps beyond the trimmed window are dropped so a returned gap never
@@ -4229,20 +4288,28 @@ async def compare_workflow_runs_endpoint(
 
     # Both sides loaded from the durable journal; a missing run on EITHER side is a
     # 404, not a partial silent compare (BR-8). No run_registry lookup (BR-6).
-    baseline_run = workflow_journal.get_run(run_id)
+    #
+    # OFF-LOOP, PER CALL (six awaits). This route is the heaviest reader in the
+    # family — it reads two runs' full event sets — so a bare synchronous call
+    # stalls the event loop for the whole comparison. Deliberately NOT an
+    # `asyncio.gather` over the six: the two `get_run` calls are separated by their
+    # own 404 raises, and short-circuiting on the FIRST missing run is the existing
+    # BR-8 contract. Gathering would change which 404 fires and would read the
+    # second run's rows for a request that is already a 404.
+    baseline_run = await asyncio.to_thread(workflow_journal.get_run, run_id)
     if baseline_run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
-    compare_run = workflow_journal.get_run(against)
+    compare_run = await asyncio.to_thread(workflow_journal.get_run, against)
     if compare_run is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"unknown run '{against}' (compare target)",
         )
 
-    a_steps = {s.step_id: s for s in workflow_journal.get_steps(run_id)}
-    b_steps = {s.step_id: s for s in workflow_journal.get_steps(against)}
-    a_events, _a_gaps = workflow_journal.read_events_with_gaps(run_id)
-    b_events, _b_gaps = workflow_journal.read_events_with_gaps(against)
+    a_steps = {s.step_id: s for s in await asyncio.to_thread(workflow_journal.get_steps, run_id)}
+    b_steps = {s.step_id: s for s in await asyncio.to_thread(workflow_journal.get_steps, against)}
+    a_events, _a_gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, run_id)
+    b_events, _b_gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, against)
     a_by_step = _events_by_step(a_events)
     b_by_step = _events_by_step(b_events)
 
@@ -4322,7 +4389,8 @@ async def get_workflow_run_diagnostics_endpoint(
 
     # Journal-authoritative (BR-6): the run row comes from get_run, NOT the live
     # registry — a cleared registry (post-restart) does not affect this read.
-    run_row = workflow_journal.get_run(run_id)
+    # OFF-LOOP: synchronous sqlite in an `async def` (see the SSE/DELETE arms).
+    run_row = await asyncio.to_thread(workflow_journal.get_run, run_id)
     if run_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
 
@@ -4334,8 +4402,10 @@ async def get_workflow_run_diagnostics_endpoint(
     # attribute so a spy on workflow_retention.sanitize_output proves the choke point.
     inputs = workflow_retention.sanitize_output(run_row.inputs_json)
 
-    events, gaps = workflow_journal.read_events_with_gaps(run_id)
-    step_rows = workflow_journal.get_steps(run_id)
+    # OFF-LOOP: this bundle reads the run's ENTIRE event set plus every step row,
+    # so it is the second-heaviest reader after /compare.
+    events, gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, run_id)
+    step_rows = await asyncio.to_thread(workflow_journal.get_steps, run_id)
     step_outcomes = [
         StepOutcome(step_id=s.step_id, state=s.state, error_kind=s.error_kind) for s in step_rows
     ]

@@ -761,3 +761,67 @@ async def test_phase3_poll_loop_drains_the_trailing_gap_on_the_terminal_pass():
     assert len(gap_frames) == 1, f"the Phase-3 drain declared no gap: {collected}"
     assert '"reason": "append_failed_trailing"' in gap_frames[0]
     assert '"after_seq": 1' in gap_frames[0]
+
+
+# ---------------------------------------------------------------------------
+# PR #526 review round 3 — BLOCKING: `after_seq` had no lower bound.
+#
+# The sibling `limit` carries ge=1, but `after_seq` carried no `ge` at all, so a
+# negative cursor reached the reader and fabricated a phantom GapMarker on a
+# healthy, lossless run (reason="append_failed", missing_count=abs(cursor)) —
+# inverting the contract that a declared gap means an event was actually lost.
+#
+# Defence in depth: the ROUTE rejects the meaningless input (these tests), and the
+# READER clamps regardless of caller (test_workflow_journal_events.py). Neither
+# alone is sufficient — a route-only bound leaves /compare, /diagnostics and any
+# future caller exposed; a reader-only clamp answers 200 for nonsense input.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("cursor", [-1, -5, -100])
+def test_negative_after_seq_is_rejected_with_422(client, cursor: int):
+    """FR-2.1 — a negative cursor is meaningless (seqs start at 1) and is refused
+    BEFORE the handler runs. RED before the fix: it returned 200 with a phantom gap."""
+    _seed_terminal_run("r1")
+    _append("r1", 1, 2, 3)
+
+    resp = client.get("/workflows/runs/r1/events", params={"after_seq": cursor})
+
+    assert resp.status_code == 422
+
+
+def test_after_seq_zero_is_accepted_as_the_from_start_cursor(client):
+    """FR-2.1 boundary — the bound is ge=0, NOT ge=1: 0 is the legitimate
+    from-start cursor and must still be accepted. A fix that used ge=1 would break
+    every client that pages from 0."""
+    _seed_terminal_run("r1")
+    _append("r1", 1, 2, 3)
+
+    resp = client.get("/workflows/runs/r1/events", params={"after_seq": 0})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [e["seq"] for e in body["events"]] == [1, 2, 3]
+    assert body["gaps"] == []
+
+
+def test_positive_after_seq_still_pages_normally(client):
+    """FR-2.1 / NFR-4 — the bound must not disturb the normal cursor path."""
+    _seed_terminal_run("r1")
+    _append("r1", 1, 2, 3)
+
+    resp = client.get("/workflows/runs/r1/events", params={"after_seq": 1})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [e["seq"] for e in body["events"]] == [2, 3]
+    assert body["gaps"] == []
+
+
+def test_limit_lower_bound_is_untouched_by_the_after_seq_fix(client):
+    """Guard against the likely slip: `limit` sits three lines below `after_seq` in
+    the same signature, so a fix could easily land ge=0 on the WRONG parameter.
+    `limit=0` must still be a 422 (its bound is ge=1)."""
+    _seed_terminal_run("r1")
+    _append("r1", 1, 2, 3)
+
+    assert client.get("/workflows/runs/r1/events", params={"limit": 0}).status_code == 422
+    assert client.get("/workflows/runs/r1/events", params={"limit": 1}).status_code == 200

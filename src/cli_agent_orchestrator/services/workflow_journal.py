@@ -910,7 +910,23 @@ def read_events_with_gaps(
     rows = read_events(run_id, after_seq)
     gaps: List[GapMarker] = []
     if after_seq is not None:
-        prev: Optional[int] = after_seq
+        # CLAMPED at 0 (PR #526 review round 3). Seeding a NEGATIVE cursor verbatim
+        # fabricated a GapMarker on a perfectly healthy, lossless run: with rows at
+        # seqs 1..3, `after_seq=-5` declared `(after_seq=-5, before_seq=1,
+        # missing_count=5, reason="append_failed")` — a phantom loss, which inverts
+        # this module's central contract that a declared gap means an event was
+        # actually lost.
+        #
+        # The clamp lives HERE, not only on the route's `ge=0` bound, because this
+        # reader is SHARED: the batch and SSE arms of the events route, /compare and
+        # /diagnostics all call it. A route-only bound would leave every other caller
+        # (present and future) able to reintroduce the phantom.
+        #
+        # Clamp to 0, NEVER to None: 0 is exactly what the from-start branch below
+        # seeds, so a clamped negative cursor and a from-start read agree on every
+        # shape. Clamping to None would skip the trailing-gap block and hide a real
+        # total-loss run — reintroducing the defect an earlier round fixed.
+        prev: Optional[int] = max(after_seq, 0)
     else:
         # A from-start read seeds at 0 — one below the first allocatable seq
         # (seqs start at 1) — UNCONDITIONALLY, whether or not rows came back.

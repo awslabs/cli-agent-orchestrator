@@ -173,7 +173,7 @@ def test_br_sec_6_marker_matches_audit_log_field_sanitizer_exactly():
 def test_br_sec_4_capture_on_truncates_over_cap_output(settings):
     settings["workflow_journal_capture_output"] = True
     settings["workflow_journal_output_cap_bytes"] = 100
-    captured = workflow_retention.resolve_captured_output("X" * 10_000)
+    captured = workflow_retention.sanitize_output("X" * 10_000)
     assert captured is not None
     assert captured.endswith("[…truncated]")
     assert len(captured.encode("utf-8")) <= 100 + len("[…truncated]".encode("utf-8"))
@@ -339,8 +339,8 @@ async def test_br_sec_2_step_output_received_output_ref_null_when_capture_off(
     appears in no stored cell of the event log regardless of the capture setting.
 
     This goes RED if the emission site writes the output TEXT into ``output_ref``
-    (``output_ref=_output_json(st.output)``, or routing it through
-    ``resolve_captured_output``, which returns the text): either leaks the sentinel here.
+    (``output_ref=_output_json(st.output)``, or routing the sanitized TEXT there
+    instead of a reference): either leaks the sentinel here.
     """
     settings["workflow_journal_capture_output"] = False
     monkeypatch.setattr(
@@ -385,7 +385,7 @@ async def test_br_sec_2_step_output_received_never_carries_the_payload(settings,
     which re-reads the setting at export time.
 
     This goes RED if the emission site writes the text: either raw
-    (``output_ref=_output_json(st.output)``) or via ``resolve_captured_output``
+    (``output_ref=_output_json(st.output)``) or via ``sanitize_output``
     (which returns the sanitized TEXT) — both leak the sentinel into output_ref.
     """
     settings["workflow_journal_capture_output"] = True
@@ -443,22 +443,15 @@ def test_output_reference_is_not_capture_gated(settings):
     assert workflow_retention.output_reference('{"x": 1}') is not None
 
 
-def test_capture_gate_off_returns_none_even_for_nonempty_text(settings):
-    """The gate: capture off -> resolve_captured_output is None regardless of input."""
-    settings["workflow_journal_capture_output"] = False
-    assert workflow_retention.resolve_captured_output("anything") is None
-
-
 def test_capture_gate_on_returns_sanitized_text(settings):
     settings["workflow_journal_capture_output"] = True
     settings["workflow_journal_output_cap_bytes"] = 4096
-    assert workflow_retention.resolve_captured_output("kept output") == "kept output"
+    assert workflow_retention.sanitize_output("kept output") == "kept output"
 
 
 def test_capture_defaults_to_off_when_unset(settings):
     """An empty settings block -> capture off (fail-closed default, NFR-SEC-2)."""
     assert workflow_retention.capture_enabled() is False
-    assert workflow_retention.resolve_captured_output("x") is None
 
 
 # ===========================================================================
@@ -579,7 +572,6 @@ def test_capture_fails_closed_on_unreadable_settings(monkeypatch):
 
     monkeypatch.setattr(workflow_retention, "get_memory_settings", _boom)
     assert workflow_retention.capture_enabled() is False
-    assert workflow_retention.resolve_captured_output("secret") is None
 
 
 def test_output_cap_degrades_to_default_on_bad_value(settings):
@@ -615,12 +607,6 @@ def test_sweep_is_a_noop_when_enumeration_fails(settings, monkeypatch):
 
     monkeypatch.setattr(workflow_journal, "list_run_ids_by_age", _boom)
     assert workflow_retention.sweep_runs(retention_days=1, retention_count=1) == 0
-
-
-def test_none_output_is_not_captured_regardless_of_gate(settings):
-    """resolve_captured_output(None) is None even with capture ON (nothing to retain)."""
-    settings["workflow_journal_capture_output"] = True
-    assert workflow_retention.resolve_captured_output(None) is None
 
 
 # ===========================================================================

@@ -178,29 +178,15 @@ def sanitize_output(text: str) -> str:
     return cleaned
 
 
-def resolve_captured_output(text: Optional[str]) -> Optional[str]:
-    """Capture gate (business-logic-model Algorithm 1) — the U7-owned attachment point.
-
-    The single decision an emission/write site consults for whether a free-text
-    output is retained:
-
-    - capture OFF (default) or ``text is None`` -> ``None``: metadata-only, NO
-      prompt/output text is retained (NFR-SEC-1/2).
-    - capture ON -> the sanitized, size-limited text (``sanitize_output``, NFR-SEC-4/6).
-
-    This module owns the gate so the drive-loop emission sequence (SEAM #1) is never
-    restructured to add capture logic.
-
-    Returns the output TEXT. Callers must therefore NOT store the result in the
-    event's ``output_ref`` column: that column is a REFERENCE (compare's
-    ``a_refs``/``b_refs`` and the diagnostic bundle's ``references.artifacts`` are
-    documented as reference-level, never payloads). Use
-    ``output_reference(text)`` for the column and let the payload travel only
-    through the capture-gated ``excerpts`` section.
-    """
-    if text is None or not capture_enabled():
-        return None
-    return sanitize_output(text)
+# NOTE (PR #526 review round 3): ``resolve_captured_output`` was REMOVED here.
+# It was described as "the U7-owned attachment point" for the capture gate, but it
+# never acquired a production caller — every reference was in its own tests. Its
+# docstring therefore over-claimed: it read as though it gated the write path, while
+# the code that actually decides what is retained is ``capture_enabled()`` consulted
+# at the diagnostics bundle, plus ``sanitize_output`` at the excerpt boundary.
+# Keeping a dead gate that claims to be THE gate is worse than having none: a future
+# author wires a payload through it and believes the payload is capture-gated. If a
+# write-path gate is wanted, add it at the call site with a test that proves it fires.
 
 
 def output_reference(text: Optional[str]) -> Optional[str]:
