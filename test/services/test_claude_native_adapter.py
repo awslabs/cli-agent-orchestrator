@@ -259,6 +259,7 @@ class TestPerProviderArgvDispatch:
             "codex",
             "kimi_cli",
             "claude_code",
+            "muse_cli",
         }
         for provider in ntl.SUPPORTED_NATIVE_PROVIDERS:
             binder = ntl._binder(provider)

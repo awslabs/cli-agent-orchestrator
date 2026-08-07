@@ -134,7 +134,11 @@ from cli_agent_orchestrator.services.control_input_journal import (
     ControlInputTransitionRefused,
     outcome_for_state,
 )
-from cli_agent_orchestrator.services.pane_input_arbiter import PaneBusyError, pane_input_lease
+from cli_agent_orchestrator.services.pane_input_arbiter import (
+    PaneBusyError,
+    PaneInputArbiterError,
+    pane_input_lease,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1082,6 +1086,63 @@ class ControlInputResult:
             "submission_evidence_ref": self.submission_evidence_ref,
             "events": None if self.events is None else [dict(event) for event in self.events],
         }
+
+
+COMPOSER_OBSERVATION_PROTOCOL = "cao-composer-observation-v1"
+
+
+@dataclass(frozen=True)
+class ComposerObservationResult:
+    """One composer-observation call's answer.
+
+    The route is read-only: it never writes to the pane.  ``observed`` is
+    true only when the exact expected digest and byte length are proven in
+    the pinned composer region and submission is not proven to have
+    occurred.  The response never carries raw composer text.
+    """
+
+    observed: bool
+    terminal_id: str
+    terminal_generation: Optional[str]
+    pane_id: str
+    pane_pid: int
+    provider: Optional[str]
+    provider_version: Optional[str]
+    execution_mode: str
+    native_session_id: Optional[str]
+    submission_observed: str
+    content_sha256: Optional[str] = None
+    content_bytes: Optional[int] = None
+    evidence_ref: Optional[str] = None
+    refusal_reason: Optional[str] = None
+    refusal_detail: Optional[str] = None
+    http_status: int = 200
+
+    def as_response(self) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "protocol": COMPOSER_OBSERVATION_PROTOCOL,
+            "observed": self.observed,
+            "terminal_id": self.terminal_id,
+            "terminal_generation": self.terminal_generation,
+            "pane_id": self.pane_id,
+            "pane_pid": self.pane_pid,
+            "provider": self.provider,
+            "provider_version": self.provider_version,
+            "execution_mode": self.execution_mode,
+            "native_session_id": self.native_session_id,
+            "submission_observed": self.submission_observed,
+            "evidence_ref": self.evidence_ref,
+        }
+        if self.content_sha256 is not None:
+            body["content_sha256"] = self.content_sha256
+        if self.content_bytes is not None:
+            body["content_bytes"] = self.content_bytes
+        if self.refusal_reason is not None:
+            body["refusal"] = {
+                "reason": self.refusal_reason,
+                "detail": self.refusal_detail,
+            }
+        return body
 
 
 def _refusal(
@@ -4682,6 +4743,265 @@ STREAMING_COALESCE_WINDOW_MS = 200
 STREAMING_MAX_IN_FLIGHT = 1
 
 
+class ComposerObservationRequestInvalid(ValueError):
+    """The observation request is malformed."""
+
+
+_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _validate_expected_digest(value: Any) -> str:
+    if not isinstance(value, str) or not _DIGEST_PATTERN.match(value):
+        raise ComposerObservationRequestInvalid(
+            "expected_text_sha256 must be 64 lowercase hex characters"
+        )
+    return value
+
+
+def _validate_expected_bytes(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ComposerObservationRequestInvalid("expected_text_bytes must be a positive integer")
+    if value <= 0:
+        raise ComposerObservationRequestInvalid("expected_text_bytes must be a positive integer")
+    return value
+
+
+def _composer_observation_supported(resolved: ResolvedControlIdentity) -> Optional[str]:
+    """Why composer observation is not supported for this terminal, or None."""
+    if not resolved.managed:
+        return "terminal is not managed"
+    if resolved.execution_mode != EXECUTION_MODE_NATIVE_TUI:
+        return f"terminal execution mode is {resolved.execution_mode!r}, not native_tui"
+    if resolved.pane_id is None:
+        return "terminal has no resolved pane identity"
+    if resolved.provider is None:
+        return "terminal has no resolved provider"
+    pin = native_pane_input.composer_observation_pin_for(
+        resolved.provider, resolved.provider_version
+    )
+    if pin is None:
+        return (
+            f"provider {resolved.provider!r} at build {resolved.provider_version!r} "
+            "has no pinned composer observation layout"
+        )
+    return None
+
+
+def _negative_observation(
+    resolved: ResolvedControlIdentity,
+    submission_observed: str,
+    *,
+    reason: Optional[str] = None,
+    detail: Optional[str] = None,
+    http_status: int = 200,
+) -> ComposerObservationResult:
+    return ComposerObservationResult(
+        observed=False,
+        terminal_id=resolved.terminal_id,
+        terminal_generation=resolved.terminal_generation,
+        pane_id=resolved.pane_id or "",
+        pane_pid=resolved.pane_pid or 0,
+        provider=resolved.provider,
+        provider_version=resolved.provider_version,
+        execution_mode=resolved.execution_mode,
+        native_session_id=resolved.native_session_id,
+        submission_observed=submission_observed,
+        evidence_ref=None,
+        refusal_reason=reason,
+        refusal_detail=detail,
+        http_status=http_status,
+    )
+
+
+def observe_composer(
+    terminal_id: str,
+    expected_text_sha256: str,
+    expected_text_bytes: int,
+    *,
+    lease_timeout: float = 0.0,
+) -> ComposerObservationResult:
+    """Read whether the exact expected text is resting in the provider composer.
+
+    The call is read-only and identity-bound.  It resolves the server's view
+    of the terminal, takes the pane-input lease, re-proves the live identity
+    under that lease, captures the pinned composer region, and compares the
+    extracted text's digest and byte length to the caller's expectation.
+
+    Returns ``observed=True`` only when the exact digest and byte length are
+    proven in the pinned composer region and submission is not proven to have
+    occurred.  Every other outcome — empty composer, mismatch, capture
+    failure, identity drift, unsupported build — returns ``observed=False``
+    with a typed reason.  Raw composer text is never returned.
+    """
+    expected_digest = _validate_expected_digest(expected_text_sha256)
+    expected_bytes = _validate_expected_bytes(expected_text_bytes)
+
+    resolved = resolve_control_identity(terminal_id)
+    if resolved is None:
+        # A 404 is honest for a pure read: both "no such terminal" and "no
+        # such route" lead to the same action, which is not to observe.
+        return ComposerObservationResult(
+            observed=False,
+            terminal_id=terminal_id,
+            terminal_generation=None,
+            pane_id="",
+            pane_pid=0,
+            provider=None,
+            provider_version=None,
+            execution_mode="",
+            native_session_id=None,
+            submission_observed=native_pane_input.SUBMISSION_UNKNOWN,
+            refusal_reason="unknown-terminal",
+            refusal_detail=f"no terminal {terminal_id!r} is known to this server",
+            http_status=404,
+        )
+
+    unsupported_reason = _composer_observation_supported(resolved)
+    if unsupported_reason is not None:
+        return _negative_observation(
+            resolved,
+            native_pane_input.SUBMISSION_UNKNOWN,
+            reason="provider-unsupported",
+            detail=unsupported_reason,
+            http_status=409,
+        )
+
+    # From here on the terminal is a supported native TUI with a resolved pane.
+    assert resolved.pane_id is not None
+
+    # Acquire the same pane-input lease used by control-input, then re-read
+    # the exact identity under it.  A pane that changed between resolution and
+    # lease acquisition must be refused, not observed.
+    try:
+        with pane_input_lease(
+            resolved.pane_id,
+            holder="composer-observation",
+            timeout=lease_timeout,
+        ):
+            live = _tmux_client().pane_control_identity(pane_id=resolved.pane_id)
+            if live is None:
+                return _negative_observation(
+                    resolved,
+                    native_pane_input.SUBMISSION_UNKNOWN,
+                    reason="identity-mismatch",
+                    detail="the pane identity could not be re-read under the lease",
+                    http_status=409,
+                )
+            if (
+                live.pane_id != resolved.pane_id
+                or live.pane_pid != resolved.pane_pid
+                or live.window_id != resolved.window_id
+            ):
+                return _negative_observation(
+                    resolved,
+                    native_pane_input.SUBMISSION_UNKNOWN,
+                    reason="identity-mismatch",
+                    detail="the pane identity changed under the lease",
+                    http_status=409,
+                )
+            if live.dead:
+                return _negative_observation(
+                    resolved,
+                    native_pane_input.SUBMISSION_UNKNOWN,
+                    reason="pane-dead",
+                    detail="the pane is dead",
+                    http_status=409,
+                )
+            server_refusal = server_identity_refusal(
+                bound=resolved.bound_server_socket_path,
+                observed=live.server_socket_path,
+            )
+            if server_refusal is not None:
+                return _negative_observation(
+                    resolved,
+                    native_pane_input.SUBMISSION_UNKNOWN,
+                    reason=server_refusal[0],
+                    detail=server_refusal[1],
+                    http_status=409,
+                )
+
+            pin = native_pane_input.composer_observation_pin_for(
+                resolved.provider, resolved.provider_version
+            )
+            if pin is None:
+                return _negative_observation(
+                    resolved,
+                    native_pane_input.SUBMISSION_UNKNOWN,
+                    reason="provider-unsupported",
+                    detail="no pinned composer observation layout for this build",
+                    http_status=409,
+                )
+
+            try:
+                rows = native_pane_input.capture_pane_screen(
+                    resolved.pane_id,
+                    timeout=native_pane_input._OBSERVATION_CAPTURE_TIMEOUT_SECONDS,
+                )
+            except native_pane_input.NativePaneInputUnavailable as exc:
+                return _negative_observation(
+                    resolved,
+                    native_pane_input.SUBMISSION_UNKNOWN,
+                    reason="capture-failed",
+                    detail=f"could not capture the pane screen: {exc}",
+                )
+
+            extracted = native_pane_input.extract_composer_text(rows, pin)
+            if extracted is None:
+                return _negative_observation(
+                    resolved,
+                    native_pane_input.SUBMISSION_UNKNOWN,
+                    reason="composer-unreadable",
+                    detail="the pinned composer region could not be read",
+                )
+
+            observed_bytes = len(extracted.encode("utf-8"))
+            observed_digest = hashlib.sha256(extracted.encode("utf-8")).hexdigest()
+
+            if observed_digest == expected_digest and observed_bytes == expected_bytes:
+                # The text is visibly resting in the composer.  This is a
+                # positive observation that it is unsubmitted; we do not infer
+                # provider submission from the capture.
+                evidence_ref = native_pane_input.submission_evidence_ref(resolved.pane_id, rows)
+                return ComposerObservationResult(
+                    observed=True,
+                    terminal_id=resolved.terminal_id,
+                    terminal_generation=resolved.terminal_generation,
+                    pane_id=resolved.pane_id,
+                    pane_pid=resolved.pane_pid,
+                    provider=resolved.provider,
+                    provider_version=resolved.provider_version,
+                    execution_mode=resolved.execution_mode,
+                    native_session_id=resolved.native_session_id,
+                    submission_observed=native_pane_input.SUBMISSION_UNSUBMITTED,
+                    content_sha256=observed_digest,
+                    content_bytes=observed_bytes,
+                    evidence_ref=evidence_ref,
+                )
+
+            return _negative_observation(
+                resolved,
+                native_pane_input.SUBMISSION_UNKNOWN,
+                reason="content-mismatch",
+                detail="the composer does not hold the exact expected text",
+            )
+    except PaneBusyError:
+        return _negative_observation(
+            resolved,
+            native_pane_input.SUBMISSION_UNKNOWN,
+            reason="pane-busy",
+            detail="the pane input lease is held by another writer",
+            http_status=409,
+        )
+    except PaneInputArbiterError as exc:
+        return _negative_observation(
+            resolved,
+            native_pane_input.SUBMISSION_UNKNOWN,
+            reason="lease-unavailable",
+            detail=str(exc),
+            http_status=409,
+        )
+
+
 def control_input_capability_block(
     resolved: Optional[ResolvedControlIdentity] = None,
 ) -> Dict[str, Any]:
@@ -4733,6 +5053,10 @@ def control_input_capability_block(
                 )
                 is not None
             )
+        }
+        block["composer_observation"] = {
+            "supported": _composer_observation_supported(resolved) is None,
+            "protocol": COMPOSER_OBSERVATION_PROTOCOL,
         }
     return block
 

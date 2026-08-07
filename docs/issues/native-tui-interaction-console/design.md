@@ -111,10 +111,17 @@ can check every claim without re-walking the tree.
   `GET /control-input/capabilities` (`:2792`, unauthenticated),
   `GET /control-input/{control_id}` (`:2804`, READ+; keyed by control id
   alone, deliberately not terminal-scoped, `:2809-2814`),
-  `GET /terminals/{id}/control-identity` (`:2825`).
-  Terminal-level failures are `200` with a typed outcome; `422` is reserved
-  for shape errors and protocol mismatch; `404` is reserved for "server has
-  no control route at all" (contract docstring `:27-33`).
+  `GET /terminals/{id}/control-identity` (`:2825`), and
+  `GET /terminals/{id}/composer-observation`
+  (`:3101`, READ+; cond-0324 read-only observation of the pinned composer
+  region, advertised only when the terminal is managed, `native_tui`,
+  identity-resolved, and the provider/build has a pinned observation
+  layout).  Terminal-level failures are `200` with a typed outcome; `422`
+  is reserved for shape errors and protocol mismatch; `404` is reserved
+  for "server has no control route at all" (contract docstring `:27-33`).
+  Composer-observation adds `409` for identity/build drift and
+  unsupported/unpinned builds, returning `observed: false` with a typed
+  refusal and never raw composer text.
 - `deliver_control_input` (`services/control_input_service.py:1327`)
   pipeline: protocol check → v3 either/or shape rule → normalization →
   per-text screening → caller-digest comparison → identity resolution +
@@ -171,6 +178,42 @@ can check every claim without re-walking the tree.
   write boundary may send is `send-keys -X cancel`; any unproven step is
   `refused/copy-mode-active` before any payload byte
   (`control_input_service.py:2052`).
+
+#### 1.2.1 Read-only composer observation (cond-0324)
+
+A conductor that has already sent a control may need to know, without
+sending another byte, whether the exact text it expected is still resting
+in the provider's composer.  The fork provides a read-only observation
+route for this purpose.
+
+- Wire surface: `GET /terminals/{id}/composer-observation?expected_text_sha256=<64 lowercase hex>&expected_text_bytes=<positive integer>`.
+- Capability is advertised in the per-terminal `control_input` block as
+  `composer_observation: {supported: bool, protocol: "cao-composer-observation-v1"}`
+  only when the terminal is managed, `native_tui`, identity-resolved, and
+  the provider/build has a pinned composer observation layout
+  (`control_input_service.py:4828`).  Currently pinned builds are Codex
+  0.146.0 and Kimi Code 0.29.2; an unpinned or unproven build advertises
+  `supported: false` and the route refuses with `provider-unsupported`.
+- The route resolves control identity, takes the pane-input lease, and
+  re-proves the live pane/server identity under the lease exactly as the
+  write path does.  It captures the pinned composer region and extracts
+  the operator-typed text using the same layout pins as the §4.1
+  composer-emptiness guard (`native_pane_input.py`).  It returns
+  `observed: true` only when the extracted text's SHA-256 and UTF-8 byte
+  length exactly match the caller's expectation and submission is not
+  proven to have occurred.
+- Response fields (`cao-composer-observation-v1`): `protocol`,
+  `observed`, `terminal_id`, `terminal_generation`, `pane_id`,
+  `pane_pid`, `provider`, `provider_version`, `execution_mode`,
+  `native_session_id`, `submission_observed` (`unsubmitted`/`submitted`/
+  `unknown`), `content_sha256` and `content_bytes` only when
+  `observed: true`, and `evidence_ref`.  Raw composer text is never
+  returned or logged.  Typed refusals carry `refusal: {reason, detail}`.
+- The extractor returns a digest only for an unwrapped, single-row payload
+  whose frame padding is unambiguous.  It preserves internal whitespace and
+  prompt-like payload characters.  Wrapped or leading/trailing-whitespace-
+  ambiguous captures fail closed rather than inventing a canonical payload;
+  the conductor's raw UTF-8 fingerprint remains authoritative.
 
 ### 1.3 Event → tmux mapping (deployed)
 

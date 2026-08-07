@@ -501,12 +501,99 @@ def submission_barrier_for(provider: Optional[str]) -> Optional[SubmissionBarrie
     return _SUBMISSION_BARRIERS.get(provider)
 
 
-# Composer chrome: the box-drawing verticals and prompt glyphs a composer
-# draws *around* the text it holds.  They sit between the fragments of a
-# wrapped line, so matching without dropping them would split every wrap
-# at its border.  They are stripped from the captured rows and from the
-# control text alike, so a text that genuinely contains one still matches
-# its own rendering.
+# --- Read-only composer observation (cond-0324) -----------------------------
+#
+# A conductor that has sent a control needs to know whether the exact text it
+# expects is still resting in the provider's composer, without sending another
+# byte.  This is a read-only observation of the pinned composer region, bound
+# to the exact pane identity under the pane-input lease.  It reuses the same
+# layout pins that make the submission barrier honest, but is build-exact:
+# an unpinned provider/build advertises no observation capability at all.
+
+_RULE_KIMI_COMPOSER_BOX = "kimi-composer-box"
+_RULE_CLAUDE_PROMPT_BOX = "claude-prompt-box"
+_RULE_CODEX_PROMPT_FOOTER = "codex-prompt-footer"
+
+
+@dataclass(frozen=True)
+class ComposerObservationPin:
+    """How one provider build's composer is observed read-only.
+
+    ``rule`` names the region-determination strategy (shared with the
+    composer-emptiness pins).  ``composer_tail_rows`` is the bottom tail
+    used for a quick positive sighting via :func:`composed_text_visible`.
+    ``evidence`` records what build the pin was read from, so review can
+    check it without re-walking the tree.
+    """
+
+    provider: str
+    rule: str
+    composer_tail_rows: int
+    evidence: str
+
+
+_CODEX_OBSERVATION_EVIDENCE = (
+    "live-verified on the installed Codex CLI 0.146.0 (cond-0324): the last "
+    "'›' prompt row and any wrapped rows before the following blank separator "
+    "are the composer; an empty composer renders only a dim-styled rotating "
+    "placeholder.  Observation reuses the same pinned region as the §4.1 "
+    "composer-emptiness pin."
+)
+
+_KIMI_OBSERVATION_EVIDENCE = (
+    "live-verified on the installed Kimi Code 0.29.2 (cond-0324): the composer "
+    "is an untitled rounded box — '╭─╮', content rows framed by '│', a '> ' "
+    "prompt, '╰─╯' — and an empty composer renders no placeholder.  Observation "
+    "reuses the same pinned region as the §4.1 composer-emptiness pin."
+)
+
+
+#: The per-provider+build composer observation pins.  A build appears here
+#: only when its composer layout was read; an unpinned build refuses the
+#: observation route rather than guessing at a region.
+_COMPOSER_OBSERVATION_PINS: dict[str, dict[str, ComposerObservationPin]] = {
+    "codex": {
+        "0.146.0": ComposerObservationPin(
+            provider="codex",
+            rule=_RULE_CODEX_PROMPT_FOOTER,
+            composer_tail_rows=4,
+            evidence=_CODEX_OBSERVATION_EVIDENCE,
+        ),
+    },
+    "kimi_cli": {
+        "0.29.2": ComposerObservationPin(
+            provider="kimi_cli",
+            rule=_RULE_KIMI_COMPOSER_BOX,
+            composer_tail_rows=5,
+            evidence=_KIMI_OBSERVATION_EVIDENCE,
+        ),
+    },
+}
+
+
+def composer_observation_pin_for(
+    provider: Optional[str], provider_version: Optional[str]
+) -> Optional[ComposerObservationPin]:
+    """The pinned read-only observation for this exact build, or None.
+
+    None means "no observation is proven for this provider/build" — the
+    caller refuses the route rather than guessing at a composer region.
+    The version is normalized the same way the other per-build tables do,
+    so all build-exact decisions agree on which build a request names.
+    """
+    if not provider or not provider_version:
+        return None
+    from cli_agent_orchestrator.services import provider_contracts
+
+    return _COMPOSER_OBSERVATION_PINS.get(provider, {}).get(
+        provider_contracts.normalized_version(provider_version)
+    )
+
+
+# Composer chrome is removed only at the pinned frame boundaries below.  Do
+# not remove arbitrary prompt-looking characters from the payload: a valid
+# control may contain them, and doing so would make two different payloads
+# hash alike.
 _COMPOSER_CHROME_CHARS = "│┃>›"
 
 
@@ -689,10 +776,6 @@ def observe_submission(
 # refusal; a provider/build with no pin is ``provider-unsupported`` instead.
 # The pins are live-verified per build in §10.3.  Blind clearing is
 # prohibited: nothing here ever sends a keystroke.
-
-_RULE_KIMI_COMPOSER_BOX = "kimi-composer-box"
-_RULE_CLAUDE_PROMPT_BOX = "claude-prompt-box"
-_RULE_CODEX_PROMPT_FOOTER = "codex-prompt-footer"
 
 
 @dataclass(frozen=True)
@@ -1009,6 +1092,89 @@ def _codex_composer_empty(styled_rows: Sequence[str]) -> Optional[bool]:
         if not (dim or inverse):
             return False
     return True
+
+
+def _kimi_composer_text(rows: Sequence[str]) -> Optional[str]:
+    """Exact text in a single, unambiguous Kimi composer row."""
+    content = _kimi_composer_box_rows(rows)
+    if content is None or len(content) != 1:
+        return None
+    row = content[0]
+    prompt_at = row.find(">")
+    if prompt_at < 0:
+        return None
+    payload = row[prompt_at + 1 :]
+    if payload.startswith(" "):
+        payload = payload[1:]
+    # The pinned box contributes one right-padding cell.  A second trailing
+    # cell would be indistinguishable from user-supplied trailing whitespace,
+    # so reject that ambiguous case instead of hashing a guess.
+    if payload.endswith(" "):
+        payload = payload[:-1]
+    if payload != payload.strip():
+        return None
+    return payload
+
+
+def _claude_composer_text(rows: Sequence[str]) -> Optional[str]:
+    """Exact text in a single, unambiguous Claude composer row."""
+    rule_indices = [i for i, text in enumerate(rows) if _CLAUDE_BOX_RULE.match(text)]
+    if len(rule_indices) < 2:
+        return None
+    content = rows[rule_indices[-2] + 1 : rule_indices[-1]]
+    if len(content) != 1:
+        return None
+    first = content[0]
+    prompt_at = first.find(_CLAUDE_PROMPT_GLYPH)
+    if prompt_at == -1:
+        return None
+    payload = first[prompt_at + 1 :]
+    if payload.startswith(" "):
+        payload = payload[1:]
+    return payload if payload == payload.strip() else None
+
+
+def _codex_composer_text(rows: Sequence[str]) -> Optional[str]:
+    """Exact text in a single, unambiguous Codex prompt row."""
+    prompt_row = next(
+        (index for index in range(len(rows) - 1, -1, -1) if "›" in rows[index]),
+        None,
+    )
+    if prompt_row is None:
+        return None
+    separator = next(
+        (index for index in range(prompt_row + 1, len(rows)) if not rows[index].strip()),
+        None,
+    )
+    if separator is None:
+        return None
+    content = rows[prompt_row:separator]
+    if len(content) != 1:
+        return None
+    first = content[0]
+    prompt_at = first.find("›")
+    if prompt_at == -1:
+        return None
+    payload = first[prompt_at + 1 :]
+    if payload.startswith(" "):
+        payload = payload[1:]
+    return payload if payload == payload.strip() else None
+
+
+def extract_composer_text(rows: Sequence[str], pin: ComposerObservationPin) -> Optional[str]:
+    """The exact text held in the pinned composer region, or ``None``.
+
+    Only an unwrapped, one-row payload with unambiguous frame padding is
+    returned.  Wrapped or whitespace-ambiguous captures fail closed so the
+    conductor's raw UTF-8 fingerprint remains authoritative.
+    """
+    if pin.rule == _RULE_KIMI_COMPOSER_BOX:
+        return _kimi_composer_text(rows)
+    if pin.rule == _RULE_CLAUDE_PROMPT_BOX:
+        return _claude_composer_text(rows)
+    if pin.rule == _RULE_CODEX_PROMPT_FOOTER:
+        return _codex_composer_text(rows)
+    return None
 
 
 def observe_composer_empty(
