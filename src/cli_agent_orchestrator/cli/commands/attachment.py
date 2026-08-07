@@ -376,7 +376,7 @@ def attachment_adjudicate(
                 observed_at=observation["observed_at"],
                 observation=observation,
             ),
-            live_survivors=observation["survivors"],
+            live_survivors=recovery.survivors_blocking_adjudication(observation),
             observed_epoch=record["epoch"],
         )
     except na.NativeAttachmentError as exc:

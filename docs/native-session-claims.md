@@ -236,6 +236,15 @@ from the recorded one — and only that survivor. A survivor bearing the
 *recorded* marker is the owner itself, and no attestation makes that
 releasable.
 
+`adjudicate`'s veto is on a process actually **seen** running, not on the
+survivor list alone. `observe_owner` puts a conservative placeholder in
+that list for an owner it could not check, which is right for automation —
+an unchecked owner is treated as alive — and wrong here: an operator who
+froze a claim *because* the process table would not answer would then be
+refused with "the frozen owner is still observably alive" about a process
+nobody observed. Having asked for a human, it would be perverse to refuse
+their answer on evidence that does not exist.
+
 An adjudication carries no owner, no pane, no identity — it is a human's
 sentence. The epoch observed at the time is what binds it to the row it
 was written about, and it is required: without it, an observation taken

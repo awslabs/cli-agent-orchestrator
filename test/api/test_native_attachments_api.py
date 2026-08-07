@@ -259,3 +259,26 @@ class TestFreezeRoute:
             f"/native-attachments/{PROVIDER}/{SESSION}/freeze", json={"detail": "no name"}
         )
         assert response.status_code == 422
+
+
+class TestTheBootSweepIsWired:
+    """Nothing asserted the lifespan calls it, so a silent removal was free."""
+
+    def test_the_lifespan_runs_the_startup_sweep(self):
+        import inspect
+
+        from cli_agent_orchestrator.api import main
+
+        source = inspect.getsource(main.lifespan)
+        assert "native_attachment_recovery.sweep_at_startup" in source
+
+    def test_the_startup_sweep_reports_rather_than_mutating(self, monkeypatch):
+        """Two tests in this repository enter the real lifespan without
+        stubbing the recovery steps. An applying default would release rows
+        out of an operator's database as a side effect of running pytest."""
+        from cli_agent_orchestrator.services import native_attachment_recovery as recovery
+
+        monkeypatch.delenv(recovery.SWEEP_ON_BOOT_ENV, raising=False)
+        _attach(pid=_reaped_pid())
+        assert recovery.sweep_at_startup()["applied"] is False
+        assert na.get(PROVIDER, SESSION)["state"] == na.ATTACHED

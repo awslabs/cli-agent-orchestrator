@@ -127,7 +127,7 @@ def _live_start_marker(pid: int) -> Optional[str]:
         return None
 
 
-def observe_owner(record: Mapping[str, Any]) -> dict[str, Any]:
+def observe_owner(record: Mapping[str, Any], *, read_marker: bool = True) -> dict[str, Any]:
     """Look for the process that holds this attachment.
 
     Returns the observation, never raises for an ordinary negative
@@ -135,6 +135,12 @@ def observe_owner(record: Mapping[str, Any]) -> dict[str, Any]:
     when the owner was looked for and found absent — because
     :func:`native_attachment.no_survivor_proof` refuses an omitted
     observation and an omitted one is what "we did not look" looks like.
+
+    ``read_marker=False`` skips the ``ps`` call that renders the live
+    start marker.  The marker is evidence for a human and decides
+    nothing, so a caller polling for a process to exit — where the answer
+    it wants is ``gone``, and ``gone`` never reads a marker at all — has
+    no reason to fork ``ps`` forty times to compute a field it discards.
     """
     owner = record.get("owner") or {}
     identity = owner.get("process_identity")
@@ -174,8 +180,10 @@ def observe_owner(record: Mapping[str, Any]) -> dict[str, Any]:
             "detail": f"pid {pid} could not be checked; an unchecked owner is treated as alive",
         }
 
-    live_marker = _live_start_marker(pid)
-    if live_marker is None:
+    live_marker = _live_start_marker(pid) if read_marker else None
+    if not read_marker:
+        marker_verdict = "not-read"
+    elif live_marker is None:
         marker_verdict = "unreadable"
     elif live_marker == stored_marker:
         marker_verdict = "matches"
@@ -194,6 +202,27 @@ def observe_owner(record: Mapping[str, Any]) -> dict[str, Any]:
             "easily a timezone change as a recycled pid"
         ),
     }
+
+
+def survivors_blocking_adjudication(observation: Mapping[str, Any]) -> list[Any]:
+    """The survivors an operator is not permitted to decide past.
+
+    ``observe_owner`` puts an entry in ``survivors`` for an owner it could
+    not check, which is right for automation — an unchecked owner is
+    treated as alive, and nothing automatic may release it.  It is wrong
+    for adjudication, and in a way that broke the valve for the exact case
+    it was built for: an operator would freeze a claim *because* the
+    process table would not answer, and then be refused with "the frozen
+    owner is still observably alive" about a process nobody observed.
+
+    So the veto is on a process actually *seen* running.  "We could not
+    look" is not a survivor sighting; it is the condition that makes a
+    human necessary, and having asked for one it would be perverse to
+    then refuse their answer.  Both steps still carry their name.
+    """
+    if observation.get("disposition") != OWNER_ALIVE:
+        return []
+    return list(observation.get("survivors") or [])
 
 
 def release_if_owner_gone(
@@ -357,10 +386,13 @@ def _observe_until_gone(record: Mapping[str, Any], *, grace_seconds: float) -> d
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
         time.sleep(_TEARDOWN_POLL_SECONDS)
-        observed = observe_owner(record)
-        if observed["disposition"] != OWNER_ALIVE:
-            return observed
-    return observed
+        polled = observe_owner(record, read_marker=False)
+        if polled["disposition"] != OWNER_ALIVE:
+            return polled
+    # Still alive. Take one full observation so the recorded evidence
+    # carries the marker comparison a reader will want, which the cheap
+    # polls above deliberately skipped.
+    return observe_owner(record)
 
 
 #: Why an operator froze a claim by hand.  ``mark_ambiguous`` does not
@@ -498,7 +530,20 @@ def sweep(*, apply: bool = False) -> dict[str, Any]:
     records = native_attachment.list_attachments(states=native_attachment.LIVE_STATES)
     outcomes: list[dict[str, Any]] = []
     for record in records:
-        observed = observe_owner(record)
+        try:
+            observed = observe_owner(record)
+        except Exception as exc:  # noqa: BLE001 - one bad row must not end the pass
+            outcomes.append(
+                {
+                    "provider": record.get("provider"),
+                    "native_session_id": record.get("native_session_id"),
+                    "state": record.get("state"),
+                    "action": "errored",
+                    "reason": type(exc).__name__,
+                    "detail": str(exc),
+                }
+            )
+            continue
         if not apply:
             releasable = observed["disposition"] == OWNER_GONE
             outcomes.append(
@@ -537,7 +582,11 @@ def sweep(*, apply: bool = False) -> dict[str, Any]:
         # here decides on a marker, but a reader comparing two reports needs
         # to know whether the environment moved underneath them.
         "environment": {
-            "tz": os.environ.get("TZ"),
+            # The effective zone, not just ``TZ`` — which is unset on a
+            # default install, so recording only the variable wrote three
+            # nulls into every report and told a later reader nothing.
+            "tz": time.strftime("%Z%z"),
+            "tz_env": os.environ.get("TZ"),
             "lc_all": os.environ.get("LC_ALL"),
             "lc_time": os.environ.get("LC_TIME"),
         },

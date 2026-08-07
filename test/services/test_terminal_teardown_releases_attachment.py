@@ -300,22 +300,96 @@ class TestTheWiringExists:
         ]
         assert callers, "no production module calls native_attachment.release"
 
-    def test_teardown_resolves_the_claim_before_deleting_the_row(self):
-        """Ordering is the contract, not an accident.
+    def test_the_claim_is_resolved_after_the_kill_and_before_the_row_delete(self):
+        """Ordering is the contract, and this asserts the executed order.
 
-        The claim must be resolved while the terminal's generation claim is
-        still held, and after the window kill — the first moment the owning
-        process can be observed absent.
+        The first version of this test compared *textual* offsets in the
+        function's source. It passed for the wrong reason: the first
+        `kill_window` in the text sits inside a nested recovery-branch
+        closure whose position says nothing about execution, so moving the
+        release to before the ordinary kill left the assertion green — and
+        that mutation silently reverts the commit to the bug it fixes.
         """
-        import inspect
+        calls: list[str] = []
+        ts = "cli_agent_orchestrator.services.terminal_service"
+        metadata = {
+            "tmux_session": SESSION_NAME,
+            "tmux_window": managed_window_name(TERMINAL, GENERATION),
+            "generation": GENERATION,
+        }
+        _attach(pid=_reaped_pid())
 
-        from cli_agent_orchestrator.services import terminal_service
+        real_release = recovery.release_owned_by_terminal
 
-        source = inspect.getsource(terminal_service._delete_terminal_claimed)
-        kill = source.index("kill_window")
-        release = source.index("release_owned_by_terminal")
-        row_delete = source.index("db_delete_terminal_if_generation")
-        assert kill < release < row_delete
+        def _record_release(*args, **kwargs):
+            calls.append("release")
+            return real_release(*args, **kwargs)
+
+        def _record_delete(*args, **kwargs):
+            calls.append("row-delete")
+            return True
+
+        with (
+            patch(f"{ts}.status_monitor"),
+            patch(f"{ts}.fifo_manager"),
+            patch(f"{ts}.provider_manager"),
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+            patch(f"{ts}.get_terminal_metadata", return_value=metadata),
+            patch(f"{ts}.get_terminal_metadata_v2", return_value=None),
+            patch(f"{ts}.db_delete_terminal_if_generation", side_effect=_record_delete),
+            patch.object(recovery, "release_owned_by_terminal", side_effect=_record_release),
+        ):
+            backend.window_exists.return_value = False
+            backend.kill_window.side_effect = lambda *a, **k: calls.append("kill")
+            delete_terminal(TERMINAL, expected_generation=GENERATION, expected_session=SESSION_NAME)
+
+        assert calls == ["kill", "release", "row-delete"]
+
+    def test_an_owner_that_dies_at_the_window_kill_is_released(self):
+        """The whole reason the release runs after the kill.
+
+        Every other test in this file uses a process whose liveness does not
+        change during teardown — already reaped, or this interpreter. Neither
+        exercises the ordering at all: a release placed *before* the kill
+        would pass both.
+        """
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            marker = native_tui_launch._process_field(child.pid, "lstart=")
+            assert marker
+            _attach(pid=child.pid, marker=marker)
+
+            ts = "cli_agent_orchestrator.services.terminal_service"
+            metadata = {
+                "tmux_session": SESSION_NAME,
+                "tmux_window": managed_window_name(TERMINAL, GENERATION),
+                "generation": GENERATION,
+            }
+
+            def _kill_the_provider(*_args, **_kwargs):
+                child.kill()
+                child.wait()
+
+            with (
+                patch(f"{ts}.status_monitor"),
+                patch(f"{ts}.fifo_manager"),
+                patch(f"{ts}.provider_manager"),
+                patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+                patch(f"{ts}.get_terminal_metadata", return_value=metadata),
+                patch(f"{ts}.get_terminal_metadata_v2", return_value=None),
+                patch(f"{ts}.db_delete_terminal_if_generation", return_value=True),
+            ):
+                backend.window_exists.return_value = False
+                backend.kill_window.side_effect = _kill_the_provider
+                delete_terminal(
+                    TERMINAL, expected_generation=GENERATION, expected_session=SESSION_NAME
+                )
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+        assert na.get(PROVIDER, SESSION)["state"] == na.DETACHED
 
 
 class TestTeardownDoesNotUndoADeliberateFreeze:

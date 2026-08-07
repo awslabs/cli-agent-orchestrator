@@ -261,7 +261,10 @@ class TestSweep:
     def test_the_report_records_the_observation_environment(self):
         """The stored markers are rendered in some timezone; say which."""
         report = recovery.sweep()
-        assert set(report["environment"]) == {"tz", "lc_all", "lc_time"}
+        assert set(report["environment"]) == {"tz", "tz_env", "lc_all", "lc_time"}
+        # The effective zone, not just the variable: TZ is unset on a default
+        # install, so recording only the variable wrote nulls and said nothing.
+        assert report["environment"]["tz"]
 
     def test_the_startup_sweep_never_raises(self, monkeypatch):
         def _boom(**_kwargs):
@@ -619,3 +622,137 @@ class TestTheRecycledPidHasAValve:
                 live_survivors=[{"pid": os.getpid(), "start_marker": "Thu Jan  1 00:00:00 1970"}],
                 observed_epoch=record["epoch"],
             )
+
+
+class TestThePidStateDecision:
+    """The one function that decides every release, tested directly.
+
+    Two of its five branches were covered end to end — `ProcessLookupError`
+    by a reaped pid, and the fall-through by this interpreter — so a
+    mutation that turned `PermissionError` into "gone" left the whole suite
+    green. That is the branch that matters in practice: a provider running
+    under a different uid is a deployment, not a hypothetical, and reading
+    it as absence releases a session out from under a running process.
+    """
+
+    def test_a_pid_owned_by_another_user_is_alive_not_absent(self):
+        """`os.kill(1, 0)` raises PermissionError for a non-root caller."""
+        assert os.geteuid() != 0, "this test is meaningless as root"
+        assert recovery._pid_state(1) == recovery.OWNER_ALIVE
+
+    def test_a_reaped_pid_is_gone(self):
+        assert recovery._pid_state(_reaped_pid()) == recovery.OWNER_GONE
+
+    def test_this_process_is_alive(self):
+        assert recovery._pid_state(os.getpid()) == recovery.OWNER_ALIVE
+
+    @pytest.mark.parametrize("pid", [0, -1, -12345])
+    def test_a_pid_that_is_not_a_pid_is_unobservable_never_absent(self, pid):
+        """`os.kill(0, 0)` signals the whole process group and succeeds.
+
+        Reading either of those as "the owner is gone" would release on an
+        argument that was never a process id.
+        """
+        assert recovery._pid_state(pid) == recovery.OWNER_UNOBSERVABLE
+
+    def test_an_unexpected_oserror_is_unobservable_never_absent(self, monkeypatch):
+        def _boom(_pid, _sig):
+            raise OSError(999, "something else entirely")
+
+        monkeypatch.setattr(recovery.os, "kill", _boom)
+        assert recovery._pid_state(4242) == recovery.OWNER_UNOBSERVABLE
+
+
+class TestTheValveWorksForTheCaseItWasBuiltFor:
+    """Freeze accepts an unobservable owner; adjudicate must not then refuse it.
+
+    `observe_owner` puts an entry in `survivors` for an owner it could not
+    check — right for automation, since an unchecked owner is treated as
+    alive. Applied to adjudication it broke the valve exactly where it was
+    needed: an operator froze a claim *because* the process table would not
+    answer, and was refused with "the frozen owner is still observably
+    alive" about a process nobody observed.
+    """
+
+    def test_an_unobservable_owner_survives_the_whole_two_step_path(self, monkeypatch):
+        _attach(pid=os.getpid())
+        monkeypatch.setattr(recovery, "_pid_state", lambda pid: recovery.OWNER_UNOBSERVABLE)
+
+        recovery.freeze_for_adjudication(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            operator="colin",
+            detail="process table will not answer for this pid",
+        )
+        record = na.get(PROVIDER, SESSION)
+        observation = recovery.observe_owner(record)
+        assert observation["disposition"] == recovery.OWNER_UNOBSERVABLE
+        assert observation["survivors"], "the conservative placeholder is still there"
+
+        result = na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=na.adjudication(
+                outcome=na.ADJUDICATION_OUTCOME_OWNER_GONE,
+                evidence_sha256="a" * 64,
+                detail="host was rebuilt; the pid cannot exist",
+                operator="colin",
+                observed_at=observation["observed_at"],
+                observation=observation,
+            ),
+            live_survivors=recovery.survivors_blocking_adjudication(observation),
+            observed_epoch=record["epoch"],
+        )
+        assert result["state"] == na.DETACHED
+
+    def test_a_seen_running_process_still_blocks(self):
+        """The veto is on a process actually seen, and that must still fire."""
+        from cli_agent_orchestrator.services import native_tui_launch
+
+        marker = native_tui_launch._process_field(os.getpid(), "lstart=")
+        _attach(pid=os.getpid(), marker=marker)
+        na.mark_ambiguous(provider=PROVIDER, native_session_id=SESSION, reason="render mismatch")
+        record = na.get(PROVIDER, SESSION)
+        observation = recovery.observe_owner(record)
+        assert recovery.survivors_blocking_adjudication(observation)
+        with pytest.raises(na.NativeAttachmentConflict, match="observably alive"):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record=na.adjudication(
+                    outcome=na.ADJUDICATION_OUTCOME_OWNER_GONE,
+                    evidence_sha256="a" * 64,
+                    detail="x",
+                    operator="colin",
+                    observed_at=observation["observed_at"],
+                    observation=observation,
+                ),
+                live_survivors=recovery.survivors_blocking_adjudication(observation),
+                observed_epoch=record["epoch"],
+            )
+
+    def test_an_unpublished_owner_never_blocks(self):
+        """There is no process to have seen; that is why a human is here."""
+        assert (
+            recovery.survivors_blocking_adjudication(
+                {"disposition": recovery.OWNER_UNPUBLISHED, "survivors": []}
+            )
+            == []
+        )
+        assert (
+            recovery.survivors_blocking_adjudication(
+                {"disposition": recovery.OWNER_UNOBSERVABLE, "survivors": [{"pid": 1}]}
+            )
+            == []
+        )
+
+
+class TestTheGraceLoopDoesNotForkPsFortyTimes:
+    def test_polling_skips_the_marker_it_would_discard(self):
+        """The marker decides nothing, and `gone` never reads one at all."""
+        record = (
+            na.get(PROVIDER, SESSION) if na.get(PROVIDER, SESSION) else _attach(pid=os.getpid())
+        )
+        cheap = recovery.observe_owner(record, read_marker=False)
+        assert cheap["disposition"] == recovery.OWNER_ALIVE
+        assert cheap["start_marker_verdict"] == "not-read"
