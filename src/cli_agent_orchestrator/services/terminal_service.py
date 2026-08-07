@@ -3509,7 +3509,25 @@ def reconcile_session_env() -> dict:
     receive the persisted env (issue #248 durability). Rows are recorded as
     removed only after their durable deletion is confirmed; failed deletions
     are retained and reported under ``failed`` (cond-0050).
-    """
-    from cli_agent_orchestrator.services import session_env
 
-    return session_env.reconcile_session_env(get_backend().session_exists)
+    A **deliberately stopped** session is exempt. Its tmux session is gone
+    by definition — that is what stopping means — so the existence probe
+    alone would delete the forwarded env of every hibernated session at the
+    next boot. The failure is silent, delayed, and surfaces much later as
+    "resume worked but every worker is on the wrong binary", which is close
+    to undiagnosable from the symptom.
+    """
+    from cli_agent_orchestrator.services import session_env, session_lifecycle
+
+    backend_exists = get_backend().session_exists
+
+    def _retain(session_name: str) -> bool:
+        if backend_exists(session_name):
+            return True
+        record = session_lifecycle.describe(session_name)
+        # An unreadable lifecycle store retains rather than deletes. Losing
+        # env is irreversible; keeping a stale row is not, and the next
+        # reconcile with a readable store cleans it up.
+        return record["lifecycle"] == session_lifecycle.STOPPED or bool(record.get("unreadable"))
+
+    return session_env.reconcile_session_env(_retain)

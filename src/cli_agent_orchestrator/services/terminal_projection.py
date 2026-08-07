@@ -31,6 +31,7 @@ it did.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -278,13 +279,57 @@ def _is_native_tui(terminal_id: str) -> bool:
         return False
 
 
+def _is_pause_like(record: Dict[str, Any]) -> bool:
+    """Whether a declared state should mute the wedge flag.
+
+    ``paused`` always does: the panes are frozen on purpose.
+
+    ``pausing`` does only until its deadline. Nothing leaves ``pausing``
+    automatically — the supervisor has to settle it — so an unbounded gate
+    would mute the flag forever on a supervisor that died mid-settle, which
+    is precisely the case the spec sends back to the marshal on expiry. The
+    numbers make it concrete: the wedge join needs 20 minutes quiet and 30
+    inactive, against a default pause deadline of 60, so an unbounded gate
+    does useful work for half an hour and is wrong without bound after it.
+    """
+    from cli_agent_orchestrator.services import session_lifecycle
+
+    lifecycle = record.get("lifecycle")
+    if lifecycle == session_lifecycle.PAUSED:
+        return True
+    if lifecycle != session_lifecycle.PAUSING:
+        return False
+    return not session_lifecycle.pause_is_overdue(record)
+
+
+def _session_paused(row: Dict[str, Any]) -> bool:
+    """Whether this row's session was declared paused.
+
+    An unreadable store reports not-paused, which keeps the wedge flag
+    rather than hiding it: over-reporting a wedge costs an operator a
+    glance, under-reporting it hides the condition the flag exists for.
+    """
+    from cli_agent_orchestrator.services import session_lifecycle
+
+    name = row.get("tmux_session")
+    if not isinstance(name, str) or not name:
+        return False
+    return _is_pause_like(session_lifecycle.describe(name))
+
+
 def project_row(
     row: Dict[str, Any],
     panes: Optional[Dict[str, Dict[str, str]]],
     *,
     vintage: str,
+    session_paused: bool = False,
 ) -> Dict[str, Any]:
-    """One terminal, as both human views must render it."""
+    """One terminal, as both human views must render it.
+
+    ``session_paused`` is passed in rather than looked up, so this stays a
+    function of its arguments and the single-terminal callers below do not
+    each pay a store read.
+    """
     if vintage == "v2":
         row = {**row, **_v2_row_identity(row)}
     state, reason = observed_lifecycle(row, panes)
@@ -303,6 +348,18 @@ def project_row(
         # that ships no viewport detector either -- see ``status_fusion``.
         fused = _fused_status(row, native_tui=native_tui)
         status = fused.status.value
+        if session_paused and fused.wedged:
+            # A correctly-paused pane is frozen mid-turn, which satisfies
+            # both halves of the wedge join — quiet output AND no activity —
+            # about half an hour in. Left alone, every worker in a paused
+            # session reports wedged, which is the precise opposite of the
+            # truth and would train an operator to ignore the flag.
+            #
+            # Gated here rather than inside ``fuse``: that function is pure,
+            # has no notion of a session, and is pinned by its own tests. A
+            # session-awareness keyword would push a concept it does not own
+            # into thirty of them.
+            fused = replace(fused, wedged=False, reason="session-paused-by-declaration")
     else:
         # A row whose identity does not resolve reports its lifecycle, not
         # a provider status. Reporting provider ``unknown`` for a deleted
@@ -360,6 +417,10 @@ def project_row(
 
 def project_session(session_name: str) -> List[Dict[str, Any]]:
     """Every terminal in a session, both vintages, one instant."""
+    from cli_agent_orchestrator.services import session_lifecycle
+
+    # Read once per pass rather than once per terminal.
+    session_paused = _is_pause_like(session_lifecycle.describe(session_name))
     panes = _observed_panes()
     projected = []
     for row in list_terminals_by_session(session_name):
@@ -374,7 +435,9 @@ def project_session(session_name: str) -> List[Dict[str, Any]]:
             if vintage == "v2"
             else get_terminal_metadata(row["id"])
         )
-        projected.append(project_row(full or row, panes, vintage=vintage))
+        projected.append(
+            project_row(full or row, panes, vintage=vintage, session_paused=session_paused)
+        )
 
     # The observer holds one viewport sample per pane id for the process's
     # lifetime, and tmux reissues pane ids after a server restart. An entry
@@ -404,7 +467,7 @@ def project_terminal(terminal_id: str) -> Optional[Dict[str, Any]]:
     panes = _observed_panes()
     row = get_terminal_metadata(terminal_id, warn_if_missing=False)
     if row is not None:
-        return project_row(row, panes, vintage="v1")
+        return project_row(row, panes, vintage="v1", session_paused=_session_paused(row))
     try:
         row = get_terminal_metadata_v2(terminal_id)
     except Exception as exc:  # pragma: no cover - an uninstalled v2 surface is absent
@@ -413,7 +476,7 @@ def project_terminal(terminal_id: str) -> Optional[Dict[str, Any]]:
     if row is None:
         report_terminal_missing_from_every_store(terminal_id)
         return None
-    return project_row(row, panes, vintage="v2")
+    return project_row(row, panes, vintage="v2", session_paused=_session_paused(row))
 
 
 def live_terminals(session_name: str) -> List[Dict[str, Any]]:

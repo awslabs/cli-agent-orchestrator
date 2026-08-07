@@ -53,7 +53,25 @@ async def create_session(
     ``env_vars`` are operator-forwarded env vars from ``cao launch --env``.
     They are persisted on the session record so every worker spawned later
     in the same session inherits them. See issue #248.
+
+    A **stopped** name is refused. Stopping records what the session would
+    restore to and, in time, what to relaunch; a new campaign taking that
+    name silently inherits all of it, and a later resume would relaunch the
+    wrong workers against the wrong provider sessions. The refusal is the
+    cheap half of that defence, and it matters most for reserved reusable
+    names — a repair session on a fixed name is guaranteed to hit this.
     """
+    if session_name:
+        from cli_agent_orchestrator.services import session_lifecycle
+
+        declared = session_lifecycle.describe(session_name)
+        if declared["lifecycle"] == session_lifecycle.STOPPED:
+            raise ValueError(
+                f"session {session_name!r} is stopped and still holds what a resume would "
+                f"restore ({declared['restore_to']!r}); delete the session to release the "
+                "name, or pick another"
+            )
+
     if provider is None:
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
     else:
@@ -191,6 +209,18 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 raise RuntimeError(
                     "session deletion held because terminal cleanup failed: " f"{terminal_errors}"
                 )
+
+        # A deleted session must not leave its declaration behind. A later
+        # session taking the name would inherit a stranger's `complete` or
+        # `paused` — and both of those are marshal suppressors, so a
+        # brand-new live campaign would start out invisible to the thing
+        # whose job is to notice it wedging.
+        try:
+            from cli_agent_orchestrator.services import session_lifecycle
+
+            session_lifecycle.forget(session_name)
+        except Exception as exc:  # noqa: BLE001 - deletion must still complete
+            logger.warning("Could not forget the declared state of %s: %s", session_name, exc)
 
         # Re-check under the session claim: a concurrent create cannot add a
         # replacement window between this observation and kill_session.

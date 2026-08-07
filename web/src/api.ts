@@ -43,6 +43,46 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
   }
 }
 
+export type SessionLifecycleValue = 'working' | 'pausing' | 'paused' | 'complete' | 'stopped'
+
+// The DECLARED dimension. Deliberately not merged into `Session`, whose
+// `status` is tmux attach state (`active`/`detached`) and is a third
+// unrelated thing again.
+export interface SessionLifecycle {
+  session_name: string
+  lifecycle: SessionLifecycleValue
+  restore_to: string | null
+  archived: boolean
+  kind: 'campaign' | 'service'
+  declared_by: string | null
+  note: string | null
+  pause_deadline_at: string | null
+  epoch: number
+  declared: boolean
+  suppresses_marshal?: boolean
+  pause_overdue?: boolean
+  unreadable?: string
+}
+
+export interface StopImpactWorker {
+  terminal_id: string
+  provider: string
+  agent_profile: string | null
+  reason: string | null
+  resumable: boolean
+}
+
+export interface StopImpact {
+  session_name: string
+  live_workers: number
+  resumable: StopImpactWorker[]
+  not_resumable: StopImpactWorker[]
+  resume_machinery_available: boolean
+  resume_machinery_reason: string
+  one_way_for_every_worker?: boolean
+  unreadable?: string
+}
+
 export interface Session {
   id: string
   name: string
@@ -600,6 +640,24 @@ export const api = {
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
   deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' }),
+
+  // Session lifecycle — what a session has DECLARED it is doing, which is a
+  // different dimension from a terminal's observed `lifecycle_state`. The
+  // value sets are disjoint (`working|pausing|paused|complete|stopped` here
+  // versus `live|superseded|dead|unknown-liveness` there) and they must never
+  // be rendered as one field.
+  //
+  // Never 404s: an undeclared session reads as `working`, because every
+  // session that predates the table would otherwise read as unknown and the
+  // fire marshal's suppression has to fail toward watching.
+  getSessionLifecycle: (name: string) =>
+    fetchJSON<SessionLifecycle>(`/sessions/${encodeURIComponent(name)}/lifecycle`),
+  // Only what the dashboard actually calls. The write wrappers were added
+  // ahead of the controls that would use them, which is the same shape as
+  // the defect this branch exists to fix — a tested surface nothing invokes.
+  // They come back with the buttons.
+  getStopImpact: (name: string) =>
+    fetchJSON<StopImpact>(`/sessions/${encodeURIComponent(name)}/stop-impact`),
 
   // Conductor annotations (§9.5). The route takes no parameters — that is the
   // security property, not an omission — and never errors: an absent or
