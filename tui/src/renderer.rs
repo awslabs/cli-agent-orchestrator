@@ -1069,8 +1069,19 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
     /// Filtering it would hide the diagnosis, which is what
     /// `inception/practices-discovery/discovered-rules.md:29` would have had us do; FR-1.5
     /// supersedes that rule per the operator's later decision.
+    ///
+    /// # Every state carries the focus marker, not just `Loaded`
+    ///
+    /// `Loading`, empty and `Failed` render one line each, and that line goes through
+    /// [`Self::focus_marked`] for the same reason the fold header does: these regions stay in the
+    /// `Tab` ring in every state, so without a marker `Tab` moves the keyboard somewhere the screen
+    /// does not acknowledge and reads as a dead keypress. Reported as a P2 on PR #564. The states
+    /// still differ in *what* they say — an empty list is a valid answer and a failure is not
+    /// (FR-6.1) — they no longer differ in whether focus is visible (NFR-3 item 7).
     fn picker_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        let agents_focused = self.focus == Focus::AgentPicker;
+        let providers_focused = self.focus == Focus::ProviderPicker;
 
         // ONE LINE PER CHOICE, not a comma-joined paragraph.
         //
@@ -1078,9 +1089,14 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         // pick a name out of it. The count stays on its own header line so it is still visible at a
         // glance, and each choice is indented beneath it. (#321)
         match self.flow.agent_choices() {
-            PickerState::Loading => lines.push("agents: loading…".to_string()),
+            PickerState::Loading => {
+                lines.push(focus_marked("agents: loading…", agents_focused));
+            }
             PickerState::Loaded(profiles) if profiles.is_empty() => {
-                lines.push("agents: none found on this machine".to_string());
+                lines.push(focus_marked(
+                    "agents: none found on this machine",
+                    agents_focused,
+                ));
             }
             PickerState::Loaded(profiles) => {
                 // The unselectable marker travels WITH its row (FR-1.5): an unloadable profile
@@ -1103,7 +1119,7 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                     "unloadable",
                     self.agents_expanded,
                     self.agent_scroll,
-                    self.focus == Focus::AgentPicker,
+                    agents_focused,
                 ));
             }
             PickerState::Failed(error) => {
@@ -1113,16 +1129,19 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                 //
                 // NEVER FOLDED, in any state: a failure the operator has to act on must not need a
                 // keystroke to become visible, and this line already fits in one row.
-                lines.push(format!(
-                    "agents: unavailable — {error}. Press [ctrl+r] to retry"
+                lines.push(focus_marked(
+                    &format!("agents: unavailable — {error}. Press [ctrl+r] to retry"),
+                    agents_focused,
                 ));
             }
         }
 
         match self.flow.provider_choices() {
-            PickerState::Loading => lines.push("providers: loading…".to_string()),
+            PickerState::Loading => {
+                lines.push(focus_marked("providers: loading…", providers_focused));
+            }
             PickerState::Loaded(providers) if providers.is_empty() => {
-                lines.push("providers: none reported".to_string());
+                lines.push(focus_marked("providers: none reported", providers_focused));
             }
             PickerState::Loaded(providers) => {
                 // `installed` is DISPLAY information, never a filter (FR-1.7): the endpoint
@@ -1146,11 +1165,12 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                     "not installed",
                     self.providers_expanded,
                     self.provider_scroll,
-                    self.focus == Focus::ProviderPicker,
+                    providers_focused,
                 ));
             }
-            PickerState::Failed(error) => lines.push(format!(
-                "providers: unavailable — {error}. Press [ctrl+r] to retry"
+            PickerState::Failed(error) => lines.push(focus_marked(
+                &format!("providers: unavailable — {error}. Press [ctrl+r] to retry"),
+                providers_focused,
             )),
         }
 
@@ -1185,7 +1205,6 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         scroll: usize,
         focused: bool,
     ) -> Vec<String> {
-        let marker = if focused { ">" } else { " " };
         let glyph = if expanded { "▾" } else { "▸" };
         let diagnosis = if unavailable > 0 {
             format!(", {unavailable} {unavailable_word}")
@@ -1193,9 +1212,12 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
             String::new()
         };
         let action = if expanded { "collapse" } else { "expand" };
-        let mut lines = vec![format!(
-            "{marker} {glyph} {label} ({count}{diagnosis}) — [enter] {action}",
-            count = rows.len()
+        let mut lines = vec![focus_marked(
+            &format!(
+                "{glyph} {label} ({count}{diagnosis}) — [enter] {action}",
+                count = rows.len()
+            ),
+            focused,
         )];
 
         if !expanded {
@@ -2419,12 +2441,26 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         left.extend(frame.pickers.iter().cloned());
         left.extend(frame.banner.iter().cloned());
 
+        // Where the viewport anchors when the column is taller than its area. The banner is the
+        // fallback because it is the only region carrying an outcome the operator must read; with
+        // focus in the results pane no left-hand line is marked, and pinning to the top would hide
+        // a failure banner behind content the operator is not looking at.
+        let banner_start = frame.command_list.len()
+            + frame.required_fields.len()
+            + frame.optional_section.len()
+            + frame.pickers.len();
+        let anchor = focused_line_index(&left).unwrap_or(if frame.banner.is_empty() {
+            0
+        } else {
+            banner_start
+        });
+
         match frame.layout {
             LayoutMode::TwoColumn => {
                 let [form_area, results_area] =
                     Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                         .areas(main);
-                paragraph(&left).render(form_area, buf);
+                self.render_form(&left, anchor, form_area, buf);
                 // The pane renders ITSELF (it is a `Widget`), so its buffer, scroll position and
                 // state wording come from the pane rather than from a copy here.
                 self.render_results(results_area, buf);
@@ -2440,10 +2476,77 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                     ),
                 ])
                 .areas(main);
-                paragraph(&left).render(form_area, buf);
+                self.render_form(&left, anchor, form_area, buf);
                 self.render_results(results_area, buf);
             }
         }
+    }
+
+    /// Renders the left column, **scrolled so the focused region is on screen**.
+    ///
+    /// # Why this region scrolls at all
+    ///
+    /// It is one non-scrolling `Paragraph`, so every row past the area's last one was silently
+    /// discarded. Folding the pickers and windowing the command list reduced the height but could
+    /// not bound it: the first `[enter]` expands the optional section *and* both pickers, and at the
+    /// 80x24 floor that content does not fit however it is sliced — measured at **12 rows over** with
+    /// 9 optional parameters, 25 agents and 9 providers, with the provider fold never drawn at all.
+    /// So `[enter]` promised to reveal options that stayed clipped (reported as a P2 on PR #564).
+    ///
+    /// The remaining options were to cap what `[enter]` reveals, or to let the column scroll. A cap
+    /// re-creates the original complaint one level down — content the operator was told is there and
+    /// cannot reach — so the column scrolls, anchored on focus, and says what is off-screen.
+    ///
+    /// # Why the anchor sits at the TOP of the viewport
+    ///
+    /// The anchored line is a *heading* — a fold header, or the marked form row — and what the
+    /// operator just asked to see is what follows it. Centring would spend half the viewport on rows
+    /// above the thing they opened, and bottom-anchoring would put an expanded fold's rows entirely
+    /// off-screen: `Tab` to agents, `[enter]`, and the 25 rows would render below the fold line at
+    /// the last row. The clamp keeps the final screen full rather than half-empty.
+    fn render_form(&self, lines: &[Line<'static>], anchor: usize, area: Rect, buf: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
+
+        let heights = wrapped_heights(lines, area.width);
+        let total: usize = heights.iter().sum();
+        if total <= area.height as usize {
+            paragraph(lines).render(area, buf);
+            return;
+        }
+
+        // One row is spent on the residue notice, so a scrolled column can never be mistaken for a
+        // complete one. It costs a row of content and buys the operator the knowledge that `[tab]`
+        // reaches more — the same trade the pickers' own residue line makes.
+        let [body, notice] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        let viewport = body.height as usize;
+        let above: usize = heights[..anchor.min(heights.len())].iter().sum();
+        let scroll = above.min(total.saturating_sub(viewport));
+        let below = total.saturating_sub(scroll + viewport);
+
+        paragraph(lines)
+            .scroll((scroll as u16, 0))
+            .render(body, buf);
+
+        let mut parts = Vec::new();
+        if scroll > 0 {
+            parts.push(format!("{scroll} above"));
+        }
+        if below > 0 {
+            parts.push(format!("{below} below"));
+        }
+        // `[tab]` and not `[↑↓]`: the arrows belong to whichever region holds focus, and this
+        // viewport follows focus rather than being steered directly. Promising `[↑↓]` here would
+        // name a key that scrolls the *fold*, not the column, which is the "documented key does
+        // nothing" defect the module already had once.
+        let text = if parts.is_empty() {
+            "  … form scrolled".to_string()
+        } else {
+            format!("  … {} — [tab] moves focus", parts.join(", "))
+        };
+        paragraph(&[Line::styled(text, self.theme.dim)]).render(notice, buf);
     }
 
     /// Renders the pane, or its state word when the area is too small for the pane itself.
@@ -2538,6 +2641,72 @@ const NOT_INSTALLED_MARKER: &str = "(not installed)";
 /// cannot drift into a residue line that is never styled — the failure mode that a hand-matched
 /// marker always eventually reaches.
 const SCROLL_RESIDUE_MARKER: &str = "[↑↓] scroll";
+
+/// `content` prefixed with the focus marker, or an equal-width blank when unfocused.
+///
+/// The **one** place the `"> "` / `"  "` convention is written for the picker region, because both
+/// `style_pickers` and `style_focus_marker` decide on `line.starts_with('>')` and every producer has
+/// to agree with them. A picker state that formatted its own line — as `Loading`, empty and `Failed`
+/// each did — silently opted out of the marker *and* of the `focus` colour, so `Tab` into it changed
+/// nothing on screen (reported as a P2 on PR #564).
+///
+/// The unfocused branch pads to the same two columns rather than returning `content` unchanged, so
+/// the rows do not shift horizontally as focus moves — a jump that reads as the text changing.
+fn focus_marked(content: &str, focused: bool) -> String {
+    let marker = if focused { ">" } else { " " };
+    format!("{marker} {content}")
+}
+
+/// The index of the focus-marked line, if any — the anchor [`Renderer::render_form`] scrolls to.
+///
+/// Reads the **rendered lines** rather than asking `self.focus` which region is active, and that is
+/// the point: the marker is what the operator can see, so anchoring on it cannot disagree with the
+/// screen. A focus state whose region forgot to mark its line would scroll to the wrong place — and
+/// that bug existed (three picker states rendered no marker at all), so this reads the one signal
+/// that is also the operator's.
+fn focused_line_index(lines: &[Line<'_>]) -> Option<usize> {
+    lines
+        .iter()
+        .position(|line| line_text(line).starts_with('>'))
+}
+
+/// One [`Line`]'s plain text, spans concatenated.
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// Each line's height in screen rows once wrapped to `width`.
+///
+/// # Why this measures rather than counts
+///
+/// A line is not a row. At 80 columns the left column is 47 wide and most command summaries wrap to
+/// two rows, so a budget in `Vec::len()` units understates the real height by roughly a third —
+/// which would make an overflow guard pass while the content still ran off the screen. Measured at
+/// the 80x24 floor: 32 lines occupied 44 rows.
+///
+/// The measurement is [`Paragraph::line_count`], i.e. **ratatui's own wrapping code**, given the
+/// same `Wrap { trim: false }` this crate renders with. Re-deriving the rule here (divide by width,
+/// round up) would be a second implementation of word wrapping that agrees with the first only
+/// until a line contains a long word or a wide grapheme.
+///
+/// A zero width yields one row per line rather than zero: `line_count` returns 0 there, and a
+/// zero total would make the caller believe everything fits.
+fn wrapped_heights(lines: &[Line<'static>], width: u16) -> Vec<usize> {
+    lines
+        .iter()
+        .map(|line| {
+            if width == 0 {
+                return 1;
+            }
+            paragraph(std::slice::from_ref(line))
+                .line_count(width)
+                .max(1)
+        })
+        .collect()
+}
 
 /// A line split into three spans, the middle one styled: `before`, `needle`, `after`.
 ///
@@ -3004,8 +3173,8 @@ type Step3FailurePayload = TerminalStatus;
 #[cfg(test)]
 mod tests {
     use super::{
-        in_app_readiness, Fatal, Focus, Frame, InAppReadiness, JsonSink, LayoutMode, PaneSink,
-        Renderer, Retryable, ServerApi, MIN_COLS, MIN_ROWS,
+        in_app_readiness, paragraph, wrapped_heights, Fatal, Focus, Frame, InAppReadiness,
+        JsonSink, LayoutMode, PaneSink, Renderer, Retryable, ServerApi, MIN_COLS, MIN_ROWS,
     };
     use crate::catalog::{self, CommandId, Policy};
     use crate::error::TuiError;
@@ -7430,6 +7599,303 @@ mod tests {
             focus_fg,
             "the UNFOCUSED fold must not carry `focus` — if both are styled the same, the colour \
              says nothing about where the keyboard is"
+        );
+    }
+
+    // ── PR #564 review: the two P2 layout defects ────────────────────────────────────────────
+
+    /// The whole screen as text, one line per row, trailing blanks trimmed.
+    ///
+    /// Every assertion about clipping has to read the DRAWN BUFFER: a region that renders into the
+    /// frame correctly and is then cut off by the layout is present in `Frame` and absent from the
+    /// operator's screen, which is the entire defect class here.
+    fn screen<S: ServerApi, H: Host>(shell: &Renderer<'_, S, H>, cols: u16, rows: u16) -> String {
+        drawn_cells(shell, cols, rows)
+            .chunks(cols as usize)
+            .map(|row| {
+                let text: String = row.iter().map(|(symbol, _)| symbol.as_str()).collect();
+                format!("{}\n", text.trim_end())
+            })
+            .collect()
+    }
+
+    /// **What the first `[enter]` reveals is REACHABLE at the 80x24 floor.**
+    ///
+    /// The reported P2: `[enter]` expands the optional section and both pickers, and at the minimum
+    /// supported size that content does not fit — measured at **12 rows over** with 9 optional
+    /// parameters, 25 agents and 9 providers, with the provider fold never drawn at all. So the
+    /// keypress promised options that stayed clipped.
+    ///
+    /// "Reachable" and not "all visible simultaneously", because at 80x24 the latter is impossible
+    /// and a test asserting it would be a test of arithmetic rather than of the product. The
+    /// property is that `[tab]` brings each region into view — which is what the residue notice
+    /// tells the operator to do.
+    #[test]
+    fn every_revealed_region_is_reachable_at_the_minimum_supported_size() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, MIN_COLS, MIN_ROWS);
+
+        // The reveal press, exactly as the operator makes it.
+        assert!(
+            shell.on_key(KeyCode::Enter),
+            "the first [enter] must be consumed as the reveal, or this test is exercising a run"
+        );
+
+        // ANTI-VACUITY: the content must genuinely overflow, or a non-scrolling column would pass
+        // this test and the guard would prove nothing.
+        let area = ratatui::layout::Rect::new(0, 0, MIN_COLS, MIN_ROWS);
+        let mut probe = ratatui::buffer::Buffer::empty(area);
+        shell.draw(area, &mut probe);
+        let frame = shell.render();
+        let mut left: Vec<Line<'static>> = Vec::new();
+        for region in [
+            &frame.command_list,
+            &frame.required_fields,
+            &frame.optional_section,
+            &frame.pickers,
+        ] {
+            left.extend(region.iter().cloned());
+        }
+        let content: usize = wrapped_heights(&left, MIN_COLS * 6 / 10).iter().sum();
+        assert!(
+            content > MIN_ROWS as usize,
+            "this test needs content TALLER than the screen ({content} rows at {MIN_ROWS}) or a \
+             non-scrolling column would satisfy it and the regression would return unnoticed"
+        );
+
+        for region in [
+            Focus::OptionalSection,
+            Focus::AgentPicker,
+            Focus::ProviderPicker,
+        ] {
+            while shell.focus() != region {
+                assert!(shell.on_key(KeyCode::Tab));
+            }
+            let drawn = screen(&shell, MIN_COLS, MIN_ROWS);
+            let marked = drawn.lines().any(|line| line.starts_with('>'));
+            assert!(
+                marked,
+                "with focus on {region:?} at {MIN_COLS}x{MIN_ROWS} the focused row must be ON \
+                 SCREEN. A focused region scrolled out of the viewport is invisible focus, and \
+                 [tab] then appears to do nothing. Screen:\n{drawn}"
+            );
+        }
+    }
+
+    /// **A scrolled column says so, so a partial form never reads as the whole form.**
+    ///
+    /// Without this the operator sees a form that simply ends, with no cue that `[tab]` reaches
+    /// more — the same "a window reads as the complete list" failure the pickers' own residue line
+    /// exists to prevent, one region up.
+    ///
+    /// The negative half is what stops the notice from becoming permanent furniture: on a terminal
+    /// tall enough for everything there is nothing off-screen, and a notice claiming otherwise
+    /// would be a standing lie about the layout.
+    #[test]
+    fn a_scrolled_form_states_that_more_is_off_screen_and_a_short_one_does_not() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+
+        let mut cramped = shell_on_the_launch_form(&server, &host, MIN_COLS, MIN_ROWS);
+        assert!(cramped.on_key(KeyCode::Enter));
+        let drawn = screen(&cramped, MIN_COLS, MIN_ROWS);
+        assert!(
+            drawn.contains("below") && drawn.contains("[tab] moves focus"),
+            "a clipped column must state what is off-screen AND the key that reaches it. \
+             Screen:\n{drawn}"
+        );
+
+        // Tall enough that the whole expanded form fits, so the notice must be absent.
+        let roomy_rows = 90;
+        let mut roomy = shell_on_the_launch_form(&server, &host, 200, roomy_rows);
+        assert!(roomy.on_key(KeyCode::Enter));
+        let drawn = screen(&roomy, 200, roomy_rows);
+        assert!(
+            drawn.contains("providers ("),
+            "control: at 200x{roomy_rows} the whole form should fit, so the provider fold must be \
+             drawn — if it is not, the negative assertion below proves nothing. Screen:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains("[tab] moves focus"),
+            "nothing is off-screen at 200x{roomy_rows}, so the residue notice must be ABSENT — a \
+             notice that is always there tells the operator nothing. Screen:\n{drawn}"
+        );
+    }
+
+    /// **The wrap measurement agrees with what is actually drawn.**
+    ///
+    /// `wrapped_heights` is built on `Paragraph::line_count`, which is UNSTABLE upstream
+    /// (ratatui#293). This pins it against a real rendered buffer rather than against its own
+    /// claim, so an upstream change to wrapping surfaces as a red test here instead of as a
+    /// viewport that is quietly the wrong size.
+    ///
+    /// A line that wraps is required, not incidental: the count-vs-measure distinction is the whole
+    /// reason this function exists, and at the 80x24 floor a naive `Vec::len()` understates the
+    /// column's height by about a third.
+    #[test]
+    fn the_wrap_measurement_agrees_with_what_is_actually_drawn() {
+        let width = 24u16;
+        let lines: Vec<Line<'static>> = vec![
+            Line::raw("short"),
+            Line::raw("a line comfortably longer than twenty-four columns, so it wraps"),
+        ];
+
+        let heights = wrapped_heights(&lines, width);
+        assert!(
+            heights[1] > 1,
+            "the fixture must actually WRAP or this test cannot tell measuring from counting \
+             (got {heights:?})"
+        );
+
+        // Render tall enough that nothing is clipped, then count the rows that received ink.
+        let total: usize = heights.iter().sum();
+        let area = ratatui::layout::Rect::new(0, 0, width, total as u16 + 4);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(paragraph(&lines), area, &mut buffer);
+        let inked = (0..area.height)
+            .filter(|row| (0..width).any(|column| buffer[(column, *row)].symbol().trim() != ""))
+            .count();
+        assert_eq!(
+            total, inked,
+            "the measured height must equal the number of rows ratatui actually paints, or the \
+             viewport is sized against a fiction"
+        );
+    }
+
+    /// One picker-state fixture: the agent answer to install, or `None` to hold it in `Loading`.
+    ///
+    /// `Loading` has no answer *by definition*, which is why it is `Option` rather than a third
+    /// `Result` variant — the absence is the state.
+    type AgentFixture = Option<Result<Vec<Profile>, String>>;
+
+    /// A picker source whose fetches never return, so both pickers stay in [`PickerState::Loading`].
+    ///
+    /// The blocking happens on the fetch threads `populate_pickers` spawns, so the test thread is
+    /// unaffected; the threads are left parked and the process ends with them. That is acceptable
+    /// in a unit test and is the only way to observe `Loading` — every other fake answers before
+    /// the first `render`.
+    struct NeverAnswers;
+
+    impl crate::guided_flow::PickerSource for NeverAnswers {
+        fn profiles(&self) -> Result<Vec<Profile>, TuiError> {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+            unreachable!("the test finishes long before this returns")
+        }
+
+        fn providers(&self) -> Result<Vec<Provider>, TuiError> {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+            unreachable!("the test finishes long before this returns")
+        }
+    }
+
+    /// **Every picker state carries the focus marker — `Tab` is never a dead keypress.**
+    ///
+    /// The reported P2: `Loading`, empty and `Failed` formatted their own line and so opted out of
+    /// both the `>` marker and the `focus` colour, while remaining in the `Tab` ring. Tabbing into
+    /// them moved the keyboard somewhere the screen did not acknowledge.
+    ///
+    /// Every state is covered in one loop rather than one test for the interesting case: the defect
+    /// was three separate producers each formatting its own line, so a test naming one of them
+    /// would leave the other two free to regress.
+    #[test]
+    fn every_picker_state_shows_where_the_keyboard_is() {
+        // `None` means "hold the picker in `Loading`" — installed as a source that never answers,
+        // which is the only way to observe that state from a test: the single-threaded fallback in
+        // `populate_pickers` resolves both fetches before `render` is ever called. Without this
+        // case a `Loading` regression survives, and it did: mutation M7 was green until it was
+        // added.
+        let states: [(&str, AgentFixture); 4] = [
+            ("loading", None),
+            ("empty", Some(Ok(Vec::new()))),
+            ("failed", Some(Err("boom".to_string()))),
+            ("loaded", Some(Ok(vec![profile("solo", true)]))),
+        ];
+
+        for (label, profiles) in states {
+            let server = FakeServer::healthy();
+            let host = FakeHost::outside_tmux();
+            let mut shell = match profiles {
+                Some(profiles) => {
+                    *server.profiles.borrow_mut() = profiles;
+                    shell_on_the_launch_form(&server, &host, 120, 60)
+                }
+                None => {
+                    let mut shell = Renderer::new(&server, &host, 120, 60)
+                        .with_concurrent_pickers(std::sync::Arc::new(NeverAnswers));
+                    assert!(shell.focus_command(CommandId::Launch));
+                    assert!(shell.on_key(KeyCode::Enter));
+                    assert!(
+                        matches!(shell.flow.agent_choices(), PickerState::Loading),
+                        "the {label} fixture must actually hold the picker in Loading, or this \
+                         case silently tests the loaded path instead"
+                    );
+                    shell
+                }
+            };
+
+            let unfocused = joined(&shell.render().pickers, "\n");
+            let agent_line = unfocused
+                .lines()
+                .find(|line| line.contains("agents"))
+                .unwrap_or_else(|| {
+                    panic!("the {label} state must render an agents line; got:\n{unfocused}")
+                })
+                .to_string();
+            assert!(
+                !agent_line.starts_with('>'),
+                "control: the {label} agents line must NOT be marked before focus reaches it, or \
+                 the positive assertion below cannot fail. Got: {agent_line:?}"
+            );
+
+            while shell.focus() != Focus::AgentPicker {
+                assert!(shell.on_key(KeyCode::Tab));
+            }
+
+            let focused = joined(&shell.render().pickers, "\n");
+            let marked = focused
+                .lines()
+                .find(|line| line.starts_with('>'))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "with focus on the agent picker in the {label} state, SOME line must carry \
+                         the focus marker — otherwise [tab] moved the keyboard somewhere the screen \
+                         does not show, and the region looks unreachable. Got:\n{focused}"
+                    )
+                });
+            assert!(
+                marked.contains("agents"),
+                "and the marked line must be the AGENTS line, not another region's. Got: {marked:?}"
+            );
+        }
+    }
+
+    /// **A focused degenerate picker is styled `focus`, exactly like a loaded one.**
+    ///
+    /// The marker and the colour are two channels on the same fact (FR-4.4/FR-4.5), and
+    /// `style_pickers` decides on `starts_with('>')` — so a state that produced no marker also lost
+    /// the colour. This asserts the colour reaches the cells, because the marker alone is what
+    /// NFR-3 item 7 calls insufficient.
+    ///
+    /// The `Failed` state is the one that matters most: its line already carries `error`, and
+    /// `style_pickers` checks the failure marker FIRST, so the focused-failed line is the one case
+    /// where the two roles genuinely compete for the same cells.
+    #[test]
+    fn a_focused_empty_picker_is_coloured_like_a_focused_loaded_one() {
+        let server = FakeServer::healthy();
+        *server.profiles.borrow_mut() = Ok(Vec::new());
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, 120, 60);
+        while shell.focus() != Focus::AgentPicker {
+            assert!(shell.on_key(KeyCode::Tab));
+        }
+
+        let focus_fg = Theme::colour().focus.fg.expect("`focus` sets a foreground");
+        assert_eq!(
+            drawn_foreground(&shell, 120, 60, "none found"),
+            focus_fg,
+            "a focused EMPTY picker must carry `focus` in the drawn cells, like every other \
+             focused row — the marker alone is the insufficient-focus case of NFR-3 item 7"
         );
     }
 }
