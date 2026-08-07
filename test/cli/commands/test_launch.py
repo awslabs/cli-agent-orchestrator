@@ -962,3 +962,27 @@ def test_launch_rejects_blocked_env_prefix_before_calling_api():
         assert result.exit_code != 0
         assert "blocked prefix" in result.output
         mock_post.assert_not_called()
+
+
+def test_launch_omp_requires_workspace_confirmation():
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--provider", "omp", "--headless"],
+            input="y\n",
+        )
+
+    assert result.exit_code == 0
+    assert "launching on omp" in result.output
+    assert "Proceed?" in result.output
+    mock_post.assert_called_once()
