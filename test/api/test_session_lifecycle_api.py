@@ -208,7 +208,10 @@ class TestStopImpactIsComputed:
         reasons = {v["provider"]: v["reason"] for v in payload["not_resumable"]}
         assert reasons["muse_cli"] == "provider-has-no-resume-path"
         assert reasons["claude_code"] == "no-recorded-native-session-id"
-        assert reasons["codex"] == "provider-version-drifted-from-pin"
+        # Not "drifted": nothing supplied a version, so nobody checked. An
+        # operator who "fixed" a drift that was never measured would find
+        # the verdict unchanged.
+        assert reasons["codex"] == "provider-version-not-verified"
 
     def test_a_worker_whose_liveness_cannot_be_read_is_a_loss(self, client, monkeypatch):
         """ "Not live" and "we could not look" are different facts.
@@ -333,3 +336,25 @@ class TestScopes:
 
         assert by_path[("/sessions/{session_name}/lifecycle/stop", ("POST",))] == (SCOPE_ADMIN,)
         assert SCOPE_READ in by_path[("/sessions/{session_name}/lifecycle", ("GET",))]
+
+
+class TestTheDeclareBodyIsClosed:
+    """Relaxing this opens a direct HTTP path into a marshal-suppressing state."""
+
+    @pytest.mark.parametrize("lifecycle", ["paused", "pausing", "stopped", "", "WORKING"])
+    def test_only_working_and_complete_are_accepted(self, client, lifecycle):
+        response = client.post(
+            f"/sessions/{SESSION}/lifecycle",
+            json={"lifecycle": lifecycle, "declared_by": "colin"},
+        )
+        assert response.status_code == 422, lifecycle
+        assert sl.describe(SESSION)["lifecycle"] == "working"
+
+    def test_paused_is_only_reachable_through_the_settle_route(self, client):
+        client.post(f"/sessions/{SESSION}/lifecycle/pause-request", json={"requested_by": "c"})
+        assert (
+            client.post(
+                f"/sessions/{SESSION}/lifecycle/pause-settled", json={"declared_by": "s"}
+            ).json()["lifecycle"]
+            == "paused"
+        )

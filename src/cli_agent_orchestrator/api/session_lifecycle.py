@@ -182,8 +182,10 @@ async def get_session_lifecycle(
     # small window, and the wrong half of it is a payload that says
     # `pausing` and `suppresses_marshal: true`.
     record = await asyncio.to_thread(sl.describe, session_name)
+    diverges = await asyncio.to_thread(sl.divergence, record)
     return {
         **record,
+        "diverges": diverges,
         "suppresses_marshal": (
             False if record.get("unreadable") else record["lifecycle"] in sl.MARSHAL_SUPPRESSING
         ),

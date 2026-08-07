@@ -63,6 +63,11 @@ REASON_UNKNOWN_PROVIDER = "provider-not-recognised"
 #: skipped: "not live" and "we could not look" are different facts, and
 #: only the first means the worker is already gone.
 REASON_LIVENESS_UNKNOWN = "liveness-could-not-be-observed"
+#: Distinct from drift. Nothing in production supplies the installed
+#: versions today, so reporting drift would accuse every worker of a
+#: mismatch against a check nobody ran — and an operator who fixes the
+#: "drift" would find the verdict unchanged.
+REASON_VERSION_UNVERIFIED = "provider-version-not-verified"
 
 #: True while no provider has a working resume path in production. Read
 #: from the code rather than asserted: the route exists and refuses.
@@ -166,9 +171,10 @@ def worker_resumability(
         verdict["reason"] = REASON_NO_RECORDED_SESSION
         return verdict
 
-    pinned, detail = _version_is_pinned(provider, (installed_versions or {}).get(provider))
+    supplied = (installed_versions or {}).get(provider)
+    pinned, detail = _version_is_pinned(provider, supplied)
     if not pinned:
-        verdict["reason"] = REASON_VERSION_DRIFT
+        verdict["reason"] = REASON_VERSION_DRIFT if supplied else REASON_VERSION_UNVERIFIED
         verdict["detail"] = detail
         return verdict
 

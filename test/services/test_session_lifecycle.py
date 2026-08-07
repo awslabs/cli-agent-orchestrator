@@ -456,3 +456,69 @@ class TestTheDeadlineCannotBeDefeated:
         settled = sl.settle_pause(SESSION, declared_by="supervisor")
         assert settled["pause_deadline_at"] is None
         assert sl.pause_is_overdue(settled) is False
+
+
+class TestAContradictedDeclarationIsVisiblyWrong:
+    """`stop` records; it does not collect panes.
+
+    So an operator can declare a session stopped while its fleet keeps
+    running — marshal-suppressed and still burning quota. The declaration
+    is trusted until changed, deliberately, and nothing here auto-corrects
+    it. But trusted is not the same as silent: every surface that renders
+    the state can say the two disagree.
+    """
+
+    def test_a_stopped_session_with_live_panes_is_flagged(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_projection
+
+        monkeypatch.setattr(
+            terminal_projection, "live_terminals", lambda name: [{"terminal_id": "a1"}]
+        )
+        record = sl.stop(SESSION, declared_by="colin")
+        message = sl.divergence(record)
+        assert message and "1 terminal(s) are still live" in message
+        assert "fire marshal" in message
+
+    def test_a_stopped_session_with_no_panes_is_not_flagged(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_projection
+
+        monkeypatch.setattr(terminal_projection, "live_terminals", lambda name: [])
+        assert sl.divergence(sl.stop(SESSION, declared_by="colin")) is None
+
+    def test_a_working_session_with_live_panes_is_not_a_contradiction(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_projection
+
+        monkeypatch.setattr(
+            terminal_projection, "live_terminals", lambda name: [{"terminal_id": "a1"}]
+        )
+        assert sl.divergence(sl.declare(SESSION, sl.WORKING, declared_by="s")) is None
+
+    def test_an_unreadable_fleet_is_not_reported_as_a_contradiction(self, monkeypatch):
+        """We could not look is not evidence that the two disagree."""
+        from cli_agent_orchestrator.services import terminal_projection
+
+        def _boom(_name):
+            raise RuntimeError("tmux unreachable")
+
+        monkeypatch.setattr(terminal_projection, "live_terminals", _boom)
+        assert sl.divergence(sl.stop(SESSION, declared_by="colin")) is None
+
+
+class TestThePinsTheReviewersFoundMissing:
+    def test_the_wedge_gate_respects_the_pause_deadline(self, monkeypatch):
+        """Reverting the deadline check passed 141 tests before this."""
+        from cli_agent_orchestrator.services import terminal_projection
+
+        fresh = sl.request_pause(SESSION, requested_by="colin", deadline_seconds=3600)
+        assert terminal_projection._is_pause_like(fresh) is True
+
+        overdue = dict(fresh)
+        overdue["pause_deadline_at"] = "2020-01-01T00:00:00Z"
+        assert terminal_projection._is_pause_like(overdue) is False
+
+    def test_a_paused_session_is_pause_like_without_any_deadline(self):
+        from cli_agent_orchestrator.services import terminal_projection
+
+        sl.request_pause(SESSION, requested_by="colin")
+        settled = sl.settle_pause(SESSION, declared_by="supervisor")
+        assert terminal_projection._is_pause_like(settled) is True

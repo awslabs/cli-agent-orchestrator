@@ -337,6 +337,8 @@ def _render(record: dict) -> None:
     if record.get("pause_deadline_at"):
         overdue = " (OVERDUE)" if record.get("pause_overdue") else ""
         click.echo(f"  pause deadline  {record['pause_deadline_at']}{overdue}")
+    if record.get("diverges"):
+        click.echo(f"  WARNING         {record['diverges']}")
     if record.get("suppresses_marshal"):
         click.echo("  the fire marshal will not fire on this session")
 

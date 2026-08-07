@@ -235,6 +235,38 @@ def describe(session_name: str) -> dict[str, Any]:
         return record
 
 
+def divergence(record: Mapping[str, Any]) -> Optional[str]:
+    """Whether a declaration contradicts the fleet it describes.
+
+    A declared state is trusted until explicitly changed — that is the
+    design, and it is why nothing here heartbeats. But trust is not the
+    same as silence: a session declared ``stopped`` whose panes are still
+    running is marshal-suppressed while burning quota, and the record
+    being *visible* does not make it *visibly wrong*.
+
+    So this reports the contradiction without resolving it. Nothing
+    auto-corrects the declaration, because the whole point is that only a
+    human or a supervisor may change it — but every surface that renders
+    the state can now say the two disagree.
+    """
+    lifecycle = record.get("lifecycle")
+    if lifecycle not in (STOPPED, COMPLETE):
+        return None
+    try:
+        from cli_agent_orchestrator.services import terminal_projection
+
+        live = terminal_projection.live_terminals(record["session_name"])
+    except Exception:  # noqa: BLE001 - an unreadable fleet is not a contradiction
+        return None
+    if not live:
+        return None
+    return (
+        f"declared {lifecycle} but {len(live)} terminal(s) are still live; "
+        "the panes were never collected, and this session is suppressed to the fire marshal "
+        "while they keep running"
+    )
+
+
 def suppresses_marshal(session_name: str) -> tuple[bool, dict[str, Any]]:
     """Whether the marshal should stay silent, and the record that decided.
 
