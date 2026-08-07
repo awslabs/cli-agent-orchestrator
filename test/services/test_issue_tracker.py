@@ -530,3 +530,15 @@ class TestPrefixUniqueness:
         tracker.delete_project("cao-system", force=True)
         reclaimed = tracker.create_project(name="Successor", project_id="succ", issue_prefix="cond")
         assert reclaimed["issue_prefix"] == "cond"
+
+
+class TestExportCompleteness:
+    def test_the_export_pages_past_the_list_page_size(self, cao_system):
+        # `list_issues` caps a page at 500. This export replaces a file that
+        # held every entry, so a cap here would silently drop issue 501 onward
+        # and the rendered log would look complete.
+        for i in range(505):
+            tracker.create_issue(project_id="cao-system", title=f"issue {i}")
+        rendered = tracker.render_markdown("cao-system")
+        assert rendered.count("\n## cond-") == 505
+        assert "505 issue(s)" in rendered

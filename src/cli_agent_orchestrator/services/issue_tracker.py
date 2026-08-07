@@ -1256,19 +1256,35 @@ def render_markdown(project_id: str, *, open_only: bool = True) -> str:
     step with it.
     """
     project = get_project(project_id)
-    listing = list_issues(
-        project_id=project_id, open_only=open_only, limit=500, order="created_asc"
-    )
+
+    # Paged rather than capped. `list_issues` bounds a page at 500, and this
+    # export replaces a file that held every entry — a truncated log that
+    # announces nothing is the exact failure the markdown ledger never had.
+    issues: List[Dict[str, Any]] = []
+    total = 0
+    while True:
+        page = list_issues(
+            project_id=project_id,
+            open_only=open_only,
+            limit=500,
+            offset=len(issues),
+            order="created_asc",
+        )
+        total = page["total"]
+        issues.extend(page["issues"])
+        if not page["issues"] or len(issues) >= total:
+            break
+
     lines = [
         f"# {'Open' if open_only else 'All'} issues — {project['name']}",
         "",
         f"Rendered from the CAO issue tracker. Project id `{project['id']}`; "
-        f"{listing['total']} issue(s).",
+        f"{total} issue(s).",
         "",
         "---",
         "",
     ]
-    for issue in listing["issues"]:
+    for issue in issues:
         severity = f"[{issue['severity']}] " if issue["severity"] != "unset" else ""
         lines.append(f"## {issue['key']} — {severity}{issue['title']}")
         lines.append("")
