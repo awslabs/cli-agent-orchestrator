@@ -437,6 +437,149 @@ export interface GraphExportResult {
   dest: string
 }
 
+// ---------------------------------------------------------------------------
+// Issue tracker
+// ---------------------------------------------------------------------------
+
+/**
+ * The enumerations the server will accept, fetched from /tracker/vocabulary.
+ *
+ * Deliberately not hard-coded here: a dropdown that offers a status the server
+ * rejects is a bug the UI cannot detect, and this list has already grown once
+ * (P0 arrived when the real ledger turned out to use it).
+ */
+export interface TrackerVocabulary {
+  statuses: string[]
+  terminal_statuses: string[]
+  severities: string[]
+  scope_kinds: string[]
+  link_kinds: string[]
+  project_statuses: string[]
+}
+
+export interface TrackerScope {
+  id: number
+  project_id?: string
+  kind: string
+  value: string
+  created_at: string | null
+}
+
+export interface TrackerProject {
+  id: string
+  name: string
+  description: string
+  status: string
+  issue_prefix: string
+  next_issue_number: number
+  created_at: string | null
+  updated_at: string | null
+  counts?: { total: number; open: number; by_status?: Record<string, number> }
+  scopes?: TrackerScope[]
+}
+
+export interface TrackerComment {
+  id: number
+  author: string | null
+  body: string
+  created_at: string | null
+}
+
+export interface TrackerEvent {
+  id: number
+  actor: string | null
+  kind: string
+  field: string | null
+  old_value: string | null
+  new_value: string | null
+  created_at: string | null
+}
+
+export interface TrackerLink {
+  id: number
+  kind: string
+  from_key: string
+  to_key: string
+}
+
+export interface TrackerIssue {
+  key: string
+  project_id: string
+  title: string
+  body: string
+  status: string
+  severity: string
+  component: string | null
+  reporter: string | null
+  assignee: string | null
+  labels: string[]
+  failing_command: string | null
+  evidence: string | null
+  resolution: string | null
+  session_name: string | null
+  terminal_id: string | null
+  source_path: string | null
+  duplicate_of: string | null
+  origin: string
+  created_at: string | null
+  updated_at: string | null
+  closed_at: string | null
+  /** Present only on the create response: which scope matched. */
+  resolved_by?: string | null
+  /** Present only on the detail response. */
+  comments?: TrackerComment[]
+  events?: TrackerEvent[]
+  links?: TrackerLink[]
+}
+
+export interface TrackerIssuePage {
+  total: number
+  limit: number
+  offset: number
+  issues: TrackerIssue[]
+}
+
+export interface TrackerIssueFilters {
+  projectId?: string
+  status?: string[]
+  severity?: string[]
+  component?: string
+  assignee?: string
+  label?: string
+  q?: string
+  openOnly?: boolean
+  limit?: number
+  offset?: number
+  order?: string
+}
+
+export interface TrackerStats {
+  project_id: string | null
+  total: number
+  open: number
+  by_status: Record<string, number>
+  by_severity: Record<string, number>
+  by_component: Record<string, number>
+}
+
+function trackerQuery(filters?: TrackerIssueFilters): string {
+  if (!filters) return ''
+  const parts: string[] = []
+  if (filters.projectId) parts.push(`project_id=${encodeURIComponent(filters.projectId)}`)
+  // Repeated params, not a comma list: the server reads them as an OR.
+  for (const s of filters.status ?? []) parts.push(`status=${encodeURIComponent(s)}`)
+  for (const s of filters.severity ?? []) parts.push(`severity=${encodeURIComponent(s)}`)
+  if (filters.component) parts.push(`component=${encodeURIComponent(filters.component)}`)
+  if (filters.assignee) parts.push(`assignee=${encodeURIComponent(filters.assignee)}`)
+  if (filters.label) parts.push(`label=${encodeURIComponent(filters.label)}`)
+  if (filters.q) parts.push(`q=${encodeURIComponent(filters.q)}`)
+  if (filters.openOnly) parts.push('open_only=true')
+  if (filters.limit) parts.push(`limit=${filters.limit}`)
+  if (filters.offset) parts.push(`offset=${filters.offset}`)
+  if (filters.order) parts.push(`order=${encodeURIComponent(filters.order)}`)
+  return parts.length ? `?${parts.join('&')}` : ''
+}
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
@@ -688,4 +831,89 @@ export const api = {
       },
     )
   },
+
+  // Issue tracker
+  getTrackerVocabulary: () => fetchJSON<TrackerVocabulary>('/tracker/vocabulary'),
+
+  listTrackerProjects: (includeArchived = false) =>
+    fetchJSON<TrackerProject[]>(`/tracker/projects${includeArchived ? '?include_archived=true' : ''}`),
+  getTrackerProject: (id: string) =>
+    fetchJSON<TrackerProject>(`/tracker/projects/${encodeURIComponent(id)}`),
+  createTrackerProject: (body: {
+    name: string
+    id?: string
+    description?: string
+    issue_prefix?: string
+    scopes?: Array<{ kind: string; value: string }>
+  }) =>
+    fetchJSON<TrackerProject>('/tracker/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  updateTrackerProject: (
+    id: string,
+    body: { name?: string; description?: string; status?: string; issue_prefix?: string },
+  ) =>
+    fetchJSON<TrackerProject>(`/tracker/projects/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  deleteTrackerProject: (id: string, force = false) =>
+    fetchJSON<{ id: string; deleted: boolean; issues_deleted: number }>(
+      `/tracker/projects/${encodeURIComponent(id)}${force ? '?force=true' : ''}`,
+      { method: 'DELETE' },
+    ),
+  addTrackerScope: (projectId: string, body: { kind: string; value: string }) =>
+    fetchJSON<TrackerScope & { created: boolean }>(
+      `/tracker/projects/${encodeURIComponent(projectId)}/scopes`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    ),
+  removeTrackerScope: (projectId: string, scopeId: number) =>
+    fetchJSON<{ id: number; deleted: boolean }>(
+      `/tracker/projects/${encodeURIComponent(projectId)}/scopes/${scopeId}`,
+      { method: 'DELETE' },
+    ),
+
+  listTrackerIssues: (filters?: TrackerIssueFilters) =>
+    fetchJSON<TrackerIssuePage>(`/tracker/issues${trackerQuery(filters)}`),
+  getTrackerIssue: (key: string) =>
+    fetchJSON<TrackerIssue>(`/tracker/issues/${encodeURIComponent(key)}`),
+  createTrackerIssue: (body: Record<string, unknown>) =>
+    fetchJSON<TrackerIssue>('/tracker/issues', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ origin: 'dashboard', ...body }),
+    }),
+  updateTrackerIssue: (key: string, body: Record<string, unknown>) =>
+    fetchJSON<TrackerIssue>(`/tracker/issues/${encodeURIComponent(key)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  deleteTrackerIssue: (key: string) =>
+    fetchJSON<{ key: string; deleted: boolean }>(`/tracker/issues/${encodeURIComponent(key)}`, {
+      method: 'DELETE',
+    }),
+  addTrackerComment: (key: string, body: { body: string; author?: string }) =>
+    fetchJSON<TrackerComment>(`/tracker/issues/${encodeURIComponent(key)}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  addTrackerLink: (key: string, body: { to_key: string; kind: string; actor?: string }) =>
+    fetchJSON<TrackerLink & { created: boolean }>(
+      `/tracker/issues/${encodeURIComponent(key)}/links`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    ),
+  removeTrackerLink: (key: string, linkId: number) =>
+    fetchJSON<{ id: number; deleted: boolean }>(
+      `/tracker/issues/${encodeURIComponent(key)}/links/${linkId}`,
+      { method: 'DELETE' },
+    ),
+  getTrackerStats: (projectId?: string) =>
+    fetchJSON<TrackerStats>(
+      `/tracker/issues/stats${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`,
+    ),
 }
