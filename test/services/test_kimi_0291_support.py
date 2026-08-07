@@ -1,23 +1,27 @@
-"""Exact Kimi Code version support under the current pin (cond-0315: 0.33.0).
+"""Exact Kimi Code version support under the open policy (cond-0331: 0.34.0).
 
 Each accepted build was added as a *separate proven build*, never a range
 widening, and stays admitted as the current pin moves forward: already-minted
-sessions under older builds must keep validating.  This suite pins the three
-properties that support turns on:
+sessions under older builds must keep validating.  Under the cond-0331 open
+policy, Kimi additionally accepts any non-empty semver-shaped version at the
+launch identity boundary, while the exact ``SUPPORTED_VERSIONS`` tuple still
+gates feature-specific authority.  This suite pins the three properties that
+support turns on:
 
-1.  every version gate (contract, route, bridge) accepts 0.33.0, 0.32.0,
-    0.31.0, 0.30.0, 0.29.2, 0.29.1, and 0.29.0, and rejects everything else —
-    an exact set, never a range;
+1.  every version gate (contract, route, bridge) accepts 0.34.0, 0.33.0,
+    0.32.0, 0.31.0, 0.30.0, 0.29.2, 0.29.1, and 0.29.0 for proven-build
+    authority, and rejects unparseable banners; semver-shaped versions outside
+    the proven set are accepted at launch but inherit no advanced authority;
 2.  a multi-line message on any accepted session is deliverable, because
     the composer-newline table carries a separate proven entry per build
     whose keystroke plans are byte-identical; and
 3.  a receipt records the *actual* installed version, so a 0.29.1 binary
-    is never described by a 0.29.0, 0.30.0, 0.31.0, 0.32.0, or 0.33.0
-    constant (or the reverse).
+    is never described by a 0.29.0, 0.30.0, 0.31.0, 0.32.0, 0.33.0, or
+    0.34.0 constant (or the reverse).
 
-This exact ACCEPTED tuple is the cross-repo parity contract: it must equal
-the conductor's capability.accepted_versions("kimi_cli"), and each side's
-suite pins it so a future drift fails its own run.
+This exact ACCEPTED tuple is the cross-repo parity contract for proven
+builds: it must equal the conductor's capability.accepted_versions("kimi_cli"),
+and each side's suite pins it so a future drift fails its own run.
 """
 
 from __future__ import annotations
@@ -33,18 +37,19 @@ from cli_agent_orchestrator.services import kimi_native_control as knc
 from cli_agent_orchestrator.services import kimi_route
 from cli_agent_orchestrator.services import provider_contracts as pc
 
-CURRENT = "0.33.0"
+CURRENT = "0.34.0"
+PIN_0330 = "0.33.0"
 PIN_0320 = "0.32.0"
 PIN_0310 = "0.31.0"
 PIN_0300 = "0.30.0"
 PIN_0292 = "0.29.2"
 RETAINED = "0.29.1"
 OLDEST = "0.29.0"
-ACCEPTED = (CURRENT, PIN_0320, PIN_0310, PIN_0300, PIN_0292, RETAINED, OLDEST)
+ACCEPTED = (CURRENT, PIN_0330, PIN_0320, PIN_0310, PIN_0300, PIN_0292, RETAINED, OLDEST)
 
 
 # --------------------------------------------------------------------
-# The version gates accept exactly {0.33.0, 0.32.0, 0.31.0, 0.30.0, 0.29.2, 0.29.1, 0.29.0}
+# The version gates accept exactly the proven set for feature authority
 # --------------------------------------------------------------------
 
 
@@ -62,11 +67,19 @@ def test_check_pinned_version_accepts_every_accepted_build(banner):
     pc.check_pinned_version("kimi", banner)
 
 
+@pytest.mark.parametrize("banner", ["0.35.0", "kimi 0.35.0", "9.9.9"])
+def test_check_pinned_version_accepts_future_semver_at_launch_boundary(banner):
+    # Open enforcement: a future semver-shaped version must not be refused
+    # at the launch identity boundary before task bytes.
+    pc.check_pinned_version("kimi", banner)
+
+
 @pytest.mark.parametrize(
     "bad",
-    ["0.29.3", "0.28.9", "0.30.1", "0.31.1", "0.32.1", "0.33.1", "0.34.0", "1.0.0", "kimi", ""],
+    ["kimi", ""],
 )
-def test_check_pinned_version_rejects_everything_outside_the_set(bad):
+def test_check_pinned_version_rejects_unparseable_banners(bad):
+    # Unknown/unparseable versions still fail closed at the boundary.
     with pytest.raises(pc.ProviderVersionDrift):
         pc.check_pinned_version("kimi", bad)
 
@@ -119,7 +132,7 @@ def test_the_composer_newline_table_keeps_the_separate_proven_0320_entry():
 
 
 def test_the_composer_newline_table_keeps_the_separate_proven_0330_entry():
-    entry = knc._PROVEN_COMPOSER_NEWLINE.get(CURRENT)
+    entry = knc._PROVEN_COMPOSER_NEWLINE.get(PIN_0330)
     assert entry is not None, "0.33.0 must be a separate keyed entry, never a range"
     # cond-0315: the installed 0.33.0 bundle declares the same composer facts as
     # the 0.29.x/0.30.0/0.31.0/0.32.0 line — each snippet verified
@@ -128,6 +141,16 @@ def test_the_composer_newline_table_keeps_the_separate_proven_0330_entry():
     assert entry["keystroke"] == knc._PROVEN_COMPOSER_NEWLINE[OLDEST]["keystroke"]
     assert entry["normalization"] == knc.NORMALIZATION_JOIN_LF_THEN_TRIM
     assert "0e77b9c64e67a4eecb96aae011750668aab11bd781564fe3e4855513812247b2" in entry["evidence"]
+
+
+def test_the_composer_newline_table_has_a_separate_proven_0340_entry():
+    entry = knc._PROVEN_COMPOSER_NEWLINE.get(CURRENT)
+    assert entry is not None, "0.34.0 must be a separate keyed entry, never a range"
+    # cond-0331: 0.34.0 was admitted by the compatibility check; its composer
+    # facts are byte-identical to the attested 0.33.0 line.
+    assert entry["keystroke"] == knc._PROVEN_COMPOSER_NEWLINE[OLDEST]["keystroke"]
+    assert entry["normalization"] == knc.NORMALIZATION_JOIN_LF_THEN_TRIM
+    assert "d3e781774e7a95f71e9d813e2cda95486d15db73712b3e821dd4a357b0511d8c" in entry["evidence"]
 
 
 @pytest.mark.parametrize("version", ACCEPTED)
@@ -145,6 +168,14 @@ def test_an_unproven_neighbouring_version_is_not_silently_accepted():
     plan = knc.plan_composer_keystrokes("line one\nline two", provider_version="0.29.3")
     assert plan["deliverable"] is False
     assert "0.29.3" in plan["undeliverable_reason"]
+
+
+def test_a_future_semver_has_no_proven_composer_authority():
+    # Open enforcement accepts 0.35.0 at launch, but it does not inherit the
+    # composer control authority of the proven builds.
+    plan = knc.plan_composer_keystrokes("line one\nline two", provider_version="0.35.0")
+    assert plan["deliverable"] is False
+    assert "0.35.0" in plan["undeliverable_reason"]
 
 
 # --------------------------------------------------------------------

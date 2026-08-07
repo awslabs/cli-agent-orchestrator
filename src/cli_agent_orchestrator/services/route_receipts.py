@@ -40,8 +40,8 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.services.durable_publish import publish_immutable
 from cli_agent_orchestrator.services.provider_contracts import (
-    ProviderVersionDrift,
-    check_pinned_version,
+    SUPPORTED_VERSIONS,
+    normalized_version,
     validate_route_proof,
 )
 
@@ -256,9 +256,14 @@ def load_valid_route_proofs(
         version = receipt.get("provider_version")
         if not isinstance(version, str):
             continue
-        try:
-            check_pinned_version(str(provider), version)
-        except ProviderVersionDrift:
+        # Route authority is proven-build authority: it stays strict for
+        # every provider, including Kimi, even though the launch identity
+        # boundary is open.  Use the exact supported set, not the launch
+        # policy, so an unproven build cannot inherit automated recovery
+        # authority from a proven neighbour.
+        short = _CAPABILITY_PROVIDER.get(str(provider))
+        normalized = normalized_version(version)
+        if not normalized or normalized not in SUPPORTED_VERSIONS.get(short or "", ()):
             continue
         digest = receipt.get("model_input_digest")
         journaled = expected_input_digests.get(str(provider), frozenset())

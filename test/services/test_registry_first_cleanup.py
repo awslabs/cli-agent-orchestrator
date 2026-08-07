@@ -831,6 +831,7 @@ def test_failed_provider_version_probe_records_provider_io(monkeypatch):
         class _FailedVersion:
             returncode = 7
             stdout = "unexpected-version"
+            stderr = "provider failed"
 
         monkeypatch.setattr(bridge.subprocess, "run", lambda *_args, **_kwargs: _FailedVersion())
         rr.reset_resource_registry()
@@ -863,7 +864,7 @@ def test_failed_provider_version_probe_records_provider_io(monkeypatch):
             assert state["state"] == "launch-failed-bridge"
             assert state["launch_failure"]["provider_io_started"] is True
             assert state["launch_failure"]["task_bytes_submitted"] is False
-            assert "unsupported provider version" in state["error"]
+            assert "provider --version exited 7" in state["error"]
         finally:
             rr.reset_resource_registry()
 

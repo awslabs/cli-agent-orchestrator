@@ -44,11 +44,8 @@ from cli_agent_orchestrator.services import (
     heartbeat_store,
     provider_contracts,
 )
-from cli_agent_orchestrator.services.codex_trust import (
-    SUPPORTED_CODEX_VERSION,
-    _contains_session_flags,
-)
-from cli_agent_orchestrator.services.kimi_route import SUPPORTED_KIMI_VERSIONS, _current_option
+from cli_agent_orchestrator.services.codex_trust import _contains_session_flags
+from cli_agent_orchestrator.services.kimi_route import _current_option
 from cli_agent_orchestrator.services.managed_event_renderer import ManagedEventRenderer
 from cli_agent_orchestrator.services.managed_session_control import ACCEPTED as CONTROL_ACCEPTED
 from cli_agent_orchestrator.services.managed_session_control import AMBIGUOUS as CONTROL_AMBIGUOUS
@@ -1864,7 +1861,17 @@ class _ProviderSession:
         )
         return readiness
 
-    def _version(self, executable: str, accepted: tuple[str, ...]) -> str:
+    def _version(self, executable: str, provider: str) -> str:
+        """Run --version and enforce the provider's launch identity policy.
+
+        ``provider`` is the short provider-contract name (``codex``, ``kimi``,
+        ``claude``), not the wire key.  All providers use open enforcement by
+        default: any non-empty semver-shaped version is accepted at the launch
+        boundary.  An operator can opt one provider into strict exact-set
+        enforcement with ``CAO_PROVIDER_VERSION_ENFORCEMENT_<PROVIDER>``.
+        The receipt records the actual installed banner; advanced capability
+        boundaries perform their own exact proven-build check.
+        """
         if not os.path.isabs(executable) or os.path.realpath(executable) != executable:
             raise BridgeError("provider executable must be a canonical absolute path")
         if (
@@ -1881,18 +1888,19 @@ class _ProviderSession:
             env=_provider_child_environment(self.request),
         )
         actual = proc.stdout.strip()
-        # Exact-set membership, never a range: a provider may accept more
-        # than one proven build (Kimi retains 0.29.1 and 0.29.0 alongside
-        # 0.29.2), and the receipt records the actual installed one.
-        if proc.returncode != 0 or actual not in accepted:
+        if proc.returncode != 0:
             raise BridgeError(
-                f"unsupported provider version {actual!r}; expected one of {list(accepted)!r}"
+                f"provider --version exited {proc.returncode}; stderr: {proc.stderr.strip()!r}"
             )
+        try:
+            provider_contracts.check_pinned_version(provider, actual)
+        except provider_contracts.ProviderContractError as exc:
+            raise BridgeError(f"unsupported provider version {actual!r}: {exc}") from exc
         return actual
 
     def _initialize_codex(self) -> dict[str, Any]:
         codex_bin = self.request["provider_executable"]
-        version = self._version(codex_bin, (SUPPORTED_CODEX_VERSION,))
+        version = self._version(codex_bin, provider_contracts.PROVIDER_CODEX)
         worktree = self.request["working_directory"]
         argv = [codex_bin, "-c", render_trusted_project_override(worktree)]
         argv.extend(["-c", _toml_override("model", self.request["model"])])
@@ -1982,7 +1990,7 @@ class _ProviderSession:
 
     def _initialize_kimi(self) -> dict[str, Any]:
         kimi_bin = self.request["provider_executable"]
-        version = self._version(kimi_bin, SUPPORTED_KIMI_VERSIONS)
+        version = self._version(kimi_bin, provider_contracts.PROVIDER_KIMI)
         # Route control (thinking effort) comes ONLY from the reservation
         # request and is part of the final inventoried child environment.
         env = _provider_child_environment(self.request)

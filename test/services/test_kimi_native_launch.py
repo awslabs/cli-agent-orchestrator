@@ -180,7 +180,7 @@ class TestRenderedSessionProofGate:
 
     @pytest.mark.parametrize(
         "version",
-        ["0.30.0", "0.29.2", "0.29.1", "0.29.0", "0.31.1", "0.32.1", "0.33.1", "0.34.0", ""],
+        ["0.30.0", "0.29.2", "0.29.1", "0.29.0", "0.31.1", "0.32.1", "0.33.1", ""],
     )
     def test_every_other_build_is_unproven_and_must_fail_closed(self, version):
         """Only a build whose title-rewrite + header were read earns the

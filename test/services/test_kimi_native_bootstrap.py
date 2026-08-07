@@ -300,8 +300,9 @@ def test_a_malformed_digest_is_refused_before_the_file_is_read(pinned_binary):
         _mint(pinned_binary, FakeAcp(), binary_sha256="not-a-digest")
 
 
-def test_version_drift_refuses_before_any_provider_io(pinned_binary):
+def test_strict_version_drift_refuses_before_any_provider_io(pinned_binary, monkeypatch):
     transport = FakeAcp()
+    monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI", "strict")
 
     with pytest.raises(boot.KimiBootstrapInvalid, match="version drift"):
         _mint(pinned_binary, transport, version_output="kimi 0.28.0")

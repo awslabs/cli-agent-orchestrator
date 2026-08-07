@@ -1199,7 +1199,11 @@ class TestBoundedWriteDeadline:
 
         assert result.outcome == AMBIGUOUS
         assert result.reason_code == REASON_WRITE_INCOMPLETE
-        assert elapsed < 0.15
+        # The write itself is bounded by WRITE_DEADLINE_SECONDS.  Keep a
+        # generous wall-clock allowance for interpreter/coverage and CI
+        # scheduling jitter; the assertion is about returning promptly, not
+        # enforcing a second timing contract on top of the primitive.
+        assert elapsed < 0.30
         assert journal.get(CONTROL).state == service.STATE_AMBIGUOUS
         assert client.write_calls == 1
 

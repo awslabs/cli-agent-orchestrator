@@ -546,8 +546,7 @@ async def test_a_kimi_0321_banner_still_blocks_before_any_pane_session_or_task(
     failure = result["preflight_failure"]
     assert failure["reason"] == v2.PREFLIGHT_REASON_SESSION_BOOTSTRAP
     assert failure["task_bytes_submitted"] is False
-    assert "version drift" in failure["detail"]
-    assert "0.32.1" in failure["detail"]
+    assert "native session proof is unavailable" in failure["detail"]
     # Zero pane/session/task mutation: no pane was created and the bootstrap
     # transport saw no ACP method at all — the refusal precedes initialize.
     assert harness.terminals == []
@@ -624,8 +623,7 @@ async def test_a_kimi_0331_banner_still_blocks_before_any_pane_session_or_task(
     failure = result["preflight_failure"]
     assert failure["reason"] == v2.PREFLIGHT_REASON_SESSION_BOOTSTRAP
     assert failure["task_bytes_submitted"] is False
-    assert "version drift" in failure["detail"]
-    assert "0.33.1" in failure["detail"]
+    assert "native session proof is unavailable" in failure["detail"]
     assert harness.terminals == []
     assert harness.transport.calls == []
 
