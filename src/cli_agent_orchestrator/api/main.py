@@ -43,6 +43,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cli_agent_orchestrator.api.attachments import router as native_attachments_router
+from cli_agent_orchestrator.api.session_lifecycle import router as session_lifecycle_router
 from cli_agent_orchestrator.api.tracker import router as tracker_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -853,6 +854,10 @@ app.add_middleware(
 # here; see api/tracker.py.
 app.include_router(tracker_router)
 app.include_router(native_attachments_router)
+# Registered before the app-level /sessions routes below, which is what lets
+# /sessions/{name}/lifecycle resolve without inheriting their tmux-existence
+# guard — a stopped session has no tmux session, and that is the point.
+app.include_router(session_lifecycle_router)
 
 
 @app.exception_handler(RequestValidationError)

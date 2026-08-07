@@ -53,7 +53,25 @@ async def create_session(
     ``env_vars`` are operator-forwarded env vars from ``cao launch --env``.
     They are persisted on the session record so every worker spawned later
     in the same session inherits them. See issue #248.
+
+    A **stopped** name is refused. Stopping records what the session would
+    restore to and, in time, what to relaunch; a new campaign taking that
+    name silently inherits all of it, and a later resume would relaunch the
+    wrong workers against the wrong provider sessions. The refusal is the
+    cheap half of that defence, and it matters most for reserved reusable
+    names — a repair session on a fixed name is guaranteed to hit this.
     """
+    if session_name:
+        from cli_agent_orchestrator.services import session_lifecycle
+
+        declared = session_lifecycle.describe(session_name)
+        if declared["lifecycle"] == session_lifecycle.STOPPED:
+            raise ValueError(
+                f"session {session_name!r} is stopped and still holds what a resume would "
+                f"restore ({declared['restore_to']!r}); resume it, or release the name with "
+                "`cao session forget` before reusing it"
+            )
+
     if provider is None:
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
     else:

@@ -451,6 +451,77 @@ class SessionEnvModel(Base):
     updated_at = Column(Text, nullable=False)  # ISO-8601 UTC timestamp
 
 
+class SessionLifecycleModel(Base):
+    """What a session is doing, as declared rather than inferred.
+
+    Until this table a session was not an entity at all: it was the tmux
+    session *name*, denormalised onto every terminal row and never stored
+    anywhere by itself.  ``session_env`` keys on the same string and is the
+    only precedent for one row per session.
+
+    That absence is why a deliberately-stopped session and a wedged one
+    were indistinguishable.  Everything that judged a session's health —
+    the marshal above all — could only look at its terminals and guess,
+    and "no worker has moved in six hours" reads identically for a
+    campaign that finished, a fleet an operator paused, and a supervisor
+    that died mid-goal.
+
+    Four fields rather than one enum, because collapsing them loses
+    information the UI and the marshal both need:
+
+    - ``lifecycle`` — what the session is doing now.
+    - ``restore_to`` — what a ``stopped`` session returns to on resume.
+      Recorded at stop even while no provider can actually be resumed yet,
+      because the alternative is losing the fact at the only moment it is
+      known.
+    - ``archived`` — a visibility flag, deliberately not a fifth state:
+      archiving a *complete* session must not lose that it was complete.
+    - ``kind`` — how health is judged at all.  A ``service`` session (a
+      long-lived memory curator, say) must never be measured by campaign
+      criteria, where "no work item advanced" is a stall rather than the
+      normal condition.
+
+    A declared state is trusted until explicitly changed.  There is no
+    heartbeat and no expiry, which is a deliberate choice against the
+    obvious alternative: a continuous liveness check on a paused
+    supervisor is itself a stall detector, and two systems that can
+    disagree about whether one session is healthy is worse than one system
+    that can be stale.
+
+    Columns are TEXT and INTEGER so ``create_all`` matches the raw
+    ``_migrate_session_lifecycle`` DDL byte-for-byte.
+
+    Note the name.  ``callback_recovery.session_lifecycle_claim`` is an
+    unrelated *lock* over a terminal generation; it predates this table and
+    shares nothing with it but a word.
+    """
+
+    __tablename__ = "session_lifecycle"
+
+    session_name = Column(Text, primary_key=True)
+    lifecycle = Column(Text, nullable=False)
+    #: Only meaningful while ``lifecycle == 'stopped'``; preserved
+    #: afterwards as the record of what a resume would have restored.
+    restore_to = Column(Text, nullable=True)
+    archived = Column(Integer, nullable=False, default=0)
+    kind = Column(Text, nullable=False, default="campaign")
+    #: Free text from whoever made the last transition, so a reader can
+    #: tell an operator's stop from a supervisor's completion.
+    declared_by = Column(Text, nullable=True)
+    note = Column(Text, nullable=True)
+    #: Set when a pause is requested and cleared when it settles. A pause
+    #: that never settles is the unresponsive-supervisor case the marshal
+    #: exists for, so this carries its own deadline rather than suppressing.
+    pause_requested_at = Column(Text, nullable=True)
+    pause_deadline_at = Column(Text, nullable=True)
+    #: Bumped on every transition. The compare-and-swap arbiter, exactly as
+    #: on the attachment store: a lost update is refused rather than
+    #: silently winning last-write.
+    epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
 class ManagedLaunchReservationModel(Base):
     """Durable identity and evidence for two-phase managed task admission.
 
@@ -906,6 +977,7 @@ def init_db() -> None:
     _migrate_workflow_run_step()
     _migrate_session_env()
     _migrate_native_session_attachments()
+    _migrate_session_lifecycle()
     _migrate_kimi_native_control_operations()
     _migrate_claude_native_control_operations()
     _migrate_codex_native_control_operations()
@@ -1292,6 +1364,47 @@ def _migrate_native_session_attachments() -> None:
             )
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"native-session attachment migration failed: {e}")
+
+
+def _migrate_session_lifecycle() -> None:
+    """Create the declared-session-state store on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via
+    ``SessionLifecycleModel``; this idempotent migration covers every
+    database created before a session was an entity at all. The DDL is
+    byte-compatible with the ORM model so both paths yield one schema.
+
+    Failure is surfaced rather than swallowed, but the read path treats an
+    absent table as "every session is working" rather than an error. That
+    asymmetry is deliberate and matches the marshal's rule: a session whose
+    state cannot be read must look like a session that needs watching, not
+    like one that declared itself quiet.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_lifecycle ("
+                "session_name TEXT NOT NULL, "
+                "lifecycle TEXT NOT NULL, "
+                "restore_to TEXT, "
+                "archived INTEGER NOT NULL DEFAULT 0, "
+                "kind TEXT NOT NULL DEFAULT 'campaign', "
+                "declared_by TEXT, "
+                "note TEXT, "
+                "pause_requested_at TEXT, "
+                "pause_deadline_at TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (session_name)"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - the read path degrades to "working"
+        logger.warning(f"session lifecycle migration failed: {e}")
 
 
 def _migrate_kimi_native_control_operations() -> None:
