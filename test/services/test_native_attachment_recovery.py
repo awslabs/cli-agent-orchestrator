@@ -328,7 +328,17 @@ class TestOperatorFreeze:
         assert result["ambiguity_reason"].startswith(recovery.OPERATOR_FREEZE_REASON)
         assert "colin" in result["ambiguity_reason"]
 
-    def test_a_claim_with_no_published_identity_can_be_declared_unresolvable(self):
+    def test_a_claim_with_no_published_identity_is_refused(self):
+        """A cold-starting launch and a crashed one are the same row.
+
+        `declare` writes the claim before the provider process exists, so
+        both are `starting` with no pid, and on the operator's screen they
+        are the same line. Freezing one blocks its own `mark_attached`, so
+        the identity is never published, the process keeps running, and the
+        adjudication that follows sees an empty survivor list and hands the
+        session away underneath it. That is the double-attach this module
+        exists to prevent, reached through the command meant to repair it.
+        """
         na.declare(
             provider=PROVIDER,
             native_session_id=SESSION,
@@ -337,13 +347,54 @@ class TestOperatorFreeze:
             execution_mode="native_tui",
             intent=_intent(),
         )
-        result = recovery.freeze_for_adjudication(
-            provider=PROVIDER,
-            native_session_id=SESSION,
-            operator="colin",
-            detail="launch crashed before publishing an identity",
-        )
-        assert result["state"] == na.AMBIGUOUS
+        with pytest.raises(na.NativeAttachmentConflict, match="no published process identity"):
+            recovery.freeze_for_adjudication(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                operator="colin",
+                detail="looks stuck",
+            )
+        assert na.get(PROVIDER, SESSION)["state"] == na.DECLARED
+
+    def test_a_running_launch_cannot_be_walked_to_detached(self):
+        """The whole two-step path, against a real process that is alive."""
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            na.declare(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                terminal_id=TERMINAL,
+                generation=GENERATION,
+                execution_mode="native_tui",
+                intent=_intent(),
+            )
+            na.mark_starting(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                terminal_id=TERMINAL,
+                generation=GENERATION,
+                execution_mode="native_tui",
+            )
+            with pytest.raises(na.NativeAttachmentConflict):
+                recovery.freeze_for_adjudication(
+                    provider=PROVIDER,
+                    native_session_id=SESSION,
+                    operator="colin",
+                    detail="listed as starting for a while",
+                )
+            # The launch can still finish, which is the point.
+            published = na.mark_attached(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                terminal_id=TERMINAL,
+                generation=GENERATION,
+                execution_mode="native_tui",
+                process_identity=na.process_identity(pid=child.pid, start_marker=MARKER),
+            )
+            assert published["state"] == na.ATTACHED
+        finally:
+            child.kill()
+            child.wait()
 
     def test_a_running_owner_is_refused(self):
         """A live process is an answered ownership question, not an open one."""
@@ -403,6 +454,7 @@ class TestOperatorFreeze:
                 observation=observation,
             ),
             live_survivors=observation["survivors"],
+            observed_epoch=record["epoch"],
         )
         assert result["state"] == na.DETACHED
 
@@ -446,3 +498,124 @@ class TestOneBadRowDoesNotEndThePass:
         assert report["counts"]["errored"] == 1
         assert na.get(PROVIDER, "good-row")["state"] == na.DETACHED
         assert na.get(PROVIDER, "bad-row")["state"] == na.ATTACHED
+
+
+class TestTheRecycledPidHasAValve:
+    """The one row automation is designed never to resolve.
+
+    A recycled pid is alive under a marker that differs from the recorded
+    one. Automation may not act on that — a timezone change produces
+    identical evidence — so without an operator path the session is
+    stranded permanently, and every future pid collision strands another.
+    The valve is a named human attesting to what they looked at.
+    """
+
+    def _recycled(self) -> dict:
+        """A live pid whose recorded marker is not the one it reports."""
+        _attach(pid=os.getpid(), marker="Thu Jan  1 00:00:00 1970")
+        return na.get(PROVIDER, SESSION)
+
+    def test_the_sweep_correctly_refuses_it(self):
+        self._recycled()
+        assert recovery.sweep(apply=True)["counts"].get("released", 0) == 0
+
+    def test_freezing_it_needs_the_attestation(self):
+        self._recycled()
+        with pytest.raises(na.NativeAttachmentConflict, match="only a human can tell"):
+            recovery.freeze_for_adjudication(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                operator="colin",
+                detail="pid looks recycled",
+            )
+
+    def test_the_attestation_records_both_markers(self):
+        self._recycled()
+        frozen = recovery.freeze_for_adjudication(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            operator="colin",
+            detail="pid 42599 is now an unrelated jupyter kernel",
+            attest_live_pid_is_not_the_owner=True,
+        )
+        assert frozen["state"] == na.AMBIGUOUS
+        assert frozen["ambiguity_reason"].startswith(na.RECYCLED_PID_ATTESTATION)
+        assert "Thu Jan  1 00:00:00 1970" in frozen["ambiguity_reason"]
+
+    def test_the_attested_row_then_adjudicates_despite_a_live_pid(self):
+        """The second gate opens only for the survivor the attestation covers."""
+        self._recycled()
+        recovery.freeze_for_adjudication(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            operator="colin",
+            detail="verified unrelated process",
+            attest_live_pid_is_not_the_owner=True,
+        )
+        record = na.get(PROVIDER, SESSION)
+        observation = recovery.observe_owner(record)
+        assert observation["survivors"], "the pid really is still alive"
+        result = na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=na.adjudication(
+                outcome=na.ADJUDICATION_OUTCOME_OWNER_GONE,
+                evidence_sha256="a" * 64,
+                detail="checked argv; unrelated process",
+                operator="colin",
+                observed_at=observation["observed_at"],
+                observation=observation,
+            ),
+            live_survivors=observation["survivors"],
+            observed_epoch=record["epoch"],
+        )
+        assert result["state"] == na.DETACHED
+
+    def test_an_owner_alive_under_its_own_marker_is_refused_even_attested(self):
+        """No attestation makes the recorded owner, running, releasable.
+
+        The recorded marker here is the *real* one this process reports, so
+        the observation says "matches" — the recorded owner, alive.
+        """
+        from cli_agent_orchestrator.services import native_tui_launch
+
+        real_marker = native_tui_launch._process_field(os.getpid(), "lstart=")
+        assert real_marker, "could not read this process's own start marker"
+        _attach(pid=os.getpid(), marker=real_marker)
+        with pytest.raises(na.NativeAttachmentConflict, match="is running"):
+            recovery.freeze_for_adjudication(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                operator="colin",
+                detail="I want it back",
+                attest_live_pid_is_not_the_owner=True,
+            )
+
+    def test_an_attestation_does_not_cover_a_matching_survivor(self):
+        """A row frozen for a recycled pid does not become a blanket permit."""
+        _attach(pid=os.getpid(), marker="Thu Jan  1 00:00:00 1970")
+        recovery.freeze_for_adjudication(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            operator="colin",
+            detail="recycled",
+            attest_live_pid_is_not_the_owner=True,
+        )
+        record = na.get(PROVIDER, SESSION)
+        observation = recovery.observe_owner(record)
+        with pytest.raises(na.NativeAttachmentConflict, match="observably alive"):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record=na.adjudication(
+                    outcome=na.ADJUDICATION_OUTCOME_OWNER_GONE,
+                    evidence_sha256="a" * 64,
+                    detail="x",
+                    operator="colin",
+                    observed_at=observation["observed_at"],
+                    observation=observation,
+                ),
+                # A survivor bearing the RECORDED marker is the owner itself.
+                live_survivors=[{"pid": os.getpid(), "start_marker": "Thu Jan  1 00:00:00 1970"}],
+                observed_epoch=record["epoch"],
+            )

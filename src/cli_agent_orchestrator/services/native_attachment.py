@@ -933,11 +933,41 @@ def _assert_adjudication_replay_matches(stored: Any, incoming: Mapping[str, Any]
         )
 
 
+#: Recorded in ``ambiguity_reason`` when an operator attests that the
+#: process now holding the recorded pid is *not* the recorded owner.  A
+#: recycled pid is the one case automation can never settle: the marker
+#: says the process is a stranger, and automation may not trust the
+#: marker, because a timezone change produces the same mismatch.  A human
+#: can weigh that; this is how they say so, and it is stored so the next
+#: reader can see the decision rather than infer it.
+RECYCLED_PID_ATTESTATION = "operator_attests_live_pid_is_not_the_recorded_owner"
+
+
+def _attestation_excludes(row: Any, survivors: list[Any]) -> bool:
+    """True when a recorded operator attestation covers every survivor found.
+
+    Only ever consulted for a frozen row, and only for survivors whose
+    start marker differs from the one on record — the exact evidence the
+    attestation is about.  A survivor whose marker *matches* is the
+    recorded owner, alive, and no attestation makes that releasable.
+    """
+    if not isinstance(row.ambiguity_reason, str):
+        return False
+    if not row.ambiguity_reason.startswith(RECYCLED_PID_ATTESTATION):
+        return False
+    recorded = (_parse_json(row.owner_process_identity_json) or {}).get("start_marker")
+    return all(
+        isinstance(survivor, Mapping) and survivor.get("start_marker") != recorded
+        for survivor in survivors
+    )
+
+
 def adjudicate(
     *,
     provider: str,
     native_session_id: str,
     record: Mapping[str, Any],
+    observed_epoch: int,
     live_survivors: Optional[list[Any]] = None,
 ) -> dict[str, Any]:
     """The one path out of ``ambiguous``, and it is not automation.
@@ -961,6 +991,19 @@ def adjudicate(
     operator name that carry the decision.  That asymmetry is the point:
     the machine keeps its veto over an owner it can still see, and gives
     up only the judgement it was never able to make.
+
+    ``observed_epoch`` is what binds those two halves together, and it is
+    required rather than optional because an optional one leaves the hole
+    open for the next caller.  :func:`release` is safe without it only
+    because its proof names the exact owner and is re-validated against
+    the stored row inside the writing transaction; an adjudication names
+    no owner at all — it is a human's sentence — so the epoch is the only
+    thing tying it to the row it was written about.  Without it, an
+    operator's observation taken before a confirmation prompt can be
+    applied *after* the session was released, re-claimed by a new launch,
+    and frozen again with a live process on it.  The state would still
+    read ``ambiguous`` and the stale survivor list would still read empty,
+    and a running provider would lose its exclusive claim.
     """
     provider = _require_text(provider, field="provider")
     native_session_id = _require_text(native_session_id, field="native_session_id")
@@ -992,14 +1035,18 @@ def adjudicate(
                     f"{AMBIGUOUS!r}; a live attachment is released by proving its owner gone, "
                     "not by adjudicating it"
                 )
-            if live_survivors:
+            if row.epoch != observed_epoch:
+                raise NativeAttachmentConflict(
+                    f"{provider} session {native_session_id} moved to epoch {row.epoch} since "
+                    f"the observation was taken at epoch {observed_epoch}; the adjudication "
+                    "describes an owner this row no longer has"
+                )
+            if live_survivors and not _attestation_excludes(row, live_survivors):
                 raise NativeAttachmentConflict(
                     f"the frozen owner of {provider} session {native_session_id} is still "
                     f"observably alive ({len(live_survivors)} survivor(s)); an operator may "
                     "resolve an unresponsive owner, never a running one"
                 )
-
-            observed_epoch = row.epoch
             updated = (
                 db.query(database.NativeSessionAttachmentModel)
                 .filter(

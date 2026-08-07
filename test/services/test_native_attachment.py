@@ -682,6 +682,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
             native_session_id=SESSION,
             record=_adjudication(),
             live_survivors=[],
+            observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
         )
         assert result["state"] == na.DETACHED
 
@@ -692,6 +693,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
             native_session_id=SESSION,
             record=_adjudication(),
             live_survivors=[],
+            observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
         )
         _, acquired = _declare(terminal_id="ffffffff", generation="99999999")
         assert acquired is True
@@ -704,6 +706,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
                 native_session_id=SESSION,
                 record=_adjudication(),
                 live_survivors=[{"pid": 4242, "start_marker": "Jul24 00:00:00"}],
+                observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
             )
         assert na.get(PROVIDER, SESSION)["state"] == na.AMBIGUOUS
 
@@ -716,6 +719,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
                 native_session_id=SESSION,
                 record=_adjudication(),
                 live_survivors=None,
+                observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
             )
 
     def test_the_owner_and_the_freeze_reason_are_preserved(self):
@@ -726,6 +730,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
             native_session_id=SESSION,
             record=_adjudication(),
             live_survivors=[],
+            observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
         )
         assert result["owner"] == frozen["owner"]
         assert result["ambiguity_reason"] == "pane_create_outcome_unknown"
@@ -738,6 +743,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
             native_session_id=SESSION,
             record=_adjudication(),
             live_survivors=[],
+            observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
         )
         stored = na.get(PROVIDER, SESSION)["release_proof"]
         assert stored["schema"] == na.ADJUDICATION_SCHEMA
@@ -751,12 +757,14 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
             native_session_id=SESSION,
             record=_adjudication(),
             live_survivors=[],
+            observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
         )
         second = na.adjudicate(
             provider=PROVIDER,
             native_session_id=SESSION,
             record=_adjudication(),
             live_survivors=[],
+            observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
         )
         assert second == first
 
@@ -768,6 +776,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
             native_session_id=SESSION,
             record=_adjudication(),
             live_survivors=[],
+            observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
         )
         with pytest.raises(na.NativeAttachmentConflict):
             na.adjudicate(
@@ -775,6 +784,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
                 native_session_id=SESSION,
                 record=_adjudication(operator="someone-else"),
                 live_survivors=[],
+                observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
             )
 
     def test_a_machine_released_row_has_nothing_to_adjudicate(self):
@@ -788,6 +798,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
                 native_session_id=SESSION,
                 record=_adjudication(),
                 live_survivors=[],
+                observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
             )
 
     @pytest.mark.parametrize("state", [na.DECLARED, na.STARTING, na.ATTACHED, na.DRAINING])
@@ -811,6 +822,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
                 native_session_id=SESSION,
                 record=_adjudication(),
                 live_survivors=[],
+                observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
             )
 
     def test_an_unvalidated_record_cannot_release_a_frozen_session(self):
@@ -821,6 +833,7 @@ class TestOperatorAdjudicationIsTheOnlyWayOutOfFrozen:
                 native_session_id=SESSION,
                 record={"outcome": "owner-proven-gone"},
                 live_survivors=[],
+                observed_epoch=na.get(PROVIDER, SESSION)["epoch"],
             )
 
     @pytest.mark.parametrize(
@@ -881,3 +894,70 @@ class TestAnAbsentTableIsNoClaims:
         monkeypatch.setattr(na.database, "SessionLocal", _broken)
         with pytest.raises(na.NativeAttachmentUnavailable):
             na.list_attachments()
+
+
+class TestAdjudicationIsBoundToTheRowItDescribes:
+    """An adjudication names no owner. The epoch is the only thing tying it
+    to the row it was written about.
+
+    `release` is safe without an epoch because its proof names the exact
+    owner and is re-validated against the stored row inside the writing
+    transaction. An adjudication is a human's sentence — there is nothing
+    in it to compare — so an observation taken before a confirmation prompt
+    can otherwise be applied after the session was released, re-claimed by
+    a new launch, and frozen again with a live process on it. The state
+    still reads `ambiguous` and the stale survivor list still reads empty.
+    """
+
+    def _frozen(self) -> dict:
+        _declare()
+        return na.mark_ambiguous(
+            provider=PROVIDER, native_session_id=SESSION, reason="pane_create_outcome_unknown"
+        )
+
+    def test_an_observation_of_an_older_row_version_is_refused(self):
+        stale = self._frozen()["epoch"]
+
+        # The session goes round the loop: adjudicated by someone else, re-claimed,
+        # and frozen again — this time by a launch whose process is running.
+        na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=_adjudication(operator="first-operator"),
+            live_survivors=[],
+            observed_epoch=stale,
+        )
+        _declare(terminal_id="ffffffff", generation="99999999")
+        na.mark_ambiguous(
+            provider=PROVIDER, native_session_id=SESSION, reason="pane_render_mismatch"
+        )
+
+        with pytest.raises(na.NativeAttachmentConflict, match="moved to epoch"):
+            na.adjudicate(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                record=_adjudication(operator="second-operator"),
+                live_survivors=[],
+                observed_epoch=stale,
+            )
+        current = na.get(PROVIDER, SESSION)
+        assert current["state"] == na.AMBIGUOUS
+        assert current["owner"]["terminal_id"] == "ffffffff"
+
+    def test_the_current_epoch_is_accepted(self):
+        frozen = self._frozen()
+        result = na.adjudicate(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            record=_adjudication(),
+            live_survivors=[],
+            observed_epoch=frozen["epoch"],
+        )
+        assert result["state"] == na.DETACHED
+
+    def test_the_binding_is_required_rather_than_optional(self):
+        """An optional gate leaves the hole open for the next caller."""
+        import inspect
+
+        signature = inspect.signature(na.adjudicate)
+        assert signature.parameters["observed_epoch"].default is inspect.Parameter.empty

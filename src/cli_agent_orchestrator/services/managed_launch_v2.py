@@ -3441,6 +3441,29 @@ async def _teardown_published_native_terminal(
     from cli_agent_orchestrator.services import terminal_service
 
     cleanup_errors: list[str] = []
+    # Freeze first, tear down second.  The order used to be the other way
+    # round, which was harmless only while nothing else touched the
+    # attachment during teardown.  Teardown now resolves the claims it
+    # ends, and it would resolve this one — the pane it just killed leaves
+    # no surviving process, so the release succeeds, and the freeze that
+    # was the whole point of this function then finds a detached row with
+    # no owner to freeze.  The session a route proof *failed* on would be
+    # freely re-acquirable, which is exactly what the freeze exists to
+    # prevent.
+    #
+    # Freezing first is safe in the other direction: ``mark_ambiguous``
+    # accepts any live state and is idempotent, and a frozen row makes the
+    # teardown's release a no-op, because release refuses a frozen row
+    # before it looks at a proof.
+    try:
+        native_attachment.mark_ambiguous(
+            provider=record["provider"],
+            native_session_id=bootstrap["native_session_id"],
+            reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the blocked state
+        cleanup_errors.append(f"native attachment freeze failed: {exc}")
+
     try:
         await asyncio.to_thread(
             terminal_service.delete_terminal,
@@ -3451,15 +3474,6 @@ async def _teardown_published_native_terminal(
         )
     except Exception as exc:  # noqa: BLE001 - preserve the blocked state
         cleanup_errors.append(f"native terminal teardown failed: {exc}")
-
-    try:
-        native_attachment.mark_ambiguous(
-            provider=record["provider"],
-            native_session_id=bootstrap["native_session_id"],
-            reason=reason,
-        )
-    except Exception as exc:  # noqa: BLE001 - preserve the blocked state
-        cleanup_errors.append(f"native attachment freeze failed: {exc}")
 
     return "; ".join(cleanup_errors) or None
 

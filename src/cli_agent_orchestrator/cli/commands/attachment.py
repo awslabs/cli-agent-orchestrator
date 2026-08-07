@@ -204,9 +204,18 @@ def attachment_sweep(do_apply, as_json):
 @click.argument("native_session_id")
 @click.option("--operator", required=True, help="Who is making this call. Recorded permanently.")
 @click.option("--detail", required=True, help="Why the owner cannot be determined.")
+@click.option(
+    "--pid-is-recycled",
+    "attest_recycled",
+    is_flag=True,
+    help=(
+        "Attest that the process now holding the recorded pid is NOT the recorded owner. "
+        "Only accepted when the live start marker differs from the recorded one."
+    ),
+)
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
 @click.option("--json", "as_json", is_flag=True)
-def attachment_freeze(provider, native_session_id, operator, detail, yes, as_json):
+def attachment_freeze(provider, native_session_id, operator, detail, attest_recycled, yes, as_json):
     """Declare a claim's ownership unresolvable, so it can be adjudicated.
 
     Only needed for a claim the sweep can never settle — an owner the
@@ -216,9 +225,29 @@ def attachment_freeze(provider, native_session_id, operator, detail, yes, as_jso
     This is deliberately the first of two steps. Freezing says "I cannot
     determine this". Adjudicating says "I have decided anyway".
     """
+    try:
+        record = na.get(provider, native_session_id)
+    except na.NativeAttachmentError as exc:
+        _fail(exc)
+        return
+    if record is None:
+        click.echo(
+            f"error [native-attachment-not-found]: no claim on {provider} "
+            f"session {native_session_id}",
+            err=True,
+        )
+        sys.exit(1)
+
     if not yes:
+        # Show the observation before asking. A cold-starting launch and a
+        # stuck orphan render as the same line in `list`, and this is the
+        # one place the difference is visible.
+        observation = recovery.observe_owner(record)
+        click.echo(f"{provider} session {native_session_id}")
+        click.echo(f"  state          {record['state']}")
+        click.echo(f"  owner is       {observation['disposition']} — {observation['detail']}")
         click.confirm(
-            f"Freeze {provider} session {native_session_id} as unresolvable, on {operator}'s name?",
+            f"\nFreeze this claim as unresolvable, on {operator}'s name?",
             abort=True,
         )
     try:
@@ -227,6 +256,7 @@ def attachment_freeze(provider, native_session_id, operator, detail, yes, as_jso
             native_session_id=native_session_id,
             operator=operator,
             detail=detail,
+            attest_live_pid_is_not_the_owner=attest_recycled,
         )
     except na.NativeAttachmentError as exc:
         _fail(exc)
@@ -301,8 +331,8 @@ def attachment_adjudicate(
         )
         sys.exit(1)
 
-    observation = recovery.observe_owner(record)
     if not yes:
+        preview = recovery.observe_owner(record)
         click.echo(f"{provider} session {native_session_id}")
         click.echo(f"  state          {record['state']}")
         click.echo(f"  frozen because {record.get('ambiguity_reason') or '-'}")
@@ -310,11 +340,29 @@ def attachment_adjudicate(
             f"  owner          {record['owner']['terminal_id']} "
             f"generation {record['owner']['generation']}"
         )
-        click.echo(f"  owner is       {observation['disposition']} — {observation['detail']}")
+        click.echo(f"  owner is       {preview['disposition']} — {preview['detail']}")
         click.confirm(
             f"\nRecord {operator} as having judged this owner gone, and release the session?",
             abort=True,
         )
+        # Re-read after the prompt. The pause is unbounded, and the record
+        # read before it describes a row that may have been released,
+        # re-claimed and re-frozen since. The epoch below is what actually
+        # refuses that, but observing the row we are about to act on rather
+        # than the one we showed is the honest way to build the evidence.
+        try:
+            record = na.get(provider, native_session_id)
+        except na.NativeAttachmentError as exc:
+            _fail(exc)
+            return
+        if record is None:
+            click.echo(
+                f"error [native-attachment-not-found]: {provider} session "
+                f"{native_session_id} disappeared while you were deciding",
+                err=True,
+            )
+            sys.exit(1)
+    observation = recovery.observe_owner(record)
 
     try:
         result = na.adjudicate(
@@ -329,6 +377,7 @@ def attachment_adjudicate(
                 observation=observation,
             ),
             live_survivors=observation["survivors"],
+            observed_epoch=record["epoch"],
         )
     except na.NativeAttachmentError as exc:
         _fail(exc)

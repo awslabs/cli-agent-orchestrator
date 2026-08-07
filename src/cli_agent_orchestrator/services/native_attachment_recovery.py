@@ -30,11 +30,12 @@ evidence that a *live* owner is a recycled pid, and hand its session to
 a second attacher.  ``ProcessLookupError`` carries no such dependency:
 an absent pid is absent in every timezone.
 
-The marker is still read, and still recorded, as evidence for a human.
-It just never decides anything.  On this install that costs exactly one
-row — a genuinely recycled pid whose real owner is dead — which stays
-claimed until an operator adjudicates it.  Unresolved is a survivable
-outcome; a forged no-survivor is not.
+The marker is still read, and still recorded, because it is exactly the
+evidence a *human* is supposed to weigh.  It just never decides anything
+here.  On this install that costs one row — a genuinely recycled pid
+whose real owner is dead — which stays claimed until an operator looks at
+the live process and attests, on their name, that it is not the recorded
+owner.  Unresolved is a survivable outcome; a forged no-survivor is not.
 
 A row with no published process identity is likewise never released
 here.  ``declare`` writes the claim *before* the provider process
@@ -44,6 +45,7 @@ during one, and those are indistinguishable from the outside.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -282,7 +284,7 @@ def release_owned_by_terminal(
     terminal_id: str,
     *,
     generation: Optional[str] = None,
-    grace_seconds: float = TEARDOWN_GRACE_SECONDS,
+    grace_seconds: Optional[float] = None,
 ) -> list[dict[str, Any]]:
     """Close the claims held by a terminal that is being torn down.
 
@@ -317,6 +319,14 @@ def release_owned_by_terminal(
     if not records:
         return []
 
+    # Resolved at call time, not bound as a default argument.  A default
+    # captures the module constant once at import, so a caller or a test
+    # that sets ``TEARDOWN_GRACE_SECONDS`` would change nothing and
+    # believe it had — which is exactly what the suite's own fixture was
+    # doing before this was noticed.
+    if grace_seconds is None:
+        grace_seconds = TEARDOWN_GRACE_SECONDS
+
     outcomes: list[dict[str, Any]] = []
     for record in records:
         observed = _observe_until_gone(record, grace_seconds=grace_seconds)
@@ -325,9 +335,24 @@ def release_owned_by_terminal(
 
 
 def _observe_until_gone(record: Mapping[str, Any], *, grace_seconds: float) -> dict[str, Any]:
-    """Re-observe while the owner is still alive, up to the grace bound."""
+    """Re-observe while the owner is still alive, up to the grace bound.
+
+    Waits with a blocking sleep, so it declines to wait at all when it
+    finds itself on a running event loop.  Teardown is normally reached
+    through ``asyncio.to_thread`` and this does not come up — but not
+    every caller does that, and stalling an event loop for two seconds per
+    claim to save a sweep the trouble is a bad trade.  Not waiting costs
+    nothing permanent: the claim stays listed and the next sweep releases
+    it the moment the process is gone.
+    """
     observed = observe_owner(record)
     if observed["disposition"] != OWNER_ALIVE or grace_seconds <= 0:
+        return observed
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
         return observed
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
@@ -352,24 +377,54 @@ def freeze_for_adjudication(
     native_session_id: str,
     operator: str,
     detail: str,
+    attest_live_pid_is_not_the_owner: bool = False,
 ) -> dict[str, Any]:
     """Move a stuck live claim into the state a human can adjudicate.
 
     ``adjudicate`` deliberately only accepts a frozen row, and teardown
     deliberately never freezes one.  That leaves a real gap: a claim whose
-    owner can never be observed — a pid the process table will not answer
-    for, a provider wedged forever — stays ``attached``, and the sweep
-    reports it every pass without ever resolving it.  There would be no
-    operator path at all.
+    owner can never be settled by observation stays in a live state, and
+    the sweep reports it every pass without ever resolving it.  There
+    would be no operator path at all — which is the defect this whole
+    change exists to remove.
 
     This is that path, and it is two steps on purpose.  Freezing says "I
     cannot determine this"; adjudicating says "I have decided anyway".
     Collapsing them into one command would let the second sentence be
     spoken without the first ever having been true.
 
-    An owner that is observably **alive** is refused.  A running process
-    is not an unresolvable ownership question — it is an answered one, and
-    the answer is no.
+    Exactly two dispositions are freezable.
+
+    **Unobservable** — the process table would not answer.  Nothing
+    further will ever answer either, so a human is the only remaining
+    resort.
+
+    **Alive with a start marker that differs from the recorded one** —
+    the recycled-pid case, and only on an explicit
+    ``attest_live_pid_is_not_the_owner``.  Automation may never act on a
+    marker mismatch, because a timezone change produces exactly the same
+    evidence; a human can look at the process and tell.  The attestation
+    is recorded in the freeze reason together with both markers, so the
+    next reader sees the judgement rather than inferring it.  Without this
+    path the recycled-pid row has no valve at all, and every future pid
+    collision strands another session permanently.
+
+    Everything else is refused, and two of the refusals matter.
+
+    An owner **alive with a matching marker** is the recorded owner,
+    running.  No attestation makes that releasable.
+
+    An owner with **no published identity** is refused even though it
+    looks like the most stuck row on the list.  ``declare`` writes the
+    claim before the provider process exists, so a launch that is
+    currently cold-starting is indistinguishable from a launch that
+    crashed — both are ``starting`` with no pid, and on the operator's
+    screen they are the same line.  Freezing one blocks its own
+    ``mark_attached``, so the identity is never published, the process
+    keeps running, and the subsequent adjudication sees an empty survivor
+    list and hands the session away underneath it.  That is the
+    double-attach this module exists to prevent, reached through the
+    command meant to repair it.
     """
     record = native_attachment.get(provider, native_session_id)
     if record is None:
@@ -377,22 +432,48 @@ def freeze_for_adjudication(
             f"no attachment declared for {provider} session {native_session_id}"
         )
     observation = observe_owner(record)
-    if observation["disposition"] == OWNER_ALIVE:
-        raise native_attachment.NativeAttachmentConflict(
-            f"the owner of {provider} session {native_session_id} is running "
-            f"({observation['detail']}); a live owner is not an unresolvable "
-            "ownership question and is refused"
-        )
-    if observation["disposition"] == OWNER_GONE:
+    disposition = observation["disposition"]
+
+    if disposition == OWNER_GONE:
         raise native_attachment.NativeAttachmentConflict(
             f"the owner of {provider} session {native_session_id} is provably gone; "
             "release it with `cao attachment sweep --apply` rather than freezing it "
             "for a judgement call nobody needs to make"
         )
+    if disposition == OWNER_UNPUBLISHED:
+        raise native_attachment.NativeAttachmentConflict(
+            f"{provider} session {native_session_id} has no published process identity, so a "
+            "launch still starting up and a launch that crashed look identical; freezing it "
+            "would block the running launch from publishing and then release its session"
+        )
+
+    reason = f"{OPERATOR_FREEZE_REASON}: {operator}: {detail}"
+
+    if disposition == OWNER_ALIVE:
+        verdict = observation.get("start_marker_verdict")
+        if verdict != "differs":
+            raise native_attachment.NativeAttachmentConflict(
+                f"the owner of {provider} session {native_session_id} is running "
+                f"({observation['detail']}); a live owner is not an unresolvable "
+                "ownership question and is refused"
+            )
+        if not attest_live_pid_is_not_the_owner:
+            raise native_attachment.NativeAttachmentConflict(
+                f"pid {observation['survivors'][0].get('pid')} is alive but its start marker "
+                f"differs from the recorded one. That is either a recycled pid or a timezone "
+                "change, and only a human can tell which. Re-run attesting that the live "
+                "process is not the recorded owner if you have checked it."
+            )
+        reason = (
+            f"{native_attachment.RECYCLED_PID_ATTESTATION}: {operator}: {detail} "
+            f"(recorded start_marker {observation.get('stored_start_marker')!r}; "
+            f"live start_marker {observation['survivors'][0].get('start_marker')!r})"
+        )
+
     return native_attachment.mark_ambiguous(
         provider=provider,
         native_session_id=native_session_id,
-        reason=f"{OPERATOR_FREEZE_REASON}: {operator}: {detail}",
+        reason=reason,
     )
 
 

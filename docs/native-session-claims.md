@@ -100,9 +100,9 @@ that decided orphanhood by "is the owner still in the terminals table?"
 would have released nineteen live sessions.
 
 The recycled-pid row is the price: its true owner is dead, but automation
-cannot prove that without trusting the marker, so it stays claimed until a
-human adjudicates it. Unresolved is survivable. A forged no-survivor is
-not.
+cannot prove that without trusting the marker. It stays claimed until a
+human looks at the live process and attests that it is not the recorded
+owner — see §3. Unresolved is survivable. A forged no-survivor is not.
 
 ### Signals that are *not* survivor oracles
 
@@ -197,9 +197,8 @@ cao attachment adjudicate kimi_cli session_04c87e57 \
     --evidence ./ps-output.txt
 ```
 
-A claim that is *not* frozen but that the sweep can never settle — an
-owner the process table will not answer for, a provider wedged forever —
-has to be declared unresolvable first:
+A claim that is *not* frozen but that the sweep can never settle has to be
+declared unresolvable first:
 
 ```
 cao attachment freeze kimi_cli session_04c87e57 \
@@ -208,10 +207,42 @@ cao attachment freeze kimi_cli session_04c87e57 \
 
 Two steps, on purpose. Freezing says "I cannot determine this";
 adjudicating says "I have decided anyway". Collapsing them would let the
-second sentence be spoken without the first ever having been true. A
-provably-gone owner is refused here and pointed at the sweep, and a
-running one is refused outright — a live process is an answered ownership
-question, not an open one.
+second sentence be spoken without the first ever having been true.
+
+Exactly two dispositions are freezable, and the refusals are the
+interesting part.
+
+| disposition | freezable | why |
+|---|---|---|
+| unobservable | yes | nothing further will ever answer |
+| alive, marker **differs** | yes, on `--pid-is-recycled` | only a human can tell a recycled pid from a timezone change |
+| alive, marker **matches** | no | that is the recorded owner, running |
+| gone | no | the sweep releases it; there is no judgement to make |
+| **no published identity** | **no** | see below |
+
+A claim with no published identity looks like the most stuck row on the
+list and is the most dangerous to touch. `declare` writes the claim before
+the provider process exists, so a launch that is *currently cold-starting*
+and a launch that crashed are the same row — `starting`, no pid, the same
+line in `list`. Freezing one blocks its own `mark_attached`, so the
+identity is never published, the process keeps running, and the
+adjudication that follows sees an empty survivor list and hands the
+session away underneath it. That is the double-attach this whole document
+is about, reached through the command meant to repair it.
+
+The recycled-pid attestation records both markers verbatim in the freeze
+reason, and `adjudicate` will then accept a survivor whose marker differs
+from the recorded one — and only that survivor. A survivor bearing the
+*recorded* marker is the owner itself, and no attestation makes that
+releasable.
+
+An adjudication carries no owner, no pane, no identity — it is a human's
+sentence. The epoch observed at the time is what binds it to the row it
+was written about, and it is required: without it, an observation taken
+before a confirmation prompt can be applied after the session was
+released, re-claimed, and frozen again with a live process on it. The
+state would still read `ambiguous` and the stale survivor list would still
+read empty.
 
 The adjudication is stored under its own schema —
 `cao-native-attachment-adjudication-v1`, not the no-survivor schema — so a
@@ -234,9 +265,14 @@ evidence that doing so is safe.
   delete terminal rows directly. Today only the v2 launch path records a
   native session id, so their exposure is theoretical — but the sweep is
   what covers them, not the wiring.
-- **The recycled-pid row.** One row on the reference install has a dead
-  owner that automation will never release, because proving it requires
-  trusting the marker. It needs `freeze` then `adjudicate`.
+- **The recycled-pid row** still needs a human: `cao attachment freeze
+  --pid-is-recycled` then `adjudicate`. Automation will never release it,
+  and that is deliberate.
+- **A crashed launch that never published an identity** has no operator
+  valve, because it cannot be told apart from one that is still starting.
+  No such row exists on the reference install — the launch path either
+  reaches `attached` or freezes itself — but if one appears, the only
+  remedy is a database edit.
 - **No web surface.** The dashboard shows nothing about session claims.
   `run_manifest._attachment_projection` renders most of an operator view
   and has no callers; it drops `process_identity` and `pane_id`, which are

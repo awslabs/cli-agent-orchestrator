@@ -166,6 +166,13 @@ class FreezeBody(StrictBody):
 
     detail: str = Field(min_length=1, max_length=500)
     operator: str = Field(min_length=1, max_length=200)
+    attest_live_pid_is_not_the_owner: bool = Field(
+        default=False,
+        description=(
+            "Attest that the process now holding the recorded pid is not the recorded owner. "
+            "Accepted only when the live start marker differs from the recorded one."
+        ),
+    )
 
 
 @router.post("/native-attachments/{provider}/{native_session_id}/freeze")
@@ -187,6 +194,7 @@ async def freeze_native_attachment(
             native_session_id=native_session_id,
             operator=body.operator,
             detail=body.detail,
+            attest_live_pid_is_not_the_owner=body.attest_live_pid_is_not_the_owner,
         )
     except na.NativeAttachmentError as exc:
         raise _http(exc)
@@ -231,6 +239,7 @@ async def adjudicate_native_attachment(
                 observation=observation,
             ),
             live_survivors=observation["survivors"],
+            observed_epoch=record["epoch"],
         )
     except na.NativeAttachmentError as exc:
         raise _http(exc)

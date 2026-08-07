@@ -45,10 +45,31 @@ def _no_teardown_grace(monkeypatch):
     """Teardown waits for a just-killed provider to leave the process table.
 
     These tests supply a pid that is already gone or already permanent, so
-    the wait would only add latency — except in the live-owner case, where
-    it would add the full grace period to every run.
+    the wait only adds latency — except in the live-owner cases, where it
+    would add the full grace period to every run.
+
+    This fixture used to be a no-op: `release_owned_by_terminal` bound the
+    module constant as a default argument, which captures its value once at
+    import, so setting it here changed nothing and the suite paid two
+    seconds per live-owner test while believing it did not.
     """
     monkeypatch.setattr(recovery, "TEARDOWN_GRACE_SECONDS", 0.0)
+
+
+def test_the_grace_fixture_is_not_a_no_op(monkeypatch):
+    """Pin the thing that was silently broken: a default argument captured
+    at import cannot be overridden by setting the constant."""
+    observed = []
+    monkeypatch.setattr(recovery, "TEARDOWN_GRACE_SECONDS", 7.5)
+    monkeypatch.setattr(
+        recovery,
+        "_observe_until_gone",
+        lambda record, *, grace_seconds: observed.append(grace_seconds)
+        or recovery.observe_owner(record),
+    )
+    _attach(pid=_reaped_pid())
+    recovery.release_owned_by_terminal(TERMINAL)
+    assert observed == [7.5]
 
 
 def _reaped_pid() -> int:
@@ -295,3 +316,87 @@ class TestTheWiringExists:
         release = source.index("release_owned_by_terminal")
         row_delete = source.index("db_delete_terminal_if_generation")
         assert kill < release < row_delete
+
+
+class TestTeardownDoesNotUndoADeliberateFreeze:
+    """`managed_launch_v2` freezes a session whose route proof failed.
+
+    Its contract is that the claim is frozen "so a later launch cannot
+    reuse an uncertain session". Teardown now resolves the claims it ends,
+    and the pane it just killed leaves no survivor — so with the original
+    ordering the release succeeded and the freeze that was the whole point
+    of the function found a detached row with no owner to freeze. The
+    uncertain session became freely re-acquirable.
+
+    The one existing test of that function stubs `delete_terminal`, so it
+    never exercised the function whose behaviour changed. This one does not
+    stub it.
+    """
+
+    def _teardown_via_route_failure(self):
+        import asyncio
+
+        from cli_agent_orchestrator.services import managed_launch_v2 as v2
+
+        ts = "cli_agent_orchestrator.services.terminal_service"
+        metadata = {
+            "tmux_session": SESSION_NAME,
+            "tmux_window": managed_window_name(TERMINAL, GENERATION),
+            "generation": GENERATION,
+        }
+        with (
+            patch(f"{ts}.status_monitor"),
+            patch(f"{ts}.fifo_manager"),
+            patch(f"{ts}.provider_manager"),
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+            patch(f"{ts}.get_terminal_metadata", return_value=metadata),
+            patch(f"{ts}.get_terminal_metadata_v2", return_value=None),
+            patch(f"{ts}.db_delete_terminal_if_generation", return_value=True),
+        ):
+            backend.window_exists.return_value = False
+            return asyncio.run(
+                v2._teardown_published_native_terminal(
+                    record={
+                        "terminal_id": TERMINAL,
+                        "generation": GENERATION,
+                        "session_name": SESSION_NAME,
+                        "provider": PROVIDER,
+                    },
+                    bootstrap={"native_session_id": SESSION},
+                    registry=None,
+                    reason="glm_route_consumed_marker_missing",
+                )
+            )
+
+    def test_the_session_stays_frozen_rather_than_being_released(self):
+        _attach(pid=_reaped_pid())
+        assert self._teardown_via_route_failure() is None
+
+        stored = na.get(PROVIDER, SESSION)
+        assert stored["state"] == na.AMBIGUOUS
+        assert stored["ambiguity_reason"] == "glm_route_consumed_marker_missing"
+
+    def test_the_uncertain_session_cannot_be_reclaimed(self):
+        """The consequence the freeze exists to produce."""
+        _attach(pid=_reaped_pid())
+        self._teardown_via_route_failure()
+        with pytest.raises(na.NativeAttachmentConflict):
+            na.declare(
+                provider=PROVIDER,
+                native_session_id=SESSION,
+                terminal_id="ffffffff",
+                generation="99999999",
+                execution_mode="native_tui",
+                intent=na.acquire_intent(
+                    acquisition_method=na.ACQUISITION_RESUME,
+                    acquisition_receipt={"kind": "resume", "session_id": SESSION},
+                    admits_only_new_instructions=True,
+                    replays_task_bytes=False,
+                ),
+            )
+
+    def test_the_ordinary_path_reports_no_cleanup_error(self):
+        """A spurious 'freeze failed' clause would reach the operator's
+        blocked detail on every route refusal."""
+        _attach(pid=_reaped_pid())
+        assert self._teardown_via_route_failure() is None
