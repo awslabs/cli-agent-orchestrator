@@ -12,9 +12,10 @@ import struct
 import subprocess
 import termios
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, Tuple, cast
+from typing import Annotated, Any, AsyncIterator, Dict, List, Optional, Tuple, cast
 
 from fastapi import (
     BackgroundTasks,
@@ -33,7 +34,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
@@ -127,7 +128,19 @@ from cli_agent_orchestrator.services.profile_search import (
 )
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.services.terminal_service import (
+    TERMINAL_RANGE_MAX_LENGTH,
+    OutputMode,
+    TerminalInputBlockedError,
+)
+from cli_agent_orchestrator.services.workflow_journal import (
+    _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
+)
+from cli_agent_orchestrator.services.workflow_journal import (
+    EventRow,
+    GapMarker,
+    StepRow,
+)
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
@@ -201,6 +214,20 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+
+
+class TerminalOutputRange(BaseModel):
+    """Serialization view of an offset-ranged terminal-log read (U5 / #504, FR-4.3).
+
+    Echoes the request's ``offset`` and the EFFECTIVE ``length`` (the clamped
+    read window, so a caller can see it was capped) alongside the decoded
+    ``data``. Not persisted — a read adapter over the existing per-terminal log.
+    """
+
+    terminal_id: str
+    offset: int
+    length: int
+    data: str
 
 
 class CreateTerminalBody(BaseModel):
@@ -464,6 +491,255 @@ class StepOutputResponse(BaseModel):
     state: str
 
 
+# ---------------------------------------------------------------------------
+# U3 (issue #504) — inspection + event-replay read models (serialization views,
+# NOT new persistence: domain-entities.md is explicit). ``EventRow``/``GapMarker``
+# are owned by U1 (workflow_journal) and reused here unchanged; ``RunRow`` /
+# ``StepRow`` shapes are read via the existing DAL helpers and never altered
+# (BR-2, additive-only). These models exist only to give the two read routes a
+# stable, documented JSON contract for the web surface (U8) and #505's clients.
+# ---------------------------------------------------------------------------
+class StepInspection(BaseModel):
+    """One step's durable projection inside a ``RunInspection`` (FR-5.1).
+
+    A UNION superset of the pre-U3 ``StepStatus`` step shape (``id`` / ``state``
+    / ``attempts``, which #505's status/result clients read) enriched with U1's
+    ``StepRow`` columns (``output_json``, ``error``, ``error_kind``,
+    ``terminal_id``, ``reprompted``, ``call_fingerprint``). ``id`` is the step
+    identifier (== ``StepRow.step_id``); it is kept as ``id`` (not renamed to
+    ``step_id``) so the existing endpoint's step contract is preserved
+    byte-for-byte and only ADDED to (BR-2). A pre-U1 row surfaces the additive
+    columns as ``None``.
+
+    ``output_json`` and ``error`` carry the step's FULL text and are NOT gated by
+    ``workflow_journal_capture_output`` — see the payload-posture note on
+    ``get_workflow_run_endpoint`` before adding a consumer or a log line.
+    """
+
+    id: str
+    state: str
+    attempts: int
+    output_json: Optional[str] = None
+    error: Optional[str] = None
+    error_kind: Optional[str] = None
+    terminal_id: Optional[str] = None
+    reprompted: Optional[int] = None
+    call_fingerprint: Optional[str] = None
+
+
+class RunInspection(BaseModel):
+    """Enriched run inspection (FR-5.1, domain-entities RunInspection).
+
+    A UNION superset of the existing ``get_run_status`` snapshot: it preserves
+    the snapshot fields #505 reads (``run_id``, ``state``, ``current_step_id``,
+    ``steps``) and ADDS the run metadata (``workflow_name``, ``started_at``,
+    ``finished_at``, ``tier``) plus richer per-step projections. Assembled from
+    ``get_run`` + ``get_steps`` with the journal fallback on a cache miss (BR-1),
+    so it is journal-authoritative (NFR-DUR-1) — never dependent on
+    ``run_registry`` holding an entry.
+    """
+
+    run_id: str
+    workflow_name: str
+    state: str
+    current_step_id: Optional[str] = None
+    started_at: str
+    finished_at: Optional[str] = None
+    tier: str
+    steps: List[StepInspection] = Field(default_factory=list)
+
+
+class EventTimelinePage(BaseModel):
+    """A batch page of a run's ordered event timeline (FR-5.2, BR-3/BR-4/BR-6).
+
+    ``events`` and ``gaps`` come verbatim from U1's ``read_events_with_gaps``
+    (seq-ordered, deterministic, dedupe-free; declared holes travel WITH the
+    events and are never renumbered away). ``next_after_seq`` is the max seq
+    returned — the reconnect/next-page cursor; ``None`` when the page is empty
+    (a caught-up follower, BR-6). This is the BATCH read; U4 (Bolt 3) will add
+    SSE live-follow over the SAME path and cursor — see the route seam comment.
+    """
+
+    events: List[EventRow] = Field(default_factory=list)
+    gaps: List[GapMarker] = Field(default_factory=list)
+    next_after_seq: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# U6 (issue #504) — run-comparison + diagnostic-bundle export views (FR-8, FR-9).
+# Read/export serialization shapes ONLY (domain-entities.md: "no new persistent
+# entity"); every field is assembled from U1's durable DAL (``get_run`` /
+# ``get_steps`` / ``read_events_with_gaps``) with NO ``run_registry`` dependency
+# (journal-authoritative, BR-6). ``EventRow`` / ``GapMarker`` are reused verbatim
+# from U1. No new persistence, no edit to any existing model.
+# ---------------------------------------------------------------------------
+class StepComparisonSide(BaseModel):
+    """One run's projection of an aligned step inside a ``RunComparison`` (FR-8.1).
+
+    The per-side metrics the comparison juxtaposes: ``attempts`` and ``state`` /
+    ``error_kind`` / ``reprompted`` carry the failure/retry behaviour;
+    ``duration_ms`` is the sum of the step's event ``elapsed_ms`` (durations are
+    derived, never persisted); ``provider`` / ``agent_profile`` are the config the
+    step ran under (last non-null among the step's events); ``validation`` is the
+    step's last non-null validation outcome. All optional fields degrade to
+    ``None`` where a swallowed/absent event left the datum unrecorded.
+    """
+
+    attempts: int
+    duration_ms: Optional[int] = None
+    provider: Optional[str] = None
+    agent_profile: Optional[str] = None
+    validation: Optional[str] = None
+    state: str
+    error_kind: Optional[str] = None
+    reprompted: Optional[int] = None
+
+
+class StepComparison(BaseModel):
+    """One aligned step across the two runs (FR-8.1, BR-1).
+
+    ``status`` is ``aligned`` when the step is present in BOTH runs, ``added``
+    when present only in the compare run (absent in the baseline), and
+    ``removed`` when present only in the baseline (absent in the compare run) —
+    a step present in one run and absent in the other is ALWAYS surfaced, never
+    silently dropped (BR-1). ``a`` is the baseline side, ``b`` the compare side;
+    the missing side is ``None`` on an added/removed row.
+    """
+
+    step_id: str
+    status: str
+    a: Optional[StepComparisonSide] = None
+    b: Optional[StepComparisonSide] = None
+
+
+class OutputDiff(BaseModel):
+    """A reference-level output/artifact difference for an aligned step (BR-2).
+
+    Output/artifact differences are compared at the ``output_ref`` REFERENCE
+    level, never by diffing payloads (payloads are not inlined). ``a_refs`` /
+    ``b_refs`` are the distinct ``output_ref`` references each run's events carry
+    for the step; an entry is emitted only when the two reference sets differ.
+    """
+
+    step_id: str
+    a_refs: List[str] = Field(default_factory=list)
+    b_refs: List[str] = Field(default_factory=list)
+
+
+class RunComparison(BaseModel):
+    """Compare two runs by aligned step (FR-8, domain-entities RunComparison).
+
+    ``baseline_run_id`` is the path run id; ``compare_run_id`` is the ``against``
+    query id. ``steps`` aligns by ``step_id`` (deterministically sorted);
+    ``output_diffs`` carries the reference-level output/artifact differences
+    (BR-2). Assembled from the durable journal for both runs — a comparison never
+    partially succeeds against a missing side (BR-8: unknown/deleted ``against``
+    -> 404, decided at the route).
+    """
+
+    baseline_run_id: str
+    compare_run_id: str
+    steps: List[StepComparison] = Field(default_factory=list)
+    output_diffs: List[OutputDiff] = Field(default_factory=list)
+
+
+class StepOutcome(BaseModel):
+    """A step's terminal outcome inside a ``DiagnosticBundle`` (FR-9.1).
+
+    Always-on execution metadata (NFR-SEC-1): ``state`` and the structured
+    ``error_kind`` are recorded regardless of the output-capture posture — this
+    row carries NO free-text output.
+    """
+
+    step_id: str
+    state: str
+    error_kind: Optional[str] = None
+
+
+class BundleEnvironment(BaseModel):
+    """Provider / agent / engine metadata for a run's bundle (FR-9.1).
+
+    Distinct non-null values observed across the run's durable events, sorted for
+    a deterministic export. Lists (not scalars) so a multi-step run whose steps
+    ran under different providers/agents/engines is represented losslessly.
+    """
+
+    providers: List[str] = Field(default_factory=list)
+    agent_profiles: List[str] = Field(default_factory=list)
+    engines: List[str] = Field(default_factory=list)
+
+
+class TerminalReference(BaseModel):
+    """A reference to a terminal-log offset range (BR-2, FR-4.2).
+
+    A REFERENCE only — ``terminal_id`` plus the byte-offset range the event
+    recorded; the complete terminal log is NEVER copied into the bundle. Resolving
+    a range to its bytes is U5's offset-ranged terminal-log read, called by a
+    consumer later, never inlined here.
+    """
+
+    terminal_id: str
+    offset_start: Optional[int] = None
+    offset_len: Optional[int] = None
+
+
+class BundleReferences(BaseModel):
+    """Terminal + artifact references for a bundle (BR-2, FR-1.3/FR-4.2).
+
+    References, not payloads: ``terminals`` are ``(terminal_id, offsets)``
+    references, ``artifacts`` are the distinct ``output_ref`` strings the events
+    carry. No terminal-log content and no artifact payload is inlined.
+    """
+
+    terminals: List[TerminalReference] = Field(default_factory=list)
+    artifacts: List[str] = Field(default_factory=list)
+
+
+class BundleExcerpt(BaseModel):
+    """A retention-safe, size-limited excerpt of a step's output (BR-5, BR-9).
+
+    Present ONLY when output capture is enabled (BR-9): each excerpt is the
+    step's output passed through U7's capture gate + the ``sanitize_output``
+    cap-and-mark SANITIZER (NFR-SEC-4/6). With capture disabled (the default), the
+    bundle carries NO excerpts — metadata + references only.
+
+    "Sanitizer", NOT "redactor": ``sanitize_output`` performs transport hygiene —
+    control-character stripping and size capping with a truncation marker. It does
+    NOT detect or remove secrets. A credential inside a step's output survives it
+    verbatim. The excerpt is retention-safe in SIZE, not in CONTENT.
+    """
+
+    step_id: str
+    excerpt: str
+
+
+class DiagnosticBundle(BaseModel):
+    """A run's troubleshooting export bundle (FR-9, domain-entities DiagnosticBundle).
+
+    Contains EVERY FR-9.1 section (BR-3): the spec identifier + content hash, the
+    SANITIZED inputs (BR-4 — size-capped and control-char-stripped, NOT
+    secret-redacted: a credential passed as a workflow input comes back verbatim),
+    the ordered event timeline with declared gaps, the
+    step outcomes + structured errors, provider/agent/engine environment metadata,
+    terminal + artifact references (BR-2), and retention-safe excerpts (BR-5,
+    capture-gated per BR-9). Reconstructable from the durable journal ALONE
+    (BR-6, FR-9.2) — no ``run_registry`` dependency — so it is usable after a
+    restart and by a support user who was not at the machine. ``capture_enabled``
+    declares the posture so a reader knows whether ``excerpts`` was gated off.
+    """
+
+    spec_id: str
+    spec_content_hash: str
+    inputs: str
+    events: List[EventRow] = Field(default_factory=list)
+    gaps: List[GapMarker] = Field(default_factory=list)
+    step_outcomes: List[StepOutcome] = Field(default_factory=list)
+    environment: BundleEnvironment
+    references: BundleReferences
+    excerpts: List[BundleExcerpt] = Field(default_factory=list)
+    capture_enabled: bool
+
+
 class SkillContentResponse(BaseModel):
     """Response model for a skill content lookup."""
 
@@ -612,6 +888,24 @@ def _seed_default_skills_at_startup() -> None:
         )
 
 
+def _sweep_workflow_runs_at_startup() -> None:
+    """Run the workflow run-journal retention sweep once at startup (NFR-SEC-3).
+
+    ``sweep_runs`` is already best-effort internally (enumeration failures return
+    0, a per-run delete failure is logged and the sweep continues), so this only
+    adds a defensive outer guard: a maintenance sweep must never prevent the
+    server from starting.
+    """
+    from cli_agent_orchestrator.services import workflow_retention
+
+    try:
+        pruned = workflow_retention.sweep_runs()
+        if pruned:
+            logger.info("workflow retention: pruned %d run(s) at startup", pruned)
+    except Exception as e:  # noqa: BLE001 — never block startup on a maintenance sweep
+        logger.warning("workflow retention sweep failed at startup: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -638,6 +932,12 @@ async def lifespan(app: FastAPI):
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
     asyncio.create_task(cleanup_expired_memories())
+    # Workflow run-journal retention (#504, NFR-SEC-3). Without this the sweep
+    # had NO production caller and the advertised age/run-count retention never
+    # ran, so the event log grew without bound. Startup-time and best-effort,
+    # matching cleanup_old_data above: sweep_runs never raises (read failures
+    # degrade to a 0-run no-op) and bounds are read from settings.
+    asyncio.create_task(asyncio.to_thread(_sweep_workflow_runs_at_startup))
 
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
@@ -2378,6 +2678,52 @@ async def get_terminal_output(
         )
 
 
+@app.get("/terminals/{terminal_id}/output/range", response_model=TerminalOutputRange)
+async def get_terminal_output_range(
+    terminal_id: TerminalId,
+    offset: int = Query(ge=0, description="Byte offset into the append-only terminal log"),
+    length: int = Query(
+        ge=1,
+        le=TERMINAL_RANGE_MAX_LENGTH,
+        description=f"Bytes to read (capped at {TERMINAL_RANGE_MAX_LENGTH})",
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> TerminalOutputRange:
+    """Read an exact byte range from a terminal's on-disk log (U5 / #504, FR-4.3).
+
+    A SEPARATE read path from ``GET /terminals/{id}/output`` (the rolling
+    buffer/tail): this ranges over the append-only ``{id}.log`` so playback can
+    fetch the output produced around a selected event (FR-7.3). A valid terminal
+    that has not logged anything yet returns 200 with empty ``data`` so playback
+    degrades gracefully (BR-4), rather than 404.
+
+    Scope-gated (PR #526 review): this route is NEW in #504 and returns raw
+    terminal log bytes, the same payload class as the run read routes gated
+    alongside it. Its only caller is this repo's own web UI, so adding the gate
+    breaks nothing. The sibling ``GET /terminals/{id}/output`` is deliberately
+    left as-is — it predates #504 and the wider ``/terminals/*`` surface is
+    uniformly ungated, so gating one pre-existing member of it belongs to a
+    separate, deliberate decision about that whole surface rather than to this PR.
+    """
+    try:
+        # Reads a byte slice off disk — run it off the loop so a large range
+        # can't stall the server.
+        data = await asyncio.to_thread(
+            terminal_service.read_output_range, terminal_id, offset, length
+        )
+        return TerminalOutputRange(terminal_id=terminal_id, offset=offset, length=length, data=data)
+    except ValueError as e:
+        # Malformed id / negative offset — a caller error, not a missing log.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        # A genuine file I/O failure surfaced by read_output_range (BR-4): report
+        # it rather than masking a real fault as empty output.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read output range: {str(e)}",
+        )
+
+
 @app.post("/terminals/{terminal_id}/exit")
 async def exit_terminal(
     terminal_id: TerminalId,
@@ -3309,16 +3655,914 @@ async def submit_workflow_run_endpoint(
     return {"run_id": run_id, "state": RunState.RUNNING.value, "links": _run_links(run_id)}
 
 
-@app.get("/workflows/runs/{run_id}")
-async def get_workflow_run_endpoint(run_id: str) -> Dict:
-    """Return a point-in-time status snapshot for a run (FR-5.5)."""
-    from cli_agent_orchestrator.services import workflow_service
+@app.get("/workflows/runs/{run_id}", response_model=RunInspection)
+async def get_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> RunInspection:
+    """Inspect a run: metadata, current state, and per-step projections (FR-5.1).
 
+    Supersedes the pre-U3 ``get_run_status`` snapshot handler that #505 shipped at
+    this same path (FR-5.5): that handler returned ``status_snapshot.model_dump()``,
+    and every field of it is reproduced verbatim below, so the #505 status/result
+    clients keep working byte-compatibly (BR-2, SEAM).
+
+    U3 (issue #504) ENRICHES this endpoint IN PLACE to the ``RunInspection``
+    shape — a UNION SUPERSET of the pre-U3 ``get_run_status`` snapshot, never a
+    replacement (BR-2, SEAM). The authoritative run state / current step / step
+    (id, state, attempts) still come from ``get_run_status`` UNCHANGED (so the
+    #505 status/result clients that read those fields keep working, live-first
+    and identical); U3 additionally overlays the durable run metadata
+    (``workflow_name``, ``started_at``, ``finished_at``, ``tier``) and the U1
+    per-step columns (``output_json``, ``error``, ``error_kind``,
+    ``terminal_id``, ``reprompted``, ``call_fingerprint``).
+
+    Journal-authoritative (NFR-DUR-1 / BR-1): ``get_run_status`` already falls
+    back to ``_rebuild_record_from_journal`` on a cache miss, and the metadata /
+    step enrichment reads the durable tables directly via ``get_run`` /
+    ``get_steps`` — so a run is fully inspectable after a restart with
+    ``run_registry`` cleared, and NO read path requires the registry to hold an
+    entry. A never-acked or corrupt-snapshot run degrades to 404 exactly as
+    ``get_run_status`` does today (BR-7).
+
+    SCOPE-GATED (PR #526 review, BLOCKING): the enrichment puts every step's full
+    ``output_json`` and ``error`` text in the response body, which makes this the
+    single most payload-bearing read route on the run surface — strictly more so
+    than ``/diagnostics``, whose excerpts are capture-gated while ``output_json``
+    here is not. It therefore carries the same read-or-better gate as
+    ``/diagnostics``, ``/events`` and ``/compare``: a FULL-route gate, not a
+    per-field split, because a field split would still return ``output_json`` to
+    an unscoped caller. Default-off is unchanged — with ``CAO_AUTH_ENABLED``
+    unset the dependency returns the full scope set and enforces nothing.
+    Consequence for #505: its CLI/MCP status/result clients read this route (plus
+    ``/events`` and ``/compare``) and must present a token carrying
+    ``cao:read``/``cao:write``/``cao:admin`` once auth is enabled.
+
+    PAYLOAD POSTURE CHANGED AT THIS PATH — read this before adding a caller
+    (PR #526 review round 3, FR-4). Before the #504/#505 integration this path was
+    answered by #505's ``RunStatus`` snapshot, which is documented payload-FREE:
+    "Carries no per-step output or prompt (B3-SD-3)" —
+    ``models/workflow_runtime.py``. The superseding ``RunInspection`` above is
+    payload-BEARING. The union-superset resolution that merged the two handlers
+    preserved every ``RunStatus`` field byte-compatibly, but it also widened what
+    this route DISCLOSES, and that widening is deliberate (it is the enriched
+    inspect feature FR-5.1 asks for) — not an oversight.
+
+    Two consequences a reader must not have to infer:
+
+    1. ``workflow_journal_capture_output`` does NOT govern these fields. That flag
+       gates only the event-log output digest and the ``/diagnostics`` excerpts.
+       ``_journal_step`` persists ``output_json`` and ``error`` on EVERY step
+       transition regardless of it, because the resume path and
+       ``{{steps.<id>.output.<field>}}`` templating read them back. So with capture
+       at its default OFF, this route still returns step output and error verbatim.
+    2. The ONLY protection is the scope dependency above, and it is INERT in the
+       default deployment: with ``CAO_AUTH_ENABLED`` unset, ``require_any_scope``
+       returns the full scope set and enforces nothing. A local CAO server therefore
+       serves step output and error text to any caller that can reach the port.
+
+    Deliberately documented rather than further gated: stripping the fields removes
+    the feature, and gating them behind the capture flag would break resume and
+    templating. If a stricter posture is wanted, it belongs in a change that also
+    covers #505's CLI/MCP consumers of this route.
+    """
+    from cli_agent_orchestrator.services import workflow_journal, workflow_service
+
+    # (1) Authoritative state/steps via the UNCHANGED existing seam. Raises
+    #     KeyError -> 404 on a never-acked / corrupt-snapshot run (BR-7). This is
+    #     the field set #505 reads; it is reused verbatim, never weakened.
     try:
-        status_snapshot = workflow_service.get_run_status(run_id)
+        # OFF-LOOP too: on a registry cache miss this reads the journal itself
+        # (the cold-read fallback / _rebuild_record_from_journal), so it is a
+        # synchronous sqlite call on the same footing as the enrichment reads below.
+        status_snapshot = await asyncio.to_thread(workflow_service.get_run_status, run_id)
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
-    return status_snapshot.model_dump()
+
+    # (2) Durable enrichment sources (journal-authoritative, no registry needed).
+    #     OFF-LOOP: the journal DAL is synchronous sqlite, so every call runs in a
+    #     worker thread. This route is `async def`, so a bare call would block the
+    #     single event loop for the whole read — including the 250 ms SSE followers
+    #     (``_EVENTS_FOLLOW_POLL_INTERVAL_S``). Matches the SSE and DELETE arms,
+    #     which already wrap the same functions.
+    run_row = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    step_rows = {
+        row.step_id: row for row in await asyncio.to_thread(workflow_journal.get_steps, run_id)
+    }
+
+    # (3) Per-step UNION: the authoritative (id, state, attempts) baseline from
+    #     the snapshot drives ordering and liveness; the durable StepRow columns
+    #     overlay where present. A step whose journal write was swallowed still
+    #     appears (from the snapshot) with None enrichment; a run whose snapshot
+    #     carries no steps (e.g. a cold script-tier read) falls back to the
+    #     durable rows so no step is silently dropped (UNION, not replace).
+    steps: List[StepInspection] = []
+    seen: set = set()
+    for st in status_snapshot.steps:
+        srow = step_rows.get(st.id)
+        steps.append(
+            StepInspection(
+                id=st.id,
+                state=st.state.value,
+                attempts=st.attempts,
+                output_json=srow.output_json if srow else None,
+                error=srow.error if srow else None,
+                error_kind=srow.error_kind if srow else None,
+                terminal_id=srow.terminal_id if srow else None,
+                reprompted=srow.reprompted if srow else None,
+                call_fingerprint=srow.call_fingerprint if srow else None,
+            )
+        )
+        seen.add(st.id)
+    for step_id, srow in step_rows.items():
+        if step_id in seen:
+            continue
+        steps.append(
+            StepInspection(
+                id=srow.step_id,
+                state=srow.state,
+                attempts=srow.attempts,
+                output_json=srow.output_json,
+                error=srow.error,
+                error_kind=srow.error_kind,
+                terminal_id=srow.terminal_id,
+                reprompted=srow.reprompted,
+                call_fingerprint=srow.call_fingerprint,
+            )
+        )
+
+    # (4) Run metadata: journal-first (authoritative). The only case where the
+    #     snapshot succeeds but the journal row is absent is a live record whose
+    #     insert_run write was swallowed — fall back to the live registry record
+    #     for its metadata so inspect still answers (a UNION fallback, not a
+    #     registry dependency: the normal post-restart path uses run_row).
+    if run_row is not None:
+        workflow_name = run_row.workflow_name
+        started_at = run_row.started_at
+        finished_at = run_row.finished_at
+        tier = run_row.tier
+    else:
+        record = workflow_service.run_registry.get(run_id)
+        workflow_name = getattr(record, "workflow_name", "")
+        started_at = getattr(record, "started_at", "") or ""
+        finished_at = getattr(record, "finished_at", None)
+        tier = getattr(record, "tier", "yaml")
+
+    return RunInspection(
+        run_id=status_snapshot.run_id,
+        workflow_name=workflow_name,
+        state=status_snapshot.state.value,
+        current_step_id=status_snapshot.current_step_id,
+        started_at=started_at,
+        finished_at=finished_at,
+        tier=tier,
+        steps=steps,
+    )
+
+
+# ---------------------------------------------------------------------------
+# U4 (issue #504, events-follow SSE surface, FR-6) — additive to the U3 batch
+# route below. #505's client follower (U10) consumes this SSE contract; the
+# batch path stays byte-behavior-identical for existing callers.
+# ---------------------------------------------------------------------------
+
+# Live-follow poll cadence. The durable ``workflow_run_event`` table is TAILED on
+# this interval (U2 publishes to no bus, so there is nothing to subscribe to);
+# journal-tailing trades minimal latency for zero coupling to U2's emission path
+# (BR-6, journal-authoritative). A future bus-push is an optimization layered on
+# later, tied to the open capture-seam decision — explicitly out of U4's scope.
+_EVENTS_FOLLOW_POLL_INTERVAL_S = 0.25
+
+# Run states at which the follow stream replays what remains and CLOSES (BR-5):
+# a run that has already ended must never leave a follower hanging on a
+# possibly-swallowed terminal event.
+#
+# IMPORTED, not redefined (PR #526 review): this set also gates whether the DAL
+# declares a trailing gap, so two independently-maintained copies could disagree
+# about whether a run has ended — the SSE arm would close a run the journal still
+# considered live, or vice versa. ``workflow_journal`` is the single Python source
+# of truth; this alias keeps the local references readable.
+_TERMINAL_RUN_STATES = _JOURNAL_TERMINAL_RUN_STATES
+
+
+def _event_sse_frame(event: EventRow) -> str:
+    """Serialize one durable ``EventRow`` as a named SSE frame (BR-1, ADR-3).
+
+    ``id: <seq>`` is the per-run seq — the sole ordering authority — so a native
+    ``EventSource`` sets ``Last-Event-ID`` to it automatically and a reconnect
+    resumes EXACTLY after the last delivered seq, dedupe-free (BR-3). ``data`` is
+    the full durable row as a JSON object, so every BR-1 minimum field (seq,
+    run_id, event_type, step_id where applicable, state, ts) is present alongside
+    the rest of #504's payload schema.
+    """
+    return f"event: {event.event_type}\ndata: {json.dumps(asdict(event))}\nid: {event.seq}\n\n"
+
+
+def _gap_sse_frame(gap: GapMarker) -> str:
+    """Serialize a declared sequence gap as a distinct ``event: gap`` frame (BR-4).
+
+    A gap is DATA the API declares, not something the client infers from
+    numbering: ``data`` carries ``{after_seq, before_seq, missing_count,
+    reason}``. It carries no ``id:`` — a gap is synthesized at read time and owns
+    no seq of its own; the surrounding event frames carry the reconnect cursor.
+    """
+    return f"event: gap\ndata: {json.dumps(asdict(gap))}\n\n"
+
+
+def _run_absent_sse_frame(run_id: str) -> str:
+    """Serialize the terminal 'this run does not exist' frame for the SSE arm.
+
+    Emitted when ``get_run`` returns ``None`` — an id that never existed, or one
+    removed by the DELETE endpoint or the retention sweep. Such a run can never
+    reach a terminal state, so without this the follower would poll forever
+    (an unbounded connection + poll cycle per typo'd id). Carries no ``id:``: it
+    is synthesized at read time and owns no seq, so a reconnect cursor is
+    unaffected.
+    """
+    return f"event: run_absent\ndata: {json.dumps({'run_id': run_id})}\n\n"
+
+
+def _gap_identity(gap: GapMarker) -> Tuple[Optional[int], int, str]:
+    """A declared gap's stable identity, for at-most-once emission per stream.
+
+    ``read_events_with_gaps`` re-synthesizes the SAME trailing marker on every
+    call while the run stays terminal, so the SSE follow loop — which reads twice
+    on the terminal-transition pass (the poll read, then the drain read) — would
+    otherwise declare one hole to the follower twice. Identity is the declared
+    span plus the reason, not object identity: the markers are distinct instances
+    built by separate reads.
+    """
+    return (gap.after_seq, gap.before_seq, gap.reason)
+
+
+def _merge_ordered_sse_frames(
+    events: List[EventRow],
+    gaps: List[GapMarker],
+    declared: Optional[set] = None,
+) -> List[str]:
+    """Interleave event + gap frames in seq/position order (business-logic-model).
+
+    An INTERIOR ``GapMarker`` is synthesized between two adjacent stored rows, so
+    its ``before_seq`` IS the seq of a delivered event; its frame is emitted
+    immediately BEFORE that event, placing the declared hole exactly where it
+    occurred in the stream (BR-4) rather than leaving the client to infer it from
+    numbering.
+
+    A gap's ``before_seq`` is NOT always a delivered event's seq, though: the
+    TRAILING marker ``read_events_with_gaps`` synthesizes for a terminal run whose
+    last append(s) were swallowed carries ``before_seq = high_water + 1``, a
+    sentinel one past the last ALLOCATED seq that by construction matches no
+    stored row (PR #526 review, BLOCKING). Matching gaps only against delivered
+    events therefore DROPPED the "run ended, the last N events are lost" fault on
+    the SSE arm entirely — the batch arm and the diagnostics bundle declared it,
+    the live surface silently did not. Any gap left unmatched after the event
+    drain is emitted as a standalone ``event: gap`` frame, in ``before_seq`` order,
+    at the position it belongs: past every event in this batch.
+
+    ``declared`` is an optional MUTABLE set of ``_gap_identity`` keys owned by the
+    caller's stream; a gap already in it is not re-emitted, and every emitted gap
+    is added to it. The follow loop passes one per connection so the trailing
+    marker is declared exactly once even though two reads synthesize it. Omitted
+    (the pure two-arg form) there is no cross-call state and every gap is emitted.
+    """
+    if declared is None:
+        declared = set()
+    gaps_by_before = {g.before_seq: g for g in gaps}
+    frames: List[str] = []
+    for event in events:
+        gap = gaps_by_before.get(event.seq)
+        if gap is not None and _gap_identity(gap) not in declared:
+            frames.append(_gap_sse_frame(gap))
+            declared.add(_gap_identity(gap))
+        frames.append(_event_sse_frame(event))
+    # Leftover drain: every gap whose before_seq bounded no delivered event —
+    # emitted in before_seq order after the event frames. Most often that is the
+    # trailing marker (before_seq = high_water + 1), but NOT always: a gap whose
+    # bounding event fell outside this page (e.g. a leading hole, or a batch the
+    # caller trimmed) is also unmatched, so its frame arrives here rather than at
+    # its true position (PR #526 review fix cycle 1 — an earlier version of this
+    # comment claimed a leftover gap is always past every event in the batch). The
+    # drain is deliberately generic: an unmatched declaration reaching the follower
+    # slightly out of position beats being swallowed, since the marker carries its
+    # own after_seq/before_seq range and the client renders what the server says.
+    for gap in sorted(gaps, key=lambda g: g.before_seq):
+        if _gap_identity(gap) not in declared:
+            frames.append(_gap_sse_frame(gap))
+            declared.add(_gap_identity(gap))
+    return frames
+
+
+async def _follow_run_events(run_id: str, after_seq: Optional[int]) -> AsyncIterator[str]:
+    """Async SSE generator: durable replay -> terminal guard -> live follow (FR-6).
+
+    Journal-authoritative (BR-6): every frame is sourced from the durable
+    ``workflow_run_event`` table via ``read_events_with_gaps`` and the run's
+    terminal state from ``get_run`` — NO ``run_registry`` / in-memory-ring
+    dependency, so a disconnected or late follower reconstructs entirely from the
+    cursor. Three phases:
+
+    1. **Durable replay** — read everything after ``after_seq`` and emit events +
+       declared gaps interleaved in seq/position order (BR-3/BR-4).
+    2. **Terminal-state guard (F-1, BR-5)** — after replay, check ``get_run``; if
+       the run already ended (completed/failed/cancelled), CLOSE rather than enter
+       live-follow. A run whose terminal event's append was swallowed must not
+       leave the follower waiting forever.
+    3. **Live-follow** — otherwise TAIL the durable table from the advancing
+       cursor on a short poll, emitting new events/gaps and re-checking
+       ``get_run`` for a terminal transition each pass; on a terminal transition
+       it drains any final rows and closes.
+
+    Cancel-safe: on client disconnect ``StreamingResponse`` throws
+    ``GeneratorExit`` into this generator, which exits the loop cleanly — the DAL
+    owns no long-lived resource (each poll opens and closes its own short-lived
+    connection), so there is nothing to leak. The blocking DAL reads run via
+    ``asyncio.to_thread`` so a slow DB op never blocks the event loop.
+    """
+    from cli_agent_orchestrator.services import workflow_journal
+
+    cursor = after_seq
+
+    # Every gap identity already declared on THIS connection. The trailing marker
+    # is re-synthesized by every read of a terminal run, and the terminal
+    # transition below reads twice (poll + drain), so without this the follower
+    # would be told about one hole twice. Scoped per connection: a reconnect
+    # legitimately re-declares, since the new stream has not seen it.
+    declared_gaps: set = set()
+
+    # Phase 1 — durable replay from the cursor.
+    events, gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, run_id, cursor)
+    for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
+        yield frame
+    if events:
+        cursor = events[-1].seq
+
+    # Phase 2 — terminal-state guard BEFORE live-follow (F-1, BR-5). The terminal
+    # event itself (run.completed / run.failed / run.cancelled) is the final frame
+    # already delivered in Phase 1 when its append succeeded; here we simply stop.
+    run = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if run is None:
+        # ABSENT run: an id that never existed (a typo from curl or an agent), or
+        # one the retention sweep / DELETE removed. There is no run that can ever
+        # go terminal, so entering live-follow would pin this connection and a
+        # poll cycle FOREVER. Declare the absence as a terminal frame and close,
+        # so a follower learns why the stream ended instead of hanging. (The
+        # batch arm answers the same case with an empty page; a stream cannot,
+        # having already committed to 200 + text/event-stream in the response
+        # header, so `event: run_absent` is the in-band equivalent.)
+        yield _run_absent_sse_frame(run_id)
+        return
+    if run.state in _TERMINAL_RUN_STATES:
+        # The run is terminal — but it may have BECOME terminal in the window
+        # between the Phase 1 read above and this state read. In that window
+        # Phase 1 saw a live run, so the terminal-only guard in
+        # read_events_with_gaps deliberately declared nothing, and any event
+        # appended in the window is not yet delivered. Returning bare here would
+        # close the stream on a run whose trailing hole was never declared (and
+        # drop those last events). One final drain read closes that window; on
+        # the common path (already terminal at connect) it is a no-op re-read
+        # whose gap is deduped by `declared_gaps`.
+        events, gaps = await asyncio.to_thread(
+            workflow_journal.read_events_with_gaps, run_id, cursor
+        )
+        for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
+            yield frame
+        return
+
+    # Phase 3 — live-follow: tail the durable table until the run goes terminal
+    # (or the client disconnects, which raises GeneratorExit into this loop).
+    try:
+        while True:
+            await asyncio.sleep(_EVENTS_FOLLOW_POLL_INTERVAL_S)
+            events, gaps = await asyncio.to_thread(
+                workflow_journal.read_events_with_gaps, run_id, cursor
+            )
+            for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
+                yield frame
+            if events:
+                cursor = events[-1].seq
+            run = await asyncio.to_thread(workflow_journal.get_run, run_id)
+            if run is None:
+                # The run VANISHED mid-follow (DELETE endpoint or retention
+                # sweep). Same reasoning as the Phase 2 absent guard: nothing
+                # can ever go terminal now, so close instead of polling forever.
+                yield _run_absent_sse_frame(run_id)
+                return
+            if run.state in _TERMINAL_RUN_STATES:
+                # Drain any events appended between this poll's read and the
+                # terminal projection landing, then close (BR-5). This read is
+                # ALSO the one that can first see a trailing gap: the poll read
+                # above may have run while the run was still live, when the
+                # terminal-only guard in read_events_with_gaps deliberately
+                # declares nothing. So a run that goes terminal mid-follow
+                # declares its trailing hole here, before the stream closes.
+                events, gaps = await asyncio.to_thread(
+                    workflow_journal.read_events_with_gaps, run_id, cursor
+                )
+                for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
+                    yield frame
+                return
+    except GeneratorExit:
+        # Client disconnected; StreamingResponse closed the generator. No
+        # long-lived resource to release — just stop.
+        return
+
+
+@app.get("/workflows/runs/{run_id}/events", response_model=EventTimelinePage)
+async def get_workflow_run_events_endpoint(
+    run_id: str,
+    request: Request,
+    after_seq: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description=(
+            "Replay cursor: return only events with seq strictly greater than "
+            "this value. Omitted -> from the start of the timeline. Takes "
+            "precedence over the Last-Event-ID header on the SSE stream (BR-3). "
+            "Must be >= 0: seqs start at 1, so 0 is the from-start cursor and a "
+            "negative value is meaningless. Bounded here (422) because an "
+            "unbounded negative cursor USED TO fabricate a phantom gap on a "
+            "healthy run; the reader also clamps defensively (BR-4)."
+        ),
+    ),
+    limit: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description=(
+            "Reserved page-size hint. The durable read is already seq-ordered and "
+            "bounded per run; accepted for forward compatibility with paged / "
+            "live-follow reads (U4) and applied as a trailing cap when supplied. "
+            "Applies to the BATCH arm only."
+        ),
+    ),
+    stream: bool = Query(
+        default=False,
+        description=(
+            "Content-negotiation override: force the SSE live-follow arm even "
+            "when the Accept header is not text/event-stream. Equivalent to "
+            "sending Accept: text/event-stream."
+        ),
+    ),
+    last_event_id: Optional[str] = Header(
+        default=None,
+        alias="Last-Event-ID",
+        description=(
+            "Native EventSource reconnect cursor for the SSE arm. When set and "
+            "?after_seq= is not, the stream resumes strictly after this seq. "
+            "?after_seq= takes precedence when both are supplied (BR-3)."
+        ),
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Read a run's ordered event timeline — BATCH page OR live SSE follow (FR-5.2/FR-6).
+
+    Content-negotiated on the SAME path (the U3-marked seam; U4 EXTENDS, does not
+    rewrite): ``Accept: text/event-stream`` (or ``?stream=true``) selects the SSE
+    live-follow arm; any other Accept returns the U3 batch ``EventTimelinePage``
+    JSON UNCHANGED. Existing batch callers (Accept ``*/*`` or ``application/json``,
+    no ``?stream=``) are byte-behavior-identical.
+
+    Both arms call U1's ``read_events_with_gaps(run_id, cursor)`` — events are
+    seq-ordered (seq is the sole ordering authority), deterministic and dedupe-free
+    (BR-3); declared sequence holes travel WITH the events as ``GapMarker``s rather
+    than being renumbered away (BR-4). Journal-authoritative (NFR-DUR-1): answered
+    entirely from the durable ``workflow_run_event`` table with no ``run_registry``
+    dependency, so a run's full timeline is replayable after a restart.
+
+    **Batch arm:** ``after_seq`` is the replay cursor (events with seq > after_seq);
+    omitted reads from the start; beyond the current max -> an empty page
+    (``next_after_seq=None``), a caught-up follower NOT an error (BR-6).
+    ``next_after_seq`` is the max seq returned, the reconnect cursor.
+
+    **SSE arm (FR-6):** durable replay from the resume cursor -> a terminal-state
+    guard that closes an already-ended run (F-1, BR-5) -> live-follow tailing the
+    durable table until the run goes terminal or the client disconnects. The resume
+    cursor is ``?after_seq=`` (preferred) or the ``Last-Event-ID`` header
+    (``?after_seq=`` wins when both are present, BR-3). Each event frame carries
+    ``id: <seq>`` so a native ``EventSource`` reconnect is exact and dedupe-free.
+
+    SCOPE-GATED (PR #526 review, BLOCKING): the timeline carries per-event
+    ``error_kind`` / ``reason`` / ``validation_result`` / ``output_ref`` and the
+    terminal-offset coordinates that address captured terminal output, so it is a
+    payload-bearing read like ``/diagnostics`` and takes the same read-or-better
+    gate. The gate applies to BOTH arms — batch and SSE — because the dependency
+    resolves before the arm is chosen. Default-off is unchanged. Consequence for
+    #505: its follower client must present a scoped token once auth is enabled.
+    """
+    from cli_agent_orchestrator.services import workflow_journal
+
+    # Content negotiation: SSE only when explicitly requested (Accept:
+    # text/event-stream or ?stream=true). A generic Accept (*/*, application/json)
+    # keeps the byte-identical batch path so existing callers are unaffected.
+    accept = request.headers.get("accept", "")
+    if stream or "text/event-stream" in accept.lower():
+        from fastapi.responses import StreamingResponse
+
+        # Resume cursor precedence: ?after_seq= wins; else the Last-Event-ID
+        # header (a native-EventSource reconnect). A malformed header is ignored
+        # (replay from the start) rather than 400-ing a reconnecting client.
+        effective_after_seq = after_seq
+        if effective_after_seq is None and last_event_id is not None:
+            try:
+                effective_after_seq = int(last_event_id)
+            except ValueError:
+                effective_after_seq = None
+        return StreamingResponse(
+            _follow_run_events(run_id, effective_after_seq),
+            media_type="text/event-stream",
+        )
+
+    # BATCH arm — byte-behavior-identical for existing callers. The DAL call runs
+    # OFF-LOOP (synchronous sqlite in an `async def`); the SSE arm above already
+    # wraps the same function, so leaving this one bare made the two arms of ONE
+    # route disagree on event-loop discipline.
+    events, gaps = await asyncio.to_thread(
+        workflow_journal.read_events_with_gaps, run_id, after_seq
+    )
+    if limit is not None and len(events) > limit:
+        events = events[:limit]
+        # Gaps beyond the trimmed window are dropped so a returned gap never
+        # points past the last delivered event (the cursor advances page-by-page).
+        last_seq = events[-1].seq if events else (after_seq or 0)
+        gaps = [g for g in gaps if g.before_seq <= last_seq]
+    next_after_seq = events[-1].seq if events else None
+    return EventTimelinePage(events=events, gaps=gaps, next_after_seq=next_after_seq)
+
+
+# ---------------------------------------------------------------------------
+# U6 (issue #504) — run comparison + diagnostic bundle (FR-8, FR-9). Two
+# read-only export routes over the DURABLE journal. Both register BEFORE the
+# ``/workflows/{name}`` catch-all (FR-6.5, BR-7) and are pinned by
+# ``test_workflow_route_ordering``. Both are answered from U1's DAL
+# (``get_run`` / ``get_steps`` / ``read_events_with_gaps``) with NO
+# ``run_registry`` dependency (journal-authoritative, BR-6 / FR-9.2), so both
+# reconstruct fully after a restart. No new persistence, no edit to any U1/U2/
+# U3/U5/U7 function — additive routes only.
+# ---------------------------------------------------------------------------
+def _events_by_step(events: List[EventRow]) -> Dict[str, List[EventRow]]:
+    """Group a run's seq-ordered events by ``step_id`` (run-level events dropped).
+
+    The events arrive seq-ordered from ``read_events_with_gaps`` (seq is the sole
+    ordering authority), so each per-step list stays seq-ordered — ``_last_non_null``
+    can rely on later-in-list meaning later-in-time.
+    """
+    grouped: Dict[str, List[EventRow]] = {}
+    for e in events:
+        if e.step_id is None:
+            continue
+        grouped.setdefault(e.step_id, []).append(e)
+    return grouped
+
+
+def _last_non_null(events: List[EventRow], attr: str) -> Optional[str]:
+    """Return the last non-null value of ``attr`` across a step's seq-ordered events.
+
+    "Last" = the value the step ran under at its final recorded transition (e.g. a
+    provider/agent that changed across a retry surfaces the last one). ``None`` when
+    no event recorded the field (e.g. a swallowed append).
+    """
+    value: Optional[str] = None
+    for e in events:
+        v = getattr(e, attr)
+        if v is not None:
+            value = v
+    return value
+
+
+def _step_duration_ms(events: List[EventRow]) -> Optional[int]:
+    """Sum a step's event ``elapsed_ms`` (durations are DERIVED, never persisted).
+
+    ``None`` when no event carried an ``elapsed_ms`` — distinguishing "took zero
+    measurable time" (sum 0) from "no duration recorded" (None).
+    """
+    total = 0
+    seen = False
+    for e in events:
+        if e.elapsed_ms is not None:
+            total += e.elapsed_ms
+            seen = True
+    return total if seen else None
+
+
+def _distinct_output_refs(events: List[EventRow]) -> List[str]:
+    """The distinct ``output_ref`` references a step's events carry (first-seen order).
+
+    Reference-level (BR-2): the ``output_ref`` STRINGS, never the payloads they
+    point at. Deterministic first-seen order so a diff is stable across reads.
+    """
+    refs: List[str] = []
+    for e in events:
+        if e.output_ref is not None and e.output_ref not in refs:
+            refs.append(e.output_ref)
+    return refs
+
+
+def _build_step_side(step_row: StepRow, step_events: List[EventRow]) -> StepComparisonSide:
+    """Assemble one run's per-step comparison side (FR-8.1).
+
+    ``attempts`` / ``state`` / ``error_kind`` / ``reprompted`` come from the durable
+    ``StepRow`` projection (the failure/retry behaviour); ``duration_ms`` /
+    ``provider`` / ``agent_profile`` / ``validation`` are derived from the step's
+    events. All datum-level ``None``s are honest gaps, never zeroed.
+    """
+    return StepComparisonSide(
+        attempts=step_row.attempts,
+        duration_ms=_step_duration_ms(step_events),
+        provider=_last_non_null(step_events, "provider"),
+        agent_profile=_last_non_null(step_events, "agent_profile"),
+        validation=_last_non_null(step_events, "validation_result"),
+        state=step_row.state,
+        error_kind=step_row.error_kind,
+        reprompted=step_row.reprompted,
+    )
+
+
+@app.get("/workflows/runs/{run_id}/compare", response_model=RunComparison)
+async def compare_workflow_runs_endpoint(
+    run_id: str,
+    against: str = Query(
+        ...,
+        description=(
+            "The run id to compare the path run against. Both runs are loaded "
+            "from the durable journal; an unknown/deleted id on either side is a "
+            "404, never a partial silent compare (BR-8)."
+        ),
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> RunComparison:
+    """Compare two runs by aligned step (FR-8.1, business-logic-model Algorithm 1).
+
+    Loads BOTH runs from the durable journal (``get_run`` / ``get_steps`` /
+    ``read_events_with_gaps``) — journal-authoritative, no ``run_registry``
+    dependency, so a comparison is answerable after a restart. Steps are aligned by
+    ``step_id`` (deterministically sorted). Per aligned step the response juxtaposes,
+    for the baseline (``a``) and compare (``b``) run: attempts, derived duration
+    (summed event ``elapsed_ms``), provider + agent config, validation outcome, and
+    the state/error_kind/reprompted failure-retry behaviour. A step present in only
+    one run is surfaced as ``added`` (only in the compare run) or ``removed`` (only
+    in the baseline), NEVER silently dropped (BR-1). Output/artifact differences are
+    reported at the ``output_ref`` REFERENCE level (BR-2), never by diffing payloads.
+
+    Unknown/deleted ``run_id`` (baseline) or ``against`` (compare) -> 404 for that
+    side (BR-8): the comparison never partially succeeds against a missing run.
+    Registered before the ``/workflows/{name}`` catch-all (FR-6.5) — a 2-segment
+    ``/workflows/runs/...`` path structurally unmatched by the single-segment
+    catch-all, pinned by ``test_workflow_route_ordering``.
+
+    SCOPE-GATED (PR #526 review, BLOCKING): the comparison exposes both runs'
+    per-step ``error_kind`` / validation outcomes and their ``output_ref``
+    references, so it is a payload-bearing read like ``/diagnostics`` and takes
+    the same read-or-better gate. Default-off is unchanged. Consequence for #505:
+    a scoped token is required once auth is enabled.
+    """
+    from cli_agent_orchestrator.services import workflow_journal
+
+    # Both sides loaded from the durable journal; a missing run on EITHER side is a
+    # 404, not a partial silent compare (BR-8). No run_registry lookup (BR-6).
+    #
+    # OFF-LOOP, PER CALL (six awaits). This route is the heaviest reader in the
+    # family — it reads two runs' full event sets — so a bare synchronous call
+    # stalls the event loop for the whole comparison. Deliberately NOT an
+    # `asyncio.gather` over the six: the two `get_run` calls are separated by their
+    # own 404 raises, and short-circuiting on the FIRST missing run is the existing
+    # BR-8 contract. Gathering would change which 404 fires and would read the
+    # second run's rows for a request that is already a 404.
+    baseline_run = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if baseline_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    compare_run = await asyncio.to_thread(workflow_journal.get_run, against)
+    if compare_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown run '{against}' (compare target)",
+        )
+
+    a_steps = {s.step_id: s for s in await asyncio.to_thread(workflow_journal.get_steps, run_id)}
+    b_steps = {s.step_id: s for s in await asyncio.to_thread(workflow_journal.get_steps, against)}
+    a_events, _a_gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, run_id)
+    b_events, _b_gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, against)
+    a_by_step = _events_by_step(a_events)
+    b_by_step = _events_by_step(b_events)
+
+    steps: List[StepComparison] = []
+    output_diffs: List[OutputDiff] = []
+    # Union of step ids from BOTH runs, sorted for a deterministic, stable export.
+    for step_id in sorted(set(a_steps) | set(b_steps)):
+        a_row = a_steps.get(step_id)
+        b_row = b_steps.get(step_id)
+        a_side = _build_step_side(a_row, a_by_step.get(step_id, [])) if a_row else None
+        b_side = _build_step_side(b_row, b_by_step.get(step_id, [])) if b_row else None
+        if a_row is not None and b_row is not None:
+            status_ = "aligned"
+        elif b_row is not None:
+            status_ = "added"  # present only in the compare run
+        else:
+            status_ = "removed"  # present only in the baseline run
+        steps.append(StepComparison(step_id=step_id, status=status_, a=a_side, b=b_side))
+
+        # Reference-level output diff (BR-2): compare the distinct output_ref sets,
+        # never the payloads. Emit a diff row only where the references differ.
+        a_refs = _distinct_output_refs(a_by_step.get(step_id, []))
+        b_refs = _distinct_output_refs(b_by_step.get(step_id, []))
+        if a_refs != b_refs:
+            output_diffs.append(OutputDiff(step_id=step_id, a_refs=a_refs, b_refs=b_refs))
+
+    return RunComparison(
+        baseline_run_id=run_id,
+        compare_run_id=against,
+        steps=steps,
+        output_diffs=output_diffs,
+    )
+
+
+@app.get("/workflows/runs/{run_id}/diagnostics", response_model=DiagnosticBundle)
+async def get_workflow_run_diagnostics_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> DiagnosticBundle:
+    """Export a run's troubleshooting bundle (FR-9, business-logic-model Algorithm 2).
+
+    Assembles EVERY FR-9.1 section (BR-3) from the DURABLE journal alone — no
+    ``run_registry`` dependency (BR-6 / FR-9.2), so the bundle is reconstructable
+    after a restart and usable by a support user who was not at the machine:
+
+    - ``spec_id`` = the run's workflow name; ``spec_content_hash`` = ``sha256`` of
+      the durable ``workflow_run.spec_snapshot`` (there is no existing standalone
+      spec-hash helper to reuse — ``workflow_spec_service`` hashes ``.py`` source
+      inline, not a reusable function — so ``hashlib.sha256`` is used directly).
+    - ``inputs`` = the run's ``inputs_json`` passed through U7's
+      ``workflow_retention.sanitize_output`` (NFR-SEC-6 / BR-4). Inputs are durable
+      run-row metadata (written at ``insert_run`` regardless of capture) so the
+      section is always present — the capture gate below applies only to
+      step-OUTPUT excerpts. NOTE: ``sanitize_output`` is size-limiting + control
+      character hygiene, NOT secret redaction — a credential passed as a workflow
+      input is returned verbatim here. That is why this route is scope-gated;
+      do not describe this section as redacted.
+    - ``events`` + ``gaps`` = the ordered event timeline with declared gaps
+      (``read_events_with_gaps``); ``step_outcomes`` = per-step state + structured
+      ``error_kind`` (always-on metadata, NFR-SEC-1, no free-text).
+    - ``environment`` = the distinct provider / agent_profile / engine observed
+      across the events (sorted).
+    - ``references`` = terminal (id + byte offsets) and artifact (``output_ref``)
+      REFERENCES only (BR-2 / FR-4.2) — no terminal-log content or artifact payload
+      is inlined (resolving a range is U5's read path, called by a consumer later).
+    - ``excerpts`` = retention-safe, size-limited step-output excerpts, present
+      ONLY when output capture is enabled (BR-9); each funnels through
+      ``sanitize_output`` (BR-5). With capture disabled (the default) the bundle is
+      metadata + references only, no output text.
+
+    Unknown ``run_id`` -> 404. Registered before the ``/workflows/{name}`` catch-all
+    (FR-6.5), pinned by ``test_workflow_route_ordering``.
+    """
+    import hashlib
+
+    from cli_agent_orchestrator.services import workflow_journal, workflow_retention
+
+    # Journal-authoritative (BR-6): the run row comes from get_run, NOT the live
+    # registry — a cleared registry (post-restart) does not affect this read.
+    # OFF-LOOP: synchronous sqlite in an `async def` (see the SSE/DELETE arms).
+    run_row = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if run_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    # spec identifier + content hash of the DURABLE snapshot (FR-9.1).
+    spec_content_hash = hashlib.sha256(run_row.spec_snapshot.encode("utf-8")).hexdigest()
+
+    # Inputs — the SINGLE redaction path (NFR-SEC-6 / BR-4): funnel through U7's
+    # sanitize_output (the audit_log cap-and-mark idiom). Referenced as a module
+    # attribute so a spy on workflow_retention.sanitize_output proves the choke point.
+    inputs = workflow_retention.sanitize_output(run_row.inputs_json)
+
+    # OFF-LOOP: this bundle reads the run's ENTIRE event set plus every step row,
+    # so it is the second-heaviest reader after /compare.
+    events, gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, run_id)
+    step_rows = await asyncio.to_thread(workflow_journal.get_steps, run_id)
+    step_outcomes = [
+        StepOutcome(step_id=s.step_id, state=s.state, error_kind=s.error_kind) for s in step_rows
+    ]
+
+    # Environment: distinct, sorted provider/agent/engine across the events.
+    environment = BundleEnvironment(
+        providers=sorted({e.provider for e in events if e.provider is not None}),
+        agent_profiles=sorted({e.agent_profile for e in events if e.agent_profile is not None}),
+        engines=sorted({e.engine for e in events if e.engine is not None}),
+    )
+
+    # References, not payloads (BR-2): terminal id + offsets, distinct artifact refs.
+    terminals: List[TerminalReference] = []
+    seen_terminals: set = set()
+    for e in events:
+        if e.terminal_id is None:
+            continue
+        key = (e.terminal_id, e.terminal_offset_start, e.terminal_offset_len)
+        if key in seen_terminals:
+            continue
+        seen_terminals.add(key)
+        terminals.append(
+            TerminalReference(
+                terminal_id=e.terminal_id,
+                offset_start=e.terminal_offset_start,
+                offset_len=e.terminal_offset_len,
+            )
+        )
+    artifacts: List[str] = []
+    for e in events:
+        if e.output_ref is not None and e.output_ref not in artifacts:
+            artifacts.append(e.output_ref)
+    references = BundleReferences(terminals=terminals, artifacts=artifacts)
+
+    # Excerpts — capture-gated (BR-9). With capture OFF (default), NO output text is
+    # emitted; with capture ON, each step's output funnels through sanitize_output
+    # (size-limited + redacted, BR-5 / NFR-SEC-4/6). Both the gate and the redactor
+    # are referenced as module attributes so a test can toggle/spy them.
+    capture_on = workflow_retention.capture_enabled()
+    excerpts: List[BundleExcerpt] = []
+    if capture_on:
+        for s in step_rows:
+            if s.output_json is not None:
+                excerpts.append(
+                    BundleExcerpt(
+                        step_id=s.step_id,
+                        excerpt=workflow_retention.sanitize_output(s.output_json),
+                    )
+                )
+
+    return DiagnosticBundle(
+        spec_id=run_row.workflow_name,
+        spec_content_hash=spec_content_hash,
+        inputs=inputs,
+        events=events,
+        gaps=gaps,
+        step_outcomes=step_outcomes,
+        environment=environment,
+        references=references,
+        excerpts=excerpts,
+        capture_enabled=capture_on,
+    )
+
+
+@app.delete("/workflows/runs/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Response:
+    """Explicitly delete a run and all its retained diagnostic data (FR-11 / NFR-SEC-5).
+
+    Invokes U1's ``workflow_journal.delete_run`` cascade — the run row, its per-step
+    projection rows, its events, and its high-water seq row are removed in one
+    connection (U7 does NOT reimplement the cascade). The live ``run_registry`` cache
+    entry (a non-authoritative rebuild of the same run, and itself retained
+    diagnostic data for NFR-SEC-5) is evicted too, so a subsequent inspect does not
+    re-serve the just-deleted run from the cache. After this, inspect (U3) / events
+    (U3) / the step reads all return not-found/empty for the id.
+
+    A 2-segment path under ``/workflows/runs/...`` — structurally unmatched by the
+    single-segment ``/workflows/{name}`` catch-all regardless of registration order
+    (FR-6.5), and pinned by ``test_workflow_route_ordering``. Idempotent: deleting an
+    unknown run id is a well-defined no-op (``delete_run`` guarantees this, BR-3) and
+    still returns 204 — a delete is never an error that faults other reads. A run
+    that is still live (a known run in a non-terminal state) is REJECTED with 409:
+    deleting it would leave the drive loop running with no way to cancel it and its
+    later appends orphaned. Cancel first, then delete. The
+    blocking sqlite cascade runs off the event loop (``to_thread``) so a slow DB op
+    bounds its blast radius to this one request. ``run_id`` binds through
+    parameterized SQL in the DAL (no injection surface), matching the pass-through
+    posture of the sibling inspect/events/cancel/resume run routes.
+    """
+    from cli_agent_orchestrator.services import workflow_journal, workflow_service
+
+    # Refuse to delete a run that is still LIVE (409). Deleting one removes the
+    # run row and evicts the registry entry, but the drive loop keeps executing
+    # with nothing left to reach it: cancel can no longer find the run, and the
+    # loop's subsequent appends land as orphan event rows keyed off a run row
+    # that no longer exists — unreachable by every read path AND by the
+    # retention sweep, which both join through that row. So the delete would
+    # create an uncancellable zombie plus unreclaimable storage. Cancel first,
+    # then delete. Absent (None) stays a 204 no-op: idempotency is preserved
+    # (BR-3), and only a KNOWN non-terminal run is rejected.
+    run = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if run is not None and run.state not in _TERMINAL_RUN_STATES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"run '{run_id}' is still {run.state}; cancel it before deleting "
+                "(deleting a live run orphans its events and leaves it uncancellable)"
+            ),
+        )
+
+    try:
+        await asyncio.to_thread(workflow_journal.delete_run, run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — surface a genuine DB failure; unknown id never lands here (BR-3)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"failed to delete run '{run_id}': {e}",
+        )
+    # Evict the non-authoritative live cache entry so the durable delete is
+    # immediately visible to the cache-first read path (a stale entry would let
+    # inspect re-serve the deleted run). Best-effort: absent id is a no-op.
+    workflow_service.run_registry.pop(run_id, None)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 def _json_or_none(output_json: Optional[str]) -> Optional[Dict[str, Any]]:
