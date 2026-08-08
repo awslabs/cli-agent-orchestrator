@@ -132,6 +132,7 @@ class IssueUpdateBody(StrictBody):
     evidence: Optional[str] = None
     resolution: Optional[str] = None
     duplicate_of: Optional[str] = None
+    kind: Optional[str] = None
     actor: Optional[str] = None
 
 
@@ -167,6 +168,7 @@ class FeatureUpdateBody(StrictBody):
     evidence: Optional[str] = None
     resolution: Optional[str] = None
     duplicate_of: Optional[str] = None
+    kind: Optional[str] = None
     actor: Optional[str] = None
 
 

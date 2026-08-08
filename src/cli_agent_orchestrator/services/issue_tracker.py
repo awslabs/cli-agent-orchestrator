@@ -1259,11 +1259,12 @@ def update_issue(issue_key: str, *, actor: Optional[str] = None, **changes: Any)
         ):
             raise TrackerError("invalid", "failing_command is not allowed for feature requests")
         # If switching to feature and existing failing_command would be retained, clear it
+        # Also handles explicit null (m1) where loop would skip; empty string is handled by loop
         if (
             target_kind == "feature"
             and getattr(row, "failing_command", None)
             and "kind" in changes
-            and "failing_command" not in changes
+            and ("failing_command" not in changes or changes.get("failing_command") is None)
         ):
             # Auto-clear stale failing_command when becoming a feature
             old_fc = row.failing_command
