@@ -13,8 +13,8 @@ import threading
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text as sa_text
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, ensure_tracker_schema
 from cli_agent_orchestrator.services import issue_tracker as tracker
@@ -23,11 +23,14 @@ from cli_agent_orchestrator.services.issue_tracker import TrackerError
 
 @pytest.fixture(autouse=True)
 def db(tmp_path, monkeypatch):
-    engine = create_engine(f"sqlite:///{tmp_path}/gates.db", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        f"sqlite:///{tmp_path}/gates.db", connect_args={"check_same_thread": False}
+    )
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(tracker, "SessionLocal", sessionmaker(bind=engine))
     # also patch the database module's engine for migration tests
     import cli_agent_orchestrator.clients.database as dbmod
+
     monkeypatch.setattr(dbmod, "engine", engine)
     yield engine
     engine.dispose()
@@ -54,11 +57,17 @@ def cao_system(tmp_path):
 class TestSchemaMigration:
     def test_fresh_db_has_kind_column_and_index(self, db):
         from cli_agent_orchestrator.clients.database import ensure_tracker_schema
+
         ensure_tracker_schema()
         with db.connect() as conn:
             cols = {row[1] for row in conn.execute(sa_text("PRAGMA table_info(tracker_issues)"))}
             assert "kind" in cols
-            idxs = [row[0] for row in conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='index'"))]
+            idxs = [
+                row[0]
+                for row in conn.execute(
+                    sa_text("SELECT name FROM sqlite_master WHERE type='index'")
+                )
+            ]
             # composite index is created by migration; either it exists or kind index exists
             assert any("kind" in name for name in idxs)
 
@@ -66,6 +75,7 @@ class TestSchemaMigration:
         # Simulate legacy db without kind column by dropping and recreating without kind is complex;
         # instead verify ensure_tracker_schema is idempotent on already-migrated db
         import cli_agent_orchestrator.clients.database as dbmod
+
         dbmod.ensure_tracker_schema()
         dbmod.ensure_tracker_schema()
         with db.connect() as conn:
@@ -77,14 +87,18 @@ class TestSchemaMigration:
         with engine.begin() as conn:
             conn.execute(sa_text("CREATE TABLE tracker_issues (bad_col TEXT)"))
         import cli_agent_orchestrator.clients.database as dbmod
+
         monkeypatch.setattr(dbmod, "engine", engine)
         with pytest.raises(RuntimeError, match="malformed"):
             dbmod._migrate_tracker_kind_column()
 
     def test_concurrent_migration_is_safe(self, tmp_path, monkeypatch):
-        engine = create_engine(f"sqlite:///{tmp_path}/conc.db", connect_args={"check_same_thread": False})
+        engine = create_engine(
+            f"sqlite:///{tmp_path}/conc.db", connect_args={"check_same_thread": False}
+        )
         Base.metadata.create_all(bind=engine)
         import cli_agent_orchestrator.clients.database as dbmod
+
         monkeypatch.setattr(dbmod, "engine", engine)
         errors = []
 
@@ -198,8 +212,12 @@ class TestImporterDryRunAndHighWatermark:
         assert len(plan["candidates"]) == 1
 
     def test_apply_high_watermark_mismatch_refuses(self, tmp_path, cao_system):
-        from cli_agent_orchestrator.services.future_improvements_import import dry_run, apply_manifest
         import json
+
+        from cli_agent_orchestrator.services.future_improvements_import import (
+            apply_manifest,
+            dry_run,
+        )
 
         source = tmp_path / "FUTURE.md"
         source.write_text("# Roadmap\n\n- **a feature**\n  body\n", encoding="utf-8")
@@ -220,23 +238,42 @@ class TestImporterDryRunAndHighWatermark:
         }
         manifest.write_text(json.dumps(data), encoding="utf-8")
         with pytest.raises(TrackerError) as exc:
-            apply_manifest(manifest_path=str(manifest), project_id="cao-system", expected_next_issue_number=9999)
-        assert "high watermark" in str(exc.value).lower() or "next_issue_number" in str(exc.value).lower()
+            apply_manifest(
+                manifest_path=str(manifest),
+                project_id="cao-system",
+                expected_next_issue_number=9999,
+            )
+        assert (
+            "high watermark" in str(exc.value).lower()
+            or "next_issue_number" in str(exc.value).lower()
+        )
         assert exc.value.code == "conflict"
 
     def test_importer_27_27_reproducibility(self, tmp_path):
         import json
         import pathlib
 
-        from cli_agent_orchestrator.services.future_improvements_import import parse_future_improvements_markdown
+        from cli_agent_orchestrator.services.future_improvements_import import (
+            parse_future_improvements_markdown,
+        )
 
-        inv_path = pathlib.Path(__file__).parents[1] / "docs" / "issues" / "feature-request-tracker" / "future-improvements-migration-inventory.json"
+        inv_path = (
+            pathlib.Path(__file__).parents[1]
+            / "docs"
+            / "issues"
+            / "feature-request-tracker"
+            / "future-improvements-migration-inventory.json"
+        )
         if not inv_path.exists():
-            inv_path = pathlib.Path("/Users/colin/Projects/cli-agent-orchestrator-worktrees/feature-request-system-spec/docs/issues/feature-request-tracker/future-improvements-migration-inventory.json")
+            inv_path = pathlib.Path(
+                "/Users/colin/Projects/cli-agent-orchestrator-worktrees/feature-request-system-spec/docs/issues/feature-request-tracker/future-improvements-migration-inventory.json"
+            )
         inv = json.loads(inv_path.read_text())
         # Collect expected migration_ids per inventory entries
         expected_ids = {e["migration_id"] for e in inv["entries"]}
-        assert len(expected_ids) == 27, f"inventory should have 27 distinct ids, got {len(expected_ids)}"
+        assert (
+            len(expected_ids) == 27
+        ), f"inventory should have 27 distinct ids, got {len(expected_ids)}"
         # For each entry, verify _migration_id reproduces it even with trailing punctuation variant
         from cli_agent_orchestrator.services.future_improvements_import import _migration_id
 
@@ -245,7 +282,9 @@ class TestImporterDryRunAndHighWatermark:
             mig = e["migration_id"]
             # Use dummy digest; for the two long titles the result is hardcoded independent of digest
             reproduced = _migration_id("0" * 64, e["source_ordinal"], title)
-            assert reproduced == mig, f"migration_id mismatch for {title!r}: {reproduced!r} != {mig!r}"
+            assert (
+                reproduced == mig
+            ), f"migration_id mismatch for {title!r}: {reproduced!r} != {mig!r}"
             # Also check with trailing period variant (parser retains ".")
             reproduced_dot = _migration_id("0" * 64, e["source_ordinal"], title + ".")
             assert reproduced_dot == mig, f"trailing-dot variant failed for {title!r}"
