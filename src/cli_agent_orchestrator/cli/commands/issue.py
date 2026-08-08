@@ -608,6 +608,7 @@ def issue_import_ledger(ledger, project_id, default_status, component, dry_run, 
 
     _emit(report, as_json, render)
 
+
 # --------------------------------------------------------------------------
 # cao feature — first-class feature requests (D5)
 # --------------------------------------------------------------------------
@@ -635,7 +636,13 @@ def _feature_line(item: Dict[str, Any]) -> str:
 @click.option("--cwd", default=None, help="filing site (default: this directory)")
 @click.option("--session", "session_name", default=None)
 @click.option("--alias", default=None, help="a project_id-kind scope value")
-@click.option("--priority", "severity", type=click.Choice(tracker.SEVERITIES), default="unset", help="P0..P4|unset")
+@click.option(
+    "--priority",
+    "severity",
+    type=click.Choice(tracker.SEVERITIES),
+    default="unset",
+    help="P0..P4|unset",
+)
 @click.option("--status", type=click.Choice(tracker.STATUSES), default="open")
 @click.option("--component", default=None)
 @click.option("--requester", default=None, help="who requested this feature")
@@ -644,7 +651,24 @@ def _feature_line(item: Dict[str, Any]) -> str:
 @click.option("--evidence", default=None, help="absolute path to supporting material")
 @click.option("--key", default=None, help="explicit key (migration only)")
 @click.option("--json", "as_json", is_flag=True)
-def feature_file(title, body, body_file, project_id, cwd, session_name, alias, severity, status, component, requester, assignee, labels, evidence, key, as_json):
+def feature_file(
+    title,
+    body,
+    body_file,
+    project_id,
+    cwd,
+    session_name,
+    alias,
+    severity,
+    status,
+    component,
+    requester,
+    assignee,
+    labels,
+    evidence,
+    key,
+    as_json,
+):
     """File a feature request against a project."""
     if body_file:
         with open(body_file, encoding="utf-8") as handle:
@@ -671,8 +695,10 @@ def feature_file(title, body, body_file, project_id, cwd, session_name, alias, s
         )
     except TrackerError as exc:
         _fail(exc)
+
     def render(row):
         click.echo(f"created {row['key']} in {row['project_id']} — {row['title']}")
+
     _emit(row, as_json, render)
 
 
@@ -688,9 +714,27 @@ def feature_file(title, body, body_file, project_id, cwd, session_name, alias, s
 @click.option("--open-only", is_flag=True, default=False)
 @click.option("--limit", default=100, type=int)
 @click.option("--offset", default=0, type=int)
-@click.option("--order", default="created_desc", type=click.Choice(["created_desc","created_asc","updated_desc","severity","key"]))
+@click.option(
+    "--order",
+    default="created_desc",
+    type=click.Choice(["created_desc", "created_asc", "updated_desc", "severity", "key"]),
+)
 @click.option("--json", "as_json", is_flag=True)
-def feature_list(project_id, status_filter, severity, component, assignee, reporter, label, query, open_only, limit, offset, order, as_json):
+def feature_list(
+    project_id,
+    status_filter,
+    severity,
+    component,
+    assignee,
+    reporter,
+    label,
+    query,
+    open_only,
+    limit,
+    offset,
+    order,
+    as_json,
+):
     """List feature requests."""
     try:
         page = tracker.list_features(
@@ -709,13 +753,17 @@ def feature_list(project_id, status_filter, severity, component, assignee, repor
         )
     except TrackerError as exc:
         _fail(exc)
+
     def render(page):
         if not page["issues"]:
             click.echo("no feature requests")
             return
         for item in page["issues"]:
             click.echo(_feature_line(item))
-        click.echo(f"\n{page['total']} total / showing {len(page['issues'])} from offset {page['offset']}")
+        click.echo(
+            f"\n{page['total']} total / showing {len(page['issues'])} from offset {page['offset']}"
+        )
+
     _emit(page, as_json, render)
 
 
@@ -727,12 +775,17 @@ def feature_show(feature_key, as_json):
     try:
         row = tracker.get_issue(feature_key)
         if row.get("kind") != "feature":
-            raise TrackerError("not-found", f"no such feature: {feature_key} (found kind={row.get('kind')})")
+            raise TrackerError(
+                "not-found", f"no such feature: {feature_key} (found kind={row.get('kind')})"
+            )
     except TrackerError as exc:
         _fail(exc)
+
     def render(row):
         click.echo(f"{row['key']} — {row['title']} [{row['status']}]")
-        click.echo(f"  kind: {row['kind']}  priority: {row['severity']}  component: {row['component'] or '-'}")
+        click.echo(
+            f"  kind: {row['kind']}  priority: {row['severity']}  component: {row['component'] or '-'}"
+        )
         click.echo(f"  requester: {row['reporter'] or '-'}  owner: {row['assignee'] or '-'}")
         if row["body"]:
             click.echo(f"\n{row['body']}")
@@ -740,6 +793,7 @@ def feature_show(feature_key, as_json):
             click.echo(f"\nevidence: {row['evidence']}")
         if row["labels"]:
             click.echo(f"labels: {', '.join(row['labels'])}")
+
     _emit(row, as_json, render)
 
 
@@ -791,7 +845,13 @@ def feature_edit(feature_key, body_file, labels, actor, as_json, **fields):
 @feature.command(name="close")
 @click.argument("feature_key")
 @click.option("--outcome", "resolution", default=None)
-@click.option("--status", "final_status", type=click.Choice(["closed","wontfix","duplicate"]), default="closed", help="shipped|declined|duplicate")
+@click.option(
+    "--status",
+    "final_status",
+    type=click.Choice(["closed", "wontfix", "duplicate"]),
+    default="closed",
+    help="shipped|declined|duplicate",
+)
 @click.option("--actor", default=None)
 @click.option("--json", "as_json", is_flag=True)
 def feature_close(feature_key, resolution, final_status, actor, as_json):
@@ -800,7 +860,9 @@ def feature_close(feature_key, resolution, final_status, actor, as_json):
         existing = tracker.get_issue(feature_key)
         if existing.get("kind") != "feature":
             raise TrackerError("not-found", f"no such feature: {feature_key}")
-        row = tracker.update_issue(feature_key, actor=actor, status=final_status, resolution=resolution)
+        row = tracker.update_issue(
+            feature_key, actor=actor, status=final_status, resolution=resolution
+        )
     except TrackerError as exc:
         _fail(exc)
     _emit(row, as_json, lambda r: click.echo(f"closed {r['key']} as {r['status']}"))
@@ -876,12 +938,14 @@ def feature_stats(project_id, as_json):
         row = tracker.stats(project_id, kind="feature")
     except TrackerError as exc:
         _fail(exc)
+
     def render(row):
         click.echo(f"{row['open']} open / {row['total']} total (features)")
         for heading, key in (("status", "by_status"), ("priority", "by_severity")):
             click.echo(f"  by {heading}:")
             for name, count in sorted(row[key].items(), key=lambda kv: (-kv[1], kv[0])):
                 click.echo(f"    {name:<14} {count}")
+
     _emit(row, as_json, render)
 
 
@@ -893,12 +957,30 @@ def feature_stats(project_id, as_json):
 @click.option("--project", "project_id", default="cao-system")
 @click.option("--expected-source-sha256", default=None)
 @click.option("--expected-supplement-sha256", default=None)
-@click.option("--expected-next-issue-number", type=int, default=None, help="expected project high-watermark (next_issue_number) for idempotency check")
+@click.option(
+    "--expected-next-issue-number",
+    type=int,
+    default=None,
+    help="expected project high-watermark (next_issue_number) for idempotency check",
+)
 @click.option("--dry-run", is_flag=True)
 @click.option("--apply", "do_apply", is_flag=True)
 @click.option("--yes", is_flag=True)
 @click.option("--json", "as_json", is_flag=True)
-def feature_import_future_improvements(source_path, supplement_path, manifest_path, inventory_out, project_id, expected_source_sha256, expected_supplement_sha256, expected_next_issue_number, dry_run, do_apply, yes, as_json):
+def feature_import_future_improvements(
+    source_path,
+    supplement_path,
+    manifest_path,
+    inventory_out,
+    project_id,
+    expected_source_sha256,
+    expected_supplement_sha256,
+    expected_next_issue_number,
+    dry_run,
+    do_apply,
+    yes,
+    as_json,
+):
     """Import FUTURE_IMPROVEMENTS roadmap — planning (dry-run) or apply via manifest.
 
     Planning (--dry-run or default) parses --source (+ --supplement) into
@@ -906,7 +988,10 @@ def feature_import_future_improvements(source_path, supplement_path, manifest_pa
     --yes) validates digests, high-watermark, and applies transactionally
     with an atomic receipt.
     """
-    from cli_agent_orchestrator.services.future_improvements_import import dry_run as _dry_run, apply_manifest
+    from cli_agent_orchestrator.services.future_improvements_import import (
+        apply_manifest,
+    )
+    from cli_agent_orchestrator.services.future_improvements_import import dry_run as _dry_run
 
     # Planning mode: --dry-run or not --apply — dry_run must not create tracker state (P1)
     if dry_run or not do_apply:
@@ -926,10 +1011,16 @@ def feature_import_future_improvements(source_path, supplement_path, manifest_pa
             _fail(exc)
         if inventory_out:
             click.echo(f"wrote plan to {inventory_out} (sha {plan.get('source_sha256','')[:12]})")
+
         def render(plan):
-            click.echo(f"dry-run: {len(plan.get('candidates', []))} candidate(s) from {plan.get('source_path')} sha {plan.get('source_sha256','')[:12]}")
+            click.echo(
+                f"dry-run: {len(plan.get('candidates', []))} candidate(s) from {plan.get('source_path')} sha {plan.get('source_sha256','')[:12]}"
+            )
             if plan.get("supplement_path"):
-                click.echo(f"  supplement: {plan.get('supplement_path')} sha {str(plan.get('supplement_sha256',''))[:12]}")
+                click.echo(
+                    f"  supplement: {plan.get('supplement_path')} sha {str(plan.get('supplement_sha256',''))[:12]}"
+                )
+
         _emit(plan, as_json, render)
         return
     # Apply mode
@@ -950,7 +1041,11 @@ def feature_import_future_improvements(source_path, supplement_path, manifest_pa
         )
     except TrackerError as exc:
         _fail(exc)
+
     def render_receipt(r):
-        click.echo(f"applied {r['candidate_count']} candidate(s) -> {len([m for m in r['mappings'] if m['key']])} keys; receipt {r['receipt_path']} tx {r['transaction_id'][:8]}")
+        click.echo(
+            f"applied {r['candidate_count']} candidate(s) -> {len([m for m in r['mappings'] if m['key']])} keys; receipt {r['receipt_path']} tx {r['transaction_id'][:8]}"
+        )
         click.echo(f"  before {r['before_next_issue_number']} after {r['after_next_issue_number']}")
+
     _emit(receipt, as_json, render_receipt)

@@ -923,11 +923,21 @@ def _migrate_tracker_kind_column() -> None:
                 raise RuntimeError("tracker_issues table is malformed: missing expected columns")
             if "kind" in cols:
                 # Ensure index exists even if column already present
-                conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"))
+                conn.execute(
+                    sa_text(
+                        "CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"
+                    )
+                )
                 return
             # Column missing — add it with default within same transaction
-            conn.execute(sa_text("ALTER TABLE tracker_issues ADD COLUMN kind TEXT NOT NULL DEFAULT 'issue'"))
-            conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"))
+            conn.execute(
+                sa_text("ALTER TABLE tracker_issues ADD COLUMN kind TEXT NOT NULL DEFAULT 'issue'")
+            )
+            conn.execute(
+                sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"
+                )
+            )
     except Exception as exc:
         # Fail-closed: upgraded ORM cannot query without column
         raise RuntimeError(f"tracker kind migration failed: {exc}") from exc

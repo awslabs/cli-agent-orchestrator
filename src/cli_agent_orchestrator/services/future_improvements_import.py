@@ -96,7 +96,7 @@ def _migration_id(digest: str, ordinal: int, title: str) -> str:
         return base_slug
     h = digest[:8]
     keep = 60 - 1 - 8
-    return f"{base_slug[:keep]}-{h}" 
+    return f"{base_slug[:keep]}-{h}"
 
 
 def _provenance_label(migration_id: str) -> str:
@@ -108,15 +108,33 @@ def _provenance_label(migration_id: str) -> str:
     return f"migration:{truncated}-{h}"
 
 
-def _row_digest(title: str, body: str, priority: str, status: str, labels: List[str], component: Optional[str]=None, reporter: Optional[str]=None, assignee: Optional[str]=None, evidence: Optional[str]=None, resolution: Optional[str]=None, duplicate_of: Optional[str]=None) -> str:
+def _row_digest(
+    title: str,
+    body: str,
+    priority: str,
+    status: str,
+    labels: List[str],
+    component: Optional[str] = None,
+    reporter: Optional[str] = None,
+    assignee: Optional[str] = None,
+    evidence: Optional[str] = None,
+    resolution: Optional[str] = None,
+    duplicate_of: Optional[str] = None,
+) -> str:
     payload = json.dumps(
-        {"title": title, "body": body, "priority": priority, "status": status, "labels": sorted(labels),
+        {
+            "title": title,
+            "body": body,
+            "priority": priority,
+            "status": status,
+            "labels": sorted(labels),
             "component": component,
             "reporter": reporter,
             "assignee": assignee,
             "evidence": evidence,
             "resolution": resolution,
-            "duplicate_of": duplicate_of},
+            "duplicate_of": duplicate_of,
+        },
         sort_keys=True,
         ensure_ascii=False,
     )
@@ -126,6 +144,7 @@ def _row_digest(title: str, body: str, priority: str, status: str, labels: List[
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
+
 
 def parse_future_improvements_markdown(
     text: str, source_sha256: str, source_class: str = "canonical"
@@ -166,7 +185,7 @@ def parse_future_improvements_markdown(
             ordinal += 1
             # Collect title until closing **
             # Rest after "- **"
-            rest = line[len(_BULLET_PREFIX):]  # after "- **"
+            rest = line[len(_BULLET_PREFIX) :]  # after "- **"
             title = None
             body_start_remainder = ""
             title_end_line_idx = i
@@ -297,6 +316,7 @@ def parse_source_file(path: str) -> Tuple[List[Dict[str, Any]], str]:
 # Manifest validation
 # ---------------------------------------------------------------------------
 
+
 def _load_manifest(path: str) -> Tuple[Dict[str, Any], str]:
     p = Path(path)
     if not p.is_file():
@@ -326,8 +346,14 @@ def validate_manifest(
 ) -> None:
     """Validate manifest invariants, raising TrackerError on refusal."""
     # Source/supplement sha256 binding
-    source_sha = manifest.get("source_sha256") or manifest.get("source_sha") or manifest.get("source_digest")
-    supplement_sha = manifest.get("supplement_sha256") or manifest.get("supplement_sha") or manifest.get("supplement_digest")
+    source_sha = (
+        manifest.get("source_sha256") or manifest.get("source_sha") or manifest.get("source_digest")
+    )
+    supplement_sha = (
+        manifest.get("supplement_sha256")
+        or manifest.get("supplement_sha")
+        or manifest.get("supplement_digest")
+    )
 
     if expected_source_sha256 is not None:
         if source_sha != expected_source_sha256:
@@ -360,30 +386,53 @@ def validate_manifest(
         # P0-2: proposed_action is review prompt, not approval — require explicit action
         if not action:
             if cand.get("proposed_action"):
-                raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} has only proposed_action {cand.get('proposed_action')!r}: explicit action required")
-            raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} missing action")
+                raise TrackerError(
+                    "invalid",
+                    f"candidate {cand.get('migration_id', idx)} has only proposed_action {cand.get('proposed_action')!r}: explicit action required",
+                )
+            raise TrackerError(
+                "invalid", f"candidate {cand.get('migration_id', idx)} missing action"
+            )
         if action not in VALID_ACTIONS:
             # Also refuse needs-current-source-adjudication
             if action == ADJUDICATION_SENTINEL or ADJUDICATION_SENTINEL in str(action):
-                raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} requires adjudication: {action}")
-            raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} has invalid action {action!r}")
+                raise TrackerError(
+                    "invalid",
+                    f"candidate {cand.get('migration_id', idx)} requires adjudication: {action}",
+                )
+            raise TrackerError(
+                "invalid",
+                f"candidate {cand.get('migration_id', idx)} has invalid action {action!r}",
+            )
         # P1: terminal/skip/map complete validation
         if action == "create-terminal-feature":
             term_status = cand.get("status") or cand.get("proposed_status") or ""
             if term_status not in tracker.TERMINAL_STATUSES:
-                raise TrackerError("invalid", f"create-terminal-feature {cand.get('migration_id', idx)!r} requires terminal status, got {term_status!r}")
+                raise TrackerError(
+                    "invalid",
+                    f"create-terminal-feature {cand.get('migration_id', idx)!r} requires terminal status, got {term_status!r}",
+                )
             if not cand.get("resolution") and not cand.get("outcome"):
-                raise TrackerError("invalid", f"create-terminal-feature {cand.get('migration_id', idx)!r} requires resolution/outcome")
+                raise TrackerError(
+                    "invalid",
+                    f"create-terminal-feature {cand.get('migration_id', idx)!r} requires resolution/outcome",
+                )
             if not cand.get("labels") or "terminal" not in str(cand.get("labels")).lower():
                 # allow but warn - not required
                 pass
         if action == "skip-invalid":
             if not cand.get("skip_reason") and not cand.get("rationale") and not cand.get("reason"):
-                raise TrackerError("invalid", f"skip-invalid {cand.get('migration_id', idx)!r} requires rationale/skip_reason")
+                raise TrackerError(
+                    "invalid",
+                    f"skip-invalid {cand.get('migration_id', idx)!r} requires rationale/skip_reason",
+                )
         # Check labels contain sentinel
         labels = cand.get("labels") or []
         if isinstance(labels, list) and ADJUDICATION_SENTINEL in labels:
-            raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} carries {ADJUDICATION_SENTINEL} and requires adjudication")
+            raise TrackerError(
+                "invalid",
+                f"candidate {cand.get('migration_id', idx)} carries {ADJUDICATION_SENTINEL} and requires adjudication",
+            )
         # If action is map-existing / relate-existing, canonical key must exist
         if action in ("map-existing", "relate-existing"):
             canonical = cand.get("canonical_key") or cand.get("map_to") or cand.get("existing_key")
@@ -391,22 +440,35 @@ def validate_manifest(
             related = cand.get("related_keys") or cand.get("referenced_issue_keys") or []
             # For map-existing, canonical is required
             if action == "map-existing" and not canonical:
-                raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} action map-existing requires canonical_key")
+                raise TrackerError(
+                    "invalid",
+                    f"candidate {cand.get('migration_id', idx)} action map-existing requires canonical_key",
+                )
             # Validate existence will be checked at apply time against DB, but we can check here if DB available
             # We do a lightweight check: if canonical provided, verify it exists (if project exists)
             # This is best-effort at validation time; apply will recheck under transaction
             if canonical:
                 # Check format is like prefix-number
                 if not re.match(r"^[a-z][a-z0-9-]{0,15}-\d{1,9}$", str(canonical).lower()):
-                    raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} has invalid canonical_key {canonical!r}")
+                    raise TrackerError(
+                        "invalid",
+                        f"candidate {cand.get('migration_id', idx)} has invalid canonical_key {canonical!r}",
+                    )
                 # Check existence in DB (if SessionLocal works)
                 try:
                     from cli_agent_orchestrator.clients.database import TrackerIssueModel
 
                     with tracker.SessionLocal() as db:
-                        exists = db.query(TrackerIssueModel).filter(TrackerIssueModel.key == str(canonical).lower()).first()
+                        exists = (
+                            db.query(TrackerIssueModel)
+                            .filter(TrackerIssueModel.key == str(canonical).lower())
+                            .first()
+                        )
                         if exists is None:
-                            raise TrackerError("not-found", f"candidate {cand.get('migration_id', idx)} canonical_key {canonical!r} does not exist")
+                            raise TrackerError(
+                                "not-found",
+                                f"candidate {cand.get('migration_id', idx)} canonical_key {canonical!r} does not exist",
+                            )
                 except TrackerError:
                     raise
                 except Exception:
@@ -416,7 +478,10 @@ def validate_manifest(
             if related:
                 for rk in related:
                     if not re.match(r"^[a-z][a-z0-9-]{0,15}-\d{1,9}$", str(rk).lower()):
-                        raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} has invalid related key {rk!r}")
+                        raise TrackerError(
+                            "invalid",
+                            f"candidate {cand.get('migration_id', idx)} has invalid related key {rk!r}",
+                        )
 
     # Source/supplement binding: if manifest has no source_sha at all, refuse? We already checked expected, but also require source_sha to be present
     if source_sha is None:
@@ -426,6 +491,7 @@ def validate_manifest(
 # ---------------------------------------------------------------------------
 # Receipt helpers
 # ---------------------------------------------------------------------------
+
 
 def _write_atomic_receipt(receipt: Dict[str, Any], receipt_path: Path) -> None:
     """Write receipt atomically; no secrets."""
@@ -442,6 +508,7 @@ def _write_atomic_receipt(receipt: Dict[str, Any], receipt_path: Path) -> None:
 # Dry-run (planning) — read-only
 # ---------------------------------------------------------------------------
 
+
 def dry_run(
     source_path: str,
     supplement_path: Optional[str] = None,
@@ -454,7 +521,10 @@ def dry_run(
     # Parse source
     source_candidates, source_sha = parse_source_file(source_path)
     if expected_source_sha256 and source_sha != expected_source_sha256:
-        raise TrackerError("conflict", f"source sha256 mismatch: got {source_sha} expected {expected_source_sha256}")
+        raise TrackerError(
+            "conflict",
+            f"source sha256 mismatch: got {source_sha} expected {expected_source_sha256}",
+        )
 
     supplement_sha: Optional[str] = None
     supplement_candidates: List[Dict[str, Any]] = []
@@ -462,7 +532,10 @@ def dry_run(
         sup_cands, sup_sha = parse_source_file(supplement_path)
         supplement_sha = sup_sha
         if expected_supplement_sha256 and supplement_sha != expected_supplement_sha256:
-            raise TrackerError("conflict", f"supplement sha256 mismatch: got {supplement_sha} expected {expected_supplement_sha256}")
+            raise TrackerError(
+                "conflict",
+                f"supplement sha256 mismatch: got {supplement_sha} expected {expected_supplement_sha256}",
+            )
         # Deduplicate supplement against source by normalized title — keep only 5 truly new supplement titles
         # Historical worktree variants are not in supplement; they are separate aliases handled via inventory, not via supplement dedup
         source_titles = {c["title"].strip().lower() for c in source_candidates}
@@ -471,8 +544,8 @@ def dry_run(
                 continue
                 # Reassign source_class and keep supplement sha
             cand["source_class"] = "dirty-working-copy-supplement"
-                # Recompute migration_id using supplement sha and new ordinal
-                # But we want stable ordinal overall: append after source
+            # Recompute migration_id using supplement sha and new ordinal
+            # But we want stable ordinal overall: append after source
             cand["ordinal"] = len(source_candidates) + len(supplement_candidates) + 1
             cand["migration_id"] = _migration_id(supplement_sha, cand["ordinal"], cand["title"])
             cand["provenance_label"] = _provenance_label(cand["migration_id"])
@@ -514,7 +587,9 @@ def dry_run(
         out_path = Path(inventory_out)
         # Validate no secrets in output
         tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(plan, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(plan, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8"
+        )
         tmp.replace(out_path)
 
     # Ensure dry-run did not touch DB: we never opened a SessionLocal for writes
@@ -524,6 +599,7 @@ def dry_run(
 # ---------------------------------------------------------------------------
 # Apply — one transaction, idempotent
 # ---------------------------------------------------------------------------
+
 
 def apply_manifest(
     manifest_path: str,
@@ -547,10 +623,18 @@ def apply_manifest(
 
     # Also enforce that manifest project matches requested project
     manifest_project = manifest.get("project") or manifest.get("target_project")
-    if manifest_project is not None and str(manifest_project).strip().lower() != str(project_id).strip().lower():
-        raise TrackerError("invalid", f"manifest target_project {manifest_project!r} does not match requested {project_id!r}")
+    if (
+        manifest_project is not None
+        and str(manifest_project).strip().lower() != str(project_id).strip().lower()
+    ):
+        raise TrackerError(
+            "invalid",
+            f"manifest target_project {manifest_project!r} does not match requested {project_id!r}",
+        )
     if manifest_project is None:
-        raise TrackerError("invalid", f"manifest missing target_project/project: expected {project_id!r}")
+        raise TrackerError(
+            "invalid", f"manifest missing target_project/project: expected {project_id!r}"
+        )
 
     candidates = manifest.get("candidates") or manifest.get("entries") or []
     source_sha = manifest.get("source_sha256") or manifest.get("source_sha")
@@ -565,7 +649,12 @@ def apply_manifest(
 
     # We need to handle idempotency via migration label lookup
     # We will perform all DB work in one transaction using the DB connection directly
-    from cli_agent_orchestrator.clients.database import TrackerIssueModel, TrackerProjectModel, TrackerEventModel, TrackerLinkModel
+    from cli_agent_orchestrator.clients.database import (
+        TrackerEventModel,
+        TrackerIssueModel,
+        TrackerLinkModel,
+        TrackerProjectModel,
+    )
 
     # Helper to find existing by migration label
     def _find_existing_by_migration(db: Any, mig_id: str) -> Optional[Any]:
@@ -573,7 +662,11 @@ def apply_manifest(
         # Labels are stored as JSON array in TrackerIssueModel.labels
         # Search via LIKE
         pattern = f'%"{label}"%'
-        row = db.query(TrackerIssueModel).filter(TrackerIssueModel.labels.like(pattern, escape="\\")).first()
+        row = (
+            db.query(TrackerIssueModel)
+            .filter(TrackerIssueModel.labels.like(pattern, escape="\\"))
+            .first()
+        )
         # If multiple, return first; ideally unique
         if row:
             return row
@@ -588,28 +681,44 @@ def apply_manifest(
             if project is None:
                 raise TrackerError("not-found", f"no such project: {project_id}")
             before_counter = int(project.next_issue_number or 1)
-            if expected_next_issue_number is not None and before_counter != int(expected_next_issue_number):
-                raise TrackerError("conflict", f"high watermark mismatch: expected next_issue_number {expected_next_issue_number} but current is {before_counter}: concurrent allocation or stale manifest")
+            if expected_next_issue_number is not None and before_counter != int(
+                expected_next_issue_number
+            ):
+                raise TrackerError(
+                    "conflict",
+                    f"high watermark mismatch: expected next_issue_number {expected_next_issue_number} but current is {before_counter}: concurrent allocation or stale manifest",
+                )
 
             # We will track created keys to handle links after creation
             created_map: Dict[str, str] = {}  # migration_id -> key
 
             for cand in candidates:
-                mig_id = cand.get("migration_id") or cand.get("migrationId") or str(cand.get("ordinal", ""))
+                mig_id = (
+                    cand.get("migration_id")
+                    or cand.get("migrationId")
+                    or str(cand.get("ordinal", ""))
+                )
                 if not mig_id:
                     raise TrackerError("invalid", "candidate missing migration_id")
                 action = cand.get("action")
                 if not action and cand.get("proposed_action"):
-                    raise TrackerError("invalid", f"candidate {cand.get('migration_id', '?')} has only proposed_action: explicit action required")
+                    raise TrackerError(
+                        "invalid",
+                        f"candidate {cand.get('migration_id', '?')} has only proposed_action: explicit action required",
+                    )
                 title = cand.get("title") or ""
                 body = cand.get("body") or ""
                 priority = cand.get("priority") or cand.get("severity") or "unset"
                 if priority not in tracker.SEVERITIES:
-                    raise TrackerError("invalid", f"candidate {mig_id!r} has invalid priority {priority!r}")
+                    raise TrackerError(
+                        "invalid", f"candidate {mig_id!r} has invalid priority {priority!r}"
+                    )
                 status = cand.get("status") or cand.get("proposed_status") or "open"
                 # Normalize status
                 if status not in tracker.STATUSES:
-                    raise TrackerError("invalid", f"candidate {mig_id!r} has invalid status {status!r}")
+                    raise TrackerError(
+                        "invalid", f"candidate {mig_id!r} has invalid status {status!r}"
+                    )
                 labels = cand.get("labels") or []
                 # Ensure migration label is present and bounded
                 mig_label = _provenance_label(mig_id)
@@ -631,11 +740,25 @@ def apply_manifest(
                 labels = tracker.normalise_labels(labels)
 
                 # Compute digest for conflict detection
-                digest = _row_digest(title, body, priority, status, labels, component=cand.get("component"), reporter=cand.get("reporter") or cand.get("requester"), assignee=cand.get("assignee") or cand.get("owner"), evidence=cand.get("evidence"), resolution=cand.get("resolution") or cand.get("outcome"), duplicate_of=cand.get("duplicate_of") or cand.get("canonical_key"))
+                digest = _row_digest(
+                    title,
+                    body,
+                    priority,
+                    status,
+                    labels,
+                    component=cand.get("component"),
+                    reporter=cand.get("reporter") or cand.get("requester"),
+                    assignee=cand.get("assignee") or cand.get("owner"),
+                    evidence=cand.get("evidence"),
+                    resolution=cand.get("resolution") or cand.get("outcome"),
+                    duplicate_of=cand.get("duplicate_of") or cand.get("canonical_key"),
+                )
 
                 # Idempotency check: does a row with this migration label already exist?
                 existing = _find_existing_by_migration(db, mig_id)
-                canonical_key = cand.get("canonical_key") or cand.get("map_to") or cand.get("existing_key")
+                canonical_key = (
+                    cand.get("canonical_key") or cand.get("map_to") or cand.get("existing_key")
+                )
                 related_keys = cand.get("related_keys") or cand.get("referenced_issue_keys") or []
                 if isinstance(related_keys, str):
                     related_keys = [related_keys]
@@ -644,7 +767,19 @@ def apply_manifest(
                     if existing is not None:
                         # Verify bytes match; if not, conflict
                         existing_labels = json.loads(existing.labels) if existing.labels else []
-                        existing_digest = _row_digest(existing.title or "", existing.body or "", existing.severity or "unset", existing.status or "open", existing_labels, component=existing.component, reporter=existing.reporter, assignee=existing.assignee, evidence=existing.evidence, resolution=existing.resolution, duplicate_of=existing.duplicate_of)
+                        existing_digest = _row_digest(
+                            existing.title or "",
+                            existing.body or "",
+                            existing.severity or "unset",
+                            existing.status or "open",
+                            existing_labels,
+                            component=existing.component,
+                            reporter=existing.reporter,
+                            assignee=existing.assignee,
+                            evidence=existing.evidence,
+                            resolution=existing.resolution,
+                            duplicate_of=existing.duplicate_of,
+                        )
                         # Compare digest of stored row vs candidate digest
                         # Note: existing_digest includes migration label etc., which candidate also includes, so compare
                         if existing_digest != digest:
@@ -655,14 +790,34 @@ def apply_manifest(
                             )
                         # Idempotent: reuse existing key
                         created_map[mig_id] = existing.key
-                        mappings.append({"migration_id": mig_id, "action": action, "key": existing.key, "status": "existing"})
-                        row_digests.append({"key": existing.key, "migration_id": mig_id, "digest": existing_digest})
+                        mappings.append(
+                            {
+                                "migration_id": mig_id,
+                                "action": action,
+                                "key": existing.key,
+                                "status": "existing",
+                            }
+                        )
+                        row_digests.append(
+                            {"key": existing.key, "migration_id": mig_id, "digest": existing_digest}
+                        )
                         # For relate-existing, verify links exactly match — changed replays must refuse, not silently add/mutate (P0-3)
                         if action == "relate-existing":
-                            existing_links = {r.to_key for r in db.query(TrackerLinkModel).filter(TrackerLinkModel.from_key == existing.key, TrackerLinkModel.kind == "relates").all()}
+                            existing_links = {
+                                r.to_key
+                                for r in db.query(TrackerLinkModel)
+                                .filter(
+                                    TrackerLinkModel.from_key == existing.key,
+                                    TrackerLinkModel.kind == "relates",
+                                )
+                                .all()
+                            }
                             expected_links = {str(rk).strip().lower() for rk in related_keys}
                             if existing_links != expected_links:
-                                raise TrackerError("conflict", f"replay links mismatch for {mig_id}: existing {sorted(existing_links)} vs candidate {sorted(expected_links)}")
+                                raise TrackerError(
+                                    "conflict",
+                                    f"replay links mismatch for {mig_id}: existing {sorted(existing_links)} vs candidate {sorted(expected_links)}",
+                                )
                         continue
                     # Not existing: allocate and create
                     # Use compare-and-swap allocator
@@ -677,8 +832,14 @@ def apply_manifest(
                         current = int(project.next_issue_number or 1)
                         claimed = (
                             db.query(TrackerProjectModel)
-                            .filter(TrackerProjectModel.id == project.id, TrackerProjectModel.next_issue_number == current)
-                            .update({TrackerProjectModel.next_issue_number: current + 1}, synchronize_session=False)
+                            .filter(
+                                TrackerProjectModel.id == project.id,
+                                TrackerProjectModel.next_issue_number == current,
+                            )
+                            .update(
+                                {TrackerProjectModel.next_issue_number: current + 1},
+                                synchronize_session=False,
+                            )
                         )
                         if claimed:
                             allocated_key = f"{project.issue_prefix}-{current:04d}"
@@ -731,10 +892,19 @@ def apply_manifest(
                     if action == "relate-existing" and related_keys:
                         for rk in related_keys:
                             rk_norm = str(rk).strip().lower()
-                            target = db.query(TrackerIssueModel).filter(TrackerIssueModel.key == rk_norm).first()
+                            target = (
+                                db.query(TrackerIssueModel)
+                                .filter(TrackerIssueModel.key == rk_norm)
+                                .first()
+                            )
                             if target is None:
-                                raise TrackerError("not-found", f"related key {rk_norm!r} does not exist for {mig_id}")
-                            link = TrackerLinkModel(from_key=allocated_key, to_key=rk_norm, kind="relates")
+                                raise TrackerError(
+                                    "not-found",
+                                    f"related key {rk_norm!r} does not exist for {mig_id}",
+                                )
+                            link = TrackerLinkModel(
+                                from_key=allocated_key, to_key=rk_norm, kind="relates"
+                            )
                             db.add(link)
                             db.add(
                                 TrackerEventModel(
@@ -746,30 +916,81 @@ def apply_manifest(
                                 )
                             )
                     created_map[mig_id] = allocated_key
-                    mappings.append({"migration_id": mig_id, "action": action, "key": allocated_key, "status": "created"})
-                    row_digests.append({"key": allocated_key, "migration_id": mig_id, "digest": digest})
+                    mappings.append(
+                        {
+                            "migration_id": mig_id,
+                            "action": action,
+                            "key": allocated_key,
+                            "status": "created",
+                        }
+                    )
+                    row_digests.append(
+                        {"key": allocated_key, "migration_id": mig_id, "digest": digest}
+                    )
 
                 elif action == "map-existing":
                     # No new row; attach provenance idempotently if not already
                     if not canonical_key:
-                        raise TrackerError("invalid", f"map-existing {mig_id} missing canonical_key")
+                        raise TrackerError(
+                            "invalid", f"map-existing {mig_id} missing canonical_key"
+                        )
                     cand_key = str(canonical_key).strip().lower()
                     # Verify exists
-                    existing_canonical = db.query(TrackerIssueModel).filter(TrackerIssueModel.key == cand_key).first()
+                    existing_canonical = (
+                        db.query(TrackerIssueModel)
+                        .filter(TrackerIssueModel.key == cand_key)
+                        .first()
+                    )
                     if existing_canonical is None:
-                        raise TrackerError("not-found", f"map-existing {mig_id} canonical_key {cand_key!r} does not exist")
+                        raise TrackerError(
+                            "not-found",
+                            f"map-existing {mig_id} canonical_key {cand_key!r} does not exist",
+                        )
                     # P0-3: map-existing replay must be exact — do not mutate different record or add label silently
-                    existing_labels = json.loads(existing_canonical.labels) if existing_canonical.labels else []
+                    existing_labels = (
+                        json.loads(existing_canonical.labels) if existing_canonical.labels else []
+                    )
                     # Verify canonical record is in same project and is not mutated cross-project
                     if existing_canonical.project_id != project_id:
-                        raise TrackerError("invalid", f"map-existing {mig_id} canonical {cand_key} belongs to project {existing_canonical.project_id!r}, not {project_id!r}")
+                        raise TrackerError(
+                            "invalid",
+                            f"map-existing {mig_id} canonical {cand_key} belongs to project {existing_canonical.project_id!r}, not {project_id!r}",
+                        )
                     if getattr(existing_canonical, "kind", "issue") != "feature":
-                        raise TrackerError("invalid", f"map-existing {mig_id} canonical {cand_key} is kind {getattr(existing_canonical,'kind','issue')!r}, expected feature")
+                        raise TrackerError(
+                            "invalid",
+                            f"map-existing {mig_id} canonical {cand_key} is kind {getattr(existing_canonical,'kind','issue')!r}, expected feature",
+                        )
                     # Must already carry migration label to be idempotent; otherwise this is first apply (not replay) but map-existing should only be used after explicit adjudication — we still allow it once
                     if mig_label in existing_labels:
                         # Verify idempotent — no label mutation needed, just check digest matches (already done via candidate check)
-                        mappings.append({"migration_id": mig_id, "action": action, "key": cand_key, "status": "existing"})
-                        row_digests.append({"key": cand_key, "migration_id": mig_id, "digest": _row_digest(existing_canonical.title or "", existing_canonical.body or "", existing_canonical.severity or "unset", existing_canonical.status or "open", existing_labels, component=existing_canonical.component, reporter=existing_canonical.reporter, assignee=existing_canonical.assignee, evidence=existing_canonical.evidence, resolution=existing_canonical.resolution, duplicate_of=existing_canonical.duplicate_of)})
+                        mappings.append(
+                            {
+                                "migration_id": mig_id,
+                                "action": action,
+                                "key": cand_key,
+                                "status": "existing",
+                            }
+                        )
+                        row_digests.append(
+                            {
+                                "key": cand_key,
+                                "migration_id": mig_id,
+                                "digest": _row_digest(
+                                    existing_canonical.title or "",
+                                    existing_canonical.body or "",
+                                    existing_canonical.severity or "unset",
+                                    existing_canonical.status or "open",
+                                    existing_labels,
+                                    component=existing_canonical.component,
+                                    reporter=existing_canonical.reporter,
+                                    assignee=existing_canonical.assignee,
+                                    evidence=existing_canonical.evidence,
+                                    resolution=existing_canonical.resolution,
+                                    duplicate_of=existing_canonical.duplicate_of,
+                                ),
+                            }
+                        )
                     else:
                         # First time mapping — attach label, but only if not already idempotent and not conflicting
                         # Verify that adding this label would not cause label mutation on replay with different bytes (digest already checked)
@@ -787,15 +1008,42 @@ def apply_manifest(
                                 new_value=mig_label,
                             )
                         )
-                        mappings.append({"migration_id": mig_id, "action": action, "key": cand_key, "status": "mapped"})
-                        row_digests.append({"key": cand_key, "migration_id": mig_id, "digest": _row_digest(existing_canonical.title or "", existing_canonical.body or "", existing_canonical.severity or "unset", existing_canonical.status or "open", existing_labels, component=existing_canonical.component, reporter=existing_canonical.reporter, assignee=existing_canonical.assignee, evidence=existing_canonical.evidence, resolution=existing_canonical.resolution, duplicate_of=existing_canonical.duplicate_of)})
+                        mappings.append(
+                            {
+                                "migration_id": mig_id,
+                                "action": action,
+                                "key": cand_key,
+                                "status": "mapped",
+                            }
+                        )
+                        row_digests.append(
+                            {
+                                "key": cand_key,
+                                "migration_id": mig_id,
+                                "digest": _row_digest(
+                                    existing_canonical.title or "",
+                                    existing_canonical.body or "",
+                                    existing_canonical.severity or "unset",
+                                    existing_canonical.status or "open",
+                                    existing_labels,
+                                    component=existing_canonical.component,
+                                    reporter=existing_canonical.reporter,
+                                    assignee=existing_canonical.assignee,
+                                    evidence=existing_canonical.evidence,
+                                    resolution=existing_canonical.resolution,
+                                    duplicate_of=existing_canonical.duplicate_of,
+                                ),
+                            }
+                        )
                     created_map[mig_id] = cand_key
                     # P1: map-existing must not mutate an issue record — ensure canonical is a feature or same kind? For now, warn but allow if explicitly adjudicated
                     # We already checked project match above
 
                 elif action == "skip-invalid":
                     # No row, just mapping
-                    mappings.append({"migration_id": mig_id, "action": action, "key": None, "status": "skipped"})
+                    mappings.append(
+                        {"migration_id": mig_id, "action": action, "key": None, "status": "skipped"}
+                    )
                     row_digests.append({"key": None, "migration_id": mig_id, "digest": digest})
 
                 else:
@@ -827,7 +1075,10 @@ def apply_manifest(
                 if tmp_receipt_path == Path(manifest_path):
                     tmp_receipt_path = Path(str(manifest_path) + ".receipt.json.tmp")
             tmp_receipt_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_receipt_path.write_text(json.dumps(receipt_tmp, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+            tmp_receipt_path.write_text(
+                json.dumps(receipt_tmp, indent=2, sort_keys=True, ensure_ascii=False),
+                encoding="utf-8",
+            )
             db.commit()
             # Atomically publish receipt after successful commit
             if receipt_out:
@@ -840,16 +1091,18 @@ def apply_manifest(
         except TrackerError:
             # Clean up temp receipt on failure
             try:
-                if 'tmp_receipt_path' in locals() and tmp_receipt_path.exists():
+                if "tmp_receipt_path" in locals() and tmp_receipt_path.exists():
                     tmp_receipt_path.unlink()
-            except: pass
+            except:
+                pass
             db.rollback()
             raise
         except Exception as exc:
             try:
-                if 'tmp_receipt_path' in locals() and tmp_receipt_path.exists():
+                if "tmp_receipt_path" in locals() and tmp_receipt_path.exists():
                     tmp_receipt_path.unlink()
-            except: pass
+            except:
+                pass
             db.rollback()
             raise TrackerError("invalid", f"migration failed: {exc}") from exc
 
@@ -863,10 +1116,13 @@ def apply_manifest(
 # Helpers for CLI
 # ---------------------------------------------------------------------------
 
+
 def _ensure_project_exists(project_id: str) -> None:
     try:
         tracker.get_project(project_id)
     except TrackerError as exc:
         if exc.code == "not-found":
-            raise TrackerError("not-found", f"project {project_id!r} does not exist; create it before import") from exc
+            raise TrackerError(
+                "not-found", f"project {project_id!r} does not exist; create it before import"
+            ) from exc
         raise
