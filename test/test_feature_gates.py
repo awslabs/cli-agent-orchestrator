@@ -241,6 +241,23 @@ class TestApiKindPatch:
         # service validates kind -> 400, Pydantic would also reject but service is the source of truth
         assert resp.status_code in (400, 422)
 
+    def test_null_and_empty_kind_are_noop(self, cao_system):
+        from test.api.conftest import TestClientWithHost
+
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        client = TestClientWithHost(app)
+        app.state.plugin_registry = PluginRegistry()
+        issue = tracker.create_issue(project_id="cao-system", title="null-kind")
+        for payload in [{"kind": None}, {"kind": ""}, {"kind": "  "}]:
+            resp = client.patch(f"/tracker/issues/{issue['key']}", json=payload)
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["kind"] == "issue"
+        # service-level as well
+        assert tracker.update_issue(issue["key"], kind=None)["kind"] == "issue"
+        assert tracker.update_issue(issue["key"], kind="")["kind"] == "issue"
+
 
 class TestDuplicateAndLinkInvariants:
     def test_duplicate_requires_canonical_and_kind_guard(self, cao_system):
