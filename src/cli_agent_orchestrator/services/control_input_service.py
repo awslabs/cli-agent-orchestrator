@@ -1103,13 +1103,16 @@ class ComposerObservationResult:
 
     observed: bool
     terminal_id: str
+    terminal_incarnation: Optional[str]
     terminal_generation: Optional[str]
     pane_id: str
     pane_pid: int
+    provider_process_id: Optional[str]
     provider: Optional[str]
     provider_version: Optional[str]
     execution_mode: str
     native_session_id: Optional[str]
+    session_name: Optional[str]
     submission_observed: str
     content_sha256: Optional[str] = None
     content_bytes: Optional[int] = None
@@ -1123,13 +1126,19 @@ class ComposerObservationResult:
             "protocol": COMPOSER_OBSERVATION_PROTOCOL,
             "observed": self.observed,
             "terminal_id": self.terminal_id,
+            "terminal_incarnation": self.terminal_incarnation,
             "terminal_generation": self.terminal_generation,
+            # ``pane_birth_id`` is the declarable control-identity name for
+            # the same immutable tmux pane id used to take this sample.
+            "pane_birth_id": self.pane_id,
+            "provider_process_id": self.provider_process_id,
             "pane_id": self.pane_id,
             "pane_pid": self.pane_pid,
             "provider": self.provider,
             "provider_version": self.provider_version,
             "execution_mode": self.execution_mode,
             "native_session_id": self.native_session_id,
+            "session_name": self.session_name,
             "submission_observed": self.submission_observed,
             "evidence_ref": self.evidence_ref,
         }
@@ -4798,13 +4807,16 @@ def _negative_observation(
     return ComposerObservationResult(
         observed=False,
         terminal_id=resolved.terminal_id,
+        terminal_incarnation=resolved.terminal_incarnation,
         terminal_generation=resolved.terminal_generation,
         pane_id=resolved.pane_id or "",
         pane_pid=resolved.pane_pid or 0,
+        provider_process_id=resolved.provider_process_id,
         provider=resolved.provider,
         provider_version=resolved.provider_version,
         execution_mode=resolved.execution_mode,
         native_session_id=resolved.native_session_id,
+        session_name=resolved.session_name,
         submission_observed=submission_observed,
         evidence_ref=None,
         refusal_reason=reason,
@@ -4843,13 +4855,16 @@ def observe_composer(
         return ComposerObservationResult(
             observed=False,
             terminal_id=terminal_id,
+            terminal_incarnation=None,
             terminal_generation=None,
             pane_id="",
             pane_pid=0,
+            provider_process_id=None,
             provider=None,
             provider_version=None,
             execution_mode="",
             native_session_id=None,
+            session_name=None,
             submission_observed=native_pane_input.SUBMISSION_UNKNOWN,
             refusal_reason="unknown-terminal",
             refusal_detail=f"no terminal {terminal_id!r} is known to this server",
@@ -4969,13 +4984,16 @@ def observe_composer(
                 return ComposerObservationResult(
                     observed=True,
                     terminal_id=resolved.terminal_id,
+                    terminal_incarnation=resolved.terminal_incarnation,
                     terminal_generation=resolved.terminal_generation,
                     pane_id=resolved.pane_id,
                     pane_pid=resolved.pane_pid,
+                    provider_process_id=resolved.provider_process_id,
                     provider=resolved.provider,
                     provider_version=resolved.provider_version,
                     execution_mode=resolved.execution_mode,
                     native_session_id=resolved.native_session_id,
+                    session_name=resolved.session_name,
                     submission_observed=native_pane_input.SUBMISSION_UNSUBMITTED,
                     content_sha256=observed_digest,
                     content_bytes=observed_bytes,
