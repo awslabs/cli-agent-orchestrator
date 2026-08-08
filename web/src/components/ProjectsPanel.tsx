@@ -505,7 +505,35 @@ export function ProjectsPanel() {
                 </button>
               </div>
 
-              <div className="flex flex-wrap gap-1.5">
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <span className="text-[11px] font-medium text-gray-500 mr-1">Type:</span>
+                {(['all','issue','feature'] as const).map(k => {
+                  const label = k === 'all' ? 'Both' : k === 'issue' ? `Bugs` : `Features`
+                  const count = k === 'all'
+                    ? (project.counts?.all_open ?? ((project.counts?.by_kind?.issue?.open ?? 0)+(project.counts?.by_kind?.feature?.open ?? 0)))
+                    : k === 'issue'
+                      ? (project.counts?.by_kind?.issue?.open ?? project.counts?.open ?? 0)
+                      : (project.counts?.by_kind?.feature?.open ?? 0)
+                  const active = kind === k
+                  return (
+                    <button
+                      key={k}
+                      onClick={() => handleSelectKind(k)}
+                      aria-pressed={active}
+                      aria-label={`Show ${label}`}
+                      className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded text-[11px] border transition-colors ${
+                        active
+                          ? 'bg-emerald-600 border-emerald-500 text-white'
+                          : 'border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-700'
+                      }`}
+                    >
+                      {k === 'issue' && <CircleDot size={11} />}
+                      {k === 'feature' && <Lightbulb size={11} />}
+                      {label} <span className={`ml-1 text-[10px] ${active ? 'text-emerald-200' : 'text-gray-600'}`}>{count}</span>
+                    </button>
+                  )
+                })}
+                <span className="w-px h-4 bg-gray-800 mx-2" />
                 {(vocab?.severities ?? []).map(s => (
                   <button
                     key={s}
