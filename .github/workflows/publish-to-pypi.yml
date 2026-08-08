@@ -36,7 +36,7 @@ jobs:
           npm run build
           # vite.config.ts writes directly to ../src/cli_agent_orchestrator/web_ui/
 
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@v9.0.0
 
       - name: Build
         run: uv build
@@ -46,6 +46,7 @@ jobs:
           name: dist
           path: dist/
           if-no-files-found: error
+          retention-days: 1
 
   publish-testpypi:
     name: Publish to TestPyPI
