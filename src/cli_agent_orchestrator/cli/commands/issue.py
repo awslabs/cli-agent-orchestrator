@@ -662,6 +662,8 @@ def feature_file(title, body, body_file, project_id, cwd, session_name, alias, s
             labels=labels,
             evidence=evidence,
             session_name=session_name,
+            terminal_id=None,
+            source_path=cwd,
             cwd=cwd,
             alias=alias,
             key=key,
@@ -888,16 +890,16 @@ def feature_stats(project_id, as_json):
 @click.option("--project", "project_id", default="cao-system")
 @click.option("--expected-source-sha256", default=None)
 @click.option("--expected-supplement-sha256", default=None)
+@click.option("--expected-next-issue-number", type=int, default=None, help="expected project high-watermark (next_issue_number) for idempotency check")
 @click.option("--dry-run", is_flag=True)
 @click.option("--apply", "do_apply", is_flag=True)
 @click.option("--yes", is_flag=True)
 @click.option("--json", "as_json", is_flag=True)
-def feature_import_future_improvements(source_path, supplement_path, manifest_path, inventory_out, project_id, expected_source_sha256, expected_supplement_sha256, dry_run, do_apply, yes, as_json):
+def feature_import_future_improvements(source_path, supplement_path, manifest_path, inventory_out, project_id, expected_source_sha256, expected_supplement_sha256, expected_next_issue_number, dry_run, do_apply, yes, as_json):
     """Import FUTURE_IMPROVEMENTS roadmap — planning (dry-run) or apply via manifest."""
     from cli_agent_orchestrator.services.future_improvements_import import dry_run as _dry_run, apply_manifest
 
-    ensure_tracker_schema()
-    # Planning mode: --dry-run or not --apply
+    # Planning mode: --dry-run or not --apply — dry_run must not create tracker state (P1)
     if dry_run or not do_apply:
         if not source_path:
             click.echo("dry-run requires --source", err=True)
@@ -928,12 +930,14 @@ def feature_import_future_improvements(source_path, supplement_path, manifest_pa
     if not yes:
         click.echo("pass --yes to apply", err=True)
         sys.exit(1)
+    ensure_tracker_schema()
     try:
         receipt = apply_manifest(
             manifest_path=manifest_path,
             project_id=project_id,
             expected_source_sha256=expected_source_sha256,
             expected_supplement_sha256=expected_supplement_sha256,
+            expected_next_issue_number=expected_next_issue_number,
         )
     except TrackerError as exc:
         _fail(exc)

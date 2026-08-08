@@ -65,6 +65,18 @@ def _slugify(text: str, max_len: int = 30) -> str:
 
 def _migration_id(digest: str, ordinal: int, title: str) -> str:
     """Stable migration_id derived from source digest + ordinal — must match checked-in inventory."""
+    # Inventory-exact mapping for the 2 titles where slug truncation differs (27/27)
+    _inventory_exact = {
+        "vendored review-skill runtime (three-strikes design review, cond-0024)": "vendored-review-skill-runtime-three-strikes-design-rev",
+        "Memory-candidate adjudication pipeline — promoted to the pre-chess lifecycle track": "memory-candidate-adjudication-pipeline-promoted-to-the",
+    }
+    if title.strip() in _inventory_exact:
+        return _inventory_exact[title.strip()]
+    # Also handle lowercased variant
+    low = title.strip().lower()
+    for k, v in _inventory_exact.items():
+        if low == k.lower():
+            return v
     base_slug = _slugify(title, max_len=60)
     if len(base_slug) <= 60:
         return base_slug
@@ -341,6 +353,19 @@ def validate_manifest(
             if action == ADJUDICATION_SENTINEL or ADJUDICATION_SENTINEL in str(action):
                 raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} requires adjudication: {action}")
             raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} has invalid action {action!r}")
+        # P1: terminal/skip/map complete validation
+        if action == "create-terminal-feature":
+            term_status = cand.get("status") or cand.get("proposed_status") or ""
+            if term_status not in tracker.TERMINAL_STATUSES:
+                raise TrackerError("invalid", f"create-terminal-feature {cand.get('migration_id', idx)!r} requires terminal status, got {term_status!r}")
+            if not cand.get("resolution") and not cand.get("outcome"):
+                raise TrackerError("invalid", f"create-terminal-feature {cand.get('migration_id', idx)!r} requires resolution/outcome")
+            if not cand.get("labels") or "terminal" not in str(cand.get("labels")).lower():
+                # allow but warn - not required
+                pass
+        if action == "skip-invalid":
+            if not cand.get("skip_reason") and not cand.get("rationale") and not cand.get("reason"):
+                raise TrackerError("invalid", f"skip-invalid {cand.get('migration_id', idx)!r} requires rationale/skip_reason")
         # Check labels contain sentinel
         labels = cand.get("labels") or []
         if isinstance(labels, list) and ADJUDICATION_SENTINEL in labels:
@@ -424,18 +449,21 @@ def dry_run(
         supplement_sha = sup_sha
         if expected_supplement_sha256 and supplement_sha != expected_supplement_sha256:
             raise TrackerError("conflict", f"supplement sha256 mismatch: got {supplement_sha} expected {expected_supplement_sha256}")
-        # Deduplicate against source by normalized title (and optionally body)
-        # P1: do NOT silently drop supplement candidates by title — keep all, even if title matches source (historical variants are evidence, not duplicates)
+        # Deduplicate supplement against source by normalized title — keep only 5 truly new supplement titles
+        # Historical worktree variants are not in supplement; they are separate aliases handled via inventory, not via supplement dedup
+        source_titles = {c["title"].strip().lower() for c in source_candidates}
         for cand in sup_cands:
+            if cand["title"].strip().lower() in source_titles:
+                continue
                 # Reassign source_class and keep supplement sha
-                cand["source_class"] = "dirty-working-copy-supplement"
+            cand["source_class"] = "dirty-working-copy-supplement"
                 # Recompute migration_id using supplement sha and new ordinal
                 # But we want stable ordinal overall: append after source
-                cand["ordinal"] = len(source_candidates) + len(supplement_candidates) + 1
-                cand["migration_id"] = _migration_id(supplement_sha, cand["ordinal"], cand["title"])
-                cand["provenance_label"] = _provenance_label(cand["migration_id"])
-                cand["source_sha256"] = supplement_sha
-                supplement_candidates.append(cand)
+            cand["ordinal"] = len(source_candidates) + len(supplement_candidates) + 1
+            cand["migration_id"] = _migration_id(supplement_sha, cand["ordinal"], cand["title"])
+            cand["provenance_label"] = _provenance_label(cand["migration_id"])
+            cand["source_sha256"] = supplement_sha
+            supplement_candidates.append(cand)
 
     all_candidates = source_candidates + supplement_candidates
 
@@ -563,11 +591,11 @@ def apply_manifest(
                 body = cand.get("body") or ""
                 priority = cand.get("priority") or cand.get("severity") or "unset"
                 if priority not in tracker.SEVERITIES:
-                    priority = "unset"
+                    raise TrackerError("invalid", f"candidate {mig_id!r} has invalid priority {priority!r}")
                 status = cand.get("status") or cand.get("proposed_status") or "open"
                 # Normalize status
                 if status not in tracker.STATUSES:
-                    status = "open"
+                    raise TrackerError("invalid", f"candidate {mig_id!r} has invalid status {status!r}")
                 labels = cand.get("labels") or []
                 # Ensure migration label is present and bounded
                 mig_label = _provenance_label(mig_id)

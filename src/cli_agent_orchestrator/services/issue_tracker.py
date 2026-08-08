@@ -939,6 +939,8 @@ def create_issue(
     status = _validate_choice(status, STATUSES, "status")
     severity = _validate_choice(severity, SEVERITIES, "severity")
     kind = _validate_kind(kind)
+    if status == "duplicate":
+        raise TrackerError("invalid", "duplicate status requires duplicate_of canonical key (set via update after creation)")
     if kind == "feature" and failing_command:
         raise TrackerError("invalid", "failing_command is not allowed for feature requests")
     label_list = normalise_labels(labels)
@@ -1260,6 +1262,9 @@ def update_issue(issue_key: str, *, actor: Optional[str] = None, **changes: Any)
             raise TrackerError("not-found", f"no such issue: {key}")
 
         now = _utcnow()
+        # Duplicate status requires canonical key (P1)
+        if changes.get("status") == "duplicate" and not changes.get("duplicate_of") and not getattr(row, "duplicate_of", None):
+            raise TrackerError("invalid", "duplicate status requires duplicate_of canonical key")
         is_feature = getattr(row, "kind", "issue") == "feature"
         if is_feature and "failing_command" in changes and changes["failing_command"] and str(changes["failing_command"]).strip():
             raise TrackerError("invalid", "failing_command is not allowed for feature requests")
