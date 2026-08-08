@@ -246,13 +246,20 @@ class TestPositiveObservation:
         assert body["protocol"] == COMPOSER_OBSERVATION_PROTOCOL
         assert body["observed"] is True
         assert body["terminal_id"] == TERMINAL
+        # The observation is later consumed as an identity-bound recovery
+        # proof.  Echo the declarable control identity under its exact wire
+        # names, not only the lower-level pane fields used to take the sample.
+        assert body["terminal_incarnation"] is None
         assert body["terminal_generation"] == GENERATION
+        assert body["pane_birth_id"] == PANE
+        assert body["provider_process_id"] == f"{PANE_PID}@marker-1"
         assert body["pane_id"] == PANE
         assert body["pane_pid"] == PANE_PID
         assert body["provider"] == "codex"
         assert body["provider_version"] == "0.146.0"
         assert body["execution_mode"] == EXECUTION_MODE_NATIVE_TUI
         assert body["native_session_id"] == "native-sess-1"
+        assert body["session_name"] == "cao"
         assert body["content_sha256"] == _sha256(TEXT)
         assert body["content_bytes"] == len(TEXT.encode("utf-8"))
         assert body["submission_observed"] == "unsubmitted"
@@ -332,6 +339,20 @@ class TestNegativeObservation:
         body = response.json()
         assert body["observed"] is False
         assert body["submission_observed"] == "unknown"
+        assert {
+            key: body[key]
+            for key in (
+                "terminal_id",
+                "terminal_incarnation",
+                "terminal_generation",
+                "pane_birth_id",
+                "provider_process_id",
+                "provider",
+                "native_session_id",
+                "execution_mode",
+                "session_name",
+            )
+        } == service.resolve_control_identity(TERMINAL).expected_identity_view()
 
     def test_a_byte_count_mismatch_returns_observed_false(self, client, tmux, monkeypatch):
         monkeypatch.setattr(

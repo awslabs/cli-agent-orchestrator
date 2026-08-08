@@ -191,8 +191,8 @@ route for this purpose.
   `composer_observation: {supported: bool, protocol: "cao-composer-observation-v1"}`
   only when the terminal is managed, `native_tui`, identity-resolved, and
   the provider/build has a pinned composer observation layout
-  (`control_input_service.py:4828`).  Currently pinned builds are Codex
-  0.146.0 and Kimi Code 0.29.2; an unpinned or unproven build advertises
+  (`control_input_service.py`).  Currently pinned builds are Codex
+  0.146.0 and Kimi Code 0.29.2/0.33.0; an unpinned or unproven build advertises
   `supported: false` and the route refuses with `provider-unsupported`.
 - The route resolves control identity, takes the pane-input lease, and
   re-proves the live pane/server identity under the lease exactly as the
@@ -203,9 +203,11 @@ route for this purpose.
   length exactly match the caller's expectation and submission is not
   proven to have occurred.
 - Response fields (`cao-composer-observation-v1`): `protocol`,
-  `observed`, `terminal_id`, `terminal_generation`, `pane_id`,
-  `pane_pid`, `provider`, `provider_version`, `execution_mode`,
-  `native_session_id`, `submission_observed` (`unsubmitted`/`submitted`/
+  `observed`, the complete declarable control identity (`terminal_id`,
+  `terminal_incarnation`, `terminal_generation`, `pane_birth_id`,
+  `provider_process_id`, `provider`, `native_session_id`, `execution_mode`,
+  `session_name`), the sampling fields `pane_id`, `pane_pid`, and
+  `provider_version`, `submission_observed` (`unsubmitted`/`submitted`/
   `unknown`), `content_sha256` and `content_bytes` only when
   `observed: true`, and `evidence_ref`.  Raw composer text is never
   returned or logged.  Typed refusals carry `refusal: {reason, detail}`.
