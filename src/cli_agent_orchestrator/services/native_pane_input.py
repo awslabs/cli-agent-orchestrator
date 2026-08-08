@@ -547,6 +547,16 @@ _KIMI_OBSERVATION_EVIDENCE = (
     "reuses the same pinned region as the §4.1 composer-emptiness pin."
 )
 
+_KIMI_0330_OBSERVATION_EVIDENCE = (
+    "live-verified on the installed Kimi Code 0.33.0 (cond-0332, terminal "
+    "1ca9d289): the rendered composer keeps the same untitled rounded box as "
+    "0.29.2 — '╭─╮', content rows framed by '│', a '> ' prompt, '╰─╯' — in "
+    "the bottom five rows of the native TUI pane.  The installed bundle "
+    "(sha256 0e77b9c64e67a4eecb96aae011750668aab11bd781564fe3e4855513812247b2) "
+    "attests the build.  Observation reuses the same pinned region as the §4.1 "
+    "composer-emptiness pin."
+)
+
 
 #: The per-provider+build composer observation pins.  A build appears here
 #: only when its composer layout was read; an unpinned build refuses the
@@ -566,6 +576,12 @@ _COMPOSER_OBSERVATION_PINS: dict[str, dict[str, ComposerObservationPin]] = {
             rule=_RULE_KIMI_COMPOSER_BOX,
             composer_tail_rows=5,
             evidence=_KIMI_OBSERVATION_EVIDENCE,
+        ),
+        "0.33.0": ComposerObservationPin(
+            provider="kimi_cli",
+            rule=_RULE_KIMI_COMPOSER_BOX,
+            composer_tail_rows=5,
+            evidence=_KIMI_0330_OBSERVATION_EVIDENCE,
         ),
     },
 }

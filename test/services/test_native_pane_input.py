@@ -72,6 +72,22 @@ def test_extract_composer_text_for_kimi():
     assert extracted == TEXT
 
 
+def test_extract_composer_text_for_kimi_0330():
+    # The 0.33.0 pin reuses the same rounded-box rule; extraction must still
+    # return the exact payload from a one-row composer box.
+    rows = [
+        "transcript row",
+        "╭──────────────────────────────────────────────────────╮",
+        f"│ > {TEXT} │",
+        "╰──────────────────────────────────────────────────────╯",
+        "  footer/status",
+    ]
+    pin = native_pane_input.composer_observation_pin_for("kimi_cli", "0.33.0")
+    assert pin is not None
+    extracted = extract_composer_text(rows, pin)
+    assert extracted == TEXT
+
+
 def test_extract_composer_text_returns_none_when_region_unreadable():
     rows = ["no composer here"]
     assert extract_composer_text(rows, _codex_pin()) is None
@@ -89,4 +105,9 @@ def test_composer_observation_pin_is_build_exact():
     assert native_pane_input.composer_observation_pin_for("codex", "0.145.0") is None
     assert native_pane_input.composer_observation_pin_for("kimi_cli", "0.29.2") is not None
     assert native_pane_input.composer_observation_pin_for("kimi_cli", "0.29.1") is None
+    # 0.33.0 is a separate pinned build; adjacent/unverified builds refuse.
+    assert native_pane_input.composer_observation_pin_for("kimi_cli", "0.33.0") is not None
+    assert native_pane_input.composer_observation_pin_for("kimi_cli", "0.32.0") is None
+    assert native_pane_input.composer_observation_pin_for("kimi_cli", "0.33.1") is None
+    assert native_pane_input.composer_observation_pin_for("kimi_cli", "0.34.0") is None
     assert native_pane_input.composer_observation_pin_for("claude_code", "2.1.220") is None
