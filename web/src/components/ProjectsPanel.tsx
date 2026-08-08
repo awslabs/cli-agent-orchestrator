@@ -580,6 +580,20 @@ export function ProjectsPanel() {
               ))}
             </div>
 
+            {/* Deep-link fallback: render selected issue even if closed/off-page or on another page */}
+            {selectedKey && vocab && page && !page.issues.some(i => i.key === selectedKey) && (
+              <div className="mt-4 rounded-lg border border-gray-800 overflow-hidden">
+                <div className="px-3 py-1.5 text-[11px] text-gray-500 bg-gray-900/40 border-b border-gray-800">Deep link: {selectedKey} (not in current page/filters)</div>
+                <ItemDetail
+                  issueKey={selectedKey}
+                  initialKind={kind === 'all' ? undefined : kind}
+                  vocab={vocab}
+                  onChanged={refreshAfterIssueChange}
+                  onDeleted={() => { setSelectedKey(null); refreshAfterIssueChange() }}
+                />
+              </div>
+            )}
+
             {page && page.total > PAGE_SIZE && (
               <div className="flex items-center justify-between mt-3 text-xs text-gray-500">
                 <span>
@@ -860,6 +874,8 @@ function ItemDetail({
   const [pendingDelete, setPendingDelete] = useState(false)
   const [duplicateOf, setDuplicateOf] = useState('')
   const [closingChoice, setClosingChoice] = useState('')
+  const [linkTo, setLinkTo] = useState('')
+  const [linkKind, setLinkKind] = useState('relates')
 
   const presentation = useMemo(() => presentationFor(issue?.kind ?? initialKind), [issue?.kind, initialKind])
   const isFeature = presentation.kind === 'feature'
@@ -934,6 +950,35 @@ function ItemDetail({
       await poster(issueKey, { body: comment, author: 'dashboard' })
       setComment('')
       await load()
+      await onChanged()
+    } catch (err) {
+      showSnackbar({ type: 'error', message: errorText(err) })
+    }
+  }
+
+  const addLink = async () => {
+    if (!linkTo.trim()) return
+    try {
+      const poster = isFeature ? api.addTrackerFeatureLink : api.addTrackerLink
+      await poster(issueKey, { to_key: linkTo.trim(), kind: linkKind })
+      setLinkTo('')
+      await load()
+      await onChanged()
+      showSnackbar({ type: 'success', message: `Linked ${issueKey} → ${linkTo.trim()}` })
+    } catch (err) {
+      showSnackbar({ type: 'error', message: errorText(err) })
+    }
+  }
+
+  const removeLink = async (linkId: number) => {
+    try {
+      if (isFeature) {
+        await api.removeTrackerFeatureLink(issueKey, linkId)
+      } else {
+        await api.removeTrackerLink(issueKey, linkId)
+      }
+      await load()
+      await onChanged()
     } catch (err) {
       showSnackbar({ type: 'error', message: errorText(err) })
     }
@@ -1128,16 +1173,34 @@ function ItemDetail({
         </div>
       )}
 
-      {issue.links && issue.links.length > 0 && (
-        <div className="flex flex-wrap gap-2">
-          {issue.links.map(link => (
-            <span key={link.id} className="inline-flex items-center gap-1.5 text-[11px] text-gray-400 px-2 py-1 rounded bg-gray-900 border border-gray-800">
-              <Link2 size={11} />
-              {link.from_key === issue.key ? `${link.kind} ${link.to_key}` : `${link.from_key} ${link.kind} this`}
-            </span>
-          ))}
+      <div className="space-y-2">
+        {issue.links && issue.links.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {issue.links.map(link => (
+              <span key={link.id} className="inline-flex items-center gap-1.5 text-[11px] text-gray-400 px-2 py-1 rounded bg-gray-900 border border-gray-800">
+                <Link2 size={11} />
+                {link.from_key === issue.key ? `${link.kind} ${link.to_key}` : `${link.from_key} ${link.kind} this`}
+                <button onClick={() => removeLink(link.id)} aria-label={`Remove link ${link.id}`} className="ml-1 text-gray-500 hover:text-red-400">
+                  <X size={10} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="flex gap-2">
+          <input
+            value={linkTo}
+            onChange={e => setLinkTo(e.target.value)}
+            placeholder="Link to key (e.g. cond-0042)"
+            aria-label="Link target key"
+            className="flex-1 px-3 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-200 placeholder-gray-600"
+          />
+          <select value={linkKind} onChange={e => setLinkKind(e.target.value)} aria-label="Link kind" className="px-2 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-200">
+            {vocab.link_kinds.map(k => <option key={k} value={k}>{k}</option>)}
+          </select>
+          <button onClick={addLink} disabled={!linkTo.trim()} className="px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-xs text-gray-200 disabled:opacity-40">Link</button>
         </div>
-      )}
+      </div>
 
       <div className="space-y-2">
         {(issue.comments ?? []).map(c => (

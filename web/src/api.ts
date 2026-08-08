@@ -1011,6 +1011,11 @@ export const api = {
       `/tracker/features/${encodeURIComponent(key)}/links`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
     ),
+  removeTrackerFeatureLink: (key: string, linkId: number) =>
+    fetchJSON<{ id: number; deleted: boolean }>(
+      `/tracker/features/${encodeURIComponent(key)}/links/${linkId}`,
+      { method: 'DELETE' },
+    ),
   getTrackerFeatureStats: (projectId?: string) =>
     fetchJSON<TrackerStats>(`/tracker/features/stats${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`),
 }

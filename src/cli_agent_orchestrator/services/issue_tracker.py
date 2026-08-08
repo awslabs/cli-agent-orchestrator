@@ -435,49 +435,32 @@ def list_projects(*, include_archived: bool = False) -> List[Dict[str, Any]]:
         if not include_archived:
             query = query.filter(TrackerProjectModel.status == "active")
         rows = query.order_by(TrackerProjectModel.name.asc()).all()
-        # Legacy tallies are issue-only for backward compatibility
-        tallies = dict(
-            db.query(TrackerIssueModel.project_id, func.count(TrackerIssueModel.id))
-            .filter(TrackerIssueModel.kind == "issue")
-            .group_by(TrackerIssueModel.project_id)
-            .all()
-        )
-        open_tallies = dict(
-            db.query(TrackerIssueModel.project_id, func.count(TrackerIssueModel.id))
-            .filter(TrackerIssueModel.kind == "issue")
-            .filter(TrackerIssueModel.status.notin_(tuple(TERMINAL_STATUSES)))
-            .group_by(TrackerIssueModel.project_id)
-            .all()
-        )
-        # Generic counts for new UI
-        all_tallies = dict(
-            db.query(TrackerIssueModel.project_id, func.count(TrackerIssueModel.id))
-            .group_by(TrackerIssueModel.project_id)
-            .all()
-        )
-        all_open = dict(
-            db.query(TrackerIssueModel.project_id, func.count(TrackerIssueModel.id))
-            .filter(TrackerIssueModel.status.notin_(tuple(TERMINAL_STATUSES)))
-            .group_by(TrackerIssueModel.project_id)
-            .all()
-        )
-        # Per-kind tallies for by_kind
-        by_kind_total: Dict[str, Dict[str,int]] = {}
-        by_kind_open: Dict[str, Dict[str,int]] = {}
-        for k in ITEM_KINDS:
-            by_kind_total[k] = dict(
-                db.query(TrackerIssueModel.project_id, func.count(TrackerIssueModel.id))
-                .filter(TrackerIssueModel.kind == k)
-                .group_by(TrackerIssueModel.project_id)
-                .all()
-            )
-            by_kind_open[k] = dict(
-                db.query(TrackerIssueModel.project_id, func.count(TrackerIssueModel.id))
-                .filter(TrackerIssueModel.kind == k)
-                .filter(TrackerIssueModel.status.notin_(tuple(TERMINAL_STATUSES)))
-                .group_by(TrackerIssueModel.project_id)
-                .all()
-            )
+        # Single snapshot for all counts to avoid concurrency drift (PR1-2 gate 4)
+        all_issues = db.query(TrackerIssueModel).all()
+        # Compute tallies in Python from one snapshot
+        tallies: Dict[str, int] = {}
+        open_tallies: Dict[str, int] = {}
+        all_tallies: Dict[str, int] = {}
+        all_open: Dict[str, int] = {}
+        by_kind_total: Dict[str, Dict[str,int]] = {k: {} for k in ITEM_KINDS}
+        by_kind_open: Dict[str, Dict[str,int]] = {k: {} for k in ITEM_KINDS}
+        for iss in all_issues:
+            pid = iss.project_id
+            kind = getattr(iss, "kind", "issue")
+            is_open = iss.status not in TERMINAL_STATUSES
+            # all
+            all_tallies[pid] = all_tallies.get(pid, 0) + 1
+            if is_open:
+                all_open[pid] = all_open.get(pid, 0) + 1
+            # by_kind
+            by_kind_total[kind][pid] = by_kind_total[kind].get(pid, 0) + 1
+            if is_open:
+                by_kind_open[kind][pid] = by_kind_open[kind].get(pid, 0) + 1
+            # legacy issue-only
+            if kind == "issue":
+                tallies[pid] = tallies.get(pid, 0) + 1
+                if is_open:
+                    open_tallies[pid] = open_tallies.get(pid, 0) + 1
         out = []
         for row in rows:
             counts: Dict[str, Any] = {
@@ -510,37 +493,25 @@ def get_project(project_id: str) -> Dict[str, Any]:
             .order_by(TrackerScopeModel.kind.asc(), TrackerScopeModel.value.asc())
             .all()
         )
-        by_status = dict(
-            db.query(TrackerIssueModel.status, func.count(TrackerIssueModel.id))
-            .filter(TrackerIssueModel.project_id == slug)
-            .filter(TrackerIssueModel.kind == "issue")
-            .group_by(TrackerIssueModel.status)
-            .all()
-        )
+        # Single snapshot for project stats (PR1-2 gate 4)
+        all_issues = db.query(TrackerIssueModel).filter(TrackerIssueModel.project_id == slug).all()
+        by_status: Dict[str, int] = {}
+        all_by_status: Dict[str, int] = {}
+        by_kind: Dict[str, Any] = {k: {"total":0,"open":0,"by_status":{}} for k in ITEM_KINDS}
+        for iss in all_issues:
+            kind = getattr(iss, "kind", "issue")
+            all_by_status[iss.status] = all_by_status.get(iss.status, 0) + 1
+            if kind == "issue":
+                by_status[iss.status] = by_status.get(iss.status, 0) + 1
+            # per-kind
+            sub = by_kind[kind]
+            sub["by_status"][iss.status] = sub["by_status"].get(iss.status, 0) + 1
+        for k in ITEM_KINDS:
+            sub = by_kind[k]["by_status"]
+            by_kind[k]["total"] = sum(int(v) for v in sub.values())
+            by_kind[k]["open"] = sum(int(v) for kk, v in sub.items() if kk not in TERMINAL_STATUSES)
         total = sum(int(v) for v in by_status.values())
         open_count = sum(int(v) for k, v in by_status.items() if k not in TERMINAL_STATUSES)
-        # Generic by_kind for detail view
-        by_kind: Dict[str, Any] = {}
-        for k in ITEM_KINDS:
-            sub = dict(
-                db.query(TrackerIssueModel.status, func.count(TrackerIssueModel.id))
-                .filter(TrackerIssueModel.project_id == slug)
-                .filter(TrackerIssueModel.kind == k)
-                .group_by(TrackerIssueModel.status)
-                .all()
-            )
-            by_kind[k] = {
-                "total": sum(int(v) for v in sub.values()),
-                "open": sum(int(v) for kk, v in sub.items() if kk not in TERMINAL_STATUSES),
-                "by_status": {kk: int(v) for kk, v in sub.items()},
-            }
-        # All-kinds aggregates
-        all_by_status = dict(
-            db.query(TrackerIssueModel.status, func.count(TrackerIssueModel.id))
-            .filter(TrackerIssueModel.project_id == slug)
-            .group_by(TrackerIssueModel.status)
-            .all()
-        )
         payload = _project_row(
             row,
             counts={
