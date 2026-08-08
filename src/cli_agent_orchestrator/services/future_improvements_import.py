@@ -66,16 +66,30 @@ def _slugify(text: str, max_len: int = 30) -> str:
 def _migration_id(digest: str, ordinal: int, title: str) -> str:
     """Stable migration_id derived from source digest + ordinal — must match checked-in inventory."""
     # Inventory-exact mapping for the 2 titles where slug truncation differs (27/27)
+    # Parsed titles may retain trailing punctuation (e.g. "." after "**Title.**") — strip it for lookup.
     _inventory_exact = {
         "vendored review-skill runtime (three-strikes design review, cond-0024)": "vendored-review-skill-runtime-three-strikes-design-rev",
         "Memory-candidate adjudication pipeline — promoted to the pre-chess lifecycle track": "memory-candidate-adjudication-pipeline-promoted-to-the",
     }
+
+    def _norm(t: str) -> str:
+        # Strip whitespace and trailing punctuation used in markdown bold titles
+        return re.sub(r"[\.\,\:\;\!\?\s]+$", "", t.strip())
+
+    norm_title = _norm(title)
+    if norm_title in _inventory_exact:
+        return _inventory_exact[norm_title]
+    # Also handle lowercased variant with normalized form
+    low = norm_title.lower()
+    for k, v in _inventory_exact.items():
+        if low == _norm(k).lower():
+            return v
+    # Fallback: also try raw stripped title (covers non-punctuated cases)
     if title.strip() in _inventory_exact:
         return _inventory_exact[title.strip()]
-    # Also handle lowercased variant
-    low = title.strip().lower()
+    low_raw = title.strip().lower()
     for k, v in _inventory_exact.items():
-        if low == k.lower():
+        if low_raw == k.lower():
             return v
     base_slug = _slugify(title, max_len=60)
     if len(base_slug) <= 60:

@@ -289,11 +289,15 @@ export function ProjectsPanel() {
 
   useEffect(() => { loadIssues() }, [loadIssues])
 
-  // Sync URL on project/kind/key changes
+  // Sync URL on project/kind/key changes — pushState so Back/Forward traverses history
+  const lastPushedUrlRef = useRef<string | null>(null)
   useEffect(() => {
     if (!urlSyncRef.current) {
       // Skip first render until projects have loaded, to avoid clobbering incoming URL
       urlSyncRef.current = true
+      try {
+        lastPushedUrlRef.current = window.location.pathname + window.location.search
+      } catch { /* test env */ }
       return
     }
     try {
@@ -305,7 +309,9 @@ export function ProjectsPanel() {
       else params.delete('key')
       const newSearch = params.toString()
       const newUrl = `${window.location.pathname}${newSearch ? '?' + newSearch : ''}`
-      window.history.replaceState(null, '', newUrl)
+      if (newUrl === lastPushedUrlRef.current) return
+      window.history.pushState(null, '', newUrl)
+      lastPushedUrlRef.current = newUrl
     } catch { /* test env */ }
   }, [activeId, kind, selectedKey])
 

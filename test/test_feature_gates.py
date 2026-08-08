@@ -205,33 +205,47 @@ class TestImporterDryRunAndHighWatermark:
         source.write_text("# Roadmap\n\n- **a feature**\n  body\n", encoding="utf-8")
         plan = dry_run(source_path=str(source), project_id="cao-system")
         manifest = tmp_path / "manifest.json"
-        # Build minimal manifest from dry_run output with explicit expected_next
+        # Build valid adjudicated manifest from dry_run plan: set explicit action, keep digest binding, provoke watermark mismatch
+        cand = dict(plan["candidates"][0])
+        cand["action"] = "create-feature"
+        cand["priority"] = "P2"
+        cand["status"] = "open"
+        cand["labels"] = ["roadmap", "source:future-improvements"]
+        cand["target_project"] = "cao-system"
         data = {
-            "source_path": plan["source_path"],
             "source_sha256": plan["source_sha256"],
-            "expected_next_issue_number": 9999,  # wrong high-watermark
-            "candidate_count": 1,
-            "mappings": [
-                {
-                    "migration_id": plan["candidates"][0]["migration_id"],
-                    "title": "a feature",
-                    "proposed_action": "create-feature",
-                    "target_project": "cao-system",
-                    "row_digest": plan["candidates"][0].get("row_digest") or plan["candidates"][0].get("digest") or "dummy",
-                }
-            ],
+            "project": "cao-system",
+            "target_project": "cao-system",
+            "candidates": [cand],
         }
         manifest.write_text(json.dumps(data), encoding="utf-8")
-        try:
-            apply_manifest(manifest_path=str(manifest), project_id="cao-system", expected_next_issue_number=1)
-            assert False, "should have raised"
-        except Exception as exc:
-            # any error due to high-watermark mismatch is acceptable
-            assert "next" in str(exc).lower() or "mismatch" in str(exc).lower() or "expected" in str(exc).lower() or isinstance(exc, TrackerError)
+        with pytest.raises(TrackerError) as exc:
+            apply_manifest(manifest_path=str(manifest), project_id="cao-system", expected_next_issue_number=9999)
+        assert "high watermark" in str(exc.value).lower() or "next_issue_number" in str(exc.value).lower()
+        assert exc.value.code == "conflict"
 
-    def test_importer_27_27_reproducibility(self, tmp_path, monkeypatch):
-        # Verify parser produces 27 candidates for checked-in supplement? Minimal check: hash stability
+    def test_importer_27_27_reproducibility(self, tmp_path):
+        import json
+        import pathlib
+
+        from cli_agent_orchestrator.services.future_improvements_import import parse_future_improvements_markdown
+
+        inv_path = pathlib.Path(__file__).parents[1] / "docs" / "issues" / "feature-request-tracker" / "future-improvements-migration-inventory.json"
+        if not inv_path.exists():
+            inv_path = pathlib.Path("/Users/colin/Projects/cli-agent-orchestrator-worktrees/feature-request-system-spec/docs/issues/feature-request-tracker/future-improvements-migration-inventory.json")
+        inv = json.loads(inv_path.read_text())
+        # Collect expected migration_ids per inventory entries
+        expected_ids = {e["migration_id"] for e in inv["entries"]}
+        assert len(expected_ids) == 27, f"inventory should have 27 distinct ids, got {len(expected_ids)}"
+        # For each entry, verify _migration_id reproduces it even with trailing punctuation variant
         from cli_agent_orchestrator.services.future_improvements_import import _migration_id
 
-        digest = "abc" * 20
-        assert _migration_id(digest, 0, "a title") == _migration_id(digest, 0, "a title")
+        for e in inv["entries"]:
+            title = e["title"]
+            mig = e["migration_id"]
+            # Use dummy digest; for the two long titles the result is hardcoded independent of digest
+            reproduced = _migration_id("0" * 64, e["source_ordinal"], title)
+            assert reproduced == mig, f"migration_id mismatch for {title!r}: {reproduced!r} != {mig!r}"
+            # Also check with trailing period variant (parser retains ".")
+            reproduced_dot = _migration_id("0" * 64, e["source_ordinal"], title + ".")
+            assert reproduced_dot == mig, f"trailing-dot variant failed for {title!r}"
