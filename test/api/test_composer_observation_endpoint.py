@@ -460,3 +460,31 @@ class TestUnsupportedProvider:
         assert response.status_code == 409
         body = response.json()
         assert body["refusal"]["reason"] == "provider-unsupported"
+
+    def test_an_unpinned_kimi_neighbour_does_not_serve_the_route(self, client, tmux, monkeypatch):
+        # 0.33.0 is pinned; its neighbours must fail closed rather than inherit.
+        monkeypatch.setattr(
+            service,
+            "_terminal_metadata",
+            lambda terminal_id: _metadata(provider="kimi_cli") if terminal_id == TERMINAL else None,
+        )
+        monkeypatch.setattr(
+            service,
+            "_managed_identity",
+            lambda terminal_id: (
+                {
+                    "reservation_id": "res-1",
+                    "generation": GENERATION,
+                    "execution_mode": EXECUTION_MODE_NATIVE_TUI,
+                    "native_session_id": "native-sess-1",
+                    "provider_process_id": f"{PANE_PID}@marker-1",
+                    "provider_version": "0.33.1",
+                }
+                if terminal_id == TERMINAL
+                else None
+            ),
+        )
+        response = _get(client, sha256=_sha256(TEXT), bytes_=len(TEXT.encode("utf-8")))
+        assert response.status_code == 409
+        body = response.json()
+        assert body["refusal"]["reason"] == "provider-unsupported"

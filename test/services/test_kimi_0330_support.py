@@ -59,8 +59,10 @@ from __future__ import annotations
 
 import pytest
 
+from cli_agent_orchestrator.services import control_input_service as cis
 from cli_agent_orchestrator.services import kimi_native_control as knc
 from cli_agent_orchestrator.services import kimi_native_launch as knl
+from cli_agent_orchestrator.services import native_pane_input as npi
 from cli_agent_orchestrator.services import provider_contracts as pc
 
 PIN_0330 = "0.33.0"
@@ -269,3 +271,50 @@ def test_exact_resume_forms_still_validate():
 def test_inexact_resume_forms_still_refuse(argv):
     with pytest.raises(pc.ResumeFormRefused):
         pc.validate_resume_argv("kimi", argv)
+
+
+# --------------------------------------------------------------------
+# The 0.33.0 composer-observation pin is build-exact (cond-0332)
+# --------------------------------------------------------------------
+
+
+def test_the_composer_observation_table_has_a_separate_proven_0330_entry():
+    pin = npi.composer_observation_pin_for("kimi_cli", PIN_0330)
+    assert pin is not None, "0.33.0 must be a separate keyed observation pin, never a range"
+    assert pin.provider == "kimi_cli"
+    assert pin.rule == npi._RULE_KIMI_COMPOSER_BOX
+    assert pin.composer_tail_rows == 5
+    assert BUNDLE_SHA256 in pin.evidence
+
+
+def test_0330_composer_observation_is_build_exact():
+    # Adjacent and otherwise-unverified builds must not inherit the 0.33.0 pin.
+    for version in ("0.32.0", "0.33.1", "0.34.0"):
+        assert npi.composer_observation_pin_for("kimi_cli", version) is None
+
+
+def test_0330_advertises_composer_observation_and_unpinned_neighbours_do_not():
+    resolved = cis.ResolvedControlIdentity(
+        terminal_id="1ca9d289",
+        terminal_incarnation=None,
+        terminal_generation="gen-0332",
+        provider="kimi_cli",
+        native_session_id="session_0a1c081e-e252-4e96-9932-18137717c3b9",
+        execution_mode=cis.EXECUTION_MODE_NATIVE_TUI,
+        session_name="cao",
+        provider_version=PIN_0330,
+        managed_reservation_id="681ece98-c52c-4f17-b5e3-7148df41676e",
+        pane_id="%72",
+        window_id="@1",
+        pane_pid=67059,
+        managed=True,
+    )
+    assert cis._composer_observation_supported(resolved) is None
+
+    for version in ("0.32.0", "0.33.1", "0.34.0"):
+        unsupported = cis.ResolvedControlIdentity(
+            **{**resolved.__dict__, "provider_version": version}
+        )
+        reason = cis._composer_observation_supported(unsupported)
+        assert reason is not None
+        assert "has no pinned composer observation layout" in reason
