@@ -666,7 +666,7 @@ kinds and migration from a pre-feature DB.
    history alongside Issues and All views.
 6. Projects expose backward-compatible issue counts plus explicit feature/all
    counts.
-7. Cross-kind links and audit history work; kind is immutable.
+7. Cross-kind links and audit history work; kind is mutable via PATCH with audit (switching to feature clears stale `failing_command`).
 8. The migration plan is source-digest-bound, explicit for every candidate,
    dry-run safe, transactional, and idempotent.
 9. The final migration accounts for the committed roadmap, the five preserved

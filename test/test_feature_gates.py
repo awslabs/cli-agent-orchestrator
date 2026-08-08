@@ -135,11 +135,21 @@ class TestFeatureKindGuards:
             # fallback: check all_total
             assert stats["all_total"] == 2 or stats["total"] == 2
 
-    def test_patch_kind_is_rejected(self, cao_system):
+    def test_patch_kind_is_mutable_with_audit(self, cao_system):
         row = tracker.create_feature(project_id="cao-system", title="f1")
+        # kind is now mutable via PATCH — switching feature -> issue succeeds and is audited
+        updated = tracker.update_issue(row["key"], **{"kind": "issue"})
+        assert updated["kind"] == "issue"
+        # switching back issue -> feature also succeeds; stale failing_command is cleared if present
+        issue_row = tracker.create_issue(project_id="cao-system", title="b1", failing_command="make test")
+        assert issue_row["failing_command"] == "make test"
+        switched = tracker.update_issue(issue_row["key"], **{"kind": "feature"})
+        assert switched["kind"] == "feature"
+        assert switched["failing_command"] is None
+        # invalid kind still rejected
         with pytest.raises(TrackerError) as exc:
-            tracker.update_issue(row["key"], **{"kind": "issue"})
-        assert exc.value.code in ("invalid", "not-found")
+            tracker.update_issue(row["key"], **{"kind": "not-a-kind"})
+        assert exc.value.code == "invalid"
 
     def test_failing_command_rejected_for_features(self, cao_system):
         with pytest.raises(TrackerError) as exc:

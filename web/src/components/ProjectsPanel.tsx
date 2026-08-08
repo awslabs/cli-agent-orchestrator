@@ -587,14 +587,10 @@ export function ProjectsPanel() {
                       className={`text-gray-600 shrink-0 transition-transform ${selectedKey === issue.key ? 'rotate-90' : ''}`}
                     />
                     <code className="text-xs text-gray-500 w-24 shrink-0">{issue.key}</code>
-                    {kind === 'all' && issue.kind && (
-                      <Pill text={issue.kind} className={KIND_CLASS[issue.kind] ?? 'bg-gray-700/40 text-gray-300 border-gray-600/40'} />
-                    )}
-                    {kind === 'feature' && (
-                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium bg-violet-500/15 text-violet-300 border border-violet-500/30">
-                        <Lightbulb size={10} /> feature
-                      </span>
-                    )}
+                    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium border ${KIND_CLASS[issue.kind] ?? (issue.kind === 'feature' ? 'bg-violet-500/15 text-violet-300 border-violet-500/30' : 'bg-sky-500/15 text-sky-300 border-sky-500/30')}`}>
+                      {issue.kind === 'feature' ? <Lightbulb size={10} /> : <CircleDot size={10} />}
+                      {issue.kind === 'feature' ? 'feature' : 'bug'}
+                    </span>
                     <Pill text={issue.severity} className={SEVERITY_CLASS[issue.severity] ?? SEVERITY_CLASS.unset} />
                     <Pill text={issue.status} className={STATUS_CLASS[issue.status] ?? 'bg-gray-700/40 text-gray-300'} />
                     <span className="text-sm text-gray-200 truncate flex-1">{issue.title}</span>
@@ -1063,6 +1059,20 @@ function ItemDetail({
 
       <div className="flex flex-wrap items-center gap-2">
         <select
+          value={issue.kind}
+          onChange={e => patch({ kind: e.target.value })}
+          aria-label="Type"
+          title="Change type — bug or feature request"
+          className={`px-2 py-1.5 rounded border text-xs font-medium inline-flex items-center gap-1 ${issue.kind === 'feature' ? 'bg-violet-500/15 text-violet-300 border-violet-500/30' : 'bg-sky-500/15 text-sky-300 border-sky-500/30'}`}
+        >
+          <option value="issue">Bug</option>
+          <option value="feature">Feature</option>
+        </select>
+        <span className={`hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium border ${KIND_CLASS[issue.kind] ?? (issue.kind === 'feature' ? 'bg-violet-500/15 text-violet-300 border-violet-500/30' : 'bg-sky-500/15 text-sky-300 border-sky-500/30')}`}>
+          {isFeature ? <Lightbulb size={10} /> : <CircleDot size={10} />}
+          {isFeature ? 'feature' : 'bug'}
+        </span>
+        <select
           value={issue.status}
           onChange={e => patch({ status: e.target.value })}
           aria-label="Status"
@@ -1078,11 +1088,6 @@ function ItemDetail({
         >
           {vocab.severities.map(s => <option key={s} value={s}>{s}</option>)}
         </select>
-        {isFeature && (
-          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium bg-violet-500/15 text-violet-300 border border-violet-500/30">
-            <Lightbulb size={10} /> feature
-          </span>
-        )}
         <span className="text-[11px] text-gray-600 flex items-center gap-1.5">
           {isTerminal ? <CheckCircle2 size={12} /> : <CircleDot size={12} />}
           filed {shortDate(issue.created_at)}

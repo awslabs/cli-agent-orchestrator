@@ -99,6 +99,7 @@ _EDITABLE_FIELDS: Tuple[str, ...] = (
     "resolution",
     "duplicate_of",
     "labels",
+    "kind",
 )
 
 MAX_TITLE = 300
@@ -1221,8 +1222,6 @@ def update_issue(issue_key: str, *, actor: Optional[str] = None, **changes: Any)
     instead of a TypeError about duplicate arguments.
     """
     key = str(issue_key or "").strip().lower()
-    if "kind" in changes:
-        raise TrackerError("invalid", "kind is immutable")
     unknown = set(changes) - set(_EDITABLE_FIELDS)
     if unknown:
         raise TrackerError("invalid", f"not editable: {', '.join(sorted(unknown))}")
@@ -1233,13 +1232,30 @@ def update_issue(issue_key: str, *, actor: Optional[str] = None, **changes: Any)
             raise TrackerError("not-found", f"no such issue: {key}")
 
         now = _utcnow()
+        events: List[TrackerEventModel] = []
         # Duplicate status requires canonical key (P1)
         if changes.get("status") == "duplicate" and not changes.get("duplicate_of") and not getattr(row, "duplicate_of", None):
             raise TrackerError("invalid", "duplicate status requires duplicate_of canonical key")
-        is_feature = getattr(row, "kind", "issue") == "feature"
-        if is_feature and "failing_command" in changes and changes["failing_command"] and str(changes["failing_command"]).strip():
+        # Determine target kind after change (for kind-switch validation)
+        target_kind = _validate_kind(changes["kind"]) if "kind" in changes else getattr(row, "kind", "issue")
+        if target_kind == "feature" and "failing_command" in changes and changes["failing_command"] and str(changes["failing_command"]).strip():
             raise TrackerError("invalid", "failing_command is not allowed for feature requests")
-        events: List[TrackerEventModel] = []
+        # If switching to feature and existing failing_command would be retained, clear it
+        if target_kind == "feature" and getattr(row, "failing_command", None) and "kind" in changes and "failing_command" not in changes:
+            # Auto-clear stale failing_command when becoming a feature
+            old_fc = row.failing_command
+            row.failing_command = None
+            events.append(
+                TrackerEventModel(
+                    issue_key=key,
+                    actor=actor,
+                    kind="field",
+                    field="failing_command",
+                    old_value=_as_text(old_fc),
+                    new_value=None,
+                    created_at=now,
+                )
+            )
 
         for field, raw in changes.items():
             if raw is None:
@@ -1281,6 +1297,8 @@ def _as_text(value: Any) -> Optional[str]:
 
 def _coerce_field(row: TrackerIssueModel, field: str, raw: Any, *, db: Any) -> Tuple[Any, Any]:
     """Validate one field change and return ``(old, new)`` in stored form."""
+    if field == "kind":
+        return getattr(row, "kind", "issue"), _validate_kind(raw)
     if field == "status":
         return row.status, _validate_choice(raw, STATUSES, "status")
     if field == "severity":
