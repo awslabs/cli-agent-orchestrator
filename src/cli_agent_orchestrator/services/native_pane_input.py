@@ -1140,9 +1140,13 @@ def _kimi_composer_text(
         if padding.strip(b" "):
             return None
         try:
-            return candidate_bytes.decode("utf-8")
+            candidate = candidate_bytes.decode("utf-8")
         except UnicodeDecodeError:
             return None
+        # A shorter value plus frame padding renders identically to an
+        # expected value ending in spaces.  The digest cannot resolve that
+        # display ambiguity, so keep the historical fail-closed posture.
+        return None if candidate.endswith(" ") else candidate
     # The pinned box contributes one right-padding cell.  A second trailing
     # cell would be indistinguishable from user-supplied trailing whitespace,
     # so reject that ambiguous case instead of hashing a guess.

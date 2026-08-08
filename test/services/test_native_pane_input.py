@@ -114,6 +114,36 @@ def test_extract_composer_text_for_kimi_0330_uses_expected_bytes_to_remove_box_p
     )
 
 
+def test_extract_composer_text_for_kimi_refuses_trailing_space_ambiguity():
+    # A composer holding "text" paints the same prefix as an expected
+    # "text  " followed by frame padding.  Refuse instead of treating box
+    # padding as user-supplied trailing whitespace.
+    rows = [
+        "╭────────────────────────╮",
+        f"│ > text{' ' * 16}│",
+        "╰────────────────────────╯",
+    ]
+    assert extract_composer_text(rows, _kimi_pin(), expected_text_bytes=len(b"text  ")) is None
+
+
+def test_extract_composer_text_for_kimi_refuses_non_padding_suffix():
+    rows = [
+        "╭────────────────────────╮",
+        "│ > expected-extra      │",
+        "╰────────────────────────╯",
+    ]
+    assert extract_composer_text(rows, _kimi_pin(), expected_text_bytes=len(b"expected")) is None
+
+
+def test_extract_composer_text_for_kimi_refuses_partial_utf8_character():
+    rows = [
+        "╭────────────────────────╮",
+        "│ > café                 │",
+        "╰────────────────────────╯",
+    ]
+    assert extract_composer_text(rows, _kimi_pin(), expected_text_bytes=4) is None
+
+
 def test_extract_composer_text_returns_none_when_region_unreadable():
     rows = ["no composer here"]
     assert extract_composer_text(rows, _codex_pin()) is None
