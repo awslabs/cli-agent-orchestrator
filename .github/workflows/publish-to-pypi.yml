@@ -21,11 +21,11 @@ jobs:
     name: Build wheel and sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
@@ -36,16 +36,17 @@ jobs:
           npm run build
           # vite.config.ts writes directly to ../src/cli_agent_orchestrator/web_ui/
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v9.0.0
 
       - name: Build
         run: uv build
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dist
           path: dist/
           if-no-files-found: error
+          retention-days: 1
 
   publish-testpypi:
     name: Publish to TestPyPI
@@ -58,7 +59,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dist
           path: dist/
@@ -134,7 +135,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dist
           path: dist/

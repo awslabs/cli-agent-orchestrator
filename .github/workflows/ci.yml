@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Fetch the pinned old-binary (H_B) ancestor
         # The exact-H_B old-binary gate tests invoke `git archive` against
@@ -34,7 +34,7 @@ jobs:
           git rev-parse --verify e473d3b50eb307d1a6e179ec209aeb2bd3e58dcb^{commit}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -60,9 +60,9 @@ jobs:
         run: uv run python scripts/validate_markdown_links.py
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
-          file: ./coverage.xml
+          files: ./coverage.xml
           flags: unittests
           name: codecov-umbrella
           fail_ci_if_error: false
@@ -74,12 +74,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
@@ -104,12 +104,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
@@ -130,11 +130,11 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: web-playwright-report
           path: web/playwright-report/
-          retention-days: 7
+          retention-days: 1
 
   cao-mcp-apps:
     name: CAO MCP Apps
@@ -151,7 +151,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Fetch the pinned old-binary (H_B) ancestor
         # Same pinned-ancestor requirement as the unit-test job: the backend
@@ -161,12 +161,12 @@ jobs:
           git rev-parse --verify e473d3b50eb307d1a6e179ec209aeb2bd3e58dcb^{commit}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v9.0.0
 
       - name: Set up Python
         run: uv python install 3.12
@@ -233,12 +233,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install MCP-apps deps
         run: npm install
@@ -260,10 +260,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -293,10 +293,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -308,9 +308,9 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install ffmpeg (GIF export)
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
@@ -333,11 +333,12 @@ jobs:
 
       - name: Upload demo GIF artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: agui-eventsource-viewer-demo
           path: docs/media/agui-eventsource-viewer-demo.gif
           if-no-files-found: warn
+          retention-days: 1
         continue-on-error: true
 
   security:
@@ -346,10 +347,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v9.0.0
 
       - name: Generate requirements.txt for scanning
         run: |
@@ -366,7 +367,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
@@ -378,10 +379,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Dependency Review
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
