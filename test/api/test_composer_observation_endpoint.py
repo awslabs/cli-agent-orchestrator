@@ -258,6 +258,51 @@ class TestPositiveObservation:
         assert body["submission_observed"] == "unsubmitted"
         assert body["evidence_ref"].startswith(f"capture-pane:{PANE}:")
 
+    def test_kimi_box_padding_is_removed_using_the_expected_byte_count(
+        self, client, tmux, monkeypatch
+    ):
+        text = (
+            "[conduct] Continue the retained round: re-read the durable task at "
+            "/tmp/task-round-5.md and proceed."
+        )
+        resolved = service.ResolvedControlIdentity(
+            terminal_id=TERMINAL,
+            terminal_incarnation=None,
+            terminal_generation=GENERATION,
+            provider="kimi_cli",
+            native_session_id="native-sess-1",
+            execution_mode=EXECUTION_MODE_NATIVE_TUI,
+            session_name="cao",
+            provider_version="0.33.0",
+            managed_reservation_id="res-1",
+            pane_id=PANE,
+            window_id=WINDOW,
+            pane_pid=PANE_PID,
+            managed=True,
+            bound_server_socket_path=SOCKET,
+        )
+        monkeypatch.setattr(service, "resolve_control_identity", lambda terminal_id: resolved)
+        monkeypatch.setattr(
+            native_pane_input,
+            "capture_pane_screen",
+            lambda pane_id, timeout=10.0: [
+                "transcript row",
+                " ╭────────────────────────────────────────────────────────────────╮",
+                f" │ > {text}{' ' * 68}│",
+                " ╰────────────────────────────────────────────────────────────────╯",
+                " footer/status",
+            ],
+        )
+
+        response = _get(client, sha256=_sha256(text), bytes_=len(text.encode("utf-8")))
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["observed"] is True
+        assert body["submission_observed"] == "unsubmitted"
+        assert body["content_sha256"] == _sha256(text)
+        assert body["content_bytes"] == len(text.encode("utf-8"))
+
 
 class TestNegativeObservation:
     """The composer does not hold the exact expected text."""

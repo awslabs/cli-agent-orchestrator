@@ -88,6 +88,32 @@ def test_extract_composer_text_for_kimi_0330():
     assert extracted == TEXT
 
 
+def test_extract_composer_text_for_kimi_0330_uses_expected_bytes_to_remove_box_padding():
+    text = (
+        "[conduct] Continue the retained round: re-read the durable task at "
+        "/Users/colin/.local/state/cao-conductor/p1-closure/runs/"
+        "cond-0225-0230-native-attestation-spec-review-k3-r12/task-round-5.md "
+        "and proceed."
+    )
+    rows = [
+        "transcript row",
+        " ╭────────────────────────────────────────────────────────────────╮",
+        f" │ > {text}{' ' * 68}│",
+        " ╰────────────────────────────────────────────────────────────────╯",
+        " footer/status",
+    ]
+    pin = native_pane_input.composer_observation_pin_for("kimi_cli", "0.33.0")
+    assert pin is not None
+    assert (
+        extract_composer_text(
+            rows,
+            pin,
+            expected_text_bytes=len(text.encode("utf-8")),
+        )
+        == text
+    )
+
+
 def test_extract_composer_text_returns_none_when_region_unreadable():
     rows = ["no composer here"]
     assert extract_composer_text(rows, _codex_pin()) is None

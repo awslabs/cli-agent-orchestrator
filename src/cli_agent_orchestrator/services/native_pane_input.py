@@ -1110,8 +1110,17 @@ def _codex_composer_empty(styled_rows: Sequence[str]) -> Optional[bool]:
     return True
 
 
-def _kimi_composer_text(rows: Sequence[str]) -> Optional[str]:
-    """Exact text in a single, unambiguous Kimi composer row."""
+def _kimi_composer_text(
+    rows: Sequence[str], *, expected_text_bytes: Optional[int] = None
+) -> Optional[str]:
+    """Exact text in a single, unambiguous Kimi composer row.
+
+    Kimi right-pads the content row to the box width.  Without an expected
+    byte count, only the historical one-padding-cell shape is unambiguous.
+    A digest-bound observation already carries the original UTF-8 byte count;
+    use that count to separate the payload from any amount of box padding,
+    then let the caller's digest comparison prove the content itself.
+    """
     content = _kimi_composer_box_rows(rows)
     if content is None or len(content) != 1:
         return None
@@ -1122,6 +1131,18 @@ def _kimi_composer_text(rows: Sequence[str]) -> Optional[str]:
     payload = row[prompt_at + 1 :]
     if payload.startswith(" "):
         payload = payload[1:]
+    if expected_text_bytes is not None:
+        encoded = payload.encode("utf-8")
+        if len(encoded) < expected_text_bytes:
+            return None
+        candidate_bytes = encoded[:expected_text_bytes]
+        padding = encoded[expected_text_bytes:]
+        if padding.strip(b" "):
+            return None
+        try:
+            return candidate_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
     # The pinned box contributes one right-padding cell.  A second trailing
     # cell would be indistinguishable from user-supplied trailing whitespace,
     # so reject that ambiguous case instead of hashing a guess.
@@ -1177,15 +1198,22 @@ def _codex_composer_text(rows: Sequence[str]) -> Optional[str]:
     return payload if payload == payload.strip() else None
 
 
-def extract_composer_text(rows: Sequence[str], pin: ComposerObservationPin) -> Optional[str]:
+def extract_composer_text(
+    rows: Sequence[str],
+    pin: ComposerObservationPin,
+    *,
+    expected_text_bytes: Optional[int] = None,
+) -> Optional[str]:
     """The exact text held in the pinned composer region, or ``None``.
 
     Only an unwrapped, one-row payload with unambiguous frame padding is
-    returned.  Wrapped or whitespace-ambiguous captures fail closed so the
-    conductor's raw UTF-8 fingerprint remains authoritative.
+    returned.  Kimi observations may use the caller's already-validated byte
+    count to distinguish payload from its variable-width box padding; the
+    caller still verifies the raw UTF-8 digest.  Wrapped or otherwise
+    whitespace-ambiguous captures fail closed.
     """
     if pin.rule == _RULE_KIMI_COMPOSER_BOX:
-        return _kimi_composer_text(rows)
+        return _kimi_composer_text(rows, expected_text_bytes=expected_text_bytes)
     if pin.rule == _RULE_CLAUDE_PROMPT_BOX:
         return _claude_composer_text(rows)
     if pin.rule == _RULE_CODEX_PROMPT_FOOTER:
