@@ -1,0 +1,522 @@
+{
+  "schema": "cao-future-improvements-migration-inventory-v1",
+  "generated_utc": "2026-08-08T12:58:46Z",
+  "target_project": "cao-system",
+  "target_kind": "feature",
+  "source_heads": {
+    "cli_agent_orchestrator_origin_main": "f0f18ce4098ef1fc3ae1ab0999dd2d83006011cc",
+    "cao_conductor_origin_main": "fa50cbfd38e017921c2d40e519cf94a1b4a0a247"
+  },
+  "sources": [
+    {
+      "class": "canonical",
+      "path": "cao-conductor/FUTURE_IMPROVEMENTS.md",
+      "git_ref": "origin/main",
+      "sha256": "44c54374f71b66706756fbd95707af998e268ed6cf79630ce659a7002f96be96",
+      "entry_count": 22
+    },
+    {
+      "class": "supplemental-uncommitted",
+      "path": "/Users/colin/Projects/cao-conductor/FUTURE_IMPROVEMENTS.md",
+      "sha256": "2726b33acdc91acdb801b02a7ad83270ac28089e77a31b82fe386740f4de8bb0",
+      "entry_count": 27,
+      "note": "Contains five additions absent from origin/main; preserved as input but not treated as code authority."
+    }
+  ],
+  "worktree_scan": {
+    "files_scanned": 307,
+    "distinct_file_hashes": 7,
+    "distinct_normalized_titles": 29,
+    "rule": "Historical worktree copies are evidence only and are never imported independently."
+  },
+  "historical_aliases": [
+    {
+      "title": "Memory-candidate adjudication pipeline",
+      "disposition": "same-source-lineage",
+      "canonical_title": "Memory-candidate adjudication pipeline — promoted to the pre-chess lifecycle track"
+    },
+    {
+      "title": "Campaign timeline view",
+      "disposition": "folded-candidate",
+      "canonical_title": "Durable supervisor-poke visibility (cond-0021)",
+      "note": "Appears in one historical worktree and was later folded into the canonical item as an optional timeline surface; do not auto-create separately."
+    }
+  ],
+  "entries": [
+    {
+      "source_ordinal": 1,
+      "migration_id": "vendored-review-skill-runtime-three-strikes-design-rev",
+      "title": "Vendored review-skill runtime (three-strikes design review, cond-0024)",
+      "body": "Four issues (0017/0019/0023/0024) came from the review skill trusting `python3` off an uncontrolled PATH while Codex workers hop between exec environments. Make the skill own its interpreter: uv-managed project env inside the skill dir (`uv run --project \"$SKILL_DIR\"` everywhere), deleting the whole machine-level-pip mitigation pile. Skillshare-owned change — Colin's call on the exact shape.",
+      "priority": "P0",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [
+        "cond-0024"
+      ],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 2,
+      "migration_id": "post-shakedown-pruning-pass",
+      "title": "Post-shakedown pruning pass",
+      "body": "The shakedown proved which surfaces matter; delete what it never exercised (dead flags, unused config keys, leftover v1 language in profiles/docs). Complexity should end the shakedown *lower* than it started. Shape: one sweep, guided by \"was this touched in the campaign evidence?\", with the coherence lints as the safety net.",
+      "priority": "P0",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 3,
+      "migration_id": "upstream-the-two-fork-patches",
+      "title": "Upstream the two fork patches",
+      "body": "(terminal touch-scroll; output-pipeline reattach on restart) so the fork can retire to a thin pin. Both are self-contained, regression-safe, genuinely useful upstream. Shape: two PRs from the prepared texts in `docs/fork/`, then rebase the deploy branch per upstream release. Gate: Colin's go on opening PRs.",
+      "priority": "P0",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 4,
+      "migration_id": "session-env-durability-across-cao-server-restarts",
+      "title": "Session-env durability across cao-server restarts",
+      "body": "The in-memory session env store is the last restart casualty (shim PATH/ZDOTDIR lost; bounce guard exists only because of it). Shape: small fork patch persisting session env_vars to the DB and re-applying on startup — which would let us DELETE the bounce guard entirely (a net-complexity win, the best kind of fix).",
+      "priority": "P0",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "closed",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "shipped"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Known delivered surface; import as closed/shipped history after exact-current-source proof is rechecked."
+    },
+    {
+      "source_ordinal": 5,
+      "migration_id": "generation-bound-harness-session-operations",
+      "title": "Generation-bound harness session operations",
+      "body": "The new `harness-session-compaction` and `harness-route-switching` skills define safe cross-provider behavior, but current CAO direct input is not idle- or generation-bound and interactive model menus require state-aware selection. Add one narrow conductor operation that validates terminal generation and durable checkpoint, sends literal slash commands/keys without bracketed-paste mode, matches rendered menu labels rather than arrow counts, attests the result with provider-native status, and writes append-only compact/route receipts. This should delete operator-only compaction and model-fallback procedures.",
+      "priority": "P1",
+      "source_class": "dirty-working-copy-supplement",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 6,
+      "migration_id": "conduct-deploy",
+      "title": "`conduct deploy`",
+      "body": "One command: version bump, `uv tool install --reinstall` (both tools + plugin), content-marker verification, doctor drift check, optional server bounce with identity re-record. Today this is procedure-by-discipline; cond-0009 taught us discipline decays at 3am.",
+      "priority": "P1",
+      "source_class": "dirty-working-copy-supplement",
+      "proposed_action": "create-feature",
+      "proposed_status": "closed",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "shipped"
+      ],
+      "referenced_issue_keys": [
+        "cond-0009"
+      ],
+      "adjudication_note": "Known delivered surface; import as closed/shipped history after exact-current-source proof is rechecked."
+    },
+    {
+      "source_ordinal": 7,
+      "migration_id": "cross-campaign-quota-arbitration",
+      "title": "Cross-campaign quota arbitration",
+      "body": "When dnd + aegix + mobile run concurrently, per-spawn preflight is local; nothing arbitrates globally. Shape: a small shared budget file written by a periodic all-provider quota snapshot; `conduct spawn` consults it and defers spawns per a policy concurrency weight. No new process — piggyback on spawn + sentinel tick.",
+      "priority": "P1",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 8,
+      "migration_id": "herdr-backend-spike-exploratory",
+      "title": "Herdr backend spike (exploratory)",
+      "body": "Upstream's event-driven status backend would delete the StatusMonitor-heuristic wedge class (cond-0020's root) wholesale. Shape: one-day spike on a sandbox session; adopt only if it demonstrably kills the pending-delivery wedge without new failure modes.",
+      "priority": "P1",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "triage",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "exploratory",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [
+        "cond-0020"
+      ],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 9,
+      "migration_id": "durable-supervisor-poke-visibility-cond-0021",
+      "title": "Durable supervisor-poke visibility (cond-0021)",
+      "body": "Record supervisor-to-worker MCP inbox pokes in campaign evidence so spec revisions and other persistent- worker steering are auditable. Prefer the smallest durable event-log fix. A full `conduct status --timeline` is optional only if it proves to be the simplest coherent solution rather than a broader monitoring redesign.",
+      "priority": "P1",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "closed",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "shipped"
+      ],
+      "referenced_issue_keys": [
+        "cond-0021"
+      ],
+      "adjudication_note": "Known delivered surface; import as closed/shipped history after exact-current-source proof is rechecked."
+    },
+    {
+      "source_ordinal": 10,
+      "migration_id": "supervisor-context-lifecycle",
+      "title": "Supervisor context lifecycle",
+      "body": "Terra ran PR01 down to ~19% context. Rather than trusting unbounded compaction: planned handover at PR boundaries when context < N% — journal checkpoint, spawn a fresh supervisor terminal seeded from journal + policy + `conduct lease list`, retire the old one. Shape: conducting-protocols guidance + a `conduct revive --handover` variant. Reward: campaign quality stops degrading with campaign length. Intentionally deferred from the 2026-07-21 self-heal readiness campaign by lead direction.",
+      "priority": "P2",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 11,
+      "migration_id": "steer-from-phone-bridge",
+      "title": "Steer-from-phone bridge",
+      "body": "Monitoring is mobile-first now; steering still needs SSH. Shape: OpenClaw bot command → `conduct tell`/`conduct approve` bridge over the existing foundry link (reply \"approve merge-pr03\" in Discord/Telegram and it lands as the gate approval). Reward: fully hands-off approvals from the beach, completing the original vision.",
+      "priority": "P2",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 12,
+      "migration_id": "visual-qa-baseline-library",
+      "title": "Visual-QA baseline library",
+      "body": "Persist each PR's accepted screenshots as baselines; subsequent QA runs diff against them (structural/pixel-region diffs) before judgment. Reward: faster re-QA, objective regression evidence, and the persistent-QA reuse pattern gets a durable memory that survives terminal retirement.",
+      "priority": "P2",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 13,
+      "migration_id": "memory-candidate-adjudication-pipeline-promoted-to-the",
+      "title": "Memory-candidate adjudication pipeline — promoted to the pre-chess lifecycle track",
+      "body": "Workers emit `memory_candidate` blocks, but durable adjudication is not implemented yet. `docs/orchestration-defaults.md` now defines a persistent, sole-writer memory curator, merge-gated promotion, and role-calibrated recall. The same pre-chess track now includes durable, read-only PR review-wave history so a supervisor can compare the current count with optional human N-cycle guidance without a hard platform gate. This remains incomplete until retained rounds, review-history accounting, curator routing, provider capability checks, and focused integration tests land. Reward: campaigns stop relearning the same project facts without making memory an unreviewed source of truth.",
+      "priority": "P2",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 14,
+      "migration_id": "per-campaign-cost-accounting",
+      "title": "Per-campaign cost accounting",
+      "body": "Aggregate provider usage (quota snapshots at spawn/collect, provider footers already captured in scrollback snapshots) into a per-PR/per-campaign spend report in the journal. Reward: routing decisions (luna vs sol, K2.7 vs K3) get grounded in real numbers.",
+      "priority": "P2",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 15,
+      "migration_id": "conduct-policy-lint",
+      "title": "`conduct policy lint`",
+      "body": "Validate a policy file (schema, role coverage, deadman sanity vs expected task durations, routing overrides resolvable) before a campaign starts instead of at first spawn. Cheap; catches the cond-0008/0012 class at authoring time.",
+      "priority": "P2",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "closed",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "shipped"
+      ],
+      "referenced_issue_keys": [
+        "cond-0008"
+      ],
+      "adjudication_note": "Known delivered surface; import as closed/shipped history after exact-current-source proof is rechecked."
+    },
+    {
+      "source_ordinal": 16,
+      "migration_id": "cao-auth-adoption-watch",
+      "title": "CAO auth adoption watch",
+      "body": "Upstream ships localhost auth → adopt it and the trust model gains its real boundary (approve/report forgery closes). No work now beyond watching releases; becomes P0 the day it ships if untrusted code ever runs in workers.",
+      "priority": "P2",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "triage",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 17,
+      "migration_id": "multi-repo-campaigns",
+      "title": "Multi-repo campaigns",
+      "body": "Aegix is root + mobile submodule; the supervisor can juggle it by prompting, but leases/manifests/status are single-repo shaped. Shape: worktree+lease records gain a repo field; policy declares the repo set; status groups by repo. Do it when aegix migrates, not before.",
+      "priority": "P3",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 18,
+      "migration_id": "parallel-stream-tooling",
+      "title": "Parallel stream tooling",
+      "body": "dnd's later phases want 2–3 concurrent writer streams with a serialized merge lane. The supervisor can already do this by judgment; tooling assist = lease queueing (`conduct lease request --queue`) and a merge-lane token. Only if supervisor-managed serialization proves error-prone in practice.",
+      "priority": "P3",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 19,
+      "migration_id": "campaign-retro-generator",
+      "title": "Campaign retro generator",
+      "body": "At campaign end, synthesize journal + timeline + ledger + cost into a retro doc (what shipped, what broke, model performance per role). Feeds roster/routing decisions for the next campaign.",
+      "priority": "P3",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 20,
+      "migration_id": "worker-warm-pool-exploratory",
+      "title": "Worker warm-pool (exploratory)",
+      "body": "Pre-spawned idle provider terminals adopted at spawn time to cut the ~60–90s provider boot from dispatch latency. Only worth it if dispatch latency ever dominates; measure first via the timeline view.",
+      "priority": "P3",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "triage",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "exploratory",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 21,
+      "migration_id": "supervisor-proposed-policy-amendments",
+      "title": "Supervisor-proposed policy amendments",
+      "body": "The supervisor drafts policy changes it believes would help (timeouts, routing, review depth) as a diff PR'd to the project repo for human merge — the campaign tuning itself under human review. Spike: prompt-only, measure whether proposals are ever good.",
+      "priority": "P4",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 22,
+      "migration_id": "headless-worker-mode-for-select-roles",
+      "title": "Headless worker mode for select roles",
+      "body": "Some roles (spec reviewers) never need steerable TUIs; API-headless runs would be cheaper and faster. Cuts against the one-substrate simplicity and dashboard visibility — only revisit if provider TUI overhead becomes a measured pain.",
+      "priority": "P4",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 23,
+      "migration_id": "multi-machine-fleet",
+      "title": "Multi-machine fleet",
+      "body": "Upstream's fleet-coordinator pattern (one cao-server per box, conductor spanning them) — e.g. Mac for iOS work + Foundry server for Linux CI. Big surface; needs CAO auth first.",
+      "priority": "P4",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 24,
+      "migration_id": "cross-tool-portability",
+      "title": "Cross-tool portability",
+      "body": "conduct assumes this Mac (paths, zsh, tmux, skillshare layout). Parameterize for Linux/the Foundry server. Only when a second machine actually needs to run campaigns.",
+      "priority": "P4",
+      "source_class": "origin-main",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 25,
+      "migration_id": "skill-harvest-loop",
+      "title": "Skill-harvest loop",
+      "body": "Pipeline converting fire-marshal postmortems, friction analysis, Prime Agent `harness_state.json`, and repeat incident signatures into reviewed PRs against `cao-conductor/skills/` and `~/.config/skillshare/skills/`. The promotion rubric already exists in `docs/operational-skill-strategy.md`; this would give it an automated feed. Mostly *not* Prime-Agent-specific — it is a pipeline design. Depends on the friction analysis for its first real cargo.",
+      "priority": "unset",
+      "source_class": "dirty-working-copy-supplement",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "deferred",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 26,
+      "migration_id": "route-validation-via-prime-lab",
+      "title": "Route validation via Prime Lab",
+      "body": "Build a verifiers environment scoring a task type we actually run, then sweep it across providers *and* reasoning efforts to replace the prose intuition in the `route-ai-work` skill with measurement. Broader than CAO. Key motivation: model and effort do not decompose — Opus-5 can perform *worse* at higher reasoning effort on tasks it overthinks, while still being the correct model over a weaker one. That non-monotonic interaction cannot be reasoned to; it has to be measured as a 2-D surface per task type. Caveat: environment authoring is the real work and a bad environment yields confident garbage.",
+      "priority": "unset",
+      "source_class": "dirty-working-copy-supplement",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "deferred",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    },
+    {
+      "source_ordinal": 27,
+      "migration_id": "multi-agent-pr-review-depth-2-branch",
+      "title": "`multi-agent-pr-review` depth-2 branch",
+      "body": "Prime Agent enforces `rlmMaxDepth` (default 1, runtime-settable, 0 is legal). At depth 2 a reviewer can spawn its own per-finding verifiers — a find-then-adversarially-verify topology the current stack cannot express, since Claude Code subagents have no Agent tool and CAO workers are recursion-gated. Not a rewrite of the working skill; a separate branch to explore the new topology.",
+      "priority": "unset",
+      "source_class": "dirty-working-copy-supplement",
+      "proposed_action": "create-feature",
+      "proposed_status": "open",
+      "labels": [
+        "roadmap",
+        "source:future-improvements",
+        "deferred",
+        "needs-current-source-adjudication"
+      ],
+      "referenced_issue_keys": [],
+      "adjudication_note": "Preserve as a feature-request candidate; recheck current source and tracker for delivery or duplication immediately before apply."
+    }
+  ],
+  "apply_rule": "Every entry requires reviewed disposition immediately before import; the proposals here do not authorize tracker mutation."
+}

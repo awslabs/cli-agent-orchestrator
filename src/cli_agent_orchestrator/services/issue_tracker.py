@@ -49,6 +49,8 @@ from cli_agent_orchestrator.clients.database import (
 
 logger = logging.getLogger(__name__)
 
+ITEM_KINDS: Tuple[str, ...] = ("issue", "feature")
+
 # Workflow vocabulary. `open` and `closed` are the load-bearing ends; the
 # middle states exist so a long-running project can distinguish "nobody has
 # looked at this" from "somebody is on it" from "it is waiting on something
@@ -216,6 +218,13 @@ def _validate_choice(value: str, allowed: Sequence[str], label: str) -> str:
         raise TrackerError(
             "invalid", f"invalid {label} {text!r}: expected one of {', '.join(allowed)}"
         )
+    return text
+
+
+def _validate_kind(kind: str) -> str:
+    text = str(kind or "").strip().lower()
+    if text not in ITEM_KINDS:
+        raise TrackerError("invalid", f"invalid kind {text!r}: expected one of {', '.join(ITEM_KINDS)}")
     return text
 
 
@@ -420,33 +429,55 @@ def _default_prefix(slug: str) -> str:
 
 
 def list_projects(*, include_archived: bool = False) -> List[Dict[str, Any]]:
-    """List projects with per-status issue counts."""
+    """List projects with per-status issue counts (issue-only legacy) plus by_kind."""
     with SessionLocal() as db:
         query = db.query(TrackerProjectModel)
         if not include_archived:
             query = query.filter(TrackerProjectModel.status == "active")
         rows = query.order_by(TrackerProjectModel.name.asc()).all()
-        tallies = dict(
-            db.query(TrackerIssueModel.project_id, func.count(TrackerIssueModel.id))
-            .group_by(TrackerIssueModel.project_id)
-            .all()
-        )
-        open_tallies = dict(
-            db.query(TrackerIssueModel.project_id, func.count(TrackerIssueModel.id))
-            .filter(TrackerIssueModel.status.notin_(tuple(TERMINAL_STATUSES)))
-            .group_by(TrackerIssueModel.project_id)
-            .all()
-        )
-        return [
-            _project_row(
-                row,
-                counts={
-                    "total": int(tallies.get(row.id, 0)),
-                    "open": int(open_tallies.get(row.id, 0)),
+        # Single snapshot for all counts to avoid concurrency drift (PR1-2 gate 4)
+        all_issues = db.query(TrackerIssueModel).all()
+        # Compute tallies in Python from one snapshot
+        tallies: Dict[str, int] = {}
+        open_tallies: Dict[str, int] = {}
+        all_tallies: Dict[str, int] = {}
+        all_open: Dict[str, int] = {}
+        by_kind_total: Dict[str, Dict[str,int]] = {k: {} for k in ITEM_KINDS}
+        by_kind_open: Dict[str, Dict[str,int]] = {k: {} for k in ITEM_KINDS}
+        for iss in all_issues:
+            pid = iss.project_id
+            kind = getattr(iss, "kind", "issue")
+            is_open = iss.status not in TERMINAL_STATUSES
+            # all
+            all_tallies[pid] = all_tallies.get(pid, 0) + 1
+            if is_open:
+                all_open[pid] = all_open.get(pid, 0) + 1
+            # by_kind
+            by_kind_total[kind][pid] = by_kind_total[kind].get(pid, 0) + 1
+            if is_open:
+                by_kind_open[kind][pid] = by_kind_open[kind].get(pid, 0) + 1
+            # legacy issue-only
+            if kind == "issue":
+                tallies[pid] = tallies.get(pid, 0) + 1
+                if is_open:
+                    open_tallies[pid] = open_tallies.get(pid, 0) + 1
+        out = []
+        for row in rows:
+            counts: Dict[str, Any] = {
+                "total": int(tallies.get(row.id, 0)),
+                "open": int(open_tallies.get(row.id, 0)),
+                "all_total": int(all_tallies.get(row.id, 0)),
+                "all_open": int(all_open.get(row.id, 0)),
+                "by_kind": {
+                    k: {
+                        "total": int(by_kind_total[k].get(row.id, 0)),
+                        "open": int(by_kind_open[k].get(row.id, 0)),
+                    }
+                    for k in ITEM_KINDS
                 },
-            )
-            for row in rows
-        ]
+            }
+            out.append(_project_row(row, counts=counts))
+        return out
 
 
 def get_project(project_id: str) -> Dict[str, Any]:
@@ -462,12 +493,23 @@ def get_project(project_id: str) -> Dict[str, Any]:
             .order_by(TrackerScopeModel.kind.asc(), TrackerScopeModel.value.asc())
             .all()
         )
-        by_status = dict(
-            db.query(TrackerIssueModel.status, func.count(TrackerIssueModel.id))
-            .filter(TrackerIssueModel.project_id == slug)
-            .group_by(TrackerIssueModel.status)
-            .all()
-        )
+        # Single snapshot for project stats (PR1-2 gate 4)
+        all_issues = db.query(TrackerIssueModel).filter(TrackerIssueModel.project_id == slug).all()
+        by_status: Dict[str, int] = {}
+        all_by_status: Dict[str, int] = {}
+        by_kind: Dict[str, Any] = {k: {"total":0,"open":0,"by_status":{}} for k in ITEM_KINDS}
+        for iss in all_issues:
+            kind = getattr(iss, "kind", "issue")
+            all_by_status[iss.status] = all_by_status.get(iss.status, 0) + 1
+            if kind == "issue":
+                by_status[iss.status] = by_status.get(iss.status, 0) + 1
+            # per-kind
+            sub = by_kind[kind]
+            sub["by_status"][iss.status] = sub["by_status"].get(iss.status, 0) + 1
+        for k in ITEM_KINDS:
+            sub = by_kind[k]["by_status"]
+            by_kind[k]["total"] = sum(int(v) for v in sub.values())
+            by_kind[k]["open"] = sum(int(v) for kk, v in sub.items() if kk not in TERMINAL_STATUSES)
         total = sum(int(v) for v in by_status.values())
         open_count = sum(int(v) for k, v in by_status.items() if k not in TERMINAL_STATUSES)
         payload = _project_row(
@@ -476,6 +518,9 @@ def get_project(project_id: str) -> Dict[str, Any]:
                 "total": total,
                 "open": open_count,
                 "by_status": {k: int(v) for k, v in by_status.items()},
+                "by_kind": by_kind,
+                "all_total": sum(int(v) for v in all_by_status.values()),
+                "all_open": sum(int(v) for kk, v in all_by_status.items() if kk not in TERMINAL_STATUSES),
             },
         )
         payload["scopes"] = [
@@ -776,6 +821,7 @@ def _issue_row(row: TrackerIssueModel) -> Dict[str, Any]:
     return {
         "key": row.key,
         "project_id": row.project_id,
+        "kind": getattr(row, "kind", "issue") or "issue",
         "title": row.title,
         "body": row.body or "",
         "status": row.status,
@@ -843,6 +889,7 @@ def create_issue(
     created_at: Optional[datetime] = None,
     cwd: Optional[str] = None,
     alias: Optional[str] = None,
+    kind: str = "issue",
 ) -> Dict[str, Any]:
     """File an issue.
 
@@ -862,6 +909,11 @@ def create_issue(
 
     status = _validate_choice(status, STATUSES, "status")
     severity = _validate_choice(severity, SEVERITIES, "severity")
+    kind = _validate_kind(kind)
+    if status == "duplicate":
+        raise TrackerError("invalid", "duplicate status requires duplicate_of canonical key (set via update after creation)")
+    if kind == "feature" and failing_command:
+        raise TrackerError("invalid", "failing_command is not allowed for feature requests")
     label_list = normalise_labels(labels)
 
     resolution = resolve_project(
@@ -898,6 +950,7 @@ def create_issue(
         row = TrackerIssueModel(
             key=issue_key,
             project_id=project.id,
+            kind=kind,
             title=heading,
             body=text,
             status=status,
@@ -933,6 +986,55 @@ def create_issue(
         payload = _issue_row(row)
         payload["resolved_by"] = resolution.matched_by
         return payload
+
+
+def create_feature(
+    *,
+    project_id: Optional[str] = None,
+    title: str,
+    body: str = "",
+    status: str = "open",
+    severity: str = "unset",
+    component: Optional[str] = None,
+    reporter: Optional[str] = None,
+    assignee: Optional[str] = None,
+    labels: Optional[Iterable[Any]] = None,
+    failing_command: Optional[str] = None,
+    evidence: Optional[str] = None,
+    session_name: Optional[str] = None,
+    terminal_id: Optional[str] = None,
+    source_path: Optional[str] = None,
+    origin: str = "api",
+    key: Optional[str] = None,
+    created_at: Optional[datetime] = None,
+    cwd: Optional[str] = None,
+    alias: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a feature request (thin wrapper over create_issue with kind=feature)."""
+    if failing_command:
+        raise TrackerError("invalid", "failing_command is not allowed for feature requests")
+    return create_issue(
+        project_id=project_id,
+        title=title,
+        body=body,
+        status=status,
+        severity=severity,
+        component=component,
+        reporter=reporter,
+        assignee=assignee,
+        labels=labels,
+        failing_command=None,
+        evidence=evidence,
+        session_name=session_name,
+        terminal_id=terminal_id,
+        source_path=source_path,
+        origin=origin,
+        key=key,
+        created_at=created_at,
+        cwd=cwd,
+        alias=alias,
+        kind="feature",
+    )
 
 
 def get_issue(key: str) -> Dict[str, Any]:
@@ -994,6 +1096,7 @@ def list_issues(
     limit: int = 100,
     offset: int = 0,
     order: str = "created_desc",
+    kind: Optional[str] = "issue",
 ) -> Dict[str, Any]:
     """List issues with filters, returning rows plus the unpaged total.
 
@@ -1005,6 +1108,15 @@ def list_issues(
 
     with SessionLocal() as db:
         q = db.query(TrackerIssueModel)
+        if kind is not None:
+            if kind == "all":
+                pass
+            else:
+                _validate_kind(kind)
+                q = q.filter(TrackerIssueModel.kind == kind)
+        else:
+            # kind=None means all kinds (explicit generic surface)
+            pass
         if project_id:
             q = q.filter(TrackerIssueModel.project_id == _validate_slug(project_id))
         if status:
@@ -1036,6 +1148,7 @@ def list_issues(
                 | TrackerIssueModel.body.ilike(needle)
                 | TrackerIssueModel.key.ilike(needle)
                 | TrackerIssueModel.failing_command.ilike(needle)
+                | TrackerIssueModel.evidence.ilike(needle)
             )
 
         total = q.count()
@@ -1047,6 +1160,39 @@ def list_issues(
             "offset": offset,
             "issues": [_issue_row(r) for r in rows],
         }
+
+
+def list_features(
+    *,
+    project_id: Optional[str] = None,
+    status: Optional[Sequence[str]] = None,
+    severity: Optional[Sequence[str]] = None,
+    component: Optional[str] = None,
+    assignee: Optional[str] = None,
+    reporter: Optional[str] = None,
+    label: Optional[str] = None,
+    query: Optional[str] = None,
+    open_only: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+    order: str = "created_desc",
+) -> Dict[str, Any]:
+    """List feature requests (thin wrapper with kind=feature)."""
+    return list_issues(
+        project_id=project_id,
+        status=status,
+        severity=severity,
+        component=component,
+        assignee=assignee,
+        reporter=reporter,
+        label=label,
+        query=query,
+        open_only=open_only,
+        limit=limit,
+        offset=offset,
+        order=order,
+        kind="feature",
+    )
 
 
 def _apply_order(q: Any, order: str) -> Any:
@@ -1075,6 +1221,8 @@ def update_issue(issue_key: str, *, actor: Optional[str] = None, **changes: Any)
     instead of a TypeError about duplicate arguments.
     """
     key = str(issue_key or "").strip().lower()
+    if "kind" in changes:
+        raise TrackerError("invalid", "kind is immutable")
     unknown = set(changes) - set(_EDITABLE_FIELDS)
     if unknown:
         raise TrackerError("invalid", f"not editable: {', '.join(sorted(unknown))}")
@@ -1085,6 +1233,12 @@ def update_issue(issue_key: str, *, actor: Optional[str] = None, **changes: Any)
             raise TrackerError("not-found", f"no such issue: {key}")
 
         now = _utcnow()
+        # Duplicate status requires canonical key (P1)
+        if changes.get("status") == "duplicate" and not changes.get("duplicate_of") and not getattr(row, "duplicate_of", None):
+            raise TrackerError("invalid", "duplicate status requires duplicate_of canonical key")
+        is_feature = getattr(row, "kind", "issue") == "feature"
+        if is_feature and "failing_command" in changes and changes["failing_command"] and str(changes["failing_command"]).strip():
+            raise TrackerError("invalid", "failing_command is not allowed for feature requests")
         events: List[TrackerEventModel] = []
 
         for field, raw in changes.items():
@@ -1287,10 +1441,23 @@ def remove_link(link_id: int, *, actor: Optional[str] = None) -> Dict[str, Any]:
         return {"id": int(link_id), "deleted": True}
 
 
-def stats(project_id: Optional[str] = None) -> Dict[str, Any]:
-    """Aggregate counts for a project (or the whole install)."""
+def stats(project_id: Optional[str] = None, *, kind: Optional[str] = "issue") -> Dict[str, Any]:
+    """Aggregate counts for a project (or the whole install).
+
+    Default ``kind="issue"`` preserves legacy issue-only counts.
+    ``kind=None`` or ``kind="all"`` aggregates across all kinds and also returns ``by_kind``.
+    """
     with SessionLocal() as db:
         q = db.query(TrackerIssueModel)
+        if kind is not None:
+            if kind == "all":
+                pass
+            else:
+                _validate_kind(kind)
+                q = q.filter(TrackerIssueModel.kind == kind)
+        else:
+            # kind=None means all kinds (explicit generic surface)
+            pass
         if project_id:
             q = q.filter(TrackerIssueModel.project_id == _validate_slug(project_id))
         rows = q.all()
@@ -1302,7 +1469,7 @@ def stats(project_id: Optional[str] = None) -> Dict[str, Any]:
         by_severity[row.severity] = by_severity.get(row.severity, 0) + 1
         key = row.component or "(none)"
         by_component[key] = by_component.get(key, 0) + 1
-    return {
+    result: Dict[str, Any] = {
         "project_id": project_id,
         "total": len(rows),
         "open": sum(1 for r in rows if r.status not in TERMINAL_STATUSES),
@@ -1310,9 +1477,33 @@ def stats(project_id: Optional[str] = None) -> Dict[str, Any]:
         "by_severity": by_severity,
         "by_component": by_component,
     }
+    if kind is None or kind == "all":
+        with SessionLocal() as db:
+            base = db.query(TrackerIssueModel)
+            if project_id:
+                base = base.filter(TrackerIssueModel.project_id == _validate_slug(project_id))
+            all_rows = base.all()
+        by_kind: Dict[str, Dict[str, Any]] = {}
+        for k in ITEM_KINDS:
+            subset = [r for r in all_rows if getattr(r, "kind", "issue") == k]
+            by_status_k: Dict[str,int] = {}
+            by_sev_k: Dict[str,int] = {}
+            for r in subset:
+                by_status_k[r.status] = by_status_k.get(r.status, 0) + 1
+                by_sev_k[r.severity] = by_sev_k.get(r.severity, 0) + 1
+            by_kind[k] = {
+                "total": len(subset),
+                "open": sum(1 for r in subset if r.status not in TERMINAL_STATUSES),
+                "by_status": by_status_k,
+                "by_severity": by_sev_k,
+            }
+        result["by_kind"] = by_kind
+        result["all_total"] = len(all_rows)
+        result["all_open"] = sum(1 for r in all_rows if r.status not in TERMINAL_STATUSES)
+    return result
 
 
-def render_markdown(project_id: str, *, open_only: bool = True) -> str:
+def render_markdown(project_id: str, *, open_only: bool = True, kind: Optional[str] = "issue") -> str:
     """Render an issue log as markdown.
 
     The markdown ledger this replaces is now an *export*: a view produced from
@@ -1333,6 +1524,7 @@ def render_markdown(project_id: str, *, open_only: bool = True) -> str:
             limit=500,
             offset=len(issues),
             order="created_asc",
+            kind=kind,
         )
         total = page["total"]
         issues.extend(page["issues"])
@@ -1349,8 +1541,11 @@ def render_markdown(project_id: str, *, open_only: bool = True) -> str:
     ]
     for issue in issues:
         severity = f"[{issue['severity']}] " if issue["severity"] != "unset" else ""
-        lines.append(f"## {issue['key']} — {severity}{issue['title']}")
+        kind_prefix = f"[{issue.get('kind', 'issue')}] " if kind is None or kind == "all" else ""
+        lines.append(f"## {issue['key']} — {kind_prefix}{severity}{issue['title']}")
         lines.append("")
+        if kind is None or kind == "all":
+            lines.append(f"- **kind:** {issue.get('kind', 'issue')}")
         lines.append(f"- **filed:** {issue['created_at']}")
         lines.append(f"- **reporter:** {issue['reporter'] or 'unknown'}")
         lines.append(f"- **status:** {issue['status']}")

@@ -491,6 +491,9 @@ export interface GraphExportResult {
 export interface TrackerVocabulary {
   statuses: string[]
   terminal_statuses: string[]
+  item_kinds?: string[]
+  statuses_by_kind?: Record<string, string[]>
+  terminal_statuses_by_kind?: Record<string, string[]>
   severities: string[]
   scope_kinds: string[]
   link_kinds: string[]
@@ -514,7 +517,7 @@ export interface TrackerProject {
   next_issue_number: number
   created_at: string | null
   updated_at: string | null
-  counts?: { total: number; open: number; by_status?: Record<string, number> }
+  counts?: { total: number; open: number; by_status?: Record<string, number>; by_kind?: Record<string, { total: number; open: number }>; all_total?: number; all_open?: number }
   scopes?: TrackerScope[]
 }
 
@@ -545,6 +548,7 @@ export interface TrackerLink {
 export interface TrackerIssue {
   key: string
   project_id: string
+  kind: 'issue' | 'feature'
   title: string
   body: string
   status: string
@@ -581,6 +585,7 @@ export interface TrackerIssuePage {
 
 export interface TrackerIssueFilters {
   projectId?: string
+  kind?: 'issue' | 'feature' | 'all'
   status?: string[]
   severity?: string[]
   component?: string
@@ -609,6 +614,7 @@ function trackerQuery(filters?: TrackerIssueFilters): string {
   // Repeated params, not a comma list: the server reads them as an OR.
   for (const s of filters.status ?? []) parts.push(`status=${encodeURIComponent(s)}`)
   for (const s of filters.severity ?? []) parts.push(`severity=${encodeURIComponent(s)}`)
+  if (filters.kind) parts.push(`kind=${encodeURIComponent(filters.kind)}`)
   if (filters.component) parts.push(`component=${encodeURIComponent(filters.component)}`)
   if (filters.assignee) parts.push(`assignee=${encodeURIComponent(filters.assignee)}`)
   if (filters.label) parts.push(`label=${encodeURIComponent(filters.label)}`)
@@ -974,4 +980,42 @@ export const api = {
     fetchJSON<TrackerStats>(
       `/tracker/issues/stats${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`,
     ),
+  listTrackerFeatures: (filters?: TrackerIssueFilters) =>
+    fetchJSON<TrackerIssuePage>(`/tracker/features${trackerQuery({ ...filters, kind: 'feature' })}`),
+  getTrackerFeature: (key: string) =>
+    fetchJSON<TrackerIssue>(`/tracker/features/${encodeURIComponent(key)}`),
+  createTrackerFeature: (body: Record<string, unknown>) =>
+    fetchJSON<TrackerIssue>('/tracker/features', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ origin: 'dashboard', ...body }),
+    }),
+  updateTrackerFeature: (key: string, body: Record<string, unknown>) =>
+    fetchJSON<TrackerIssue>(`/tracker/features/${encodeURIComponent(key)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  deleteTrackerFeature: (key: string) =>
+    fetchJSON<{ key: string; deleted: boolean }>(`/tracker/features/${encodeURIComponent(key)}`, {
+      method: 'DELETE',
+    }),
+  addTrackerFeatureComment: (key: string, body: { body: string; author?: string }) =>
+    fetchJSON<TrackerComment>(`/tracker/features/${encodeURIComponent(key)}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  addTrackerFeatureLink: (key: string, body: { to_key: string; kind: string; actor?: string }) =>
+    fetchJSON<TrackerLink & { created: boolean }>(
+      `/tracker/features/${encodeURIComponent(key)}/links`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    ),
+  removeTrackerFeatureLink: (key: string, linkId: number) =>
+    fetchJSON<{ id: number; deleted: boolean }>(
+      `/tracker/features/${encodeURIComponent(key)}/links/${linkId}`,
+      { method: 'DELETE' },
+    ),
+  getTrackerFeatureStats: (projectId?: string) =>
+    fetchJSON<TrackerStats>(`/tracker/features/stats${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`),
 }

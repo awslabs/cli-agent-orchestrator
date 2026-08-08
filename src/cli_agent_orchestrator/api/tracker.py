@@ -135,6 +135,41 @@ class IssueUpdateBody(StrictBody):
     actor: Optional[str] = None
 
 
+class FeatureCreateBody(StrictBody):
+    title: str
+    project_id: Optional[str] = None
+    body: str = ""
+    status: str = "open"
+    severity: str = "unset"
+    component: Optional[str] = None
+    reporter: Optional[str] = None
+    assignee: Optional[str] = None
+    labels: List[str] = Field(default_factory=list)
+    evidence: Optional[str] = None
+    session_name: Optional[str] = None
+    terminal_id: Optional[str] = None
+    source_path: Optional[str] = None
+    cwd: Optional[str] = None
+    alias: Optional[str] = None
+    key: Optional[str] = None
+    origin: str = "api"
+
+
+class FeatureUpdateBody(StrictBody):
+    title: Optional[str] = None
+    body: Optional[str] = None
+    status: Optional[str] = None
+    severity: Optional[str] = None
+    component: Optional[str] = None
+    reporter: Optional[str] = None
+    assignee: Optional[str] = None
+    labels: Optional[List[str]] = None
+    evidence: Optional[str] = None
+    resolution: Optional[str] = None
+    duplicate_of: Optional[str] = None
+    actor: Optional[str] = None
+
+
 class CommentBody(StrictBody):
     body: str
     author: Optional[str] = None
@@ -161,6 +196,12 @@ async def tracker_vocabulary(_scopes: List[str] = _READ) -> Dict[str, Any]:
     return {
         "statuses": list(tracker.STATUSES),
         "terminal_statuses": sorted(tracker.TERMINAL_STATUSES),
+        "statuses_by_kind": {"issue": list(tracker.STATUSES), "feature": list(tracker.STATUSES)},
+        "terminal_statuses_by_kind": {
+            "issue": sorted(tracker.TERMINAL_STATUSES),
+            "feature": sorted(tracker.TERMINAL_STATUSES),
+        },
+        "item_kinds": list(tracker.ITEM_KINDS),
         "severities": list(tracker.SEVERITIES),
         "scope_kinds": list(tracker.SCOPE_KINDS),
         "link_kinds": list(tracker.LINK_KINDS),
@@ -258,6 +299,7 @@ async def delete_project(
 async def export_project_markdown(
     project_id: str,
     open_only: bool = Query(True),
+    kind: Optional[str] = Query(None),
     _scopes: List[str] = _READ,
 ) -> Response:
     """Render the issue log as markdown.
@@ -265,8 +307,9 @@ async def export_project_markdown(
     The ledger files this replaces become a view produced on demand, not a
     second source of truth somebody has to keep in step.
     """
+    effective_kind = kind if kind is not None else "issue"
     try:
-        text = tracker.render_markdown(project_id, open_only=open_only)
+        text = tracker.render_markdown(project_id, open_only=open_only, kind=effective_kind)
     except tracker.TrackerError as exc:
         raise _http(exc) from exc
     return Response(content=text, media_type="text/markdown; charset=utf-8")
@@ -315,8 +358,11 @@ async def list_issues(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     order: str = Query("created_desc"),
+    kind: Optional[str] = Query(None, description="issue|feature|all"),
     _scopes: List[str] = _READ,
 ) -> Dict[str, Any]:
+    # Default is issue-only for backward compatibility
+    effective_kind = kind if kind is not None else "issue"
     try:
         return tracker.list_issues(
             project_id=project_id,
@@ -331,6 +377,7 @@ async def list_issues(
             limit=limit,
             offset=offset,
             order=order,
+            kind=effective_kind,
         )
     except tracker.TrackerError as exc:
         raise _http(exc) from exc
@@ -397,6 +444,11 @@ async def update_issue(
         if name != "actor" and name in body.model_fields_set
     }
     try:
+        existing = tracker.get_issue(issue_key)
+        _assert_issue(existing)
+        # Duplicate status requires canonical key validation (P1)
+        if changes.get("status") == "duplicate" and not changes.get("duplicate_of") and not existing.get("duplicate_of"):
+            raise tracker.TrackerError("invalid", "duplicate status requires duplicate_of canonical key")
         return tracker.update_issue(issue_key, actor=body.actor, **changes)
     except tracker.TrackerError as exc:
         raise _http(exc) from exc
@@ -405,6 +457,8 @@ async def update_issue(
 @router.delete("/tracker/issues/{issue_key}")
 async def delete_issue(issue_key: str, _scopes: List[str] = _WRITE) -> Dict[str, Any]:
     try:
+        existing = tracker.get_issue(issue_key)
+        _assert_issue(existing)
         return tracker.delete_issue(issue_key)
     except tracker.TrackerError as exc:
         raise _http(exc) from exc
@@ -457,3 +511,207 @@ async def remove_link(
         return tracker.remove_link(link_id, actor=actor)
     except tracker.TrackerError as exc:
         raise _http(exc) from exc
+
+
+# --------------------------------------------------------------------------
+# features — typed aliases over shared storage (D4)
+# --------------------------------------------------------------------------
+
+def _assert_feature(row: dict) -> None:
+    if row.get("kind") != "feature":
+        raise tracker.TrackerError("not-found", f"no such feature: {row.get('key')}")
+
+
+def _assert_issue(row: dict) -> None:
+    if row.get("kind") != "issue":
+        raise tracker.TrackerError("not-found", f"no such issue: {row.get('key')} (kind={row.get('kind')})")
+
+
+@router.get("/tracker/features")
+async def list_features(
+    project_id: Optional[str] = Query(None),
+    status_filter: Optional[List[str]] = Query(None, alias="status"),
+    severity: Optional[List[str]] = Query(None),
+    component: Optional[str] = Query(None),
+    assignee: Optional[str] = Query(None),
+    reporter: Optional[str] = Query(None),
+    label: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    open_only: bool = Query(False),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    order: str = Query("created_desc"),
+    _scopes: List[str] = _READ,
+) -> Dict[str, Any]:
+    try:
+        return tracker.list_features(
+            project_id=project_id,
+            status=status_filter,
+            severity=severity,
+            component=component,
+            assignee=assignee,
+            reporter=reporter,
+            label=label,
+            query=q,
+            open_only=open_only,
+            limit=limit,
+            offset=offset,
+            order=order,
+        )
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.get("/tracker/features/stats")
+async def feature_stats(
+    project_id: Optional[str] = Query(None),
+    _scopes: List[str] = _READ,
+) -> Dict[str, Any]:
+    try:
+        return tracker.stats(project_id, kind="feature")
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/tracker/features", status_code=201)
+async def create_feature(
+    body: FeatureCreateBody,
+    _scopes: List[str] = _WRITE,
+) -> Dict[str, Any]:
+    try:
+        return tracker.create_feature(
+            project_id=body.project_id,
+            title=body.title,
+            body=body.body,
+            status=body.status,
+            severity=body.severity,
+            component=body.component,
+            reporter=body.reporter,
+            assignee=body.assignee,
+            labels=body.labels,
+            evidence=body.evidence,
+            session_name=body.session_name,
+            terminal_id=body.terminal_id,
+            source_path=body.source_path,
+            cwd=body.cwd,
+            alias=body.alias,
+            key=body.key,
+            origin=body.origin,
+        )
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.get("/tracker/features/{feature_key}")
+async def get_feature(feature_key: str, _scopes: List[str] = _READ) -> Dict[str, Any]:
+    try:
+        row = tracker.get_issue(feature_key)
+        _assert_feature(row)
+        return row
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.patch("/tracker/features/{feature_key}")
+async def update_feature(
+    feature_key: str,
+    body: FeatureUpdateBody,
+    _scopes: List[str] = _WRITE,
+) -> Dict[str, Any]:
+    try:
+        existing = tracker.get_issue(feature_key)
+        _assert_feature(existing)
+        changes = {
+            name: value
+            for name, value in body.model_dump().items()
+            if name != "actor" and name in body.model_fields_set
+        }
+        return tracker.update_issue(feature_key, actor=body.actor, **changes)
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.delete("/tracker/features/{feature_key}")
+async def delete_feature(feature_key: str, _scopes: List[str] = _WRITE) -> Dict[str, Any]:
+    try:
+        existing = tracker.get_issue(feature_key)
+        _assert_feature(existing)
+        return tracker.delete_issue(feature_key)
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/tracker/features/{feature_key}/comments", status_code=201)
+async def add_feature_comment(
+    feature_key: str,
+    body: CommentBody,
+    _scopes: List[str] = _WRITE,
+) -> Dict[str, Any]:
+    try:
+        existing = tracker.get_issue(feature_key)
+        _assert_feature(existing)
+        return tracker.add_comment(feature_key, body=body.body, author=body.author)
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.delete("/tracker/features/{feature_key}/comments/{comment_id}")
+async def delete_feature_comment(
+    feature_key: str,
+    comment_id: int,
+    _scopes: List[str] = _WRITE,
+) -> Dict[str, Any]:
+    try:
+        existing = tracker.get_issue(feature_key)
+        _assert_feature(existing)
+        return tracker.delete_comment(feature_key, comment_id)
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/tracker/features/{feature_key}/links", status_code=201)
+async def add_feature_link(
+    feature_key: str,
+    body: LinkBody,
+    _scopes: List[str] = _WRITE,
+) -> Dict[str, Any]:
+    try:
+        existing = tracker.get_issue(feature_key)
+        _assert_feature(existing)
+        return tracker.add_link(feature_key, to_key=body.to_key, kind=body.kind, actor=body.actor)
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.delete("/tracker/features/{feature_key}/links/{link_id}")
+async def remove_feature_link(
+    feature_key: str,
+    link_id: int,
+    actor: Optional[str] = Query(None),
+    _scopes: List[str] = _WRITE,
+) -> Dict[str, Any]:
+    try:
+        existing = tracker.get_issue(feature_key)
+        _assert_feature(existing)
+        # Verify link belongs to this feature (URL key must match link's from_key/to_key)
+        from cli_agent_orchestrator.clients.database import SessionLocal, TrackerLinkModel
+        with SessionLocal() as db:
+            link = db.get(TrackerLinkModel, int(link_id))
+            if link is None or (link.from_key != feature_key.lower() and link.to_key != feature_key.lower()):
+                raise tracker.TrackerError("not-found", f"no link {link_id} on feature {feature_key}")
+        return tracker.remove_link(link_id, actor=actor)
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+
+
+@router.get("/tracker/projects/{project_id}/features/export")
+async def export_project_features_markdown(
+    project_id: str,
+    open_only: bool = Query(True),
+    _scopes: List[str] = _READ,
+) -> Response:
+    try:
+        text = tracker.render_markdown(project_id, open_only=open_only, kind="feature")
+    except tracker.TrackerError as exc:
+        raise _http(exc) from exc
+    return Response(content=text, media_type="text/markdown; charset=utf-8")
