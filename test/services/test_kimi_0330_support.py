@@ -59,13 +59,11 @@ from __future__ import annotations
 
 import pytest
 
-from cli_agent_orchestrator.services import (
-    control_input_service as cis,
-    kimi_native_control as knc,
-    kimi_native_launch as knl,
-    native_pane_input as npi,
-    provider_contracts as pc,
-)
+from cli_agent_orchestrator.services import control_input_service as cis
+from cli_agent_orchestrator.services import kimi_native_control as knc
+from cli_agent_orchestrator.services import kimi_native_launch as knl
+from cli_agent_orchestrator.services import native_pane_input as npi
+from cli_agent_orchestrator.services import provider_contracts as pc
 
 PIN_0330 = "0.33.0"
 BUNDLE_SHA256 = "0e77b9c64e67a4eecb96aae011750668aab11bd781564fe3e4855513812247b2"

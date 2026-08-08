@@ -461,9 +461,7 @@ class TestUnsupportedProvider:
         body = response.json()
         assert body["refusal"]["reason"] == "provider-unsupported"
 
-    def test_an_unpinned_kimi_neighbour_does_not_serve_the_route(
-        self, client, tmux, monkeypatch
-    ):
+    def test_an_unpinned_kimi_neighbour_does_not_serve_the_route(self, client, tmux, monkeypatch):
         # 0.33.0 is pinned; its neighbours must fail closed rather than inherit.
         monkeypatch.setattr(
             service,
