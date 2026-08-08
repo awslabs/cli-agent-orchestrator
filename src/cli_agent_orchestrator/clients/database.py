@@ -376,6 +376,7 @@ class TrackerIssueModel(Base):
     duplicate_of = Column(String, nullable=True)
     # "cli" | "api" | "dashboard" | "migration"
     origin = Column(String, nullable=False, default="api", server_default="api")
+    kind = Column(String, nullable=False, default="issue", server_default="issue", index=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
     closed_at = Column(DateTime(timezone=True), nullable=True)
@@ -898,6 +899,34 @@ _TRACKER_ORM_TABLE_NAMES = frozenset(
 )
 
 
+def _migrate_tracker_kind_column() -> None:
+    """Add ``kind`` column and composite index to ``tracker_issues`` idempotently.
+
+    Fresh DBs receive the column via SQLAlchemy metadata defaults.
+    Existing DBs are migrated via ``ALTER TABLE`` / ``CREATE INDEX`` gated on
+    ``PRAGMA table_info``. Failure is fatal — the ORM cannot safely query a
+    table missing a mapped non-null column.
+    """
+    from sqlalchemy import text as sa_text
+
+    try:
+        with engine.connect() as conn:
+            info = list(conn.execute(sa_text("PRAGMA table_info(tracker_issues)")))
+        cols = {row[1] for row in info}
+        if "kind" in cols:
+            # Ensure index exists even if column already present (e.g. fresh DB via metadata)
+            with engine.begin() as conn:
+                conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"))
+            return
+        # Column missing — add it with default
+        with engine.begin() as conn:
+            conn.execute(sa_text("ALTER TABLE tracker_issues ADD COLUMN kind TEXT NOT NULL DEFAULT 'issue'"))
+            conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"))
+    except Exception as exc:
+        # Fail-closed: upgraded ORM cannot query without column
+        raise RuntimeError(f"tracker kind migration failed: {exc}") from exc
+
+
 def ensure_tracker_schema() -> None:
     """Create the issue-tracker tables if they are absent.
 
@@ -916,6 +945,7 @@ def ensure_tracker_schema() -> None:
         bind=engine,
         tables=[t for t in Base.metadata.sorted_tables if t.name in _TRACKER_ORM_TABLE_NAMES],
     )
+    _migrate_tracker_kind_column()
 
 
 def _ensure_db_dir() -> None:
@@ -965,6 +995,7 @@ def init_db() -> None:
         ],
     )
     _restrict_db_file_permissions()
+    _migrate_tracker_kind_column()
     _migrate_terminals_schema()
     inbox_schema_ready = _migrate_callback_recovery_inbox_schema()
     _migrate_callback_recovery_schema(inbox_schema_ready=inbox_schema_ready)

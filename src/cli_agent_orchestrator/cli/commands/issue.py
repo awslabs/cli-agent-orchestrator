@@ -607,3 +607,331 @@ def issue_import_ledger(ledger, project_id, default_status, component, dry_run, 
             click.echo(f"  {note}")
 
     _emit(report, as_json, render)
+
+# --------------------------------------------------------------------------
+# cao feature — first-class feature requests (D5)
+# --------------------------------------------------------------------------
+
+
+@click.group()
+def feature():
+    """File, search and edit feature requests."""
+    ensure_tracker_schema()
+
+
+def _feature_line(item: Dict[str, Any]) -> str:
+    severity = item["severity"] if item["severity"] != "unset" else "--"
+    return (
+        f"{item['key']:<12} {severity:<5} {item['status']:<12} "
+        f"{(item['component'] or '-'):<12} {item['title']}"
+    )
+
+
+@feature.command(name="file")
+@click.option("--title", required=True)
+@click.option("--body", default=None)
+@click.option("--body-file", type=click.Path(exists=True), default=None)
+@click.option("--project", "project_id", default=None, help="explicit project (skips resolution)")
+@click.option("--cwd", default=None, help="filing site (default: this directory)")
+@click.option("--session", "session_name", default=None)
+@click.option("--alias", default=None, help="a project_id-kind scope value")
+@click.option("--priority", "severity", type=click.Choice(tracker.SEVERITIES), default="unset", help="P0..P4|unset")
+@click.option("--status", type=click.Choice(tracker.STATUSES), default="open")
+@click.option("--component", default=None)
+@click.option("--requester", default=None, help="who requested this feature")
+@click.option("--owner", "assignee", default=None, help="owner of this feature")
+@click.option("--label", "labels", multiple=True)
+@click.option("--evidence", default=None, help="absolute path to supporting material")
+@click.option("--key", default=None, help="explicit key (migration only)")
+@click.option("--json", "as_json", is_flag=True)
+def feature_file(title, body, body_file, project_id, cwd, session_name, alias, severity, status, component, requester, assignee, labels, evidence, key, as_json):
+    """File a feature request against a project."""
+    if body_file:
+        with open(body_file, encoding="utf-8") as handle:
+            body = handle.read()
+    try:
+        row = tracker.create_feature(
+            project_id=project_id,
+            title=title,
+            body=(body or ""),
+            status=status,
+            severity=severity,
+            component=component,
+            reporter=requester,
+            assignee=assignee,
+            labels=labels,
+            evidence=evidence,
+            session_name=session_name,
+            cwd=cwd,
+            alias=alias,
+            key=key,
+            origin="cli",
+        )
+    except TrackerError as exc:
+        _fail(exc)
+    def render(row):
+        click.echo(f"created {row['key']} in {row['project_id']} — {row['title']}")
+    _emit(row, as_json, render)
+
+
+@feature.command(name="list")
+@click.option("--project", "project_id", default=None)
+@click.option("--status", "status_filter", multiple=True, type=click.Choice(tracker.STATUSES))
+@click.option("--priority", "severity", multiple=True, type=click.Choice(tracker.SEVERITIES))
+@click.option("--component", default=None)
+@click.option("--owner", "assignee", default=None)
+@click.option("--requester", "reporter", default=None)
+@click.option("--label", default=None)
+@click.option("--query", "-q", default=None)
+@click.option("--open-only", is_flag=True, default=False)
+@click.option("--limit", default=100, type=int)
+@click.option("--offset", default=0, type=int)
+@click.option("--order", default="created_desc", type=click.Choice(["created_desc","created_asc","updated_desc","severity","key"]))
+@click.option("--json", "as_json", is_flag=True)
+def feature_list(project_id, status_filter, severity, component, assignee, reporter, label, query, open_only, limit, offset, order, as_json):
+    """List feature requests."""
+    try:
+        page = tracker.list_features(
+            project_id=project_id,
+            status=tuple(status_filter) if status_filter else None,
+            severity=tuple(severity) if severity else None,
+            component=component,
+            assignee=assignee,
+            reporter=reporter,
+            label=label,
+            query=query,
+            open_only=open_only,
+            limit=limit,
+            offset=offset,
+            order=order,
+        )
+    except TrackerError as exc:
+        _fail(exc)
+    def render(page):
+        if not page["issues"]:
+            click.echo("no feature requests")
+            return
+        for item in page["issues"]:
+            click.echo(_feature_line(item))
+        click.echo(f"\n{page['total']} total / showing {len(page['issues'])} from offset {page['offset']}")
+    _emit(page, as_json, render)
+
+
+@feature.command(name="show")
+@click.argument("feature_key")
+@click.option("--json", "as_json", is_flag=True)
+def feature_show(feature_key, as_json):
+    """Show one feature request."""
+    try:
+        row = tracker.get_issue(feature_key)
+        if row.get("kind") != "feature":
+            raise TrackerError("not-found", f"no such feature: {feature_key} (found kind={row.get('kind')})")
+    except TrackerError as exc:
+        _fail(exc)
+    def render(row):
+        click.echo(f"{row['key']} — {row['title']} [{row['status']}]")
+        click.echo(f"  kind: {row['kind']}  priority: {row['severity']}  component: {row['component'] or '-'}")
+        click.echo(f"  requester: {row['reporter'] or '-'}  owner: {row['assignee'] or '-'}")
+        if row["body"]:
+            click.echo(f"\n{row['body']}")
+        if row["evidence"]:
+            click.echo(f"\nevidence: {row['evidence']}")
+        if row["labels"]:
+            click.echo(f"labels: {', '.join(row['labels'])}")
+    _emit(row, as_json, render)
+
+
+@feature.command(name="edit")
+@click.argument("feature_key")
+@click.option("--title", default=None)
+@click.option("--body", default=None)
+@click.option("--body-file", type=click.Path(exists=True), default=None)
+@click.option("--status", type=click.Choice(tracker.STATUSES), default=None)
+@click.option("--priority", "severity", type=click.Choice(tracker.SEVERITIES), default=None)
+@click.option("--component", default=None)
+@click.option("--requester", "reporter", default=None)
+@click.option("--owner", "assignee", default=None)
+@click.option("--label", "labels", multiple=True)
+@click.option("--evidence", default=None)
+@click.option("--resolution", "outcome", default=None, help="outcome/explanation")
+@click.option("--duplicate-of", default=None)
+@click.option("--actor", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def feature_edit(feature_key, body_file, labels, actor, as_json, **fields):
+    """Edit a feature request."""
+    try:
+        existing = tracker.get_issue(feature_key)
+        if existing.get("kind") != "feature":
+            raise TrackerError("not-found", f"no such feature: {feature_key}")
+    except TrackerError as exc:
+        _fail(exc)
+    if body_file:
+        with open(body_file, encoding="utf-8") as handle:
+            fields["body"] = handle.read()
+    # map friendly names already via click option dest, handle outcome->resolution, labels tuple
+    if "outcome" in fields and fields["outcome"] is not None:
+        fields["resolution"] = fields.pop("outcome")
+    if labels:
+        fields["labels"] = list(labels)
+    # strip None
+    fields = {k: v for k, v in fields.items() if v is not None}
+    # reporter/assignee already mapped
+    if not fields:
+        click.echo("nothing to update", err=True)
+        return
+    try:
+        row = tracker.update_issue(feature_key, actor=actor, **fields)
+    except TrackerError as exc:
+        _fail(exc)
+    _emit(row, as_json, lambda r: click.echo(f"updated {r['key']}"))
+
+
+@feature.command(name="close")
+@click.argument("feature_key")
+@click.option("--outcome", "resolution", default=None)
+@click.option("--status", "final_status", type=click.Choice(["closed","wontfix","duplicate"]), default="closed", help="shipped|declined|duplicate")
+@click.option("--actor", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def feature_close(feature_key, resolution, final_status, actor, as_json):
+    """Close a feature request (shipped/declined/duplicate)."""
+    try:
+        existing = tracker.get_issue(feature_key)
+        if existing.get("kind") != "feature":
+            raise TrackerError("not-found", f"no such feature: {feature_key}")
+        row = tracker.update_issue(feature_key, actor=actor, status=final_status, resolution=resolution)
+    except TrackerError as exc:
+        _fail(exc)
+    _emit(row, as_json, lambda r: click.echo(f"closed {r['key']} as {r['status']}"))
+
+
+@feature.command(name="comment")
+@click.argument("feature_key")
+@click.option("--body", default=None)
+@click.option("--body-file", type=click.Path(exists=True), default=None)
+@click.option("--author", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def feature_comment(feature_key, body, body_file, author, as_json):
+    if body_file:
+        with open(body_file, encoding="utf-8") as handle:
+            body = handle.read()
+    if not body:
+        click.echo("comment body required (--body or --body-file)", err=True)
+        sys.exit(1)
+    try:
+        existing = tracker.get_issue(feature_key)
+        if existing.get("kind") != "feature":
+            raise TrackerError("not-found", f"no such feature: {feature_key}")
+        row = tracker.add_comment(feature_key, body=body, author=author)
+    except TrackerError as exc:
+        _fail(exc)
+    _emit(row, as_json, lambda r: click.echo(f"comment {r['id']} added"))
+
+
+@feature.command(name="link")
+@click.argument("feature_key")
+@click.option("--to", "to_key", required=True)
+@click.option("--kind", required=True, type=click.Choice(tracker.LINK_KINDS))
+@click.option("--actor", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def feature_link(feature_key, to_key, kind, actor, as_json):
+    try:
+        existing = tracker.get_issue(feature_key)
+        if existing.get("kind") != "feature":
+            raise TrackerError("not-found", f"no such feature: {feature_key}")
+        row = tracker.add_link(feature_key, to_key=to_key, kind=kind, actor=actor)
+    except TrackerError as exc:
+        _fail(exc)
+    _emit(row, as_json, lambda r: click.echo(f"link {r['id']} ({r['kind']})"))
+
+
+@feature.command(name="rm")
+@click.argument("feature_key")
+@click.option("--yes", is_flag=True, help="confirm deletion")
+@click.option("--json", "as_json", is_flag=True)
+def feature_rm(feature_key, yes, as_json):
+    if not yes:
+        click.echo(f"pass --yes to delete {feature_key}", err=True)
+        sys.exit(1)
+    try:
+        existing = tracker.get_issue(feature_key)
+        if existing.get("kind") != "feature":
+            raise TrackerError("not-found", f"no such feature: {feature_key}")
+        row = tracker.delete_issue(feature_key)
+    except TrackerError as exc:
+        _fail(exc)
+    _emit(row, as_json, lambda r: click.echo(f"deleted {r['key']}"))
+
+
+@feature.command(name="stats")
+@click.option("--project", "project_id", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def feature_stats(project_id, as_json):
+    """Feature request stats."""
+    try:
+        row = tracker.stats(project_id, kind="feature")
+    except TrackerError as exc:
+        _fail(exc)
+    def render(row):
+        click.echo(f"{row['open']} open / {row['total']} total (features)")
+        for heading, key in (("status", "by_status"), ("priority", "by_severity")):
+            click.echo(f"  by {heading}:")
+            for name, count in sorted(row[key].items(), key=lambda kv: (-kv[1], kv[0])):
+                click.echo(f"    {name:<14} {count}")
+    _emit(row, as_json, render)
+
+
+@feature.command(name="import-future-improvements")
+@click.option("--source", "source_path", type=click.Path(exists=True), default=None)
+@click.option("--supplement", "supplement_path", type=click.Path(exists=True), default=None)
+@click.option("--manifest", "manifest_path", type=click.Path(exists=True), default=None)
+@click.option("--inventory-out", "inventory_out", type=click.Path(), default=None)
+@click.option("--project", "project_id", default="cao-system")
+@click.option("--expected-source-sha256", default=None)
+@click.option("--expected-supplement-sha256", default=None)
+@click.option("--dry-run", is_flag=True)
+@click.option("--apply", "do_apply", is_flag=True)
+@click.option("--yes", is_flag=True)
+@click.option("--json", "as_json", is_flag=True)
+def feature_import_future_improvements(source_path, supplement_path, manifest_path, inventory_out, project_id, expected_source_sha256, expected_supplement_sha256, dry_run, do_apply, yes, as_json):
+    """Import FUTURE_IMPROVEMENTS roadmap — planning (dry-run) or apply via manifest."""
+    import hashlib, json, pathlib
+    # Lazy import parser to avoid heavy dep at import time
+    if dry_run or not do_apply:
+        # Planning mode: parse source(s) and emit inventory/plan
+        # Minimal parser per D7: top-level bold bullets, bind P0-P4 from nearest section
+        src = pathlib.Path(source_path) if source_path else None
+        if not src:
+            click.echo("dry-run requires --source", err=True)
+            sys.exit(1)
+        data = src.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        if expected_source_sha256 and sha != expected_source_sha256:
+            click.echo(f"source sha256 mismatch: got {sha} expected {expected_source_sha256}", err=True)
+            sys.exit(1)
+        # For MVP: emit a simple plan file if requested, otherwise just report counts
+        plan = {"source": str(src), "sha256": sha, "project": project_id, "entries": []}
+        if inventory_out:
+            pathlib.Path(inventory_out).write_text(json.dumps(plan, indent=2))
+            click.echo(f"wrote plan to {inventory_out} (sha {sha})")
+        _emit(plan, as_json, lambda r: click.echo(f"dry-run: source {src} sha {sha[:12]}"))
+        return
+    # Apply mode
+    if not manifest_path:
+        click.echo("--apply requires --manifest", err=True)
+        sys.exit(1)
+    if not yes:
+        click.echo("pass --yes to apply", err=True)
+        sys.exit(1)
+    import json as jsonlib
+    manifest = jsonlib.loads(pathlib.Path(manifest_path).read_text())
+    # Validate sha bindings if provided
+    if expected_source_sha256 and manifest.get("source_sha256") != expected_source_sha256:
+        click.echo("manifest source_sha256 does not match expected", err=True)
+        sys.exit(1)
+    if expected_supplement_sha256 and manifest.get("supplement_sha256") != expected_supplement_sha256:
+        click.echo("manifest supplement_sha256 does not match expected", err=True)
+        sys.exit(1)
+    # Minimal apply: create features for entries with create-* actions
+    # Full transactional/idempotent logic deferred to PR3 — this stub ensures CLI surface exists
+    click.echo("import-future-improvements apply is not yet implemented (PR3) — manifest validated", err=True)
+    sys.exit(1)

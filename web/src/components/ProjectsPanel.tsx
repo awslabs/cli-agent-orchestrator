@@ -74,6 +74,7 @@ export function ProjectsPanel() {
   const [issuesLoading, setIssuesLoading] = useState(false)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
 
+  const [kind, setKind] = useState<'issue' | 'feature' | 'all'>('issue')
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState<string[]>([])
   const [severityFilter, setSeverityFilter] = useState<string[]>([])
@@ -111,16 +112,42 @@ export function ProjectsPanel() {
     if (!activeId) { setPage(null); return }
     setIssuesLoading(true)
     try {
-      const result = await api.listTrackerIssues({
-        projectId: activeId,
-        q: query.trim() || undefined,
-        status: statusFilter.length ? statusFilter : undefined,
-        severity: severityFilter.length ? severityFilter : undefined,
-        openOnly,
-        limit: PAGE_SIZE,
-        offset,
-        order: 'severity',
-      })
+      let result
+      if (kind === 'feature') {
+        result = await api.listTrackerFeatures({
+          projectId: activeId,
+          q: query.trim() || undefined,
+          status: statusFilter.length ? statusFilter : undefined,
+          severity: severityFilter.length ? severityFilter : undefined,
+          openOnly,
+          limit: PAGE_SIZE,
+          offset,
+          order: 'severity',
+        })
+      } else if (kind === 'all') {
+        result = await api.listTrackerIssues({
+          projectId: activeId,
+          q: query.trim() || undefined,
+          status: statusFilter.length ? statusFilter : undefined,
+          severity: severityFilter.length ? severityFilter : undefined,
+          openOnly,
+          limit: PAGE_SIZE,
+          offset,
+          order: 'severity',
+          kind: 'all',
+        })
+      } else {
+        result = await api.listTrackerIssues({
+          projectId: activeId,
+          q: query.trim() || undefined,
+          status: statusFilter.length ? statusFilter : undefined,
+          severity: severityFilter.length ? severityFilter : undefined,
+          openOnly,
+          limit: PAGE_SIZE,
+          offset,
+          order: 'severity',
+        })
+      }
       setPage(result)
     } catch (err) {
       showSnackbar({ type: 'error', message: `Could not load issues: ${errorText(err)}` })
@@ -128,11 +155,11 @@ export function ProjectsPanel() {
     } finally {
       setIssuesLoading(false)
     }
-  }, [activeId, query, statusFilter, severityFilter, openOnly, offset, showSnackbar])
+  }, [activeId, query, statusFilter, severityFilter, openOnly, offset, kind, showSnackbar])
 
   useEffect(() => { loadIssues() }, [loadIssues])
   // A filter change invalidates the current page number, not just its contents.
-  useEffect(() => { setOffset(0) }, [activeId, query, statusFilter, severityFilter, openOnly])
+  useEffect(() => { setOffset(0) }, [activeId, query, statusFilter, severityFilter, openOnly, kind])
 
   const refreshAfterIssueChange = useCallback(async () => {
     await loadIssues()
@@ -195,6 +222,13 @@ export function ProjectsPanel() {
 
         {project && (
           <>
+            <div className="flex gap-2 mb-3">
+              {(['issue','feature','all'] as const).map(k => {
+                const label = k === 'issue' ? `Issues ${project.counts?.by_kind?.issue?.open ?? project.counts?.open ?? 0}` : k === 'feature' ? `Feature requests ${project.counts?.by_kind?.feature?.open ?? 0}` : `All ${project.counts?.all_open ?? ((project.counts?.by_kind?.issue?.open ?? 0)+(project.counts?.by_kind?.feature?.open ?? 0))}`
+                const active = kind === k
+                return <button key={k} onClick={() => { setKind(k); setSelectedKey(null) }} className={`px-3 py-1.5 rounded text-sm ${active ? 'bg-emerald-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}>{label}</button>
+              })}
+            </div>
             <ProjectHeader
               project={project}
               onToggleScopes={() => setShowScopes(v => !v)}
