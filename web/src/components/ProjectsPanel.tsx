@@ -459,6 +459,7 @@ export function ProjectsPanel() {
             </div>
             <ProjectHeader
               project={project}
+              kind={kind}
               onToggleScopes={() => setShowScopes(v => !v)}
               scopesOpen={showScopes}
               onArchive={() => setPendingArchive(project)}
@@ -652,9 +653,10 @@ export function ProjectsPanel() {
 // ---------------------------------------------------------------------------
 
 function ProjectHeader({
-  project, onToggleScopes, scopesOpen, onArchive, onChanged,
+  project, kind, onToggleScopes, scopesOpen, onArchive, onChanged,
 }: {
   project: TrackerProject
+  kind: TabKind
   onToggleScopes: () => void
   scopesOpen: boolean
   onArchive: () => void
@@ -725,10 +727,10 @@ function ProjectHeader({
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
               <a
-                href={`/tracker/projects/${encodeURIComponent(project.id)}/export`}
+                href={`/tracker/projects/${encodeURIComponent(project.id)}/${kind === 'feature' ? 'features/export' : kind === 'all' ? 'export?kind=all' : 'export'}`}
                 target="_blank"
                 rel="noreferrer"
-                title="Render the issue log as markdown"
+                title={kind === 'feature' ? "Render the feature log as markdown" : kind === 'all' ? "Render all items as markdown" : "Render the issue log as markdown"}
                 className="p-2 rounded hover:bg-gray-800 text-gray-400 hover:text-gray-200"
               >
                 <FileDown size={15} />

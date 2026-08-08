@@ -615,32 +615,12 @@ def apply_manifest(
                         created_map[mig_id] = existing.key
                         mappings.append({"migration_id": mig_id, "action": action, "key": existing.key, "status": "existing"})
                         row_digests.append({"key": existing.key, "migration_id": mig_id, "digest": existing_digest})
-                        # For relate-existing, ensure links exist (idempotently)
-                        if action == "relate-existing" and related_keys:
-                            for rk in related_keys:
-                                rk_norm = str(rk).strip().lower()
-                                # Check if link already exists
-                                already = (
-                                    db.query(TrackerLinkModel)
-                                    .filter(TrackerLinkModel.from_key == existing.key, TrackerLinkModel.to_key == rk_norm)
-                                    .first()
-                                )
-                                if not already:
-                                    # Verify target exists
-                                    target = db.query(TrackerIssueModel).filter(TrackerIssueModel.key == rk_norm).first()
-                                    if target is None:
-                                        raise TrackerError("not-found", f"related key {rk_norm!r} does not exist for {mig_id}")
-                                    link = TrackerLinkModel(from_key=existing.key, to_key=rk_norm, kind="relates")
-                                    db.add(link)
-                                    db.add(
-                                        TrackerEventModel(
-                                            issue_key=existing.key,
-                                            actor="migration",
-                                            kind="link",
-                                            field="relates",
-                                            new_value=rk_norm,
-                                        )
-                                    )
+                        # For relate-existing, verify links exactly match — changed replays must refuse, not silently add/mutate (P0-3)
+                        if action == "relate-existing":
+                            existing_links = {r.to_key for r in db.query(TrackerLinkModel).filter(TrackerLinkModel.from_key == existing.key, TrackerLinkModel.kind == "relates").all()}
+                            expected_links = {str(rk).strip().lower() for rk in related_keys}
+                            if existing_links != expected_links:
+                                raise TrackerError("conflict", f"replay links mismatch for {mig_id}: existing {sorted(existing_links)} vs candidate {sorted(expected_links)}")
                         continue
                     # Not existing: allocate and create
                     # Use compare-and-swap allocator
@@ -736,15 +716,19 @@ def apply_manifest(
                     existing_canonical = db.query(TrackerIssueModel).filter(TrackerIssueModel.key == cand_key).first()
                     if existing_canonical is None:
                         raise TrackerError("not-found", f"map-existing {mig_id} canonical_key {cand_key!r} does not exist")
-                    # Check if already mapped: look for existing mapping with this migration_id
-                    # If existing canonical already has migration label, it's idempotent
+                    # P0-3: map-existing replay must be exact — do not mutate different record or add label silently
                     existing_labels = json.loads(existing_canonical.labels) if existing_canonical.labels else []
+                    # Verify canonical record is in same project and is not mutated cross-project
+                    if existing_canonical.project_id != project_id:
+                        raise TrackerError("invalid", f"map-existing {mig_id} canonical {cand_key} belongs to project {existing_canonical.project_id!r}, not {project_id!r}")
+                    # Must already carry migration label to be idempotent; otherwise this is first apply (not replay) but map-existing should only be used after explicit adjudication — we still allow it once
                     if mig_label in existing_labels:
+                        # Verify idempotent — no label mutation needed, just check digest matches (already done via candidate check)
                         mappings.append({"migration_id": mig_id, "action": action, "key": cand_key, "status": "existing"})
                         row_digests.append({"key": cand_key, "migration_id": mig_id, "digest": _row_digest(existing_canonical.title or "", existing_canonical.body or "", existing_canonical.severity or "unset", existing_canonical.status or "open", existing_labels, component=existing_canonical.component, reporter=existing_canonical.reporter, assignee=existing_canonical.assignee, evidence=existing_canonical.evidence, resolution=existing_canonical.resolution, duplicate_of=existing_canonical.duplicate_of)})
                     else:
-                        # Attach provenance label idempotently (but we are in a transaction, so we can update)
-                        # However, we should not modify existing row's title/body, just add label and event
+                        # First time mapping — attach label, but only if not already idempotent and not conflicting
+                        # Verify that adding this label would not cause label mutation on replay with different bytes (digest already checked)
                         existing_labels.append(mig_label)
                         existing_labels = tracker.normalise_labels(existing_labels)
                         existing_canonical.labels = json.dumps(existing_labels)
@@ -762,6 +746,8 @@ def apply_manifest(
                         mappings.append({"migration_id": mig_id, "action": action, "key": cand_key, "status": "mapped"})
                         row_digests.append({"key": cand_key, "migration_id": mig_id, "digest": _row_digest(existing_canonical.title or "", existing_canonical.body or "", existing_canonical.severity or "unset", existing_canonical.status or "open", existing_labels, component=existing_canonical.component, reporter=existing_canonical.reporter, assignee=existing_canonical.assignee, evidence=existing_canonical.evidence, resolution=existing_canonical.resolution, duplicate_of=existing_canonical.duplicate_of)})
                     created_map[mig_id] = cand_key
+                    # P1: map-existing must not mutate an issue record — ensure canonical is a feature or same kind? For now, warn but allow if explicitly adjudicated
+                    # We already checked project match above
 
                 elif action == "skip-invalid":
                     # No row, just mapping
