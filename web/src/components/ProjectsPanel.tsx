@@ -963,12 +963,12 @@ function ItemDetail({
 
   // Fields to render: for feature, hide failing_command when null/empty
   const editableFields: Array<{ field: keyof TrackerIssue; label: string; mono?: boolean; hideWhenEmpty?: boolean }> = [
-    { field: 'component', label: 'Component' },
-    { field: 'assignee', label: presentation.assigneeLabel },
-    { field: 'reporter', label: presentation.reporterLabel },
-    { field: 'failing_command', label: 'Failing command', mono: true, hideWhenEmpty: isFeature },
-    { field: 'evidence', label: 'Evidence', mono: true },
-    { field: 'resolution', label: presentation.resolutionLabel },
+    { field: 'component' as keyof TrackerIssue, label: 'Component' },
+    { field: 'assignee' as keyof TrackerIssue, label: presentation.assigneeLabel },
+    { field: 'reporter' as keyof TrackerIssue, label: presentation.reporterLabel },
+    { field: 'failing_command' as keyof TrackerIssue, label: 'Failing command', mono: true, hideWhenEmpty: isFeature },
+    { field: 'evidence' as keyof TrackerIssue, label: 'Evidence', mono: true },
+    { field: 'resolution' as keyof TrackerIssue, label: presentation.resolutionLabel },
   ].filter(f => !(f.hideWhenEmpty && !draft[f.field as string] && !issue[f.field]))
 
   return (
@@ -1449,11 +1449,6 @@ function NewItemModal({
             <span className="text-[11px] uppercase tracking-wide text-gray-500">Failing command</span>
             <input value={failingCommand} onChange={e => setFailingCommand(e.target.value)} aria-label="Failing command"
               className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-xs text-gray-200 font-mono" />
-          </label>
-          <label className="block">
-            <span className="text-[11px] uppercase tracking-wide text-gray-500">Evidence path</span>
-            <input value={evidence} onChange={e => setEvidence(e.target.value)} aria-label="Evidence"
-              className="mt-1 w-full px-3 py-2 rounded bg-gray-950 border border-gray-800 text-xs text-gray-200 font-mono hidden" />
           </label>
         </>
       )}

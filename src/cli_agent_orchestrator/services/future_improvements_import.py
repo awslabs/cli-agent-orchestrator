@@ -64,25 +64,33 @@ def _slugify(text: str, max_len: int = 30) -> str:
 
 
 def _migration_id(digest: str, ordinal: int, title: str) -> str:
-    """Stable migration_id derived from source digest + ordinal."""
-    slug = _slugify(title, max_len=30)
-    # Use short digest prefix + ordinal + slug for readability and stability
-    # Also include hash of digest+ordinal to ensure uniqueness even if slug collides
-    short = digest[:12]
-    return f"fi-{short}-{ordinal:04d}-{slug}"[:64]
+    """Stable migration_id derived from source digest + ordinal — must match checked-in inventory."""
+    base_slug = _slugify(title, max_len=60)
+    if len(base_slug) <= 60:
+        return base_slug
+    h = digest[:8]
+    keep = 60 - 1 - 8
+    return f"{base_slug[:keep]}-{h}" 
 
 
 def _provenance_label(migration_id: str) -> str:
-    label = f"migration:{migration_id}"
-    # Bounded label
-    if len(label) > MAX_MIGRATION_LABEL_LEN:
-        label = label[:MAX_MIGRATION_LABEL_LEN]
-    return label
+    if len(f"migration:{migration_id}") <= MAX_MIGRATION_LABEL_LEN:
+        return f"migration:{migration_id}"
+    h = hashlib.sha256(migration_id.encode()).hexdigest()[:8]
+    keep = MAX_MIGRATION_LABEL_LEN - len("migration:") - 1 - 8
+    truncated = migration_id[:keep].rstrip("-")
+    return f"migration:{truncated}-{h}"
 
 
-def _row_digest(title: str, body: str, priority: str, status: str, labels: List[str]) -> str:
+def _row_digest(title: str, body: str, priority: str, status: str, labels: List[str], component: Optional[str]=None, reporter: Optional[str]=None, assignee: Optional[str]=None, evidence: Optional[str]=None, resolution: Optional[str]=None, duplicate_of: Optional[str]=None) -> str:
     payload = json.dumps(
-        {"title": title, "body": body, "priority": priority, "status": status, "labels": sorted(labels)},
+        {"title": title, "body": body, "priority": priority, "status": status, "labels": sorted(labels),
+            "component": component,
+            "reporter": reporter,
+            "assignee": assignee,
+            "evidence": evidence,
+            "resolution": resolution,
+            "duplicate_of": duplicate_of},
         sort_keys=True,
         ensure_ascii=False,
     )
@@ -322,8 +330,11 @@ def validate_manifest(
     for idx, cand in enumerate(candidates):
         if not isinstance(cand, dict):
             raise TrackerError("invalid", f"candidate {idx} must be an object")
-        action = cand.get("action") or cand.get("proposed_action")
+        action = cand.get("action")
+        # P0-2: proposed_action is review prompt, not approval — require explicit action
         if not action:
+            if cand.get("proposed_action"):
+                raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} has only proposed_action {cand.get('proposed_action')!r}: explicit action required")
             raise TrackerError("invalid", f"candidate {cand.get('migration_id', idx)} missing action")
         if action not in VALID_ACTIONS:
             # Also refuse needs-current-source-adjudication
@@ -370,9 +381,7 @@ def validate_manifest(
 
     # Source/supplement binding: if manifest has no source_sha at all, refuse? We already checked expected, but also require source_sha to be present
     if source_sha is None:
-        # Allow manifest without source_sha only if no expected was given? But design says binding is required
-        # We'll be lenient: if expected is None, allow missing. Otherwise already raised.
-        pass
+        raise TrackerError("invalid", "manifest missing source_sha256: digest binding is required")
 
 
 # ---------------------------------------------------------------------------
@@ -416,9 +425,8 @@ def dry_run(
         if expected_supplement_sha256 and supplement_sha != expected_supplement_sha256:
             raise TrackerError("conflict", f"supplement sha256 mismatch: got {supplement_sha} expected {expected_supplement_sha256}")
         # Deduplicate against source by normalized title (and optionally body)
-        source_titles = {c["title"].strip().lower() for c in source_candidates}
+        # P1: do NOT silently drop supplement candidates by title — keep all, even if title matches source (historical variants are evidence, not duplicates)
         for cand in sup_cands:
-            if cand["title"].strip().lower() not in source_titles:
                 # Reassign source_class and keep supplement sha
                 cand["source_class"] = "dirty-working-copy-supplement"
                 # Recompute migration_id using supplement sha and new ordinal
@@ -481,6 +489,7 @@ def apply_manifest(
     expected_source_sha256: Optional[str] = None,
     expected_supplement_sha256: Optional[str] = None,
     receipt_out: Optional[str] = None,
+    expected_next_issue_number: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Apply an explicitly adjudicated manifest atomically.
 
@@ -495,11 +504,11 @@ def apply_manifest(
     validate_manifest(manifest, expected_source_sha256, expected_supplement_sha256)
 
     # Also enforce that manifest project matches requested project
-    manifest_project = manifest.get("project") or manifest.get("target_project") or project_id
-    if manifest_project != project_id:
-        # Allow but log? For strictness, if manifest has project field, it must match
-        if manifest.get("project"):
-            raise TrackerError("invalid", f"manifest project {manifest_project!r} does not match requested {project_id!r}")
+    manifest_project = manifest.get("project") or manifest.get("target_project")
+    if manifest_project is not None and str(manifest_project).strip().lower() != str(project_id).strip().lower():
+        raise TrackerError("invalid", f"manifest target_project {manifest_project!r} does not match requested {project_id!r}")
+    if manifest_project is None:
+        raise TrackerError("invalid", f"manifest missing target_project/project: expected {project_id!r}")
 
     candidates = manifest.get("candidates") or manifest.get("entries") or []
     source_sha = manifest.get("source_sha256") or manifest.get("source_sha")
@@ -537,6 +546,8 @@ def apply_manifest(
             if project is None:
                 raise TrackerError("not-found", f"no such project: {project_id}")
             before_counter = int(project.next_issue_number or 1)
+            if expected_next_issue_number is not None and before_counter != int(expected_next_issue_number):
+                raise TrackerError("conflict", f"high watermark mismatch: expected next_issue_number {expected_next_issue_number} but current is {before_counter}: concurrent allocation or stale manifest")
 
             # We will track created keys to handle links after creation
             created_map: Dict[str, str] = {}  # migration_id -> key
@@ -545,7 +556,9 @@ def apply_manifest(
                 mig_id = cand.get("migration_id") or cand.get("migrationId") or str(cand.get("ordinal", ""))
                 if not mig_id:
                     raise TrackerError("invalid", "candidate missing migration_id")
-                action = cand.get("action") or cand.get("proposed_action")
+                action = cand.get("action")
+                if not action and cand.get("proposed_action"):
+                    raise TrackerError("invalid", f"candidate {cand.get('migration_id', '?')} has only proposed_action: explicit action required")
                 title = cand.get("title") or ""
                 body = cand.get("body") or ""
                 priority = cand.get("priority") or cand.get("severity") or "unset"
@@ -576,7 +589,7 @@ def apply_manifest(
                 labels = tracker.normalise_labels(labels)
 
                 # Compute digest for conflict detection
-                digest = _row_digest(title, body, priority, status, labels)
+                digest = _row_digest(title, body, priority, status, labels, component=cand.get("component"), reporter=cand.get("reporter") or cand.get("requester"), assignee=cand.get("assignee") or cand.get("owner"), evidence=cand.get("evidence"), resolution=cand.get("resolution") or cand.get("outcome"), duplicate_of=cand.get("duplicate_of") or cand.get("canonical_key"))
 
                 # Idempotency check: does a row with this migration label already exist?
                 existing = _find_existing_by_migration(db, mig_id)
@@ -589,7 +602,7 @@ def apply_manifest(
                     if existing is not None:
                         # Verify bytes match; if not, conflict
                         existing_labels = json.loads(existing.labels) if existing.labels else []
-                        existing_digest = _row_digest(existing.title or "", existing.body or "", existing.severity or "unset", existing.status or "open", existing_labels)
+                        existing_digest = _row_digest(existing.title or "", existing.body or "", existing.severity or "unset", existing.status or "open", existing_labels, component=existing.component, reporter=existing.reporter, assignee=existing.assignee, evidence=existing.evidence, resolution=existing.resolution, duplicate_of=existing.duplicate_of)
                         # Compare digest of stored row vs candidate digest
                         # Note: existing_digest includes migration label etc., which candidate also includes, so compare
                         if existing_digest != digest:
@@ -728,7 +741,7 @@ def apply_manifest(
                     existing_labels = json.loads(existing_canonical.labels) if existing_canonical.labels else []
                     if mig_label in existing_labels:
                         mappings.append({"migration_id": mig_id, "action": action, "key": cand_key, "status": "existing"})
-                        row_digests.append({"key": cand_key, "migration_id": mig_id, "digest": _row_digest(existing_canonical.title or "", existing_canonical.body or "", existing_canonical.severity or "unset", existing_canonical.status or "open", existing_labels)})
+                        row_digests.append({"key": cand_key, "migration_id": mig_id, "digest": _row_digest(existing_canonical.title or "", existing_canonical.body or "", existing_canonical.severity or "unset", existing_canonical.status or "open", existing_labels, component=existing_canonical.component, reporter=existing_canonical.reporter, assignee=existing_canonical.assignee, evidence=existing_canonical.evidence, resolution=existing_canonical.resolution, duplicate_of=existing_canonical.duplicate_of)})
                     else:
                         # Attach provenance label idempotently (but we are in a transaction, so we can update)
                         # However, we should not modify existing row's title/body, just add label and event
@@ -747,7 +760,7 @@ def apply_manifest(
                             )
                         )
                         mappings.append({"migration_id": mig_id, "action": action, "key": cand_key, "status": "mapped"})
-                        row_digests.append({"key": cand_key, "migration_id": mig_id, "digest": _row_digest(existing_canonical.title or "", existing_canonical.body or "", existing_canonical.severity or "unset", existing_canonical.status or "open", existing_labels)})
+                        row_digests.append({"key": cand_key, "migration_id": mig_id, "digest": _row_digest(existing_canonical.title or "", existing_canonical.body or "", existing_canonical.severity or "unset", existing_canonical.status or "open", existing_labels, component=existing_canonical.component, reporter=existing_canonical.reporter, assignee=existing_canonical.assignee, evidence=existing_canonical.evidence, resolution=existing_canonical.resolution, duplicate_of=existing_canonical.duplicate_of)})
                     created_map[mig_id] = cand_key
 
                 elif action == "skip-invalid":

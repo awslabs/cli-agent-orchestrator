@@ -604,7 +604,7 @@ async def get_feature(feature_key: str, _scopes: List[str] = _READ) -> Dict[str,
 async def update_feature(
     feature_key: str,
     body: FeatureUpdateBody,
-    _scopes: List[str] = _READ,
+    _scopes: List[str] = _WRITE,
 ) -> Dict[str, Any]:
     try:
         existing = tracker.get_issue(feature_key)
