@@ -99,6 +99,7 @@ _EDITABLE_FIELDS: Tuple[str, ...] = (
     "resolution",
     "duplicate_of",
     "labels",
+    "kind",
 )
 
 MAX_TITLE = 300
@@ -224,7 +225,9 @@ def _validate_choice(value: str, allowed: Sequence[str], label: str) -> str:
 def _validate_kind(kind: str) -> str:
     text = str(kind or "").strip().lower()
     if text not in ITEM_KINDS:
-        raise TrackerError("invalid", f"invalid kind {text!r}: expected one of {', '.join(ITEM_KINDS)}")
+        raise TrackerError(
+            "invalid", f"invalid kind {text!r}: expected one of {', '.join(ITEM_KINDS)}"
+        )
     return text
 
 
@@ -442,8 +445,8 @@ def list_projects(*, include_archived: bool = False) -> List[Dict[str, Any]]:
         open_tallies: Dict[str, int] = {}
         all_tallies: Dict[str, int] = {}
         all_open: Dict[str, int] = {}
-        by_kind_total: Dict[str, Dict[str,int]] = {k: {} for k in ITEM_KINDS}
-        by_kind_open: Dict[str, Dict[str,int]] = {k: {} for k in ITEM_KINDS}
+        by_kind_total: Dict[str, Dict[str, int]] = {k: {} for k in ITEM_KINDS}
+        by_kind_open: Dict[str, Dict[str, int]] = {k: {} for k in ITEM_KINDS}
         for iss in all_issues:
             pid = iss.project_id
             kind = getattr(iss, "kind", "issue")
@@ -497,7 +500,7 @@ def get_project(project_id: str) -> Dict[str, Any]:
         all_issues = db.query(TrackerIssueModel).filter(TrackerIssueModel.project_id == slug).all()
         by_status: Dict[str, int] = {}
         all_by_status: Dict[str, int] = {}
-        by_kind: Dict[str, Any] = {k: {"total":0,"open":0,"by_status":{}} for k in ITEM_KINDS}
+        by_kind: Dict[str, Any] = {k: {"total": 0, "open": 0, "by_status": {}} for k in ITEM_KINDS}
         for iss in all_issues:
             kind = getattr(iss, "kind", "issue")
             all_by_status[iss.status] = all_by_status.get(iss.status, 0) + 1
@@ -520,7 +523,9 @@ def get_project(project_id: str) -> Dict[str, Any]:
                 "by_status": {k: int(v) for k, v in by_status.items()},
                 "by_kind": by_kind,
                 "all_total": sum(int(v) for v in all_by_status.values()),
-                "all_open": sum(int(v) for kk, v in all_by_status.items() if kk not in TERMINAL_STATUSES),
+                "all_open": sum(
+                    int(v) for kk, v in all_by_status.items() if kk not in TERMINAL_STATUSES
+                ),
             },
         )
         payload["scopes"] = [
@@ -911,7 +916,10 @@ def create_issue(
     severity = _validate_choice(severity, SEVERITIES, "severity")
     kind = _validate_kind(kind)
     if status == "duplicate":
-        raise TrackerError("invalid", "duplicate status requires duplicate_of canonical key (set via update after creation)")
+        raise TrackerError(
+            "invalid",
+            "duplicate status requires duplicate_of canonical key (set via update after creation)",
+        )
     if kind == "feature" and failing_command:
         raise TrackerError("invalid", "failing_command is not allowed for feature requests")
     label_list = normalise_labels(labels)
@@ -1221,8 +1229,6 @@ def update_issue(issue_key: str, *, actor: Optional[str] = None, **changes: Any)
     instead of a TypeError about duplicate arguments.
     """
     key = str(issue_key or "").strip().lower()
-    if "kind" in changes:
-        raise TrackerError("invalid", "kind is immutable")
     unknown = set(changes) - set(_EDITABLE_FIELDS)
     if unknown:
         raise TrackerError("invalid", f"not editable: {', '.join(sorted(unknown))}")
@@ -1233,13 +1239,51 @@ def update_issue(issue_key: str, *, actor: Optional[str] = None, **changes: Any)
             raise TrackerError("not-found", f"no such issue: {key}")
 
         now = _utcnow()
-        # Duplicate status requires canonical key (P1)
-        if changes.get("status") == "duplicate" and not changes.get("duplicate_of") and not getattr(row, "duplicate_of", None):
-            raise TrackerError("invalid", "duplicate status requires duplicate_of canonical key")
-        is_feature = getattr(row, "kind", "issue") == "feature"
-        if is_feature and "failing_command" in changes and changes["failing_command"] and str(changes["failing_command"]).strip():
-            raise TrackerError("invalid", "failing_command is not allowed for feature requests")
         events: List[TrackerEventModel] = []
+        # Duplicate status requires canonical key (P1)
+        if (
+            changes.get("status") == "duplicate"
+            and not changes.get("duplicate_of")
+            and not getattr(row, "duplicate_of", None)
+        ):
+            raise TrackerError("invalid", "duplicate status requires duplicate_of canonical key")
+        # Determine target kind after change (for kind-switch validation)
+        # N3: explicit null/empty is treated as no-op (skip), not 400
+        if "kind" in changes and (changes["kind"] is None or not str(changes["kind"]).strip()):
+            # Remove null/empty kind from changes so loop skips it
+            del changes["kind"]
+        target_kind = (
+            _validate_kind(changes["kind"]) if "kind" in changes else getattr(row, "kind", "issue")
+        )
+        if (
+            target_kind == "feature"
+            and "failing_command" in changes
+            and changes["failing_command"]
+            and str(changes["failing_command"]).strip()
+        ):
+            raise TrackerError("invalid", "failing_command is not allowed for feature requests")
+        # If switching to feature and existing failing_command would be retained, clear it
+        # Also handles explicit null (m1) where loop would skip; empty string is handled by loop
+        if (
+            target_kind == "feature"
+            and getattr(row, "failing_command", None)
+            and "kind" in changes
+            and ("failing_command" not in changes or changes.get("failing_command") is None)
+        ):
+            # Auto-clear stale failing_command when becoming a feature
+            old_fc = row.failing_command
+            row.failing_command = None
+            events.append(
+                TrackerEventModel(
+                    issue_key=key,
+                    actor=actor,
+                    kind="field",
+                    field="failing_command",
+                    old_value=_as_text(old_fc),
+                    new_value=None,
+                    created_at=now,
+                )
+            )
 
         for field, raw in changes.items():
             if raw is None:
@@ -1281,6 +1325,8 @@ def _as_text(value: Any) -> Optional[str]:
 
 def _coerce_field(row: TrackerIssueModel, field: str, raw: Any, *, db: Any) -> Tuple[Any, Any]:
     """Validate one field change and return ``(old, new)`` in stored form."""
+    if field == "kind":
+        return getattr(row, "kind", "issue"), _validate_kind(raw)
     if field == "status":
         return row.status, _validate_choice(raw, STATUSES, "status")
     if field == "severity":
@@ -1486,8 +1532,8 @@ def stats(project_id: Optional[str] = None, *, kind: Optional[str] = "issue") ->
         by_kind: Dict[str, Dict[str, Any]] = {}
         for k in ITEM_KINDS:
             subset = [r for r in all_rows if getattr(r, "kind", "issue") == k]
-            by_status_k: Dict[str,int] = {}
-            by_sev_k: Dict[str,int] = {}
+            by_status_k: Dict[str, int] = {}
+            by_sev_k: Dict[str, int] = {}
             for r in subset:
                 by_status_k[r.status] = by_status_k.get(r.status, 0) + 1
                 by_sev_k[r.severity] = by_sev_k.get(r.severity, 0) + 1
@@ -1503,7 +1549,9 @@ def stats(project_id: Optional[str] = None, *, kind: Optional[str] = "issue") ->
     return result
 
 
-def render_markdown(project_id: str, *, open_only: bool = True, kind: Optional[str] = "issue") -> str:
+def render_markdown(
+    project_id: str, *, open_only: bool = True, kind: Optional[str] = "issue"
+) -> str:
     """Render an issue log as markdown.
 
     The markdown ledger this replaces is now an *export*: a view produced from

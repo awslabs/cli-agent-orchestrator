@@ -13,8 +13,8 @@ import threading
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text as sa_text
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, ensure_tracker_schema
 from cli_agent_orchestrator.services import issue_tracker as tracker
@@ -23,11 +23,14 @@ from cli_agent_orchestrator.services.issue_tracker import TrackerError
 
 @pytest.fixture(autouse=True)
 def db(tmp_path, monkeypatch):
-    engine = create_engine(f"sqlite:///{tmp_path}/gates.db", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        f"sqlite:///{tmp_path}/gates.db", connect_args={"check_same_thread": False}
+    )
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(tracker, "SessionLocal", sessionmaker(bind=engine))
     # also patch the database module's engine for migration tests
     import cli_agent_orchestrator.clients.database as dbmod
+
     monkeypatch.setattr(dbmod, "engine", engine)
     yield engine
     engine.dispose()
@@ -54,11 +57,17 @@ def cao_system(tmp_path):
 class TestSchemaMigration:
     def test_fresh_db_has_kind_column_and_index(self, db):
         from cli_agent_orchestrator.clients.database import ensure_tracker_schema
+
         ensure_tracker_schema()
         with db.connect() as conn:
             cols = {row[1] for row in conn.execute(sa_text("PRAGMA table_info(tracker_issues)"))}
             assert "kind" in cols
-            idxs = [row[0] for row in conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='index'"))]
+            idxs = [
+                row[0]
+                for row in conn.execute(
+                    sa_text("SELECT name FROM sqlite_master WHERE type='index'")
+                )
+            ]
             # composite index is created by migration; either it exists or kind index exists
             assert any("kind" in name for name in idxs)
 
@@ -66,6 +75,7 @@ class TestSchemaMigration:
         # Simulate legacy db without kind column by dropping and recreating without kind is complex;
         # instead verify ensure_tracker_schema is idempotent on already-migrated db
         import cli_agent_orchestrator.clients.database as dbmod
+
         dbmod.ensure_tracker_schema()
         dbmod.ensure_tracker_schema()
         with db.connect() as conn:
@@ -77,14 +87,25 @@ class TestSchemaMigration:
         with engine.begin() as conn:
             conn.execute(sa_text("CREATE TABLE tracker_issues (bad_col TEXT)"))
         import cli_agent_orchestrator.clients.database as dbmod
+
         monkeypatch.setattr(dbmod, "engine", engine)
         with pytest.raises(RuntimeError, match="malformed"):
             dbmod._migrate_tracker_kind_column()
 
     def test_concurrent_migration_is_safe(self, tmp_path, monkeypatch):
-        engine = create_engine(f"sqlite:///{tmp_path}/conc.db", connect_args={"check_same_thread": False})
-        Base.metadata.create_all(bind=engine)
+        # Legacy DB without kind column — the race is between PRAGMA check and ALTER TABLE
+        # Base.metadata.create_all already includes kind, so we must create the table manually
+        engine = create_engine(
+            f"sqlite:///{tmp_path}/conc.db", connect_args={"check_same_thread": False}
+        )
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    "CREATE TABLE tracker_issues (key TEXT PRIMARY KEY, project_id TEXT, title TEXT, status TEXT)"
+                )
+            )
         import cli_agent_orchestrator.clients.database as dbmod
+
         monkeypatch.setattr(dbmod, "engine", engine)
         errors = []
 
@@ -99,7 +120,11 @@ class TestSchemaMigration:
             t.start()
         for t in threads:
             t.join()
-        assert errors == []
+        assert errors == [], f"concurrent migration should be idempotent, got {errors}"
+        # Verify column was added and no duplicate error escaped
+        with engine.connect() as conn:
+            cols = {row[1] for row in conn.execute(sa_text("PRAGMA table_info(tracker_issues)"))}
+            assert "kind" in cols
 
 
 class TestFeatureKindGuards:
@@ -135,16 +160,103 @@ class TestFeatureKindGuards:
             # fallback: check all_total
             assert stats["all_total"] == 2 or stats["total"] == 2
 
-    def test_patch_kind_is_rejected(self, cao_system):
+    def test_patch_kind_is_mutable_with_audit(self, cao_system):
         row = tracker.create_feature(project_id="cao-system", title="f1")
+        # kind is now mutable via PATCH — switching feature -> issue succeeds and is audited
+        updated = tracker.update_issue(row["key"], **{"kind": "issue"}, actor="alice")
+        assert updated["kind"] == "issue"
+        detail = tracker.get_issue(row["key"])
+        assert any(e.get("field") == "kind" for e in detail.get("events", []))
+        # switching back issue -> feature also succeeds; stale failing_command is cleared if present
+        issue_row = tracker.create_issue(
+            project_id="cao-system", title="b1", failing_command="make test"
+        )
+        assert issue_row["failing_command"] == "make test"
+        switched = tracker.update_issue(issue_row["key"], **{"kind": "feature"}, actor="bob")
+        assert switched["kind"] == "feature"
+        assert switched["failing_command"] is None
+        detail2 = tracker.get_issue(issue_row["key"])
+        # kind switch and auto-clear of failing_command should both be audited
+        assert any(e.get("field") == "kind" for e in detail2.get("events", []))
+        assert any(e.get("field") == "failing_command" for e in detail2.get("events", []))
+        # invalid kind still rejected
         with pytest.raises(TrackerError) as exc:
-            tracker.update_issue(row["key"], **{"kind": "issue"})
-        assert exc.value.code in ("invalid", "not-found")
+            tracker.update_issue(row["key"], **{"kind": "not-a-kind"})
+        assert exc.value.code == "invalid"
 
     def test_failing_command_rejected_for_features(self, cao_system):
         with pytest.raises(TrackerError) as exc:
             tracker.create_feature(project_id="cao-system", title="f1", failing_command="cmd")
         assert exc.value.code == "invalid"
+
+    def test_explicit_null_clears_failing_command_on_kind_switch(self, cao_system):
+        issue = tracker.create_issue(
+            project_id="cao-system", title="leak", failing_command="make test"
+        )
+        assert issue["failing_command"] == "make test"
+        # explicit None must also clear (loop skips None, so auto-clear must fire)
+        switched = tracker.update_issue(
+            issue["key"], kind="feature", failing_command=None, actor="test"
+        )
+        assert switched["kind"] == "feature"
+        assert switched["failing_command"] is None
+
+    def test_kind_switch_is_audited(self, cao_system):
+        issue = tracker.create_issue(project_id="cao-system", title="audit")
+        tracker.update_issue(issue["key"], kind="feature", actor="alice")
+        detail = tracker.get_issue(issue["key"])
+        kind_events = [e for e in detail.get("events", []) if e.get("field") == "kind"]
+        assert len(kind_events) >= 1
+
+
+class TestApiKindPatch:
+    def test_issue_patch_kind_via_http(self, cao_system):
+        from test.api.conftest import TestClientWithHost
+
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        client = TestClientWithHost(app)
+        app.state.plugin_registry = PluginRegistry()
+        issue = tracker.create_issue(project_id="cao-system", title="via-api")
+        resp = client.patch(f"/tracker/issues/{issue['key']}", json={"kind": "feature"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["kind"] == "feature"
+        # switching via the feature endpoint back to issue
+        feat = resp.json()
+        resp2 = client.patch(f"/tracker/features/{feat['key']}", json={"kind": "issue"})
+        assert resp2.status_code == 200, resp2.text
+        assert resp2.json()["kind"] == "issue"
+
+    def test_invalid_kind_is_422(self, cao_system):
+        from test.api.conftest import TestClientWithHost
+
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        client = TestClientWithHost(app)
+        app.state.plugin_registry = PluginRegistry()
+        issue = tracker.create_issue(project_id="cao-system", title="bad-kind")
+        resp = client.patch(f"/tracker/issues/{issue['key']}", json={"kind": "not-a-kind"})
+        # service validates kind -> 400, Pydantic would also reject but service is the source of truth
+        assert resp.status_code in (400, 422)
+
+    def test_null_and_empty_kind_are_noop(self, cao_system):
+        from test.api.conftest import TestClientWithHost
+
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        client = TestClientWithHost(app)
+        app.state.plugin_registry = PluginRegistry()
+        issue = tracker.create_issue(project_id="cao-system", title="null-kind")
+        for payload in [{"kind": None}, {"kind": ""}, {"kind": "  "}]:
+            resp = client.patch(f"/tracker/issues/{issue['key']}", json=payload)
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["kind"] == "issue"
+        # service-level as well
+        assert tracker.update_issue(issue["key"], kind=None)["kind"] == "issue"
+        assert tracker.update_issue(issue["key"], kind="")["kind"] == "issue"
 
 
 class TestDuplicateAndLinkInvariants:
@@ -198,8 +310,12 @@ class TestImporterDryRunAndHighWatermark:
         assert len(plan["candidates"]) == 1
 
     def test_apply_high_watermark_mismatch_refuses(self, tmp_path, cao_system):
-        from cli_agent_orchestrator.services.future_improvements_import import dry_run, apply_manifest
         import json
+
+        from cli_agent_orchestrator.services.future_improvements_import import (
+            apply_manifest,
+            dry_run,
+        )
 
         source = tmp_path / "FUTURE.md"
         source.write_text("# Roadmap\n\n- **a feature**\n  body\n", encoding="utf-8")
@@ -220,23 +336,42 @@ class TestImporterDryRunAndHighWatermark:
         }
         manifest.write_text(json.dumps(data), encoding="utf-8")
         with pytest.raises(TrackerError) as exc:
-            apply_manifest(manifest_path=str(manifest), project_id="cao-system", expected_next_issue_number=9999)
-        assert "high watermark" in str(exc.value).lower() or "next_issue_number" in str(exc.value).lower()
+            apply_manifest(
+                manifest_path=str(manifest),
+                project_id="cao-system",
+                expected_next_issue_number=9999,
+            )
+        assert (
+            "high watermark" in str(exc.value).lower()
+            or "next_issue_number" in str(exc.value).lower()
+        )
         assert exc.value.code == "conflict"
 
     def test_importer_27_27_reproducibility(self, tmp_path):
         import json
         import pathlib
 
-        from cli_agent_orchestrator.services.future_improvements_import import parse_future_improvements_markdown
+        from cli_agent_orchestrator.services.future_improvements_import import (
+            parse_future_improvements_markdown,
+        )
 
-        inv_path = pathlib.Path(__file__).parents[1] / "docs" / "issues" / "feature-request-tracker" / "future-improvements-migration-inventory.json"
+        inv_path = (
+            pathlib.Path(__file__).parents[1]
+            / "docs"
+            / "issues"
+            / "feature-request-tracker"
+            / "future-improvements-migration-inventory.json"
+        )
         if not inv_path.exists():
-            inv_path = pathlib.Path("/Users/colin/Projects/cli-agent-orchestrator-worktrees/feature-request-system-spec/docs/issues/feature-request-tracker/future-improvements-migration-inventory.json")
+            inv_path = pathlib.Path(
+                "/Users/colin/Projects/cli-agent-orchestrator-worktrees/feature-request-system-spec/docs/issues/feature-request-tracker/future-improvements-migration-inventory.json"
+            )
         inv = json.loads(inv_path.read_text())
         # Collect expected migration_ids per inventory entries
         expected_ids = {e["migration_id"] for e in inv["entries"]}
-        assert len(expected_ids) == 27, f"inventory should have 27 distinct ids, got {len(expected_ids)}"
+        assert (
+            len(expected_ids) == 27
+        ), f"inventory should have 27 distinct ids, got {len(expected_ids)}"
         # For each entry, verify _migration_id reproduces it even with trailing punctuation variant
         from cli_agent_orchestrator.services.future_improvements_import import _migration_id
 
@@ -245,7 +380,9 @@ class TestImporterDryRunAndHighWatermark:
             mig = e["migration_id"]
             # Use dummy digest; for the two long titles the result is hardcoded independent of digest
             reproduced = _migration_id("0" * 64, e["source_ordinal"], title)
-            assert reproduced == mig, f"migration_id mismatch for {title!r}: {reproduced!r} != {mig!r}"
+            assert (
+                reproduced == mig
+            ), f"migration_id mismatch for {title!r}: {reproduced!r} != {mig!r}"
             # Also check with trailing period variant (parser retains ".")
             reproduced_dot = _migration_id("0" * 64, e["source_ordinal"], title + ".")
             assert reproduced_dot == mig, f"trailing-dot variant failed for {title!r}"
