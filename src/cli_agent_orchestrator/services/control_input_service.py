@@ -4945,7 +4945,11 @@ def observe_composer(
                     detail=f"could not capture the pane screen: {exc}",
                 )
 
-            extracted = native_pane_input.extract_composer_text(rows, pin)
+            extracted = native_pane_input.extract_composer_text(
+                rows,
+                pin,
+                expected_text_bytes=expected_bytes,
+            )
             if extracted is None:
                 return _negative_observation(
                     resolved,
