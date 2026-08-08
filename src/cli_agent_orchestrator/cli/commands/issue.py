@@ -894,26 +894,32 @@ def feature_stats(project_id, as_json):
 @click.option("--json", "as_json", is_flag=True)
 def feature_import_future_improvements(source_path, supplement_path, manifest_path, inventory_out, project_id, expected_source_sha256, expected_supplement_sha256, dry_run, do_apply, yes, as_json):
     """Import FUTURE_IMPROVEMENTS roadmap — planning (dry-run) or apply via manifest."""
-    import hashlib, json, pathlib
-    # Lazy import parser to avoid heavy dep at import time
+    from cli_agent_orchestrator.services.future_improvements_import import dry_run as _dry_run, apply_manifest
+
+    ensure_tracker_schema()
+    # Planning mode: --dry-run or not --apply
     if dry_run or not do_apply:
-        # Planning mode: parse source(s) and emit inventory/plan
-        # Minimal parser per D7: top-level bold bullets, bind P0-P4 from nearest section
-        src = pathlib.Path(source_path) if source_path else None
-        if not src:
+        if not source_path:
             click.echo("dry-run requires --source", err=True)
             sys.exit(1)
-        data = src.read_bytes()
-        sha = hashlib.sha256(data).hexdigest()
-        if expected_source_sha256 and sha != expected_source_sha256:
-            click.echo(f"source sha256 mismatch: got {sha} expected {expected_source_sha256}", err=True)
-            sys.exit(1)
-        # For MVP: emit a simple plan file if requested, otherwise just report counts
-        plan = {"source": str(src), "sha256": sha, "project": project_id, "entries": []}
+        try:
+            plan = _dry_run(
+                source_path=source_path,
+                supplement_path=supplement_path,
+                inventory_out=inventory_out,
+                project_id=project_id,
+                expected_source_sha256=expected_source_sha256,
+                expected_supplement_sha256=expected_supplement_sha256,
+            )
+        except TrackerError as exc:
+            _fail(exc)
         if inventory_out:
-            pathlib.Path(inventory_out).write_text(json.dumps(plan, indent=2))
-            click.echo(f"wrote plan to {inventory_out} (sha {sha})")
-        _emit(plan, as_json, lambda r: click.echo(f"dry-run: source {src} sha {sha[:12]}"))
+            click.echo(f"wrote plan to {inventory_out} (sha {plan.get('source_sha256','')[:12]})")
+        def render(plan):
+            click.echo(f"dry-run: {len(plan.get('candidates', []))} candidate(s) from {plan.get('source_path')} sha {plan.get('source_sha256','')[:12]}")
+            if plan.get("supplement_path"):
+                click.echo(f"  supplement: {plan.get('supplement_path')} sha {str(plan.get('supplement_sha256',''))[:12]}")
+        _emit(plan, as_json, render)
         return
     # Apply mode
     if not manifest_path:
@@ -922,16 +928,16 @@ def feature_import_future_improvements(source_path, supplement_path, manifest_pa
     if not yes:
         click.echo("pass --yes to apply", err=True)
         sys.exit(1)
-    import json as jsonlib
-    manifest = jsonlib.loads(pathlib.Path(manifest_path).read_text())
-    # Validate sha bindings if provided
-    if expected_source_sha256 and manifest.get("source_sha256") != expected_source_sha256:
-        click.echo("manifest source_sha256 does not match expected", err=True)
-        sys.exit(1)
-    if expected_supplement_sha256 and manifest.get("supplement_sha256") != expected_supplement_sha256:
-        click.echo("manifest supplement_sha256 does not match expected", err=True)
-        sys.exit(1)
-    # Minimal apply: create features for entries with create-* actions
-    # Full transactional/idempotent logic deferred to PR3 — this stub ensures CLI surface exists
-    click.echo("import-future-improvements apply is not yet implemented (PR3) — manifest validated", err=True)
-    sys.exit(1)
+    try:
+        receipt = apply_manifest(
+            manifest_path=manifest_path,
+            project_id=project_id,
+            expected_source_sha256=expected_source_sha256,
+            expected_supplement_sha256=expected_supplement_sha256,
+        )
+    except TrackerError as exc:
+        _fail(exc)
+    def render_receipt(r):
+        click.echo(f"applied {r['candidate_count']} candidate(s) -> {len([m for m in r['mappings'] if m['key']])} keys; receipt {r['receipt_path']} tx {r['transaction_id'][:8]}")
+        click.echo(f"  before {r['before_next_issue_number']} after {r['after_next_issue_number']}")
+    _emit(receipt, as_json, render_receipt)
