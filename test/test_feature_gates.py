@@ -172,6 +172,58 @@ class TestFeatureKindGuards:
             tracker.create_feature(project_id="cao-system", title="f1", failing_command="cmd")
         assert exc.value.code == "invalid"
 
+    def test_explicit_null_clears_failing_command_on_kind_switch(self, cao_system):
+        issue = tracker.create_issue(
+            project_id="cao-system", title="leak", failing_command="make test"
+        )
+        assert issue["failing_command"] == "make test"
+        # explicit None must also clear (loop skips None, so auto-clear must fire)
+        switched = tracker.update_issue(
+            issue["key"], kind="feature", failing_command=None, actor="test"
+        )
+        assert switched["kind"] == "feature"
+        assert switched["failing_command"] is None
+
+    def test_kind_switch_is_audited(self, cao_system):
+        issue = tracker.create_issue(project_id="cao-system", title="audit")
+        tracker.update_issue(issue["key"], kind="feature", actor="alice")
+        detail = tracker.get_issue(issue["key"])
+        kind_events = [e for e in detail.get("events", []) if e.get("field") == "kind"]
+        assert len(kind_events) >= 1
+
+
+class TestApiKindPatch:
+    def test_issue_patch_kind_via_http(self, cao_system):
+        from test.api.conftest import TestClientWithHost
+
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        client = TestClientWithHost(app)
+        app.state.plugin_registry = PluginRegistry()
+        issue = tracker.create_issue(project_id="cao-system", title="via-api")
+        resp = client.patch(f"/tracker/issues/{issue['key']}", json={"kind": "feature"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["kind"] == "feature"
+        # switching via the feature endpoint back to issue
+        feat = resp.json()
+        resp2 = client.patch(f"/tracker/features/{feat['key']}", json={"kind": "issue"})
+        assert resp2.status_code == 200, resp2.text
+        assert resp2.json()["kind"] == "issue"
+
+    def test_invalid_kind_is_422(self, cao_system):
+        from test.api.conftest import TestClientWithHost
+
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        client = TestClientWithHost(app)
+        app.state.plugin_registry = PluginRegistry()
+        issue = tracker.create_issue(project_id="cao-system", title="bad-kind")
+        resp = client.patch(f"/tracker/issues/{issue['key']}", json={"kind": "not-a-kind"})
+        # service validates kind -> 400, Pydantic would also reject but service is the source of truth
+        assert resp.status_code in (400, 422)
+
 
 class TestDuplicateAndLinkInvariants:
     def test_duplicate_requires_canonical_and_kind_guard(self, cao_system):
