@@ -130,7 +130,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: web-playwright-report
           path: web/playwright-report/
@@ -333,7 +333,7 @@ jobs:
 
       - name: Upload demo GIF artifact
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: agui-eventsource-viewer-demo
           path: docs/media/agui-eventsource-viewer-demo.gif
