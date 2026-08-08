@@ -1314,6 +1314,35 @@ def _observed_identity(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
+def _admit_session_creation(session_name: str) -> str:
+    """One lifecycle admission policy for both creation modes.
+
+    Applied under the physical session claim, before any resource declaration
+    or backend effect: canonicalize the target, fail closed on an unreadable
+    lifecycle store, and reject a stopped name. Returns the canonical name.
+
+    ``describe`` fails open to ``working`` + ``unreadable`` for observational
+    marshal callers; creation admission must not, since an unreadable store can
+    hide a stopped row and admit a stale-env deletion or name reuse.
+    """
+    from cli_agent_orchestrator.services import session_lifecycle
+
+    canonical = session_lifecycle.normalise_session_name(session_name)
+    declared = session_lifecycle.describe(canonical)
+    if declared.get("unreadable"):
+        raise session_lifecycle.SessionLifecycleUnavailable(
+            f"cannot admit session {canonical!r}: its declared lifecycle is "
+            f"unreadable ({declared['unreadable']})"
+        )
+    if declared["lifecycle"] == session_lifecycle.STOPPED:
+        raise ValueError(
+            f"session {canonical!r} is stopped and still holds what a resume "
+            f"would restore ({declared['restore_to']!r}); delete the session "
+            "to release the name, or pick another"
+        )
+    return canonical
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1408,32 +1437,16 @@ async def create_terminal(
         # releases the claim and aborts with zero resource effects.
         from cli_agent_orchestrator.services import callback_recovery, session_lifecycle
 
-        session_claim = callback_recovery.session_lifecycle_claim(
+        session_claim = callback_recovery.async_session_lifecycle_claim(
             type(get_backend()).__name__, session_name
         )
-        session_claim.__enter__()
+        await session_claim.__aenter__()
         try:
-            # Admission: a stopped name still holds what a resume would restore
-            # to (and a collected fleet); it must not be silently recreated.
-            # Checked under the claim so a stop cannot flip the row between
-            # this read and the physical creation below.
-            declared = session_lifecycle.describe(session_name)
-            # ``describe`` fails open to ``working`` + ``unreadable`` for
-            # observational marshal callers; creation admission must not; an
-            # unreadable store can hide a stopped row, so this is typed
-            # lifecycle unavailability at the admission boundary — refuse
-            # before stale-env deletion / ID generation / any physical effect.
-            if declared.get("unreadable"):
-                raise session_lifecycle.SessionLifecycleUnavailable(
-                    f"cannot admit new session {session_name!r}: its declared lifecycle "
-                    f"is unreadable ({declared['unreadable']})"
-                )
-            if declared["lifecycle"] == session_lifecycle.STOPPED:
-                raise ValueError(
-                    f"session {session_name!r} is stopped and still holds what a "
-                    f"resume would restore ({declared['restore_to']!r}); delete the "
-                    "session to release the name, or pick another"
-                )
+            # Admission under the claim: a stopped name still holds what a
+            # resume would restore to (and a collected fleet) and must not be
+            # silently recreated; an unreadable store cannot be trusted. The
+            # same policy is applied to the add-to-existing path below.
+            session_name = _admit_session_creation(session_name)
             # Prevent duplicate sessions (re-checked under the claim).
             if get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
@@ -1445,7 +1458,7 @@ async def create_terminal(
             # reused over an unconfirmed stale row.
             clear_session_env(session_name)
         except BaseException:
-            session_claim.__exit__(None, None, None)
+            await session_claim.__aexit__(None, None, None)
             session_claim = None
             raise
 
@@ -1500,19 +1513,29 @@ async def create_terminal(
         if not session_name:
             session_name = generate_session_name()
 
+        # Canonicalize the join target so the physical claim, the admission
+        # check, and every backend effect share the canonical name (and
+        # serialize against stop/delete, which take the same claim). A new
+        # session already canonicalized and admitted in the preflight above.
+        from cli_agent_orchestrator.services import callback_recovery, session_lifecycle
+
+        session_name = session_lifecycle.normalise_session_name(session_name)
+
         # Creation and teardown share this exact backend/session claim.  It
         # covers the final existence check, physical pane/session effect, DB
         # persistence, and rollback so a stale delete cannot kill a new window
-        # in a reused session name. A new session already acquired it for the
-        # admission/preflight above; the add-to-existing-session path acquires
-        # it here.
-        from cli_agent_orchestrator.services import callback_recovery
-
+        # in a reused session name. The add-to-existing-session path acquires
+        # it here (a new session already holds it from the preflight).
         if session_claim is None:
-            session_claim = callback_recovery.session_lifecycle_claim(
+            session_claim = callback_recovery.async_session_lifecycle_claim(
                 type(get_backend()).__name__, session_name
             )
-            session_claim.__enter__()
+            await session_claim.__aenter__()
+            # Admission under the claim for the add-to-existing path: reject a
+            # stopped/unreadable row before any resource declaration (v2 below)
+            # or backend window effect. On refusal the resource-try finally
+            # releases the claim; nothing is owned yet, so cleanup is a no-op.
+            session_name = _admit_session_creation(session_name)
 
         window_name = (
             managed_window_name(terminal_id, terminal_generation)
@@ -2031,7 +2054,7 @@ async def create_terminal(
         raise
     finally:
         if session_claim is not None:
-            session_claim.__exit__(None, None, None)
+            await session_claim.__aexit__(None, None, None)
 
 
 def _notify_caller_of_deferred_failure(

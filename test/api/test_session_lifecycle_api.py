@@ -15,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.services import session_lifecycle as sl
+from cli_agent_orchestrator.services import session_service
 
 SESSION = "cao-p1-closure"
 
@@ -427,3 +428,72 @@ class TestTheDeclareBodyIsClosed:
             ).json()["lifecycle"]
             == "paused"
         )
+
+
+class TestStopRouteWiringAndBoundary:
+    def test_stop_route_passes_the_live_plugin_registry(self, client, monkeypatch):
+        """Every collected pane's completion hook needs the live registry; the
+        route must forward it rather than collecting with registry=None."""
+        captured = {}
+
+        def _stop(session_name, **kwargs):
+            captured["registry"] = kwargs.get("registry")
+            return {
+                "session_name": session_name,
+                "lifecycle": "stopped",
+                "restore_to": "working",
+                "collected_terminal_ids": [],
+                "errors": [],
+            }
+
+        monkeypatch.setattr(session_service, "stop_session", _stop)
+        payload = client.post(
+            f"/sessions/{SESSION}/lifecycle/stop",
+            json={"declared_by": "colin", "acknowledged_one_way": True},
+        ).json()
+        assert payload["lifecycle"] == "stopped"
+        assert captured["registry"] is client.app.state.plugin_registry
+
+    def test_archive_route_passes_the_live_plugin_registry(self, client, monkeypatch):
+        captured = {}
+
+        def _stop(session_name, **kwargs):
+            captured["registry"] = kwargs.get("registry")
+            captured["archived"] = kwargs.get("archived")
+            return {
+                "session_name": session_name,
+                "lifecycle": "stopped",
+                "kind": "archived",
+                "restore_to": "working",
+                "collected_terminal_ids": [],
+                "errors": [],
+            }
+
+        monkeypatch.setattr(session_service, "stop_session", _stop)
+        payload = client.post(
+            f"/sessions/{SESSION}/lifecycle/archived",
+            json={"archived": True, "declared_by": "colin", "acknowledged_one_way": True},
+        ).json()
+        assert payload["kind"] == "archived"
+        assert captured == {
+            "registry": client.app.state.plugin_registry,
+            "archived": True,
+        }
+
+    def test_stop_route_does_not_leak_internal_exception_detail(self, client, monkeypatch):
+        """An unexpected failure's path/secret-bearing text must not cross the
+        HTTP boundary; only a bounded generic 500 detail is returned."""
+        secret = "AKIA-SECRET-TOKEN-/etc/shadow"
+
+        def _boom(session_name, **kwargs):
+            raise RuntimeError(f"backend exploded at path={secret}")
+
+        monkeypatch.setattr(session_service, "stop_session", _boom)
+        response = client.post(
+            f"/sessions/{SESSION}/lifecycle/stop",
+            json={"declared_by": "colin", "acknowledged_one_way": True},
+        )
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert secret not in detail
+        assert "exploded" not in detail

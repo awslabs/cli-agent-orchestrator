@@ -664,3 +664,64 @@ class TestLifecycleWritesAreSerialized:
             with pytest.raises(RuntimeError, match="canonical order"):
                 with callback_recovery.session_lifecycle_write_claim(SESSION):
                     pass
+
+
+class TestLifecycleWriteClaimIsCrossProcess:
+    """The lifecycle write claim must serialize across processes (a flock), not
+    just threads. A mutation probe swapping it for a process-local mutex would
+    pass the thread tests but must fail this one."""
+
+    def test_a_child_cannot_enter_until_the_parent_releases(self):
+        import os
+        import subprocess
+        import sys
+        from queue import Empty, Queue
+        from threading import Thread
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        session = f"cao-xprocess-oracle-{os.getpid()}"
+        script = (
+            "from cli_agent_orchestrator.services import callback_recovery\n"
+            "import sys\n"
+            "session = sys.argv[1]\n"
+            "print('CHILD-STARTED', flush=True)\n"
+            "with callback_recovery.session_lifecycle_write_claim(session):\n"
+            "    print('CHILD-ACQUIRED', flush=True)\n"
+            "print('CHILD-DONE', flush=True)\n"
+        )
+
+        parent = callback_recovery.session_lifecycle_write_claim(session)
+        parent.__enter__()
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-c", script, session],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            queue: Queue = Queue()
+
+            def _pump(stream):
+                for line in stream:
+                    queue.put(line)
+
+            reader = Thread(target=_pump, args=(child.stdout,), daemon=True)
+            reader.start()
+
+            started = queue.get(timeout=20)  # child imported + started
+            assert "CHILD-STARTED" in started
+            # Parent still holds the flock, so the child must be blocked: no
+            # ACQUIRED line within a bounded window.
+            with pytest.raises(Empty):
+                queue.get(timeout=0.5)
+            assert child.poll() is None, "child exited while the parent still held the claim"
+        finally:
+            parent.__exit__(None, None, None)
+
+        # After release the child acquires and completes.
+        acquired = queue.get(timeout=10)
+        assert "CHILD-ACQUIRED" in acquired
+        done = queue.get(timeout=10)
+        assert "CHILD-DONE" in done
+        child.wait(timeout=10)

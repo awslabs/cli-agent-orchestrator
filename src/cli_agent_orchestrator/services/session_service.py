@@ -39,6 +39,36 @@ from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 logger = logging.getLogger(__name__)
 
 
+class SessionStopRefused(RuntimeError):
+    """A zero-effect precondition refused the stop before any mutation.
+
+    No pane was collected and no lifecycle row changed (e.g. an open callback
+    recovery). Distinct from a partial collection so the API boundary can map
+    it to a retryable conflict rather than an opaque failure.
+    """
+
+
+class SessionStopPartial(RuntimeError):
+    """Some panes refused collection after the lifecycle row was already stopped.
+
+    The row is preserved and a retry converges, so this is a visible, recoverable
+    state — not a silent half-teardown. Carries the IDs that were collected and
+    the structured per-terminal errors for server-side logging; only bounded,
+    redacted guidance crosses the HTTP boundary.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        collected_terminal_ids: List[str],
+        errors: List[Dict],
+    ) -> None:
+        super().__init__(message)
+        self.collected_terminal_ids = list(collected_terminal_ids)
+        self.errors = list(errors)
+
+
 async def create_session(
     provider: str | None,
     agent_profile: str,
@@ -334,7 +364,7 @@ def stop_session(
                     if callback_recovery.terminal_has_open_recovery(
                         terminal["id"], terminal.get("generation")
                     ):
-                        raise RuntimeError(
+                        raise SessionStopRefused(
                             f"session stop held because terminal {terminal['id']} has an "
                             "open callback-recovery operation; collection is refused until "
                             "callback completion or a terminal refusal/manual disposition"
@@ -386,10 +416,13 @@ def stop_session(
                         errors.append({"terminal_id": terminal["id"], "detail": str(e)})
                 if errors:
                     # The row is already stopped and the env is preserved, so the
-                    # divergence is visible and a retry converges.
-                    raise RuntimeError(
-                        "session stop partially collected; lifecycle preserved; "
-                        f"retry converges: {errors}"
+                    # divergence is visible and a retry converges. Surface the
+                    # structured detail for server-side logging; the HTTP layer
+                    # exposes only bounded, redacted guidance.
+                    raise SessionStopPartial(
+                        "session stop partially collected; lifecycle preserved; " "retry converges",
+                        collected_terminal_ids=collected,
+                        errors=errors,
                     )
 
             # Kill the enclosing backend session if anything remains. Per-window

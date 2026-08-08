@@ -502,7 +502,7 @@ class TestStopSession:
         # First attempt: one of two panes refuses collection.
         mock_list.return_value = [{"id": "term-1"}, {"id": "term-2"}]
         mock_delete.side_effect = [Exception("boom on term-1"), None]
-        with pytest.raises(Exception, match="partially collected"):
+        with pytest.raises(session_service.SessionStopPartial, match="partially collected"):
             session_service.stop_session(STOP_SESSION, declared_by="colin")
 
         # The row is stopped despite the partial failure, restore_to is intact,

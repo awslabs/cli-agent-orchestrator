@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
 import shlex
 import threading
-from contextlib import ExitStack, contextmanager
+import weakref
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -129,12 +132,59 @@ class RecoveryAdmission:
 
 _LIFECYCLE_CLAIMS = threading.local()
 
+logger = logging.getLogger(__name__)
+
 
 @contextmanager
 def generation_lifecycle_claim(terminal_id: str, generation: str):
     """Serialize recovery admission with teardown for one exact incarnation."""
     with generation_lifecycle_claims(((terminal_id, generation),)):
         yield
+
+
+def _claim_lock_path(key: tuple[str, str, str]) -> Path:
+    """The flock file for one canonical lifecycle key.
+
+    Hex-encodes every component so distinct identities (e.g. ``a/b`` vs
+    ``a-b``) never share a lock — the encoding is reversible and filename-safe.
+    Shared by the sync claim and the async session claim so they serialize
+    against each other on the same file.
+    """
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+
+    terminal_id, claim_kind, generation = key
+    return (
+        Path(COMPANION_DIR)
+        / terminal_id.encode("utf-8").hex()
+        / claim_kind.encode("utf-8").hex()
+        / generation.encode("utf-8").hex()
+        / ".callback-recovery-lifecycle.lock"
+    )
+
+
+def _flock_acquire(path: Path) -> int:
+    """Create (if needed) and exclusively flock the lock file; return the fd.
+
+    The fd owns the lock; ``_flock_release`` releases it. Blocking, so callers
+    that must not stall an event loop acquire it off-loop (see
+    ``async_session_lifecycle_claim``).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _flock_release(descriptor: int) -> None:
+    """Drop the exclusive flock and close the fd that owned it."""
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager
@@ -146,8 +196,6 @@ def generation_lifecycle_claims(keys):
     in caller order can deadlock against session retirement, which necessarily
     observes the same keys in a different order.
     """
-    from cli_agent_orchestrator.constants import COMPANION_DIR
-
     held = getattr(_LIFECYCLE_CLAIMS, "held", set())
     canonical = sorted(
         {
@@ -171,27 +219,9 @@ def generation_lifecycle_claims(keys):
         )
 
     with ExitStack() as stack:
-        for terminal_id, claim_kind, generation in missing:
-            # Do not lossy-sanitize lifecycle identities: e.g. ``a/b`` and
-            # ``a-b`` must never share a teardown lock.  Hex is a reversible,
-            # filename-safe encoding of the exact UTF-8 identity.
-            encoded_terminal = terminal_id.encode("utf-8").hex()
-            encoded_generation = generation.encode("utf-8").hex()
-            directory = (
-                Path(COMPANION_DIR)
-                / encoded_terminal
-                / claim_kind.encode("utf-8").hex()
-                / encoded_generation
-            )
-            directory.mkdir(parents=True, exist_ok=True)
-            descriptor = os.open(
-                directory / ".callback-recovery-lifecycle.lock",
-                os.O_CREAT | os.O_RDWR,
-                0o600,
-            )
-            stack.callback(os.close, descriptor)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            stack.callback(fcntl.flock, descriptor, fcntl.LOCK_UN)
+        for key in missing:
+            descriptor = _flock_acquire(_claim_lock_path(key))
+            stack.callback(_flock_release, descriptor)
         _LIFECYCLE_CLAIMS.held = {*held, *missing}
         try:
             yield
@@ -266,6 +296,155 @@ def session_lifecycle_write_claim(session_name: str):
     """
     with generation_lifecycle_claims((("", "session-workspace-write", session_name),)):
         yield
+
+
+# Per-event-loop async gates for the physical session claim. Keyed by loop so a
+# gate created under one ``asyncio.run`` cannot leak into another (locks bind to
+# the loop that first uses them); the WeakKeyDictionary drops the gate set when
+# its loop is garbage-collected.
+_ASYNC_SESSION_GATES: (
+    "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]]"
+) = weakref.WeakKeyDictionary()
+
+
+def _async_session_gate(session_key: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    inner = _ASYNC_SESSION_GATES.get(loop)
+    if inner is None:
+        inner = {}
+        _ASYNC_SESSION_GATES[loop] = inner
+    lock = inner.get(session_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        inner[session_key] = lock
+    return lock
+
+
+class _AcquireHandoff:
+    """Cancellation-safe ownership transfer for an off-loop flock acquire.
+
+    The worker that acquires the descriptor either hands it to the caller (the
+    caller then owns release) or, if the caller abandoned the wait, releases the
+    descriptor itself. The lock makes the check-and-handoff atomic, so exactly
+    one of the two ever owns the descriptor — a task cancelled while the acquire
+    is in flight can never orphan the lock.
+    """
+
+    __slots__ = ("descriptor", "abandoned", "lock")
+
+    def __init__(self) -> None:
+        self.descriptor: int | None = None
+        self.abandoned = False
+        self.lock = threading.Lock()
+
+
+def _safe_flock_release(descriptor: int) -> None:
+    """Release a flock descriptor without raising (cleanup-only path)."""
+    try:
+        _flock_release(descriptor)
+    except Exception:
+        logger.warning("flock release failed for descriptor %s", descriptor, exc_info=True)
+
+
+def _acquire_or_abandon(path: Path, handoff: _AcquireHandoff) -> int:
+    """Acquire the flock off-loop, then hand the descriptor off or release it.
+
+    Runs in a worker thread. If the caller has abandoned the wait (cancelled
+    before or around delivery), the worker releases the descriptor it just
+    acquired itself — so an abandoned acquisition can never leave the lock held
+    by a discarded descriptor.
+    """
+    descriptor = _flock_acquire(path)
+    release = False
+    with handoff.lock:
+        if handoff.abandoned:
+            release = True
+        else:
+            handoff.descriptor = descriptor
+    if release:
+        _safe_flock_release(descriptor)
+    return descriptor
+
+
+async def _release_claim_descriptor(descriptor: int | None) -> None:
+    """Release a held flock descriptor off-loop, surviving caller cancellation.
+
+    Runs off the event loop and is shielded, so a cancellation during release
+    cannot abort the executor's ``_flock_release`` — the release completes
+    regardless of caller cancellation. A secondary ``CancelledError`` raised by
+    the shield is swallowed so the body's original exception/cancellation
+    propagates unchanged.
+    """
+    if descriptor is None:
+        return
+    try:
+        await asyncio.shield(asyncio.to_thread(_safe_flock_release, descriptor))
+    except asyncio.CancelledError:
+        # The shielded release still completes off-loop.
+        pass
+
+
+@asynccontextmanager
+async def async_session_lifecycle_claim(backend_kind: str, session_name: str):
+    """Task-owned, non-blocking physical session claim for async creation.
+
+    The sync ``session_lifecycle_claim`` uses a ``threading.local`` reentrancy
+    set, which two asyncio tasks on one event-loop thread would share: while
+    task A is suspended in ``await provider.initialize()`` holding the claim,
+    task B would see A's key and enter the supposedly exclusive create section
+    without blocking. This closes that seam:
+
+    * a per-session ``asyncio.Lock`` gates tasks on the loop — the second task
+      *awaits* the gate (it does not block the event loop), and a child task
+      does not inherit the parent's ownership (the lock is task-owned, not
+      re-entrant);
+    * the same cross-process file lock the sync claim uses is then acquired
+      *off* the loop (a worker thread), so a contended sync stop/delete in
+      another process does not stall the loop either, and async and sync paths
+      still serialize on the canonical key.
+
+    Cancellation safety: the off-loop acquire goes through an ownership handoff
+    (``_AcquireHandoff``). If the task is cancelled while the worker is still
+    acquiring, the task abandons and the worker releases the descriptor itself
+    once it lands; if the worker already delivered it, the task owns and
+    releases it. Release is shielded off-loop, so cancellation during release
+    cannot orphan the descriptor either. A cancelled waiter never enters the
+    claim body, and the gate is always released.
+
+    Canonical lock order is unchanged: this is the physical session key, which
+    sorts before every terminal-generation key, and it is the only claim async
+    creation takes (it does not nest generation claims).
+    """
+    session_key = f"{backend_kind}:{session_name}"
+    canonical = ("", "session-workspace", session_key)
+    gate = _async_session_gate(session_key)
+    await gate.acquire()
+    descriptor: int | None = None
+    try:
+        handoff = _AcquireHandoff()
+        try:
+            descriptor = await asyncio.to_thread(
+                _acquire_or_abandon, _claim_lock_path(canonical), handoff
+            )
+        except BaseException:
+            # Cancelled (or failed) while the worker may still be acquiring.
+            # Mark the wait abandoned: if the worker has not yet handed off it
+            # will release the descriptor itself when it lands; if it already
+            # did, this task owns it now and releases it.
+            with handoff.lock:
+                handoff.abandoned = True
+                descriptor = handoff.descriptor
+            if descriptor is not None:
+                await _release_claim_descriptor(descriptor)
+            descriptor = None
+            raise
+        try:
+            yield
+        finally:
+            await _release_claim_descriptor(descriptor)
+            descriptor = None
+    finally:
+        gate.release()
 
 
 def _now() -> str:

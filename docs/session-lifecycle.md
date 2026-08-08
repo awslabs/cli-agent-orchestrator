@@ -5,9 +5,13 @@ sessions in **none** of the declared states, which makes this document's real
 subject not "what states exist" but **"can a declared state be wrong?"** —
 because every declared state is a suppressor for the recovery path.
 
-Status: accepted design, not yet implemented. Sequenced before the fire-marshal
-cutover, because without it a deliberately-stopped session is indistinguishable
-from a stalled one and the marshal fires on both.
+Status: phased. The lifecycle storage, the HTTP/CLI routes, and the
+row-preserving stop/archive collection described here are **implemented**
+(by this work). Two things remain **deferred**: resuming a stopped session
+(relaunching each worker against its recorded native session — see §4), and
+the Fire Marshal cutover that consumes these declarations. The lifecycle
+foundation is a prerequisite for both, sequenced first because without it a
+deliberately-stopped session is indistinguishable from a stalled one.
 
 ---
 

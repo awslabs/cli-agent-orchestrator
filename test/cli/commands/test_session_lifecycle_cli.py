@@ -97,7 +97,27 @@ class TestStopShowsTheCostBeforeAsking:
             result = CliRunner().invoke(
                 session_cli.session, ["stop", SESSION, "--by", "colin"], input="n\n"
             )
-        assert result.output.index("will NOT come back") < result.output.index("Record")
+        assert result.output.index("will NOT come back") < result.output.index("collect")
+
+    def test_help_states_collection_preservation_and_one_way(self):
+        """Stop snapshots/collects panes, preserves the row/env/artifacts, and is
+        currently one-way — not a declaration-only record."""
+        result = CliRunner().invoke(session_cli.session, ["stop", "--help"])
+        assert result.exit_code == 0
+        help_text = result.output.lower()
+        assert "collect" in help_text and "snapshot" in help_text
+        assert "preserved" in help_text or "preserves" in help_text
+        assert "one-way" in help_text or "resume is not implemented" in help_text
+
+    def test_the_confirmation_asks_to_collect_not_just_record(self):
+        with (
+            patch.object(session_cli.requests, "get", return_value=_response(self.IMPACT)),
+            patch.object(session_cli.requests, "post"),
+        ):
+            result = CliRunner().invoke(
+                session_cli.session, ["stop", SESSION, "--by", "colin"], input="n\n"
+            )
+        assert "collect" in result.output.lower()
 
 
 class TestThePauseVerbs:

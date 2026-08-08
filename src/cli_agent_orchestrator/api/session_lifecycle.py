@@ -36,7 +36,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from cli_agent_orchestrator.security.auth import (
@@ -289,8 +289,16 @@ async def settle_session_pause(
         raise _http(exc)
 
 
+def _stop_registry(request: Request):
+    # Imported lazily to avoid a load-time cycle: api.main imports this router.
+    from cli_agent_orchestrator.api.main import get_plugin_registry
+
+    return get_plugin_registry(request)
+
+
 @router.post("/sessions/{session_name}/lifecycle/stop")
 async def stop_session_lifecycle(
+    request: Request,
     session_name: str,
     body: StopBody,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
@@ -307,9 +315,10 @@ async def stop_session_lifecycle(
     torn down through the same event-driven teardown ``DELETE`` uses
     (snapshotted first, so recovery artifacts survive) and the lifecycle row
     is left in ``stopped`` with its ``restore_to`` target and forwarded env
-    intact. Releasing the name stays the destructive ``DELETE`` path's job;
-    a stop never forgets the row or clears the env. The lifecycle *read*
-    routes stay tmux-free by design — only this action collects.
+    intact. Each collected pane emits the normal completion hooks via the live
+    plugin registry. Releasing the name stays the destructive ``DELETE``
+    path's job; a stop never forgets the row or clears the env. The lifecycle
+    *read* routes stay tmux-free by design — only this action collects.
     """
     if not body.acknowledged_one_way:
         raise HTTPException(
@@ -327,20 +336,39 @@ async def stop_session_lifecycle(
             restore_to=body.restore_to,
             note=body.note,
             expected_epoch=body.expected_epoch,
+            registry=_stop_registry(request),
         )
     except sl.SessionLifecycleError as exc:
         raise _http(exc)
-    except Exception as exc:
-        # A collection failure (an open callback recovery, or a pane that
-        # refused teardown) leaves the row preserved; the operator retries.
+    except session_service.SessionStopRefused as exc:
+        # Zero-effect precondition refusal (e.g. open callback recovery):
+        # deliberate, redacted operational guidance the operator can act on.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc).splitlines()[0],
+        )
+    except session_service.SessionStopPartial as exc:
+        logger.warning(
+            "session stop partially collected for %s: collected=%d errors=%s",
+            session_name,
+            len(exc.collected_terminal_ids),
+            exc.errors,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc).splitlines()[0],
+            detail="session stop partially collected; lifecycle preserved; retry converges",
+        )
+    except Exception:
+        logger.exception("session stop failed for %s", session_name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="session stop failed; see server logs",
         )
 
 
 @router.post("/sessions/{session_name}/lifecycle/archived")
 async def set_session_archived(
+    request: Request,
     session_name: str,
     body: ArchiveBody,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
@@ -370,6 +398,7 @@ async def set_session_archived(
                 note=body.note,
                 expected_epoch=body.expected_epoch,
                 archived=True,
+                registry=_stop_registry(request),
             )
         return await asyncio.to_thread(
             sl.set_archived,
@@ -381,10 +410,27 @@ async def set_session_archived(
         )
     except sl.SessionLifecycleError as exc:
         raise _http(exc)
-    except Exception as exc:
+    except session_service.SessionStopRefused as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc).splitlines()[0],
+        )
+    except session_service.SessionStopPartial as exc:
+        logger.warning(
+            "session archive partially collected for %s: collected=%d errors=%s",
+            session_name,
+            len(exc.collected_terminal_ids),
+            exc.errors,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc).splitlines()[0],
+            detail="session stop partially collected; lifecycle preserved; retry converges",
+        )
+    except Exception:
+        logger.exception("session archive failed for %s", session_name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="session archive failed; see server logs",
         )
 
 
