@@ -13,8 +13,8 @@ import threading
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text as sa_text
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, ensure_tracker_schema
 from cli_agent_orchestrator.services import issue_tracker as tracker
@@ -224,11 +224,12 @@ class TestImporterDryRunAndHighWatermark:
         assert len(plan["candidates"]) == 1
 
     def test_apply_high_watermark_mismatch_refuses(self, tmp_path, cao_system):
-        from cli_agent_orchestrator.services.future_improvements_import import (
-            dry_run,
-            apply_manifest,
-        )
         import json
+
+        from cli_agent_orchestrator.services.future_improvements_import import (
+            apply_manifest,
+            dry_run,
+        )
 
         source = tmp_path / "FUTURE.md"
         source.write_text("# Roadmap\n\n- **a feature**\n  body\n", encoding="utf-8")
