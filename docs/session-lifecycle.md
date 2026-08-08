@@ -5,9 +5,13 @@ sessions in **none** of the declared states, which makes this document's real
 subject not "what states exist" but **"can a declared state be wrong?"** —
 because every declared state is a suppressor for the recovery path.
 
-Status: accepted design, not yet implemented. Sequenced before the fire-marshal
-cutover, because without it a deliberately-stopped session is indistinguishable
-from a stalled one and the marshal fires on both.
+Status: phased. The lifecycle storage, the HTTP/CLI routes, and the
+row-preserving stop/archive collection described here are **implemented**
+(by this work). Two things remain **deferred**: resuming a stopped session
+(relaunching each worker against its recorded native session — see §4), and
+the Fire Marshal cutover that consumes these declarations. The lifecycle
+foundation is a prerequisite for both, sequenced first because without it a
+deliberately-stopped session is indistinguishable from a stalled one.
 
 ---
 
@@ -141,6 +145,59 @@ hibernate must never silently be a one-way door.
 
 Resume relaunches each resumable worker against its recorded native session id
 and sends the supervisor a resumption bump.
+
+### 4.0 Stop collects and preserves; deletion forgets
+
+Collection is part of the stop, not a separate act the caller remembers to do
+afterwards. `POST /sessions/{name}/lifecycle/stop` (and archive, which forces a
+stop) tears the fleet down through the same event-driven teardown `DELETE`
+uses — each terminal is snapshotted before its window is killed, so the
+recovery artifacts survive — and it leaves behind everything a resume, a
+recovery, or an investigation needs:
+
+- the lifecycle row, in `stopped`, with its `restore_to` target preserved
+  rather than recomputed on retry;
+- the forwarded environment, so a resume relaunches each worker against the
+  binary and credentials it ran with;
+- the per-terminal snapshots and callback-recovery records.
+
+The order is what makes a partial failure safe. The session-lifecycle claim is
+held across the whole operation, so a concurrent create cannot add a window
+between the stopped check and the teardown. The create path takes the same
+claim for its *own* admission: a new session acquires it before its stopped-name
+check and stale-env pre-clear, so a stop that wins the claim first leaves the
+racing create to re-read `stopped` under the claim and refuse — zero physical
+session, the preserved env untouched. That admission also fails closed on an
+unreadable lifecycle store: `describe` returns `working` + `unreadable` for
+observational marshal callers, but creation cannot proceed without knowing the
+row isn't stopped, so an unreadable result is typed lifecycle unavailability and
+the create refuses before any effect. An open callback recovery is refused
+*before* anything is written or collected — collecting a terminal mid-recovery
+would lose the one-shot refusal the recovery is adjudicating, and a stop
+recorded while one is open would be a false state. The `stopped` declaration is
+written *before* any pane is collected, so a write or admission failure deletes
+nothing, and a fully collected fleet can never be left declared `working`. A
+pane that refuses collection mid-stop leaves the row already stopped — a visible
+divergence, not a silent one — and a retry re-collects what
+remains, idempotently.
+
+That last guarantee holds under concurrency too. Every lifecycle mutation — not
+just the stop — takes a per-session *write* claim, and the stop holds it across
+admission, the write, and collection. So a `declare(WORKING)` that races the
+stop cannot commit over it mid-collection: it waits for the stop's critical
+section, then sees `stopped`, and a stopped session cannot be declared live (its
+panes are collected), so it leaves with a typed conflict rather than overwriting
+the stop. The write claim is keyed by session name alone — the lifecycle module
+stays backend- and tmux-free, and reads never take it — and it is named to sort
+after the physical session claim and before any terminal-generation claim, which
+fixes a single lock order (physical < write < generation) with no inversion.
+Optional `expected_epoch` compare-and-swap is unchanged: a conflict stays a
+conflict, never blind last-write-wins.
+
+This is deliberately not symmetric with deletion. `DELETE /sessions/{name}`
+remains the destructive operation that forgets the lifecycle row and clears the
+forwarded env, releasing the name for reuse. A stop never does either, so an
+ordinary hibernate can never become an accidental cleanup.
 
 ### 4.1 One owner per provider session
 

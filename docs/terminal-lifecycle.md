@@ -13,13 +13,23 @@ exhaust system resources. CAO provides automatic and manual cleanup paths.
 | Handoff completes successfully (auto-delete) | Yes |
 | `delete_terminal` MCP tool | Yes |
 | `DELETE /terminals/{id}` API | Yes |
+| `cao session stop` / `POST /sessions/{name}/lifecycle/stop` (lifecycle stop) | Yes |
+| `cao session lifecycle` archive (`POST .../lifecycle/archived`) | Yes |
+| `DELETE /sessions/{name}` (destructive session deletion) | No |
 | `cao shutdown --session <name>` | No |
 | `cao shutdown --all` | No |
 | Process crash | No |
 
-Snapshots are only saved when a terminal is deleted individually via
-`terminal_service.delete_terminal`. Session-level shutdown (`delete_session`)
-kills windows directly and does not snapshot. If you want scrollback preserved,
+Snapshots are only saved when a terminal is torn down individually via
+`terminal_service.delete_terminal`. Session-level shutdown and destructive
+deletion (`delete_session`, `cao shutdown`) kill windows directly and do not
+snapshot. **Lifecycle stop and archive are different:** they collect each pane
+through that same snapshotting `delete_terminal` path, so every pane is
+snapshotted even though the operation is session-level. They are not a
+deletion — the lifecycle row, the forwarded environment, and the restore
+target are all preserved for a future resume; only the destructive
+`DELETE /sessions/{name}` (or shutdown) releases the name and discards them. If
+you want scrollback preserved, prefer lifecycle stop/archive over shutdown, or
 delete terminals individually before shutting down the session.
 
 ## Snapshot files

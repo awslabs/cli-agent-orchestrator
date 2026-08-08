@@ -343,8 +343,17 @@ def _write(
     evaluated before the read that was supposed to inform it.
     """
     stamp = _now()
+    from cli_agent_orchestrator.services.callback_recovery import (
+        session_lifecycle_write_claim,
+    )
+
     try:
-        with database.SessionLocal() as db:
+        # cond-0221: take the per-session lifecycle write claim so this
+        # read-then-CAS cannot interleave with another mutation, and — via the
+        # re-entrant thread-local — so a ``stop_session`` that already holds it
+        # across collection does not block its own ``_write``. Reads never take
+        # it; the module stays backend- and tmux-free.
+        with session_lifecycle_write_claim(session_name), database.SessionLocal() as db:
             if not _table_present(db):
                 database.SessionLifecycleModel.__table__.create(bind=db.get_bind())
             row = _fetch(db, session_name)
@@ -424,6 +433,13 @@ def declare(
     Refuses ``stopped`` — stopping collects panes and must record what it
     would restore to, so it has its own entry point rather than being a
     value somebody can pass here by accident.
+
+    Also refuses to *leave* ``stopped``: a stopped session's panes are
+    collected, so declaring it ``working``/``complete`` would leave a
+    collected fleet declared live. Reviving a stopped session is resume's
+    job — it relaunches the panes first — not a bare declaration's. This is
+    the typed refusal that makes a declare racing a ``stop_session`` (cond-0221
+    P1) wait-and-conflict rather than overwrite the stop.
     """
     session_name = normalise_session_name(session_name)
     declared_by = _require_text(declared_by, field="declared_by")
@@ -436,6 +452,16 @@ def declare(
             "use stop() to record a stopped session; it must capture what a resume would "
             "restore to, and a bare declaration cannot"
         )
+
+    def _derive(record: Mapping[str, Any]) -> dict[str, Any]:
+        if record["lifecycle"] == STOPPED:
+            raise SessionLifecycleConflict(
+                f"session {session_name} is stopped; its panes have been collected, so it "
+                f"cannot be declared {lifecycle!r}. Resume it (which relaunches the fleet) "
+                "or delete it to release the name."
+            )
+        return {}
+
     values: dict[str, Any] = {
         "lifecycle": lifecycle,
         "declared_by": declared_by,
@@ -444,7 +470,7 @@ def declare(
     if lifecycle != PAUSING:
         values["pause_requested_at"] = None
         values["pause_deadline_at"] = None
-    return _write(session_name, expected_epoch=expected_epoch, values=values)
+    return _write(session_name, expected_epoch=expected_epoch, derive=_derive, values=values)
 
 
 def request_pause(
@@ -704,8 +730,12 @@ def forget(session_name: str) -> bool:
     removed.
     """
     session_name = normalise_session_name(session_name)
+    from cli_agent_orchestrator.services.callback_recovery import (
+        session_lifecycle_write_claim,
+    )
+
     try:
-        with database.SessionLocal() as db:
+        with session_lifecycle_write_claim(session_name), database.SessionLocal() as db:
             if not _table_present(db):
                 return False
             removed = (

@@ -522,3 +522,206 @@ class TestThePinsTheReviewersFoundMissing:
         sl.request_pause(SESSION, requested_by="colin")
         settled = sl.settle_pause(SESSION, declared_by="supervisor")
         assert terminal_projection._is_pause_like(settled) is True
+
+
+class TestAStoppedSessionCannotBeRevivedByADeclaration:
+    """A stopped session's panes are collected; declaring it live is incoherent.
+
+    This is the typed-confusal half of cond-0221's P1 fix: a declare that
+    races (or follows) a stop cannot overwrite ``stopped`` with a live state,
+    because that would leave a collected fleet declared working. Reviving a
+    stopped session is resume's job (it relaunches the panes first), not a
+    bare declaration's. ``expected_epoch`` semantics are untouched: a conflict
+    stays a conflict, never blind last-write-wins.
+    """
+
+    def test_declare_working_on_a_stopped_session_is_refused(self):
+        sl.stop(SESSION, declared_by="colin")
+        with pytest.raises(sl.SessionLifecycleConflict, match="stopped"):
+            sl.declare(SESSION, sl.WORKING, declared_by="racer")
+        assert sl.describe(SESSION)["lifecycle"] == sl.STOPPED
+
+    def test_declare_complete_on_a_stopped_session_is_refused(self):
+        sl.stop(SESSION, declared_by="colin")
+        with pytest.raises(sl.SessionLifecycleConflict, match="stopped"):
+            sl.declare(SESSION, sl.COMPLETE, declared_by="racer")
+        assert sl.describe(SESSION)["lifecycle"] == sl.STOPPED
+
+    def test_a_stopped_session_can_still_be_restopped_or_archived(self):
+        """Reviving is refused; the idempotent/visibility operations are not."""
+        sl.declare(SESSION, sl.COMPLETE, declared_by="supervisor")
+        sl.stop(SESSION, declared_by="colin")
+        restopped = sl.stop(SESSION, declared_by="colin")
+        assert restopped["lifecycle"] == sl.STOPPED
+        assert restopped["restore_to"] == sl.COMPLETE
+        archived = sl.set_archived(SESSION, True, declared_by="colin")
+        assert archived["archived"] is True
+
+    def test_a_working_session_can_still_be_declared_complete(self):
+        """The refusal is scoped to a stopped source, not a new rule on declare."""
+        sl.declare(SESSION, sl.WORKING, declared_by="supervisor")
+        record = sl.declare(SESSION, sl.COMPLETE, declared_by="supervisor")
+        assert record["lifecycle"] == sl.COMPLETE
+
+
+class TestLifecycleWritesAreSerialized:
+    """Every lifecycle mutation shares one cross-process critical section.
+
+    cond-0221 P1: a lifecycle write must not commit during a stop's
+    declaration/collection critical section. The write claim is a file lock
+    keyed by session name alone (the lifecycle module stays backend-free), it
+    sorts after the physical session-workspace claim and before any
+    terminal-generation claim, and ``_write``/``forget`` both take it.
+    """
+
+    def test_the_write_claim_excludes_a_concurrent_writer(self):
+        """Two writers for one session cannot both hold the critical section."""
+        import threading
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        holder_in = threading.Event()
+        release_holder = threading.Event()
+        contender_entered = threading.Event()
+
+        def _holder():
+            with callback_recovery.session_lifecycle_write_claim(SESSION):
+                holder_in.set()
+                release_holder.wait(timeout=10)
+
+        def _contender():
+            holder_in.wait(timeout=10)
+            with callback_recovery.session_lifecycle_write_claim(SESSION):
+                contender_entered.set()
+
+        holder = threading.Thread(target=_holder)
+        holder.start()
+        assert holder_in.wait(timeout=10)
+
+        contender = threading.Thread(target=_contender)
+        contender.start()
+        contender.join(timeout=2)
+        # The claim is still held by `holder`, so the contender must be blocked.
+        assert contender.is_alive(), "the write claim let a second writer in"
+        assert not contender_entered.is_set()
+
+        release_holder.set()
+        holder.join(timeout=10)
+        contender.join(timeout=10)
+        assert contender_entered.is_set(), "the contender never entered after release"
+        assert not holder.is_alive() and not contender.is_alive()
+
+    def test_writes_for_different_sessions_do_not_block_each_other(self):
+        """The claim is per session, not global — unrelated sessions are independent."""
+        import threading
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        held = threading.Event()
+        release = threading.Event()
+        other_done = threading.Event()
+
+        def _hold():
+            with callback_recovery.session_lifecycle_write_claim(SESSION):
+                held.set()
+                release.wait(timeout=10)
+
+        def _other():
+            held.wait(timeout=10)
+            with callback_recovery.session_lifecycle_write_claim("cao-unrelated"):
+                other_done.set()
+
+        a = threading.Thread(target=_hold)
+        a.start()
+        held.wait(timeout=10)
+        b = threading.Thread(target=_other)
+        b.start()
+        b.join(timeout=10)
+        assert other_done.is_set(), "an unrelated session was serialized"
+        release.set()
+        a.join(timeout=10)
+
+    def test_the_canonical_order_physical_then_write_then_generation_is_accepted(self):
+        """No inversion: session-workspace < session-workspace-write < terminal."""
+        from cli_agent_orchestrator.services import callback_recovery
+
+        with callback_recovery.session_lifecycle_claim("TmuxBackend", SESSION):
+            with callback_recovery.session_lifecycle_write_claim(SESSION):
+                with callback_recovery.generation_lifecycle_claims(
+                    (("term-1", "model-generation", "g1"),)
+                ):
+                    pass  # accepted — canonical nesting
+
+    def test_an_inverted_order_is_refused_rather_than_deadlocking(self):
+        """A generation claim held first inverts the write claim and must raise.
+
+        This is the deadlock guard: canonical order is enforced (RuntimeError)
+        rather than waited on, so a buggy acquisition cannot wedge the process.
+        """
+        from cli_agent_orchestrator.services import callback_recovery
+
+        with callback_recovery.generation_lifecycle_claims((("term-1", "model-generation", "g1"),)):
+            with pytest.raises(RuntimeError, match="canonical order"):
+                with callback_recovery.session_lifecycle_write_claim(SESSION):
+                    pass
+
+
+class TestLifecycleWriteClaimIsCrossProcess:
+    """The lifecycle write claim must serialize across processes (a flock), not
+    just threads. A mutation probe swapping it for a process-local mutex would
+    pass the thread tests but must fail this one."""
+
+    def test_a_child_cannot_enter_until_the_parent_releases(self):
+        import os
+        import subprocess
+        import sys
+        from queue import Empty, Queue
+        from threading import Thread
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        session = f"cao-xprocess-oracle-{os.getpid()}"
+        script = (
+            "from cli_agent_orchestrator.services import callback_recovery\n"
+            "import sys\n"
+            "session = sys.argv[1]\n"
+            "print('CHILD-STARTED', flush=True)\n"
+            "with callback_recovery.session_lifecycle_write_claim(session):\n"
+            "    print('CHILD-ACQUIRED', flush=True)\n"
+            "print('CHILD-DONE', flush=True)\n"
+        )
+
+        parent = callback_recovery.session_lifecycle_write_claim(session)
+        parent.__enter__()
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-c", script, session],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            queue: Queue = Queue()
+
+            def _pump(stream):
+                for line in stream:
+                    queue.put(line)
+
+            reader = Thread(target=_pump, args=(child.stdout,), daemon=True)
+            reader.start()
+
+            started = queue.get(timeout=20)  # child imported + started
+            assert "CHILD-STARTED" in started
+            # Parent still holds the flock, so the child must be blocked: no
+            # ACQUIRED line within a bounded window.
+            with pytest.raises(Empty):
+                queue.get(timeout=0.5)
+            assert child.poll() is None, "child exited while the parent still held the claim"
+        finally:
+            parent.__exit__(None, None, None)
+
+        # After release the child acquires and completes.
+        acquired = queue.get(timeout=10)
+        assert "CHILD-ACQUIRED" in acquired
+        done = queue.get(timeout=10)
+        assert "CHILD-DONE" in done
+        child.wait(timeout=10)

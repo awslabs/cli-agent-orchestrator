@@ -475,15 +475,13 @@ def _render_impact(impact: dict) -> None:
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
 @click.option("--json", "as_json", is_flag=True)
 def session_stop(session_name, declared_by, note, yes, as_json):
-    """Record that a session's panes have been collected.
+    """Stop a session: snapshot and tear down every pane.
 
-    Shows what will not come back before asking. Proceeding is allowed;
-    proceeding unknowingly is not — a command called stop must never
-    silently be a delete.
-
-    Records the declaration only. Collecting the panes is a separate act,
-    so a stop recorded without one leaves a visibly wrong record rather
-    than a silently half-torn-down session.
+    Shows what will not come back before asking. Each pane is snapshotted and
+    collected; the lifecycle row is left `stopped` with its restore target, the
+    forwarded environment, and the recovery/snapshot artifacts preserved for a
+    future resume. Resume is not implemented yet, so this is currently one-way
+    for every worker — proceeding is allowed, proceeding unknowingly is not.
     """
     try:
         response = requests.get(
@@ -496,7 +494,7 @@ def session_stop(session_name, declared_by, note, yes, as_json):
 
     if not yes:
         _render_impact(impact)
-        click.confirm(f"\nRecord {session_name} as stopped?", abort=True)
+        click.confirm(f"\nStop {session_name} and collect all of its panes?", abort=True)
 
     record = _lifecycle_post(
         session_name,

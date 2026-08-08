@@ -15,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.services import session_lifecycle as sl
+from cli_agent_orchestrator.services import session_service
 
 SESSION = "cao-p1-closure"
 
@@ -25,6 +26,25 @@ def db(tmp_path, monkeypatch):
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(sl.database, "SessionLocal", sessionmaker(bind=engine))
     return engine
+
+
+def _stub_no_live_fleet(monkeypatch, *, terminals=None):
+    """Make a stop's collection a harmless no-op against an absent fleet.
+
+    The lifecycle API routes collect through ``session_service.stop_session``;
+    these tests are about the declaration and the wiring, not tmux, so the
+    backend and terminal teardown are stubbed.
+    """
+    from unittest.mock import MagicMock
+
+    from cli_agent_orchestrator.services import session_service, terminal_service
+
+    backend = MagicMock()
+    backend.session_exists.return_value = False
+    monkeypatch.setattr(session_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(session_service, "list_terminals_by_session", lambda _name: terminals or [])
+    monkeypatch.setattr(terminal_service, "delete_terminal", lambda *a, **k: True)
+    return backend
 
 
 class TestReads:
@@ -166,8 +186,9 @@ class TestStopIsGatedOnAnAcknowledgement:
         assert "stop-impact" in response.json()["detail"]
         assert sl.describe(SESSION)["lifecycle"] == "working"
 
-    def test_acknowledging_records_the_stop_and_its_restore_target(self, client):
+    def test_acknowledging_records_the_stop_and_its_restore_target(self, client, monkeypatch):
         sl.declare(SESSION, sl.COMPLETE, declared_by="supervisor")
+        _stub_no_live_fleet(monkeypatch)
         payload = client.post(
             f"/sessions/{SESSION}/lifecycle/stop",
             json={"declared_by": "colin", "acknowledged_one_way": True},
@@ -178,6 +199,54 @@ class TestStopIsGatedOnAnAcknowledgement:
     def test_the_acknowledgement_is_required_not_defaulted(self, client):
         response = client.post(f"/sessions/{SESSION}/lifecycle/stop", json={"declared_by": "colin"})
         assert response.status_code == 422
+
+
+class TestStopCollectsThroughTheRoute:
+    """A stop is collection plus declaration, not declaration alone."""
+
+    def test_the_route_tears_down_every_pane_and_preserves_the_row(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        collected = []
+
+        def _delete(terminal_id, *args, **kwargs):
+            collected.append(terminal_id)
+            return True
+
+        _stub_no_live_fleet(monkeypatch, terminals=[{"id": "a1"}, {"id": "b2"}])
+        monkeypatch.setattr(terminal_service, "delete_terminal", _delete)
+
+        payload = client.post(
+            f"/sessions/{SESSION}/lifecycle/stop",
+            json={"declared_by": "colin", "acknowledged_one_way": True},
+        ).json()
+
+        assert payload["lifecycle"] == "stopped"
+        assert sorted(payload["collected_terminal_ids"]) == ["a1", "b2"]
+        assert sorted(collected) == ["a1", "b2"]
+        # The row survives collection — readable once tmux is gone.
+        assert client.get(f"/sessions/{SESSION}/lifecycle").json()["lifecycle"] == "stopped"
+
+    def test_a_collection_failure_is_reported_and_the_row_is_preserved(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("pane refused teardown")
+
+        _stub_no_live_fleet(monkeypatch, terminals=[{"id": "a1"}])
+        monkeypatch.setattr(terminal_service, "delete_terminal", _boom)
+
+        sl.declare(SESSION, sl.COMPLETE, declared_by="supervisor")
+        response = client.post(
+            f"/sessions/{SESSION}/lifecycle/stop",
+            json={"declared_by": "colin", "acknowledged_one_way": True},
+        )
+        # Mid-collection failure: the row was written before the pane refused,
+        # so the stop is recorded (and visibly divergent) and the operator retries.
+        assert response.status_code == 500
+        assert "partially collected" in response.json()["detail"]
+        assert sl.describe(SESSION)["lifecycle"] == "stopped"
+        assert sl.describe(SESSION)["restore_to"] == "complete"
 
 
 class TestStopImpactIsComputed:
@@ -285,8 +354,9 @@ class TestKindAndArchive:
         )
         assert response.status_code == 422
 
-    def test_archiving_forces_a_stop_and_remembers_the_state(self, client):
+    def test_archiving_forces_a_stop_and_remembers_the_state(self, client, monkeypatch):
         sl.declare(SESSION, sl.COMPLETE, declared_by="supervisor")
+        _stub_no_live_fleet(monkeypatch)
         payload = client.post(
             f"/sessions/{SESSION}/lifecycle/archived",
             json={"archived": True, "declared_by": "colin", "acknowledged_one_way": True},
@@ -358,3 +428,72 @@ class TestTheDeclareBodyIsClosed:
             ).json()["lifecycle"]
             == "paused"
         )
+
+
+class TestStopRouteWiringAndBoundary:
+    def test_stop_route_passes_the_live_plugin_registry(self, client, monkeypatch):
+        """Every collected pane's completion hook needs the live registry; the
+        route must forward it rather than collecting with registry=None."""
+        captured = {}
+
+        def _stop(session_name, **kwargs):
+            captured["registry"] = kwargs.get("registry")
+            return {
+                "session_name": session_name,
+                "lifecycle": "stopped",
+                "restore_to": "working",
+                "collected_terminal_ids": [],
+                "errors": [],
+            }
+
+        monkeypatch.setattr(session_service, "stop_session", _stop)
+        payload = client.post(
+            f"/sessions/{SESSION}/lifecycle/stop",
+            json={"declared_by": "colin", "acknowledged_one_way": True},
+        ).json()
+        assert payload["lifecycle"] == "stopped"
+        assert captured["registry"] is client.app.state.plugin_registry
+
+    def test_archive_route_passes_the_live_plugin_registry(self, client, monkeypatch):
+        captured = {}
+
+        def _stop(session_name, **kwargs):
+            captured["registry"] = kwargs.get("registry")
+            captured["archived"] = kwargs.get("archived")
+            return {
+                "session_name": session_name,
+                "lifecycle": "stopped",
+                "kind": "archived",
+                "restore_to": "working",
+                "collected_terminal_ids": [],
+                "errors": [],
+            }
+
+        monkeypatch.setattr(session_service, "stop_session", _stop)
+        payload = client.post(
+            f"/sessions/{SESSION}/lifecycle/archived",
+            json={"archived": True, "declared_by": "colin", "acknowledged_one_way": True},
+        ).json()
+        assert payload["kind"] == "archived"
+        assert captured == {
+            "registry": client.app.state.plugin_registry,
+            "archived": True,
+        }
+
+    def test_stop_route_does_not_leak_internal_exception_detail(self, client, monkeypatch):
+        """An unexpected failure's path/secret-bearing text must not cross the
+        HTTP boundary; only a bounded generic 500 detail is returned."""
+        secret = "AKIA-SECRET-TOKEN-/etc/shadow"
+
+        def _boom(session_name, **kwargs):
+            raise RuntimeError(f"backend exploded at path={secret}")
+
+        monkeypatch.setattr(session_service, "stop_session", _boom)
+        response = client.post(
+            f"/sessions/{SESSION}/lifecycle/stop",
+            json={"declared_by": "colin", "acknowledged_one_way": True},
+        )
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert secret not in detail
+        assert "exploded" not in detail

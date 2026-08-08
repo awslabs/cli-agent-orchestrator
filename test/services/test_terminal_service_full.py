@@ -1434,14 +1434,17 @@ class TestCreateTerminalSessionEnvStore:
         mock_tmux.create_session.assert_not_called()
         mock_tmux.kill_session.assert_not_called()
 
-        # Structural pin: the pre-clear call site precedes both the
-        # resource-owning try and terminal-ID generation in the source.
+        # Structural pin: the pre-clear still precedes terminal-ID generation
+        # and the resource-owning section. cond-0221 moved it under the
+        # new-session admission claim's own try/except (which only releases the
+        # claim on failure — no resource cleanup, so cond-0067's zero-cleanup
+        # preflight still holds) ahead of the resource try that owns ID gen.
         source, _ = inspect.getsourcelines(terminal_service.create_terminal)
         joined = "".join(source)
         preclear_at = joined.index("clear_session_env(session_name)")
-        cleanup_try_at = joined.index("    try:")
+        resource_section_at = joined.index("# Step 1: Generate unique identifiers")
         id_generation_at = joined.index("terminal_id = generate_terminal_id()")
-        assert preclear_at < cleanup_try_at < id_generation_at
+        assert preclear_at < resource_section_at < id_generation_at
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
@@ -2679,3 +2682,286 @@ class TestDeferredInitFailureNotification:
 
         mock_create_inbox.assert_not_called()
         mock_delete.assert_called_once()
+
+
+class TestCreateTerminalLifecycleAdmission:
+    """The under-claim new-session admission is the zero-effect linearization
+    point. ``describe()`` fails open to ``working`` for observational marshal
+    callers; creation admission must not, or an unreadable lifecycle store can
+    hide a stopped row and allow stale-env deletion / name reuse."""
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_lifecycle_refuses_admission_with_zero_effects(self, monkeypatch):
+        from cli_agent_orchestrator.services import session_lifecycle, terminal_service
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        # describe() converts a read failure into {working, unreadable: ...}.
+        monkeypatch.setattr(
+            session_lifecycle,
+            "describe",
+            lambda name: {
+                "session_name": name,
+                "lifecycle": session_lifecycle.WORKING,
+                "unreadable": "database is locked",
+            },
+        )
+
+        effects: list = []
+        monkeypatch.setattr(
+            terminal_service, "clear_session_env", lambda *a, **k: effects.append("clear_env")
+        )
+        monkeypatch.setattr(
+            terminal_service, "generate_terminal_id", lambda: effects.append("gen_id") or "deadbeef"
+        )
+        backend = MagicMock()
+        backend.session_exists.return_value = False
+        backend.create_session.side_effect = lambda *a, **k: effects.append("create_session")
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+
+        outcome: dict = {}
+        try:
+            await create_terminal(
+                "mock_cli", "developer", session_name="cao-probe", new_session=True
+            )
+            outcome["ok"] = True
+        except session_lifecycle.SessionLifecycleUnavailable as exc:
+            outcome["unavailable"] = exc
+        except BaseException as exc:  # noqa: BLE001 - capture the pre-fix fail-open path
+            outcome["other"] = exc
+
+        # Admission must treat unreadable as typed lifecycle unavailability and
+        # refuse — not fail open into stale-env deletion / creation.
+        assert isinstance(
+            outcome.get("unavailable"), session_lifecycle.SessionLifecycleUnavailable
+        ), outcome
+        # Zero effects: nothing past the admission check ran.
+        assert effects == [], effects
+
+
+class TestCreateTerminalAddToExistingAdmission:
+    """P1: the add-to-existing (new_session=False) path shares the new-session
+    lifecycle admission. A stopped or unreadable row is rejected under the
+    physical claim before any window/resource/env/provider/DB effect — even when
+    the backend session still exists (partial-stop composition)."""
+
+    @pytest.fixture(autouse=True)
+    def _db(self, isolated_memory_db):
+        return isolated_memory_db
+
+    def _wire(self, monkeypatch, *, session_exists):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        effects: list = []
+        backend = MagicMock()
+        backend.session_exists.return_value = session_exists
+        backend.create_window.side_effect = lambda *a, **k: effects.append("create_window") or "win"
+        backend.create_session.side_effect = lambda *a, **k: effects.append("create_session")
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "deadbeef")
+        monkeypatch.setattr(terminal_service, "generate_window_name", lambda *a, **k: "dev-abcd")
+        monkeypatch.setattr(terminal_service, "load_agent_profile", lambda *a, **k: None)
+        provider = MagicMock()
+        provider.initialize = AsyncMock(return_value=True)
+        pm = MagicMock()
+        pm.create_provider.return_value = provider
+        monkeypatch.setattr(terminal_service, "provider_manager", pm)
+        monkeypatch.setattr(terminal_service, "db_create_terminal", lambda *a, **k: None)
+        monkeypatch.setattr(terminal_service, "fifo_manager", MagicMock())
+        monkeypatch.setattr(terminal_service, "status_monitor", MagicMock())
+        return effects
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_stopped_session_before_any_window_effect(self, monkeypatch):
+        from cli_agent_orchestrator.services import session_lifecycle as sl
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        sl.stop("cao-existing", declared_by="boot")
+        effects = self._wire(monkeypatch, session_exists=True)
+
+        with pytest.raises(ValueError, match="is stopped"):
+            await create_terminal(
+                "mock_cli", "developer", session_name="cao-existing", new_session=False
+            )
+        assert effects == [], effects
+
+    @pytest.mark.asyncio
+    async def test_refuses_an_unreadable_lifecycle_before_any_window_effect(self, monkeypatch):
+        from cli_agent_orchestrator.services import session_lifecycle as sl
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        monkeypatch.setattr(
+            sl,
+            "describe",
+            lambda name: {
+                "session_name": name,
+                "lifecycle": sl.WORKING,
+                "unreadable": "database is locked",
+            },
+        )
+        effects = self._wire(monkeypatch, session_exists=True)
+
+        with pytest.raises(sl.SessionLifecycleUnavailable):
+            await create_terminal(
+                "mock_cli", "developer", session_name="cao-existing", new_session=False
+            )
+        assert effects == [], effects
+
+    @pytest.mark.asyncio
+    async def test_admits_an_ordinary_working_session_and_creates_the_window(self, monkeypatch):
+        from cli_agent_orchestrator.services import session_lifecycle as sl
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        sl.declare("cao-existing", sl.WORKING, declared_by="boot")
+        effects = self._wire(monkeypatch, session_exists=True)
+
+        await create_terminal(
+            "mock_cli", "developer", session_name="cao-existing", new_session=False
+        )
+        assert effects == ["create_window"], effects
+
+    @pytest.mark.asyncio
+    async def test_a_partial_stopped_row_refuses_even_when_the_backend_session_survives(
+        self, monkeypatch
+    ):
+        """Composition: a stop that left a durable stopped row plus a surviving
+        backend session (partial collection) must still refuse an added terminal
+        — backend existence alone no longer admits the create."""
+        from cli_agent_orchestrator.services import session_lifecycle as sl
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        sl.stop("cao-existing", declared_by="boot")  # durable stopped row
+        effects = self._wire(monkeypatch, session_exists=True)  # session still alive
+
+        with pytest.raises(ValueError, match="is stopped"):
+            await create_terminal(
+                "mock_cli", "developer", session_name="cao-existing", new_session=False
+            )
+        assert effects == [], effects
+
+
+class TestCreateTerminalAsyncClaim:
+    """Two asyncio tasks on one event-loop thread cannot overlap the create
+    critical section, and the second must not block the loop while the first
+    awaits (P1.3). The thread-local reentrancy bypass must not let task B in."""
+
+    @pytest.fixture(autouse=True)
+    def _db(self, isolated_memory_db):
+        return isolated_memory_db
+
+    def _wire_async(self, monkeypatch, *, a_init):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        effects = {"create_session": 0, "db": 0}
+
+        provider_a = MagicMock()
+        provider_a.initialize = a_init
+        provider_b = MagicMock()
+        provider_b.initialize = AsyncMock(return_value=True)
+        pm = MagicMock()
+        pm.create_provider.side_effect = [provider_a, provider_b]
+
+        backend = MagicMock()
+        created: list = []
+        backend.session_exists.side_effect = lambda _name: bool(created)
+
+        def _create_session(*a, **k):
+            created.append(True)
+            effects["create_session"] += 1
+            return "win"
+
+        backend.create_session.side_effect = _create_session
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "deadbeef")
+        monkeypatch.setattr(terminal_service, "generate_window_name", lambda *a, **k: "win")
+        monkeypatch.setattr(terminal_service, "load_agent_profile", lambda *a, **k: None)
+        monkeypatch.setattr(terminal_service, "provider_manager", pm)
+
+        def _db_create(*a, **k):
+            effects["db"] += 1
+
+        monkeypatch.setattr(terminal_service, "db_create_terminal", _db_create)
+        monkeypatch.setattr(terminal_service, "fifo_manager", MagicMock())
+        monkeypatch.setattr(terminal_service, "status_monitor", MagicMock())
+        monkeypatch.setattr(terminal_service, "clear_session_env", lambda *a, **k: None)
+        return effects
+
+    @pytest.mark.asyncio
+    async def test_task_b_reaches_no_effect_until_task_a_releases(self, monkeypatch):
+        import asyncio
+
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        a_in_init = asyncio.Event()
+        release_a = asyncio.Event()
+
+        async def a_init():
+            a_in_init.set()
+            await release_a.wait()
+
+        effects = self._wire_async(monkeypatch, a_init=a_init)
+
+        task_a = asyncio.create_task(
+            create_terminal("mock_cli", "developer", session_name="cao-x", new_session=True)
+        )
+        await a_in_init.wait()  # A holds the claim, paused in provider init
+        assert effects["create_session"] == 1, effects  # A created + persisted
+        assert effects["db"] == 1, effects
+
+        task_b = asyncio.create_task(
+            create_terminal("mock_cli", "developer", session_name="cao-x", new_session=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)  # B runs and must block on the claim, not the loop
+        assert not task_b.done(), "task B entered the critical section while A held it"
+        assert effects["create_session"] == 1, effects  # B reached no physical effect
+        assert effects["db"] == 1, effects  # B reached no DB effect
+
+        release_a.set()
+        await task_a  # A completes and releases the claim
+        with pytest.raises(ValueError, match="already exists"):
+            await task_b  # B now proceeds and refuses the duplicate
+        assert effects["create_session"] == 1, effects
+        assert effects["db"] == 1, effects
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_in_init_releases_the_claim_for_b(self, monkeypatch):
+        import asyncio
+
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        a_in_init = asyncio.Event()
+        a_cancel_gate = asyncio.Event()
+
+        async def a_init():
+            a_in_init.set()
+            await a_cancel_gate.wait()  # held until cancelled
+
+        effects = self._wire_async(monkeypatch, a_init=a_init)
+
+        task_a = asyncio.create_task(
+            create_terminal("mock_cli", "developer", session_name="cao-x", new_session=True)
+        )
+        await a_in_init.wait()
+
+        task_b = asyncio.create_task(
+            create_terminal("mock_cli", "developer", session_name="cao-x", new_session=True)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not task_b.done()
+
+        task_a.cancel()  # cancel A while it holds the claim
+        with pytest.raises(asyncio.CancelledError):
+            await task_a
+
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # B must now be able to enter (A released on cancellation).
+        a_cancel_gate.set()  # let B's own init proceed if it reaches it
+        with pytest.raises(ValueError, match="already exists"):
+            await task_b

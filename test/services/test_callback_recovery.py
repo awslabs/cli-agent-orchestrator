@@ -1391,3 +1391,206 @@ def test_v2_reservation_and_terminal_are_authoritative(recovery_context):
     callback = _publish_callback(admitted)
     completed = _commit_callback(admitted, callback)
     assert completed["state"] == callback_recovery.STATE_COMPLETED
+
+
+class TestAsyncSessionClaimCancellation:
+    """A task cancelled around the off-loop flock acquire must never orphan the
+    eventual descriptor. The worker itself releases it when the caller abandons
+    the wait; the lock-serialized handoff guarantees exactly one owner."""
+
+    def test_flock_failure_closes_the_unowned_descriptor(self, monkeypatch, tmp_path):
+        from cli_agent_orchestrator.services import callback_recovery
+
+        closed: list[int] = []
+        monkeypatch.setattr(callback_recovery.os, "open", lambda *args, **kwargs: 73)
+
+        def flock_fails(*args, **kwargs):
+            raise OSError("flock failed")
+
+        monkeypatch.setattr(callback_recovery.fcntl, "flock", flock_fails)
+        monkeypatch.setattr(callback_recovery.os, "close", closed.append)
+
+        with pytest.raises(OSError, match="flock failed"):
+            callback_recovery._flock_acquire(tmp_path / "claim.lock")
+
+        assert closed == [73]
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_off_loop_acquire_releases_eventual_descriptor(self, monkeypatch):
+        import asyncio
+        import threading
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        acquire_started = threading.Event()
+        allow_acquire_to_return = threading.Event()
+        released = threading.Event()
+
+        def delayed_acquire(_path):
+            acquire_started.set()
+            assert allow_acquire_to_return.wait(timeout=5)
+            return 77
+
+        def record_release(descriptor):
+            assert descriptor == 77
+            released.set()
+
+        monkeypatch.setattr(callback_recovery, "_flock_acquire", delayed_acquire)
+        monkeypatch.setattr(callback_recovery, "_flock_release", record_release)
+
+        async def hold_claim():
+            async with callback_recovery.async_session_lifecycle_claim(
+                "TmuxBackend", "cao-cancel-during-acquire"
+            ):
+                pytest.fail("a cancelled acquisition must never enter the claim")
+
+        task = asyncio.create_task(hold_claim())
+        assert await asyncio.to_thread(acquire_started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The worker is still blocked acquiring; let it land and self-release.
+        allow_acquire_to_return.set()
+        for _ in range(100):
+            if released.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert released.is_set(), "eventual flock descriptor was orphaned after cancellation"
+
+    def test_handoff_releases_exactly_once_in_both_race_orderings(self, monkeypatch):
+        """The lock-serialized handoff guarantees exactly one owner whether the
+        caller abandons before or after the worker lands the descriptor."""
+        from cli_agent_orchestrator.services import callback_recovery
+
+        releases: list = []
+        monkeypatch.setattr(callback_recovery, "_flock_acquire", lambda _path: 42)
+        monkeypatch.setattr(callback_recovery, "_flock_release", lambda fd: releases.append(fd))
+
+        # Ordering A: caller already abandoned -> worker hands nothing off and
+        # releases the descriptor it just acquired itself.
+        handoff_a = callback_recovery._AcquireHandoff()
+        handoff_a.abandoned = True
+        callback_recovery._acquire_or_abandon("/tmp/whatever", handoff_a)
+        assert handoff_a.descriptor is None
+        assert releases == [42]
+
+        # Ordering B: worker hands off first -> caller owns and releases; the
+        # worker does not.
+        releases.clear()
+        handoff_b = callback_recovery._AcquireHandoff()
+        callback_recovery._acquire_or_abandon("/tmp/whatever", handoff_b)
+        assert handoff_b.descriptor == 42
+        assert releases == []
+        with handoff_b.lock:
+            handoff_b.abandoned = True
+            owned = handoff_b.descriptor
+        callback_recovery._safe_flock_release(owned)
+        assert releases == [42]
+
+    @pytest.mark.asyncio
+    async def test_cancel_in_the_body_releases_the_descriptor_once(self, monkeypatch):
+        import asyncio
+        import threading
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        releases: list = []
+        in_body = threading.Event()
+        monkeypatch.setattr(callback_recovery, "_flock_acquire", lambda _path: 9)
+        monkeypatch.setattr(callback_recovery, "_flock_release", lambda fd: releases.append(fd))
+
+        async def hold_claim():
+            async with callback_recovery.async_session_lifecycle_claim(
+                "TmuxBackend", "cao-cancel-in-body"
+            ):
+                in_body.set()
+                await asyncio.sleep(5)
+
+        task = asyncio.create_task(hold_claim())
+        assert await asyncio.to_thread(in_body.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        for _ in range(100):
+            if releases:
+                break
+            await asyncio.sleep(0.01)
+        assert releases == [9], "descriptor not released exactly once after body cancellation"
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_waiter_never_enters_and_the_next_task_progresses(self, monkeypatch):
+        import asyncio
+        import threading
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        acquire_started = threading.Event()
+        allow_acquire_to_return = threading.Event()
+
+        def delayed_acquire(_path):
+            acquire_started.set()
+            assert allow_acquire_to_return.wait(timeout=5)
+            return 1
+
+        monkeypatch.setattr(callback_recovery, "_flock_acquire", delayed_acquire)
+        monkeypatch.setattr(callback_recovery, "_flock_release", lambda fd: None)
+
+        async def hold():
+            async with callback_recovery.async_session_lifecycle_claim(
+                "TmuxBackend", "cao-cancel-progress"
+            ):
+                await asyncio.sleep(5)
+
+        waiter = asyncio.create_task(hold())
+        assert await asyncio.to_thread(acquire_started.wait, 5)
+        waiter.cancel()  # cancelled while still acquiring -> never enters the body
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        allow_acquire_to_return.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # A fresh task for the same session must be able to enter after release.
+        cm = callback_recovery.async_session_lifecycle_claim("TmuxBackend", "cao-cancel-progress")
+        fresh = asyncio.create_task(cm.__aenter__())
+        # It should not be blocked forever; give the worker time to self-release.
+        try:
+            await asyncio.wait_for(fresh, timeout=5)
+        except asyncio.TimeoutError:
+            pytest.fail("the cancelled waiter's abandonment blocked the next task")
+        # Clean up: release what fresh acquired.
+        await cm.__aexit__(None, None, None)
+
+    @pytest.mark.asyncio
+    async def test_an_exception_in_the_body_releases_descriptor_and_gate(self, monkeypatch):
+        """A non-cancellation exception must still release the descriptor and the
+        gate so the next task is not blocked and the lock is not orphaned."""
+        import asyncio
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        releases: list = []
+        monkeypatch.setattr(callback_recovery, "_flock_acquire", lambda _path: 5)
+        monkeypatch.setattr(callback_recovery, "_flock_release", lambda fd: releases.append(fd))
+
+        cm = callback_recovery.async_session_lifecycle_claim("TmuxBackend", "cao-exc-body")
+        await cm.__aenter__()
+        with pytest.raises(ValueError, match="boom"):
+            # Simulate the claim body raising.
+            try:
+                raise ValueError("boom")
+            finally:
+                await cm.__aexit__(ValueError, ValueError("boom"), None)
+
+        for _ in range(100):
+            if releases:
+                break
+            await asyncio.sleep(0.01)
+        assert releases == [5]
+        # The gate is free: a fresh acquire for the same session enters promptly.
+        again_cm = callback_recovery.async_session_lifecycle_claim("TmuxBackend", "cao-exc-body")
+        again = asyncio.create_task(again_cm.__aenter__())
+        try:
+            await asyncio.wait_for(again, timeout=5)
+        except asyncio.TimeoutError:
+            pytest.fail("the body exception leaked the gate and blocked the next task")
+        await again_cm.__aexit__(None, None, None)
