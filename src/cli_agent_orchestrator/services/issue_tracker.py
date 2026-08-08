@@ -1175,6 +1175,7 @@ def list_issues(
                 | TrackerIssueModel.body.ilike(needle)
                 | TrackerIssueModel.key.ilike(needle)
                 | TrackerIssueModel.failing_command.ilike(needle)
+                | TrackerIssueModel.evidence.ilike(needle)
             )
 
         total = q.count()
@@ -1564,8 +1565,11 @@ def render_markdown(project_id: str, *, open_only: bool = True, kind: Optional[s
     ]
     for issue in issues:
         severity = f"[{issue['severity']}] " if issue["severity"] != "unset" else ""
-        lines.append(f"## {issue['key']} — {severity}{issue['title']}")
+        kind_prefix = f"[{issue.get('kind', 'issue')}] " if kind is None or kind == "all" else ""
+        lines.append(f"## {issue['key']} — {kind_prefix}{severity}{issue['title']}")
         lines.append("")
+        if kind is None or kind == "all":
+            lines.append(f"- **kind:** {issue.get('kind', 'issue')}")
         lines.append(f"- **filed:** {issue['created_at']}")
         lines.append(f"- **reporter:** {issue['reporter'] or 'unknown'}")
         lines.append(f"- **status:** {issue['status']}")

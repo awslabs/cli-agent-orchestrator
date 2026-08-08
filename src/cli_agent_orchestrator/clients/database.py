@@ -910,16 +910,22 @@ def _migrate_tracker_kind_column() -> None:
     from sqlalchemy import text as sa_text
 
     try:
-        with engine.connect() as conn:
-            info = list(conn.execute(sa_text("PRAGMA table_info(tracker_issues)")))
-        cols = {row[1] for row in info}
-        if "kind" in cols:
-            # Ensure index exists even if column already present (e.g. fresh DB via metadata)
-            with engine.begin() as conn:
-                conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"))
-            return
-        # Column missing — add it with default
+        # P1: avoid race by holding single transaction for check+DDL, and validate existing schema is not malformed
         with engine.begin() as conn:
+            info = list(conn.execute(sa_text("PRAGMA table_info(tracker_issues)")))
+            if not info:
+                # Table does not exist yet — metadata create_all will handle it; nothing to migrate
+                return
+            cols = {row[1]: row for row in info}
+            # Validate existing cols: reject malformed existing schemas (e.g. missing primary key, wrong types)
+            # We expect at least key, project_id, title columns
+            if "key" not in cols or "project_id" not in cols:
+                raise RuntimeError("tracker_issues table is malformed: missing expected columns")
+            if "kind" in cols:
+                # Ensure index exists even if column already present
+                conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"))
+                return
+            # Column missing — add it with default within same transaction
             conn.execute(sa_text("ALTER TABLE tracker_issues ADD COLUMN kind TEXT NOT NULL DEFAULT 'issue'"))
             conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"))
     except Exception as exc:

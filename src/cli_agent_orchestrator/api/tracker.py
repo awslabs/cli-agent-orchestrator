@@ -444,6 +444,11 @@ async def update_issue(
         if name != "actor" and name in body.model_fields_set
     }
     try:
+        existing = tracker.get_issue(issue_key)
+        _assert_issue(existing)
+        # Duplicate status requires canonical key validation (P1)
+        if changes.get("status") == "duplicate" and not changes.get("duplicate_of") and not existing.get("duplicate_of"):
+            raise tracker.TrackerError("invalid", "duplicate status requires duplicate_of canonical key")
         return tracker.update_issue(issue_key, actor=body.actor, **changes)
     except tracker.TrackerError as exc:
         raise _http(exc) from exc
@@ -452,6 +457,8 @@ async def update_issue(
 @router.delete("/tracker/issues/{issue_key}")
 async def delete_issue(issue_key: str, _scopes: List[str] = _WRITE) -> Dict[str, Any]:
     try:
+        existing = tracker.get_issue(issue_key)
+        _assert_issue(existing)
         return tracker.delete_issue(issue_key)
     except tracker.TrackerError as exc:
         raise _http(exc) from exc
@@ -513,6 +520,11 @@ async def remove_link(
 def _assert_feature(row: dict) -> None:
     if row.get("kind") != "feature":
         raise tracker.TrackerError("not-found", f"no such feature: {row.get('key')}")
+
+
+def _assert_issue(row: dict) -> None:
+    if row.get("kind") != "issue":
+        raise tracker.TrackerError("not-found", f"no such issue: {row.get('key')} (kind={row.get('kind')})")
 
 
 @router.get("/tracker/features")
@@ -679,6 +691,14 @@ async def remove_feature_link(
     _scopes: List[str] = _WRITE,
 ) -> Dict[str, Any]:
     try:
+        existing = tracker.get_issue(feature_key)
+        _assert_feature(existing)
+        # Verify link belongs to this feature (URL key must match link's from_key/to_key)
+        from cli_agent_orchestrator.clients.database import SessionLocal, TrackerLinkModel
+        with SessionLocal() as db:
+            link = db.get(TrackerLinkModel, int(link_id))
+            if link is None or (link.from_key != feature_key.lower() and link.to_key != feature_key.lower()):
+                raise tracker.TrackerError("not-found", f"no link {link_id} on feature {feature_key}")
         return tracker.remove_link(link_id, actor=actor)
     except tracker.TrackerError as exc:
         raise _http(exc) from exc
