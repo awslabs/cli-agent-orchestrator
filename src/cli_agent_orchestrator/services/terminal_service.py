@@ -25,7 +25,7 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -35,7 +35,10 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
+    list_siblings_by_group_prefix,
     update_last_active,
+    update_terminal_group,
+    update_terminal_metadata,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.constants import (
@@ -173,6 +176,8 @@ async def create_terminal(
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -217,6 +222,11 @@ async def create_terminal(
             branch there, and overrides ``working_directory`` to the new
             worktree path before the tmux session/window is created. Requires
             the resolved directory to actually be inside a git repository.
+        group: Ordered, general-to-specific grouping array for list_siblings
+            discovery (#432). None = this terminal opts out of discovery.
+        metadata: Free-form JSON describing what this terminal is doing.
+            Also updatable later by the running agent via the
+            ``update_metadata`` MCP tool.
 
     Returns:
         Terminal object with all metadata populated
@@ -406,6 +416,8 @@ async def create_terminal(
             allowed_tools,
             caller_id=caller_id,
             engine=resolved_engine.value if resolved_engine is not None else None,
+            group=group,
+            metadata=metadata,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -505,6 +517,8 @@ async def create_terminal(
             allowed_tools=allowed_tools,
             engine=resolved_engine,
             shell_command=shell_command,
+            group=group,
+            metadata=metadata,
             status=initial_status,
             last_active=datetime.now(),
         )
@@ -963,6 +977,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "engine": metadata.get("engine"),
+            "group": metadata.get("group"),
+            "metadata": metadata.get("metadata"),
             "status": status,
             "last_active": metadata["last_active"],
         }
@@ -970,6 +986,82 @@ def get_terminal(terminal_id: str) -> Dict:
     except Exception as e:
         logger.error(f"Failed to get terminal {terminal_id}: {e}")
         raise
+
+
+def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
+    """Replace a terminal's group array.
+
+    Used by consumers whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment) so ``group``
+    doesn't go stale (#432). ``None``/``[]`` opts the terminal back out of
+    discovery.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_group(terminal_id, group)
+
+
+def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
+    """Replace a terminal's free-form metadata dict.
+
+    Whole-dict replace, not a merge: concurrent calls are last-write-wins
+    (tedswinyar, PR #433 review). Acceptable for this field -- callers should
+    re-send the full intended dict each time rather than assuming a partial
+    update accumulates on top of a prior one.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_metadata(terminal_id, metadata)
+
+
+def list_siblings(
+    caller_id: str, depth: Optional[int] = None, cross_session: bool = False
+) -> List[Dict[str, Any]]:
+    """Resolve ``caller_id``'s own group and return matching sibling terminals.
+
+    Depth is clamped server-side to ``[1, len(caller_group)]`` (#432): it can
+    never be widened past the caller's own group length, and an explicit 0 is
+    rejected by the API layer's query-param validation before this is ever
+    called (never silently reinterpreted as an unscoped, all-terminals
+    query). ``depth=None`` defaults to the caller's full own group length —
+    the widest scope the caller is allowed to see.
+
+    A caller with no group set finds no siblings (participates in no
+    discovery, per #432) rather than erroring.
+
+    Session-scoped by default (issue #432 design discussion): results are
+    additionally filtered to the caller's own ``tmux_session`` unless
+    ``cross_session=True`` is explicitly passed — see
+    ``list_siblings_by_group_prefix``'s own docstring for the full rationale.
+
+    Returns:
+        List of ``{id, group, metadata, status}`` dicts for every OTHER
+        terminal whose group shares the resolved prefix. ``status`` is a
+        live, point-in-time snapshot (tedswinyar, PR #433 review): a handoff
+        terminal that has COMPLETED can still delete itself between this
+        call returning and a caller's follow-up ``send_message`` to it, so a
+        discovered sibling is never a guarantee it's still reachable --
+        ``status`` lets a caller skip an obviously-finished sibling
+        proactively, but callers should still expect sends to occasionally
+        fail against a sibling that disappeared in that window.
+    """
+    caller_metadata = get_terminal_metadata(caller_id)
+    caller_group = caller_metadata.get("group") if caller_metadata else None
+    if not caller_group:
+        return []
+    caller_session = caller_metadata.get("tmux_session") if caller_metadata else None
+    max_depth = len(caller_group)
+    effective_depth = max_depth if depth is None else depth
+    effective_depth = max(1, min(effective_depth, max_depth))
+    prefix = caller_group[:effective_depth]
+    siblings = list_siblings_by_group_prefix(
+        caller_id, prefix, caller_session=caller_session, cross_session=cross_session
+    )
+    for sibling in siblings:
+        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+    return siblings
 
 
 def get_working_directory(terminal_id: str) -> Optional[str]:

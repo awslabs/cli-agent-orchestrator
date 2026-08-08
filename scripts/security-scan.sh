@@ -4,7 +4,7 @@
 # scanner failure so it's safe to wire into pre-push hooks or Makefile targets.
 #
 # Usage:
-#   scripts/security-scan.sh                 # run all available scanners
+#   scripts/security-scan.sh                 # run every available scanner
 #   scripts/security-scan.sh trivy           # just Trivy
 #   scripts/security-scan.sh codeql          # just CodeQL (python)
 #   scripts/security-scan.sh gitleaks        # just gitleaks (secret scan, #457)
@@ -21,15 +21,32 @@ cd "$ROOT_DIR"
 target="${1:-all}"
 exit_code=0
 
+# This scan passes NO severity filter, deliberately (#568). The CI `security`
+# job does pass `severity: 'CRITICAL,HIGH'`, but trivy-action's entrypoint.sh
+# runs `unset TRIVY_SEVERITY` whenever `format` is sarif and
+# `limit-severities-for-sarif` is not true — and CI uses `format: 'sarif'`.
+# So that input is DISCARDED and the gate fails on a finding of ANY severity
+# ("Building SARIF report with all severities" in the job log). A local check
+# narrowed to CRITICAL,HIGH passes while CI goes red, which is exactly how
+# #568 was missed. It likewise passes no scanner filter: CI supplies no such
+# input either, so Trivy runs its default scanner set — the job log shows both
+# [vuln] and [secret] scanning enabled. Narrowing either axis here would make
+# this wrapper weaker than the gate it claims to mirror; don't reintroduce it.
 run_trivy() {
-    echo "==> Trivy filesystem scan (CRITICAL,HIGH; unfixed ignored, matching CI)"
+    echo "==> Trivy filesystem scan (ALL severities; unfixed ignored, matching CI)"
+    echo "    Note: the CI gate fails on ANY severity — trivy-action unsets"
+    echo "    TRIVY_SEVERITY under format: sarif, so its CRITICAL,HIGH input is ignored."
     if ! command -v trivy >/dev/null 2>&1; then
         echo "  SKIP: trivy not on PATH (brew install aquasecurity/trivy/trivy)"
         return 0
     fi
-    uv export --format requirements-txt > requirements.txt
+    # `--frozen` is load-bearing: a plain `uv export` REWRITES the tracked
+    # uv.lock as a side effect (it reverts the cli-agent-orchestrator version to
+    # the last locked one), leaving a dirty tree that a contributor running this
+    # script before committing can easily sweep into an unrelated commit. With
+    # --frozen the export reads the lockfile and never rewrites it (#568).
+    uv export --frozen --format requirements-txt > requirements.txt
     trivy fs \
-        --severity CRITICAL,HIGH \
         --ignore-unfixed \
         --exit-code 1 \
         . || exit_code=1

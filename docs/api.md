@@ -94,6 +94,33 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   commits — commit and merge/push results before the terminal is deleted if
   they need to be kept. See the MCP `handoff`/`assign` tool descriptions for
   the full behavior.
+- `POST /sessions` accepts optional `group`/`metadata` at creation, opting a
+  session's initial terminal into peer discovery (a mid-session worker uses
+  `PATCH /terminals/{terminal_id}/group`/`metadata` instead — see below).
+  `group` is an ordered, general-to-specific array (e.g.
+  `["tenant_1", "project_5"]`); `metadata` is a free-form JSON object the
+  running agent updates via the `update_metadata` MCP tool. Both PATCH
+  endpoints are whole-value replace, not merge, last-write-wins under
+  concurrent calls, and reject an omitted field with `422` (an explicit
+  `null`/`[]`/`{}` clears the value; omitting it does not).
+- `GET /terminals/{terminal_id}/siblings` lists other terminals sharing a
+  leading prefix of `terminal_id`'s own `group`, optionally narrowed by
+  `depth`; a caller can never see a wider scope than its own group, and a
+  terminal with no `group` set finds no siblings. Session-scoped by default
+  — results are also filtered to the caller's own tmux session unless the
+  explicit `cross_session=true` opt-in is passed. Sibling `metadata` is
+  agent-authored, untrusted content — same trust domain as an inbound
+  `send_message` body. The `list_siblings`/`update_metadata` MCP tools also
+  require the `discovery` entry in `allowedTools` — a separate opt-in from
+  orchestration tools, not bundled into `@cao-mcp-server` — see
+  [Tool Restrictions](tool-restrictions.md) and
+  [Discovery Tool Coexistence](discovery-tool-coexistence.md).
+
+**`group` is an organizational label, not a security boundary.** On a
+default install with auth disabled, a worker already has local shell access
+to this API, so `group`/`discovery`/session-scoping provide no tenant
+isolation or access-control guarantee even used together — do not build a
+security boundary on top of them.
 
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
