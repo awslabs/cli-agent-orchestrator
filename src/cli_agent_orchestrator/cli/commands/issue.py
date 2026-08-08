@@ -813,6 +813,7 @@ def feature_close(feature_key, resolution, final_status, actor, as_json):
 @click.option("--author", default=None)
 @click.option("--json", "as_json", is_flag=True)
 def feature_comment(feature_key, body, body_file, author, as_json):
+    """Add a comment to a feature request."""
     if body_file:
         with open(body_file, encoding="utf-8") as handle:
             body = handle.read()
@@ -836,6 +837,7 @@ def feature_comment(feature_key, body, body_file, author, as_json):
 @click.option("--actor", default=None)
 @click.option("--json", "as_json", is_flag=True)
 def feature_link(feature_key, to_key, kind, actor, as_json):
+    """Relate a feature to another issue/feature."""
     try:
         existing = tracker.get_issue(feature_key)
         if existing.get("kind") != "feature":
@@ -851,6 +853,7 @@ def feature_link(feature_key, to_key, kind, actor, as_json):
 @click.option("--yes", is_flag=True, help="confirm deletion")
 @click.option("--json", "as_json", is_flag=True)
 def feature_rm(feature_key, yes, as_json):
+    """Delete a feature request and everything attached to it."""
     if not yes:
         click.echo(f"pass --yes to delete {feature_key}", err=True)
         sys.exit(1)
@@ -896,7 +899,13 @@ def feature_stats(project_id, as_json):
 @click.option("--yes", is_flag=True)
 @click.option("--json", "as_json", is_flag=True)
 def feature_import_future_improvements(source_path, supplement_path, manifest_path, inventory_out, project_id, expected_source_sha256, expected_supplement_sha256, expected_next_issue_number, dry_run, do_apply, yes, as_json):
-    """Import FUTURE_IMPROVEMENTS roadmap — planning (dry-run) or apply via manifest."""
+    """Import FUTURE_IMPROVEMENTS roadmap — planning (dry-run) or apply via manifest.
+
+    Planning (--dry-run or default) parses --source (+ --supplement) into
+    candidates without creating tracker state. Apply (--apply --manifest
+    --yes) validates digests, high-watermark, and applies transactionally
+    with an atomic receipt.
+    """
     from cli_agent_orchestrator.services.future_improvements_import import dry_run as _dry_run, apply_manifest
 
     # Planning mode: --dry-run or not --apply — dry_run must not create tracker state (P1)
