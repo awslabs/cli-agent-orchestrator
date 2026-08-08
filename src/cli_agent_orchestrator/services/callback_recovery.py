@@ -241,6 +241,33 @@ def session_lifecycle_claim(backend_kind: str, session_or_workspace: str):
         yield
 
 
+@contextmanager
+def session_lifecycle_write_claim(session_name: str):
+    """Serialize every declared-lifecycle write for one session.
+
+    cond-0221 P1: a ``stop_session`` holds the physical session-workspace
+    claim across admission, the ``stopped`` write, and pane collection, but an
+    ordinary transition (``declare``/``set_kind``/…) wrote the lifecycle row
+    through ``_write`` under *no* shared claim, so a last-write-wins
+    ``declare(WORKING)`` could commit over a mid-collection stop and leave a
+    collected fleet declared ``working``. This claim closes that seam: every
+    lifecycle write takes it, and ``stop_session`` holds it across the whole
+    stop, so a competing mutation cannot commit during the stop's critical
+    section — it waits, then sees ``stopped`` and is refused by the
+    transition itself.
+
+    Keyed by session name alone (the lifecycle module is deliberately
+    backend-free), and named so it sorts *after* the physical
+    ``session-workspace`` claim and *before* any terminal-generation claim.
+    That fixes the lock order as physical < write < generation wherever more
+    than one is held (only ``stop_session``/``delete_session`` nest them), and
+    the canonical-order guard below turns an inversion into a ``RuntimeError``
+    rather than a deadlock.
+    """
+    with generation_lifecycle_claims((("", "session-workspace-write", session_name),)):
+        yield
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 

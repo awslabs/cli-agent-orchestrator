@@ -5,12 +5,18 @@ routers already are: that module is 5,500 lines and a subsystem that must
 be read alongside the managed-launch state machine to be understood is one
 nobody will extend.
 
-**These routes must not consult tmux.** The existing ``GET /sessions/{name}``
+**The read routes must not consult tmux.** The existing ``GET /sessions/{name}``
 fails closed on ``session_exists`` first, which is correct for a route that
 returns live terminals and fatal for one that returns declared state: a
 ``stopped`` session is *defined* by its tmux session being gone, so
 inheriting that guard would make the state of a stopped session
 unreadable — exactly the state whose whole purpose is to outlive the panes.
+``POST /lifecycle/stop`` (and archive, which forces a stop) is the one
+exception: it is an *action*, not a read, and a stop that did not collect
+would leave a fleet running under a declaration that says it is hibernated.
+It collects through ``session_service.stop_session`` and leaves the row, the
+forwarded env, and the snapshots intact — so the read routes stay readable
+once tmux is gone.
 
 Routers are registered before the app-level ``/sessions`` routes and match
 first, so ``/sessions/{name}/lifecycle`` is safely owned here.
@@ -40,7 +46,7 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import session_lifecycle as sl
-from cli_agent_orchestrator.services import session_resumability
+from cli_agent_orchestrator.services import session_resumability, session_service
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +295,7 @@ async def stop_session_lifecycle(
     body: StopBody,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
-    """Record that a session's panes have been collected.
+    """Collect a session's panes and record it stopped, preserving the truth.
 
     Admin-only and gated on an explicit acknowledgement, because today this
     is irreversible for every worker in the session. It records
@@ -297,10 +303,13 @@ async def stop_session_lifecycle(
     keeping it costs one column while discarding it would mean a session
     stopped this week cannot be brought back correctly once resume lands.
 
-    This route records the declaration. It does not kill anything — pane
-    collection is the caller's, so a client that stops the state and then
-    fails to collect leaves a visibly wrong record rather than a silently
-    half-torn-down session.
+    Collection and the declaration are one operation, not two: the panes are
+    torn down through the same event-driven teardown ``DELETE`` uses
+    (snapshotted first, so recovery artifacts survive) and the lifecycle row
+    is left in ``stopped`` with its ``restore_to`` target and forwarded env
+    intact. Releasing the name stays the destructive ``DELETE`` path's job;
+    a stop never forgets the row or clears the env. The lifecycle *read*
+    routes stay tmux-free by design — only this action collects.
     """
     if not body.acknowledged_one_way:
         raise HTTPException(
@@ -312,7 +321,7 @@ async def stop_session_lifecycle(
         )
     try:
         return await asyncio.to_thread(
-            sl.stop,
+            session_service.stop_session,
             session_name,
             declared_by=body.declared_by,
             restore_to=body.restore_to,
@@ -321,6 +330,13 @@ async def stop_session_lifecycle(
         )
     except sl.SessionLifecycleError as exc:
         raise _http(exc)
+    except Exception as exc:
+        # A collection failure (an open callback recovery, or a pane that
+        # refused teardown) leaves the row preserved; the operator retries.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc).splitlines()[0],
+        )
 
 
 @router.post("/sessions/{session_name}/lifecycle/archived")
@@ -331,10 +347,11 @@ async def set_session_archived(
 ) -> Dict[str, Any]:
     """Hide or unhide a session without losing what it was.
 
-    Archiving forces a stop and is therefore gated exactly as stopping is.
-    Un-archiving only clears the flag — it does not restore the lifecycle,
-    because that is resume's job and resume would have to relaunch panes
-    this route never collected.
+    Archiving forces a stop and is therefore gated exactly as stopping is,
+    and it carries a stop's full obligation: it collects the panes and
+    preserves the row, the forwarded env, and the snapshots. Un-archiving
+    only clears the flag — it does not restore the lifecycle, because that
+    is resume's job and resume would have to relaunch panes.
     """
     if body.archived and not body.acknowledged_one_way:
         raise HTTPException(
@@ -345,16 +362,30 @@ async def set_session_archived(
             ),
         )
     try:
+        if body.archived:
+            return await asyncio.to_thread(
+                session_service.stop_session,
+                session_name,
+                declared_by=body.declared_by,
+                note=body.note,
+                expected_epoch=body.expected_epoch,
+                archived=True,
+            )
         return await asyncio.to_thread(
             sl.set_archived,
             session_name,
-            body.archived,
+            False,
             declared_by=body.declared_by,
             note=body.note,
             expected_epoch=body.expected_epoch,
         )
     except sl.SessionLifecycleError as exc:
         raise _http(exc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc).splitlines()[0],
+        )
 
 
 @router.post("/sessions/{session_name}/lifecycle/kind")

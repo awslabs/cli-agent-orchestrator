@@ -1434,14 +1434,17 @@ class TestCreateTerminalSessionEnvStore:
         mock_tmux.create_session.assert_not_called()
         mock_tmux.kill_session.assert_not_called()
 
-        # Structural pin: the pre-clear call site precedes both the
-        # resource-owning try and terminal-ID generation in the source.
+        # Structural pin: the pre-clear still precedes terminal-ID generation
+        # and the resource-owning section. cond-0221 moved it under the
+        # new-session admission claim's own try/except (which only releases the
+        # claim on failure — no resource cleanup, so cond-0067's zero-cleanup
+        # preflight still holds) ahead of the resource try that owns ID gen.
         source, _ = inspect.getsourcelines(terminal_service.create_terminal)
         joined = "".join(source)
         preclear_at = joined.index("clear_session_env(session_name)")
-        cleanup_try_at = joined.index("    try:")
+        resource_section_at = joined.index("# Step 1: Generate unique identifiers")
         id_generation_at = joined.index("terminal_id = generate_terminal_id()")
-        assert preclear_at < cleanup_try_at < id_generation_at
+        assert preclear_at < resource_section_at < id_generation_at
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
@@ -2679,3 +2682,57 @@ class TestDeferredInitFailureNotification:
 
         mock_create_inbox.assert_not_called()
         mock_delete.assert_called_once()
+
+
+class TestCreateTerminalLifecycleAdmission:
+    """The under-claim new-session admission is the zero-effect linearization
+    point. ``describe()`` fails open to ``working`` for observational marshal
+    callers; creation admission must not, or an unreadable lifecycle store can
+    hide a stopped row and allow stale-env deletion / name reuse."""
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_lifecycle_refuses_admission_with_zero_effects(self, monkeypatch):
+        from cli_agent_orchestrator.services import session_lifecycle, terminal_service
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        # describe() converts a read failure into {working, unreadable: ...}.
+        monkeypatch.setattr(
+            session_lifecycle,
+            "describe",
+            lambda name: {
+                "session_name": name,
+                "lifecycle": session_lifecycle.WORKING,
+                "unreadable": "database is locked",
+            },
+        )
+
+        effects: list = []
+        monkeypatch.setattr(
+            terminal_service, "clear_session_env", lambda *a, **k: effects.append("clear_env")
+        )
+        monkeypatch.setattr(
+            terminal_service, "generate_terminal_id", lambda: effects.append("gen_id") or "deadbeef"
+        )
+        backend = MagicMock()
+        backend.session_exists.return_value = False
+        backend.create_session.side_effect = lambda *a, **k: effects.append("create_session")
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+
+        outcome: dict = {}
+        try:
+            await create_terminal(
+                "mock_cli", "developer", session_name="cao-probe", new_session=True
+            )
+            outcome["ok"] = True
+        except session_lifecycle.SessionLifecycleUnavailable as exc:
+            outcome["unavailable"] = exc
+        except BaseException as exc:  # noqa: BLE001 - capture the pre-fix fail-open path
+            outcome["other"] = exc
+
+        # Admission must treat unreadable as typed lifecycle unavailability and
+        # refuse — not fail open into stale-env deletion / creation.
+        assert isinstance(
+            outcome.get("unavailable"), session_lifecycle.SessionLifecycleUnavailable
+        ), outcome
+        # Zero effects: nothing past the admission check ran.
+        assert effects == [], effects

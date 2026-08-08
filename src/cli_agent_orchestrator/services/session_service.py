@@ -20,7 +20,7 @@ Session Lifecycle:
 """
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
@@ -160,7 +160,14 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     result: Dict = {"deleted": [], "errors": []}
     session_claim = None
     try:
-        from cli_agent_orchestrator.services import callback_recovery, terminal_service
+        from cli_agent_orchestrator.services import callback_recovery
+        from cli_agent_orchestrator.services import session_lifecycle as sl
+        from cli_agent_orchestrator.services import terminal_service
+
+        # Canonicalize before every physical or durable effect. Otherwise a
+        # bare name can tear down an absent session while forget() alone
+        # releases the lifecycle row belonging to the real prefixed session.
+        session_name = sl.normalise_session_name(session_name)
 
         backend = get_backend()
         session_claim = callback_recovery.session_lifecycle_claim(
@@ -216,9 +223,7 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         # brand-new live campaign would start out invisible to the thing
         # whose job is to notice it wedging.
         try:
-            from cli_agent_orchestrator.services import session_lifecycle
-
-            session_lifecycle.forget(session_name)
+            sl.forget(session_name)
         except Exception as exc:  # noqa: BLE001 - deletion must still complete
             logger.warning("Could not forget the declared state of %s: %s", session_name, exc)
 
@@ -250,3 +255,146 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     finally:
         if session_claim is not None:
             session_claim.__exit__(None, None, None)
+
+
+def stop_session(
+    session_name: str,
+    *,
+    declared_by: str,
+    restore_to: Optional[str] = None,
+    note: Optional[str] = None,
+    expected_epoch: Optional[int] = None,
+    registry: PluginRegistry | None = None,
+    archived: bool = False,
+) -> Dict:
+    """Collect a session's panes while preserving its declared stopped state.
+
+    The row-preserving counterpart to ``delete_session``. A lifecycle stop
+    must both tear the fleet down and keep the truth a resume needs: the
+    lifecycle row stays in ``stopped`` with its ``restore_to`` target, the
+    forwarded environment survives so a resume relaunches against it, and the
+    per-terminal snapshots/recovery artifacts survive because collection goes
+    through the same event-driven ``delete_terminal`` path deletion does.
+
+    The order is load-bearing:
+
+    * the session-lifecycle claim is held across the whole operation, so a
+      concurrent create cannot add a window between the stopped check and the
+      teardown;
+    * admission (an open callback recovery) refuses *before* anything is
+      written or collected — collecting a terminal mid-recovery would lose
+      the one-shot refusal the recovery is adjudicating, and a stop recorded
+      while one is open would be a false state;
+    * the stopped declaration is written *before* any pane is collected, so a
+      write or admission failure deletes nothing, and a fully collected fleet
+      can never be left declared working;
+    * on a mid-collection failure the row is already stopped, so the
+      divergence is visible (not silent) and a retry re-collects what remains
+      — re-stopping is idempotent and keeps ``restore_to``.
+
+    Deliberately not symmetric with deletion: this never calls ``forget`` and
+    never clears the forwarded env. Releasing the name is the destructive
+    ``DELETE`` path's job, kept separate so an ordinary stop can never become
+    an accidental cleanup.
+    """
+    from cli_agent_orchestrator.services import callback_recovery
+    from cli_agent_orchestrator.services import session_lifecycle as sl
+    from cli_agent_orchestrator.services import terminal_service
+
+    # cond-0221: canonicalize once, before any physical or admission effect, so
+    # a bare name (`repair`) reaches the physical claim, the terminal listing,
+    # the exact-generation deletion's expected_session, backend existence/kill,
+    # and the durable row as `cao-repair`. It also makes the lifecycle write
+    # claim taken here and the one taken inside ``sl.stop()``/``set_archived()``
+    # (which normalize internally) the same key — re-entrant — rather than a
+    # raw-vs-canonical pair that inverts the canonical lock order.
+    session_name = sl.normalise_session_name(session_name)
+
+    backend = get_backend()
+    collected: List[str] = []
+    record: Dict = {}
+    with callback_recovery.session_lifecycle_claim(type(backend).__name__, session_name):
+        # cond-0221: hold the lifecycle write claim across admission, the stop
+        # write, and collection. Every lifecycle mutation takes it, so a
+        # competing ``declare``/``set_kind``/… cannot commit during the stop —
+        # it waits, then sees ``stopped`` and is refused by the transition.
+        # Acquired before the generation claims: the write claim sorts after the
+        # physical session-workspace claim and before terminal-generation claims
+        # (physical < write < generation), and ``sl.stop()``'s own ``_write``
+        # takes it re-entrantly via the thread-local, so it does not self-deadlock.
+        with callback_recovery.session_lifecycle_write_claim(session_name):
+            terminals = list_terminals_by_session(session_name)
+            claim_keys = callback_recovery.terminal_lifecycle_claim_set(*terminals)
+            with callback_recovery.generation_lifecycle_claims(claim_keys):
+                # Admission: an open callback recovery blocks both collection and
+                # the declaration. Checked before the lifecycle write so a refusal
+                # leaves no false stopped state, and before any deletion so it
+                # collects nothing.
+                for terminal in terminals:
+                    if callback_recovery.terminal_has_open_recovery(
+                        terminal["id"], terminal.get("generation")
+                    ):
+                        raise RuntimeError(
+                            f"session stop held because terminal {terminal['id']} has an "
+                            "open callback-recovery operation; collection is refused until "
+                            "callback completion or a terminal refusal/manual disposition"
+                        )
+
+                # Record the stop (preserving the row and restore_to) before any
+                # collection. A write failure here raises and collects nothing.
+                if archived:
+                    record = sl.set_archived(
+                        session_name,
+                        True,
+                        declared_by=declared_by,
+                        note=note,
+                        expected_epoch=expected_epoch,
+                    )
+                else:
+                    record = sl.stop(
+                        session_name,
+                        declared_by=declared_by,
+                        restore_to=restore_to,
+                        note=note,
+                        expected_epoch=expected_epoch,
+                    )
+
+                # Collect the panes via the same event-driven teardown deletion
+                # uses: delete_terminal snapshots before killing, so recovery
+                # artifacts survive. The forwarded env is intentionally left.
+                errors = []
+                for terminal in terminals:
+                    try:
+                        generation = terminal.get("generation")
+                        kwargs = {}
+                        if generation:
+                            kwargs = {
+                                "expected_generation": generation,
+                                "expected_session": terminal.get("tmux_session") or session_name,
+                            }
+                        terminal_service.delete_terminal(
+                            terminal["id"], registry=registry, **kwargs
+                        )
+                        collected.append(terminal["id"])
+                    except Exception as e:  # noqa: BLE001 - one pane must not erase the rest
+                        logger.warning(
+                            "Failed to collect terminal %s during stop of %s: %s",
+                            terminal["id"],
+                            session_name,
+                            e,
+                        )
+                        errors.append({"terminal_id": terminal["id"], "detail": str(e)})
+                if errors:
+                    # The row is already stopped and the env is preserved, so the
+                    # divergence is visible and a retry converges.
+                    raise RuntimeError(
+                        "session stop partially collected; lifecycle preserved; "
+                        f"retry converges: {errors}"
+                    )
+
+            # Kill the enclosing backend session if anything remains. Per-window
+            # teardown already removed each pane; this clears empty shells.
+            if backend.session_exists(session_name):
+                backend.kill_session(session_name)
+
+    return {**record, "collected_terminal_ids": collected, "errors": []}

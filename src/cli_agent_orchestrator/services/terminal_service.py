@@ -1390,6 +1390,7 @@ async def create_terminal(
     # FIFO stop/unlink, status clear, provider cleanup, and terminal-row
     # delete against the freshly generated — possibly 32-bit-colliding —
     # terminal ID, destroying an unrelated live terminal's state.)
+    session_claim = None
     if new_session:
         if not session_name:
             session_name = generate_session_name()
@@ -1398,20 +1399,57 @@ async def create_terminal(
         if not session_name.startswith(SESSION_PREFIX):
             session_name = f"{SESSION_PREFIX}{session_name}"
 
-        # Prevent duplicate sessions
-        if get_backend().session_exists(session_name):
-            raise ValueError(f"Session '{session_name}' already exists")
+        # cond-0221: acquire the physical session claim BEFORE the admission
+        # check and the stale-env pre-clear, so a racing stop_session (or
+        # delete) cannot write ``stopped``/collect panes between this check
+        # and the physical creation below. cond-0067's zero-cleanup preflight
+        # is preserved: the checks below still run before terminal-ID
+        # generation and outside the resource-owning try below, so a failure
+        # releases the claim and aborts with zero resource effects.
+        from cli_agent_orchestrator.services import callback_recovery, session_lifecycle
 
-        # Wipe any stale mapping a prior aborted lifecycle for this name
-        # may have left behind, so a no-env relaunch can't inherit them.
-        # Strict (cond-0050): if the durable delete cannot complete, this
-        # raises and creation aborts BEFORE any tmux session/provider/
-        # window/terminal side effect — a session name may never be
-        # reused over an unconfirmed stale row.
-        clear_session_env(session_name)
+        session_claim = callback_recovery.session_lifecycle_claim(
+            type(get_backend()).__name__, session_name
+        )
+        session_claim.__enter__()
+        try:
+            # Admission: a stopped name still holds what a resume would restore
+            # to (and a collected fleet); it must not be silently recreated.
+            # Checked under the claim so a stop cannot flip the row between
+            # this read and the physical creation below.
+            declared = session_lifecycle.describe(session_name)
+            # ``describe`` fails open to ``working`` + ``unreadable`` for
+            # observational marshal callers; creation admission must not; an
+            # unreadable store can hide a stopped row, so this is typed
+            # lifecycle unavailability at the admission boundary — refuse
+            # before stale-env deletion / ID generation / any physical effect.
+            if declared.get("unreadable"):
+                raise session_lifecycle.SessionLifecycleUnavailable(
+                    f"cannot admit new session {session_name!r}: its declared lifecycle "
+                    f"is unreadable ({declared['unreadable']})"
+                )
+            if declared["lifecycle"] == session_lifecycle.STOPPED:
+                raise ValueError(
+                    f"session {session_name!r} is stopped and still holds what a "
+                    f"resume would restore ({declared['restore_to']!r}); delete the "
+                    "session to release the name, or pick another"
+                )
+            # Prevent duplicate sessions (re-checked under the claim).
+            if get_backend().session_exists(session_name):
+                raise ValueError(f"Session '{session_name}' already exists")
+            # Wipe any stale mapping a prior aborted lifecycle for this name
+            # may have left behind, so a no-env relaunch can't inherit them.
+            # Strict (cond-0050): if the durable delete cannot complete, this
+            # raises and creation aborts BEFORE any tmux session/provider/
+            # window/terminal side effect — a session name may never be
+            # reused over an unconfirmed stale row.
+            clear_session_env(session_name)
+        except BaseException:
+            session_claim.__exit__(None, None, None)
+            session_claim = None
+            raise
 
     session_created = False  # tracks whether THIS call created the tmux session
-    session_claim = None
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
     # every MCP spawn/assign-into-existing-session call does). Independent of
@@ -1465,13 +1503,16 @@ async def create_terminal(
         # Creation and teardown share this exact backend/session claim.  It
         # covers the final existence check, physical pane/session effect, DB
         # persistence, and rollback so a stale delete cannot kill a new window
-        # in a reused session name.
+        # in a reused session name. A new session already acquired it for the
+        # admission/preflight above; the add-to-existing-session path acquires
+        # it here.
         from cli_agent_orchestrator.services import callback_recovery
 
-        session_claim = callback_recovery.session_lifecycle_claim(
-            type(get_backend()).__name__, session_name
-        )
-        session_claim.__enter__()
+        if session_claim is None:
+            session_claim = callback_recovery.session_lifecycle_claim(
+                type(get_backend()).__name__, session_name
+            )
+            session_claim.__enter__()
 
         window_name = (
             managed_window_name(terminal_id, terminal_generation)
