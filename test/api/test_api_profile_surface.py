@@ -362,3 +362,115 @@ class TestPreviewProfileTemplateEndpoint:
 
         assert response.status_code == 422
         assert not mock_render.called
+
+
+_VALID_PROFILE = """---
+name: test-agent
+description: A test agent
+---
+
+You are a test agent.
+"""
+
+
+class TestValidateAgentProfileEndpoint:
+    """Tests for POST /agents/profiles/validate."""
+
+    def test_valid_profile_reports_valid_with_no_messages(self, client) -> None:
+        """A schema-clean profile with no advisories should come back empty."""
+        response = client.post("/agents/profiles/validate", json={"content": _VALID_PROFILE})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["valid"] is True
+        assert body["messages"] == []
+
+    def test_schema_violation_is_an_error_with_a_path(self, client) -> None:
+        """JSON-Schema failures must be error severity and carry the field path."""
+        content = "---\nname: test-agent\nengine: v3\n---\n\nBody.\n"
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["valid"] is False
+        errors = [m for m in body["messages"] if m["severity"] == "error"]
+        assert any(m["path"] == "engine" for m in errors)
+
+    def test_missing_required_name_is_an_error(self, client) -> None:
+        """``name`` is the only required field; omitting it must invalidate."""
+        content = "---\ndescription: no name here\n---\n\nBody.\n"
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["valid"] is False
+        assert any("name" in m["message"] for m in body["messages"])
+
+    def test_deprecated_field_yields_a_deprecation_warning(self, client) -> None:
+        """A deprecated key produces a warning and, separately, a schema error.
+
+        ``additionalProperties: false`` rejects the unknown key, so the profile
+        is not valid. The warning exists to explain *why* in useful terms rather
+        than leaving only the generic schema message.
+        """
+        content = "---\nname: test-agent\nautoApproveTools: true\n---\n\nBody.\n"
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        body = response.json()
+        warnings = [m for m in body["messages"] if m["severity"] == "warning"]
+        assert any("deprecated" in m["message"] for m in warnings)
+        assert body["valid"] is False
+
+    def test_non_builtin_role_warns_without_invalidating(self, client) -> None:
+        """Custom roles are legal but advisory-flagged, as in the CLI.
+
+        This is the property the UI relies on to decide whether to block a save:
+        a warning-only profile must still report ``valid: true``.
+        """
+        content = "---\nname: test-agent\nrole: not-a-real-role\n---\n\nBody.\n"
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["valid"] is True
+        warnings = [m for m in body["messages"] if m["severity"] == "warning"]
+        assert any("role" in m["message"] for m in warnings)
+
+    def test_oversized_content_is_rejected_by_the_model(self, client) -> None:
+        """The body is length-bounded so an unbounded parse cannot be forced."""
+        response = client.post(
+            "/agents/profiles/validate",
+            json={"content": "x" * 300_000},
+        )
+
+        assert response.status_code == 422
+
+
+class TestAgentProfileSchemaEndpoint:
+    """Tests for GET /agents/profiles/schema."""
+
+    def test_returns_the_profile_schema(self, client) -> None:
+        """The served document must be the profile schema itself."""
+        response = client.get("/agents/profiles/schema")
+
+        assert response.status_code == 200
+        schema = response.json()
+        assert schema["required"] == ["name"]
+        assert schema["additionalProperties"] is False
+        assert "engine" in schema["properties"]
+
+    def test_is_not_shadowed_by_the_name_route(self, client) -> None:
+        """Route ordering regression guard.
+
+        ``GET /agents/profiles/{name}`` is declared after this route. If the two
+        are ever reordered, FastAPI matches in declaration order and this path
+        would be captured as a profile literally named "schema", surfacing as a
+        404 from the profile lookup rather than the schema document.
+        """
+        with patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile") as mock_load:
+            response = client.get("/agents/profiles/schema")
+
+        assert response.status_code == 200
+        assert not mock_load.called
+        assert "properties" in response.json()

@@ -96,6 +96,29 @@
       "type": "array",
       "items": {"type": "string"}
     },
+    "container": {
+      "type": "object",
+      "description": "CAO-native container settings. Consumed by the provider layer, not passed through to provider JSON.",
+      "properties": {
+        "path_maps": {
+          "type": "array",
+          "description": "Host-to-guest path translations for provider files used inside a container. CAO rewrites matching prefixes using the longest match; it does not create the container or its bind mounts.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "host": {"type": "string", "minLength": 1},
+              "guest": {"type": "string", "minLength": 1}
+            },
+            "required": ["host", "guest"]
+          }
+        }
+      }
+    },
+    "provider_init_timeout": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Per-profile override, in seconds, for provider initialization. Replaces the server-wide provider_init_timeout as the hard outer cap for this profile."
+    },
     "prompt": {
       "type": "string"
     },

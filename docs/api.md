@@ -50,6 +50,15 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   a template's JSON-Schema without writing a profile.
 - `POST /agents/profiles/templates/preview` validates and renders a template to
   Markdown without writing a profile.
+- `POST /agents/profiles/validate` validates a finished profile's frontmatter
+  against the profile JSON-Schema plus CAO conventions, without writing
+  anything. This is the HTTP equivalent of `cao profile validate`, and is
+  distinct from `templates/validate`, which checks a template *config* against
+  that template's own schema. Findings are severity-tagged (`error` or
+  `warning`); only errors clear the `valid` flag, so warnings are advisory.
+- `GET /agents/profiles/schema` returns the agent profile JSON-Schema, so a
+  client can render create and edit forms from the server's definition instead
+  of duplicating the field list.
 - `POST /agents/profiles/install` installs a profile.
 - Template validation and preview require the selected template to include a
   `schema.json` file.

@@ -14,7 +14,7 @@ import termios
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, Tuple, cast
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, cast
 
 from fastapi import (
     BackgroundTasks,
@@ -537,6 +537,39 @@ class PreviewTemplateResponse(BaseModel):
 
     template: str
     content: str
+
+
+class ProfileValidationRequest(BaseModel):
+    """Request body for the non-mutating profile validate route."""
+
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileValidationMessage(BaseModel):
+    """One validation finding.
+
+    ``path`` is the dotted frontmatter location for JSON-Schema errors and is
+    absent for convention checks that are not tied to a single key.
+    """
+
+    severity: Literal["error", "warning"]
+    message: str
+    path: Optional[str] = None
+
+
+class ProfileValidationResponse(BaseModel):
+    """Outcome of validating a profile's frontmatter.
+
+    ``valid`` is False only when at least one error-severity finding is
+    present. Warnings are advisory and do not invalidate a profile, so a
+    client should block a save on errors alone.
+    """
+
+    valid: bool
+    messages: List[ProfileValidationMessage] = Field(default_factory=list)
 
 
 class MemorySummary(BaseModel):
@@ -1701,6 +1734,51 @@ async def preview_profile_template_endpoint(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     return PreviewTemplateResponse(template=request.template, content=content)
+
+
+@app.post("/agents/profiles/validate")
+async def validate_agent_profile_endpoint(
+    request: ProfileValidationRequest,
+) -> ProfileValidationResponse:
+    """Validate a profile's frontmatter against the profile schema. Writes nothing.
+
+    Distinct from ``/agents/profiles/templates/validate``, which checks a
+    *template config* against that template's own schema. This checks a
+    *finished profile* against ``agent_profile.schema.json`` plus CAO
+    conventions, and is the HTTP equivalent of ``cao profile validate``.
+
+    Deliberately NOT guarded by ``SCOPE_WRITE``, for the same reason as the
+    template validate route: this is a POST only because the profile content
+    travels in a JSON body rather than a query string, and it mutates no state.
+    """
+    from cli_agent_orchestrator.services.profile_validator import validate_profile_text
+
+    try:
+        findings = validate_profile_text(request.content)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ProfileValidationResponse(
+        valid=not any(f.severity == "error" for f in findings),
+        messages=[
+            ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
+            for f in findings
+        ],
+    )
+
+
+@app.get("/agents/profiles/schema")
+async def get_agent_profile_schema_endpoint() -> Dict:
+    """Return the agent profile JSON-Schema.
+
+    Lets a client render create and edit forms from the server's own schema
+    definition instead of duplicating the field list. Declared above
+    ``GET /agents/profiles/{name}`` because FastAPI matches in declaration
+    order, and the path parameter would otherwise capture "schema" as a name.
+    """
+    from cli_agent_orchestrator.services.profile_validator import load_profile_schema
+
+    return load_profile_schema()
 
 
 @app.get("/agents/profiles/{name}")
