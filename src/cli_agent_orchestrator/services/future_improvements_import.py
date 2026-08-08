@@ -749,6 +749,8 @@ def apply_manifest(
                     # Verify canonical record is in same project and is not mutated cross-project
                     if existing_canonical.project_id != project_id:
                         raise TrackerError("invalid", f"map-existing {mig_id} canonical {cand_key} belongs to project {existing_canonical.project_id!r}, not {project_id!r}")
+                    if getattr(existing_canonical, "kind", "issue") != "feature":
+                        raise TrackerError("invalid", f"map-existing {mig_id} canonical {cand_key} is kind {getattr(existing_canonical,'kind','issue')!r}, expected feature")
                     # Must already carry migration label to be idempotent; otherwise this is first apply (not replay) but map-existing should only be used after explicit adjudication — we still allow it once
                     if mig_label in existing_labels:
                         # Verify idempotent — no label mutation needed, just check digest matches (already done via candidate check)
@@ -786,44 +788,60 @@ def apply_manifest(
                     raise TrackerError("invalid", f"unknown action {action}")
 
             after_counter = int(project.next_issue_number or 1)
+            # P1: prepare receipt before commit so DB changes are not committed before receipt is safely publishable
+            # Build receipt data inside transaction but write temp file before commit
+            receipt_tmp: Dict[str, Any] = {
+                "schema": "cao-future-improvements-receipt-v1",
+                "generated_utc": _utcnow_iso(),
+                "transaction_id": transaction_id,
+                "project": project_id,
+                "source_sha256": source_sha,
+                "supplement_sha256": supplement_sha,
+                "manifest_sha256": manifest_sha,
+                "manifest_path": manifest_path,
+                "before_next_issue_number": before_counter,
+                "after_next_issue_number": after_counter,
+                "mappings": mappings,
+                "row_digests": row_digests,
+                "candidate_count": len(candidates),
+            }
+            # Write to temp receipt path before commit (so receipt is durable before DB publish)
+            if receipt_out:
+                tmp_receipt_path = Path(receipt_out).with_suffix(Path(receipt_out).suffix + ".tmp")
+            else:
+                tmp_receipt_path = Path(manifest_path).with_suffix(".receipt.json.tmp")
+                if tmp_receipt_path == Path(manifest_path):
+                    tmp_receipt_path = Path(str(manifest_path) + ".receipt.json.tmp")
+            tmp_receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_receipt_path.write_text(json.dumps(receipt_tmp, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
             db.commit()
+            # Atomically publish receipt after successful commit
+            if receipt_out:
+                final_receipt_path = Path(receipt_out)
+            else:
+                final_receipt_path = Path(manifest_path).with_suffix(".receipt.json")
+                if final_receipt_path == Path(manifest_path):
+                    final_receipt_path = Path(str(manifest_path) + ".receipt.json")
+            tmp_receipt_path.replace(final_receipt_path)
         except TrackerError:
+            # Clean up temp receipt on failure
+            try:
+                if 'tmp_receipt_path' in locals() and tmp_receipt_path.exists():
+                    tmp_receipt_path.unlink()
+            except: pass
             db.rollback()
             raise
         except Exception as exc:
+            try:
+                if 'tmp_receipt_path' in locals() and tmp_receipt_path.exists():
+                    tmp_receipt_path.unlink()
+            except: pass
             db.rollback()
             raise TrackerError("invalid", f"migration failed: {exc}") from exc
 
-    # Build receipt
-    receipt: Dict[str, Any] = {
-        "schema": "cao-future-improvements-receipt-v1",
-        "generated_utc": _utcnow_iso(),
-        "transaction_id": transaction_id,
-        "project": project_id,
-        "source_sha256": source_sha,
-        "supplement_sha256": supplement_sha,
-        "manifest_sha256": manifest_sha,
-        "manifest_path": manifest_path,
-        "before_next_issue_number": before_counter,
-        "after_next_issue_number": after_counter,
-        "mappings": mappings,
-        "row_digests": row_digests,
-        "candidate_count": len(candidates),
-    }
-
-    # Write atomic receipt; determine path
-    if receipt_out:
-        receipt_path = Path(receipt_out)
-    else:
-        # Default: manifest_path.receipt.json
-        receipt_path = Path(manifest_path).with_suffix(".receipt.json")
-        # If manifest has no suffix, use .receipt.json
-        if receipt_path == Path(manifest_path):
-            receipt_path = Path(str(manifest_path) + ".receipt.json")
-    # Ensure parent exists
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_atomic_receipt(receipt, receipt_path)
-    receipt["receipt_path"] = str(receipt_path)
+    # Build receipt (for return value, already published)
+    receipt = receipt_tmp
+    receipt["receipt_path"] = str(final_receipt_path)
     return receipt
 
 
