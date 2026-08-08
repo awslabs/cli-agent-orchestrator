@@ -452,6 +452,12 @@ def issue_show(issue_key, as_json):
 @click.option("--resolution", default=None)
 @click.option("--duplicate-of", default=None)
 @click.option(
+    "--kind",
+    type=click.Choice(tracker.ITEM_KINDS),
+    default=None,
+    help="change type: issue (bug) or feature",
+)
+@click.option(
     "--actor", default=None, help="who is making this change (recorded in the audit trail)"
 )
 @click.option("--json", "as_json", is_flag=True)
@@ -811,6 +817,12 @@ def feature_show(feature_key, as_json):
 @click.option("--evidence", default=None)
 @click.option("--resolution", "outcome", default=None, help="outcome/explanation")
 @click.option("--duplicate-of", default=None)
+@click.option(
+    "--kind",
+    type=click.Choice(tracker.ITEM_KINDS),
+    default=None,
+    help="change type: feature or issue (bug)",
+)
 @click.option("--actor", default=None)
 @click.option("--json", "as_json", is_flag=True)
 def feature_edit(feature_key, body_file, labels, actor, as_json, **fields):

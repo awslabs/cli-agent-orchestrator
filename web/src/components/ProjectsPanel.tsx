@@ -1063,15 +1063,12 @@ function ItemDetail({
           onChange={e => patch({ kind: e.target.value })}
           aria-label="Type"
           title="Change type — bug or feature request"
-          className={`px-2 py-1.5 rounded border text-xs font-medium inline-flex items-center gap-1 ${issue.kind === 'feature' ? 'bg-violet-500/15 text-violet-300 border-violet-500/30' : 'bg-sky-500/15 text-sky-300 border-sky-500/30'}`}
+          className={`px-2 py-1.5 rounded border text-xs font-medium ${issue.kind === 'feature' ? 'bg-violet-500/15 text-violet-300 border-violet-500/30' : 'bg-sky-500/15 text-sky-300 border-sky-500/30'}`}
         >
-          <option value="issue">Bug</option>
-          <option value="feature">Feature</option>
+          {(vocab.item_kinds ?? ['issue', 'feature']).map(k => (
+            <option key={k} value={k}>{k === 'feature' ? 'Feature' : 'Bug'}</option>
+          ))}
         </select>
-        <span className={`hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium border ${KIND_CLASS[issue.kind] ?? (issue.kind === 'feature' ? 'bg-violet-500/15 text-violet-300 border-violet-500/30' : 'bg-sky-500/15 text-sky-300 border-sky-500/30')}`}>
-          {isFeature ? <Lightbulb size={10} /> : <CircleDot size={10} />}
-          {isFeature ? 'feature' : 'bug'}
-        </span>
         <select
           value={issue.status}
           onChange={e => patch({ status: e.target.value })}

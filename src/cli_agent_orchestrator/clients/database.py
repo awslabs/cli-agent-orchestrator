@@ -939,6 +939,21 @@ def _migrate_tracker_kind_column() -> None:
                 )
             )
     except Exception as exc:
+        # Concurrent ALTER race: another process added the column between our
+        # PRAGMA check and ALTER. SQLite reports "duplicate column name: kind"
+        # — treat as success and ensure the index exists.
+        msg = str(exc).lower()
+        if "duplicate column name" in msg and "kind" in msg:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(
+                        sa_text(
+                            "CREATE INDEX IF NOT EXISTS ix_tracker_issues_project_kind_status ON tracker_issues(project_id, kind, status)"
+                        )
+                    )
+            except Exception:
+                pass
+            return
         # Fail-closed: upgraded ORM cannot query without column
         raise RuntimeError(f"tracker kind migration failed: {exc}") from exc
 

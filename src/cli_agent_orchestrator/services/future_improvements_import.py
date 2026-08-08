@@ -542,7 +542,6 @@ def dry_run(
         for cand in sup_cands:
             if cand["title"].strip().lower() in source_titles:
                 continue
-                # Reassign source_class and keep supplement sha
             cand["source_class"] = "dirty-working-copy-supplement"
             # Recompute migration_id using supplement sha and new ordinal
             # But we want stable ordinal overall: append after source

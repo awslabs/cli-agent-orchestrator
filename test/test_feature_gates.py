@@ -93,10 +93,17 @@ class TestSchemaMigration:
             dbmod._migrate_tracker_kind_column()
 
     def test_concurrent_migration_is_safe(self, tmp_path, monkeypatch):
+        # Legacy DB without kind column — the race is between PRAGMA check and ALTER TABLE
+        # Base.metadata.create_all already includes kind, so we must create the table manually
         engine = create_engine(
             f"sqlite:///{tmp_path}/conc.db", connect_args={"check_same_thread": False}
         )
-        Base.metadata.create_all(bind=engine)
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    "CREATE TABLE tracker_issues (key TEXT PRIMARY KEY, project_id TEXT, title TEXT, status TEXT)"
+                )
+            )
         import cli_agent_orchestrator.clients.database as dbmod
 
         monkeypatch.setattr(dbmod, "engine", engine)
@@ -113,7 +120,11 @@ class TestSchemaMigration:
             t.start()
         for t in threads:
             t.join()
-        assert errors == []
+        assert errors == [], f"concurrent migration should be idempotent, got {errors}"
+        # Verify column was added and no duplicate error escaped
+        with engine.connect() as conn:
+            cols = {row[1] for row in conn.execute(sa_text("PRAGMA table_info(tracker_issues)"))}
+            assert "kind" in cols
 
 
 class TestFeatureKindGuards:
@@ -152,16 +163,22 @@ class TestFeatureKindGuards:
     def test_patch_kind_is_mutable_with_audit(self, cao_system):
         row = tracker.create_feature(project_id="cao-system", title="f1")
         # kind is now mutable via PATCH — switching feature -> issue succeeds and is audited
-        updated = tracker.update_issue(row["key"], **{"kind": "issue"})
+        updated = tracker.update_issue(row["key"], **{"kind": "issue"}, actor="alice")
         assert updated["kind"] == "issue"
+        detail = tracker.get_issue(row["key"])
+        assert any(e.get("field") == "kind" for e in detail.get("events", []))
         # switching back issue -> feature also succeeds; stale failing_command is cleared if present
         issue_row = tracker.create_issue(
             project_id="cao-system", title="b1", failing_command="make test"
         )
         assert issue_row["failing_command"] == "make test"
-        switched = tracker.update_issue(issue_row["key"], **{"kind": "feature"})
+        switched = tracker.update_issue(issue_row["key"], **{"kind": "feature"}, actor="bob")
         assert switched["kind"] == "feature"
         assert switched["failing_command"] is None
+        detail2 = tracker.get_issue(issue_row["key"])
+        # kind switch and auto-clear of failing_command should both be audited
+        assert any(e.get("field") == "kind" for e in detail2.get("events", []))
+        assert any(e.get("field") == "failing_command" for e in detail2.get("events", []))
         # invalid kind still rejected
         with pytest.raises(TrackerError) as exc:
             tracker.update_issue(row["key"], **{"kind": "not-a-kind"})

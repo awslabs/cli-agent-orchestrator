@@ -1248,6 +1248,10 @@ def update_issue(issue_key: str, *, actor: Optional[str] = None, **changes: Any)
         ):
             raise TrackerError("invalid", "duplicate status requires duplicate_of canonical key")
         # Determine target kind after change (for kind-switch validation)
+        # N3: explicit null is treated as no-op (skip), not 400
+        if "kind" in changes and changes["kind"] is None:
+            # Remove null kind from changes so loop skips it
+            del changes["kind"]
         target_kind = (
             _validate_kind(changes["kind"]) if "kind" in changes else getattr(row, "kind", "issue")
         )
