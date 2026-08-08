@@ -339,6 +339,20 @@ class TestNegativeObservation:
         body = response.json()
         assert body["observed"] is False
         assert body["submission_observed"] == "unknown"
+        assert {
+            key: body[key]
+            for key in (
+                "terminal_id",
+                "terminal_incarnation",
+                "terminal_generation",
+                "pane_birth_id",
+                "provider_process_id",
+                "provider",
+                "native_session_id",
+                "execution_mode",
+                "session_name",
+            )
+        } == service.resolve_control_identity(TERMINAL).expected_identity_view()
 
     def test_a_byte_count_mismatch_returns_observed_false(self, client, tmux, monkeypatch):
         monkeypatch.setattr(
