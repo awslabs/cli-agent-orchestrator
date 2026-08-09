@@ -72,12 +72,13 @@ ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)
 # which is shared across v0.111 and v0.136 status bars.
 TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])"
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
-# "• Thinking (2s ...)", "• Starting script creation (10s • esc to interrupt)".
-# The prefix text varies but the "(Ns • esc to interrupt)" format is consistent.
+# "• Working (1m 00s ...)", "• Working (1h 00m 00s ...)", or dynamic
+# prefixes such as "• Starting script creation (10s • esc to interrupt)".
+# Codex expands the elapsed value at the minute and hour boundaries.
 # Appears inline with --no-alt-screen when the agent is actively processing.
 # Must be checked before COMPLETED to avoid false positives (the • matches
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
-TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
+TUI_PROGRESS_PATTERN = r"•[^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
@@ -332,6 +333,13 @@ class ProviderError(Exception):
 
 class CodexProvider(BaseProvider):
     """Provider for Codex CLI tool integration."""
+
+    # Codex redraws its inline TUI in place. The append-only pipe-pane stream
+    # therefore retains transient progress frames (notably MCP startup) after
+    # they have been erased from the visible terminal. Route status detection
+    # through StatusMonitor's pyte-composited viewport so get_status() sees only
+    # the live frame rather than stale redraw history.
+    supports_screen_detection = True
 
     def __init__(
         self,
@@ -892,6 +900,20 @@ class CodexProvider(BaseProvider):
         # If we're not at an idle prompt and we don't see explicit errors/permission prompts,
         # assume the CLI is still producing output.
         return TerminalStatus.PROCESSING
+
+    def get_status_from_screen(self, screen_lines: list[str]) -> TerminalStatus:
+        """Detect status from the current pyte-composited Codex viewport.
+
+        Codex's existing detector is line-oriented and already understands its
+        trust/update dialogs, progress spinner, idle composer, and completed
+        response markers. Remove pyte's blank padding rows and reuse that
+        detector against the rendered screen; cursor-erased startup frames are
+        absent here, which prevents a stale spinner from pinning PROCESSING.
+        """
+        rows = [line.rstrip() for line in screen_lines if line.strip()]
+        if not rows:
+            return TerminalStatus.UNKNOWN
+        return self.get_status("\n".join(rows))
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.

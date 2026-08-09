@@ -1102,6 +1102,86 @@ class TestCodexProviderStatusDetection:
         assert status == TerminalStatus.COMPLETED
 
 
+class TestCodexRenderedScreenStatusDetection:
+    """Regression coverage for in-place Codex TUI redraws.
+
+    ``tmux pipe-pane`` is append-only: text erased from the visible terminal
+    remains in CAO's raw rolling buffer.  MCP startup uses the same spinner
+    shape as a live agent turn, so raw parsing can remain PROCESSING forever
+    after the visible screen has returned to the idle composer.
+    """
+
+    def test_provider_opts_into_rendered_screen_detection(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.supports_screen_detection is True
+
+    def test_blank_rendered_screen_is_unknown(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(["", "   "]) == TerminalStatus.UNKNOWN
+
+    def test_overwritten_mcp_startup_spinner_does_not_pin_processing(self):
+        import pyte
+
+        raw = (
+            "\x1b[1;1H• Starting MCP servers (0/3): cao-mcp-server"
+            " (0s • esc to interrupt)"
+            "\x1b[3;1H› Improve documentation in @filename"
+            "\x1b[5;1H  gpt-5.6-terra high · /tmp/project"
+            # Codex clears the transient activity row once MCP startup settles.
+            "\x1b[1;1H\x1b[2K"
+        )
+        screen = pyte.Screen(200, 20)
+        pyte.Stream(screen).feed(raw)
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        # Demonstrate the old failure mode: stripping cursor controls from the
+        # append-only stream leaves the erased spinner behind.
+        assert provider.get_status(raw) == TerminalStatus.PROCESSING
+        # The composited viewport contains only the live idle composer.
+        assert provider.get_status_from_screen(list(screen.display)) == TerminalStatus.IDLE
+
+    def test_live_mcp_startup_spinner_is_processing(self):
+        screen_lines = [
+            "• Starting MCP servers (1/3): cao-mcp-server (0s • esc to interrupt)",
+            "",
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("elapsed", ["1m 00s", "1h 00m 00s"])
+    def test_minute_plus_live_progress_is_processing(self, elapsed):
+        screen_lines = [
+            "› Implement the requested feature",
+            f"• Working ({elapsed} • esc to interrupt)",
+            "",
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+
+    def test_completed_turn_on_rendered_screen_is_completed(self):
+        screen_lines = [
+            "› Reply with the readiness token",
+            "• CAO_CODEX_READY",
+            "",
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.COMPLETED
+
+
 class TestCodexBulletFormatStatusDetection:
     """Tests for Codex's real interactive output format using › prompt and • bullets."""
 
