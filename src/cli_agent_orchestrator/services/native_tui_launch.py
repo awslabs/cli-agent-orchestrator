@@ -1070,11 +1070,18 @@ def _claude_argv(
 def _muse_argv(
     *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
 ) -> list[str]:
-    # Muse Code 0.1.0 binds --session-id only on `muse exec` (headless,
-    # one-shot); the interactive TUI rejects the flag. Both launch and recovery
-    # therefore re-run the exec command bound to the minted session id.
+    # Muse's accepted interactive lifecycle resumes a caller-chosen id:
+    # ``muse resume <id>`` starts the multi-turn TUI bound to that exact id
+    # (verified on the installed 0.1.0-R708.1 build).  There is no NEW
+    # interactive launch kind — the id is minted before any provider I/O and
+    # the TUI always resumes it.
+    if launch_kind != LAUNCH_KIND_RESUME:
+        raise NativeLaunchInvalid(
+            "Muse native sessions are minted by a caller-chosen session id; "
+            f"the TUI must resume the exact id, got launch_kind {launch_kind!r}"
+        )
     try:
-        return muse_native_launch.build_launch_argv(
+        return muse_native_launch.build_resume_argv(
             session_id=session_id,
             muse_binary=binary,
             extra_args=extra_args,
@@ -1110,7 +1117,7 @@ _ARGV_BINDERS: dict[str, dict[str, Any]] = {
     "codex": {"build": _codex_argv, "binds_exactly": codex_native_launch.resumes_exactly},
     "kimi_cli": {"build": _kimi_argv, "binds_exactly": kimi_native_launch.resumes_exactly},
     "claude_code": {"build": _claude_argv, "binds_exactly": claude_native_launch.binds_exactly},
-    "muse_cli": {"build": _muse_argv, "binds_exactly": muse_native_launch.binds_exactly},
+    "muse_cli": {"build": _muse_argv, "binds_exactly": muse_native_launch.resumes_exactly},
 }
 
 SUPPORTED_NATIVE_PROVIDERS = frozenset(_ARGV_BINDERS)
