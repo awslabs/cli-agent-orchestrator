@@ -74,10 +74,15 @@ def _reserve_request(worktree, tmp_path, **changes):
 
 
 def _ready_bridge_state(record, monkeypatch):
+    # Each reservation mints its own provider-native session id, exactly as
+    # a real launch does; the roster (M3-A) refuses one native id bound to
+    # two live incarnations, so the shared fake id would make every second
+    # bind in a test collide with the first.
+    session_id = f"thr_{uuid.uuid4().hex[:16]}"
     receipt = {
         "bridge_version": BRIDGE_VERSION,
-        "receipt_id": "thr_0192a7b4",
-        "provider_session_id": "thr_0192a7b4",
+        "receipt_id": session_id,
+        "provider_session_id": session_id,
         "provider_receipt_kind": "codex-thread-start",
         "provider_transcript_sha256": "a" * 64,
         "provider_version": "0.146.0",
@@ -225,11 +230,11 @@ def test_bind_journals_native_bound(isolated_memory_db, worktree, tmp_path, monk
     request = _reserve_request(worktree, tmp_path)
     record, _ = v2.reserve(request)
     v2.claim_launch(record["reservation_id"])
-    _ready_bridge_state(record, monkeypatch)
+    receipt = _ready_bridge_state(record, monkeypatch)
     bound = v2.bind_native(record["reservation_id"], _bind_request(record))
     assert bound["state"] == "bound"
     binding = bound["binding"]
-    assert binding["native_session_id"] == "thr_0192a7b4"
+    assert binding["native_session_id"] == receipt["provider_session_id"]
     assert binding["issuance_source"] == "app_server_thread_start"
     assert len(binding["creation_payload_sha256"]) == 64
     assert len(binding["binding_payload_sha256"]) == 64
@@ -351,7 +356,7 @@ def test_admission_lifecycle_and_ambiguity(isolated_memory_db, worktree, tmp_pat
     assert not send_again
     receipt = {
         "receipt_id": "turn-1",
-        "provider_session_id": "thr_0192a7b4",
+        "provider_session_id": bound["binding"]["native_session_id"],
         "provider_turn_id": "turn-1",
         "provider_receipt_kind": "codex-turn-start",
     }

@@ -1289,3 +1289,68 @@ def test_deliver_inbox_via_bridge_unavailable_is_no_ack_fallback(
     assert not managed_launch.deliver_inbox_via_bridge(
         record["terminal_id"], message_id=7, message="ping", sender_id="sup-1"
     )
+
+
+def test_managed_control_identity_does_not_hide_missing_columns(isolated_memory_db):
+    """Schema drift must fail closed: a missing column in the v2
+    reservations table is never silently converted into "unmanaged"."""
+    import sqlite3
+
+    from sqlalchemy import text
+
+    # The v2 table exists but is missing the M3-A additive column the
+    # roster owns — the narrow projection must still resolve the managed
+    # identity rather than erasing it.
+    with isolated_memory_db.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS managed_launch_v2_reservations ("
+                "reservation_id TEXT PRIMARY KEY, "
+                "terminal_id TEXT NOT NULL UNIQUE, "
+                "generation TEXT NOT NULL UNIQUE, "
+                "protocol_vintage TEXT NOT NULL, "
+                "session_name TEXT NOT NULL, "
+                "provider TEXT NOT NULL, "
+                "agent_profile TEXT NOT NULL, "
+                "caller_id TEXT NOT NULL, "
+                "working_directory TEXT NOT NULL, "
+                "obligation_generation TEXT NOT NULL, "
+                "run_id TEXT NOT NULL, "
+                "launch_nonce_digest TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "request_json TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+        )
+        # A managed-v2 reservation row without the additive column.
+        conn.execute(
+            text(
+                "INSERT INTO managed_launch_v2_reservations("
+                "reservation_id, terminal_id, generation, protocol_vintage, "
+                "session_name, provider, agent_profile, caller_id, "
+                "working_directory, obligation_generation, run_id, "
+                "launch_nonce_digest, state, request_json, created_at, updated_at"
+                ") VALUES ("
+                "'11111111-1111-4111-8111-111111111111', 'a1b2c3d4', "
+                "'00000000-0000-4000-8000-000000000001', 'v2', "
+                "'cao-test', 'codex', 'developer', 'deadbeef', '/tmp/repo', "
+                "'obgen-1', 'run-1', 'n' * 40, 'admitted', '{}', 't', 't')"
+            )
+        )
+        conn.commit()
+
+    identity = managed_launch.managed_control_identity("a1b2c3d4")
+    assert identity is not None
+    assert identity["vintage"] == "v2"
+    assert identity["terminal_id"] == "a1b2c3d4"
+    assert identity["controllable"] is True
+
+    # A column the projection DOES read, removed = genuine drift: fail
+    # closed (raise), never "unmanaged".
+    with isolated_memory_db.begin() as conn:
+        conn.execute(text("ALTER TABLE managed_launch_v2_reservations DROP COLUMN state"))
+        conn.commit()
+    with pytest.raises(Exception):
+        managed_launch.managed_control_identity("a1b2c3d4")

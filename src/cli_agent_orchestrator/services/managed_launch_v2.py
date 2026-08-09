@@ -69,6 +69,7 @@ from cli_agent_orchestrator.services import (
     provider_contracts,
     recovery_receipts,
     secret_gate,
+    stable_agent_roster,
 )
 from cli_agent_orchestrator.services.destructive_endpoint import write_binding_record
 from cli_agent_orchestrator.services.managed_launch import (
@@ -734,6 +735,10 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "task_id": row.task_id,
         "run_id": row.run_id,
         "launch_nonce_digest": row.launch_nonce_digest,
+        # The stable CAO agent id minted at reserve (M3-A).  ``None`` on a
+        # reservation created before the roster existed; the bind derives
+        # a deterministic id from the terminal identity for those.
+        "stable_agent_id": getattr(row, "stable_agent_id", None),
         # PROJECTED, not stored. A cleaned generation answers ``cleaned``
         # while the row still holds the finalization verdict it actually
         # reached, because these are two facts about different things: the
@@ -1276,6 +1281,10 @@ def reserve(request: ManagedLaunchV2ReserveRequest) -> tuple[dict[str, Any], boo
                 task_id=request.task_id,
                 run_id=request.run_id,
                 launch_nonce_digest=nonce_digest,
+                # M3-A: the stable agent id is minted and persisted BEFORE
+                # any provider effect, so response loss returns the same id
+                # and a replay adopts the same stable agent.
+                stable_agent_id=str(uuid.uuid4()),
                 state="reserved",
                 request_json=request_json,
                 execution_mode=resolution.mode,
@@ -2454,6 +2463,108 @@ def _build_bind_intent(
     }
 
 
+_ROSTER_ACQUISITION_BY_ISSUANCE = {
+    "cli_session_id": stable_agent_roster.ACQUISITION_CHOSEN_SESSION_ID,
+    "acp_session_new": stable_agent_roster.ACQUISITION_ACP_BOOTSTRAP,
+    "app_server_thread_start": stable_agent_roster.ACQUISITION_ZERO_TURN_BOOTSTRAP,
+}
+
+
+def _roster_binding_contract(
+    db: Any, row: Any, expected_record: dict[str, Any], reserved_request: dict[str, Any]
+) -> stable_agent_roster.BindingContract:
+    """The M3-A stable-agent binding for one v2 bind, from durable facts.
+
+    Built exclusively from the machine-recorded launch contract — the
+    reservation row (including the agent id minted at reserve), the
+    journaled binding record, and the pinned issuance source — never from
+    pane scraping or provider guesses.  Route provenance
+    (``provider_route``, policy digest, route payload digest) is recorded
+    beside the native id; DeepSeek and Z.ai are Claude Code route values,
+    never separate harness identity domains.
+
+    Role is launch truth: managed-v2 reservations in this slice are
+    worker launches, bound as ``worker`` explicitly — a profile name never
+    decides the role.
+    """
+    terminal = (
+        db.query(database.TerminalModel)
+        .filter(database.TerminalModel.id == row.terminal_id)
+        .first()
+    )
+    if terminal is None:
+        terminal = (
+            db.query(database.ManagedLaunchV2TerminalModel)
+            .filter(database.ManagedLaunchV2TerminalModel.id == row.terminal_id)
+            .first()
+        )
+    pane_pid = getattr(terminal, "v2_pane_pid", None)
+    if pane_pid is None and terminal is not None:
+        pane_pid = getattr(terminal, "pane_pid", None)
+    route_provenance: dict[str, Any] = {
+        "provider_route": reserved_request.get("provider_route", "anthropic"),
+    }
+    for key in ("assigned_policy_sha256", "route_payload_sha256"):
+        value = expected_record.get(key)
+        if value is not None:
+            route_provenance[key] = value
+    return stable_agent_roster.BindingContract(
+        agent_id=row.stable_agent_id
+        or stable_agent_roster.derive_initial_agent_id(row.terminal_id, row.generation),
+        session_name=row.session_name,
+        role=stable_agent_roster.ROLE_WORKER,
+        profile_family=row.agent_profile or "default",
+        harness=row.provider,
+        native_session_id=expected_record["native_session_id"],
+        acquisition_method=_ROSTER_ACQUISITION_BY_ISSUANCE.get(
+            _ISSUANCE_SOURCES[row.provider],
+            stable_agent_roster.ACQUISITION_RESUME,
+        ),
+        route_provenance=route_provenance,
+        terminal_id=row.terminal_id,
+        generation=row.generation,
+        pane_id=getattr(terminal, "pane_id", None),
+        pane_pid=pane_pid,
+        execution_mode=expected_record.get("execution_mode"),
+    )
+
+
+def _roster_mark_admitted_best_effort(row: Any, db: Any) -> None:
+    """M3-A (i-0023): record the roster incarnation's admitted state
+    best-effort, never aborting the reservation's delivery truth.
+
+    The reservation's ``admitted`` transition is the durable fact that the
+    task bytes were delivered; the roster's incarnation disposition is the
+    lifecycle of the physical pane.  A teardown that retires the exact
+    incarnation AFTER the bytes were posted is a legitimate race, and the
+    two durable facts diverge intentionally: the delivery happened and the
+    pane was then cleaned up.  A transient roster-store failure leaves the
+    incarnation ``bound``; an idempotent completion replay re-attempts the
+    mark and converges.  The bytes are never resent and the delivery is
+    never reported as not-delivered.
+    """
+    try:
+        stable_agent_roster.mark_admitted(
+            terminal_id=row.terminal_id, generation=row.generation, db=db
+        )
+    except stable_agent_roster.StableAgentConflict as exc:
+        # The incarnation was retired after delivery; its lifecycle is
+        # authoritative and the reservation's admitted state is preserved.
+        logger.warning(
+            "roster incarnation for terminal %s is already retired; delivery "
+            "is recorded as admitted: %s",
+            row.terminal_id,
+            exc,
+        )
+    except stable_agent_roster.StableAgentError as exc:
+        logger.warning(
+            "roster mark_admitted failed for terminal %s; an idempotent "
+            "completion replay will retry: %s",
+            row.terminal_id,
+            exc,
+        )
+
+
 def _reconcile_and_complete_bind(
     db: Any, row: Any, reservation_id: str, intent: dict[str, Any]
 ) -> None:
@@ -2463,7 +2574,9 @@ def _reconcile_and_complete_bind(
     before the SQL commit): it must match the journaled bytes exactly
     and the journaled fencing token must still be the registered one;
     then the row commits ``bound``.  Absent the record, it is published
-    now from the journaled bytes.
+    now from the journaled bytes.  The M3-A stable-agent binding commits
+    atomically with the ``bound`` transition, so real task admission can
+    never precede the durable roster record.
     """
     from cli_agent_orchestrator.services.destructive_endpoint import binding_record_path
 
@@ -2522,6 +2635,28 @@ def _reconcile_and_complete_bind(
             # mode grafted on.
             execution_mode=expected_record.get("execution_mode"),
         )
+    # M3-A: bind the stable agent, lineage, and incarnation durably BEFORE
+    # the reservation commits ``bound`` — the same transaction, so real
+    # task admission (which requires ``bound``) can never precede the
+    # roster record.  A conflicting immutable roster identity refuses the
+    # bind with zero mutation; a replay adopts the existing rows.  The
+    # roster is fail-closed after this build's initialization: a store
+    # that cannot record the binding refuses the bind (typed), it never
+    # silently keeps a pre-M3-A path.
+    reserved_request = _parse_json(row.request_json, {})
+    try:
+        stable_agent_roster.bind_generation(
+            _roster_binding_contract(db, row, expected_record, reserved_request), db=db
+        )
+    except stable_agent_roster.StableAgentConflict as exc:
+        # An immutable identity conflict is permanent: refuse the bind.
+        raise ManagedLaunchConflict(f"stable-agent roster refused the bind: {exc}") from exc
+    except stable_agent_roster.StableAgentError as exc:
+        # A transient roster unavailability (store contention, concurrent
+        # write) must stay retryable — never a permanent conflict.
+        raise ManagedLaunchUnavailable(
+            f"stable-agent roster unavailable for the bind: {exc}"
+        ) from exc
     row.binding_json = _canonical_json(intent["binding"])
     row.state = "bound"
     row.updated_at = _now()
@@ -2640,6 +2775,23 @@ def claim_admission(
                     "task admission requires the journaled native_bound reference; "
                     "zero task bytes are sent without it"
                 )
+            # M3-A: the stable-agent/native binding must be durably admitted
+            # before any real task bytes cross.  The roster record is created
+            # in the same transaction as ``bound``, so a missing or
+            # identity_missing/retired binding here is a truthful refusal,
+            # never a silent admission and never a bypassed gate.
+            try:
+                stable_agent_roster.assert_admission_ready(
+                    terminal_id=row.terminal_id, generation=row.generation, db=db
+                )
+            except stable_agent_roster.StableAgentAdmissionRefused as exc:
+                raise ManagedLaunchConflict(
+                    f"task admission refused before the stable-agent binding is durable: {exc}"
+                ) from exc
+            except stable_agent_roster.StableAgentError as exc:
+                raise ManagedLaunchUnavailable(
+                    f"stable-agent roster refused the admission gate: {exc}"
+                ) from exc
             # A delivery refused before any I/O leaves a durable record so
             # a lost response cannot read as maybe-sent. That record must
             # not then become the thing that blocks the retry it exists to
@@ -2718,6 +2870,16 @@ def complete_admission(
                     raise ManagedLaunchConflict(
                         "provider submission receipt changed after admission"
                     )
+                # i-0023 / repair-3 P1-2: an idempotent replay re-attempts
+                # the roster mark so a transient store failure converges on
+                # the roster side without resending the delivered bytes.
+                # The mark only completes a nested savepoint, so finish the
+                # outer transaction explicitly rather than depending on
+                # driver-specific session-close semantics.
+                # Delivery identity/bytes are untouched: the reservation row
+                # was not modified in this branch.
+                _roster_mark_admitted_best_effort(row, db)
+                db.commit()
                 return _row_dict(row)
             if row.state != "admitting":
                 raise ManagedLaunchConflict(f"admission cannot complete from state {row.state!r}")
@@ -2760,6 +2922,14 @@ def complete_admission(
             row.admission_json = _canonical_json(admission)
             row.state = "admitted"
             row.updated_at = _now()
+            # M3-A (i-0023): the roster mark is delivery-adjacent
+            # bookkeeping, NOT a delivery gate.  The reservation's
+            # ``admitted`` transition is the durable delivery truth and is
+            # committed even if the roster mark conflicts (e.g. a teardown
+            # retired the incarnation after the bytes were posted) or the
+            # roster store is transiently unavailable — the bytes are never
+            # resent and the delivery is never reported as not-delivered.
+            _roster_mark_admitted_best_effort(row, db)
             db.commit()
             db.refresh(row)
             return _row_dict(row)
@@ -2810,6 +2980,10 @@ def complete_native_admission(
             if admission.get("status") == "admitted":
                 if admission.get("native_submission") != operation:
                     raise ManagedLaunchConflict("native submission record changed after admission")
+                # i-0023 / repair-3 P1-2: same idempotent re-mark as the ACP
+                # replay path, committed explicitly (delivery untouched).
+                _roster_mark_admitted_best_effort(row, db)
+                db.commit()
                 return _row_dict(row)
             if row.state != "admitting":
                 raise ManagedLaunchConflict(f"admission cannot complete from state {row.state!r}")
@@ -2885,6 +3059,9 @@ def complete_native_admission(
             row.admission_json = _canonical_json(admission)
             row.state = "admitted"
             row.updated_at = _now()
+            # M3-A (i-0023): same best-effort roster mark as the ACP path —
+            # the reservation's delivery truth is committed regardless.
+            _roster_mark_admitted_best_effort(row, db)
             db.commit()
             db.refresh(row)
             return _row_dict(row)

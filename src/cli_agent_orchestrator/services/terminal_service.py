@@ -339,10 +339,32 @@ def record_native_session(terminal_id: str, native_session_id: str) -> bool:
     identical to the right one.
     """
     try:
-        return set_terminal_native_session_id(terminal_id, native_session_id)
+        recorded = set_terminal_native_session_id(terminal_id, native_session_id)
     except Exception as exc:  # pragma: no cover - a missing label is not fatal
         logger.warning("Could not record native session for %s: %s", terminal_id, exc)
         return False
+    # M3-A repair seam: bind the observed identity onto the terminal's
+    # roster lineage when that lineage is still truthfully
+    # ``identity_missing``.  Best-effort and never fatal: a conflicting
+    # recorded identity is a real conflict and is logged, and the truthful
+    # missing state remains visible to the roster audit.
+    try:
+        from cli_agent_orchestrator.services import stable_agent_roster
+
+        metadata = get_terminal_metadata(terminal_id)
+        harness = (metadata or {}).get("provider", "unknown")
+        # Pass the exact generation when the row carries one so the repair
+        # resolves the exact incarnation; a terminal-only fallback resolves
+        # the unique live incarnation deterministically.
+        stable_agent_roster.record_native_identity(
+            terminal_id=terminal_id,
+            generation=(metadata or {}).get("generation"),
+            native_session_id=native_session_id,
+            harness=harness,
+        )
+    except Exception as exc:  # noqa: BLE001 - the terminal fact is already recorded
+        logger.warning("stable-agent roster repair failed for terminal %s: %s", terminal_id, exc)
+    return recorded
 
 
 def upgrade_observed_identity(
@@ -1343,6 +1365,84 @@ def _admit_session_creation(session_name: str) -> str:
     return canonical
 
 
+def _roster_retire_incarnation_best_effort(terminal_id: str, generation: Optional[str]) -> None:
+    """M3-A teardown retirement: best-effort and never raised.
+
+    The physical disposable is already being torn down; a roster failure
+    here (missing record, unreadable store) must not block cleanup — Stop
+    is best-effort for every roster.  The stable agent and its history
+    survive regardless; the audit reports anything left un-retired.
+    """
+    try:
+        from cli_agent_orchestrator.services import stable_agent_roster
+
+        stable_agent_roster.retire_incarnation(
+            terminal_id=terminal_id,
+            generation=generation,
+            reason="terminal teardown",
+        )
+    except Exception as e:  # noqa: BLE001 - teardown must never be blocked
+        logger.warning(f"Failed to retire roster incarnation for {terminal_id}: {e}")
+
+
+def _roster_bind_unmanaged(
+    *,
+    terminal_id: str,
+    session_name: str,
+    stable_agent_role: Optional[str],
+    agent_profile: Optional[str],
+    provider: str,
+    terminal_generation: Optional[str],
+    pane_id: Optional[str],
+    pane_pid: Optional[int],
+    native_status_source: bool,
+) -> None:
+    """M3-A / cond-0377: durably bind the stable CAO agent for an
+    UNMANAGED terminal (the session supervisor and legacy workers).  The
+    stable-agent record exists before the launch returns and before any
+    message the caller sends at creation; managed reservations bind at
+    their own canonical choke point (``bind_native``), so this seam
+    excludes them.  Role is launch truth: the caller passes the role its
+    owning operation decided; ``None`` means worker.
+
+    DARK-FOUNDATION TRUTH, NOT FULL ADMISSION ENFORCEMENT: the native
+    identity is not yet known on this path, so the lineage starts in the
+    truthful ``identity_missing`` state and the repair seam
+    (``record_native_identity``) upgrades it when the provider answers.
+    The roster records identity here, but the legacy unmanaged input
+    lanes are NOT yet gated on native-ID-ready admission — deterministic
+    native capture and status repair are the follow-up cond-0377
+    sub-slices.  The managed-v2 seam's ``assert_admission_ready`` gate IS
+    enforced; this unmanaged path is a dark foundation, not the full gate.
+
+    Fail-closed by contract: a newly created terminal whose stable-agent
+    row cannot be durably bound is NOT a successfully rostered launch —
+    this raises (the caller unwinds with zero task input) rather than
+    reporting success with a swallowed bind failure.  A terminal row that
+    did not durably persist (unit fakes) has nothing to bind and is
+    skipped.
+    """
+    from cli_agent_orchestrator.services import stable_agent_roster
+
+    if get_terminal_metadata(terminal_id) is None:
+        return
+    stable_agent_roster.bind_generation(
+        stable_agent_roster.BindingContract(
+            agent_id=stable_agent_roster.derive_initial_agent_id(terminal_id),
+            session_name=session_name,
+            role=stable_agent_role or stable_agent_roster.ROLE_WORKER,
+            profile_family=agent_profile or "default",
+            harness=provider,
+            native_session_id=None,
+            terminal_id=terminal_id,
+            generation=terminal_generation,
+            pane_id=pane_id,
+            pane_pid=pane_pid,
+            execution_mode="native_tui" if native_status_source else None,
+        )
+    )
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1371,6 +1471,12 @@ async def create_terminal(
     # the FIFO -- it is a line-oriented subprocess. Only the launch verb
     # knows whether the pane it is about to create is a full-screen TUI.
     native_status_source: bool = False,
+    #: The stable-agent role of THIS terminal (M3-A / cond-0377).  Role is
+    #: launch truth, never a profile-name heuristic: session creation
+    #: passes ``supervisor`` for the session's initial terminal, and every
+    #: other terminal is a ``worker`` unless its owning operation
+    #: explicitly says otherwise.  ``None`` means worker.
+    stable_agent_role: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1420,6 +1526,12 @@ async def create_terminal(
     # delete against the freshly generated — possibly 32-bit-colliding —
     # terminal ID, destroying an unrelated live terminal's state.)
     session_claim = None
+    # M3-A: whether the unmanaged roster bind committed during this
+    # creation.  If a later step fails, the exact incarnation must be
+    # retired during unwind so a dead terminal is never left live.
+    # Initialized at function scope so every cleanup path (new and
+    # add-to-existing sessions alike) sees it bound.
+    roster_bound = False
     if new_session:
         if not session_name:
             session_name = generate_session_name()
@@ -1740,6 +1852,62 @@ async def create_terminal(
             )
             _register_incarnation(terminal_id, terminal_generation, identity)
 
+        # M3-A / cond-0377: bind the stable CAO agent for every UNMANAGED
+        # terminal before any real task input can be delivered to it.
+        # Fail-closed: a roster bind failure unwinds the launch (typed
+        # failure, zero task input) instead of returning a successfully
+        # rostered terminal.  The standalone synchronous bind runs OFF the
+        # asyncio event loop (``to_thread``) while still being awaited
+        # before any task input or a successful return, so SQLite
+        # contention and retry backoff never stall unrelated requests.
+        #
+        # Cancellation safety (repair-3 P1-1): cancellation does not stop
+        # the worker thread.  On cancellation we shield-await the worker to
+        # a KNOWN outcome before allowing cleanup/lock ownership to end; if
+        # it committed, the cleanup fact is set so the cancellation teardown
+        # retires the exact incarnation.  A late commit can therefore never
+        # cross the teardown boundary.
+        if reserved_terminal_id is None:
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    _roster_bind_unmanaged,
+                    terminal_id=terminal_id,
+                    session_name=session_name,
+                    stable_agent_role=stable_agent_role,
+                    agent_profile=agent_profile,
+                    provider=provider,
+                    terminal_generation=terminal_generation,
+                    pane_id=identity.get("pane_id"),
+                    pane_pid=(int(identity["pane_pid"]) if identity.get("pane_pid") else None),
+                    native_status_source=native_status_source,
+                )
+            )
+            # The worker is SHIELDED from the very first await: Python
+            # delivers an outer-task cancellation to an awaited task, which
+            # would mark the to_thread future cancelled while the thread
+            # keeps running.  Shield keeps ``worker`` alive so its done()
+            # truthfully reflects the thread's completion.
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # Hold ownership: await the worker to completion (shielded,
+                # tolerating repeated cancellation), then record whether it
+                # committed so the teardown below retires the incarnation.
+                # A late thread commit can never cross this boundary.
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                try:
+                    worker.result()
+                except Exception:
+                    roster_bound = False
+                else:
+                    roster_bound = True
+                raise
+            roster_bound = True
+
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
@@ -1948,8 +2116,14 @@ async def create_terminal(
                 logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
         return terminal
 
-    except Exception as e:
-        # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
+    except (asyncio.CancelledError, Exception) as e:
+        # Cleanup on failure OR cancellation: a cancelled launch is not a
+        # successfully created terminal, so the same resource cleanup runs
+        # (FIFO, status, provider, roster retirement, terminal row).  This
+        # catches CancelledError without broadly swallowing BaseException
+        # (KeyboardInterrupt/SystemExit still propagate) and re-raises
+        # below, preserving normal cancellation semantics and the primary
+        # cancellation/error.
         logger.error(f"Failed to create terminal: {e}")
         # A managed no-task launch deliberately preserves a generation once
         # its durable terminal row exists.  The reservation service records the
@@ -1990,6 +2164,14 @@ async def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
+        # M3-A (i-0003): if the unmanaged roster bind committed before this
+        # failure, retire the exact incarnation BEFORE removing the terminal
+        # row — a dead terminal must never leave a live roster incarnation
+        # that blocks identity reuse and lies to the audit.  Idempotent
+        # (retiring a retired/absent incarnation is a no-op), best-effort,
+        # and preserves the primary exception below.
+        if roster_bound:
+            _roster_retire_incarnation_best_effort(terminal_id, terminal_generation)
         # Roll back the DB terminal row so a failed create does not leave an
         # orphan record: the stale row would still be listed for the session
         # and report UNKNOWN status even though nothing is running. Idempotent
@@ -3406,6 +3588,12 @@ def _delete_terminal_claimed(
                     )
         except Exception as e:
             logger.warning(f"Failed to resolve native session claims for {terminal_id}: {e}")
+        # M3-A: retire the roster incarnation so the physical history is
+        # truthful while the stable agent survives teardown.  Best-effort
+        # and never raised: missing roster records or an unreadable store
+        # must not block cleanup (Stop is best-effort for every roster).
+        _recheck_teardown_claim()
+        _roster_retire_incarnation_best_effort(terminal_id, expected_generation)
         _recheck_teardown_claim()
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)

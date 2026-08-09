@@ -43,6 +43,7 @@ from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services import native_pane_input as npi
 from cli_agent_orchestrator.services import native_tui_launch
+from cli_agent_orchestrator.services import stable_agent_roster as roster
 from cli_agent_orchestrator.services.canonical_json import canonical_sha256
 from cli_agent_orchestrator.services.managed_launch import (
     ManagedLaunchConflict,
@@ -400,6 +401,12 @@ async def test_a_native_generation_reaches_admitted_without_any_bridge(
 
     assert admitted["state"] == "admitted"
     assert harness.bridge_calls == []
+    # i-0031 hardening: the roster incarnation reflects the admitted state.
+    incarnation = roster.get_incarnation_by_terminal(
+        admitted["terminal_id"], generation=admitted["generation"]
+    )
+    assert incarnation is not None
+    assert incarnation["disposition"] == roster.INCARNATION_ADMITTED
     # Typed as one literal line into the exact bound pane, with the
     # submitting key as its own separate event.
     assert harness.keystrokes.panes == [PANE_ID]
