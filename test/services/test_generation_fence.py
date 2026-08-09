@@ -549,7 +549,7 @@ async def test_async_flock_waiters_do_not_starve_default_executor_or_park(store,
     constrained = ThreadPoolExecutor(max_workers=2)
     loop.set_default_executor(constrained)
     real_enter = gf._enter_or_abandon
-    waiter_started = asyncio.Event()
+    waiters_started = asyncio.Event()
     worker_calls = 0
     worker_calls_lock = threading.Lock()
 
@@ -557,9 +557,13 @@ async def test_async_flock_waiters_do_not_starve_default_executor_or_park(store,
         nonlocal worker_calls
         with worker_calls_lock:
             worker_calls += 1
-            is_waiter = worker_calls >= 2
-        if is_waiter:
-            loop.call_soon_threadsafe(waiter_started.set)
+            # The holder's acquisition completed before we create either
+            # waiter.  Waiting for call three proves *both* contended
+            # acquisitions reached the dedicated flock pool before the
+            # holder asks the constrained default executor for native work.
+            both_waiters_started = worker_calls == 3
+        if both_waiters_started:
+            loop.call_soon_threadsafe(waiters_started.set)
         return real_enter(manager, handoff)
 
     monkeypatch.setattr(gf, "_enter_or_abandon", observe_enter)
@@ -585,20 +589,25 @@ async def test_async_flock_waiters_do_not_starve_default_executor_or_park(store,
         loop.call_soon_threadsafe(park_started.set)
         return gf.install_park(store, request=_park_request(), fencing_token_id="token-1")
 
-    holder_task = asyncio.create_task(holder())
-    await asyncio.wait_for(holder_entered.wait(), timeout=1)
-    waiters = [asyncio.create_task(waiter()) for _ in range(2)]
-    await asyncio.wait_for(waiter_started.wait(), timeout=1)
-    park_task = asyncio.create_task(asyncio.to_thread(park))
-    await asyncio.wait_for(park_started.wait(), timeout=1)
-    allow_holder_work.set()
-    await asyncio.wait_for(holder_work_finished.wait(), timeout=1)
-    assert not park_task.done()
-    release_holder.set()
-    await asyncio.wait_for(asyncio.gather(holder_task, park_task, *waiters), timeout=3)
-    assert park_task.result()["outcome"] == gf.OUTCOME_FENCED
-
-    # Do not retain a constrained executor for tests that share this loop.
-    replacement = ThreadPoolExecutor(max_workers=4)
-    loop.set_default_executor(replacement)
-    constrained.shutdown(wait=True)
+    try:
+        holder_task = asyncio.create_task(holder())
+        await asyncio.wait_for(holder_entered.wait(), timeout=1)
+        waiters = [asyncio.create_task(waiter()) for _ in range(2)]
+        await asyncio.wait_for(waiters_started.wait(), timeout=1)
+        park_task = asyncio.create_task(asyncio.to_thread(park))
+        await asyncio.wait_for(park_started.wait(), timeout=1)
+        allow_holder_work.set()
+        await asyncio.wait_for(holder_work_finished.wait(), timeout=1)
+        # It has reached install_park, but the holder still owns the exact
+        # generation lock.  The assertion is a lock-state oracle, not a
+        # scheduler-timing guess.
+        assert not park_task.done()
+        release_holder.set()
+        await asyncio.wait_for(asyncio.gather(holder_task, park_task, *waiters), timeout=3)
+        assert park_task.result()["outcome"] == gf.OUTCOME_FENCED
+    finally:
+        # A failed assertion must not poison later tests with a shut-down or
+        # constrained loop-default executor.
+        replacement = ThreadPoolExecutor(max_workers=4)
+        loop.set_default_executor(replacement)
+        constrained.shutdown(wait=True)

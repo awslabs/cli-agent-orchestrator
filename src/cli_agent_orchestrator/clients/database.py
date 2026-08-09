@@ -3267,14 +3267,24 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         with SessionLocal() as db:
             if not _inbox_receiver_eligible(db, receiver_id):
                 raise ValueError(f"Terminal '{receiver_id}' not found")
-            v2 = (
-                db.query(ManagedLaunchV2TerminalModel)
-                .filter(
-                    ManagedLaunchV2TerminalModel.id == receiver_id,
-                    *_live_managed_v2_terminal_clauses(),
+            # The eligibility check above intentionally tolerates a database
+            # from before the managed-v2 migration.  Keep this second read
+            # on the same compatibility boundary: it only obtains the exact
+            # generation to bind for a live v2 receiver, and a missing v2
+            # table means this is necessarily a legacy receiver.
+            try:
+                v2 = (
+                    db.query(ManagedLaunchV2TerminalModel)
+                    .filter(
+                        ManagedLaunchV2TerminalModel.id == receiver_id,
+                        *_live_managed_v2_terminal_clauses(),
+                    )
+                    .first()
                 )
-                .first()
-            )
+            except OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                v2 = None
             expected_generation = None
             if v2 is not None:
                 expected_generation = str(v2.generation)

@@ -82,7 +82,16 @@ PROVEN_PROCESS_ID = f"{PANE_PID}@{START_MARKER}"
 
 @pytest.fixture(autouse=True)
 def _companion(tmp_path, monkeypatch):
-    monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
+    # The native binder publishes the exact successor/token record through
+    # its module-local root, while the production byte-admission seam resolves
+    # the root from ``constants`` at delivery time.  Point both at this test's
+    # isolated companion tree so these are real current-v2 identities rather
+    # than legacy-looking fixtures with no current fencing token.
+    from cli_agent_orchestrator import constants
+
+    companion = tmp_path / "companion"
+    monkeypatch.setattr(constants, "COMPANION_DIR", companion)
+    monkeypatch.setattr(v2, "COMPANION_DIR", companion)
     monkeypatch.setattr(bridge, "BRIDGE_ROOT", tmp_path / "bridge")
     cis.reset_control_input_journal()
 
@@ -263,6 +272,16 @@ async def _bound_native(worktree, tmp_path):
         ),
     )
     assert bound["state"] == "bound"
+    # Bind is what makes this a real managed-v2 writer: every delivery test
+    # below must begin with the exact successor record that its immutable
+    # binding names, rather than relying on the old generation-only path.
+    from cli_agent_orchestrator.services import heartbeat_store
+
+    current = heartbeat_store.current_fencing_record(v2.COMPANION_DIR, bound["terminal_id"])
+    assert current is not None
+    assert current["generation"] == bound["generation"]
+    assert current["attempt_id"] == bound["binding"]["attempt_id"]
+    assert current["current_token"]["id"] == bound["binding"]["fencing_token_id"]
     return reservation_id, bound
 
 
