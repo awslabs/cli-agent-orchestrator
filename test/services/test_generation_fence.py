@@ -582,8 +582,15 @@ async def test_async_flock_waiters_do_not_starve_default_executor_or_park(store,
             await release_holder.wait()
 
     async def waiter():
-        async with gf.async_admission_critical_section(store, "a1b2c3d4", "gen-000042"):
-            return None
+        try:
+            async with gf.async_admission_critical_section(store, "a1b2c3d4", "gen-000042"):
+                return ("entered", None)
+        except gf.FencedError as exc:
+            # Once the holder releases, flock makes no FIFO promise between
+            # an already-blocked admission and park.  A waiter therefore may
+            # either enter before park or observe its typed absorbing fence;
+            # neither outcome changes the executor-liveness contract below.
+            return ("fenced", exc)
 
     def park():
         loop.call_soon_threadsafe(park_started.set)
@@ -603,8 +610,20 @@ async def test_async_flock_waiters_do_not_starve_default_executor_or_park(store,
         # scheduler-timing guess.
         assert not park_task.done()
         release_holder.set()
-        await asyncio.wait_for(asyncio.gather(holder_task, park_task, *waiters), timeout=3)
-        assert park_task.result()["outcome"] == gf.OUTCOME_FENCED
+        results = await asyncio.wait_for(
+            asyncio.gather(holder_task, park_task, *waiters, return_exceptions=True), timeout=3
+        )
+        assert all(not isinstance(result, BaseException) for result in results)
+        holder_result, park_result, *waiter_results = results
+        assert holder_result is None
+        assert park_result["outcome"] == gf.OUTCOME_FENCED
+        assert park_result["park_receipt"]["fence_receipt"]["fencing_token_id"] == "token-1"
+        for outcome, detail in waiter_results:
+            assert outcome in {"entered", "fenced"}
+            if outcome == "entered":
+                assert detail is None
+            else:
+                assert isinstance(detail, gf.FencedError)
     finally:
         # A failed assertion must not poison later tests with a shut-down or
         # constrained loop-default executor.
