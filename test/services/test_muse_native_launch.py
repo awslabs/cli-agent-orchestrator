@@ -40,6 +40,10 @@ class TestBuildResumeArgv:
             with pytest.raises(mnl.MuseNativeLaunchError):
                 mnl.build_resume_argv(session_id=_uuid(), extra_args=[bad, "x"])
 
+    def test_rejects_disabling_retained_session_log(self):
+        with pytest.raises(mnl.MuseNativeLaunchError, match="exact session resumability"):
+            mnl.build_resume_argv(session_id=_uuid(), extra_args=["--no-session-log"])
+
     def test_accepts_provider_contract_resume_form(self):
         sid = _uuid()
         form = provider_contracts.validate_resume_argv(

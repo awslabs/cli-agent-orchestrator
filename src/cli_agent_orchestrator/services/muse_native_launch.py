@@ -39,8 +39,8 @@ from cli_agent_orchestrator.services import provider_contracts
 RESUME_COMMAND = "resume"
 
 #: Options that would rebind the identity to a different session or to the
-#: most recent one.  None of these may appear in a managed native Muse
-#: launch.
+#: most recent one, or would disable the retained session log required by
+#: ``muse resume``.  None may appear in a managed native Muse launch.
 FORBIDDEN_OPTIONS = frozenset(
     {
         "--session-id",
@@ -50,6 +50,7 @@ FORBIDDEN_OPTIONS = frozenset(
         "-c",
         "--continue",
         "--fork-session",
+        "--no-session-log",
     }
 )
 
@@ -100,8 +101,8 @@ def _validated_extra_args(extra_args: Optional[Iterable[str]]) -> List[str]:
     for arg in extra:
         if arg in FORBIDDEN_OPTIONS or arg == RESUME_COMMAND:
             raise MuseNativeLaunchError(
-                f"{arg} would unbind the session identity and is never permitted "
-                "in a managed native Muse launch"
+                f"{arg} would violate exact session resumability and is never "
+                "permitted in a managed native Muse launch"
             )
     return extra
 
