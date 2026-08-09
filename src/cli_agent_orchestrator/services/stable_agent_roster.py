@@ -1081,6 +1081,16 @@ def record_native_identity(
             raise StableAgentUnavailable(
                 f"incarnation {incarnation.incarnation_id} has no stable agent row"
             )
+        # A retired incarnation is a dead physical terminal: repairing its
+        # identity would revive a retired record and repoint the agent at a
+        # live disposition that no live incarnation backs.  Refused in the
+        # same transaction as the retirement (i-0025).
+        if incarnation.disposition == INCARNATION_RETIRED:
+            raise StableAgentConflict(
+                f"incarnation {incarnation.incarnation_id} of terminal {terminal_id} "
+                "is retired; native-identity repair is refused for a retired "
+                "incarnation — reincarnate on a fresh incarnation instead"
+            )
         # One live incarnation per stable agent: a repair that would link a
         # live incarnation while another live incarnation already exists is
         # refused (legacy/corrupt state defense; bind already enforces this).
@@ -1395,6 +1405,43 @@ def audit_dry_run(db: Any = None) -> dict[str, Any]:
                         "detail": f"current_incarnation_id {row.current_incarnation_id!r} has no row",
                     }
                 )
+            # Disposition/incarnation consistency (i-0025): a LIVE agent must
+            # back its live disposition with a live current incarnation, and
+            # a retired current incarnation must be reflected as dormant.
+            if row.current_incarnation_id is not None:
+                current_inc = next(
+                    (i for i in incarnations if i.incarnation_id == row.current_incarnation_id),
+                    None,
+                )
+                if current_inc is not None:
+                    if (
+                        row.disposition == DISPOSITION_LIVE
+                        and current_inc.disposition not in LIVE_INCARNATION_DISPOSITIONS
+                    ):
+                        problems.append(
+                            {
+                                "kind": "live-agent-with-retired-current-incarnation",
+                                "agent_id": row.agent_id,
+                                "detail": (
+                                    f"agent disposition is {row.disposition!r} but its "
+                                    f"current incarnation is {current_inc.disposition!r}"
+                                ),
+                            }
+                        )
+                    if (
+                        row.disposition == DISPOSITION_DORMANT
+                        and current_inc.disposition in LIVE_INCARNATION_DISPOSITIONS
+                    ):
+                        problems.append(
+                            {
+                                "kind": "dormant-agent-with-live-current-incarnation",
+                                "agent_id": row.agent_id,
+                                "detail": (
+                                    f"agent disposition is {row.disposition!r} but its "
+                                    f"current incarnation is {current_inc.disposition!r}"
+                                ),
+                            }
+                        )
 
         for row in lineages:
             if row.agent_id not in agent_ids:

@@ -22,6 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    text,
 )
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
@@ -792,6 +793,21 @@ class StableAgentLineageModel(Base):
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
 
+    #: Partial unique index declared in ORM metadata so ``create_all`` and
+    #: the startup migration enforce the SAME invariant: one (harness,
+    #: native_session_id) pair maps to one lineage.  NULL rows (truthful
+    #: ``identity_missing``) are excluded so an agent may record the
+    #: absence of identity more than once across its history.
+    __table_args__ = (
+        Index(
+            "ix_stable_lineage_harness_native_session_id",
+            "harness",
+            "native_session_id",
+            unique=True,
+            sqlite_where=text("native_session_id IS NOT NULL"),
+        ),
+    )
+
 
 class StableAgentIncarnationModel(Base):
     """One disposable physical incarnation of a stable agent.
@@ -822,6 +838,26 @@ class StableAgentIncarnationModel(Base):
     retirement_reason = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
+
+    #: Partial unique indexes declared in ORM metadata so ``create_all``
+    #: and the startup migration enforce the SAME invariants: incarnation
+    #: identity is (terminal_id, generation) when both are present, and
+    #: generation-less legacy rows are keyed on the terminal id alone.
+    __table_args__ = (
+        Index(
+            "ix_stable_incarnation_terminal_generation",
+            "terminal_id",
+            "generation",
+            unique=True,
+            sqlite_where=text("terminal_id IS NOT NULL AND generation IS NOT NULL"),
+        ),
+        Index(
+            "ix_stable_incarnation_terminal_legacy",
+            "terminal_id",
+            unique=True,
+            sqlite_where=text("terminal_id IS NOT NULL AND generation IS NULL"),
+        ),
+    )
 
 
 class KimiNativeControlOperationModel(Base):

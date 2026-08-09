@@ -51,6 +51,29 @@ def persisted_terminal(monkeypatch):
 
 
 @pytest.fixture
+def strict_close_db(isolated_memory_db, monkeypatch):
+    """SessionLocal whose close() strictly rolls back any pending outer
+    transaction — the coordinator's stated replay premise.  The replay-side
+    roster repair must be committed EXPLICITLY, never left to close()."""
+    from sqlalchemy import create_engine as _ce
+    from sqlalchemy.orm import Session as _SA_Session
+    from sqlalchemy.orm import sessionmaker as _sm
+
+    class _StrictCloseSession(_SA_Session):
+        def close(self):
+            if self.in_transaction():
+                self.rollback()
+            super().close()
+
+    sessionmaker = _sm(
+        autocommit=False, autoflush=False, bind=isolated_memory_db, class_=_StrictCloseSession
+    )
+    monkeypatch.setattr(roster.database, "SessionLocal", sessionmaker)
+    monkeypatch.setattr(v2.database, "SessionLocal", sessionmaker)
+    return sessionmaker
+
+
+@pytest.fixture
 def worktree(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -228,6 +251,252 @@ def test_v2_admission_gate_and_admitted_state(isolated_memory_db, worktree, tmp_
 
     incarnation = roster.get_incarnation_by_terminal(record["terminal_id"])
     assert incarnation["disposition"] == roster.INCARNATION_ADMITTED
+
+
+def test_completion_after_teardown_race_preserves_admitted(
+    isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """i-0023: after the task bytes are posted, a teardown that retires the
+    roster incarnation must not roll the reservation back to ``admitting``:
+    the delivery truth (``admitted``) is preserved and the bytes are never
+    resent.  The roster's lifecycle (retired) and the reservation's
+    delivery truth (admitted) are different durable facts."""
+    record, bound, _receipt = _reserve_and_bind(worktree, tmp_path, monkeypatch)
+    digest = v2.native_binding_digest(bound)
+    admit = _admit_request(bound, digest)
+    claimed, should_send = v2.claim_admission(record["reservation_id"], admit)
+    assert should_send
+    assert claimed["state"] == "admitting"
+
+    # Teardown wins the race after the provider posted the bytes.
+    roster.retire_incarnation(
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+        reason="teardown",
+    )
+
+    receipt = {
+        "receipt_id": "turn-1",
+        "provider_session_id": bound["binding"]["native_session_id"],
+        "provider_turn_id": "turn-1",
+        "provider_receipt_kind": "codex-turn-start",
+    }
+    completed = v2.complete_admission(record["reservation_id"], admit.delivery_id, receipt)
+    assert completed["state"] == "admitted"
+
+    # Never resent: the reservation stays durably admitted on replay.
+    replayed = v2.get(record["reservation_id"])
+    assert replayed["state"] == "admitted"
+    assert replayed["admission"]["status"] == "admitted"
+
+
+def _commit_spy(monkeypatch):
+    """Wrap SessionLocal so the tests can assert an EXPLICIT commit of the
+    replay-side roster repair — the requirement the coordinator stated —
+    independent of any toolchain's close()/rollback semantics."""
+    real_session = roster.database.SessionLocal
+    commits: list[int] = []
+
+    def _factory():
+        session = real_session()
+        original = session.commit
+
+        def _commit(*args, **kwargs):
+            commits.append(1)
+            return original(*args, **kwargs)
+
+        session.commit = _commit
+        return session
+
+    monkeypatch.setattr(roster.database, "SessionLocal", _factory)
+    monkeypatch.setattr(v2.database, "SessionLocal", _factory)
+    return commits
+
+
+def test_replay_converges_roster_mark_admitted_after_transient_failure(
+    isolated_memory_db, strict_close_db, worktree, tmp_path, monkeypatch
+):
+    """P1-2 (ACP): the first completion persists reservation ``admitted``
+    even when the roster mark is transiently unavailable; an idempotent
+    replay re-marks and the roster durably reads ``admitted`` from a
+    fresh session — the replay-side repair must be committed, never
+    rolled back with the outer session close."""
+    record, bound, _receipt = _reserve_and_bind(worktree, tmp_path, monkeypatch)
+    digest = v2.native_binding_digest(bound)
+    admit = _admit_request(bound, digest)
+    claimed, should_send = v2.claim_admission(record["reservation_id"], admit)
+    assert should_send
+
+    receipt = {
+        "receipt_id": "turn-1",
+        "provider_session_id": bound["binding"]["native_session_id"],
+        "provider_turn_id": "turn-1",
+        "provider_receipt_kind": "codex-turn-start",
+    }
+    real_mark = roster.mark_admitted
+    calls = {"n": 0}
+
+    def _failing_first(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise roster.StableAgentUnavailable("transient roster store failure")
+        return real_mark(*args, **kwargs)
+
+    monkeypatch.setattr(roster, "mark_admitted", _failing_first)
+
+    completed = v2.complete_admission(record["reservation_id"], admit.delivery_id, receipt)
+    assert completed["state"] == "admitted"
+    incarnation = roster.get_incarnation_by_terminal(
+        record["terminal_id"], generation=record["generation"]
+    )
+    assert incarnation["disposition"] == roster.INCARNATION_BOUND
+
+    # Restore successful roster marking and replay the exact completion;
+    # the replay must EXPLICITLY commit the roster repair (never leave it
+    # to session-close semantics).
+    monkeypatch.setattr(roster, "mark_admitted", real_mark)
+    commits = _commit_spy(monkeypatch)
+    again = v2.complete_admission(record["reservation_id"], admit.delivery_id, receipt)
+    assert again["state"] == "admitted"
+    assert commits, "the replay-side roster repair must be explicitly committed"
+
+    # The roster must durably read admitted from a fresh session.
+    incarnation = roster.get_incarnation_by_terminal(
+        record["terminal_id"], generation=record["generation"]
+    )
+    assert incarnation["disposition"] == roster.INCARNATION_ADMITTED
+
+    # Delivery identity/bytes unchanged: exact-replay conflict checks hold.
+    replay = v2.get(record["reservation_id"])
+    assert replay["state"] == "admitted"
+    assert replay["admission"]["delivery_id"] == admit.delivery_id
+    assert replay["admission"]["provider_submission_receipt"] == receipt
+
+
+def test_native_replay_converges_roster_mark_admitted_after_transient_failure(
+    isolated_memory_db, strict_close_db, worktree, tmp_path, monkeypatch
+):
+    """P1-2 (native): the same replay-side convergence on the native
+    completion path."""
+    from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION as _BV
+
+    executable = tmp_path / "fake-kimi"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    payload = {
+        "protocol_version": PROTOCOL_VERSION_V2,
+        "reservation_id": str(uuid.uuid4()),
+        "session_name": "cao-test-native",
+        "provider": "kimi_cli",
+        "agent_profile": "reviewer",
+        "caller_id": "deadbeef",
+        "working_directory": str(worktree),
+        "expected_model": "gpt-5.6-sol",
+        "expected_effort": "xhigh",
+        "provider_executable": str(executable),
+        "provider_executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "obligation_generation": "obgen-7c2e4a1b",
+        "task_id": "self-heal-demo-task",
+        "run_id": "run-0001",
+        "delivery_id": DELIVERY_ID,
+        "launch_nonce": "n" * 40,
+        "execution_mode": "native_tui",
+    }
+    record, _ = v2.reserve(ManagedLaunchV2ReserveRequest(**payload))
+    reservation_id = record["reservation_id"]
+    v2.claim_launch(reservation_id)
+    session_id = f"kimi-{uuid.uuid4().hex[:12]}"
+    receipt = {
+        "bridge_version": _BV,
+        "receipt_id": session_id,
+        "provider_session_id": session_id,
+        "provider_receipt_kind": "kimi-native-tui-attached",
+        "provider_version": "kimi 0.29.0",
+        "model_input_ready": True,
+        "reservation_id": reservation_id,
+        "terminal_id": record["terminal_id"],
+        "generation": record["generation"],
+        "provider": "kimi_cli",
+        "agent_profile": "reviewer",
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh",
+        "working_directory": str(worktree),
+    }
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+        lambda rid: {"state": "ready", "readiness": receipt},
+        raising=False,
+    )
+    bound = v2.bind_native(reservation_id, _bind_request(record))
+    assert bound["state"] == "bound"
+
+    digest = v2.native_binding_digest(bound)
+    admit = _admit_request(bound, digest)
+    claimed, should_send = v2.claim_admission(reservation_id, admit)
+    assert should_send
+
+    operation = {
+        "schema": "cao-kimi-native-control-v1",
+        "operation_id": admit.delivery_id,
+        "kind": "queue",
+        "state": "accepted",
+        "provider": "kimi_cli",
+        "native_session_id": session_id,
+        "terminal_id": record["terminal_id"],
+        "generation": record["generation"],
+        "execution_mode": "native_tui",
+        "payload_sha256": hashlib.sha256(b"x").hexdigest(),
+        "posted": True,
+        "provider_accepted": True,
+    }
+    real_mark = roster.mark_admitted
+    calls = {"n": 0}
+
+    def _failing_first(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise roster.StableAgentUnavailable("transient roster store failure")
+        return real_mark(*args, **kwargs)
+
+    monkeypatch.setattr(roster, "mark_admitted", _failing_first)
+    expected_digest = hashlib.sha256(b"x").hexdigest()
+    completed = v2.complete_native_admission(
+        reservation_id, admit.delivery_id, operation, expected_digest
+    )
+    assert completed["state"] == "admitted"
+    incarnation = roster.get_incarnation_by_terminal(
+        record["terminal_id"], generation=record["generation"]
+    )
+    assert incarnation["disposition"] == roster.INCARNATION_BOUND
+
+    monkeypatch.setattr(roster, "mark_admitted", real_mark)
+    commits = _commit_spy(monkeypatch)
+    again = v2.complete_native_admission(
+        reservation_id, admit.delivery_id, operation, expected_digest
+    )
+    assert again["state"] == "admitted"
+    assert commits, "the replay-side roster repair must be explicitly committed"
+    incarnation = roster.get_incarnation_by_terminal(
+        record["terminal_id"], generation=record["generation"]
+    )
+    assert incarnation["disposition"] == roster.INCARNATION_ADMITTED
+
+    # A later teardown wins physical lifecycle ownership. Replaying the
+    # exact already-admitted native completion must preserve delivery truth,
+    # must not resend bytes, and must not revive the retired incarnation.
+    roster.retire_incarnation(
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+        reason="teardown after delivery",
+    )
+    retired_replay = v2.complete_native_admission(
+        reservation_id, admit.delivery_id, operation, expected_digest
+    )
+    assert retired_replay["state"] == "admitted"
+    incarnation = roster.get_incarnation_by_terminal(
+        record["terminal_id"], generation=record["generation"]
+    )
+    assert incarnation["disposition"] == roster.INCARNATION_RETIRED
 
 
 def test_bind_unavailable_stays_retryable_not_conflict(

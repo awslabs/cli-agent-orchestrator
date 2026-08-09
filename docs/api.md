@@ -383,6 +383,115 @@ per-item failures and reports how many were removed.
 
 ---
 
+## Stable-Agent Roster (read-only, M3-A / cond-0377)
+
+The roster is the fork-owned durable record of stable CAO agents, their
+harness-native conversation lineages, and their disposable physical
+incarnations.  All roster endpoints are **read-only**: they never mutate
+roster state.  The durable records are written by the launch seams
+(managed-v2 `bind_native`, unmanaged terminal creation, admission
+completion, teardown retirement) and by the native-identity repair seam.
+
+All four routes require at least the **read** authorization scope
+(`cao:read`); write and admin scopes also satisfy them.  Legacy, missing,
+corrupt, or unknown-version rows are reported truthfully and never crash
+a read or audit.
+
+### GET /roster/agents
+
+Every stable agent, oldest first.
+
+**Query parameters:**
+- `session_name` (optional): scope the listing to one CAO session name.
+
+**Response (200):**
+```json
+{
+  "schema": "cao-m3-roster-list-v1",
+  "agents": [
+    {
+      "agent_id": "…", "session_name": "…", "role": "worker",
+      "profile_family": "developer", "disposition": "live",
+      "disposition_known": true,
+      "resume_contract_version": "cao-m3-resume-contract-v1",
+      "current_lineage_id": "…", "current_incarnation_id": "…",
+      "revision": 3, "created_at": "…", "updated_at": "…"
+    }
+  ]
+}
+```
+
+`role` is `supervisor` or `worker`; `disposition` is one of `live`,
+`dormant`, `identity_missing`, `retired` (`disposition_known` is `false`
+for an unrecognized stored value).  An `identity_missing` agent has a
+current lineage with no native session id — truthful, never fabricated,
+and never a blocker for Stop.
+
+### GET /roster/agents/{agent_id}
+
+One stable agent with its full lineage and incarnation history.
+
+**Response (200):**
+```json
+{
+  "schema": "cao-m3-roster-agent-v1",
+  "agent": { "…": "…", "current_lineage": { "…": "…" }, "current_incarnation": { "…": "…" } },
+  "lineages": [ { "lineage_id": "…", "harness": "…", "native_session_id": "…",
+                  "acquisition_method": "…", "route_provenance": { "…": "…" },
+                  "predecessor_lineage_id": "…", "lineage_origin": "…" } ],
+  "incarnations": [ { "incarnation_id": "…", "terminal_id": "…", "generation": "…",
+                      "pane_id": "…", "disposition": "bound|admitted|retired" } ]
+}
+```
+
+**Errors:** an unknown `agent_id` returns **404** with
+`{"detail": "unknown stable agent: …"}`.
+
+### GET /roster/terminals/{terminal_id}
+
+The roster incarnation for one terminal, or an explicit null.
+
+**Query parameters:**
+- `generation` (optional): read exactly that generation's incarnation.
+
+**Semantics:** with `generation`, the exact incarnation for that
+(terminal, generation) pair, or `null`.  Without it, the **unique live**
+incarnation of the terminal id — two live incarnations sharing a
+terminal id (legacy/corrupt state) return **409** ("ambiguous") rather
+than picking an arbitrary historical row.
+
+**Response (200):**
+```json
+{ "schema": "cao-m3-roster-incarnation-v1", "incarnation": { "…": "…" } }
+```
+
+### GET /roster/audit
+
+A truthful, **non-mutating** dry-run audit for later migration and
+status repair.
+
+**Response (200):**
+```json
+{
+  "schema": "cao-m3-roster-audit-v1",
+  "agents_total": 0, "lineages_total": 0, "incarnations_total": 0,
+  "live_count": 0, "dormant_count": 0, "identity_missing_count": 0,
+  "identity_missing_agents": [],
+  "legacy_candidates_count": 0,
+  "legacy_candidates": [ { "terminal_id": "…", "session_name": "…",
+                           "provider": "…", "native_session_id": "…" } ],
+  "problems": [],
+  "problems_count": 0
+}
+```
+
+`legacy_candidates` lists live terminals that already carry a native
+session id but have no roster incarnation yet (migration candidates).
+`problems` reports corrupt provenance JSON, unknown dispositions,
+unknown resume-contract versions, dangling current pointers, and
+agent/incarnation disposition inconsistencies — never fatal.  The audit
+never mutates roster state.
+
 ## Error Responses
 
 All endpoints return standard HTTP status codes:
@@ -391,7 +500,10 @@ All endpoints return standard HTTP status codes:
 - `201 Created`: Resource created
 - `400 Bad Request`: Invalid parameters
 - `404 Not Found`: Resource not found
+- `409 Conflict`: Immutable identity conflict, admission refused, or an
+  ambiguous terminal-only roster lookup
 - `500 Internal Server Error`: Server error
+- `503 Service Unavailable`: The roster/attachment store could not be read
 
 Error response format:
 ```json

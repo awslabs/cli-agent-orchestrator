@@ -1526,6 +1526,12 @@ async def create_terminal(
     # delete against the freshly generated — possibly 32-bit-colliding —
     # terminal ID, destroying an unrelated live terminal's state.)
     session_claim = None
+    # M3-A: whether the unmanaged roster bind committed during this
+    # creation.  If a later step fails, the exact incarnation must be
+    # retired during unwind so a dead terminal is never left live.
+    # Initialized at function scope so every cleanup path (new and
+    # add-to-existing sessions alike) sees it bound.
+    roster_bound = False
     if new_session:
         if not session_name:
             session_name = generate_session_name()
@@ -1850,19 +1856,57 @@ async def create_terminal(
         # terminal before any real task input can be delivered to it.
         # Fail-closed: a roster bind failure unwinds the launch (typed
         # failure, zero task input) instead of returning a successfully
-        # rostered terminal.
+        # rostered terminal.  The standalone synchronous bind runs OFF the
+        # asyncio event loop (``to_thread``) while still being awaited
+        # before any task input or a successful return, so SQLite
+        # contention and retry backoff never stall unrelated requests.
+        #
+        # Cancellation safety (repair-3 P1-1): cancellation does not stop
+        # the worker thread.  On cancellation we shield-await the worker to
+        # a KNOWN outcome before allowing cleanup/lock ownership to end; if
+        # it committed, the cleanup fact is set so the cancellation teardown
+        # retires the exact incarnation.  A late commit can therefore never
+        # cross the teardown boundary.
         if reserved_terminal_id is None:
-            _roster_bind_unmanaged(
-                terminal_id=terminal_id,
-                session_name=session_name,
-                stable_agent_role=stable_agent_role,
-                agent_profile=agent_profile,
-                provider=provider,
-                terminal_generation=terminal_generation,
-                pane_id=identity.get("pane_id"),
-                pane_pid=(int(identity["pane_pid"]) if identity.get("pane_pid") else None),
-                native_status_source=native_status_source,
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    _roster_bind_unmanaged,
+                    terminal_id=terminal_id,
+                    session_name=session_name,
+                    stable_agent_role=stable_agent_role,
+                    agent_profile=agent_profile,
+                    provider=provider,
+                    terminal_generation=terminal_generation,
+                    pane_id=identity.get("pane_id"),
+                    pane_pid=(int(identity["pane_pid"]) if identity.get("pane_pid") else None),
+                    native_status_source=native_status_source,
+                )
             )
+            # The worker is SHIELDED from the very first await: Python
+            # delivers an outer-task cancellation to an awaited task, which
+            # would mark the to_thread future cancelled while the thread
+            # keeps running.  Shield keeps ``worker`` alive so its done()
+            # truthfully reflects the thread's completion.
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # Hold ownership: await the worker to completion (shielded,
+                # tolerating repeated cancellation), then record whether it
+                # committed so the teardown below retires the incarnation.
+                # A late thread commit can never cross this boundary.
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                try:
+                    worker.result()
+                except Exception:
+                    roster_bound = False
+                else:
+                    roster_bound = True
+                raise
+            roster_bound = True
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -2072,8 +2116,14 @@ async def create_terminal(
                 logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
         return terminal
 
-    except Exception as e:
-        # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
+    except (asyncio.CancelledError, Exception) as e:
+        # Cleanup on failure OR cancellation: a cancelled launch is not a
+        # successfully created terminal, so the same resource cleanup runs
+        # (FIFO, status, provider, roster retirement, terminal row).  This
+        # catches CancelledError without broadly swallowing BaseException
+        # (KeyboardInterrupt/SystemExit still propagate) and re-raises
+        # below, preserving normal cancellation semantics and the primary
+        # cancellation/error.
         logger.error(f"Failed to create terminal: {e}")
         # A managed no-task launch deliberately preserves a generation once
         # its durable terminal row exists.  The reservation service records the
@@ -2114,6 +2164,14 @@ async def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
+        # M3-A (i-0003): if the unmanaged roster bind committed before this
+        # failure, retire the exact incarnation BEFORE removing the terminal
+        # row — a dead terminal must never leave a live roster incarnation
+        # that blocks identity reuse and lies to the audit.  Idempotent
+        # (retiring a retired/absent incarnation is a no-op), best-effort,
+        # and preserves the primary exception below.
+        if roster_bound:
+            _roster_retire_incarnation_best_effort(terminal_id, terminal_generation)
         # Roll back the DB terminal row so a failed create does not leave an
         # orphan record: the stale row would still be listed for the session
         # and report UNKNOWN status even though nothing is running. Idempotent

@@ -33,6 +33,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.stable_agent_roster import ROLE_SUPERVISOR
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
 from cli_agent_orchestrator.utils.template import render_template
 
@@ -264,6 +265,11 @@ async def execute_flow(name: str) -> bool:
             provider=flow.provider,
             agent_profile=flow.agent_profile,
             new_session=True,
+            # M3-A / cond-0377 (i-0027): the flow's first terminal IS its
+            # conductor; pass the supervisor role explicitly so the roster
+            # persists the correct immutable role.  Role is launch truth,
+            # never a profile-name heuristic.
+            stable_agent_role=ROLE_SUPERVISOR,
         )
 
         # Send rendered prompt to terminal

@@ -4,7 +4,7 @@ import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -861,3 +861,95 @@ class TestGetFlowsToRun:
         result = get_flows_to_run()
 
         assert result == []
+
+
+class TestExecuteFlowRosterRole:
+    """M3-A / cond-0377 (i-0027): the flow conductor is created with the
+    supervisor role, so the roster persists the correct immutable role."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.render_template")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service._get_next_run_time")
+    @patch("cli_agent_orchestrator.services.flow_service._parse_flow_file")
+    @patch("cli_agent_orchestrator.services.flow_service.get_flow")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_flow_conductor_is_rostered_as_supervisor(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_get_flow,
+        mock_parse,
+        mock_next_run,
+        mock_update_times,
+        mock_render,
+        mock_list_terminals,
+        mock_send_input,
+        isolated_memory_db,
+        monkeypatch,
+    ):
+        """The flow's first terminal IS its conductor; the roster must
+        persist it with the supervisor role."""
+        from cli_agent_orchestrator.services import stable_agent_roster as roster
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        mock_get_flow.return_value = Flow(
+            name="my-flow",
+            file_path="/tmp/flow.yaml",
+            schedule="* * * * *",
+            agent_profile="developer",
+            provider="claude_code",
+            script="",
+        )
+        mock_parse.return_value = ("", "{{ value }}")
+        mock_next_run.return_value = datetime(2026, 8, 9, 12, 0)
+        mock_render.return_value = "rendered prompt"
+        mock_list_terminals.return_value = []
+        mock_send_input.return_value = True
+
+        mock_gen_id.return_value = "fl0wc001"
+        mock_gen_session.return_value = "cao-flow-my-flow"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_tmux.window_identity.return_value = {
+            "pane_id": "%66",
+            "window_id": "w66",
+            "server_socket_path": "/tmp/cao-flow.sock",
+            "session_id": "1",
+            "pane_pid": 4322,
+        }
+        mock_load_profile.return_value = MagicMock()
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda terminal_id: {"provider": "claude_code"}
+        )
+
+        result = await execute_flow("my-flow")
+        assert result is True
+
+        agents = roster.list_agents(session_name="cao-flow-my-flow")
+        assert len(agents) == 1
+        assert agents[0]["role"] == roster.ROLE_SUPERVISOR
+        assert agents[0]["profile_family"] == "developer"

@@ -1176,3 +1176,86 @@ def test_repair_race_same_harness_native_id_is_typed_and_converges(
     winner = results[0]
     assert winner["lineage"]["native_session_id"] == native_id
     assert winner["lineage"]["lineage_origin"] == roster.LINEAGE_ORIGIN_REPAIR
+
+
+# ---------------------------------------------------------------------------
+# PR #91 review: i-0025 repair refuses a retired incarnation
+# ---------------------------------------------------------------------------
+
+
+def test_repair_refuses_retired_incarnation(isolated_memory_db):
+    """Native-identity repair must refuse an exact incarnation that is
+    already retired, transactionally: a repair/teardown race must not
+    revive a dead terminal or persist a live agent with no live
+    incarnation."""
+    terminal_id = "b2c3d4e5"
+    generation = "00000000-0000-4000-8000-0000000000c1"
+    bound = roster.bind_generation(
+        _supervisor_contract(
+            terminal_id=terminal_id,
+            generation=generation,
+        )
+    )
+    agent_id = bound["agent"]["agent_id"]
+    lineage_id = bound["lineage"]["lineage_id"]
+
+    roster.retire_incarnation(terminal_id=terminal_id, generation=generation, reason="done")
+    with pytest.raises(roster.StableAgentConflict, match="retired"):
+        roster.record_native_identity(
+            terminal_id=terminal_id,
+            generation=generation,
+            native_session_id="11111111-2222-4333-8444-5555555555cc",
+            harness="claude_code",
+        )
+
+    agent = roster.get_agent(agent_id)
+    assert agent["disposition"] == roster.DISPOSITION_DORMANT
+    assert agent["current_incarnation"]["disposition"] == roster.INCARNATION_RETIRED
+    # The lineage was untouched by the refused repair.
+    assert roster.list_lineages(agent_id=agent_id)[0]["lineage_id"] == lineage_id
+    assert roster.list_lineages(agent_id=agent_id)[0]["native_session_id"] is None
+
+
+def test_audit_flags_live_agent_with_retired_current_incarnation(isolated_memory_db):
+    """The audit validates agent/incarnation disposition consistency: a
+    LIVE agent whose current incarnation is retired is reported as a
+    problem, and a DORMANT agent with a live current incarnation too."""
+    from cli_agent_orchestrator.clients import database
+
+    stamp = _rfc3339(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    agent_id = "00000000-0000-4000-8000-0000000000c2"
+    with database.SessionLocal() as db:
+        db.add(
+            database.StableAgentModel(
+                agent_id=agent_id,
+                session_name="cao-odd",
+                role=roster.ROLE_WORKER,
+                profile_family="developer",
+                disposition=roster.DISPOSITION_LIVE,
+                resume_contract_version=roster.RESUME_CONTRACT_VERSION,
+                current_incarnation_id="00000000-0000-4000-8000-0000000000c3",
+                revision=1,
+                created_at=stamp,
+                updated_at=stamp,
+            )
+        )
+        db.add(
+            database.StableAgentIncarnationModel(
+                incarnation_id="00000000-0000-4000-8000-0000000000c3",
+                agent_id=agent_id,
+                lineage_id=None,
+                terminal_id="a1b2c3d4",
+                generation="00000000-0000-4000-8000-0000000000c4",
+                disposition=roster.INCARNATION_RETIRED,
+                retired_at=stamp,
+                retirement_reason="done",
+                created_at=stamp,
+                updated_at=stamp,
+            )
+        )
+        db.commit()
+
+    audit = roster.audit_dry_run()
+    assert any(
+        p["kind"] == "live-agent-with-retired-current-incarnation" for p in audit["problems"]
+    )
