@@ -1194,6 +1194,7 @@ class TestBoundedWriteDeadline:
                 raise subprocess.TimeoutExpired(cmd=["tmux", "send-keys"], timeout=remaining)
 
         client = DeadlineAwareBlockingTmux()
+        production_deadline = service.WRITE_DEADLINE_SECONDS
         monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.05)
         started = time.monotonic()
         result = self._deliver_with(monkeypatch, journal, client)
@@ -1209,6 +1210,11 @@ class TestBoundedWriteDeadline:
         assert journal.get(CONTROL).state == service.STATE_AMBIGUOUS
         assert client.write_calls == 1
 
+        # The artificial 50 ms deadline only establishes the bounded-write
+        # classification above. Restore the ordinary deadline before this
+        # separate probe, whose contract is lease release rather than CI
+        # scheduling latency for an otherwise healthy write.
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", production_deadline)
         # The request returned only after the inline write stopped, so the
         # lease is free and no detached worker can produce a late byte.
         healthy = FakeTmux()
