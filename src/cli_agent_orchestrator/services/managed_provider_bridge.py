@@ -2256,7 +2256,12 @@ class _ProviderSession:
                 self._scan_companion_events()
                 self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
         except generation_fence.FencedError as exc:
-            raise BridgeError(f"w13-fenced-before-provider-io: {exc}") from exc
+            prefix = (
+                "successor-fenced-before-provider-io"
+                if "no longer current" in str(exc)
+                else "w13-fenced-before-provider-io"
+            )
+            raise BridgeError(f"{prefix}: {exc}") from exc
         except heartbeat_store.FencingRefused as exc:
             raise BridgeError(f"successor-fenced-before-provider-io: {exc}") from exc
         receipt_id = provider_turn_id
@@ -2852,6 +2857,19 @@ class _ProviderSession:
                     name=f"cao-compact-{operation_id}",
                 ).start()
             except Exception as exc:
+                # Unlike an RPC failure after ``start_request``, a fence is
+                # proven before any provider byte/request exists.  Preserve
+                # that absorbing fact instead of misleading reconciliation
+                # with an ambiguous compact submission.
+                from cli_agent_orchestrator.services import generation_fence
+
+                if isinstance(exc, generation_fence.FencedError):
+                    return self._refuse_control(
+                        journal,
+                        operation_id,
+                        "generation_fenced",
+                        str(exc),
+                    )
                 return self._control_receipt(
                     journal.transition(
                         operation_id,
@@ -2873,18 +2891,35 @@ class _ProviderSession:
                 )
             journal.transition(operation_id, CONTROL_SUBMITTED)
             try:
-                turn_id, kind, evidence = self._submit_provider_turn(
-                    message,
-                    client_message_id=operation_id,
-                    meta={
-                        "caoSessionOperationId": operation_id,
-                        "caoGeneration": self.request["generation"],
-                        "caoMessageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
-                    },
-                )
-            except SessionOperationRefused as exc:
-                return self._refuse_control(journal, operation_id, exc.code, exc.detail)
+                # Follow-up is provider input (including /terminals/{id}/input),
+                # so it owns the exact same fence critical section as task
+                # admission. Cancel and route-set are deliberately outside:
+                # they are non-byte control/cleanup operations.
+                with self._admission_critical_section():
+                    turn_id, kind, evidence = self._submit_provider_turn(
+                        message,
+                        client_message_id=operation_id,
+                        meta={
+                            "caoSessionOperationId": operation_id,
+                            "caoGeneration": self.request["generation"],
+                            "caoMessageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                        },
+                    )
             except Exception as exc:
+                # A permanent generation fence is known before provider I/O.
+                # It must not be journaled as an ambiguous prompt outcome: a
+                # retry belongs to a successor generation, never this one.
+                from cli_agent_orchestrator.services import generation_fence
+
+                if isinstance(exc, generation_fence.FencedError):
+                    return self._refuse_control(
+                        journal,
+                        operation_id,
+                        "generation_fenced",
+                        str(exc),
+                    )
+                if isinstance(exc, SessionOperationRefused):
+                    return self._refuse_control(journal, operation_id, exc.code, exc.detail)
                 return self._control_receipt(
                     journal.transition(
                         operation_id,
@@ -2953,13 +2988,18 @@ class _ProviderSession:
                 }
                 if {key: binding.get(key) for key in expected_binding} != expected_binding:
                     raise BridgeError("provider admission generation/session binding changed")
-                heartbeat_store.assert_current_fencing_binding(
-                    COMPANION_DIR,
-                    terminal_id=terminal_id,
-                    generation=generation,
-                    attempt_id=str(self.request.get("attempt_id") or ""),
-                    fencing_token_id=str(binding.get("fencing_token_id") or ""),
-                )
+                try:
+                    heartbeat_store.assert_current_fencing_binding(
+                        COMPANION_DIR,
+                        terminal_id=terminal_id,
+                        generation=generation,
+                        attempt_id=str(self.request.get("attempt_id") or ""),
+                        fencing_token_id=str(binding.get("fencing_token_id") or ""),
+                    )
+                except heartbeat_store.FencingRefused as exc:
+                    raise generation_fence.FencedError(
+                        f"managed generation binding is no longer current: {exc}"
+                    ) from exc
             with generation_fence.admission_critical_section(
                 COMPANION_DIR, terminal_id, generation
             ):
@@ -4238,13 +4278,7 @@ def _serve(
                             )
                         elif operation["state"] == CONTROL_QUEUED:
                             try:
-                                if action == "compact":
-                                    receipt = session.session_operation(command, control_journal)
-                                else:
-                                    with session._admission_critical_section():
-                                        receipt = session.session_operation(
-                                            command, control_journal
-                                        )
+                                receipt = session.session_operation(command, control_journal)
                             except Exception as exc:  # noqa: BLE001 - journal exact outcome
                                 current = control_journal.get(operation_id)
                                 if current["state"] == CONTROL_QUEUED:

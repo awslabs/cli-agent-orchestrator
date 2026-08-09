@@ -73,6 +73,10 @@ class _NativeManagedSendRefused(RuntimeError):
     the claimed rows to PENDING cannot duplicate a provider effect.
     """
 
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(f"sender run refused ({reason_code}); zero bytes reached the pane")
+
 
 class _NativeManagedSendUndeliverable(RuntimeError):
     """A native-TUI managed send ended without a delivery proof and without a
@@ -698,6 +702,62 @@ class InboxService:
         if not messages:
             return
 
+        # M3 is exact-generation authority. A queued row that names an old
+        # managed generation is never allowed to drift onto a successor or sit
+        # PENDING for an infinite retry loop. Terminalize it before selecting
+        # any bridge/pane path; post-claim ambiguity remains non-replayable in
+        # the existing durable operation records.
+        if managed_identity is not None:
+            from cli_agent_orchestrator.constants import COMPANION_DIR
+            from cli_agent_orchestrator.services import generation_fence
+
+            generation = managed_identity.get("generation")
+            if (
+                isinstance(generation, str)
+                and generation_fence.installed_receipt(COMPANION_DIR, terminal_id, generation)
+                is not None
+            ):
+                for message in messages:
+                    update_message_status(message.id, MessageStatus.FAILED)
+                logger.info(
+                    "Terminalized %d queued inbox row(s) for parked generation %s/%s",
+                    len(messages),
+                    terminal_id,
+                    generation,
+                )
+                return
+            if isinstance(generation, str):
+                exact_messages = []
+                for message in messages:
+                    expected = message.expected_receiver_generation
+                    if expected is None and managed_identity.get("vintage") == "v2":
+                        # Pre-M3 generic rows were not bound to the receiver
+                        # generation. Never let a crash between park receipt
+                        # publication and eager DB cleanup retarget one onto a
+                        # successor; it is visible terminal history, not work
+                        # a current provider is entitled to receive.
+                        update_message_status(message.id, MessageStatus.FAILED)
+                        logger.info(
+                            "Terminalized pre-M3 generationless inbox row %s for managed %s/%s",
+                            message.id,
+                            terminal_id,
+                            generation,
+                        )
+                    elif expected is not None and expected != generation:
+                        update_message_status(message.id, MessageStatus.FAILED)
+                        logger.info(
+                            "Terminalized old-generation inbox row %s for %s: expected %s, live %s",
+                            message.id,
+                            terminal_id,
+                            expected,
+                            generation,
+                        )
+                    else:
+                        exact_messages.append(message)
+                messages = exact_messages
+                if not messages:
+                    return
+
         # P1-7 (final conformance §20.2f): for a receiver with a live managed
         # provider session, deliver each exact message through its provider
         # bridge — the provider's own model-turn acceptance is recorded as the
@@ -1019,15 +1079,19 @@ class InboxService:
             except _NativeManagedSendRefused as e:
                 for preparation in preparations:
                     self._abort_wake_confirmation(preparation)
-                # The typed refusal proves zero bytes reached the pane, so
-                # resetting the exact rows cannot duplicate a provider effect:
-                # the inbox row's atomic claim remains the at-most-once
-                # anchor, and a later cycle re-attempts the same payload.
+                # A permanent generation fence is an absorbing refusal, not
+                # a transient no-byte condition. All other pre-write
+                # refusals retain the existing retry behavior.
+                terminal = (
+                    MessageStatus.FAILED
+                    if e.reason_code == "generation-fenced"
+                    else MessageStatus.PENDING
+                )
                 for message in batch:
-                    update_message_status(message.id, MessageStatus.PENDING)
+                    update_message_status(message.id, terminal)
                 logger.info(
                     f"Native managed send for terminal {terminal_id} refused with "
-                    f"zero bytes proven; leaving {len(batch)} message(s) pending: {e}"
+                    f"zero bytes proven; set {len(batch)} message(s) to {terminal.value}: {e}"
                 )
             except TerminalInputRefusedError as e:
                 for preparation in preparations:
@@ -1117,9 +1181,7 @@ class InboxService:
         if result.outcome == ACCEPTED:
             return
         if result.outcome == REFUSED:
-            raise _NativeManagedSendRefused(
-                f"sender run refused ({result.reason_code}); zero bytes reached the pane"
-            )
+            raise _NativeManagedSendRefused(result.reason_code)
         raise _NativeManagedSendUndeliverable(
             f"sender run ended {result.outcome!r} "
             f"({result.reason_code}); not reattempted blindly"

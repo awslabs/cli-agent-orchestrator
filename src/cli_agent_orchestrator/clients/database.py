@@ -3257,19 +3257,38 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         ValueError: If the receiver terminal does not exist, is not a live
             managed-v2 identity, or is ambiguous across protocol vintages.
     """
-    with SessionLocal() as db:
-        if not _inbox_receiver_eligible(db, receiver_id):
-            raise ValueError(f"Terminal '{receiver_id}' not found")
-        inbox_msg = InboxModel(
-            sender_id=sender_id,
-            receiver_id=receiver_id,
-            message=message,
-            status=MessageStatus.PENDING.value,
-        )
-        db.add(inbox_msg)
-        db.commit()
-        db.refresh(inbox_msg)
-        return _inbox_message_from_row(inbox_msg)
+    # A generic inbox row must not be an unbound future delivery for a managed
+    # terminal.  Serialize generation observation with successor issuance and
+    # store the exact live generation in the same transaction as the row.
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services import heartbeat_store
+
+    with heartbeat_store.successor_critical_section(COMPANION_DIR, receiver_id):
+        with SessionLocal() as db:
+            if not _inbox_receiver_eligible(db, receiver_id):
+                raise ValueError(f"Terminal '{receiver_id}' not found")
+            v2 = (
+                db.query(ManagedLaunchV2TerminalModel)
+                .filter(
+                    ManagedLaunchV2TerminalModel.id == receiver_id,
+                    *_live_managed_v2_terminal_clauses(),
+                )
+                .first()
+            )
+            expected_generation = None
+            if v2 is not None:
+                expected_generation = str(v2.generation)
+            inbox_msg = InboxModel(
+                sender_id=sender_id,
+                receiver_id=receiver_id,
+                message=message,
+                status=MessageStatus.PENDING.value,
+                expected_receiver_generation=expected_generation,
+            )
+            db.add(inbox_msg)
+            db.commit()
+            db.refresh(inbox_msg)
+            return _inbox_message_from_row(inbox_msg)
 
 
 def _inbox_message_from_row(row: Any) -> InboxMessage:

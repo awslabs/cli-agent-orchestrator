@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import subprocess
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -843,7 +844,7 @@ def test_emit_beat_retains_producer_and_rehydrates_across_sessions(tmp_path, mon
 
     monkeypatch.setattr(hb, "COALESCE_SECONDS", 0)  # every beat writes
     session, companion, request = _v2_session(tmp_path, monkeypatch)
-    _bound_generation(companion, request)
+    token = _bound_generation(companion, request)
     session._emit_beat("turn-1", "codex-turn-start:turn-1")
     first_producer = session._heartbeat_producer
     assert first_producer is not None
@@ -1005,6 +1006,183 @@ def test_successor_fencing_cannot_interleave_with_provider_io(tmp_path, monkeypa
     with pytest.raises(bridge.BridgeError, match="successor-fenced-before-provider-io"):
         session.admit(admission)
     assert submitted == [admission["message"]]
+
+
+def test_parked_follow_up_is_journaled_as_generation_fenced_without_provider_call(
+    tmp_path, monkeypatch
+):
+    """A /terminals/{id}/input follow-up is a byte lane, never ambiguous."""
+    from cli_agent_orchestrator.services import generation_fence as gf
+
+    session, companion, request = _v2_session(tmp_path, monkeypatch)
+    token = _bound_generation(companion, request)
+    session._config_options = []
+    journal = bridge.SessionControlJournal(tmp_path / "session-control.sqlite")
+    operation_id = "55555555-5555-4555-8555-555555555555"
+    command = {
+        "operation_id": operation_id,
+        "action": "follow-up",
+        "reservation_id": request["reservation_id"],
+        "terminal_id": request["terminal_id"],
+        "generation": request["generation"],
+        "message": "do not send",
+    }
+    journal.begin(
+        operation_id=operation_id,
+        terminal_id=request["terminal_id"],
+        generation=request["generation"],
+        action="follow-up",
+        request_sha256="d" * 64,
+        provider=request["provider"],
+        provider_session_id=session.provider_session_id,
+    )
+    calls = []
+    session._submit_provider_turn = lambda *a, **kw: calls.append((a, kw))
+    gf.install_fence(
+        companion,
+        terminal_id=request["terminal_id"],
+        generation=request["generation"],
+        vintage="v2",
+        fencing_token_id=token.id,
+        request={
+            "schema": gf.FENCE_REQUEST_SCHEMA,
+            "terminal_generation": request["generation"],
+            "obligation_generation": request["obligation_generation"],
+            "attempt_id": request["attempt_id"],
+            "intent_id": str(uuid.uuid4()),
+            "report_sha256": "a" * 64,
+        },
+    )
+
+    receipt = session.session_operation(command, journal)
+
+    assert receipt["state"] == "refused"
+    assert receipt["reason_code"] == "generation_fenced"
+    assert calls == []
+
+
+def test_stale_follow_up_token_is_typed_generation_fenced_without_provider_call(
+    tmp_path, monkeypatch
+):
+    """Successor drift uses the same typed follow-up boundary as a park."""
+    from cli_agent_orchestrator.services import heartbeat_store
+
+    session, companion, request = _v2_session(tmp_path, monkeypatch)
+    _bound_generation(companion, request)
+    heartbeat_store.issue_fencing_token(
+        companion, request["terminal_id"], "successor-generation", "attempt-2"
+    )
+    session._config_options = []
+    journal = bridge.SessionControlJournal(tmp_path / "stale-session-control.sqlite")
+    operation_id = "66666666-6666-4666-8666-666666666666"
+    command = {
+        "operation_id": operation_id,
+        "action": "follow-up",
+        "reservation_id": request["reservation_id"],
+        "terminal_id": request["terminal_id"],
+        "generation": request["generation"],
+        "message": "stale follow-up",
+    }
+    journal.begin(
+        operation_id=operation_id,
+        terminal_id=request["terminal_id"],
+        generation=request["generation"],
+        action="follow-up",
+        request_sha256="e" * 64,
+        provider=request["provider"],
+        provider_session_id=session.provider_session_id,
+    )
+    calls = []
+    session._submit_provider_turn = lambda *a, **kw: calls.append((a, kw))
+
+    receipt = session.session_operation(command, journal)
+
+    assert receipt["state"] == "refused"
+    assert receipt["reason_code"] == "generation_fenced"
+    assert calls == []
+
+
+def test_parked_compact_is_typed_generation_fenced_before_start_request(tmp_path, monkeypatch):
+    """Compact is provider input, so a park refuses it before ACP submission."""
+    import threading
+
+    from cli_agent_orchestrator.services import generation_fence as gf
+
+    session, companion, request = _v2_session(tmp_path, monkeypatch)
+    request["provider"] = "kimi_cli"
+    session.provider = "kimi_cli"
+    token = _bound_generation(companion, request)
+
+    class Rpc:
+        def __init__(self):
+            self.calls = []
+
+        def notifications_since(self, _index):
+            return (
+                [
+                    {
+                        "method": "session/update",
+                        "params": {
+                            "update": {
+                                "sessionUpdate": "available_commands_update",
+                                "availableCommands": [{"name": "compact"}],
+                            }
+                        },
+                    }
+                ],
+                1,
+            )
+
+        def notification_count(self):
+            return 1
+
+        def start_request(self, method, params):
+            self.calls.append((method, params))
+            return "must-not-start"
+
+    rpc = Rpc()
+    session.rpc = rpc
+    session._active_prompt_lock = threading.Lock()
+    session._active_prompt_request_id = None
+    journal = bridge.SessionControlJournal(tmp_path / "compact-session-control.sqlite")
+    operation_id = "77777777-7777-4777-8777-777777777777"
+    command = {
+        "operation_id": operation_id,
+        "action": "compact",
+        "reservation_id": request["reservation_id"],
+        "terminal_id": request["terminal_id"],
+        "generation": request["generation"],
+    }
+    journal.begin(
+        operation_id=operation_id,
+        terminal_id=request["terminal_id"],
+        generation=request["generation"],
+        action="compact",
+        request_sha256="f" * 64,
+        provider=request["provider"],
+        provider_session_id=session.provider_session_id,
+    )
+    gf.install_fence(
+        companion,
+        terminal_id=request["terminal_id"],
+        generation=request["generation"],
+        vintage="v2",
+        fencing_token_id=token.id,
+        request={
+            "schema": gf.FENCE_REQUEST_SCHEMA,
+            "terminal_generation": request["generation"],
+            "obligation_generation": request["obligation_generation"],
+            "attempt_id": request["attempt_id"],
+            "intent_id": str(uuid.uuid4()),
+            "report_sha256": "a" * 64,
+        },
+    )
+
+    receipt = session.session_operation(command, journal)
+
+    assert receipt["state"] == "refused"
+    assert receipt["reason_code"] == "generation_fenced"
+    assert rpc.calls == []
 
 
 def test_actor_broker_built_for_generation_private_uds(tmp_path, monkeypatch):

@@ -36,7 +36,8 @@ import fcntl
 import hashlib
 import json
 import os
-from contextlib import contextmanager
+import threading
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -53,6 +54,13 @@ FENCE_RESPONSE_SCHEMA = "cao-w13-fence-resp-v1"
 FENCE_RECEIPT_SCHEMA = "cao-w13-fence-receipt-v1"
 FENCE_STATE_SCHEMA = "cao-w13-fence-state-v1"
 SEAL_INTENT_SCHEMA = "cao-w13-seal-intent-v1"
+
+# M3 uses the same per-generation state file and, critically, the same lock
+# as W13.  A parked generation is an absorbing provider-byte fence, not a
+# second, merely advisory, lifecycle marker.
+PARK_REQUEST_SCHEMA = "cao-m3-park-req-v1"
+PARK_RESPONSE_SCHEMA = "cao-m3-park-resp-v1"
+PARK_RECEIPT_SCHEMA = "cao-m3-park-receipt-v1"
 
 OUTCOME_FENCED = "fenced"
 OUTCOME_ALREADY_FENCED = "already-fenced"
@@ -79,6 +87,10 @@ class FenceRequestError(FenceError):
 
 class FencedError(FenceError):
     """Input/tool admission was attempted against a sealed generation."""
+
+
+class ParkRequestError(FenceRequestError):
+    """An M3 park operation is malformed or conflicts with its receipt."""
 
 
 def _rfc3339_now() -> str:
@@ -177,6 +189,21 @@ def _read_state(path: Path) -> Optional[dict[str, Any]]:
     return parsed
 
 
+def _state_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_state(path: Path, state: dict[str, Any], *, old_digest: str | object) -> None:
+    try:
+        publish_mutable(
+            path,
+            json.dumps(state, sort_keys=True).encode() + b"\n",
+            expected_old_sha256=old_digest,  # type: ignore[arg-type]
+        )
+    except PublicationError as exc:
+        raise FenceError(str(exc)) from exc
+
+
 def install_fence(
     companion_dir: Path,
     *,
@@ -198,9 +225,6 @@ def install_fence(
         return _response(OUTCOME_UNKNOWN_GENERATION, None)
     if vintage != "v2":
         return _response(OUTCOME_VINTAGE_MISMATCH, None)
-    if superseded:
-        return _response(OUTCOME_SUPERSEDED, None)
-
     directory = Path(companion_dir) / terminal_id / generation
     with _generation_lock(directory):
         path = fence_state_path(companion_dir, terminal_id, generation)
@@ -217,6 +241,12 @@ def install_fence(
                 "a fence is already installed for this generation under a "
                 "different intent or identity; intent_id is single-use"
             )
+        # Idempotency is deliberately evaluated before current-generation
+        # status. A response-lost retry remains entitled to its stored receipt
+        # even if a successor has since issued a new fencing token. Only a new
+        # intent for that old generation is superseded.
+        if superseded:
+            return _response(OUTCOME_SUPERSEDED, None)
         receipt = {
             "schema": FENCE_RECEIPT_SCHEMA,
             "intent_id": request["intent_id"],
@@ -230,15 +260,181 @@ def install_fence(
             "receipt": receipt,
             "updated_seq": 1,
         }
-        try:
-            publish_mutable(
-                path,
-                json.dumps(new_state, sort_keys=True).encode() + b"\n",
-                expected_old_sha256=ABSENT,
-            )
-        except PublicationError as exc:
-            raise FenceError(str(exc)) from exc
+        _write_state(path, new_state, old_digest=ABSENT)
         return _response(OUTCOME_FENCED, receipt)
+
+
+_PARK_FIELDS = (
+    "operation_id",
+    "reservation_id",
+    "terminal_id",
+    "terminal_generation",
+    "logical_task_id",
+    "retained_round",
+    "obligation_generation",
+    "attempt_id",
+    "report_sha256",
+)
+
+
+def _validate_park_request(request: dict[str, Any]) -> None:
+    if request.get("schema") != PARK_REQUEST_SCHEMA:
+        raise ParkRequestError(f"park request schema must be {PARK_REQUEST_SCHEMA}")
+    for field in _PARK_FIELDS:
+        value = request.get(field)
+        if field == "retained_round":
+            if not isinstance(value, int) or value < 0:
+                raise ParkRequestError("park request retained_round must be a non-negative integer")
+        elif not isinstance(value, str) or not value:
+            raise ParkRequestError(f"park request missing field: {field}")
+    digest = request["report_sha256"]
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ParkRequestError("park request report_sha256 must be 64 lowercase hex")
+
+
+def park_receipt_digest(receipt: dict[str, Any]) -> str:
+    """Digest a complete M3 receipt by canonical bytes, independent of JSON order."""
+    fence = receipt.get("fence_receipt") or {}
+    ordered_fence = {field: fence.get(field) for field in RECEIPT_FIELD_ORDER}
+    ordered = {
+        field: (ordered_fence if field == "fence_receipt" else receipt.get(field))
+        for field in (
+            "schema",
+            "operation_id",
+            "reservation_id",
+            "terminal_id",
+            "terminal_generation",
+            "logical_task_id",
+            "retained_round",
+            "obligation_generation",
+            "attempt_id",
+            "report_sha256",
+            "fence_receipt",
+            "fence_receipt_sha256",
+            "installed_at",
+        )
+    }
+    return hashlib.sha256(encode_canonical(ordered)).hexdigest()
+
+
+def _park_response(outcome: str, receipt: Optional[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema": PARK_RESPONSE_SCHEMA,
+        "outcome": outcome,
+        "park_receipt": receipt,
+        "park_receipt_sha256": park_receipt_digest(receipt) if receipt else None,
+    }
+
+
+def install_park(
+    companion_dir: Path,
+    *,
+    request: dict[str, Any],
+    fencing_token_id: str,
+    superseded: bool = False,
+) -> dict[str, Any]:
+    """Persist and install one immutable/adoptable M3 park receipt.
+
+    The caller has already re-proven the reservation row.  This function owns
+    the durable operation state and the provider-byte linearization point.
+    A compatible pre-existing W13 fence is adopted rather than cleared or
+    replaced; a later retry reads this exact receipt even after succession.
+    """
+    _validate_park_request(request)
+    terminal_id = request["terminal_id"]
+    generation = request["terminal_generation"]
+    directory = Path(companion_dir) / terminal_id / generation
+    with _generation_lock(directory):
+        path = fence_state_path(companion_dir, terminal_id, generation)
+        state = _read_state(path)
+        old_digest: str | object = _state_digest(path) if state is not None else ABSENT
+        existing_park = (state or {}).get("park")
+        if existing_park is not None:
+            stored_request = existing_park.get("request") or {}
+            if all(stored_request.get(field) == request[field] for field in _PARK_FIELDS):
+                return _park_response(OUTCOME_ALREADY_FENCED, existing_park["receipt"])
+            raise ParkRequestError(
+                "park operation already exists with a different immutable intent"
+            )
+
+        # There may already be a W13 seal. It is compatible only when it
+        # fenced this exact generation/obligation/attempt/report; M3 adopts
+        # its token and digest, never writes a second fence.
+        if state is not None:
+            stored = state.get("request") or {}
+            compatible = all(
+                stored.get(field) == request[field]
+                for field in (
+                    "terminal_generation",
+                    "obligation_generation",
+                    "attempt_id",
+                    "report_sha256",
+                )
+            )
+            if not compatible:
+                raise ParkRequestError("existing W13 fence is incompatible with this park intent")
+            fence_receipt = state["receipt"]
+        else:
+            if superseded:
+                return _park_response(OUTCOME_SUPERSEDED, None)
+            fence_receipt = {
+                "schema": FENCE_RECEIPT_SCHEMA,
+                "intent_id": request["operation_id"],
+                "terminal_generation": generation,
+                "fencing_token_id": fencing_token_id,
+                "installed_at": _rfc3339_now(),
+            }
+            state = {
+                "schema": FENCE_STATE_SCHEMA,
+                "request": {
+                    "terminal_generation": generation,
+                    "obligation_generation": request["obligation_generation"],
+                    "attempt_id": request["attempt_id"],
+                    "intent_id": request["operation_id"],
+                    "report_sha256": request["report_sha256"],
+                },
+                "receipt": fence_receipt,
+                "updated_seq": 0,
+            }
+        receipt = {
+            "schema": PARK_RECEIPT_SCHEMA,
+            "operation_id": request["operation_id"],
+            "reservation_id": request["reservation_id"],
+            "terminal_id": terminal_id,
+            "terminal_generation": generation,
+            "logical_task_id": request["logical_task_id"],
+            "retained_round": request["retained_round"],
+            "obligation_generation": request["obligation_generation"],
+            "attempt_id": request["attempt_id"],
+            "report_sha256": request["report_sha256"],
+            "fence_receipt": fence_receipt,
+            "fence_receipt_sha256": receipt_digest(fence_receipt),
+            "installed_at": _rfc3339_now(),
+        }
+        state = dict(state)
+        state["park"] = {
+            "request": {field: request[field] for field in _PARK_FIELDS},
+            "receipt": receipt,
+        }
+        state["updated_seq"] = int(state.get("updated_seq") or 0) + 1
+        _write_state(path, state, old_digest=old_digest)
+        return _park_response(OUTCOME_FENCED, receipt)
+
+
+def query_park(
+    companion_dir: Path, *, terminal_id: str, generation: str, operation_id: str
+) -> dict[str, Any]:
+    """Read-only exact-operation reconciliation after response loss/restart."""
+    if not isinstance(operation_id, str) or not operation_id:
+        raise ParkRequestError("park operation_id must be a non-empty string")
+    state = _read_state(fence_state_path(companion_dir, terminal_id, generation))
+    park = (state or {}).get("park")
+    if park is None:
+        return _park_response("not-found", None)
+    receipt = park.get("receipt")
+    if not isinstance(receipt, dict) or receipt.get("operation_id") != operation_id:
+        return _park_response("not-found", None)
+    return _park_response(OUTCOME_ALREADY_FENCED, receipt)
 
 
 def installed_receipt(
@@ -300,6 +496,128 @@ def admission_critical_section(
     with _generation_lock(directory):
         assert_admission_open(companion_dir, terminal_id, generation)
         yield
+
+
+@contextmanager
+def managed_admission_critical_section(
+    companion_dir: Path,
+    terminal_id: str,
+    generation: str,
+    *,
+    attempt_id: str,
+    fencing_token_id: str,
+) -> Iterator[None]:
+    """Canonical managed-byte lock order: successor → generation → effect.
+
+    The successor registry decides which exact producer generation is current,
+    so a managed writer must hold it while it revalidates the binding and then
+    retain it through the generation fence and provider I/O.  This prevents a
+    successor token issuance from racing a native admission after its last
+    readiness check but before its first provider byte.
+    """
+    from cli_agent_orchestrator.services import heartbeat_store
+
+    with heartbeat_store.successor_critical_section(companion_dir, terminal_id):
+        try:
+            heartbeat_store.assert_current_fencing_binding(
+                companion_dir,
+                terminal_id=terminal_id,
+                generation=generation,
+                attempt_id=attempt_id,
+                fencing_token_id=fencing_token_id,
+            )
+        except heartbeat_store.FencingRefused as exc:
+            # Every byte lane consumes the fence module's typed refusal. Do
+            # not let a successor/token race escape as an implementation
+            # error after the caller has already durably claimed an intent.
+            raise FencedError(f"managed generation binding is no longer current: {exc}") from exc
+        with admission_critical_section(companion_dir, terminal_id, generation):
+            yield
+
+
+class _AsyncAcquireHandoff:
+    """Exactly-once ownership transfer for a blocking context-manager enter."""
+
+    __slots__ = ("abandoned", "entered", "lock")
+
+    def __init__(self) -> None:
+        self.abandoned = False
+        self.entered = False
+        self.lock = threading.Lock()
+
+
+def _enter_or_abandon(manager: Any, handoff: _AsyncAcquireHandoff) -> None:
+    """Run blocking enter off-loop; release if cancellation abandoned it."""
+    manager.__enter__()
+    release = False
+    with handoff.lock:
+        if handoff.abandoned:
+            release = True
+        else:
+            handoff.entered = True
+    if release:
+        manager.__exit__(None, None, None)
+
+
+async def _async_exit(manager: Any) -> None:
+    import asyncio
+
+    try:
+        await asyncio.shield(asyncio.to_thread(manager.__exit__, None, None, None))
+    except asyncio.CancelledError:
+        # The worker still owns and completes release; preserve the caller's
+        # cancellation after the context manager has been scheduled to close.
+        pass
+
+
+@asynccontextmanager
+async def async_admission_critical_section(
+    companion_dir: Path,
+    terminal_id: str,
+    generation: str,
+    *,
+    attempt_id: Optional[str] = None,
+    fencing_token_id: Optional[str] = None,
+):
+    """Cancellation-safe off-loop wrapper for generation/managed admission.
+
+    Supplying the exact attempt/token selects the managed successor→generation
+    lock order.  Omitting both retains the legacy generation-only W13 use for
+    unmanaged callers.  Supplying only one is a programming error.
+    """
+    import asyncio
+
+    if (attempt_id is None) != (fencing_token_id is None):
+        raise FenceRequestError("managed admission requires both attempt_id and fencing_token_id")
+    manager = (
+        managed_admission_critical_section(
+            companion_dir,
+            terminal_id,
+            generation,
+            attempt_id=attempt_id,
+            fencing_token_id=fencing_token_id,
+        )
+        if attempt_id is not None and fencing_token_id is not None
+        else admission_critical_section(companion_dir, terminal_id, generation)
+    )
+    entered = False
+    handoff = _AsyncAcquireHandoff()
+    try:
+        try:
+            await asyncio.to_thread(_enter_or_abandon, manager, handoff)
+        except BaseException:
+            with handoff.lock:
+                handoff.abandoned = True
+                entered = handoff.entered
+            if entered:
+                await _async_exit(manager)
+                entered = False
+            raise
+        entered = handoff.entered
+        yield
+    finally:
+        if entered:
+            await _async_exit(manager)
 
 
 @contextmanager

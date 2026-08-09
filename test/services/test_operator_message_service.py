@@ -21,6 +21,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import control_input_service as cis
+from cli_agent_orchestrator.services import generation_fence as gf
 from cli_agent_orchestrator.services import managed_launch_v2
 from cli_agent_orchestrator.services import operator_message_service as oms
 from cli_agent_orchestrator.services.control_input_contract import (
@@ -301,6 +302,38 @@ class TestIdentityAndCapabilityGates:
         result = _submit()
         assert result.outcome == "refused"
         assert result.reason_code == "provider-unsupported"
+
+    def test_parked_generation_refuses_before_the_operator_adapter(
+        self, wire, monkeypatch, tmp_path
+    ):
+        """The dashboard/operator lane records no adapter/provider call after park."""
+        from cli_agent_orchestrator import constants
+
+        companion = tmp_path / "companion"
+        monkeypatch.setattr(constants, "COMPANION_DIR", companion)
+        gf.install_fence(
+            companion,
+            terminal_id=TERMINAL,
+            generation=GENERATION,
+            vintage="v2",
+            request={
+                "schema": gf.FENCE_REQUEST_SCHEMA,
+                "terminal_generation": GENERATION,
+                "obligation_generation": "obligation-1",
+                "attempt_id": "attempt-1",
+                "intent_id": str(uuid.uuid4()),
+                "report_sha256": "a" * 64,
+            },
+            fencing_token_id="token-1",
+        )
+        adapter = _FakeAdapter(record=_record(_op_id()))
+        wire(_resolved(managed=True), adapter, {"deliverable": True})
+
+        result = _submit(operation_id=_op_id())
+
+        assert result.outcome == "refused"
+        assert result.reason_code == "generation-fenced"
+        assert adapter.calls == []
 
     def test_attachments_without_an_image_block_are_unsupported(self, wire, monkeypatch):
         monkeypatch.setattr(

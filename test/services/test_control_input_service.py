@@ -25,6 +25,7 @@ import pytest
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import control_input_service as service
+from cli_agent_orchestrator.services import generation_fence as gf
 from cli_agent_orchestrator.services import native_pane_input
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
@@ -34,6 +35,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     BRACKETED_PASTE_START_C1,
     CONTROL_INPUT_PROTOCOL,
     REASON_CONTROL_ROUTE_ABSENT,
+    REASON_GENERATION_FENCED,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
     REASON_LINEAGE_UNPROVEN,
@@ -3860,3 +3862,41 @@ class TestSequenceSubmissionBarrier:
         enters = [write for write in client.writes if write.get("submit")]
         assert len(enters) == 1
         assert [event["outcome"] for event in result.events] == ["sent", "sent", "skipped"]
+
+
+def test_parked_managed_literal_and_sequence_controls_write_zero_tmux_bytes(
+    journal, tmux, monkeypatch, tmp_path
+):
+    """Both public control grammars meet the same managed park boundary."""
+    from cli_agent_orchestrator import constants
+
+    companion = tmp_path / "companion"
+    monkeypatch.setattr(constants, "COMPANION_DIR", companion)
+    resolved = _seq_resolved()
+    monkeypatch.setattr(service, "resolve_control_identity", lambda _terminal: resolved)
+    gf.install_fence(
+        companion,
+        terminal_id=TERMINAL,
+        generation=resolved.terminal_generation,
+        vintage="v2",
+        fencing_token_id="token-1",
+        request={
+            "schema": gf.FENCE_REQUEST_SCHEMA,
+            "terminal_generation": resolved.terminal_generation,
+            "obligation_generation": "obligation-1",
+            "attempt_id": "attempt-1",
+            "intent_id": "11111111-1111-4111-8111-111111111111",
+            "report_sha256": "a" * 64,
+        },
+    )
+
+    literal = _deliver(journal, control_id="ctl-fenced-literal", text="literal")
+    sequence = _deliver_sequence(
+        journal,
+        control_id="ctl-fenced-sequence",
+        events=[{"type": "text", "text": "sequence"}, {"type": "key", "key": "Enter"}],
+    )
+
+    assert literal.outcome == sequence.outcome == REFUSED
+    assert literal.reason_code == sequence.reason_code == REASON_GENERATION_FENCED
+    assert tmux.writes == []
