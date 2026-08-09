@@ -1510,12 +1510,29 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
             .one_or_none()
         )
         try:
+            # Narrow compatible projection: only the columns this identity
+            # decision reads.  Additive columns the roster owns (M3-A
+            # ``stable_agent_id``) are deliberately NOT selected, so a
+            # store that has not run the latest migration still resolves
+            # the managed-v2 identity.  Any OTHER missing column is schema
+            # drift/corruption and fails closed (raises) rather than
+            # misclassifying a managed-v2 terminal as unmanaged.
             row_v2 = (
-                db.query(database.ManagedLaunchV2ReservationModel)
+                db.query(
+                    database.ManagedLaunchV2ReservationModel.reservation_id,
+                    database.ManagedLaunchV2ReservationModel.terminal_id,
+                    database.ManagedLaunchV2ReservationModel.generation,
+                    database.ManagedLaunchV2ReservationModel.provider,
+                    database.ManagedLaunchV2ReservationModel.execution_mode,
+                    database.ManagedLaunchV2ReservationModel.execution_mode_source,
+                    database.ManagedLaunchV2ReservationModel.state,
+                )
                 .filter(database.ManagedLaunchV2ReservationModel.terminal_id == terminal_id)
                 .one_or_none()
             )
         except OperationalError as exc:
+            # Only a genuinely absent v2 table reads as "not managed-v2";
+            # anything else fails closed above.
             if "no such table" not in str(exc).lower():
                 raise
             row_v2 = None
@@ -1570,7 +1587,7 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
             # read as ACP with both identities null, so a managed native
             # pane was refused by the generic control path and could not
             # be reached at all -- not even once it was admitted.
-            identity.update(_v2_native_control_projection(identity["reservation_id"]))
+            identity.update(_v2_native_control_projection(str(identity["reservation_id"])))
             return identity
     return None
 

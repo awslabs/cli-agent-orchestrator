@@ -16,6 +16,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     DateTime,
+    Index,
     Integer,
     String,
     Text,
@@ -581,6 +582,12 @@ class ManagedLaunchV2ReservationModel(Base):
     task_id = Column(Text, nullable=True)
     run_id = Column(Text, nullable=False)
     launch_nonce_digest = Column(Text, nullable=False)
+    # The explicit stable CAO agent id (M3-A / cond-0377), minted at
+    # reserve and persisted BEFORE any provider effect, so response loss
+    # returns the same id.  Null on reservations created before the
+    # roster existed; the bind seam derives a deterministic id from the
+    # terminal identity for those.
+    stable_agent_id = Column(Text, nullable=True)
     state = Column(Text, nullable=False)
     request_json = Column(Text, nullable=False)
     binding_json = Column(Text, nullable=True)
@@ -708,6 +715,111 @@ class NativeSessionAttachmentModel(Base):
     # Monotonic per-row counter; every CAS transition bumps it so a
     # lost-update race is detectable rather than silently last-write-wins.
     epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
+class StableAgentModel(Base):
+    """One stable CAO agent (M3-A / cond-0377): the durable identity below
+    a CAO session and above disposable physical incarnations.
+
+    A CAO session owns stable ``agent_id`` records for its supervisor and
+    workers.  The record binds session, role/profile family, disposition,
+    resume-contract version, and the current lineage/incarnation pointers;
+    the append-only history lives in ``stable_agent_lineages`` and
+    ``stable_agent_incarnations``.  The roster exists independently of
+    tmux, so Stop/Resume can work without a conductor.
+
+    ``agent_id`` is an explicit immutable identity minted from the durable
+    initial physical launch identity — NOT a value inferred from
+    role/profile.  A session may hold many workers of one profile, each
+    with an independent native conversation and history; session, role,
+    and profile family are attributes that must match on replay, never a
+    uniqueness key.
+    """
+
+    __tablename__ = "stable_agents"
+
+    agent_id = Column(Text, primary_key=True)
+    session_name = Column(Text, nullable=False)
+    role = Column(Text, nullable=False)
+    profile_family = Column(Text, nullable=False)
+    # live | dormant | identity_missing | retired.  ``identity_missing``
+    # means the current lineage has no native session id: truthful, never
+    # fabricated, and never a blocker for Stop.
+    disposition = Column(Text, nullable=False)
+    resume_contract_version = Column(Text, nullable=False)
+    current_lineage_id = Column(Text, nullable=True)
+    current_incarnation_id = Column(Text, nullable=True)
+    # Strictly increasing per-agent counter; every mutation bumps it so a
+    # replay or a lost update is detectable rather than silently winning.
+    revision = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (Index("ix_stable_agents_session_name", "session_name"),)
+
+
+class StableAgentLineageModel(Base):
+    """One append-only native-session lineage of a stable agent.
+
+    A lineage is one harness-native conversation identity: it holds the
+    native session id (or the truthful ``NULL`` ``identity_missing``
+    state), the harness identity, bounded route-provider provenance, and
+    the predecessor link so a fresh fallback never overwrites history.
+    ``(harness, native_session_id)`` is unique for non-null ids: one
+    harness+id pair maps to one lineage and therefore to one stable
+    agent, while two unrelated harnesses may legally emit the same
+    textual id (a Claude and a Muse lineage with the same raw string are
+    independent).
+    """
+
+    __tablename__ = "stable_agent_lineages"
+
+    lineage_id = Column(Text, primary_key=True)
+    agent_id = Column(Text, nullable=False)
+    harness = Column(Text, nullable=False)
+    # NULL is the truthful ``identity_missing`` state, never a fabricated id.
+    native_session_id = Column(Text, nullable=True)
+    acquisition_method = Column(Text, nullable=True)
+    # Bounded canonical JSON of route-provider provenance (closed keys).
+    route_provenance_json = Column(Text, nullable=True)
+    # Bounded free-text continuity truth (e.g. Codex pre-turn threads).
+    continuity_note = Column(Text, nullable=True)
+    predecessor_lineage_id = Column(Text, nullable=True)
+    # initial | resume | fallback | adopt | repair
+    lineage_origin = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
+class StableAgentIncarnationModel(Base):
+    """One disposable physical incarnation of a stable agent.
+
+    A new terminal always receives a new generation; the incarnation row
+    binds the terminal/generation/pane/process identity and the lineage it
+    currently belongs to.  ``lineage_id`` is NULL only while the native
+    identity is not yet established (identity pending); once bound it is
+    immutable.  One incarnation per terminal id.
+    """
+
+    __tablename__ = "stable_agent_incarnations"
+
+    incarnation_id = Column(Text, primary_key=True)
+    agent_id = Column(Text, nullable=False)
+    lineage_id = Column(Text, nullable=True)
+    terminal_id = Column(Text, nullable=True)
+    generation = Column(Text, nullable=True)
+    pane_id = Column(Text, nullable=True)
+    pane_pid = Column(Integer, nullable=True)
+    # Canonical JSON of the physical process identity (pid + start marker).
+    process_identity_json = Column(Text, nullable=True)
+    execution_mode = Column(Text, nullable=True)
+    # bound | admitted | retired.  ``admitted`` is the durable state that
+    # gates real task input; ``retired`` preserves the row as history.
+    disposition = Column(Text, nullable=False)
+    retired_at = Column(Text, nullable=True)
+    retirement_reason = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
 
@@ -1045,6 +1157,7 @@ def init_db() -> None:
     _migrate_codex_native_control_operations()
     _migrate_managed_launch_reservations()
     _migrate_managed_launch_v2()
+    _migrate_stable_agent_roster()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1426,6 +1539,152 @@ def _migrate_native_session_attachments() -> None:
             )
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"native-session attachment migration failed: {e}")
+
+
+def _migrate_stable_agent_roster() -> None:
+    """Create the M3-A stable-agent roster tables on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via the
+    ``StableAgentModel`` / ``StableAgentLineageModel`` /
+    ``StableAgentIncarnationModel`` models; this idempotent migration
+    covers databases created before the roster existed (cond-0377).  The
+    DDL is byte-compatible with the ORM models so both paths yield one
+    schema.  Additive and dark: old binaries never read these tables, and
+    existing rows elsewhere are untouched.
+
+    Two corrections to the earlier draft schema are also applied here:
+    the ``stable_agents`` table no longer carries the
+    ``UNIQUE (session_name, role, profile_family)`` constraint (agent_id
+    is the explicit immutable identity; role/profile are attributes), and
+    the lineage uniqueness index is scoped to
+    ``(harness, native_session_id)`` rather than the raw native id.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS stable_agents ("
+                "agent_id TEXT NOT NULL PRIMARY KEY, "
+                "session_name TEXT NOT NULL, "
+                "role TEXT NOT NULL, "
+                "profile_family TEXT NOT NULL, "
+                "disposition TEXT NOT NULL, "
+                "resume_contract_version TEXT NOT NULL, "
+                "current_lineage_id TEXT, "
+                "current_incarnation_id TEXT, "
+                "revision INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_stable_agents_session_name "
+                "ON stable_agents(session_name)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS stable_agent_lineages ("
+                "lineage_id TEXT NOT NULL PRIMARY KEY, "
+                "agent_id TEXT NOT NULL, "
+                "harness TEXT NOT NULL, "
+                "native_session_id TEXT, "
+                "acquisition_method TEXT, "
+                "route_provenance_json TEXT, "
+                "continuity_note TEXT, "
+                "predecessor_lineage_id TEXT, "
+                "lineage_origin TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS stable_agent_incarnations ("
+                "incarnation_id TEXT NOT NULL PRIMARY KEY, "
+                "agent_id TEXT NOT NULL, "
+                "lineage_id TEXT, "
+                "terminal_id TEXT, "
+                "generation TEXT, "
+                "pane_id TEXT, "
+                "pane_pid INTEGER, "
+                "process_identity_json TEXT, "
+                "execution_mode TEXT, "
+                "disposition TEXT NOT NULL, "
+                "retired_at TEXT, "
+                "retirement_reason TEXT, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            # Uniqueness is scoped to (harness, native_session_id): one
+            # harness+id pair maps to one lineage — therefore to one stable
+            # agent — while two unrelated harnesses may legally emit the
+            # same textual id.  The NULL rows (truthful
+            # ``identity_missing``) are excluded so an agent may record the
+            # absence of identity more than once across its history.  The
+            # earlier draft's raw-id index is dropped when present.
+            conn.execute("DROP INDEX IF EXISTS ix_stable_lineage_native_session_id")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_stable_lineage_harness_native_session_id ON stable_agent_lineages"
+                "(harness, native_session_id) WHERE native_session_id IS NOT NULL"
+            )
+            # Incarnation uniqueness is keyed on (terminal_id, generation):
+            # a later generation may reuse a terminal id and history must
+            # stay readable rather than collide.  Legacy rows with no
+            # generation (unmanaged launches) are keyed on the terminal id
+            # alone via the NULL-generation partial index.  The earlier
+            # draft's terminal-only index is dropped when present.
+            conn.execute("DROP INDEX IF EXISTS ix_stable_incarnation_terminal_id")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_stable_incarnation_terminal_generation ON stable_agent_incarnations"
+                "(terminal_id, generation) WHERE terminal_id IS NOT NULL AND generation IS NOT NULL"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_stable_incarnation_terminal_legacy ON stable_agent_incarnations"
+                "(terminal_id) WHERE terminal_id IS NOT NULL AND generation IS NULL"
+            )
+            # A database that ran the earlier dark draft has the inline
+            # ``UNIQUE (session_name, role, profile_family)`` autoindex,
+            # which SQLite will not drop in place; rebuild the table
+            # without it.  No production store can contain this table yet —
+            # the draft never left this change — so the rebuild is purely
+            # defensive.
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='stable_agents' AND name LIKE 'sqlite_autoindex_%'"
+            ).fetchall()
+            if len(rows) > 1:
+                conn.execute("ALTER TABLE stable_agents RENAME TO stable_agents_legacy_unique")
+                conn.execute(
+                    "CREATE TABLE stable_agents ("
+                    "agent_id TEXT NOT NULL PRIMARY KEY, "
+                    "session_name TEXT NOT NULL, "
+                    "role TEXT NOT NULL, "
+                    "profile_family TEXT NOT NULL, "
+                    "disposition TEXT NOT NULL, "
+                    "resume_contract_version TEXT NOT NULL, "
+                    "current_lineage_id TEXT, "
+                    "current_incarnation_id TEXT, "
+                    "revision INTEGER NOT NULL DEFAULT 0, "
+                    "created_at TEXT NOT NULL, "
+                    "updated_at TEXT NOT NULL"
+                    ")"
+                )
+                conn.execute("INSERT INTO stable_agents SELECT * FROM stable_agents_legacy_unique")
+                # The old session-name index followed the renamed table and
+                # dies with it; recreate it on the rebuilt table AFTER the
+                # drop so the final schema is complete.
+                conn.execute("DROP TABLE stable_agents_legacy_unique")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_stable_agents_session_name "
+                    "ON stable_agents(session_name)"
+                )
+    except Exception as e:  # noqa: BLE001 - the operation path fails closed
+        logger.warning(f"stable-agent roster migration failed: {e}")
 
 
 def _migrate_session_lifecycle() -> None:

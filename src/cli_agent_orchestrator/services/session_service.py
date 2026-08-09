@@ -33,6 +33,7 @@ from cli_agent_orchestrator.plugins import (
 )
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
+from cli_agent_orchestrator.services.stable_agent_roster import ROLE_SUPERVISOR
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
@@ -116,6 +117,10 @@ async def create_session(
         allowed_tools=allowed_tools,
         registry=registry,
         env_vars=env_vars,
+        # M3-A: session creation owns the initial supervisor role and
+        # passes it explicitly — role is launch truth, never a
+        # profile-name heuristic.
+        stable_agent_role=ROLE_SUPERVISOR,
     )
     dispatch_plugin_event(
         registry,
