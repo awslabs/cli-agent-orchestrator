@@ -37,6 +37,8 @@ import hashlib
 import json
 import os
 import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -425,8 +427,26 @@ def query_park(
     companion_dir: Path, *, terminal_id: str, generation: str, operation_id: str
 ) -> dict[str, Any]:
     """Read-only exact-operation reconciliation after response loss/restart."""
-    if not isinstance(operation_id, str) or not operation_id:
-        raise ParkRequestError("park operation_id must be a non-empty string")
+    if (
+        not isinstance(terminal_id, str)
+        or len(terminal_id) != 8
+        or any(ch not in "0123456789abcdef" for ch in terminal_id)
+    ):
+        raise ParkRequestError("park terminal_id must be 8 lowercase hex characters")
+    if (
+        not isinstance(generation, str)
+        or not generation
+        or generation in {".", ".."}
+        or any(separator in generation for separator in ("/", "\\", "\x00"))
+    ):
+        raise ParkRequestError("park terminal_generation is not a safe path segment")
+    if not isinstance(operation_id, str):
+        raise ParkRequestError("park operation_id must be a canonical lowercase UUID")
+    try:
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError
+    except ValueError as exc:
+        raise ParkRequestError("park operation_id must be a canonical lowercase UUID") from exc
     state = _read_state(fence_state_path(companion_dir, terminal_id, generation))
     park = (state or {}).get("park")
     if park is None:
@@ -546,6 +566,13 @@ class _AsyncAcquireHandoff:
         self.lock = threading.Lock()
 
 
+# Flock waiters must never occupy asyncio's shared default executor: native
+# holders use that executor for readiness and tmux work before releasing the
+# same lock.  A bounded, separate pool keeps cross-process flock semantics
+# intact while isolating lock contention from provider-byte progress.
+_ASYNC_FLOCK_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cao-fence-flock")
+
+
 def _enter_or_abandon(manager: Any, handoff: _AsyncAcquireHandoff) -> None:
     """Run blocking enter off-loop; release if cancellation abandoned it."""
     manager.__enter__()
@@ -604,7 +631,9 @@ async def async_admission_critical_section(
     handoff = _AsyncAcquireHandoff()
     try:
         try:
-            await asyncio.to_thread(_enter_or_abandon, manager, handoff)
+            await asyncio.get_running_loop().run_in_executor(
+                _ASYNC_FLOCK_EXECUTOR, _enter_or_abandon, manager, handoff
+            )
         except BaseException:
             with handoff.lock:
                 handoff.abandoned = True

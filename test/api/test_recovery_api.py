@@ -328,6 +328,16 @@ def test_park_requires_the_exact_bound_reservation_identity(
     )
     assert wrong_query.status_code == 200
     assert wrong_query.json()["outcome"] == "not-found"
+    # Reconciliation is read-only, but its identifier segments must still be
+    # exact/safe before they can name a filesystem location.
+    malformed_query = client.get(
+        f"/managed-launch/v2/park/{record['terminal_id']}/{record['generation']}/not-a-uuid"
+    )
+    assert malformed_query.status_code == 409
+    invalid_terminal_query = client.get(
+        f"/managed-launch/v2/park/A1B2C3D4/{record['generation']}/{body['operation_id']}"
+    )
+    assert invalid_terminal_query.status_code == 409
     wrong_terminal = client.post(
         "/managed-launch/v2/park", json={**body, "terminal_id": "feedface"}
     )

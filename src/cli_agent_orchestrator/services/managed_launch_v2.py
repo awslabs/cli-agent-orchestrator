@@ -4844,11 +4844,6 @@ async def admit_reserved(
     )
 
     record = get(reservation_id)
-    # The fence check is the admission boundary: a sealed generation
-    # rejects every post-fence input with zero provider I/O.
-    generation_fence.assert_admission_open(
-        COMPANION_DIR, record["terminal_id"], record["generation"]
-    )
     # Admission branches on the immutable mode exactly as launch does,
     # and the two branches share no code below this point. The ACP bridge
     # is a lawful admission transport for ACP rows only: a native
@@ -4859,7 +4854,38 @@ async def admit_reserved(
     if record["execution_mode"] == em.NATIVE_TUI:
         return await _admit_native_tui(reservation_id, record, request)
 
-    record, should_send = claim_admission(reservation_id, request)
+    binding = record.get("binding") or {}
+    attempt_id = binding.get("attempt_id")
+    fencing_token_id = binding.get("fencing_token_id")
+    if not isinstance(attempt_id, str) or not isinstance(fencing_token_id, str):
+        raise ManagedLaunchConflict(
+            "ACP admission requires an immutable bound attempt and fencing token"
+        )
+    try:
+        # Claim only after the canonical successor -> generation fence
+        # recheck.  A known parked generation records a durable pre-I/O
+        # refusal, never an io-attempted/ambiguous admission.
+        async with generation_fence.async_admission_critical_section(
+            COMPANION_DIR,
+            record["terminal_id"],
+            record["generation"],
+            attempt_id=attempt_id,
+            fencing_token_id=fencing_token_id,
+        ):
+            record, should_send = await asyncio.to_thread(claim_admission, reservation_id, request)
+    except generation_fence.FencedError as exc:
+        return await asyncio.to_thread(
+            refuse_admission_before_io,
+            reservation_id,
+            request,
+            "generation_fenced",
+            str(exc),
+            observation={
+                "kind": "generation_fenced",
+                "terminal_id": record["terminal_id"],
+                "generation": record["generation"],
+            },
+        )
     if not should_send:
         if record["state"] == "admitting":
             state = read_state(reservation_id)
@@ -4889,6 +4915,19 @@ async def admit_reserved(
         receipt = state.get("submission") if state else None
         if isinstance(receipt, dict):
             return complete_admission(reservation_id, request.delivery_id, receipt)
+        # The bridge's fence boundary proves it rejected before provider I/O.
+        # It is not a generic response-loss ambiguity even if a park landed
+        # after the local locked claim and before bridge entry.
+        if str(exc).startswith(
+            ("w13-fenced-before-provider-io:", "successor-fenced-before-provider-io:")
+        ):
+            return await asyncio.to_thread(
+                mark_admission_refused,
+                reservation_id,
+                request.delivery_id,
+                "generation_fenced",
+                str(exc),
+            )
         return mark_admission_ambiguous(reservation_id, request.delivery_id, str(exc))
     receipt = response.get("receipt")
     if not isinstance(receipt, dict):

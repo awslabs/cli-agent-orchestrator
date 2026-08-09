@@ -696,7 +696,10 @@ class InboxService:
             # Scan past parked identity-bound rows. With the production default
             # of one message, selecting only the oldest row lets one stale
             # recovery callback starve every later valid message forever.
-            scan_parked = managed_identity is not None and not native_managed
+            # Scan beyond a stale head for every managed transport.  Native
+            # managed rows need this too: otherwise the default one-row scan
+            # fails G1 and returns before a valid G2 row directly behind it.
+            scan_parked = managed_identity is not None
             limit = 100 if scan_parked else (num_messages if num_messages > 0 else 100)
             messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
@@ -757,6 +760,11 @@ class InboxService:
                 messages = exact_messages
                 if not messages:
                     return
+                # The wider scan exists only to dispose of stale rows. Keep
+                # the ordinary delivery budget once the surviving rows are
+                # exact-current, including for native TUI delivery below.
+                if native_managed and num_messages > 0 and required_message_id is None:
+                    messages = messages[:num_messages]
 
         # P1-7 (final conformance §20.2f): for a receiver with a live managed
         # provider session, deliver each exact message through its provider

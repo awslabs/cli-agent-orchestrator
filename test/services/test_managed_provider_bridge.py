@@ -533,6 +533,68 @@ def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
     assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-4") is None
 
 
+def test_parked_acp_inbox_refuses_before_provider_ack_or_receipt(tmp_path, monkeypatch):
+    """A real M3/W13 receipt fences ACP inbox bytes, not just a mocked helper."""
+    from cli_agent_orchestrator.services import companion_receipts
+    from cli_agent_orchestrator.services import generation_fence as gf
+
+    session, companion, request = _v2_session(tmp_path, monkeypatch)
+    token = _bound_generation(companion, request)
+    submitted = []
+    acknowledgements = []
+    route_receipts = []
+    monkeypatch.setattr(
+        session,
+        "_submit_provider_turn",
+        lambda *args, **kwargs: submitted.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        companion_receipts,
+        "record_message_ack",
+        lambda *args, **kwargs: acknowledgements.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        companion_receipts,
+        "record_route_receipt",
+        lambda *args, **kwargs: route_receipts.append((args, kwargs)),
+    )
+    gf.install_fence(
+        companion,
+        terminal_id=request["terminal_id"],
+        generation=request["generation"],
+        vintage="v2",
+        fencing_token_id=token.id,
+        request={
+            "schema": gf.FENCE_REQUEST_SCHEMA,
+            "terminal_generation": request["generation"],
+            "obligation_generation": request["obligation_generation"],
+            "attempt_id": request["attempt_id"],
+            "intent_id": str(uuid.uuid4()),
+            "report_sha256": "a" * 64,
+        },
+    )
+    command = {
+        "op": "deliver",
+        "reservation_id": request["reservation_id"],
+        "terminal_id": request["terminal_id"],
+        "generation": request["generation"],
+        "message_id": "parked-msg-1",
+        "message": "do not submit",
+        "message_sha256": hashlib.sha256(b"do not submit").hexdigest(),
+        "sender_id": "supervisor",
+        "expected_provider": request["provider"],
+        "expected_provider_session_id": session.provider_session_id,
+        "expected_execution_mode": "acp",
+    }
+
+    with pytest.raises(bridge.BridgeError, match="w13-fenced-before-provider-io"):
+        session.deliver_inbox(command)
+
+    assert submitted == []
+    assert acknowledgements == []
+    assert route_receipts == []
+
+
 def test_reverse_request_prompt_lifecycle_is_observation_only(tmp_path, monkeypatch):
     # P1-10: a provider-native reverse request is recorded as a pending
     # structured prompt and closed when answered — observation only.

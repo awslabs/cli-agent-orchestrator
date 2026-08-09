@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -192,6 +193,63 @@ def test_m3_park_adopts_compatible_w13_fence(store):
     receipt = parked["park_receipt"]
     assert receipt["fence_receipt_sha256"] == fence["fence_receipt_sha256"]
     assert receipt["fence_receipt"]["fencing_token_id"] == "token-w13"
+
+
+@pytest.mark.parametrize(
+    "w13_changes",
+    (
+        {"obligation_generation": "other-obligation"},
+        {"attempt_id": "11111111-1111-4111-8111-111111111111"},
+        {"report_sha256": "b" * 64},
+    ),
+)
+def test_m3_park_refuses_incompatible_w13_fence(store, w13_changes):
+    """M3 may adopt only the W13 seal for its exact obligation/attempt/report."""
+    isolated = store / next(iter(w13_changes))
+    gf.install_fence(
+        isolated,
+        terminal_id="a1b2c3d4",
+        generation="gen-000042",
+        vintage="v2",
+        request=_request(**w13_changes),
+        fencing_token_id="token-w13",
+    )
+
+    with pytest.raises(gf.ParkRequestError, match="incompatible"):
+        gf.install_park(isolated, request=_park_request(), fencing_token_id="token-m3")
+
+
+def test_m3_park_receipt_digest_is_independent_of_mapping_insertion_order(store):
+    parked = gf.install_park(store, request=_park_request(), fencing_token_id="token-1")
+    receipt = parked["park_receipt"]
+    reordered = {
+        key: (
+            {nested_key: receipt[key][nested_key] for nested_key in reversed(tuple(receipt[key]))}
+            if key == "fence_receipt"
+            else receipt[key]
+        )
+        for key in reversed(tuple(receipt))
+    }
+
+    assert gf.park_receipt_digest(reordered) == gf.park_receipt_digest(receipt)
+
+
+@pytest.mark.parametrize(
+    ("terminal_id", "generation"),
+    (
+        ("A1B2C3D4", "gen-000042"),
+        ("a1b2c3d4", "../outside"),
+        ("a1b2c3d4", "generation\\outside"),
+    ),
+)
+def test_m3_park_query_refuses_unsafe_identity_path_segments(store, terminal_id, generation):
+    with pytest.raises(gf.ParkRequestError):
+        gf.query_park(
+            store,
+            terminal_id=terminal_id,
+            generation=generation,
+            operation_id="11111111-1111-4111-8111-111111111111",
+        )
 
 
 def test_fenced_generation_rejects_input_admission(store):
@@ -476,3 +534,71 @@ async def test_async_admission_cancellation_and_exception_close_the_owner_once(s
             pass
     assert failed.enters == 1
     assert failed.exits == 0
+
+
+@pytest.mark.asyncio
+async def test_async_flock_waiters_do_not_starve_default_executor_or_park(store, monkeypatch):
+    """Contended flock acquisition is isolated from native work and park I/O.
+
+    The holder deliberately needs the two-worker default executor after two
+    same-generation waiters have begun acquiring the flock.  Before the
+    dedicated acquisition pool, those waiters occupied both workers and this
+    deterministic holder/park cycle could not progress.
+    """
+    loop = asyncio.get_running_loop()
+    constrained = ThreadPoolExecutor(max_workers=2)
+    loop.set_default_executor(constrained)
+    real_enter = gf._enter_or_abandon
+    waiter_started = asyncio.Event()
+    worker_calls = 0
+    worker_calls_lock = threading.Lock()
+
+    def observe_enter(manager, handoff):
+        nonlocal worker_calls
+        with worker_calls_lock:
+            worker_calls += 1
+            is_waiter = worker_calls >= 2
+        if is_waiter:
+            loop.call_soon_threadsafe(waiter_started.set)
+        return real_enter(manager, handoff)
+
+    monkeypatch.setattr(gf, "_enter_or_abandon", observe_enter)
+    holder_entered = asyncio.Event()
+    allow_holder_work = asyncio.Event()
+    holder_work_finished = asyncio.Event()
+    release_holder = asyncio.Event()
+    park_started = asyncio.Event()
+
+    async def holder():
+        async with gf.async_admission_critical_section(store, "a1b2c3d4", "gen-000042"):
+            holder_entered.set()
+            await allow_holder_work.wait()
+            await asyncio.to_thread(lambda: "native-readiness-and-tmux-work")
+            holder_work_finished.set()
+            await release_holder.wait()
+
+    async def waiter():
+        async with gf.async_admission_critical_section(store, "a1b2c3d4", "gen-000042"):
+            return None
+
+    def park():
+        loop.call_soon_threadsafe(park_started.set)
+        return gf.install_park(store, request=_park_request(), fencing_token_id="token-1")
+
+    holder_task = asyncio.create_task(holder())
+    await asyncio.wait_for(holder_entered.wait(), timeout=1)
+    waiters = [asyncio.create_task(waiter()) for _ in range(2)]
+    await asyncio.wait_for(waiter_started.wait(), timeout=1)
+    park_task = asyncio.create_task(asyncio.to_thread(park))
+    await asyncio.wait_for(park_started.wait(), timeout=1)
+    allow_holder_work.set()
+    await asyncio.wait_for(holder_work_finished.wait(), timeout=1)
+    assert not park_task.done()
+    release_holder.set()
+    await asyncio.wait_for(asyncio.gather(holder_task, park_task, *waiters), timeout=3)
+    assert park_task.result()["outcome"] == gf.OUTCOME_FENCED
+
+    # Do not retain a constrained executor for tests that share this loop.
+    replacement = ThreadPoolExecutor(max_workers=4)
+    loop.set_default_executor(replacement)
+    constrained.shutdown(wait=True)

@@ -3900,3 +3900,50 @@ def test_parked_managed_literal_and_sequence_controls_write_zero_tmux_bytes(
     assert literal.outcome == sequence.outcome == REFUSED
     assert literal.reason_code == sequence.reason_code == REASON_GENERATION_FENCED
     assert tmux.writes == []
+
+
+def test_unmanaged_control_ignores_an_unrelated_park_receipt_and_writes(
+    journal, tmux, monkeypatch, tmp_path
+):
+    """M3 fences managed generations only; raw control keeps its prior lane."""
+    from cli_agent_orchestrator import constants
+    from cli_agent_orchestrator.services import native_pane_input
+
+    companion = tmp_path / "companion"
+    monkeypatch.setattr(constants, "COMPANION_DIR", companion)
+    resolved = _seq_resolved(managed=False)
+    monkeypatch.setattr(service, "resolve_control_identity", lambda _terminal: resolved)
+    monkeypatch.setattr(
+        native_pane_input,
+        "await_compose_visible",
+        lambda _pane, _text, *, barrier, deadline_monotonic: True,
+    )
+    monkeypatch.setattr(
+        native_pane_input,
+        "observe_submission",
+        lambda _pane, _text, *, barrier, deadline_monotonic: (
+            SUBMISSION_SUBMITTED,
+            "evidence://unmanaged-after-park",
+        ),
+    )
+    gf.install_park(
+        companion,
+        fencing_token_id="other-token",
+        request={
+            "schema": gf.PARK_REQUEST_SCHEMA,
+            "operation_id": "22222222-2222-4222-8222-222222222222",
+            "reservation_id": "33333333-3333-4333-8333-333333333333",
+            "terminal_id": "feedface",
+            "terminal_generation": "other-generation",
+            "logical_task_id": "other-task",
+            "retained_round": 0,
+            "obligation_generation": "other-obligation",
+            "attempt_id": "other-attempt",
+            "report_sha256": "b" * 64,
+        },
+    )
+
+    result = _deliver(journal, control_id="ctl-unmanaged-after-park", text="still-send")
+
+    assert result.outcome == ACCEPTED
+    assert tmux.writes

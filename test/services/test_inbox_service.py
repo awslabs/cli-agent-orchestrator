@@ -1706,6 +1706,52 @@ class TestNativeManagedV2InboxDelivery:
         InboxService().deliver_pending(terminal_id)
         assert len(control_calls) == 1
 
+    def test_stale_native_head_does_not_starve_the_current_generation_row(
+        self, isolated_memory_db, monkeypatch
+    ):
+        """Default one-message delivery scans through failed G1 work to valid G2."""
+        terminal_id = "ntv0005e"
+        old_generation = "gen-native-old"
+        generation = "gen-native-current"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        stale = database.create_inbox_message("supervisor-1", terminal_id, "old G1")
+        current = database.create_inbox_message("supervisor-1", terminal_id, "current G2")
+        with database.SessionLocal() as db:
+            db.query(database.InboxModel).filter_by(id=stale.id).update(
+                {"expected_receiver_generation": old_generation}
+            )
+            db.commit()
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert control_calls == [
+            (
+                terminal_id,
+                {
+                    "text": "current G2",
+                    "expected_identity": {
+                        "terminal_id": terminal_id,
+                        "terminal_generation": generation,
+                    },
+                },
+            )
+        ]
+        with database.SessionLocal() as db:
+            statuses = {
+                row.id: MessageStatus(row.status)
+                for row in db.query(database.InboxModel).filter_by(receiver_id=terminal_id).all()
+            }
+        assert statuses == {stale.id: MessageStatus.FAILED, current.id: MessageStatus.DELIVERED}
+
     def test_pre_m3_generationless_g1_row_cannot_retarget_g2_after_park(
         self, isolated_memory_db, monkeypatch, tmp_path
     ):

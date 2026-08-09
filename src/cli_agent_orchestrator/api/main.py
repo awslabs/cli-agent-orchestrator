@@ -4498,7 +4498,12 @@ async def create_inbox_message_endpoint(
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
     try:
-        inbox_msg = create_inbox_message(
+        # Managed-v2 creation takes the terminal successor flock to bind an
+        # exact receiver generation.  Never wait for that OS lock on the
+        # ASGI loop: a native admission can own it while awaiting tmux/readiness
+        # work on this same loop.
+        inbox_msg = await asyncio.to_thread(
+            create_inbox_message,
             sender_id,
             receiver_id,
             message,
@@ -4514,7 +4519,14 @@ async def create_inbox_message_endpoint(
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+        # This path includes synchronous DB, successor/fence, bridge, and
+        # native-pane work.  Keeping it off-loop gives the admission that
+        # owns a predecessor lock a chance to complete and release it.
+        await asyncio.to_thread(
+            inbox_service.deliver_pending,
+            receiver_id,
+            registry=get_plugin_registry(request),
+        )
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 

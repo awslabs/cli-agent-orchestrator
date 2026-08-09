@@ -1,5 +1,9 @@
 """Tests for terminal-related API endpoints including working directory and exit."""
 
+import asyncio
+import uuid
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -469,6 +473,109 @@ class TestCreateInboxMessageEndpoint:
 
             assert response.status_code == 500
             assert "Failed to create inbox message" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_managed_inbox_post_does_not_block_admission_or_concurrent_park(
+        self, tmp_path, monkeypatch
+    ):
+        """Inbox creation/delivery waits off-loop behind a managed admission.
+
+        ``create_inbox_message`` now takes the successor flock in order to
+        bind an exact managed generation.  This deliberately puts POST and a
+        park request behind an admission holding that flock.  The event loop
+        must remain available for the admission to release it; otherwise the
+        old synchronous endpoint call formed a three-way deadlock.
+        """
+        from cli_agent_orchestrator.api import main
+        from cli_agent_orchestrator.plugins.registry import PluginRegistry
+        from cli_agent_orchestrator.services import generation_fence as gf
+        from cli_agent_orchestrator.services import heartbeat_store
+
+        companion = tmp_path / "companion"
+        terminal_id = "a1b2c3d4"
+        generation = "generation-inbox-race"
+        attempt_id = str(uuid.uuid4())
+        token = heartbeat_store.issue_fencing_token(companion, terminal_id, generation, attempt_id)
+        admission_entered = asyncio.Event()
+        release_admission = asyncio.Event()
+        create_started = asyncio.Event()
+        park_started = asyncio.Event()
+        immediate_delivery = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        message = SimpleNamespace(
+            id=73,
+            sender_id="sender-1",
+            receiver_id=terminal_id,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        async def hold_managed_admission():
+            async with gf.async_admission_critical_section(
+                companion,
+                terminal_id,
+                generation,
+                attempt_id=attempt_id,
+                fencing_token_id=token.id,
+            ):
+                admission_entered.set()
+                await release_admission.wait()
+
+        def create_behind_successor_lock(*_args):
+            loop.call_soon_threadsafe(create_started.set)
+            with heartbeat_store.successor_critical_section(companion, terminal_id):
+                return message
+
+        def deliver_immediately(*_args, **_kwargs):
+            loop.call_soon_threadsafe(immediate_delivery.set)
+
+        def park_behind_successor_lock():
+            loop.call_soon_threadsafe(park_started.set)
+            with heartbeat_store.successor_critical_section(companion, terminal_id):
+                return gf.install_park(
+                    companion,
+                    fencing_token_id=token.id,
+                    request={
+                        "schema": gf.PARK_REQUEST_SCHEMA,
+                        "operation_id": str(uuid.uuid4()),
+                        "reservation_id": str(uuid.uuid4()),
+                        "terminal_id": terminal_id,
+                        "terminal_generation": generation,
+                        "logical_task_id": "inbox-race-task",
+                        "retained_round": 0,
+                        "obligation_generation": "obligation-inbox-race",
+                        "attempt_id": attempt_id,
+                        "report_sha256": "a" * 64,
+                    },
+                )
+
+        monkeypatch.setattr(main, "create_inbox_message", create_behind_successor_lock)
+        monkeypatch.setattr(main.inbox_service, "deliver_pending", deliver_immediately)
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(plugin_registry=PluginRegistry()))
+        )
+
+        admission = asyncio.create_task(hold_managed_admission())
+        await asyncio.wait_for(admission_entered.wait(), timeout=1)
+        post = asyncio.create_task(
+            main.create_inbox_message_endpoint(request, terminal_id, "sender-1", "hello", [])
+        )
+        await asyncio.wait_for(create_started.wait(), timeout=1)
+        park = asyncio.create_task(asyncio.to_thread(park_behind_successor_lock))
+        await asyncio.wait_for(park_started.wait(), timeout=1)
+
+        # Both sync paths are blocked in workers, so the event loop can still
+        # schedule the admission release.  This is the regression oracle.
+        tick = asyncio.Event()
+        loop.call_soon(tick.set)
+        await asyncio.wait_for(tick.wait(), timeout=1)
+        release_admission.set()
+
+        response, park_result, _ = await asyncio.wait_for(
+            asyncio.gather(post, park, admission), timeout=3
+        )
+        assert response["message_id"] == message.id
+        assert park_result["outcome"] == gf.OUTCOME_FENCED
+        assert immediate_delivery.is_set()
 
 
 class TestWebSocketLocalhostRestriction:
