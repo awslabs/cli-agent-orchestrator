@@ -282,11 +282,11 @@ NATIVE_ID_SOURCES = {
     PROVIDER_CODEX: "app_server_thread_start",  # app-server thread/start id
     PROVIDER_KIMI: "acp_session_new",  # ACP session/new sessionId
     PROVIDER_CLAUDE: "cli_session_id",  # explicit --session-id <uuid> at start
-    # Muse Code binds a caller-provided --session-id only on the headless
-    # `muse exec` surface (the interactive TUI rejects the flag); the id source
-    # is the minted session id passed to `muse exec`. native_tui is a
-    # documented follow-up until the TUI's session-creation path is proven.
-    PROVIDER_MUSE: "muse_exec_session_id",
+    # Muse's accepted interactive lifecycle resumes a caller-chosen id
+    # (`muse resume <id>`, verified on the installed 0.1.0-R708.1 build);
+    # the id source is the minted session id, chosen before any provider
+    # I/O exactly like Claude's.
+    PROVIDER_MUSE: "cli_session_id",
 }
 
 #: The reserved ``expected_effort`` meaning "this route selects no effort;
@@ -627,6 +627,7 @@ def validate_resume_argv(provider: str, argv: list[str]) -> ResumeForm:
       codex:  ``codex resume <id>`` · ``codex exec resume <id>``
       kimi:   ``--session <id>`` · ``-S <id>`` · ``-r <id>``
       claude: ``--resume <uuid>``
+      muse:   ``muse resume <id>``
     Forbidden forms refuse with zero provider I/O.
     """
     if provider not in PROVIDERS:
@@ -681,6 +682,21 @@ def validate_resume_argv(provider: str, argv: list[str]) -> ResumeForm:
         if str(parsed) != native_id:
             raise ResumeFormRefused("claude resume native id must be a canonical lowercase UUID")
         return ResumeForm(provider, tuple(args), native_id)
+    if provider == PROVIDER_MUSE:
+        # The installed interactive lifecycle is ``muse resume <id>``: the
+        # TUI binds the exact caller-chosen id (verified on 0.1.0-R708.1).
+        if len(args) == 2 and args[0] == "resume" and args[1] and not args[1].startswith("-"):
+            native_id = args[1]
+            try:
+                parsed = _uuid_module.UUID(native_id)
+            except ValueError as exc:
+                raise ResumeFormRefused(
+                    "muse resume native id must be a canonical UUID; " f"got {native_id!r}"
+                ) from exc
+            if str(parsed) != native_id:
+                raise ResumeFormRefused("muse resume native id must be a canonical lowercase UUID")
+            return ResumeForm(provider, tuple(args), native_id)
+        raise ResumeFormRefused("muse resume accepts exactly `muse resume <id>`")
     raise ResumeFormRefused("claude resume accepts exactly `--resume <uuid>`")
 
 

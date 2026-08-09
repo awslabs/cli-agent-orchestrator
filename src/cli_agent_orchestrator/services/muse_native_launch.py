@@ -1,53 +1,56 @@
 """The Muse argv forms a managed native session is allowed to use.
 
-Muse Code 0.1.0 binds a caller-provided session id **only** on the headless
-``muse exec`` surface (``--session-id <uuid>``); the interactive TUI rejects the
-flag and mints its session internally after its first turn. So, like Claude's
-native path, Muse's native identity is *chosen* (an input) rather than
-discovered (a result): a canonical UUID is minted before any provider I/O and
-handed to ``muse exec`` as ``--session-id <uuid>``.
+Muse Code 0.1.0's accepted interactive lifecycle resumes a caller-provided
+session id through the TUI: ``muse resume <id>`` starts the interactive,
+multi-turn interface bound to exactly that id (verified on the installed
+0.1.0-R708.1 build: caller-chosen id, exact fresh-pane TUI resume, context
+carry, pane-kill/process exit, and explicit model/effort changes).  Like
+Claude's native path, Muse's native identity is *chosen* (an input) rather
+than discovered (a result): a canonical UUID is minted before any provider
+I/O and handed to ``muse resume <id>``.
 
-Consequence to name (a documented first-version limitation, not a silent one):
-``muse exec`` is a one-shot headless runner, not an interactive multi-turn TUI.
-The managed launch therefore carries the assigned task as the exec invocation's
-initial prompt (pre-bound in argv) rather than admitting task bytes into an
-interactive prompt after launch. The pane shows the exec output, not a usable
-provider UI. ``native_tui``-style interactive operation is a follow-up pending
-a proven TUI session-mint.
+This supersedes the earlier one-shot ``muse exec --session-id <uuid>``
+contract.  ``muse exec`` pre-bound the assigned task as the invocation's
+initial prompt and produced no usable interactive provider UI; the accepted
+interactive lifecycle resumes the id and admits task bytes into the running
+TUI exactly like the other native harnesses.
 
 Two argv forms exist and nothing else is accepted:
 
-    launch    muse exec --session-id <uuid> [profile args] <initial prompt>
-    recover   muse exec --session-id <uuid> [profile args] <initial prompt>
+    launch    muse resume <id> [profile args]
+    recover   muse resume <id> [profile args]
 
-Every recency-derived form is refused by construction. The identity option
-``--session-id`` leads; a caller cannot smuggle a second identity option past
-``_validated_extra_args``.
+Every recency-derived form is refused by construction.  The identity
+subcommand ``resume`` leads and its argument is the exact id; a caller
+cannot smuggle a second identity option past ``_validated_extra_args``.
 """
 
 from __future__ import annotations
 
 import re
 import uuid as _uuid_module
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 from cli_agent_orchestrator.services import provider_contracts
 
-#: The flag that *assigns* an identity at launch. Its argument is mandatory
-#: (``--session-id <uuid>``), so a missing value is a startup error rather
-#: than a silent fallback.
-LAUNCH_OPTION = "--session-id"
+#: The subcommand that resumes an exact identity at launch.  Its argument
+#: is mandatory (``muse resume <id>``), so a missing value is a startup
+#: error rather than a silent fallback.
+RESUME_COMMAND = "resume"
 
 #: Options that would rebind the identity to a different session or to the
-#: most recent one. None of these may appear in a managed native Muse launch.
+#: most recent one, or would disable the retained session log required by
+#: ``muse resume``.  None may appear in a managed native Muse launch.
 FORBIDDEN_OPTIONS = frozenset(
     {
-        "--resume",
-        "-r",
+        "--session-id",
+        "-s",
+        "--exec",
         "--last",
         "-c",
         "--continue",
         "--fork-session",
+        "--no-session-log",
     }
 )
 
@@ -96,58 +99,53 @@ def validate_session_id(session_id: str) -> str:
 def _validated_extra_args(extra_args: Optional[Iterable[str]]) -> List[str]:
     extra = list(extra_args or [])
     for arg in extra:
-        if arg in FORBIDDEN_OPTIONS or arg == LAUNCH_OPTION:
+        if arg in FORBIDDEN_OPTIONS or arg == RESUME_COMMAND:
             raise MuseNativeLaunchError(
-                f"{arg} would unbind the session identity and is never permitted "
-                "in a managed native Muse launch"
+                f"{arg} would violate exact session resumability and is never "
+                "permitted in a managed native Muse launch"
             )
     return extra
 
 
-def build_launch_argv(
+def build_resume_argv(
     *,
     session_id: str,
     muse_binary: str = "muse",
-    model: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
     extra_args: Optional[Iterable[str]] = None,
-    initial_prompt: Optional[str] = None,
 ) -> List[str]:
-    """``muse exec --session-id <uuid> [model/effort/extra] [initial prompt]``.
+    """``muse resume <id> [profile args]``.
 
-    The identity option leads; profile/model/effort arguments follow; the
-    assigned task travels as the exec invocation's initial prompt (see module
-    docstring: ``muse exec`` is one-shot, so the task is pre-bound in argv).
+    The identity subcommand leads and its argument is the exact id, so no
+    optional positional prompt can be confused with the session id.  Muse's
+    global/profile options are placed after the identity pair.
     """
-    validate_session_id(session_id)
+    native_id = validate_session_id(session_id)
+    if not isinstance(muse_binary, str) or not muse_binary:
+        raise MuseNativeLaunchError("muse_binary must be a non-empty string")
     extra = _validated_extra_args(extra_args)
-    argv = [muse_binary, "exec", LAUNCH_OPTION, session_id, "--yolo"]
-    if model:
-        argv.extend(["--model", model])
-    if reasoning_effort:
-        argv.extend(["--reasoning-effort", reasoning_effort])
-    argv.extend(extra)
-    if initial_prompt:
-        argv.append(initial_prompt)
-    return argv
+    provider_contracts.validate_resume_argv(
+        provider_contracts.PROVIDER_MUSE, [RESUME_COMMAND, native_id]
+    )
+    return [muse_binary, RESUME_COMMAND, native_id, *extra]
 
 
-def binds_exactly(argv: List[str], session_id: str) -> bool:
+def resumes_exactly(argv: Sequence[str], session_id: str) -> bool:
     """Whether ``argv`` binds exactly this session and no other.
 
-    ``muse exec --session-id <uuid>`` is the only accepted identity form for the
-    installed 0.1.0 (the interactive TUI rejects the flag), so the check requires
-    exactly one ``--session-id`` occurrence whose value equals the minted id.
+    ``muse resume <id>`` is the only accepted identity form; the check
+    requires exactly one ``resume`` occurrence whose following argument
+    equals the minted id and forbids every recency/identity-rebinding form.
     """
     if not argv:
         return False
-    for arg in argv[1:]:
-        if arg in FORBIDDEN_OPTIONS:
+    values = list(argv)
+    for value in values[1:]:
+        if value in FORBIDDEN_OPTIONS:
             return False
-    occurrences = [index for index, arg in enumerate(argv) if arg == LAUNCH_OPTION]
-    if len(occurrences) != 1:
+    positions = [index for index, value in enumerate(values) if value == RESUME_COMMAND]
+    if len(positions) != 1:
         return False
-    index = occurrences[0]
+    index = positions[0]
     return index + 1 < len(argv) and argv[index + 1] == session_id
 
 
