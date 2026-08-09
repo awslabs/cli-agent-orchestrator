@@ -271,6 +271,16 @@ Each provider has a dedicated workflow that runs only when its files change:
 
 Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
 
+### Docs Site Workflow (`gh-pages.yml`)
+
+Builds the Docusaurus site (`docusaurus/`) on every PR and push to `main` for a
+build signal, but only **deploys** to GitHub Pages on the upstream repo
+(`awslabs/cli-agent-orchestrator`) by default — forks don't have Pages enabled,
+so `actions/deploy-pages` would otherwise fail with a 404. Fork maintainers can
+opt in by enabling GitHub Pages in their fork and setting the `DEPLOY_DOCS_PAGES`
+repository variable to `true`; see [docusaurus/README.md](docusaurus/README.md#deploying-on-a-fork)
+for the full steps.
+
 ## Working with Providers
 
 ### Test Against a Real Provider CLI
