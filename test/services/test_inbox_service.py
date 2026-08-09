@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import os
 import threading
+import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -1678,9 +1679,144 @@ class TestNativeManagedV2InboxDelivery:
             MessageStatus.DELIVERED
         )
 
+    def test_native_generation_fence_terminalizes_the_claimed_inbox_row(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv0005f"
+        generation = "gen-native-fenced"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        database.create_inbox_message("supervisor-1", terminal_id, "never retarget me")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(REFUSED, "generation-fenced")
+
+        self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        InboxService().deliver_pending(terminal_id)
+        InboxService().deliver_pending(terminal_id)
+
+        assert len(control_calls) == 1
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == MessageStatus.FAILED
+
         # Terminalized: no third pass has any effect.
         InboxService().deliver_pending(terminal_id)
-        assert len(control_calls) == 2
+        assert len(control_calls) == 1
+
+    def test_stale_native_head_does_not_starve_the_current_generation_row(
+        self, isolated_memory_db, monkeypatch
+    ):
+        """Default one-message delivery scans through failed G1 work to valid G2."""
+        terminal_id = "ntv0005e"
+        old_generation = "gen-native-old"
+        generation = "gen-native-current"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        stale = database.create_inbox_message("supervisor-1", terminal_id, "old G1")
+        current = database.create_inbox_message("supervisor-1", terminal_id, "current G2")
+        with database.SessionLocal() as db:
+            db.query(database.InboxModel).filter_by(id=stale.id).update(
+                {"expected_receiver_generation": old_generation}
+            )
+            db.commit()
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert control_calls == [
+            (
+                terminal_id,
+                {
+                    "text": "current G2",
+                    "expected_identity": {
+                        "terminal_id": terminal_id,
+                        "terminal_generation": generation,
+                    },
+                },
+            )
+        ]
+        with database.SessionLocal() as db:
+            statuses = {
+                row.id: MessageStatus(row.status)
+                for row in db.query(database.InboxModel).filter_by(receiver_id=terminal_id).all()
+            }
+        assert statuses == {stale.id: MessageStatus.FAILED, current.id: MessageStatus.DELIVERED}
+
+    def test_pre_m3_generationless_g1_row_cannot_retarget_g2_after_park(
+        self, isolated_memory_db, monkeypatch, tmp_path
+    ):
+        """Crash-equivalent old rows remain visible terminal history, never G2 input."""
+        from cli_agent_orchestrator import constants
+        from cli_agent_orchestrator.services import generation_fence
+
+        companion = tmp_path / "companion"
+        monkeypatch.setattr(constants, "COMPANION_DIR", companion)
+        terminal_id = "ntv000g1"
+        g1 = "gen-native-g1"
+        g2 = "gen-native-g2"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", g1)
+        # Deliberately bypass the current creation helper: this models a
+        # pre-M3 row from before exact receiver-generation binding existed.
+        with database.SessionLocal() as db:
+            row = database.InboxModel(
+                sender_id="supervisor-1",
+                receiver_id=terminal_id,
+                message="old G1 work",
+                status=MessageStatus.PENDING.value,
+                expected_receiver_generation=None,
+            )
+            db.add(row)
+            db.commit()
+            row_id = row.id
+            terminal = (
+                db.query(database.ManagedLaunchV2TerminalModel).filter_by(id=terminal_id).one()
+            )
+            terminal.generation = g2  # G1 parked; G2 is now the live receiver.
+            db.commit()
+        parked = generation_fence.install_park(
+            companion,
+            request={
+                "schema": generation_fence.PARK_REQUEST_SCHEMA,
+                "operation_id": str(uuid.uuid4()),
+                "reservation_id": str(uuid.uuid4()),
+                "terminal_id": terminal_id,
+                "terminal_generation": g1,
+                "logical_task_id": "task-g1",
+                "retained_round": 0,
+                "obligation_generation": "obligation-g1",
+                "attempt_id": str(uuid.uuid4()),
+                "report_sha256": "a" * 64,
+            },
+            fencing_token_id="token-g1",
+        )
+        assert parked["outcome"] == generation_fence.OUTCOME_FENCED
+        calls = []
+
+        def control(*args, **kwargs):
+            calls.append((args, kwargs))
+            return self._result(ACCEPTED)
+
+        self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", g2), control
+        )
+        InboxService().deliver_pending(terminal_id)
+        InboxService().reconcile_orphaned_messages()
+
+        stored = next(
+            row for row in database.get_inbox_messages(terminal_id, limit=10) if row.id == row_id
+        )
+        assert calls == []
+        assert stored is not None and stored.status == MessageStatus.FAILED
 
     def test_back_to_back_sender_runs_leave_the_guarded_run_pending(
         self, isolated_memory_db, monkeypatch

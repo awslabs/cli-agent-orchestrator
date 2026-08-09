@@ -51,6 +51,7 @@ import re
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
@@ -81,6 +82,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_COMPOSER_NONEMPTY,
     REASON_CONTROL_ROUTE_ABSENT,
     REASON_COPY_MODE_ACTIVE,
+    REASON_GENERATION_FENCED,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
     REASON_LINEAGE_UNPROVEN,
@@ -375,6 +377,69 @@ class ResolvedControlIdentity:
             "observed_server_socket_path": self.observed_server_socket_path,
         }
         return payload
+
+
+@contextmanager
+def provider_byte_admission(resolved: ResolvedControlIdentity, terminal_id: str, generation: str):
+    """Acquire the canonical managed byte-admission critical section.
+
+    Managed native writers cannot use the generation lock alone: a successor
+    token issuer holds the terminal lock before it reaches that lock.  Read
+    the immutable reservation binding, then let the shared helper acquire
+    successor -> revalidate exact binding -> generation lock around the pane
+    effect.  Legacy/unmanaged writers retain their existing generation-only
+    fence behavior.
+    """
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services import generation_fence
+
+    # Raw/unmanaged control retains its pre-M3 nonblocking pane-lease
+    # semantics. It has no managed generation authority and must not block a
+    # concurrent control before the lease can return its typed pane-busy
+    # result.
+    if not resolved.managed:
+        yield
+        return
+    # A legacy managed projection can lack a v2 reservation; it has no
+    # successor registry identity to revalidate and retains W13's
+    # generation-only path. A real v2 reservation must never take this
+    # fallback.
+    if not resolved.managed_reservation_id:
+        with generation_fence.admission_critical_section(COMPANION_DIR, terminal_id, generation):
+            yield
+        return
+
+    reservation_id = resolved.managed_reservation_id
+    try:
+        from cli_agent_orchestrator.services import managed_launch_v2
+
+        record = managed_launch_v2.get(reservation_id)
+        binding = record.get("binding") or {}
+        attempt_id = binding.get("attempt_id")
+        fencing_token_id = binding.get("fencing_token_id")
+    except Exception as exc:  # no exact provenance means no byte admission
+        raise generation_fence.FencedError(
+            "managed provider-byte admission cannot read immutable generation binding"
+        ) from exc
+    if (
+        record.get("terminal_id") != terminal_id
+        or record.get("generation") != generation
+        or not isinstance(attempt_id, str)
+        or not attempt_id
+        or not isinstance(fencing_token_id, str)
+        or not fencing_token_id
+    ):
+        raise generation_fence.FencedError(
+            "managed provider-byte admission immutable generation binding changed"
+        )
+    with generation_fence.managed_admission_critical_section(
+        COMPANION_DIR,
+        terminal_id,
+        generation,
+        attempt_id=attempt_id,
+        fencing_token_id=fencing_token_id,
+    ):
+        yield
 
 
 def _terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
@@ -1836,30 +1901,64 @@ def deliver_control_input(
 
     holder = f"control-input:{control_id}"
     try:
-        with pane_input_lease(resolved.pane_id, holder=holder, timeout=lease_timeout):
-            if normalized_events is not None:
-                return _deliver_sequence_under_lease(
+        # This is the provider-byte admission point for both literal and
+        # sequence controls.  The generation fence is intentionally outer to
+        # the pane lease: it spans final identity/readiness, journal claim,
+        # every literal chunk, and submit/chord without a check-then-write gap.
+        from cli_agent_orchestrator.services import generation_fence
+
+        assert binding.generation is not None
+        with provider_byte_admission(resolved, terminal_id, binding.generation):
+            with pane_input_lease(resolved.pane_id, holder=holder, timeout=lease_timeout):
+                if normalized_events is not None:
+                    return _deliver_sequence_under_lease(
+                        book,
+                        client,
+                        binding,
+                        events=normalized_events,
+                        terminal_id=terminal_id,
+                        resolved=resolved,
+                        digest=digest,
+                        declared_command=declared_command,
+                        declared_interactive=declared_interactive,
+                    )
+                return _deliver_under_lease(
                     book,
                     client,
                     binding,
-                    events=normalized_events,
+                    text=text,
+                    enter=enter,
+                    chord=chord,
                     terminal_id=terminal_id,
                     resolved=resolved,
                     digest=digest,
-                    declared_command=declared_command,
-                    declared_interactive=declared_interactive,
                 )
-            return _deliver_under_lease(
+    except generation_fence.FencedError as exc:
+        if normalized_events is not None:
+            return _record_sequence_refusal(
                 book,
-                client,
-                binding,
-                text=text,
-                enter=enter,
-                chord=chord,
+                control_id,
+                REASON_GENERATION_FENCED,
+                str(exc),
+                events=normalized_events,
                 terminal_id=terminal_id,
                 resolved=resolved,
                 digest=digest,
+                request_schema_version=(
+                    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+                    if declared_command or declared_interactive
+                    else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+                ),
             )
+        return _record_refusal(
+            book,
+            control_id,
+            REASON_GENERATION_FENCED,
+            str(exc),
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
     except PaneBusyError as exc:
         # Raised by the acquisition only; nothing inside the block can
         # produce it.  Nothing was written, so the control may be sent
@@ -4547,8 +4646,14 @@ def deliver_native_inbox_payload(
     client = _tmux_client()
     deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
     try:
-        with pane_input_lease(
-            resolved.pane_id, holder=f"inbox-payload:{terminal_id}", timeout=lease_timeout
+        from cli_agent_orchestrator.services import generation_fence
+
+        assert binding.generation is not None
+        with (
+            provider_byte_admission(resolved, terminal_id, binding.generation),
+            pane_input_lease(
+                resolved.pane_id, holder=f"inbox-payload:{terminal_id}", timeout=lease_timeout
+            ),
         ):
             # The same live re-read the control path requires: a pane that
             # died or was replaced between the resolution and the write is
@@ -4689,6 +4794,8 @@ def deliver_native_inbox_payload(
                 chunks_sent=transport.chunks_sent,
                 enter_sent=True,
             )
+    except generation_fence.FencedError as exc:
+        return NativePayloadResult(REFUSED, REASON_GENERATION_FENCED, str(exc))
     except PaneBusyError as exc:
         return NativePayloadResult(
             REFUSED,

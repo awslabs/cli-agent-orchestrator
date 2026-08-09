@@ -1,11 +1,12 @@
 ---
 created: 2026-05-30
-lastUpdated: 2026-07-30
-summary: "Reference for ordinary inbox delivery and the dedicated refusal-bound callback recovery protocol."
+lastUpdated: 2026-08-09
+summary: "Reference for ordinary inbox delivery, managed generation binding, and the dedicated refusal-bound callback recovery protocol."
 category: REFERENCE
 status: CURRENT
 note: "Current fork contract; callback recovery is not a general managed-message API."
 changelog:
+  - "2026-08-09: Generic inbox rows now capture the exact live managed-v2 receiver generation; parked, stale, and pre-M3 generationless rows are terminalized rather than retargeted."
   - "2026-07-30: Replaced generic bound messages with one-shot refusal/callback recovery."
   - "2026-07-30: Added exact-generation managed message binding."
 ---
@@ -37,7 +38,19 @@ operation only with the exact original callback inbox row. Open operations hold
 terminal deletion and retention cleanup. Blocking database and bridge work is
 offloaded from FastAPI's event loop.
 
-The existing generic `/inbox/messages` contract is unchanged.
+## Generic managed inbox generation binding
+
+`POST /terminals/{receiver}/inbox/messages` remains the ordinary generic
+message surface, but a live managed-v2 receiver now captures its exact current
+receiver generation while holding the terminal successor lock. Delivery
+revalidates that generation before choosing a bridge or native pane writer.
+
+A row for a parked generation, a row bound to an older generation, and a
+pre-M3 generationless row observed on a managed-v2 receiver are terminalized
+as visible failed history. They are never retargeted to a successor, never
+fall back to raw pane paste, and never remain pending solely because a parked
+head row preceded valid current-generation work. The park path eagerly applies
+the same cleanup; delivery repeats it as crash-recovery backstop.
 
 ## Overview
 

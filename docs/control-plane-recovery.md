@@ -64,6 +64,16 @@ v1 query and deleter has zero visibility into them.
   RPC. `fenced`/`already-fenced` are the only success outcomes and are
   idempotent on `intent_id`; a sealed generation rejects every
   post-fence input/tool admission at the bridge boundary.
+- **Park** (`POST /managed-launch/v2/park`): M3's immutable retained-round
+  operation. The request binds its operation/reservation, terminal and exact
+  generation, logical task/round, obligation/attempt, and report digest. The
+  fork persists the receipt under the same generation lock and adopts a
+  compatible W13 receipt rather than clearing or replacing it. A lost reply is
+  reconciled read-only at `GET /managed-launch/v2/park/{terminal}/{generation}/{operation}`;
+  a changed intent is a conflict, while an exact retry returns the original
+  receipt even after a successor exists. All provider-byte lanes (native and
+  ACP admission, follow-up, native control/operator input, and native inbox)
+  hold that same lock through their final check and actual submission.
 
 Provider contracts are pinned: Codex resume is exactly
 `codex resume <id>` / `codex exec resume <id>`; Kimi is

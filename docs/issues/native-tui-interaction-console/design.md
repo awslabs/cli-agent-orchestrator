@@ -31,7 +31,8 @@ grace — a focused Fable P1 delta gate is required before that amended
 contract merges; r16 keeps its acceptance honest per build — Claude
 2.1.220 queues `/model`-class commands mid-turn rather than opening a
 menu (pinned provider limit, live-proven; Kimi's full menu/steer
-acceptance passes))
+acceptance passes); M3 generation-fence amendment recorded on 2026-08-09
+(absorbing `generation-fenced` refusal, no post-park provider bytes))
 
 Task ID: `native-tui-console/spec-initial-v1`
 
@@ -96,6 +97,11 @@ can check every claim without re-walking the tree.
   `stale-generation`, `identity-mismatch`, `pane-dead`, `pane-busy`,
   `copy-mode-active`, `write-deadline`, `request-rebound`, `response-lost`,
   `write-incomplete`, `owner-lost-before-write`, `owner-lost-mid-write`.
+- **M3 amendment (2026-08-09):** `generation-fenced` is a typed
+  `refused` outcome decided under the managed successor → generation fence
+  lock before any literal chunk or submit key. It is absorbing for that
+  generation: the client must advance to a successor and must not retry the
+  parked control id or payload.
 - Key/chord membership is deliberately **not** enforced by the digest path
   (`:617-624`): a digest must be computable for a request the server will
   then refuse, so the two sides never disagree about which requests exist.

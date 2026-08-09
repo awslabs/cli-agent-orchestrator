@@ -109,6 +109,7 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     ManagedLaunchV2NegativeRequest,
     ManagedLaunchV2ReserveRequest,
     ManagedV2FenceInstallRequest,
+    ManagedV2ParkRequest,
 )
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
@@ -2558,6 +2559,231 @@ async def install_managed_fence(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
+@app.post("/managed-launch/v2/park")
+async def install_managed_park(
+    body: ManagedV2ParkRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Install or reconcile the exact M3 parked-generation receipt.
+
+    The durable receipt is written by the fork under the provider-byte fence
+    lock.  This route never infers a successor from the caller: it resolves
+    the v2 reservation and current fencing token from fork-owned records.
+    """
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services import generation_fence, heartbeat_store
+
+    def _install() -> Dict[str, Any]:
+        from cli_agent_orchestrator.clients import database
+
+        with database.SessionLocal() as db:
+            row = (
+                db.query(database.ManagedLaunchV2ReservationModel)
+                .filter(
+                    database.ManagedLaunchV2ReservationModel.reservation_id == body.reservation_id
+                )
+                .first()
+            )
+            if (
+                row is None
+                or str(row.terminal_id) != body.terminal_id
+                or str(row.generation) != body.terminal_generation
+            ):
+                return {
+                    "schema": generation_fence.PARK_RESPONSE_SCHEMA,
+                    "outcome": generation_fence.OUTCOME_UNKNOWN_GENERATION,
+                    "park_receipt": None,
+                    "park_receipt_sha256": None,
+                }
+            if str(row.obligation_generation) != body.obligation_generation:
+                raise generation_fence.ParkRequestError(
+                    "park obligation_generation does not match the reservation row"
+                )
+            if str(row.task_id) != body.logical_task_id:
+                raise generation_fence.ParkRequestError(
+                    "park logical_task_id does not match the reservation row"
+                )
+            try:
+                binding = json.loads(str(row.binding_json)) if row.binding_json else None
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise generation_fence.ParkRequestError(
+                    "park requires a readable immutable native binding"
+                ) from exc
+            if not isinstance(binding, dict):
+                raise generation_fence.ParkRequestError(
+                    "park requires an immutable bound reservation; unbound generations cannot park"
+                )
+            attempt_id = binding.get("attempt_id")
+            fencing_token_id = binding.get("fencing_token_id")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                raise generation_fence.ParkRequestError("park binding omitted immutable attempt_id")
+            if not isinstance(fencing_token_id, str) or not fencing_token_id:
+                raise generation_fence.ParkRequestError(
+                    "park binding omitted immutable fencing_token_id"
+                )
+            if body.attempt_id != attempt_id:
+                raise generation_fence.ParkRequestError(
+                    "park attempt_id does not match the journaled native binding"
+                )
+        request = body.model_dump(mode="json", by_alias=True)
+
+        def _terminalize_generationless_pending() -> None:
+            # Pre-M3 generic rows have no exact-generation binding. They may
+            # not drift onto a successor after this park receipt; preserve a
+            # visible terminal state instead of silently retrying forever.
+            with database.SessionLocal() as db:
+                (
+                    db.query(database.InboxModel)
+                    .filter(
+                        database.InboxModel.receiver_id == body.terminal_id,
+                        database.InboxModel.status == MessageStatus.PENDING.value,
+                        database.InboxModel.expected_receiver_generation.is_(None),
+                    )
+                    .update({database.InboxModel.status: MessageStatus.FAILED.value})
+                )
+                db.commit()
+
+        # The terminal successor lock precedes the exact-generation lock in
+        # every managed effect. Check an existing operation first so an exact
+        # lost-response retry still adopts its receipt after a successor.
+        with heartbeat_store.successor_critical_section(COMPANION_DIR, body.terminal_id):
+            # Re-read the immutable reservation under the terminal lock. The
+            # preflight above makes ordinary malformed calls cheap, but only
+            # this locked read is the authority for a durable park receipt.
+            with database.SessionLocal() as db:
+                locked_row = (
+                    db.query(database.ManagedLaunchV2ReservationModel)
+                    .filter(
+                        database.ManagedLaunchV2ReservationModel.reservation_id
+                        == body.reservation_id
+                    )
+                    .first()
+                )
+                if (
+                    locked_row is None
+                    or str(locked_row.terminal_id) != body.terminal_id
+                    or str(locked_row.generation) != body.terminal_generation
+                ):
+                    return {
+                        "schema": generation_fence.PARK_RESPONSE_SCHEMA,
+                        "outcome": generation_fence.OUTCOME_UNKNOWN_GENERATION,
+                        "park_receipt": None,
+                        "park_receipt_sha256": None,
+                    }
+                if (
+                    str(locked_row.obligation_generation) != body.obligation_generation
+                    or str(locked_row.task_id) != body.logical_task_id
+                ):
+                    raise generation_fence.ParkRequestError(
+                        "park immutable reservation identity does not match"
+                    )
+                try:
+                    locked_binding = (
+                        json.loads(str(locked_row.binding_json))
+                        if locked_row.binding_json
+                        else None
+                    )
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise generation_fence.ParkRequestError(
+                        "park requires a readable immutable native binding"
+                    ) from exc
+                if not isinstance(locked_binding, dict):
+                    raise generation_fence.ParkRequestError(
+                        "park requires an immutable bound reservation; unbound generations cannot park"
+                    )
+                attempt_id = locked_binding.get("attempt_id")
+                fencing_token_id = locked_binding.get("fencing_token_id")
+                if (
+                    not isinstance(attempt_id, str)
+                    or not attempt_id
+                    or not isinstance(fencing_token_id, str)
+                    or not fencing_token_id
+                    or body.attempt_id != attempt_id
+                ):
+                    raise generation_fence.ParkRequestError(
+                        "park attempt/token does not match the immutable native binding"
+                    )
+            adopted = generation_fence.query_park(
+                COMPANION_DIR,
+                terminal_id=body.terminal_id,
+                generation=body.terminal_generation,
+                operation_id=body.operation_id,
+            )
+            if adopted["outcome"] != "not-found":
+                receipt = adopted.get("park_receipt") or {}
+                immutable = (
+                    "operation_id",
+                    "reservation_id",
+                    "terminal_id",
+                    "terminal_generation",
+                    "logical_task_id",
+                    "retained_round",
+                    "obligation_generation",
+                    "attempt_id",
+                    "report_sha256",
+                )
+                if any(receipt.get(field) != request.get(field) for field in immutable):
+                    raise generation_fence.ParkRequestError(
+                        "park operation already exists with a different immutable intent"
+                    )
+                _terminalize_generationless_pending()
+                return adopted
+            try:
+                heartbeat_store.assert_current_fencing_binding(
+                    COMPANION_DIR,
+                    terminal_id=body.terminal_id,
+                    generation=body.terminal_generation,
+                    attempt_id=attempt_id,
+                    fencing_token_id=fencing_token_id,
+                )
+            except heartbeat_store.FencingRefused:
+                return generation_fence.install_park(
+                    COMPANION_DIR,
+                    request=request,
+                    fencing_token_id=fencing_token_id,
+                    superseded=True,
+                )
+            result = generation_fence.install_park(
+                COMPANION_DIR,
+                request=request,
+                fencing_token_id=fencing_token_id,
+            )
+            if result["outcome"] in {
+                generation_fence.OUTCOME_FENCED,
+                generation_fence.OUTCOME_ALREADY_FENCED,
+            }:
+                _terminalize_generationless_pending()
+            return result
+
+    try:
+        return await asyncio.to_thread(_install)
+    except generation_fence.FenceError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@app.get("/managed-launch/v2/park/{terminal_id}/{generation}/{operation_id}")
+async def reconcile_managed_park(
+    terminal_id: str,
+    generation: str,
+    operation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Read-only exact M3 park reconciliation after response loss/restart."""
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services import generation_fence
+
+    try:
+        return await asyncio.to_thread(
+            generation_fence.query_park,
+            COMPANION_DIR,
+            terminal_id=terminal_id,
+            generation=generation,
+            operation_id=operation_id,
+        )
+    except generation_fence.FenceError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
 @app.post("/managed/destructive")
 async def execute_conditional_destructive(
     request: Request,
@@ -4272,7 +4498,12 @@ async def create_inbox_message_endpoint(
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
     try:
-        inbox_msg = create_inbox_message(
+        # Managed-v2 creation takes the terminal successor flock to bind an
+        # exact receiver generation.  Never wait for that OS lock on the
+        # ASGI loop: a native admission can own it while awaiting tmux/readiness
+        # work on this same loop.
+        inbox_msg = await asyncio.to_thread(
+            create_inbox_message,
             sender_id,
             receiver_id,
             message,
@@ -4288,7 +4519,14 @@ async def create_inbox_message_endpoint(
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+        # This path includes synchronous DB, successor/fence, bridge, and
+        # native-pane work.  Keeping it off-loop gives the admission that
+        # owns a predecessor lock a chance to complete and release it.
+        await asyncio.to_thread(
+            inbox_service.deliver_pending,
+            receiver_id,
+            registry=get_plugin_registry(request),
+        )
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 

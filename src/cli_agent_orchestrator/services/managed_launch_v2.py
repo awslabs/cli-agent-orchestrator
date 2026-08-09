@@ -4522,7 +4522,7 @@ def _reconcile_native_admission(
     )
 
 
-async def _admit_native_tui(
+async def _admit_native_tui_under_fence(
     reservation_id: str,
     record: dict[str, Any],
     request: ManagedLaunchV2AdmitRequest,
@@ -4708,22 +4708,46 @@ async def _admit_native_tui(
         observer="managed_launch_v2.admit_reserved",
     )
     try:
-        operation = await asyncio.to_thread(
-            native_control.queue,
-            operation_id=request.delivery_id,
-            native_session_id=identity["native_session_id"],
-            terminal_id=record["terminal_id"],
-            generation=record["generation"],
-            execution_mode=em.NATIVE_TUI,
-            text=request.message,
-            observation=observation,
-            transport=TmuxPaneInput(identity["pane_id"]),
-            # The version the generation was *bound* to, not one probed
-            # now. Which keystroke breaks a composer line without sending
-            # is a fact about the build that is running, and the binding
-            # is the record of which build that is.
-            provider_version=(record.get("binding") or {}).get("provider_version"),
+        loop = asyncio.get_running_loop()
+        effect = loop.run_in_executor(
+            None,
+            partial(
+                native_control.queue,
+                operation_id=request.delivery_id,
+                native_session_id=identity["native_session_id"],
+                terminal_id=record["terminal_id"],
+                generation=record["generation"],
+                execution_mode=em.NATIVE_TUI,
+                text=request.message,
+                observation=observation,
+                transport=TmuxPaneInput(identity["pane_id"]),
+                # The version the generation was *bound* to, not one probed
+                # now. Which keystroke breaks a composer line without sending
+                # is a fact about the build that is running, and the binding
+                # is the record of which build that is.
+                provider_version=(record.get("binding") or {}).get("provider_version"),
+            ),
         )
+        try:
+            operation = await asyncio.shield(effect)
+        except asyncio.CancelledError:
+            # The executor Future, rather than this coroutine, owns the pane
+            # effect. A shutdown can cancel both this task and its outer
+            # request task; retain the admission lock until that Future is
+            # finished despite any number of repeated cancellations.
+            while not effect.done():
+                try:
+                    await asyncio.shield(effect)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if effect.done():
+                try:
+                    effect.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+            raise
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
         # Deliberately conservative. The adapter turns transport failures
         # into ambiguous records itself, so an exception escaping it is a
@@ -4744,6 +4768,67 @@ async def _admit_native_tui(
     )
 
 
+async def _admit_native_tui(
+    reservation_id: str,
+    record: dict[str, Any],
+    request: ManagedLaunchV2AdmitRequest,
+) -> dict[str, Any]:
+    """Run native admission under the shared generation linearization lock.
+
+    The async wrapper acquires/releases flock off-loop and holds it across
+    final identity/readiness, durable admission claim, and adapter/tmux I/O.
+    """
+    import asyncio
+
+    binding = record.get("binding") or {}
+    attempt_id = binding.get("attempt_id")
+    fencing_token_id = binding.get("fencing_token_id")
+    if not isinstance(attempt_id, str) or not isinstance(fencing_token_id, str):
+        raise ManagedLaunchConflict(
+            "native admission requires an immutable bound attempt and fencing token"
+        )
+    async with generation_fence.async_admission_critical_section(
+        COMPANION_DIR,
+        record["terminal_id"],
+        record["generation"],
+        attempt_id=attempt_id,
+        fencing_token_id=fencing_token_id,
+    ):
+        # ``to_thread`` cancellation only cancels the awaiter, not tmux/native
+        # control work already running in its worker.  Do not release the two
+        # admission locks until that worker has reached its durable outcome:
+        # otherwise park could return while a cancelled caller's queue still
+        # emits provider bytes.  The API caller still observes cancellation,
+        # but only after the no-post-park-byte invariant is restored.
+        delivery = asyncio.create_task(
+            _admit_native_tui_under_fence(reservation_id, record, request)
+        )
+        try:
+            return await asyncio.shield(delivery)
+        except asyncio.CancelledError:
+            # A task may be cancelled repeatedly while its caller is being
+            # torn down. Each cancellation interrupts *this* await, not the
+            # thread-backed delivery, so keep the ownership handoff alive
+            # until the worker's task is conclusively done. Releasing the
+            # outer fence after a second cancellation would let park publish
+            # while a still-running tmux worker emits its remaining bytes.
+            while not delivery.done():
+                try:
+                    await asyncio.shield(delivery)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if delivery.done():
+                try:
+                    delivery.result()
+                except (asyncio.CancelledError, Exception):
+                    # Delivery has a durable outcome (or already recorded an
+                    # ambiguity); the caller's cancellation remains primary.
+                    pass
+            raise
+
+
 async def admit_reserved(
     reservation_id: str,
     request: ManagedLaunchV2AdmitRequest,
@@ -4759,11 +4844,6 @@ async def admit_reserved(
     )
 
     record = get(reservation_id)
-    # The fence check is the admission boundary: a sealed generation
-    # rejects every post-fence input with zero provider I/O.
-    generation_fence.assert_admission_open(
-        COMPANION_DIR, record["terminal_id"], record["generation"]
-    )
     # Admission branches on the immutable mode exactly as launch does,
     # and the two branches share no code below this point. The ACP bridge
     # is a lawful admission transport for ACP rows only: a native
@@ -4774,7 +4854,38 @@ async def admit_reserved(
     if record["execution_mode"] == em.NATIVE_TUI:
         return await _admit_native_tui(reservation_id, record, request)
 
-    record, should_send = claim_admission(reservation_id, request)
+    binding = record.get("binding") or {}
+    attempt_id = binding.get("attempt_id")
+    fencing_token_id = binding.get("fencing_token_id")
+    if not isinstance(attempt_id, str) or not isinstance(fencing_token_id, str):
+        raise ManagedLaunchConflict(
+            "ACP admission requires an immutable bound attempt and fencing token"
+        )
+    try:
+        # Claim only after the canonical successor -> generation fence
+        # recheck.  A known parked generation records a durable pre-I/O
+        # refusal, never an io-attempted/ambiguous admission.
+        async with generation_fence.async_admission_critical_section(
+            COMPANION_DIR,
+            record["terminal_id"],
+            record["generation"],
+            attempt_id=attempt_id,
+            fencing_token_id=fencing_token_id,
+        ):
+            record, should_send = await asyncio.to_thread(claim_admission, reservation_id, request)
+    except generation_fence.FencedError as exc:
+        return await asyncio.to_thread(
+            refuse_admission_before_io,
+            reservation_id,
+            request,
+            "generation_fenced",
+            str(exc),
+            observation={
+                "kind": "generation_fenced",
+                "terminal_id": record["terminal_id"],
+                "generation": record["generation"],
+            },
+        )
     if not should_send:
         if record["state"] == "admitting":
             state = read_state(reservation_id)
@@ -4804,6 +4915,19 @@ async def admit_reserved(
         receipt = state.get("submission") if state else None
         if isinstance(receipt, dict):
             return complete_admission(reservation_id, request.delivery_id, receipt)
+        # The bridge's fence boundary proves it rejected before provider I/O.
+        # It is not a generic response-loss ambiguity even if a park landed
+        # after the local locked claim and before bridge entry.
+        if str(exc).startswith(
+            ("w13-fenced-before-provider-io:", "successor-fenced-before-provider-io:")
+        ):
+            return await asyncio.to_thread(
+                mark_admission_refused,
+                reservation_id,
+                request.delivery_id,
+                "generation_fenced",
+                str(exc),
+            )
         return mark_admission_ambiguous(reservation_id, request.delivery_id, str(exc))
     receipt = response.get("receipt")
     if not isinstance(receipt, dict):

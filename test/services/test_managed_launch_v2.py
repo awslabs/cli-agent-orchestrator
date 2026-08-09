@@ -371,7 +371,9 @@ def test_admission_lifecycle_and_ambiguity(isolated_memory_db, worktree, tmp_pat
     assert ambiguous["admission"]["status"] == "ambiguous_preserved"
 
 
-def test_fenced_generation_rejects_admission(isolated_memory_db, worktree, tmp_path, monkeypatch):
+def test_fenced_generation_refuses_acp_admission_before_claim_or_provider_io(
+    isolated_memory_db, worktree, tmp_path, monkeypatch
+):
     request = _reserve_request(worktree, tmp_path)
     record, _ = v2.reserve(request)
     v2.claim_launch(record["reservation_id"])
@@ -395,16 +397,103 @@ def test_fenced_generation_rejects_admission(isolated_memory_db, worktree, tmp_p
         fencing_token_id=bound["binding"]["fencing_token_id"],
     )
 
-    async def _admit():
-        return await v2.admit_reserved(
-            record["reservation_id"],
-            _admit_request(bound, v2.native_binding_digest(bound)),
-        )
+    bridge_calls = []
+    monkeypatch.setattr(
+        bridge,
+        "request_bridge",
+        lambda *args, **kwargs: bridge_calls.append((args, kwargs)),
+    )
 
     import asyncio
 
-    with pytest.raises(gf.FencedError):
-        asyncio.run(_admit())
+    refused = asyncio.run(
+        v2.admit_reserved(
+            record["reservation_id"],
+            _admit_request(bound, v2.native_binding_digest(bound)),
+        )
+    )
+
+    assert refused["admission"]["status"] == "refused"
+    assert refused["admission"]["refusal_reason"] == "generation_fenced"
+    assert refused["admission"]["retryable"] is False
+    assert bridge_calls == []
+
+
+def test_acp_fence_after_durable_claim_converges_to_permanent_zero_io_refusal(
+    isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """A bridge's known pre-I/O fence result is not response-loss ambiguity.
+
+    This uses the exact request-bridge seam: the claim has committed before
+    the bridge call begins, then the bridge's own pre-provider admission
+    detects a just-installed W13 fence.  It is deliberately distinct from
+    the fence-before-claim test above.
+    """
+    request = _reserve_request(worktree, tmp_path)
+    record, _ = v2.reserve(request)
+    v2.claim_launch(record["reservation_id"])
+    _ready_bridge_state(record, monkeypatch)
+    bound = v2.bind_native(record["reservation_id"], _bind_request(record))
+    admit = _admit_request(bound, v2.native_binding_digest(bound))
+    from cli_agent_orchestrator.services import generation_fence as gf
+
+    durable_claims = []
+    provider_byte_calls = []
+    receipt_calls = []
+
+    def request_bridge_after_park(reservation_id, command, *, timeout):
+        # ``claim_admission`` committed before `request_bridge` is reached.
+        claimed = v2.get(reservation_id)
+        durable_claims.append(claimed["admission"])
+        assert claimed["state"] == "admitting"
+        assert claimed["admission"]["status"] == "io-attempted"
+        assert command["delivery_id"] == admit.delivery_id
+
+        gf.install_fence(
+            tmp_path / "companion",
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            vintage="v2",
+            request={
+                "schema": gf.FENCE_REQUEST_SCHEMA,
+                "terminal_generation": record["generation"],
+                "obligation_generation": record["obligation_generation"],
+                "attempt_id": bound["binding"]["attempt_id"],
+                "intent_id": str(uuid.uuid4()),
+                "report_sha256": "a" * 64,
+            },
+            fencing_token_id=bound["binding"]["fencing_token_id"],
+        )
+        # This is the bridge's pre-provider boundary.  Both observable
+        # provider effects are deliberately below it, so the real fence
+        # check must stop them before it returns the closed BridgeError.
+        try:
+            gf.assert_admission_open(
+                tmp_path / "companion", record["terminal_id"], record["generation"]
+            )
+        except gf.FencedError as exc:
+            raise bridge.BridgeError(f"w13-fenced-before-provider-io: {exc}") from exc
+        provider_byte_calls.append(command)
+        receipt_calls.append(command)
+        raise AssertionError("the parked generation reached the provider-effect branch")
+
+    monkeypatch.setattr(bridge, "request_bridge", request_bridge_after_park)
+
+    import asyncio
+
+    refused = asyncio.run(v2.admit_reserved(record["reservation_id"], admit))
+
+    assert len(durable_claims) == 1
+    assert durable_claims[0]["status"] == "io-attempted"
+    assert refused["admission"]["status"] == "refused"
+    assert refused["admission"]["refusal_reason"] == "generation_fenced"
+    assert v2._is_retryable_refusal(refused["admission"], admit.delivery_id) is False
+    assert refused["state"] == "admitting"
+    assert provider_byte_calls == []
+    assert receipt_calls == []
+    durable = v2.get(record["reservation_id"])
+    assert durable["admission"]["status"] == "refused"
+    assert durable["admission"]["refusal_reason"] == "generation_fenced"
 
 
 def test_attempt_resume_refused_45_while_containment_red(

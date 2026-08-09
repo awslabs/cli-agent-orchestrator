@@ -12,7 +12,7 @@ import re
 import uuid as _uuid_module
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from cli_agent_orchestrator.models.managed_launch import ManagedLaunchAdmissionContext
 
@@ -299,6 +299,52 @@ class ManagedV2FenceInstallRequest(BaseModel):
     @field_validator("report_sha256")
     @classmethod
     def _fence_digest(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError("report_sha256 must be 64 lowercase hex characters")
+        return value
+
+
+class ManagedV2ParkRequest(BaseModel):
+    """Immutable M3 park intent, installed by the fork before it acknowledges.
+
+    This is intentionally distinct from the W13 report seal: it records the
+    retained-round identity which a later conductor continuation must replace,
+    while adopting the same underlying permanent generation fence.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    schema_id: Literal["cao-m3-park-req-v1"] = Field(alias="schema")
+    operation_id: str
+    reservation_id: str
+    terminal_id: str
+    terminal_generation: str
+    # Existing reservation callers call this task_id; the receipt spells out
+    # logical_task_id so it cannot be mistaken for a mutable provider task.
+    logical_task_id: str = Field(
+        validation_alias=AliasChoices("logical_task_id", "task_id"),
+        serialization_alias="logical_task_id",
+    )
+    retained_round: int = Field(ge=0)
+    obligation_generation: str
+    attempt_id: str
+    report_sha256: str
+
+    @field_validator("operation_id", "reservation_id", "attempt_id")
+    @classmethod
+    def _park_uuids(cls, value: str) -> str:
+        return _uuid_text(value)
+
+    @field_validator("terminal_id")
+    @classmethod
+    def _park_terminal_hex(cls, value: str) -> str:
+        if not _CALLER_RE.fullmatch(value):
+            raise ValueError("terminal_id must be 8 lowercase hex characters")
+        return value
+
+    @field_validator("report_sha256")
+    @classmethod
+    def _park_digest(cls, value: str) -> str:
         if not _SHA256_RE.fullmatch(value):
             raise ValueError("report_sha256 must be 64 lowercase hex characters")
         return value

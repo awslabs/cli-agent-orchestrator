@@ -25,6 +25,7 @@ import pytest
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import control_input_service as service
+from cli_agent_orchestrator.services import generation_fence as gf
 from cli_agent_orchestrator.services import native_pane_input
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
@@ -34,6 +35,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     BRACKETED_PASTE_START_C1,
     CONTROL_INPUT_PROTOCOL,
     REASON_CONTROL_ROUTE_ABSENT,
+    REASON_GENERATION_FENCED,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
     REASON_LINEAGE_UNPROVEN,
@@ -1192,6 +1194,7 @@ class TestBoundedWriteDeadline:
                 raise subprocess.TimeoutExpired(cmd=["tmux", "send-keys"], timeout=remaining)
 
         client = DeadlineAwareBlockingTmux()
+        production_deadline = service.WRITE_DEADLINE_SECONDS
         monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.05)
         started = time.monotonic()
         result = self._deliver_with(monkeypatch, journal, client)
@@ -1207,6 +1210,11 @@ class TestBoundedWriteDeadline:
         assert journal.get(CONTROL).state == service.STATE_AMBIGUOUS
         assert client.write_calls == 1
 
+        # The artificial 50 ms deadline only establishes the bounded-write
+        # classification above. Restore the ordinary deadline before this
+        # separate probe, whose contract is lease release rather than CI
+        # scheduling latency for an otherwise healthy write.
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", production_deadline)
         # The request returned only after the inline write stopped, so the
         # lease is free and no detached worker can produce a late byte.
         healthy = FakeTmux()
@@ -3860,3 +3868,88 @@ class TestSequenceSubmissionBarrier:
         enters = [write for write in client.writes if write.get("submit")]
         assert len(enters) == 1
         assert [event["outcome"] for event in result.events] == ["sent", "sent", "skipped"]
+
+
+def test_parked_managed_literal_and_sequence_controls_write_zero_tmux_bytes(
+    journal, tmux, monkeypatch, tmp_path
+):
+    """Both public control grammars meet the same managed park boundary."""
+    from cli_agent_orchestrator import constants
+
+    companion = tmp_path / "companion"
+    monkeypatch.setattr(constants, "COMPANION_DIR", companion)
+    resolved = _seq_resolved()
+    monkeypatch.setattr(service, "resolve_control_identity", lambda _terminal: resolved)
+    gf.install_fence(
+        companion,
+        terminal_id=TERMINAL,
+        generation=resolved.terminal_generation,
+        vintage="v2",
+        fencing_token_id="token-1",
+        request={
+            "schema": gf.FENCE_REQUEST_SCHEMA,
+            "terminal_generation": resolved.terminal_generation,
+            "obligation_generation": "obligation-1",
+            "attempt_id": "attempt-1",
+            "intent_id": "11111111-1111-4111-8111-111111111111",
+            "report_sha256": "a" * 64,
+        },
+    )
+
+    literal = _deliver(journal, control_id="ctl-fenced-literal", text="literal")
+    sequence = _deliver_sequence(
+        journal,
+        control_id="ctl-fenced-sequence",
+        events=[{"type": "text", "text": "sequence"}, {"type": "key", "key": "Enter"}],
+    )
+
+    assert literal.outcome == sequence.outcome == REFUSED
+    assert literal.reason_code == sequence.reason_code == REASON_GENERATION_FENCED
+    assert tmux.writes == []
+
+
+def test_unmanaged_control_ignores_an_unrelated_park_receipt_and_writes(
+    journal, tmux, monkeypatch, tmp_path
+):
+    """M3 fences managed generations only; raw control keeps its prior lane."""
+    from cli_agent_orchestrator import constants
+    from cli_agent_orchestrator.services import native_pane_input
+
+    companion = tmp_path / "companion"
+    monkeypatch.setattr(constants, "COMPANION_DIR", companion)
+    resolved = _seq_resolved(managed=False)
+    monkeypatch.setattr(service, "resolve_control_identity", lambda _terminal: resolved)
+    monkeypatch.setattr(
+        native_pane_input,
+        "await_compose_visible",
+        lambda _pane, _text, *, barrier, deadline_monotonic: True,
+    )
+    monkeypatch.setattr(
+        native_pane_input,
+        "observe_submission",
+        lambda _pane, _text, *, barrier, deadline_monotonic: (
+            SUBMISSION_SUBMITTED,
+            "evidence://unmanaged-after-park",
+        ),
+    )
+    gf.install_park(
+        companion,
+        fencing_token_id="other-token",
+        request={
+            "schema": gf.PARK_REQUEST_SCHEMA,
+            "operation_id": "22222222-2222-4222-8222-222222222222",
+            "reservation_id": "33333333-3333-4333-8333-333333333333",
+            "terminal_id": "feedface",
+            "terminal_generation": "other-generation",
+            "logical_task_id": "other-task",
+            "retained_round": 0,
+            "obligation_generation": "other-obligation",
+            "attempt_id": "other-attempt",
+            "report_sha256": "b" * 64,
+        },
+    )
+
+    result = _deliver(journal, control_id="ctl-unmanaged-after-park", text="still-send")
+
+    assert result.outcome == ACCEPTED
+    assert tmux.writes

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import uuid
 
@@ -269,6 +270,181 @@ def test_fence_install_binds_body_identity_to_reservation_row(
     )
     assert correct.json()["outcome"] == "fenced"
     assert fence_state_path(companion, record["terminal_id"], record["generation"]).exists()
+
+
+def test_park_requires_the_exact_bound_reservation_identity(
+    client, isolated_memory_db, worktree, tmp_path
+):
+    """No body field can bind a durable park receipt to a different task."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import heartbeat_store
+
+    record = client.post(
+        "/managed-launch/v2/reservations", json=_reserve_payload(worktree, tmp_path)
+    ).json()
+    attempt_id = str(uuid.uuid4())
+    token = heartbeat_store.issue_fencing_token(
+        tmp_path / "companion", record["terminal_id"], record["generation"], attempt_id
+    )
+    with database.SessionLocal() as db:
+        row = (
+            db.query(database.ManagedLaunchV2ReservationModel)
+            .filter_by(reservation_id=record["reservation_id"])
+            .one()
+        )
+        row.binding_json = json.dumps({"attempt_id": attempt_id, "fencing_token_id": token.id})
+        db.commit()
+    body = {
+        "schema": "cao-m3-park-req-v1",
+        "operation_id": str(uuid.uuid4()),
+        "reservation_id": record["reservation_id"],
+        "terminal_id": record["terminal_id"],
+        "terminal_generation": record["generation"],
+        "logical_task_id": record["task_id"],
+        "retained_round": 0,
+        "obligation_generation": record["obligation_generation"],
+        "attempt_id": attempt_id,
+        "report_sha256": "a" * 64,
+    }
+    installed = client.post("/managed-launch/v2/park", json=body)
+    assert installed.status_code == 200
+    assert installed.json()["outcome"] == "fenced"
+    assert (
+        client.get(
+            f"/managed-launch/v2/park/{record['terminal_id']}/{record['generation']}/{body['operation_id']}"
+        ).json()["park_receipt_sha256"]
+        == installed.json()["park_receipt_sha256"]
+    )
+    retry = client.post("/managed-launch/v2/park", json=body)
+    assert retry.status_code == 200
+    assert retry.json()["outcome"] == "already-fenced"
+    assert retry.json()["park_receipt_sha256"] == installed.json()["park_receipt_sha256"]
+    changed_same_operation = client.post(
+        "/managed-launch/v2/park", json={**body, "retained_round": 1}
+    )
+    assert changed_same_operation.status_code == 409
+    wrong_query = client.get(
+        f"/managed-launch/v2/park/{record['terminal_id']}/{record['generation']}/{uuid.uuid4()}"
+    )
+    assert wrong_query.status_code == 200
+    assert wrong_query.json()["outcome"] == "not-found"
+    # Reconciliation is read-only, but its identifier segments must still be
+    # exact/safe before they can name a filesystem location.
+    malformed_query = client.get(
+        f"/managed-launch/v2/park/{record['terminal_id']}/{record['generation']}/not-a-uuid"
+    )
+    assert malformed_query.status_code == 409
+    invalid_terminal_query = client.get(
+        f"/managed-launch/v2/park/A1B2C3D4/{record['generation']}/{body['operation_id']}"
+    )
+    assert invalid_terminal_query.status_code == 409
+    wrong_terminal = client.post(
+        "/managed-launch/v2/park", json={**body, "terminal_id": "feedface"}
+    )
+    assert wrong_terminal.status_code == 200
+    assert wrong_terminal.json()["outcome"] == "unknown-generation"
+    # A distinct operation cannot use the reservation to publish a receipt
+    # for arbitrary logical task B, even though every other field is valid.
+    mismatch = client.post(
+        "/managed-launch/v2/park",
+        json={**body, "operation_id": str(uuid.uuid4()), "logical_task_id": "other-task"},
+    )
+    assert mismatch.status_code == 409
+    assert mismatch.json()["detail"]
+
+    # Every reservation-bound identity is authoritative; no alternate
+    # obligation, attempt, or generation may consume/publish this receipt.
+    assert (
+        client.post(
+            "/managed-launch/v2/park",
+            json={**body, "operation_id": str(uuid.uuid4()), "obligation_generation": "wrong"},
+        ).status_code
+        == 409
+    )
+    assert (
+        client.post(
+            "/managed-launch/v2/park",
+            json={**body, "operation_id": str(uuid.uuid4()), "attempt_id": str(uuid.uuid4())},
+        ).status_code
+        == 409
+    )
+    wrong_generation = client.post(
+        "/managed-launch/v2/park",
+        json={**body, "operation_id": str(uuid.uuid4()), "terminal_generation": str(uuid.uuid4())},
+    )
+    assert wrong_generation.status_code == 200
+    assert wrong_generation.json()["outcome"] == "unknown-generation"
+
+    def reserve_park_body(*, binding: object | None, malformed: bool = False):
+        other = client.post(
+            "/managed-launch/v2/reservations", json=_reserve_payload(worktree, tmp_path)
+        ).json()
+        other_attempt = str(uuid.uuid4())
+        if binding is not None:
+            other_token = heartbeat_store.issue_fencing_token(
+                tmp_path / "companion",
+                other["terminal_id"],
+                other["generation"],
+                other_attempt,
+            )
+            stored_binding = (
+                "{"
+                if malformed
+                else {"attempt_id": other_attempt, "fencing_token_id": other_token.id}
+            )
+            with database.SessionLocal() as db:
+                row = (
+                    db.query(database.ManagedLaunchV2ReservationModel)
+                    .filter_by(reservation_id=other["reservation_id"])
+                    .one()
+                )
+                row.binding_json = (
+                    stored_binding
+                    if isinstance(stored_binding, str)
+                    else json.dumps(stored_binding)
+                )
+                db.commit()
+        return other, {
+            "schema": "cao-m3-park-req-v1",
+            "operation_id": str(uuid.uuid4()),
+            "reservation_id": other["reservation_id"],
+            "terminal_id": other["terminal_id"],
+            "terminal_generation": other["generation"],
+            "logical_task_id": other["task_id"],
+            "retained_round": 0,
+            "obligation_generation": other["obligation_generation"],
+            "attempt_id": other_attempt,
+            "report_sha256": "b" * 64,
+        }
+
+    # Missing or unreadable durable bindings are typed conflicts, before any
+    # attacker-controlled generation path can be written.
+    _, unbound_body = reserve_park_body(binding=None)
+    assert client.post("/managed-launch/v2/park", json=unbound_body).status_code == 409
+    _, malformed_body = reserve_park_body(binding=True, malformed=True)
+    assert client.post("/managed-launch/v2/park", json=malformed_body).status_code == 409
+
+    # Stored-receipt adoption wins after a successor has issued.  Conversely,
+    # a new operation for a distinct superseded generation cannot park it.
+    heartbeat_store.issue_fencing_token(
+        tmp_path / "companion", record["terminal_id"], str(uuid.uuid4()), str(uuid.uuid4())
+    )
+    adopted_after_successor = client.post("/managed-launch/v2/park", json=body)
+    assert adopted_after_successor.status_code == 200
+    assert adopted_after_successor.json()["outcome"] == "already-fenced"
+    assert (
+        adopted_after_successor.json()["park_receipt_sha256"]
+        == installed.json()["park_receipt_sha256"]
+    )
+
+    fresh, fresh_body = reserve_park_body(binding=True)
+    heartbeat_store.issue_fencing_token(
+        tmp_path / "companion", fresh["terminal_id"], str(uuid.uuid4()), str(uuid.uuid4())
+    )
+    superseded = client.post("/managed-launch/v2/park", json=fresh_body)
+    assert superseded.status_code == 200
+    assert superseded.json()["outcome"] == "superseded-generation"
+    assert superseded.json()["park_receipt"] is None
 
 
 def test_destructive_endpoint_refusal_and_execution(

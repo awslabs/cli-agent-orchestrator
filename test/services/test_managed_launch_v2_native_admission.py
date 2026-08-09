@@ -18,8 +18,10 @@ composer.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import subprocess
+import threading
 import uuid
 from typing import Any, Mapping, Optional
 
@@ -34,6 +36,7 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import execution_mode as em
+from cli_agent_orchestrator.services import generation_fence as gf
 from cli_agent_orchestrator.services import kimi_native_bootstrap as boot
 from cli_agent_orchestrator.services import kimi_native_control as knc
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
@@ -60,6 +63,7 @@ TASK_MESSAGE = "review the exact head"
 @pytest.fixture(autouse=True)
 def _companion(tmp_path, monkeypatch):
     monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
+    monkeypatch.setattr("cli_agent_orchestrator.constants.COMPANION_DIR", tmp_path / "companion")
     monkeypatch.setattr(bridge, "BRIDGE_ROOT", tmp_path / "bridge")
 
 
@@ -408,6 +412,87 @@ async def test_a_native_generation_reaches_admitted_without_any_bridge(
         ("key", "End"),
         ("enter", ""),
     ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_native_admission_keeps_park_out_until_its_worker_finishes(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """A cancelled awaiter cannot release byte ownership ahead of its worker."""
+    reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
+    effect_started = threading.Event()
+    release_effect = threading.Event()
+    park_started = threading.Event()
+    park_completed = threading.Event()
+    original_literal = harness.keystrokes.send_literal
+    real_create_task = asyncio.create_task
+    effect_tasks = []
+
+    def capture_effect_task(coro, *args, **kwargs):
+        task = real_create_task(coro, *args, **kwargs)
+        effect_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", capture_effect_task)
+
+    def blocking_literal(text):
+        original_literal(text)  # the first provider-byte/effect proof
+        effect_started.set()
+        assert release_effect.wait(timeout=5)
+
+    monkeypatch.setattr(harness.keystrokes, "send_literal", blocking_literal)
+    admission = _admit_request(v2.native_binding_digest(bound))
+    admission_task = real_create_task(v2.admit_reserved(reservation_id, admission))
+    assert await asyncio.to_thread(effect_started.wait, 5)
+    assert len(effect_tasks) == 1
+    admission_task.cancel()
+    record = v2.get(reservation_id)
+    binding = record["binding"]
+    park_request = {
+        "schema": gf.PARK_REQUEST_SCHEMA,
+        "operation_id": str(uuid.uuid4()),
+        "reservation_id": reservation_id,
+        "terminal_id": record["terminal_id"],
+        "terminal_generation": record["generation"],
+        "logical_task_id": record["task_id"],
+        "retained_round": 0,
+        "obligation_generation": record["obligation_generation"],
+        "attempt_id": binding["attempt_id"],
+        "report_sha256": "a" * 64,
+    }
+
+    def install_park():
+        park_started.set()
+        result = gf.install_park(
+            v2.COMPANION_DIR,
+            request=park_request,
+            fencing_token_id=binding["fencing_token_id"],
+        )
+        park_completed.set()
+        return result
+
+    park_task = asyncio.create_task(asyncio.to_thread(install_park))
+    assert await asyncio.to_thread(park_started.wait, 5)
+    # Directly cancelling the effect-owning coroutine must still wait for
+    # its executor Future; request cancellation alone is not the hard case.
+    effect_tasks[0].cancel()
+    # Teardown often sends a second cancellation while the first cleanup
+    # await is in progress. It must not hand the lock back early.
+    admission_task.cancel()
+    # The worker is still between its first literal and remaining provider
+    # effects. A completed receipt here would violate M3's absolute fence.
+    assert not park_completed.is_set()
+    assert not admission_task.done()
+
+    release_effect.set()
+    with pytest.raises(asyncio.CancelledError):
+        await admission_task
+    parked = await asyncio.wait_for(park_task, timeout=5)
+    assert parked["outcome"] == gf.OUTCOME_FENCED
+    after_receipt = list(harness.keystrokes.events)
+    with pytest.raises(gf.FencedError):
+        await v2.admit_reserved(reservation_id, admission)
+    assert harness.keystrokes.events == after_receipt
 
 
 @pytest.mark.asyncio

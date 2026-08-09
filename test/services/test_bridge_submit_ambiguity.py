@@ -100,10 +100,21 @@ def _serve_in_thread(request, target, monkeypatch=None):
     server = threading.Thread(target=bridge._serve, args=(request, target), daemon=True)
     server.start()
     for _ in range(200):
-        if target["socket"].exists():
+        # A socket pathname can appear after bind but before listen, so it is
+        # not a safe client-readiness signal.  Do not probe-connect: this
+        # bridge fixture deliberately has one accept loop and a probe could
+        # consume the request connection.  ``ready`` is atomically published
+        # only after bind/chmod/listen and provider initialization.
+        try:
+            state = json.loads(target["state"].read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            state = None
+        if state is not None and state.get("state") == "ready":
             return server
+        if not server.is_alive():
+            raise AssertionError("bridge exited before publishing ready state")
         time.sleep(0.01)
-    raise AssertionError("bridge socket never appeared")
+    raise AssertionError("bridge never published ready state")
 
 
 def _call(target, request, command):

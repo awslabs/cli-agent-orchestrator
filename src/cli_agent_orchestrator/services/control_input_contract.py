@@ -213,6 +213,11 @@ REASON_MALFORMED_COMMAND_DECLARATION = "malformed-command-declaration"
 # ritual may be specified as a clear, because prefill has been observed
 # to survive Escape.
 REASON_COMPOSER_NONEMPTY = "composer-nonempty"
+# An M3/W13 permanent generation fence is decided before the first provider
+# byte.  It is intentionally a normal typed refusal, not an ambiguous
+# transport failure: callers must advance to a successor, never retry this
+# parked generation.
+REASON_GENERATION_FENCED = "generation-fenced"
 
 # Every reason is bound to the one outcome it can honestly carry.
 #
@@ -250,6 +255,7 @@ REASON_OUTCOMES: "dict[str, str]" = {
     REASON_COPY_MODE_ACTIVE: REFUSED,
     REASON_MALFORMED_COMMAND_DECLARATION: REFUSED,
     REASON_COMPOSER_NONEMPTY: REFUSED,
+    REASON_GENERATION_FENCED: REFUSED,
     REASON_WRITE_DEADLINE: REFUSED,
     REASON_CONTROL_ROUTE_ABSENT: UNSUPPORTED,
     REASON_PROTOCOL_MISMATCH: UNSUPPORTED,
