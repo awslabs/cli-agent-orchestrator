@@ -32,8 +32,8 @@ from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
-from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.stable_agent_roster import ROLE_SUPERVISOR
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
 from cli_agent_orchestrator.utils.template import render_template
 
