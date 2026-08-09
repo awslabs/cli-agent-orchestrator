@@ -456,13 +456,6 @@ export function ProjectsPanel() {
 
         {project && (
           <>
-            <div className="flex gap-2 mb-3">
-              {(['issue','feature','all'] as const).map(k => {
-                const label = k === 'issue' ? `Issues ${project.counts?.by_kind?.issue?.open ?? project.counts?.open ?? 0}` : k === 'feature' ? `Feature requests ${project.counts?.by_kind?.feature?.open ?? 0}` : `All ${project.counts?.all_open ?? ((project.counts?.by_kind?.issue?.open ?? 0)+(project.counts?.by_kind?.feature?.open ?? 0))}`
-                const active = kind === k
-                return <button key={k} onClick={() => handleSelectKind(k)} className={`px-3 py-1.5 rounded text-sm ${active ? 'bg-emerald-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}>{label}</button>
-              })}
-            </div>
             <ProjectHeader
               project={project}
               kind={kind}
