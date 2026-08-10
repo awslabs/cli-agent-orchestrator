@@ -168,7 +168,7 @@ def _bootstrap_environment(
     return env
 
 
-def _row_pre_task_state(terminal_id: str, metadata: Mapping[str, Any]) -> Optional[str]:
+def _row_pre_task_state(metadata: Mapping[str, Any]) -> Optional[str]:
     """The terminal row's dedicated pre-task identity state, or ``None``.
 
     An activated launch stamps its row with
@@ -181,30 +181,16 @@ def _row_pre_task_state(terminal_id: str, metadata: Mapping[str, Any]) -> Option
     state marker: it stays ``NULL`` until the true captured provider id is
     durably written.
 
-    The caller-supplied metadata is used when it carries the state (the
-    direct-input lane passes the full row); a caller that passes only a
-    provider/generation projection (the control-input lane) falls back to
-    the durable row so both lanes decide on the same evidence.  A store
-    whose schema predates the column (no ``pre_task_identity_state`` yet)
-    reads as a legacy row — the schema is migrated by ``init_db`` at
-    startup, and an unreadable evidence path must degrade truthfully to
-    the legacy exemption rather than crash every input call.
+    The state is read ONLY from the caller-supplied metadata — the
+    direct-input lane passes the full row it already read, and the
+    control-input lane passes the state its identity resolution already
+    read.  No second query is issued here, deliberately: a missing state
+    is the truthful legacy signal from that original read, and a database
+    that is locked, corrupt, or unreadable during the pre-marker window
+    must never be converted into a task-to-shell admission.
     """
     state = metadata.get("pre_task_identity_state")
-    if state is not None:
-        return state if isinstance(state, str) else None
-    from sqlalchemy.exc import OperationalError
-
-    from cli_agent_orchestrator.clients import database
-
-    try:
-        row = database.get_terminal_metadata(terminal_id, warn_if_missing=False)
-    except OperationalError:
-        return None
-    if row is None:
-        return None
-    value = row.get("pre_task_identity_state")
-    return value if isinstance(value, str) else None
+    return state if isinstance(state, str) else None
 
 
 def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, Any]) -> None:
@@ -227,7 +213,7 @@ def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, An
         return
     from cli_agent_orchestrator.services import stable_agent_roster
 
-    row_state = _row_pre_task_state(terminal_id, metadata)
+    row_state = _row_pre_task_state(metadata)
     try:
         agent = stable_agent_roster.get_agent(
             stable_agent_roster.derive_initial_agent_id(
@@ -301,9 +287,9 @@ def mark_pre_task_identity_ready(*, terminal_id: str, generation: Optional[str] 
     is up and input can be admitted.  The roster lineage transitions first
     and the row state second, so a crash between the two writes leaves the
     row (the first-visibility surface) still in-flight and the gate closed.
-    Either transition is refused unless the surface is still in an in-flight
-    pre-task state, so an identity that was never captured cannot be
-    declared ready.
+    Both surfaces must already be ``captured``: ready is refused from
+    ``pending`` on either surface, so no caller can skip the captured
+    identity boundary.
     """
     from cli_agent_orchestrator.clients import database
     from cli_agent_orchestrator.services import stable_agent_roster
@@ -311,14 +297,14 @@ def mark_pre_task_identity_ready(*, terminal_id: str, generation: Optional[str] 
     stable_agent_roster.transition_lineage_note(
         terminal_id=terminal_id,
         generation=generation,
-        from_notes=(PRE_TASK_IDENTITY_PENDING, PRE_TASK_IDENTITY_CAPTURED),
+        from_notes=(PRE_TASK_IDENTITY_CAPTURED,),
         continuity_note=PRE_TASK_IDENTITY_READY,
     )
     if not database.set_terminal_pre_task_identity_state(terminal_id, PRE_TASK_IDENTITY_READY):
         raise UnmanagedIdentityUnavailable(
             f"terminal {terminal_id} refused its pre-task identity ready transition "
-            "(absent row, legacy row, or non-forward state move); the launch fails "
-            "closed rather than admitting input on an unready row"
+            "(absent row, legacy row, or a state that was not captured); the launch "
+            "fails closed rather than admitting input on an unready row"
         )
 
 

@@ -332,6 +332,13 @@ class ResolvedControlIdentity:
     # re-prove the identity live against the same durable record the
     # projection came from.  Internal, like the two fields above.
     managed_reservation_id: Optional[str] = None
+    # The ordinary row's pre-task identity state, carried from the terminal
+    # metadata this resolution already read so the unmanaged admission gate
+    # never issues a second query (a missing state is the truthful legacy
+    # signal from that same read).  Internal and non-declarable: it is not
+    # an IDENTITY_FIELDS member, never enters the request digest, and is
+    # not echoed in ``as_dict`` — exactly like the internal fields above.
+    pre_task_identity_state: Optional[str] = None
     # Why the authoritative sources could not name this generation's
     # native identity, when they could not.  Kept as a typed pair rather
     # than folded into the absences above, because "we looked and it is
@@ -648,6 +655,13 @@ def resolve_control_identity(terminal_id: str) -> Optional[ResolvedControlIdenti
         session_name=metadata.get("tmux_session"),
         provider_version=managed.get("provider_version") if managed else None,
         managed_reservation_id=managed.get("reservation_id") if managed else None,
+        # Carried from the same metadata read for the unmanaged admission
+        # gate; absent on managed rows (which skip that gate entirely).
+        pre_task_identity_state=(
+            metadata.get("pre_task_identity_state")
+            if isinstance(metadata.get("pre_task_identity_state"), str)
+            else None
+        ),
         native_identity_refusal=managed.get("native_identity_refusal") if managed else None,
         # For an unmanaged pane this stays unprovable: pane_pid is the
         # pane's root process, the provider is a descendant of it, and a
@@ -1808,6 +1822,11 @@ def deliver_control_input(
                 {
                     "provider": resolved.provider,
                     "generation": resolved.terminal_generation,
+                    # The row state this resolution already read: the gate
+                    # must never issue a second metadata query, and a
+                    # missing state is the truthful legacy signal from that
+                    # same read.
+                    "pre_task_identity_state": resolved.pre_task_identity_state,
                 },
             )
         except stable_agent_roster.StableAgentAdmissionRefused as exc:

@@ -164,6 +164,31 @@ def test_captured_only_from_pending(isolated_db):
     assert not database.set_terminal_pre_task_identity_state("state03", PRE_TASK_IDENTITY_CAPTURED)
 
 
+def test_ready_only_from_captured(isolated_db):
+    """The captured identity boundary cannot be skipped: a pending row must
+    refuse a direct pending -> ready move, and the refused move changes
+    nothing."""
+    database.create_terminal(
+        "state05",
+        "cao-session",
+        "worker-abcd",
+        "claude_code",
+        pane_id="%77",
+        pane_pid=7777,
+        pre_task_identity_state=PRE_TASK_IDENTITY_PENDING,
+    )
+    assert not database.set_terminal_pre_task_identity_state("state05", PRE_TASK_IDENTITY_READY)
+    assert (
+        database.get_terminal_metadata("state05")["pre_task_identity_state"]
+        == PRE_TASK_IDENTITY_PENDING
+    )
+    # The lawful path still works: capture first, then ready.
+    assert database.set_terminal_pre_task_identity_state("state05", PRE_TASK_IDENTITY_CAPTURED)
+    assert database.set_terminal_pre_task_identity_state("state05", PRE_TASK_IDENTITY_READY)
+    # Idempotent ready -> ready remains allowed.
+    assert database.set_terminal_pre_task_identity_state("state05", PRE_TASK_IDENTITY_READY)
+
+
 def test_unknown_state_refused(isolated_db):
     database.create_terminal(
         "state04",

@@ -561,9 +561,16 @@ def test_row_visible_before_roster_bind_refuses_input(isolated_memory_db):
     assert row["native_session_id"] is None
     assert row["pre_task_identity_state"] == seam.PRE_TASK_IDENTITY_PENDING
     # No roster row exists yet — the pre-task bind thread has not committed.
+    # The admission gate reads the state from the carried metadata (the
+    # direct lane passes the full row it read); it never re-queries.
     with pytest.raises(roster.StableAgentAdmissionRefused, match="pending"):
         seam.assert_unmanaged_admission_ready(
-            terminal_id, {"provider": "claude_code", "generation": "gen-1"}
+            terminal_id,
+            {
+                "provider": "claude_code",
+                "generation": "gen-1",
+                "pre_task_identity_state": seam.PRE_TASK_IDENTITY_PENDING,
+            },
         )
 
 
@@ -646,8 +653,56 @@ def test_row_state_ready_without_roster_ready_fails_closed(isolated_memory_db):
         roster.StableAgentAdmissionRefused, match="reaches its ready state"
     ):
         seam.assert_unmanaged_admission_ready(
-            terminal_id, {"provider": "claude_code", "generation": generation}
+            terminal_id,
+            {
+                "provider": "claude_code",
+                "generation": generation,
+                "pre_task_identity_state": seam.PRE_TASK_IDENTITY_READY,
+            },
         )
+
+def test_roster_pending_blocks_ready_transition(isolated_memory_db):
+    """The captured identity boundary cannot be skipped on the roster
+    surface: a lineage still marked pending refuses the ready transition,
+    and the row state is left untouched (still pending)."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    terminal_id = "pendingroster"
+    generation = "gen-1"
+    database.create_terminal(
+        terminal_id,
+        "cao-session",
+        "developer-abcd",
+        "claude_code",
+        generation=generation,
+        pane_id="%65",
+        pane_pid=6565,
+        pre_task_identity_state=seam.PRE_TASK_IDENTITY_PENDING,
+    )
+    roster.bind_generation(
+        roster.BindingContract(
+            agent_id=roster.derive_initial_agent_id(terminal_id, generation),
+            session_name="cao-session",
+            role=roster.ROLE_WORKER,
+            profile_family="developer",
+            harness="claude_code",
+            terminal_id=terminal_id,
+            generation=generation,
+            pane_id="%65",
+            pane_pid=6565,
+            execution_mode="native_tui",
+            continuity_note=seam.PRE_TASK_IDENTITY_PENDING,
+        )
+    )
+    with pytest.raises(roster.StableAgentConflict, match="only a lineage marked"):
+        seam.mark_pre_task_identity_ready(terminal_id=terminal_id, generation=generation)
+    # The refused transition changed nothing on either surface.
+    assert database.get_terminal_metadata(terminal_id)["pre_task_identity_state"] == (
+        seam.PRE_TASK_IDENTITY_PENDING
+    )
+    agent = roster.get_agent(roster.derive_initial_agent_id(terminal_id, generation))
+    assert agent["current_lineage"]["continuity_note"] == seam.PRE_TASK_IDENTITY_PENDING
 
 
 @pytest.mark.asyncio
@@ -681,12 +736,21 @@ async def test_concurrent_direct_input_refused_before_roster_marker_commits(
 
     # The pre-marker barrier: the row's dedicated state is pending and the
     # real native session id is still NULL — a state string never occupies
-    # the session-id column.
+    # the session-id column.  The direct lane's metadata carries the state
+    # the way the real metadata read would.
     from cli_agent_orchestrator.clients import database
 
     row = database.get_terminal_metadata("test1234")
     assert row["pre_task_identity_state"] == seam.PRE_TASK_IDENTITY_PENDING
     assert row["native_session_id"] is None
+    monkeypatch.setattr(
+        ts,
+        "get_terminal_metadata",
+        lambda terminal_id, **_kwargs: {
+            "provider": "claude_code",
+            "pre_task_identity_state": seam.PRE_TASK_IDENTITY_PENDING,
+        },
+    )
 
     with pytest.raises(TerminalInputRefusedError) as excinfo:
         await asyncio.to_thread(ts.send_input, "test1234", "echo should-not-run")
@@ -780,6 +844,7 @@ async def test_captured_identity_stays_gated_until_provider_ready(
             "tmux_window": "developer-abcd",
             "generation": None,
             "native_session_id": native_id,
+            "pre_task_identity_state": seam.PRE_TASK_IDENTITY_READY,
         },
     )
     await asyncio.to_thread(ts.send_input, "test1234", "echo now-ok")

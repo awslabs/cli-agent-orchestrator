@@ -362,8 +362,42 @@ def test_unmanaged_control_refused_while_row_pending_marker_no_roster(
     monkeypatch.setattr(
         service,
         "_terminal_metadata",
-        lambda terminal_id: _metadata(provider="claude_code"),
+        lambda terminal_id: _metadata(
+            provider="claude_code", pre_task_identity_state=seam.PRE_TASK_IDENTITY_PENDING
+        ),
     )
+
+    result = _deliver(journal)
+
+    assert result.outcome == REFUSED
+    assert result.reason_code == REASON_LINEAGE_UNPROVEN
+    assert tmux.writes == []
+    with pytest.raises(ControlInputNotFound):
+        journal.get(CONTROL)
+
+
+def test_control_gate_uses_resolved_state_without_db_fallback(
+    isolated_memory_db, tmux, journal, monkeypatch
+):
+    """The admission gate consumes the state its identity resolution already
+    read and never issues a second metadata query.  An injected database
+    failure cannot be converted into a legacy exemption: the carried pending
+    state still refuses the control with zero pane writes."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    monkeypatch.setattr(
+        service,
+        "_terminal_metadata",
+        lambda terminal_id: _metadata(
+            provider="claude_code", pre_task_identity_state=seam.PRE_TASK_IDENTITY_PENDING
+        ),
+    )
+
+    def _db_must_not_be_consulted(*args, **kwargs):
+        raise AssertionError("admission must not re-query the database")
+
+    monkeypatch.setattr(database, "get_terminal_metadata", _db_must_not_be_consulted)
 
     result = _deliver(journal)
 
@@ -416,7 +450,9 @@ def test_unmanaged_control_refused_after_capture_before_ready(
     monkeypatch.setattr(
         service,
         "_terminal_metadata",
-        lambda terminal_id: _metadata(provider="claude_code"),
+        lambda terminal_id: _metadata(
+            provider="claude_code", pre_task_identity_state=seam.PRE_TASK_IDENTITY_CAPTURED
+        ),
     )
 
     result = _deliver(journal)
@@ -467,11 +503,17 @@ def test_unmanaged_control_gate_opens_after_readiness_transition(
             continuity_note=seam.PRE_TASK_IDENTITY_CAPTURED,
         )
     )
-    monkeypatch.setattr(
-        service,
-        "_terminal_metadata",
-        lambda terminal_id: _metadata(provider="claude_code"),
-    )
+
+    def _live_metadata(terminal_id):
+        # The real metadata read reflects the durable row: captured before
+        # the readiness transition, ready after it.
+        row = database.get_terminal_metadata(terminal_id) or {}
+        return _metadata(
+            provider="claude_code",
+            pre_task_identity_state=row.get("pre_task_identity_state"),
+        )
+
+    monkeypatch.setattr(service, "_terminal_metadata", _live_metadata)
 
     # Before the transition the control is refused at the lineage gate...
     result = _deliver(journal)
@@ -489,7 +531,11 @@ def test_unmanaged_control_gate_opens_after_readiness_transition(
     assert row["native_session_id"] == native_id
     seam.assert_unmanaged_admission_ready(
         TERMINAL,
-        {"provider": "claude_code", "generation": GENERATION},
+        {
+            "provider": "claude_code",
+            "generation": GENERATION,
+            "pre_task_identity_state": seam.PRE_TASK_IDENTITY_READY,
+        },
     )
     result = _deliver(journal)
     assert result.reason_code != REASON_LINEAGE_UNPROVEN or result.outcome == ACCEPTED

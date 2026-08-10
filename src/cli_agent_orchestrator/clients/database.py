@@ -3184,12 +3184,15 @@ def set_terminal_pre_task_identity_state(terminal_id: str, state: str) -> bool:
 
     A closed, forward-only vocabulary: ``pending`` (stamped at row
     creation) -> ``captured`` (the real native id is durably written) ->
-    ``ready`` (provider/TUI initialization succeeded).  Idempotent for the
-    current state; every other transition is refused — a row born without
-    the marker (``NULL``) never gains one, and a state never moves
-    backwards — so a crash or refusal anywhere in the launch leaves the
-    row fail-closed.  ``native_session_id`` is never touched here: the
-    state column and the real session id are separate facts.
+    ``ready`` (provider/TUI initialization succeeded).  Each step requires
+    exactly its predecessor — ``captured`` only from ``pending``, and
+    ``ready`` only from ``captured`` — so no caller can skip the captured
+    identity boundary; idempotent for the current state.  Every other
+    transition is refused — a row born without the marker (``NULL``)
+    never gains one, and a state never moves backwards — so a crash or
+    refusal anywhere in the launch leaves the row fail-closed.
+    ``native_session_id`` is never touched here: the state column and the
+    real session id are separate facts.
     """
     from cli_agent_orchestrator.services.provider_contracts import (
         PRE_TASK_IDENTITY_CAPTURED,
@@ -3233,12 +3236,10 @@ def set_terminal_pre_task_identity_state(terminal_id: str, state: str) -> bool:
                 current,
             )
             return False
-        if state == PRE_TASK_IDENTITY_READY and current not in {
-            PRE_TASK_IDENTITY_PENDING,
-            PRE_TASK_IDENTITY_CAPTURED,
-        }:
+        if state == PRE_TASK_IDENTITY_READY and current != PRE_TASK_IDENTITY_CAPTURED:
             logger.warning(
-                "Refusing to move terminal %s pre-task identity state from %s to ready",
+                "Refusing to move terminal %s pre-task identity state from %s to ready; "
+                "only a captured identity may become ready",
                 terminal_id,
                 current,
             )
