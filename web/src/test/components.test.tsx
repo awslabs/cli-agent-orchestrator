@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { StatusBadge } from '../components/StatusBadge'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
 import { FALLBACK_PROVIDERS } from '../components/AgentPanel'
+import { projectedTerminal } from './projectedTerminal'
 
 describe('StatusBadge', () => {
   it('renders idle status', () => {
@@ -46,6 +47,31 @@ describe('StatusBadge', () => {
   it('renders null status as unknown', () => {
     render(<StatusBadge status={null} />)
     expect(screen.getByText('Unknown')).toBeInTheDocument()
+  })
+
+  it('explains the status decision and every contributing signal on hover', async () => {
+    const terminal = projectedTerminal({
+      status: 'processing',
+      status_confidence: 'high',
+      status_reason: "classified from the rendered pane by the provider's own screen detector",
+      status_signals: [
+        { name: 'screen', state: 'available', value: 'processing' },
+        { name: 'liveness', state: 'available', value: 184 },
+        { name: 'activity', state: 'available', value: 901 },
+      ],
+    })
+    render(<StatusBadge status="processing" terminal={terminal} />)
+
+    fireEvent.mouseEnter(screen.getByRole('note', { name: /Processing/ }))
+    const card = await screen.findByTestId('status-hovercard')
+    // The card is a structured <dl>; assert the evidence facts rather than a
+    // layout-specific sentence assembled from sibling nodes.
+    expect(card.textContent).toContain('High')
+    expect(card.textContent).toContain("classified from the rendered pane by the provider's own screen detector")
+    expect(card.textContent).toContain('Available · Processing')
+    expect(card.textContent).toContain('no pane rendering change for 3m 4s')
+    expect(card.textContent).toContain('15m 1s since CAO last sent input')
+    expect(within(card).getByText('Reason')).toBeTruthy()
   })
 })
 

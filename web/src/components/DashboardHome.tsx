@@ -822,6 +822,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                         <div className="space-y-1.5">
                           {terminals.map(t => {
                             const relActive = fmtRel(t.last_active)
+                            const currentStatus = terminalStatuses[t.id] ?? t.status
                             return (
                               <div key={t.id} className="bg-gray-900/50 border border-gray-700/30 rounded-lg px-3 py-2 space-y-1.5">
                                 {/* flex-wrap keeps narrow (mobile) widths from
@@ -846,7 +847,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                         is the only reachability statement the
                                         fork can make, and `not_fifo_monitored`
                                         already IS one. */}
-                                    <StatusBadge status={terminalStatuses[t.id] || null} />
+                                    <StatusBadge status={currentStatus} terminal={t} />
                                     <TerminalAnnotations annotations={annotationsFor(t.id)} />
                                     {/* Same fallback the modals use: a blank
                                         gap and the word "unknown" are the same
@@ -854,15 +855,12 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                     <span className="text-[10px] text-gray-600">{t.provider || 'unknown'}</span>
                                   </div>
                                   <div className="flex items-center gap-1 shrink-0">
-                                    {/* The complete work state, and the only
-                                        path to it that a keyboard or a touch
-                                        screen has — the chips' hover card is a
-                                        pointer-only enhancement. Renders
-                                        nothing when the row has no
-                                        annotations, so a fleet without the
-                                        conductor keeps this cluster exactly as
-                                        it was. */}
-                                    <WorkStateInfoButton annotations={annotationsFor(t.id)} terminalId={t.id} agentProfile={t.agent_profile} />
+                                    {/* The complete status evidence and work
+                                        state, and the only path to it that a
+                                        keyboard or touch screen needs. It is
+                                        present even when the conductor has no
+                                        annotations for this row. */}
+                                    <WorkStateInfoButton annotations={annotationsFor(t.id)} terminal={t} status={currentStatus} />
                                     <button onClick={() => setInboxTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Inbox"><Mail size={12} /></button>
                                     <button onClick={() => setOutputTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Output"><FileText size={12} /></button>
                                     <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider ?? undefined, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded transition-colors"><Monitor size={12} />Terminal</button>
