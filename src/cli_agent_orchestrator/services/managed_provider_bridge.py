@@ -37,6 +37,7 @@ from cli_agent_orchestrator.providers.codex import (
     _toml_scalar,
     _validate_config_key,
     render_trusted_project_override,
+    resolve_codex_mcp_material_entry,
 )
 from cli_agent_orchestrator.services import (
     actor_broker,
@@ -1113,20 +1114,17 @@ def _profile_material_from_profile(
     for name, value in (profile.mcpServers or {}).items():
         raw = dict(value) if isinstance(value, dict) else value.model_dump(exclude_none=True)
         config = resolve_mcp_server_config(raw)
-        env = {str(key): str(item) for key, item in (config.get("env") or {}).items()}
-        env.setdefault("CAO_TERMINAL_ID", terminal_id)
+        # The ONE Codex material shape: exactly one usable transport per
+        # entry (command/stdio or url/streamable-HTTP), validated typed and
+        # fail-closed.  ``resolve_mcp_server_config`` passes command-less
+        # (url/type) entries through untouched, so an HTTP entry resolves
+        # here exactly as the profile declared it.
         mcp_servers.append(
-            {
-                "name": name,
-                "command": config["command"],
-                "args": [str(item) for item in (config.get("args") or [])],
-                "env": [{"name": key, "value": value} for key, value in sorted(env.items())],
-                # env_vars are NAMES of vars to forward — pass them through
-                # verbatim so the shared Codex composer is the single fail-fast
-                # validator (a non-string entry is a malformed profile).
-                "env_vars": list(config.get("env_vars") or []),
-                "tool_timeout_sec": config.get("tool_timeout_sec"),
-            }
+            resolve_codex_mcp_material_entry(
+                name=name,
+                config=config,
+                terminal_id=terminal_id,
+            )
         )
     return {
         "profile": profile,

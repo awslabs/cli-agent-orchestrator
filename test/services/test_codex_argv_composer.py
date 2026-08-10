@@ -22,6 +22,7 @@ from cli_agent_orchestrator.providers.codex import (
     CodexRoute,
     codex_route_suffix,
     compose_codex_core_args,
+    resolve_codex_mcp_material_entry,
 )
 
 
@@ -159,6 +160,211 @@ def test_mcp_default_timeout_is_600_when_unspecified():
         trusted_project_root=None,
     )
     assert "mcp_servers.context7.tool_timeout_sec=600.0" in " ".join(core)
+
+
+# ---------------------------------------------------------------------------
+# URL/streamable-HTTP MCP entries: url + optional bearer token env var
+# ---------------------------------------------------------------------------
+
+
+def test_url_mcp_entry_emits_url_and_bearer_only():
+    """A command-less HTTP entry serializes exactly the Codex ``url`` and
+    ``bearer_token_env_var`` keys — no command/args/env/env_vars, no
+    CAO_TERMINAL_ID injection into a nonexistent subprocess, and no
+    ``type`` key (that stays profile-side information)."""
+    core = compose_codex_core_args(
+        codex_profile=None,
+        codex_config=None,
+        system_prompt="",
+        mcp_servers=[
+            {
+                "name": "web",
+                "url": "https://example.invalid/mcp",
+                "bearer_token_env_var": "TEST_TOKEN",
+            }
+        ],
+        allowed_tools=None,
+        trusted_project_root=None,
+    )
+    assert core == [
+        "--yolo",
+        "-c",
+        'mcp_servers.web.url="https://example.invalid/mcp"',
+        "-c",
+        'mcp_servers.web.bearer_token_env_var="TEST_TOKEN"',
+    ]
+    joined = " ".join(core)
+    assert "mcp_servers.web.command" not in joined
+    assert "mcp_servers.web.args" not in joined
+    assert "mcp_servers.web.env" not in joined
+    assert "CAO_TERMINAL_ID" not in joined
+    assert "type" not in joined
+    assert "mcp_servers.web.tool_timeout_sec" not in joined
+
+
+def test_url_mcp_entry_without_bearer_emits_url_only():
+    core = compose_codex_core_args(
+        codex_profile=None,
+        codex_config=None,
+        system_prompt="",
+        mcp_servers=[{"name": "web", "url": "https://example.invalid/mcp"}],
+        allowed_tools=None,
+        trusted_project_root=None,
+    )
+    assert core == [
+        "--yolo",
+        "-c",
+        'mcp_servers.web.url="https://example.invalid/mcp"',
+    ]
+
+
+def test_mcp_resolver_rejects_ambiguous_or_missing_transport():
+    """Exactly one usable transport per entry: both, neither, or an
+    empty-string transport is a typed refusal, never an invented one."""
+    with pytest.raises(ValueError, match="exactly one usable transport"):
+        resolve_codex_mcp_material_entry(
+            name="web",
+            config={"command": "/usr/bin/env", "url": "https://example.invalid/mcp"},
+            terminal_id="t1",
+        )
+    with pytest.raises(ValueError, match="exactly one usable transport"):
+        resolve_codex_mcp_material_entry(
+            name="web", config={"type": "http"}, terminal_id="t1"
+        )
+    with pytest.raises(ValueError, match="exactly one usable transport"):
+        resolve_codex_mcp_material_entry(
+            name="web", config={"command": "", "url": ""}, terminal_id="t1"
+        )
+
+
+def test_mcp_resolver_rejects_empty_url_and_empty_bearer():
+    # An empty url is not a usable transport: neither transport is usable.
+    with pytest.raises(ValueError, match="exactly one usable transport"):
+        resolve_codex_mcp_material_entry(
+            name="web", config={"url": ""}, terminal_id="t1"
+        )
+    with pytest.raises(ValueError, match="non-empty string"):
+        resolve_codex_mcp_material_entry(
+            name="web",
+            config={"url": "https://example.invalid/mcp", "bearer_token_env_var": ""},
+            terminal_id="t1",
+        )
+
+
+def test_mcp_composer_rejects_no_transport_entry():
+    """The composer itself fails closed on an entry with no usable
+    transport — the same typed boundary every consumer maps."""
+    with pytest.raises(ValueError, match="exactly one usable transport"):
+        compose_codex_core_args(
+            codex_profile=None,
+            codex_config=None,
+            system_prompt="",
+            mcp_servers=[{"name": "web", "type": "http"}],
+            allowed_tools=None,
+            trusted_project_root=None,
+        )
+
+
+def test_command_mcp_material_entry_shape_is_unchanged():
+    """The shared resolver keeps the established command/stdio shape
+    byte-for-byte: sorted env with the CAO_TERMINAL_ID default, args,
+    env_vars, and the tool timeout passthrough."""
+    entry = resolve_codex_mcp_material_entry(
+        name="context7",
+        config={
+            "command": "/usr/bin/env",
+            "args": ["context7"],
+            "env": {"API_KEY": "sk", "A": "1"},
+            "env_vars": ["HOME"],
+            "tool_timeout_sec": 90,
+        },
+        terminal_id="t1",
+    )
+    assert entry == {
+        "name": "context7",
+        "command": "/usr/bin/env",
+        "args": ["context7"],
+        "env": [
+            {"name": "A", "value": "1"},
+            {"name": "API_KEY", "value": "sk"},
+            {"name": "CAO_TERMINAL_ID", "value": "t1"},
+        ],
+        "env_vars": ["HOME"],
+        "tool_timeout_sec": 90,
+    }
+    # The serialized form matches the pre-existing command behavior exactly.
+    core = compose_codex_core_args(
+        codex_profile=None,
+        codex_config=None,
+        system_prompt="",
+        mcp_servers=[entry],
+        allowed_tools=None,
+        trusted_project_root=None,
+    )
+    assert core == [
+        "--yolo",
+        "-c",
+        'mcp_servers.context7.command="/usr/bin/env"',
+        "-c",
+        'mcp_servers.context7.args=["context7"]',
+        "-c",
+        'mcp_servers.context7.env.A="1"',
+        "-c",
+        'mcp_servers.context7.env.API_KEY="sk"',
+        "-c",
+        'mcp_servers.context7.env.CAO_TERMINAL_ID="t1"',
+        "-c",
+        'mcp_servers.context7.env_vars=["HOME", "CAO_TERMINAL_ID"]',
+        "-c",
+        "mcp_servers.context7.tool_timeout_sec=90.0",
+    ]
+
+
+def test_material_producers_agree_on_mixed_command_and_url_servers(monkeypatch):
+    """The managed-v2 material builder and the ordinary provider fallback
+    produce the SAME material entries for a mixed profile (command + URL)."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+    from cli_agent_orchestrator.services.managed_provider_bridge import (
+        _profile_material_from_profile,
+    )
+
+    profile = AgentProfile(
+        name="developer",
+        description="Developer",
+        mcpServers={
+            "local": {
+                "command": "/usr/bin/env",
+                "args": ["mcp-server"],
+                "env": {"TOKEN": "abc"},
+            },
+            "web": {
+                "type": "http",
+                "url": "https://example.invalid/mcp",
+                "bearer_token_env_var": "TEST_TOKEN",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.codex.load_agent_profile", lambda _name: profile
+    )
+    managed = _profile_material_from_profile(profile, "term-1", allowed_tools=["Read"])
+    fallback = CodexProvider("term-1", "s1", "w1", agent_profile="developer")
+    assert fallback._resolve_codex_profile_material()["mcp_servers"] == managed["mcp_servers"]
+    assert managed["mcp_servers"] == [
+        {
+            "name": "local",
+            "command": "/usr/bin/env",
+            "args": ["mcp-server"],
+            "env": [{"name": "CAO_TERMINAL_ID", "value": "term-1"}, {"name": "TOKEN", "value": "abc"}],
+            "env_vars": [],
+            "tool_timeout_sec": None,
+        },
+        {
+            "name": "web",
+            "url": "https://example.invalid/mcp",
+            "bearer_token_env_var": "TEST_TOKEN",
+        },
+    ]
 
 
 def test_mcp_env_vars_must_be_strings():

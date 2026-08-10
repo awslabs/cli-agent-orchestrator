@@ -322,6 +322,77 @@ async def test_unmanaged_codex_codexconfig_model_beats_profile_model(
 
 
 @pytest.mark.asyncio
+async def test_unmanaged_codex_http_mcp_profile_launches(
+    isolated_memory_db, launch_mocks, monkeypatch, tmp_path
+):
+    """A command-less URL/streamable-HTTP MCP server entry (type: http with
+    url + bearer_token_env_var) resolves through the ordinary pre-task path
+    without a raw KeyError: the bootstrap and the resumed TUI both consume
+    the exact Codex url/bearer overrides and nothing else."""
+    native_id = str(uuid.uuid4())
+    profile = AgentProfile(
+        name="developer",
+        description="Developer",
+        mcpServers={
+            "web": {
+                "type": "http",
+                "url": "https://example.invalid/mcp",
+                "bearer_token_env_var": "TEST_TOKEN",
+            }
+        },
+    )
+    captured = _codex_seam_harness(monkeypatch, native_id=native_id, profile=profile)
+    result = await create_terminal(
+        "codex", "developer", new_session=True, working_directory=str(tmp_path)
+    )
+    assert result.id == "test1234"
+    # The bootstrap core args carry the URL transport and nothing else.
+    profile_args = captured["kwargs"]["profile_args"]
+    joined = " ".join(profile_args)
+    assert 'mcp_servers.web.url="https://example.invalid/mcp"' in joined
+    assert 'mcp_servers.web.bearer_token_env_var="TEST_TOKEN"' in joined
+    # The URL transport emits no subprocess surface.
+    assert "mcp_servers.web.command" not in joined
+    assert "mcp_servers.web.env" not in joined
+    assert "mcp_servers.web.tool_timeout_sec" not in joined
+    # The roster bind still completed with the minted identity.
+    agent = roster.get_agent(roster.derive_initial_agent_id("test1234"))
+    assert agent["current_lineage"]["native_session_id"] == native_id
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_codex_malformed_mcp_fails_typed(
+    isolated_memory_db, launch_mocks, monkeypatch, tmp_path
+):
+    """An MCP server entry with no usable transport (or two transports) is
+    a typed pre-task identity refusal — zero provider initialization, never
+    a raw KeyError or serializer leak."""
+    native_id = str(uuid.uuid4())
+    profile = AgentProfile(
+        name="developer",
+        description="Developer",
+        mcpServers={
+            "broken": {
+                "type": "http",
+                "command": "/usr/bin/env",
+                "url": "https://example.invalid/mcp",
+            }
+        },
+    )
+    _codex_seam_harness(monkeypatch, native_id=native_id, profile=profile)
+    from cli_agent_orchestrator.services import unmanaged_native_identity
+
+    with pytest.raises(
+        unmanaged_native_identity.UnmanagedIdentityUnavailable,
+        match="exactly one usable transport",
+    ):
+        await create_terminal(
+            "codex", "developer", new_session=True, working_directory=str(tmp_path)
+        )
+    launch_mocks["provider_manager"].create_provider.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_unmanaged_codex_sealed_model_beats_codexconfig_and_profile(
     isolated_memory_db, launch_mocks, monkeypatch, tmp_path
 ):
@@ -649,9 +720,7 @@ def test_row_state_ready_without_roster_ready_fails_closed(isolated_memory_db):
             continuity_note=seam.PRE_TASK_IDENTITY_CAPTURED,
         )
     )
-    with pytest.raises(
-        roster.StableAgentAdmissionRefused, match="reaches its ready state"
-    ):
+    with pytest.raises(roster.StableAgentAdmissionRefused, match="reaches its ready state"):
         seam.assert_unmanaged_admission_ready(
             terminal_id,
             {
@@ -660,6 +729,7 @@ def test_row_state_ready_without_roster_ready_fails_closed(isolated_memory_db):
                 "pre_task_identity_state": seam.PRE_TASK_IDENTITY_READY,
             },
         )
+
 
 def test_roster_pending_blocks_ready_transition(isolated_memory_db):
     """The captured identity boundary cannot be skipped on the roster

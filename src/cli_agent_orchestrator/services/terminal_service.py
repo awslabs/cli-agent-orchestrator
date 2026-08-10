@@ -2071,9 +2071,18 @@ async def create_terminal(
                 _profile_material_from_profile,
             )
 
-            codex_profile_material = _profile_material_from_profile(
-                profile, terminal_id, allowed_tools=allowed_tools
-            )
+            # A malformed profile (e.g. an MCP server entry with no usable
+            # transport) is a pre-task identity failure: the launch fails
+            # closed with the typed refusal, never a raw serializer error.
+            try:
+                codex_profile_material = _profile_material_from_profile(
+                    profile, terminal_id, allowed_tools=allowed_tools
+                )
+            except Exception as exc:  # noqa: BLE001 - record the concrete blocker
+                raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
+                    f"the codex profile material was refused by the pre-task identity "
+                    f"contract: {exc}"
+                ) from exc
         if reserved_terminal_id is None:
             worker = asyncio.create_task(
                 asyncio.to_thread(

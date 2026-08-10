@@ -7,7 +7,7 @@ import re
 import shlex
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -275,20 +275,50 @@ def _codex_mcp_args(mcp_servers: Optional[list]) -> list[str]:
     """Serialize resolved MCP server material into Codex ``-c`` overrides.
 
     ``mcp_servers`` is the resolved structure produced once from the loaded
-    profile (by the profile-material helper): a list of dicts each with
-    ``name``, ``command``, ``args``, ``env`` (list of ``{name, value}``),
-    ``env_vars`` (list of strings), and ``tool_timeout_sec`` (number or None).
+    profile (by :func:`resolve_codex_mcp_material_entry`): a list of dicts,
+    each carrying exactly one transport.  A command/stdio entry has ``name``,
+    ``command``, ``args``, ``env`` (list of ``{name, value}``), ``env_vars``
+    (list of strings), and ``tool_timeout_sec`` (number or None).  A
+    URL/streamable-HTTP entry has ``name``, ``url``, and an optional
+    ``bearer_token_env_var`` — no subprocess surface at all, so no
+    command/args/env/env_vars and no ``CAO_TERMINAL_ID`` injection.
 
     One implementation of MCP serialization/timeouts so the bootstrap and TUI
     agree, and so the same validation closes the same traps on every path: the
     server name / env key are TOML bare keys (a dot would nest under the wrong
-    table), env_vars are strings, and the timeout is a positive number.
+    table), env_vars are strings, the timeout is a positive number, and an
+    entry with no usable transport is refused rather than silently skipped.
+    ``type: http`` is profile-side information and is never serialized — Codex
+    selects the HTTP transport from ``url`` itself.
     """
     args: list[str] = []
     for server in mcp_servers or []:
         name = _validate_config_key(server["name"], source="mcpServers name")
         prefix = f"mcp_servers.{name}"
-        args.extend(["-c", f"{prefix}.command={_toml_scalar(server['command'])}"])
+        if "url" in server:
+            # URL/streamable-HTTP transport: the URL plus an optional bearer
+            # token env var name.  No command/args/env/env_vars keys, and no
+            # CAO_TERMINAL_ID injection into a subprocess that does not exist.
+            url = server.get("url")
+            if not isinstance(url, str) or not url:
+                raise ValueError(f"mcpServers {name!r} url must be a non-empty string, got {url!r}")
+            args.extend(["-c", f"{prefix}.url={_toml_scalar(url)}"])
+            token = server.get("bearer_token_env_var")
+            if token is not None:
+                if not isinstance(token, str) or not token:
+                    raise ValueError(
+                        f"mcpServers {name!r} bearer_token_env_var must be a non-empty "
+                        f"string, got {token!r}"
+                    )
+                args.extend(["-c", f"{prefix}.bearer_token_env_var={_toml_scalar(token)}"])
+            continue
+        command = server.get("command")
+        if not isinstance(command, str) or not command:
+            raise ValueError(
+                f"mcpServers {name!r} must configure exactly one usable transport "
+                f"(a non-empty command or a non-empty url); got neither"
+            )
+        args.extend(["-c", f"{prefix}.command={_toml_scalar(command)}"])
         server_args = "[" + ", ".join(_toml_scalar(a) for a in (server.get("args") or [])) + "]"
         args.extend(["-c", f"{prefix}.args={server_args}"])
         for item in server.get("env") or []:
@@ -321,6 +351,64 @@ def _codex_mcp_args(mcp_servers: Optional[list]) -> list[str]:
             ]
         )
     return args
+
+
+def resolve_codex_mcp_material_entry(
+    *, name: str, config: Mapping[str, Any], terminal_id: str
+) -> dict[str, Any]:
+    """The ONE resolved Codex MCP material entry, from a profile config.
+
+    Both the managed-v2 material builder (``_profile_material_from_profile``)
+    and the ordinary provider fallback (``CodexProvider._resolve_codex_profile_material``)
+    consume this so bootstrap/TUI/managed-v2 can never build different shapes.
+
+    An entry carries exactly one usable transport, never invented: a
+    command/stdio server (non-empty ``command``) or a URL/streamable-HTTP
+    server (non-empty ``url``).  An entry with both, with neither, or with an
+    empty-string transport is refused with a typed ``ValueError`` (the same
+    typed boundary every composer consumer already maps).  ``type: http`` is
+    profile-side information and is not carried into the material: Codex
+    selects the HTTP transport from the ``url`` key itself.
+
+    Command entries keep the established shape byte-for-byte (args, sorted
+    env with the ``CAO_TERMINAL_ID`` default, env_vars, tool timeout).  URL
+    entries carry only ``url`` and an optional non-empty
+    ``bearer_token_env_var`` — there is no subprocess to receive env or a
+    timeout, and ``CAO_TERMINAL_ID`` is never injected into one.
+    """
+    command = config.get("command")
+    url = config.get("url")
+    usable_command = isinstance(command, str) and bool(command)
+    usable_url = isinstance(url, str) and bool(url)
+    if usable_command == usable_url:
+        raise ValueError(
+            f"mcpServers {name!r} must configure exactly one usable transport: "
+            f"got command={command!r} and url={url!r}"
+        )
+    if usable_url:
+        token = config.get("bearer_token_env_var")
+        if token is not None and (not isinstance(token, str) or not token):
+            raise ValueError(
+                f"mcpServers {name!r} bearer_token_env_var must be a non-empty string, "
+                f"got {token!r}"
+            )
+        entry: dict[str, Any] = {"name": name, "url": url}
+        if token is not None:
+            entry["bearer_token_env_var"] = token
+        return entry
+    env = {str(key): str(item) for key, item in (config.get("env") or {}).items()}
+    env.setdefault("CAO_TERMINAL_ID", terminal_id)
+    return {
+        "name": name,
+        "command": command,
+        "args": [str(item) for item in (config.get("args") or [])],
+        "env": [{"name": key, "value": value} for key, value in sorted(env.items())],
+        # env_vars are NAMES of vars to forward — pass them through
+        # verbatim so the shared Codex composer is the single fail-fast
+        # validator (a non-string entry is a malformed profile).
+        "env_vars": list(config.get("env_vars") or []),
+        "tool_timeout_sec": config.get("tool_timeout_sec"),
+    }
 
 
 def compose_codex_core_args(
@@ -494,17 +582,16 @@ class CodexProvider(BaseProvider):
                 else server_config.model_dump(exclude_none=True)
             )
             cfg = resolve_mcp_server_config(cfg)
-            env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
-            env.setdefault("CAO_TERMINAL_ID", self.terminal_id)
+            # The ONE Codex material shape, identical to the managed-v2
+            # builder: exactly one usable transport per entry
+            # (command/stdio or url/streamable-HTTP), validated typed and
+            # fail-closed.
             mcp_servers.append(
-                {
-                    "name": server_name,
-                    "command": cfg["command"],
-                    "args": [str(a) for a in (cfg.get("args") or [])],
-                    "env": [{"name": k, "value": v} for k, v in sorted(env.items())],
-                    "env_vars": list(cfg.get("env_vars") or []),
-                    "tool_timeout_sec": cfg.get("tool_timeout_sec"),
-                }
+                resolve_codex_mcp_material_entry(
+                    name=server_name,
+                    config=cfg,
+                    terminal_id=self.terminal_id,
+                )
             )
         return {
             "profile": profile,
