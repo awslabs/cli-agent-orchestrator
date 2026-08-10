@@ -228,9 +228,7 @@ def test_mcp_resolver_rejects_ambiguous_or_missing_transport():
             terminal_id="t1",
         )
     with pytest.raises(ValueError, match="exactly one usable transport"):
-        resolve_codex_mcp_material_entry(
-            name="web", config={"type": "http"}, terminal_id="t1"
-        )
+        resolve_codex_mcp_material_entry(name="web", config={"type": "http"}, terminal_id="t1")
     with pytest.raises(ValueError, match="exactly one usable transport"):
         resolve_codex_mcp_material_entry(
             name="web", config={"command": "", "url": ""}, terminal_id="t1"
@@ -240,9 +238,7 @@ def test_mcp_resolver_rejects_ambiguous_or_missing_transport():
 def test_mcp_resolver_rejects_empty_url_and_empty_bearer():
     # An empty url is not a usable transport: neither transport is usable.
     with pytest.raises(ValueError, match="exactly one usable transport"):
-        resolve_codex_mcp_material_entry(
-            name="web", config={"url": ""}, terminal_id="t1"
-        )
+        resolve_codex_mcp_material_entry(name="web", config={"url": ""}, terminal_id="t1")
     with pytest.raises(ValueError, match="non-empty string"):
         resolve_codex_mcp_material_entry(
             name="web",
@@ -355,7 +351,10 @@ def test_material_producers_agree_on_mixed_command_and_url_servers(monkeypatch):
             "name": "local",
             "command": "/usr/bin/env",
             "args": ["mcp-server"],
-            "env": [{"name": "CAO_TERMINAL_ID", "value": "term-1"}, {"name": "TOKEN", "value": "abc"}],
+            "env": [
+                {"name": "CAO_TERMINAL_ID", "value": "term-1"},
+                {"name": "TOKEN", "value": "abc"},
+            ],
             "env_vars": [],
             "tool_timeout_sec": None,
         },
