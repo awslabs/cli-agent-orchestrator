@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
+import time
 import uuid
 from typing import Any, Optional
 
@@ -492,6 +493,49 @@ def _declare_attachment(
     )
 
 
+def _seed_exact_attached_attachment(
+    provider: str,
+    session_id: str,
+    *,
+    terminal_id: str,
+    generation: str,
+    pane_id: str = PANE_ID,
+    process_identity: Optional[dict[str, Any]] = None,
+) -> None:
+    """Declare + start + attach a claim whose owner is exactly the repair's
+    current facts (the default pane/process tuple)."""
+    identity = process_identity or {"pid": PANE_PID, "start_marker": START_MARKER}
+    native_attachment.declare(
+        provider=provider,
+        native_session_id=session_id,
+        terminal_id=terminal_id,
+        generation=generation,
+        execution_mode=em.NATIVE_TUI,
+        intent=native_attachment.acquire_intent(
+            acquisition_method=native_attachment.ACQUISITION_CHOSEN_SESSION_ID,
+            acquisition_receipt={"schema": "test-intent"},
+            admits_only_new_instructions=True,
+            replays_task_bytes=False,
+        ),
+    )
+    native_attachment.mark_starting(
+        provider=provider,
+        native_session_id=session_id,
+        terminal_id=terminal_id,
+        generation=generation,
+        execution_mode=em.NATIVE_TUI,
+    )
+    native_attachment.mark_attached(
+        provider=provider,
+        native_session_id=session_id,
+        terminal_id=terminal_id,
+        generation=generation,
+        execution_mode=em.NATIVE_TUI,
+        process_identity=identity,
+        pane_id=pane_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # B: parser unit tests
 # ---------------------------------------------------------------------------
@@ -815,9 +859,10 @@ def test_legacy_happy_path_binds_the_callback_target_occurrence(isolated_memory_
     harness.screens.append(claude_panel_rows())
     harness.styled_screens.append(claude_composer_rows())
 
-    outcome = _call(generation=None)
+    outcome = _call(generation=None, physical_occurrence=CALLBACK_TARGET)
     assert outcome["status"] == "repaired"
     assert outcome["generation"] == CALLBACK_TARGET
+    assert outcome["physical_occurrence"] == CALLBACK_TARGET
     assert outcome["model_generation"] is None
     assert outcome["native_session_id"] == SESSION_ID
 
@@ -932,6 +977,7 @@ def test_legacy_teardown_is_serialized_by_the_shared_lifecycle_claims(
             terminal_id=TERMINAL_ID,
             generation=None,
             provider_version=CLAUDE_VERSION,
+            physical_occurrence=CALLBACK_TARGET,
             operation_id=_uuid(),
         )
 
@@ -1304,11 +1350,13 @@ def test_unsupported_build_and_provider_refuse_before_any_io(isolated_memory_db,
 
 
 def test_stored_same_id_with_attachment_is_already_known_zero_bytes(isolated_memory_db, harness):
-    # Both sides know the same id and the attachment exists: a typed no-op
-    # with zero /status, zero evidence, zero mutation.
+    # Both sides know the same id and the attachment is an exact live owner:
+    # a typed no-op with zero /status, zero evidence, zero mutation.
     _seed_terminal("claude_code", native_session_id=SESSION_ID)
     _seed_roster("claude_code", native_session_id=SESSION_ID)
-    _declare_attachment("claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION)
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
 
     outcome = _claude_call()
     assert outcome["status"] == "already-known"
@@ -1341,7 +1389,9 @@ def test_both_known_and_equal_with_attachment_is_already_known_zero_bytes(
 ):
     _seed_terminal("claude_code", native_session_id=SESSION_ID)
     _seed_roster("claude_code", native_session_id=SESSION_ID)
-    _declare_attachment("claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION)
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
 
     outcome = _claude_call()
     assert outcome["status"] == "already-known"
@@ -1943,3 +1993,741 @@ def test_terminal_not_found_is_typed(isolated_memory_db, harness):
     assert outcome["status"] == "refused"
     assert outcome["reason"] == "terminal-not-found"
     assert harness.typed == []
+
+
+# ---------------------------------------------------------------------------
+# Follow-up 2: fixes 1-9
+# ---------------------------------------------------------------------------
+
+
+# --- 1: true legacy callback target is never mutated while refusing ---
+
+
+def test_true_legacy_missing_callback_target_refuses_without_mutating(
+    isolated_memory_db, harness, monkeypatch
+):
+    """A generation-null legacy row with no callback target refuses without
+    calling (or mutating through) the get_terminal_metadata self-heal."""
+    with database.SessionLocal() as db:
+        db.add(
+            database.TerminalModel(
+                id=TERMINAL_ID,
+                tmux_session=SESSION_NAME,
+                tmux_window=f"w-{TERMINAL_ID}",
+                provider="claude_code",
+                generation=None,
+                callback_target_generation=None,
+                pane_id=PANE_ID,
+                window_id=WINDOW_ID,
+                server_socket_path=SERVER_SOCKET,
+                session_id=TMUX_SESSION_ID,
+                pane_pid=PANE_PID,
+                lifecycle_state="live",
+            )
+        )
+        db.commit()
+
+    def _loud(*args, **kwargs):
+        raise AssertionError("the self-heal seam must not be called for a true legacy row")
+
+    monkeypatch.setattr(database, "get_terminal_metadata", _loud)
+    outcome = _call(generation=None)
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "callback-target-missing"
+    assert harness.typed == []
+    with database.SessionLocal() as db:
+        row = db.query(database.TerminalModel).filter_by(id=TERMINAL_ID).one()
+        assert row.callback_target_generation is None
+
+
+# --- 2: use only the terminal native ID re-read under claims ---
+
+
+def _mutate_terminal_and_lineage_before_claim(monkeypatch, terminal_id, lineage_id):
+    """Make the pre-claim roster read change the terminal + lineage native
+    ids, simulating a concurrent change between the initial load and the
+    lifecycle claim."""
+    real_get = roster.get_incarnation_by_terminal
+
+    def _mutating_get(terminal, generation=None, db=None):
+        result = real_get(terminal, generation=generation, db=db)
+        if db is None:  # the pre-claim roster read
+            with database.SessionLocal() as s:
+                v2 = s.query(database.ManagedLaunchV2TerminalModel).filter_by(id=terminal).first()
+                if v2 is not None:
+                    v2.v2_native_session_id = terminal_id
+                inc = (
+                    s.query(database.StableAgentIncarnationModel)
+                    .filter_by(terminal_id=terminal)
+                    .first()
+                )
+                lineage = (
+                    s.query(database.StableAgentLineageModel)
+                    .filter_by(lineage_id=inc.lineage_id)
+                    .first()
+                )
+                lineage.native_session_id = lineage_id
+                s.commit()
+        return result
+
+    monkeypatch.setattr(roster, "get_incarnation_by_terminal", _mutating_get)
+
+
+def test_concurrent_terminal_id_change_before_claim_yields_already_known(
+    isolated_memory_db, harness, monkeypatch
+):
+    """A concurrent change that makes terminal + lineage hold the same known
+    id before the claim is acquired produces the zero-byte already-known
+    outcome, not a stale pane interaction."""
+    _seed_terminal("claude_code")
+    _seed_roster("claude_code")
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
+    _mutate_terminal_and_lineage_before_claim(monkeypatch, SESSION_ID, SESSION_ID)
+
+    outcome = _claude_call()
+    assert outcome["status"] == "already-known"
+    assert harness.typed == []
+    assert _evidence_rows() == []
+
+
+def test_concurrent_terminal_id_change_before_claim_yields_conflict_zero_bytes(
+    isolated_memory_db, harness, monkeypatch
+):
+    _seed_terminal("claude_code")
+    _seed_roster("claude_code")
+    _mutate_terminal_and_lineage_before_claim(
+        monkeypatch, "11111111-2222-4333-8444-555555555555", "22222222-2222-4222-8222-222222222222"
+    )
+
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "identity-conflict"
+    assert harness.typed == []
+    assert _evidence_rows() == []
+    assert native_attachment.list_attachments(owner_terminal_id=TERMINAL_ID) == []
+
+
+def test_drift_after_observation_before_adoption_refuses_without_adopting(
+    isolated_memory_db, harness, monkeypatch
+):
+    """A terminal native id that changes after the panel observation but
+    before attachment adoption is refused; a wrong conservative claim is
+    never adopted."""
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    real_verdict = nsr._capture_panel_verdict
+
+    def _mutating_verdict(provider, pane_id, plan, **kwargs):
+        verdict = real_verdict(provider, pane_id, plan, **kwargs)
+        with database.SessionLocal() as s:
+            row = s.query(database.ManagedLaunchV2TerminalModel).filter_by(id=TERMINAL_ID).first()
+            row.v2_native_session_id = "99999999-8888-4777-8666-555555555555"
+            s.commit()
+        return verdict
+
+    monkeypatch.setattr(nsr, "_capture_panel_verdict", _mutating_verdict)
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "identity-conflict"
+    assert _terminal_row().v2_native_session_id == "99999999-8888-4777-8666-555555555555"
+    assert native_attachment.get("claude_code", SESSION_ID) is None
+    assert _evidence_rows() == []
+
+
+# --- 3: already-known requires the exact live attachment owner ---
+
+
+@pytest.mark.parametrize(
+    "mutate_owner, label",
+    [
+        pytest.param(lambda attrs: attrs.update(terminal_id="d4e5f607"), "wrong-terminal"),
+        pytest.param(lambda attrs: attrs.update(generation=_uuid()), "wrong-occurrence"),
+        pytest.param(lambda attrs: attrs.update(pane_id="%99"), "wrong-pane"),
+        pytest.param(
+            lambda attrs: attrs.update(process_identity={"pid": 1, "start_marker": "x"}),
+            "wrong-process",
+        ),
+    ],
+)
+def test_already_known_refuses_a_wrong_owner(isolated_memory_db, harness, mutate_owner, label):
+    _seed_terminal("claude_code", native_session_id=SESSION_ID)
+    _seed_roster("claude_code", native_session_id=SESSION_ID)
+    attrs = {
+        "terminal_id": TERMINAL_ID,
+        "generation": GENERATION,
+        "pane_id": PANE_ID,
+        "process_identity": {"pid": PANE_PID, "start_marker": START_MARKER},
+    }
+    mutate_owner(attrs)
+    _seed_exact_attached_attachment(
+        "claude_code",
+        SESSION_ID,
+        terminal_id=attrs["terminal_id"],
+        generation=attrs["generation"],
+        pane_id=attrs["pane_id"],
+        process_identity=attrs["process_identity"],
+    )
+
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-reconcile"
+    assert harness.typed == []
+    assert _evidence_rows() == []
+
+
+def test_already_known_refuses_a_detached_attachment(isolated_memory_db, harness):
+    _seed_terminal("claude_code", native_session_id=SESSION_ID)
+    _seed_roster("claude_code", native_session_id=SESSION_ID)
+    identity = {"pid": PANE_PID, "start_marker": START_MARKER}
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
+    native_attachment.release(
+        provider="claude_code",
+        native_session_id=SESSION_ID,
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+        proof=native_attachment.no_survivor_proof(
+            provider="claude_code",
+            native_session_id=SESSION_ID,
+            terminal_id=TERMINAL_ID,
+            generation=GENERATION,
+            execution_mode=em.NATIVE_TUI,
+            pane_id=PANE_ID,
+            process_identity=identity,
+            survivors=[],
+            observed_at="now",
+            observer="test",
+        ),
+    )
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-reconcile"
+    assert harness.typed == []
+
+
+def test_already_known_refuses_a_wrong_execution_mode(isolated_memory_db, harness):
+    _seed_terminal("claude_code", native_session_id=SESSION_ID)
+    _seed_roster("claude_code", native_session_id=SESSION_ID)
+    identity = {"pid": PANE_PID, "start_marker": START_MARKER}
+    # Declare the claim in ACP mode (not native_tui) and attach it.
+    native_attachment.declare(
+        provider="claude_code",
+        native_session_id=SESSION_ID,
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        execution_mode=em.ACP,
+        intent=native_attachment.acquire_intent(
+            acquisition_method=native_attachment.ACQUISITION_CHOSEN_SESSION_ID,
+            acquisition_receipt={"schema": "test-intent"},
+            admits_only_new_instructions=True,
+            replays_task_bytes=False,
+        ),
+    )
+    native_attachment.mark_starting(
+        provider="claude_code",
+        native_session_id=SESSION_ID,
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        execution_mode=em.ACP,
+    )
+    native_attachment.mark_attached(
+        provider="claude_code",
+        native_session_id=SESSION_ID,
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        execution_mode=em.ACP,
+        process_identity=identity,
+        pane_id=PANE_ID,
+    )
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-reconcile"
+    assert harness.typed == []
+
+
+# --- 4: recheck operation evidence after the lifecycle claims ---
+
+
+def test_concurrent_exact_retry_adopts_evidence_after_the_claim(isolated_memory_db, harness):
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    harness.block = threading.Event()
+    op = _uuid()
+    results: dict[str, Any] = {}
+
+    def _first() -> None:
+        results["first"] = nsr.repair_terminal_native_identity(
+            terminal_id=TERMINAL_ID,
+            generation=GENERATION,
+            provider_version=CLAUDE_VERSION,
+            operation_id=op,
+        )
+
+    first_thread = threading.Thread(target=_first, daemon=True)
+    first_thread.start()
+    while "capture" not in harness.calls:
+        time.sleep(0.02)
+
+    def _second() -> None:
+        results["second"] = nsr.repair_terminal_native_identity(
+            terminal_id=TERMINAL_ID,
+            generation=GENERATION,
+            provider_version=CLAUDE_VERSION,
+            operation_id=op,
+        )
+
+    second_thread = threading.Thread(target=_second, daemon=True)
+    second_thread.start()
+    time.sleep(0.1)  # let the second block on the lifecycle claim
+
+    harness.block.set()
+    first_thread.join(timeout=30)
+    second_thread.join(timeout=30)
+
+    assert results["first"]["status"] == "repaired"
+    assert results["second"]["status"] == "repaired"
+    assert results["second"]["evidence_sha256"] == results["first"]["evidence_sha256"]
+    assert "exact retry" in results["second"]["detail"]
+    # Only the first typed /status; the second adopted the recorded evidence.
+    assert _typed_bytes(harness) == [
+        ("literal", "/status"),
+        ("enter", ""),
+        ("key", "Escape"),
+    ]
+    assert len(_evidence_rows()) == 1
+
+
+def test_concurrent_changed_request_gets_operation_conflict_after_the_claim(
+    isolated_memory_db, harness
+):
+    _seed_legacy_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    harness.block = threading.Event()
+    op = _uuid()
+    results: dict[str, Any] = {}
+
+    def _first() -> None:
+        results["first"] = nsr.repair_terminal_native_identity(
+            terminal_id=TERMINAL_ID,
+            generation=None,
+            physical_occurrence=CALLBACK_TARGET,
+            provider_version=None,
+            operation_id=op,
+        )
+
+    first_thread = threading.Thread(target=_first, daemon=True)
+    first_thread.start()
+    while "capture" not in harness.calls:
+        time.sleep(0.02)
+
+    def _second() -> None:
+        results["second"] = nsr.repair_terminal_native_identity(
+            terminal_id=TERMINAL_ID,
+            generation=None,
+            physical_occurrence=CALLBACK_TARGET,
+            provider_version=CLAUDE_VERSION,
+            operation_id=op,
+        )
+
+    second_thread = threading.Thread(target=_second, daemon=True)
+    second_thread.start()
+    time.sleep(0.1)
+
+    harness.block.set()
+    first_thread.join(timeout=30)
+    second_thread.join(timeout=30)
+
+    assert results["first"]["status"] == "repaired"
+    assert results["second"]["status"] == "refused"
+    assert results["second"]["reason"] == "operation-conflict"
+    assert _typed_bytes(harness) == [
+        ("literal", "/status"),
+        ("enter", ""),
+        ("key", "Escape"),
+    ]
+    assert len(_evidence_rows()) == 1
+
+
+# --- 5: exact-owner partial adoption must reconcile, never re-type ---
+
+
+def _partial_exact_owner(harness, receipt_mutate):
+    """Create an exact-owner attachment carrying a (possibly corrupted)
+    status-repair receipt, WITHOUT any committed evidence.  Inserted
+    directly so a corrupted receipt that the sanctioned seam would refuse to
+    write can still exist (as a legacy/buggy row could)."""
+    import json as _json
+
+    _seed_all("claude_code")
+    identity = {"pid": PANE_PID, "start_marker": START_MARKER}
+    op = _uuid()
+    digest = "b" * 64
+    receipt = native_attachment.status_repair_adoption_receipt(
+        operation_id=op,
+        request_digest=canonical_digest_for(TERMINAL_ID, GENERATION, CLAUDE_VERSION, None),
+        provider="claude_code",
+        native_session_id=SESSION_ID,
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+        pane_id=PANE_ID,
+        process_identity=identity,
+        parser_key="claude-modal-v1",
+        provider_version=CLAUDE_VERSION,
+        evidence_sha256=digest,
+        observed_at="now",
+        composer_restored=True,
+    )
+    receipt_mutate(receipt)
+    with database.SessionLocal() as db:
+        db.add(
+            database.NativeSessionAttachmentModel(
+                provider="claude_code",
+                native_session_id=SESSION_ID,
+                state=native_attachment.ATTACHED,
+                owner_terminal_id=TERMINAL_ID,
+                owner_generation=GENERATION,
+                owner_execution_mode=em.NATIVE_TUI,
+                owner_pane_id=PANE_ID,
+                owner_process_identity_json=_json.dumps(identity, sort_keys=True),
+                intent_json=_json.dumps({"schema": native_attachment.INTENT_SCHEMA}),
+                release_proof_json=None,
+                adoption_receipt_json=_json.dumps(receipt, sort_keys=True),
+                ambiguity_reason=None,
+                epoch=0,
+                created_at="now",
+                updated_at="now",
+            )
+        )
+        db.commit()
+    return op
+
+
+@pytest.mark.parametrize(
+    "mutate, label",
+    [
+        pytest.param(lambda r: r.__setitem__("schema", "wrong"), "corrupted-schema"),
+        pytest.param(lambda r: r.__setitem__("request_digest", "f" * 64), "different-digest"),
+        pytest.param(lambda r: r.__setitem__("operation_id", _uuid()), "different-operation"),
+        pytest.param(lambda r: r.__setitem__("parser_key", "wrong-parser"), "wrong-parser"),
+        pytest.param(lambda r: r.__setitem__("provider_version", "0.146.0"), "wrong-version"),
+        pytest.param(lambda r: r.__setitem__("composer_restored", False), "no-composer-proof"),
+        pytest.param(lambda r: r.pop("evidence_sha256"), "missing-evidence"),
+    ],
+)
+def test_exact_owner_with_invalid_receipt_reconciles_without_second_status(
+    isolated_memory_db, harness, mutate, label
+):
+    op = _partial_exact_owner(harness, mutate)
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-reconcile"
+    assert harness.typed == []
+    assert _evidence_rows() == []
+
+
+def test_exact_owner_partial_with_matching_receipt_converges_without_second_status(
+    isolated_memory_db, harness, monkeypatch
+):
+    """An exact-owner partial adoption whose receipt fully validates for THIS
+    operation converges (reuses the observed identity) with no second
+    /status."""
+    _seed_all("claude_code")
+    identity = {"pid": PANE_PID, "start_marker": START_MARKER}
+    op = _uuid()
+    digest = "b" * 64
+    receipt = native_attachment.status_repair_adoption_receipt(
+        operation_id=op,
+        request_digest=canonical_digest_for(TERMINAL_ID, GENERATION, CLAUDE_VERSION, None),
+        provider="claude_code",
+        native_session_id=SESSION_ID,
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+        pane_id=PANE_ID,
+        process_identity=identity,
+        parser_key="claude-modal-v1",
+        provider_version=CLAUDE_VERSION,
+        evidence_sha256=digest,
+        observed_at="now",
+        composer_restored=True,
+    )
+    intent = native_attachment.acquire_intent(
+        acquisition_method=native_attachment.ACQUISITION_STATUS_DISCOVERED,
+        acquisition_receipt={"schema": "test", "native_session_id": SESSION_ID},
+        admits_only_new_instructions=True,
+        replays_task_bytes=False,
+    )
+    native_attachment.adopt_running_owner(
+        provider="claude_code",
+        native_session_id=SESSION_ID,
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+        pane_id=PANE_ID,
+        process_identity=identity,
+        receipt=receipt,
+        intent=intent,
+    )
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert outcome["status"] == "repaired"
+    assert harness.typed == []
+    assert len(_evidence_rows()) == 1
+
+
+def canonical_digest_for(terminal_id, generation, provider_version, physical_occurrence):
+    return nsr.canonical_request_digest(
+        terminal_id=terminal_id,
+        generation=generation,
+        provider_version=provider_version,
+        physical_occurrence=physical_occurrence,
+    )
+
+
+# --- 6: bind legacy operation ids to the physical occurrence ---
+
+
+def test_legacy_request_omitting_physical_occurrence_refuses_before_pane_io(
+    isolated_memory_db, harness
+):
+    _seed_legacy_all("claude_code")
+    outcome = _call(generation=None)
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "physical-occurrence-required"
+    assert harness.typed == []
+    assert _legacy_row().native_session_id is None
+
+
+def test_legacy_wrong_physical_occurrence_refuses_zero_byte(isolated_memory_db, harness):
+    _seed_legacy_all("claude_code")
+    outcome = _call(generation=None, physical_occurrence="11111111-2222-4333-8444-5555555555aa")
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "generation-mismatch"
+    assert harness.typed == []
+    assert _legacy_row().native_session_id is None
+
+
+def test_completed_legacy_operation_not_adopted_after_callback_target_changes(
+    isolated_memory_db, harness
+):
+    _seed_legacy_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    op = _uuid()
+    first = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert first["status"] == "repaired"
+    # The durable callback target changes; the same exact op/occurrence
+    # cannot be adopted against the recycled physical identity.
+    with database.SessionLocal() as db:
+        row = db.query(database.TerminalModel).filter_by(id=TERMINAL_ID).one()
+        row.callback_target_generation = "22222222-2222-4222-8222-2222222222aa"
+        db.commit()
+    second = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert second["status"] == "refused"
+    assert second["reason"] == "generation-mismatch"
+    assert _typed_bytes(harness) == [
+        ("literal", "/status"),
+        ("enter", ""),
+        ("key", "Escape"),
+    ]
+
+
+def test_same_operation_id_with_changed_occurrence_is_operation_conflict(
+    isolated_memory_db, harness
+):
+    _seed_legacy_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    op = _uuid()
+    first = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert first["status"] == "repaired"
+    other = "22222222-2222-4222-8222-2222222222aa"
+    with database.SessionLocal() as db:
+        row = db.query(database.TerminalModel).filter_by(id=TERMINAL_ID).one()
+        row.callback_target_generation = other
+        db.commit()
+    harness.typed.clear()
+    second = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=None,
+        physical_occurrence=other,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert second["status"] == "refused"
+    assert second["reason"] == "operation-conflict"
+    assert harness.typed == []
+
+
+# --- 7: managed-v2 binding version is authoritative where available ---
+
+
+def _seed_binding_version(version: Optional[str]):
+    import json as _json
+
+    with database.SessionLocal() as db:
+        existing = (
+            db.query(database.ManagedLaunchV2ReservationModel)
+            .filter_by(terminal_id=TERMINAL_ID)
+            .first()
+        )
+        if existing is None:
+            db.add(
+                database.ManagedLaunchV2ReservationModel(
+                    reservation_id=_uuid(),
+                    terminal_id=TERMINAL_ID,
+                    generation=GENERATION,
+                    protocol_vintage="v2",
+                    session_name=SESSION_NAME,
+                    provider="claude_code",
+                    agent_profile="developer",
+                    caller_id="deadbeef",
+                    working_directory="/Users/x/repo",
+                    obligation_generation=GENERATION,
+                    run_id="run-1",
+                    launch_nonce_digest="a" * 64,
+                    state="bound",
+                    request_json=_json.dumps({"expected_model": "m", "expected_effort": "high"}),
+                    binding_json=(_json.dumps({"provider_version": version}) if version else None),
+                    created_at="now",
+                    updated_at="now",
+                )
+            )
+            db.commit()
+        else:
+            existing.binding_json = _json.dumps({"provider_version": version}) if version else None
+            db.commit()
+
+
+def test_managed_binding_version_match_repairs(isolated_memory_db, harness):
+    _seed_all("claude_code")
+    _seed_binding_version(CLAUDE_VERSION)
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "repaired"
+    assert outcome["provider_version"] == CLAUDE_VERSION
+
+
+def test_managed_binding_version_caller_mismatch_refuses_zero_mutation(isolated_memory_db, harness):
+    _seed_all("claude_code")
+    _seed_binding_version(CLAUDE_VERSION)
+    harness.screens.append(claude_panel_rows())
+
+    outcome = _claude_call(provider_version="2.1.225")
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "version-drift"
+    assert harness.typed == []
+    assert _terminal_row().v2_native_session_id is None
+
+
+def test_managed_binding_version_rendered_panel_mismatch_refuses_zero_mutation(
+    isolated_memory_db, harness
+):
+    _seed_all("claude_code")
+    _seed_binding_version(CLAUDE_VERSION)
+    harness.screens.append(claude_panel_rows(version="2.1.225"))
+
+    outcome = _claude_call(provider_version=None)
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "panel-unparsed"
+    assert _typed_bytes(harness) == [
+        ("literal", "/status"),
+        ("enter", ""),
+        ("key", "Escape"),
+    ]
+    assert _terminal_row().v2_native_session_id is None
+    assert _evidence_rows() == []
+
+
+def test_managed_binding_version_missing_falls_back_to_pinned_plan(isolated_memory_db, harness):
+    _seed_all("claude_code")
+    _seed_binding_version(None)
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call(provider_version=None)
+    assert outcome["status"] == "repaired"
+    assert outcome["provider_version"] == CLAUDE_VERSION
+
+
+# --- 8: no raw internal exception text in public outcomes ---
+
+
+def test_attachment_conflict_secret_is_absent_from_the_public_result(
+    isolated_memory_db, harness, monkeypatch
+):
+    secret = "super_secret_owner_fact_zz9"
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    real_adopt = native_attachment.adopt_running_owner
+
+    def _exploding_adopt(**kwargs):
+        raise native_attachment.NativeAttachmentConflict(f"owner terminal={secret}")
+
+    monkeypatch.setattr(native_attachment, "adopt_running_owner", _exploding_adopt)
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-conflict"
+    assert secret not in str(outcome)
+
+
+def test_roster_failure_secret_is_absent_from_the_public_result(
+    isolated_memory_db, harness, monkeypatch
+):
+    secret = "super_secret_roster_row_zz9"
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    real_record = roster.record_native_identity
+
+    def _exploding_roster(**kwargs):
+        if kwargs.get("db") is not None:
+            raise roster.StableAgentUnavailable(f"store row {secret}")
+        return real_record(**kwargs)
+
+    monkeypatch.setattr(roster, "record_native_identity", _exploding_roster)
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "persistence-failed"
+    assert secret not in str(outcome)

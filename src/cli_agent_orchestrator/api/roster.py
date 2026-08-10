@@ -164,6 +164,14 @@ class NativeIdentityRepairBody(BaseModel):
             "interaction plan; the panel-attested build is what is recorded"
         ),
     )
+    physical_occurrence: Optional[str] = Field(
+        default=None,
+        description=(
+            "The durable physical identity of the terminal (its callback-target "
+            "generation for a legacy row, or its model generation for a managed "
+            "row). Required for legacy rows and bound into the operation identity."
+        ),
+    )
 
 
 #: HTTP mapping for the repair's typed refusal reasons.  Everything not
@@ -174,11 +182,15 @@ _REPAIR_REFUSED_HTTP: dict[str, int] = {
     "provider-unsupported": status.HTTP_400_BAD_REQUEST,
     "unsupported-build": status.HTTP_400_BAD_REQUEST,
     "generation-required": status.HTTP_400_BAD_REQUEST,
+    "physical-occurrence-required": status.HTTP_400_BAD_REQUEST,
+    "version-drift": status.HTTP_409_CONFLICT,
+    "binding-unreadable": status.HTTP_503_SERVICE_UNAVAILABLE,
     "terminal-not-found": status.HTTP_404_NOT_FOUND,
     "no-roster-incarnation": status.HTTP_404_NOT_FOUND,
     "roster-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
     "persistence-failed": status.HTTP_503_SERVICE_UNAVAILABLE,
     "attachment-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "attachment-reconcile": status.HTTP_409_CONFLICT,
 }
 
 
@@ -211,6 +223,7 @@ async def repair_terminal_native_identity(
             terminal_id=terminal_id,
             generation=body.generation,
             provider_version=body.provider_version,
+            physical_occurrence=body.physical_occurrence,
             operation_id=body.operation_id,
         )
 

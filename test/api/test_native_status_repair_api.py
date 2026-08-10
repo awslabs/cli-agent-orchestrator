@@ -32,6 +32,7 @@ def _stub_service(monkeypatch):
         terminal_id: str,
         generation: Optional[str],
         provider_version: Optional[str],
+        physical_occurrence: Optional[str],
         operation_id: str,
     ) -> dict[str, Any]:
         state["calls"].append(
@@ -39,6 +40,7 @@ def _stub_service(monkeypatch):
                 "terminal_id": terminal_id,
                 "generation": generation,
                 "provider_version": provider_version,
+                "physical_occurrence": physical_occurrence,
                 "operation_id": operation_id,
             }
         )
@@ -59,6 +61,7 @@ def _outcome(status: str, reason: Optional[str] = None, **extra: Any) -> dict[st
         "terminal_id": "a1b2c3d4",
         "generation": GENERATION,
         "model_generation": GENERATION,
+        "physical_occurrence": GENERATION,
         "provider": "claude_code",
         "provider_version": VERSION,
         "native_session_id": None,
@@ -73,7 +76,12 @@ def _outcome(status: str, reason: Optional[str] = None, **extra: Any) -> dict[st
 
 
 def _post(client, **body: Any):
-    payload = {"operation_id": OPERATION_ID, "generation": GENERATION, "provider_version": VERSION}
+    payload = {
+        "operation_id": OPERATION_ID,
+        "generation": GENERATION,
+        "provider_version": VERSION,
+        "physical_occurrence": GENERATION,
+    }
     payload.update(body)
     return client.post(ENDPOINT, json=payload)
 
@@ -101,16 +109,26 @@ def test_repair_wires_the_exact_identity(client, _stub_service):
     assert call["terminal_id"] == "a1b2c3d4"
     assert call["generation"] == GENERATION
     assert call["provider_version"] == VERSION
+    assert call["physical_occurrence"] == GENERATION
     assert call["operation_id"] == OPERATION_ID
 
 
-def test_legacy_repair_omits_generation_and_provider_version(client, _stub_service):
-    _stub_service["outcome"] = _outcome(nsr.STATUS_REPAIRED, generation=None, model_generation=None)
-    response = client.post(ENDPOINT, json={"operation_id": OPERATION_ID})
+def test_legacy_repair_binds_the_physical_occurrence(client, _stub_service):
+    occurrence = "00000000-0000-4000-8000-0000000000aa"
+    _stub_service["outcome"] = _outcome(
+        nsr.STATUS_REPAIRED,
+        generation=None,
+        model_generation=None,
+        physical_occurrence=occurrence,
+    )
+    response = client.post(
+        ENDPOINT, json={"operation_id": OPERATION_ID, "physical_occurrence": occurrence}
+    )
     assert response.status_code == 200
     call = _stub_service["calls"][0]
     assert call["generation"] is None
     assert call["provider_version"] is None
+    assert call["physical_occurrence"] == occurrence
 
 
 def test_repair_already_known_and_kimi_still_missing_are_200(client, _stub_service):
@@ -127,10 +145,13 @@ def test_repair_already_known_and_kimi_still_missing_are_200(client, _stub_servi
         ("invalid-input", 400),
         ("provider-unsupported", 400),
         ("unsupported-build", 400),
+        ("generation-required", 400),
+        ("physical-occurrence-required", 400),
+        ("version-drift", 409),
+        ("binding-unreadable", 503),
         ("operation-conflict", 409),
         ("terminal-not-found", 404),
         ("no-roster-incarnation", 404),
-        ("generation-required", 400),
         ("callback-target-missing", 409),
         ("roster-unavailable", 503),
         ("generation-mismatch", 409),
@@ -145,6 +166,7 @@ def test_repair_already_known_and_kimi_still_missing_are_200(client, _stub_servi
         ("composer-not-restored", 409),
         ("attachment-conflict", 409),
         ("attachment-unresolved", 409),
+        ("attachment-reconcile", 409),
         ("identity-conflict", 409),
         ("persistence-failed", 503),
         ("attachment-unavailable", 503),

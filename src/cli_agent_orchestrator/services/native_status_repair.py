@@ -131,6 +131,7 @@ Known-identity preflight and operation idempotency
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import time
@@ -502,24 +503,65 @@ _REPAIR_PARSER_PLANS: dict[str, dict[str, Any]] = {
 
 
 def _resolve_plan(
-    provider: str, provider_version: Optional[str]
+    provider: str,
+    provider_version: Optional[str],
+    durable_version: Optional[str] = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """Select the pre-status interaction plan, or a typed refusal reason.
 
     ``provider_version`` is caller/provider metadata that selects the plan
-    only; the panel-attested build is recorded from the parse.  A legacy
-    row with no durable version metadata selects the provider's pinned
-    plan, so legacy usefulness is never blocked on missing metadata.
+    only; the panel-attested build is recorded from the parse.  A
+    managed-v2 ``durable_version`` from the reservation binding is
+    authoritative where present: the caller's version must agree with it,
+    and the panel-attested build must match it (enforced by the parser
+    header).  A legacy row with no durable version selects the provider's
+    pinned plan, so legacy usefulness is never blocked on missing metadata.
     """
     plan = _REPAIR_PARSER_PLANS.get(provider)
     if plan is None:
         return None, "provider-unsupported"
-    if provider_version:
-        version = normalized_version(provider_version)
-        if version not in plan["supported_versions"]:
+    caller_version = normalized_version(provider_version) if provider_version else None
+    if durable_version:
+        # The durable managed-v2 binding is authoritative: the caller's
+        # version must agree with it (a disagreement is version-drift even
+        # when the caller's version is itself unproven), and the plan runs
+        # the durable build.
+        durable = normalized_version(durable_version)
+        if durable not in plan["supported_versions"]:
             return None, "unsupported-build"
-        return dict(plan, plan_version=version), None
+        if caller_version and caller_version != durable:
+            return None, "version-drift"
+        return dict(plan, plan_version=durable), None
+    if caller_version:
+        if caller_version not in plan["supported_versions"]:
+            return None, "unsupported-build"
+        return dict(plan, plan_version=caller_version), None
     return dict(plan, plan_version=plan["supported_versions"][0]), None
+
+
+def _load_durable_binding_version(terminal_id: str) -> Optional[str]:
+    """The durable provider version recorded in a managed-v2 reservation
+    binding, or None when absent.  A present but unreadable binding is a
+    fail-closed refusal: a durable fact that cannot be read is never
+    guessed at."""
+    with database.SessionLocal() as db:
+        row = (
+            db.query(database.ManagedLaunchV2ReservationModel)
+            .filter(database.ManagedLaunchV2ReservationModel.terminal_id == terminal_id)
+            .first()
+        )
+        if row is None or not row.binding_json:
+            return None
+        try:
+            binding = json.loads(str(row.binding_json))
+        except (TypeError, ValueError) as exc:
+            raise NativeStatusRepairConflict(
+                "binding-unreadable",
+                "the managed-v2 binding record is unreadable; refusing to guess a "
+                "durable provider version",
+            ) from exc
+        version = binding.get("provider_version") if isinstance(binding, Mapping) else None
+        return version if isinstance(version, str) and version else None
 
 
 # ---------------------------------------------------------------------------
@@ -588,18 +630,21 @@ def _load_terminal_row(terminal_id: str) -> Optional[dict[str, Any]]:
 
 
 def _resolve_occurrence(
-    row: Mapping[str, Any], expected_generation: Optional[str]
+    row: Mapping[str, Any],
+    expected_generation: Optional[str],
+    physical_occurrence: Optional[str],
 ) -> tuple[Optional[str], str]:
     """Resolve (model_generation, physical_occurrence) or raise a typed
     refusal.
 
     "Managed" means the row carries a model generation (a v2 row always
     does; a v1 ``terminals`` row may).  A managed row requires the expected
-    model generation and binds its occurrence to it.  A legacy row
-    (``generation is None``) refuses a supplied expected generation and
-    binds its physical occurrence to the durable callback-target
-    generation.  A legacy row never accepts an arbitrary physical
-    generation as a model generation.
+    model generation and binds its occurrence to it; a supplied physical
+    occurrence must equal it.  A legacy row (``generation is None``)
+    refuses a supplied expected generation, *requires* the caller's
+    physical occurrence, and binds it only when it equals the durable
+    callback-target generation.  A legacy row never accepts an arbitrary
+    physical generation as a model generation.
     """
     managed = row["generation"] is not None
     if managed:
@@ -614,6 +659,11 @@ def _resolve_occurrence(
                 f"terminal {row['id']} holds model generation {row['generation']!r}, "
                 f"not the exact {expected_generation!r}",
             )
+        if physical_occurrence is not None and physical_occurrence != row["generation"]:
+            raise NativeStatusRepairConflict(
+                "generation-mismatch",
+                "a supplied physical occurrence must equal the managed model generation",
+            )
         return expected_generation, expected_generation
     if expected_generation is not None:
         raise NativeStatusRepairConflict(
@@ -621,14 +671,20 @@ def _resolve_occurrence(
             f"terminal {row['id']} is a legacy row with no model generation; a "
             "supplied expected generation is refused",
         )
-    occurrence = row["callback_target_generation"]
-    if not occurrence:
+    if not physical_occurrence:
         raise NativeStatusRepairConflict(
-            "callback-target-missing",
-            f"legacy terminal {row['id']} has no pane-bound callback-target "
-            "generation; nothing can be bound without it",
+            "physical-occurrence-required",
+            f"legacy terminal {row['id']} has no model generation; the repair "
+            "requires the durable callback-target physical occurrence to bind the "
+            "operation, and none was supplied",
         )
-    return None, occurrence
+    if row["callback_target_generation"] != physical_occurrence:
+        raise NativeStatusRepairConflict(
+            "generation-mismatch",
+            "the supplied physical occurrence does not equal the legacy terminal's "
+            "durable callback-target generation",
+        )
+    return None, physical_occurrence
 
 
 def _live_start_marker(pid: int) -> Optional[str]:
@@ -663,7 +719,7 @@ def _verify_exact_facts(
     pane_pid: int,
     process_identity: Mapping[str, Any],
     expected_session_id: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any]:
     """Every exact fact must still match, immediately before any mutation.
 
     ``expected_session_id`` is supplied only at commit time: the lineage
@@ -768,19 +824,30 @@ def _verify_exact_facts(
                 f"the lineage belongs to a different harness; native ids never cross "
                 "harness domains and this repair is refused",
             )
-        if expected_session_id is not None:
-            if (
-                lineage.native_session_id is not None
-                and lineage.native_session_id != expected_session_id
-            ):
-                raise NativeStatusRepairConflict(
-                    "identity-conflict",
-                    "the lineage is already bound to a different native session; "
-                    "repairing it would overwrite a known identity",
-                )
+    if expected_session_id is not None:
+        # The terminal row and the lineage must both be identity_missing or
+        # already bound to exactly the id about to be adopted — a known
+        # different id on either side is never overwritten.
+        if row["native_session_id"] is not None and row["native_session_id"] != expected_session_id:
+            raise NativeStatusRepairConflict(
+                "identity-conflict",
+                "the terminal row is already bound to a different native session; "
+                "repairing it would overwrite a known identity",
+            )
+        if (
+            lineage is not None
+            and lineage.native_session_id is not None
+            and lineage.native_session_id != expected_session_id
+        ):
+            raise NativeStatusRepairConflict(
+                "identity-conflict",
+                "the lineage is already bound to a different native session; "
+                "repairing it would overwrite a known identity",
+            )
     return {
         "lineage_id": incarnation.get("lineage_id"),
         "native_session_id": lineage.native_session_id if lineage is not None else None,
+        "terminal_native_session_id": row["native_session_id"],
         "agent_id": incarnation.get("agent_id"),
     }
 
@@ -840,7 +907,7 @@ def _verify_live_pane(
         )
     if normalize_server_identity(server_socket_path) != server:
         raise NativeStatusRepairConflict(
-            "server-identity-drift", "pane {pane_id} sits on a different tmux server"
+            "server-identity-drift", f"pane {pane_id} sits on a different tmux server"
         )
     live_marker = _live_start_marker(pane_pid)
     if live_marker is None:
@@ -1012,23 +1079,34 @@ def _prior_adoption_facts(
     operation_id: str,
     request_digest: str,
     plan: Mapping[str, Any],
-) -> Optional[dict[str, Any]]:
-    """A prior status-repair adoption of this exact owner, or None.
+) -> dict[str, Any]:
+    """A prior status-repair adoption decision: reuse, reconcile, or absent.
 
     The exact-retry convergence path: when an attachment already claims
     this exact running pane/process (verified live above) with a fully
-    validated status-repair receipt, the identity it names was observed
-    under this exact process and can be reused without another
-    ``/status``.  A superficially matching receipt is not enough — the
-    schema, request digest, physical owner, panel-attested version, and
-    parser key must all hold, and a Claude plan additionally requires the
-    composer-restored proof.  Anything ambiguous falls through to a fresh
-    observation.
+    validated status-repair receipt *for this exact operation*, the
+    identity it names was observed under this exact process and can be
+    reused without another ``/status``.
+
+    Distinguishes absence from a partial operation.  An exact-owner
+    attachment whose receipt fails schema, request digest, operation
+    binding, panel-attested version, parser key, required evidence, or (for
+    a Claude plan) composer-restored proof is a *partial operation*, not
+    absence: typing ``/status`` again would be unsafe, so it returns a
+    ``reconcile`` verdict with zero pane bytes.  Multiple exact-owner
+    matches are ambiguity, not absence.
     """
+
+    def _reconcile(reason: str) -> dict[str, Any]:
+        return {"kind": "reconcile", "reason": reason}
+
     try:
         records = native_attachment.list_attachments(owner_terminal_id=terminal_id)
     except native_attachment.NativeAttachmentError as exc:
-        raise NativeStatusRepairConflict("attachment-unavailable", str(exc)) from exc
+        logger.warning("repair %s: attachment listing failed: %s", operation_id, exc)
+        raise NativeStatusRepairConflict(
+            "attachment-unavailable", "the attachment store could not be read"
+        ) from exc
     matches = [
         record
         for record in records
@@ -1037,24 +1115,34 @@ def _prior_adoption_facts(
         and record["owner"].get("generation") == occurrence
         and record["owner"].get("pane_id") == pane_id
         and record["owner"].get("process_identity") == dict(process_identity)
-        and isinstance(record.get("adoption_receipt"), Mapping)
     ]
-    if len(matches) != 1:
-        return None
-    receipt = matches[0]["adoption_receipt"]
+    if len(matches) > 1:
+        return _reconcile("multiple exact-owner attachments exist; ambiguity is not absence")
+    if not matches:
+        return {"kind": "absent"}
+    receipt = matches[0].get("adoption_receipt")
+    if not isinstance(receipt, Mapping):
+        return _reconcile("the exact-owner attachment has no status-repair adoption receipt")
     if receipt.get("schema") != native_attachment.STATUS_REPAIR_ADOPTION_SCHEMA:
-        return None
+        return _reconcile("the exact-owner adoption receipt has an invalid schema")
     if receipt.get("request_digest") != request_digest:
-        return None
+        return _reconcile("the exact-owner adoption receipt binds a different request digest")
+    if receipt.get("operation_id") != operation_id:
+        return _reconcile("the exact-owner adoption receipt belongs to a different operation")
+    if not isinstance(receipt.get("operation_id"), str) or _is_invalid_uuid(
+        str(receipt.get("operation_id"))
+    ):
+        return _reconcile("the exact-owner adoption receipt has an invalid operation binding")
     if receipt.get("provider_version") != plan["plan_version"]:
-        return None
+        return _reconcile("the exact-owner adoption receipt attests a different provider build")
     if receipt.get("parser_key") != plan["parser_key"]:
-        return None
+        return _reconcile("the exact-owner adoption receipt names a different parser")
     if plan.get("escape") and receipt.get("composer_restored") is not True:
-        return None
+        return _reconcile("the exact-owner adoption receipt lacks the composer-restored proof")
     if not receipt.get("native_session_id") or not receipt.get("evidence_sha256"):
-        return None
+        return _reconcile("the exact-owner adoption receipt lacks required evidence fields")
     return {
+        "kind": "reuse",
         "session_id": receipt["native_session_id"],
         "parser_key": receipt["parser_key"],
         "provider_version": receipt["provider_version"],
@@ -1131,9 +1219,17 @@ def _adopt_running_owner(
             intent=intent,
         )
     except native_attachment.NativeAttachmentConflict as exc:
-        raise NativeStatusRepairConflict("attachment-conflict", str(exc)) from exc
+        logger.warning("repair %s: attachment adoption refused: %s", operation_id, exc)
+        raise NativeStatusRepairConflict(
+            "attachment-conflict",
+            "the exact live attachment could not be adopted because another owner "
+            "or a conflicting state holds the session",
+        ) from exc
     except native_attachment.NativeAttachmentError as exc:
-        raise NativeStatusRepairConflict("attachment-unavailable", str(exc)) from exc
+        logger.warning("repair %s: attachment adoption unavailable: %s", operation_id, exc)
+        raise NativeStatusRepairConflict(
+            "attachment-unavailable", "the attachment store could not be written"
+        ) from exc
 
 
 def _commit_repair(db: Any, facts: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
@@ -1185,9 +1281,17 @@ def _commit_repair(db: Any, facts: Mapping[str, Any]) -> Optional[Mapping[str, A
             db=db,
         )
     except roster.StableAgentConflict as exc:
-        raise NativeStatusRepairConflict("identity-conflict", str(exc)) from exc
+        logger.warning(
+            "repair %s: roster repair refused a known identity: %s",
+            facts["operation_id"],
+            exc,
+        )
+        raise NativeStatusRepairConflict(
+            "identity-conflict", "the roster already binds a different known identity"
+        ) from exc
     except roster.StableAgentError as exc:
-        raise NativeStatusRepairUnavailable(str(exc)) from exc
+        logger.warning("repair %s: roster repair unavailable: %s", facts["operation_id"], exc)
+        raise NativeStatusRepairUnavailable("the roster repair could not be recorded") from exc
     db.add(
         database.NativeStatusRepairEvidenceModel(
             operation_id=facts["operation_id"],
@@ -1248,11 +1352,28 @@ def _evidence_by_operation(operation_id: str) -> Optional[dict[str, Any]]:
 
 
 def canonical_request_digest(
-    *, terminal_id: str, generation: Optional[str], provider_version: Optional[str]
+    *,
+    terminal_id: str,
+    generation: Optional[str],
+    provider_version: Optional[str],
+    physical_occurrence: Optional[str] = None,
 ) -> str:
-    """The canonical digest of the immutable operation inputs."""
+    """The canonical digest of the immutable operation inputs.
+
+    The physical occurrence (the legacy callback-target generation, or the
+    managed model generation) is part of the identity: a completed
+    operation must never be adopted against a recycled terminal id whose
+    physical occurrence changed.
+    """
     return hashlib.sha256(
-        "\x00".join((terminal_id, generation or "", provider_version or "")).encode("utf-8")
+        "\x00".join(
+            (
+                terminal_id,
+                generation or "",
+                provider_version or "",
+                physical_occurrence or "",
+            )
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -1261,6 +1382,7 @@ def repair_terminal_native_identity(
     terminal_id: str,
     generation: Optional[str] = None,
     provider_version: Optional[str] = None,
+    physical_occurrence: Optional[str] = None,
     operation_id: str,
     caller: str = "cao.native-status-repair",
 ) -> dict[str, Any]:
@@ -1268,11 +1390,14 @@ def repair_terminal_native_identity(
 
     ``generation`` is the *expected model generation*: required for
     managed/v2 rows and must equal ``row.generation``; legacy rows have
-    none and must not be passed one (their physical occurrence is the
-    ``callback_target_generation``).  ``operation_id`` is an explicit
-    canonical UUID bound to a server-derived digest of the immutable
-    inputs, so an exact retry is idempotent and a changed request is a
-    typed conflict.
+    none and must not be passed one.  ``physical_occurrence`` is the
+    durable physical identity of the terminal: required for legacy rows and
+    must equal their callback-target generation; for managed rows it is
+    derived from the model generation and, if supplied, must equal it.
+    ``operation_id`` is an explicit canonical UUID bound to a
+    server-derived digest of the immutable inputs (terminal, generation,
+    provider plan, and physical occurrence), so an exact retry is
+    idempotent and a changed request is a typed conflict.
 
     The operation is serialized under the canonical lifecycle claim set
     (model-generation, callback-target-generation, pane) that terminal
@@ -1290,11 +1415,15 @@ def repair_terminal_native_identity(
             "detail": "terminal_id and operation_id are both required",
             "operation_id": operation_id,
             "request_digest": canonical_request_digest(
-                terminal_id=terminal_id, generation=generation, provider_version=provider_version
+                terminal_id=terminal_id,
+                generation=generation,
+                provider_version=provider_version,
+                physical_occurrence=physical_occurrence,
             ),
             "terminal_id": terminal_id,
             "generation": generation,
             "model_generation": generation,
+            "physical_occurrence": physical_occurrence,
             "provider": None,
             "provider_version": normalized_version(provider_version) if provider_version else None,
             "native_session_id": None,
@@ -1312,11 +1441,15 @@ def repair_terminal_native_identity(
             "detail": "operation_id must be a canonical lowercase UUID",
             "operation_id": operation_id,
             "request_digest": canonical_request_digest(
-                terminal_id=terminal_id, generation=generation, provider_version=provider_version
+                terminal_id=terminal_id,
+                generation=generation,
+                provider_version=provider_version,
+                physical_occurrence=physical_occurrence,
             ),
             "terminal_id": terminal_id,
             "generation": generation,
             "model_generation": generation,
+            "physical_occurrence": physical_occurrence,
             "provider": None,
             "provider_version": normalized_version(provider_version) if provider_version else None,
             "native_session_id": None,
@@ -1327,21 +1460,11 @@ def repair_terminal_native_identity(
             "task_bytes_submitted": False,
         }
     req_digest = canonical_request_digest(
-        terminal_id=terminal_id, generation=generation, provider_version=provider_version
+        terminal_id=terminal_id,
+        generation=generation,
+        provider_version=provider_version,
+        physical_occurrence=physical_occurrence,
     )
-
-    # Operation-id idempotency: a completed exact retry adopts the recorded
-    # evidence with no pane I/O; a changed immutable request is a typed
-    # conflict before anything touches the pane.
-    prior_evidence = _evidence_by_operation(operation_id)
-    if prior_evidence is not None:
-        return _evidence_outcome(
-            prior_evidence,
-            terminal_id=terminal_id,
-            generation=generation,
-            operation_id=operation_id,
-            request_digest=req_digest,
-        )
 
     base: dict[str, Any] = {
         "schema": REPAIR_SCHEMA,
@@ -1353,6 +1476,7 @@ def repair_terminal_native_identity(
         "terminal_id": terminal_id,
         "generation": None,
         "model_generation": generation,
+        "physical_occurrence": physical_occurrence,
         "provider": None,
         "provider_version": normalized_version(provider_version) if provider_version else None,
         "native_session_id": None,
@@ -1377,42 +1501,77 @@ def repair_terminal_native_identity(
             f"terminal {terminal_id} is {row['lifecycle_state']!r}, not live",
         )
     provider = row["provider"]
-    plan, plan_error = _resolve_plan(provider, provider_version)
+
+    # A terminals-table row missing its callback-target generation: use the
+    # canonical get_terminal_metadata CAS/self-heal seam, but ONLY when the
+    # row already carries a non-null model generation the heal will
+    # deterministically reuse.  A true generation-null legacy row is refused
+    # without calling (or mutating through) the helper.
+    if row["vintage"] == "legacy" and not row["callback_target_generation"]:
+        if row["generation"] is None:
+            return refused(
+                "callback-target-missing",
+                "the legacy terminal has no pane-bound callback-target generation "
+                "and none can be established without ambiguity; refusing without "
+                "mutating",
+            )
+        database.get_terminal_metadata(terminal_id, warn_if_missing=False)
+        row = _load_terminal_row(terminal_id)
+        if row is None:
+            return refused("terminal-not-found", f"no terminal row is recorded for {terminal_id}")
+        if not row["callback_target_generation"]:
+            return refused(
+                "callback-target-missing",
+                "the legacy terminal's callback-target generation could not be "
+                "established; refusing without mutating",
+            )
+
+    try:
+        model_generation, occurrence = _resolve_occurrence(row, generation, physical_occurrence)
+    except NativeStatusRepairError as exc:
+        return refused(getattr(exc, "reason", "errored"), str(exc))
+    base["generation"] = occurrence
+    base["physical_occurrence"] = occurrence
+
+    # Operation-id idempotency: a completed exact retry adopts the recorded
+    # evidence with no pane I/O; a changed immutable request (including a
+    # changed physical occurrence or provider plan) is a typed conflict
+    # before anything touches the pane.
+    prior_evidence = _evidence_by_operation(operation_id)
+    if prior_evidence is not None:
+        return _evidence_outcome(
+            prior_evidence,
+            terminal_id=terminal_id,
+            generation=generation,
+            occurrence=occurrence,
+            operation_id=operation_id,
+            request_digest=req_digest,
+        )
+
+    # The managed-v2 reservation binding is a durable, authoritative
+    # provider-version fact where present; it is never guessed at.
+    try:
+        durable_version = _load_durable_binding_version(terminal_id)
+    except NativeStatusRepairError as exc:
+        return refused(getattr(exc, "reason", "errored"), str(exc))
+    plan, plan_error = _resolve_plan(provider, provider_version, durable_version)
     if plan_error is not None or plan is None:
         if provider not in _REPAIR_PARSER_PLANS:
             return refused(
                 "provider-unsupported",
                 f"provider {provider!r} has no pinned native /status repair parser",
             )
+        if plan_error == "version-drift":
+            return refused(
+                "version-drift",
+                "the supplied provider build does not agree with the durable "
+                "managed-v2 binding provider version",
+            )
         return refused(
             "unsupported-build",
             f"provider {provider!r} build {provider_version!r} has no pinned repair "
             "parser; an unproven build is refused, never guessed",
         )
-
-    # A terminals-table row missing its callback-target generation: use the
-    # canonical get_terminal_metadata CAS/self-heal seam.  The heal derives
-    # the target from the row's own model generation when one exists
-    # (pane-bound, unambiguous); a heal that could only mint a random
-    # occurrence is refused rather than fabricating a physical identity.
-    if row["vintage"] == "legacy" and not row["callback_target_generation"]:
-        database.get_terminal_metadata(terminal_id, warn_if_missing=False)
-        row = _load_terminal_row(terminal_id)
-        if row is None:
-            return refused("terminal-not-found", f"no terminal row is recorded for {terminal_id}")
-        if not row["callback_target_generation"] or row["generation"] is None:
-            return refused(
-                "callback-target-missing",
-                "the legacy terminal has no pane-bound callback-target generation "
-                "and none could be established without ambiguity; refusing without "
-                "mutating",
-            )
-
-    try:
-        model_generation, occurrence = _resolve_occurrence(row, generation)
-    except NativeStatusRepairError as exc:
-        return refused(getattr(exc, "reason", "errored"), str(exc))
-    base["generation"] = occurrence
 
     try:
         incarnation = roster.get_incarnation_by_terminal(terminal_id, generation=model_generation)
@@ -1536,10 +1695,17 @@ def _evidence_outcome(
     *,
     terminal_id: str,
     generation: Optional[str],
+    occurrence: str,
     operation_id: str,
     request_digest: str,
 ) -> dict[str, Any]:
-    """The truthful reconstructed outcome of a completed exact retry."""
+    """The truthful reconstructed outcome of a completed exact retry.
+
+    The recorded evidence is adopted only when its request digest AND its
+    bound physical occurrence both still match the current request: a
+    completed operation must never be adopted against a recycled terminal
+    id whose physical occurrence changed.
+    """
     if evidence["request_digest"] != request_digest:
         return {
             "schema": REPAIR_SCHEMA,
@@ -1551,6 +1717,31 @@ def _evidence_outcome(
             "terminal_id": terminal_id,
             "generation": evidence.get("generation"),
             "model_generation": generation,
+            "physical_occurrence": occurrence,
+            "provider": evidence["provider"],
+            "provider_version": evidence["provider_version"],
+            "native_session_id": evidence["native_session_id"],
+            "evidence_sha256": evidence["evidence_sha256"],
+            "parser_key": evidence["parser_key"],
+            "attachment": None,
+            "composer_restored": None,
+            "task_bytes_submitted": False,
+        }
+    if str(evidence.get("generation") or "") != occurrence:
+        return {
+            "schema": REPAIR_SCHEMA,
+            "status": STATUS_REFUSED,
+            "reason": "operation-conflict",
+            "detail": (
+                "the operation id is bound to a different physical occurrence than "
+                "the terminal now carries; a recycled terminal is never adopted"
+            ),
+            "operation_id": operation_id,
+            "request_digest": request_digest,
+            "terminal_id": terminal_id,
+            "generation": evidence.get("generation"),
+            "model_generation": generation,
+            "physical_occurrence": occurrence,
             "provider": evidence["provider"],
             "provider_version": evidence["provider_version"],
             "native_session_id": evidence["native_session_id"],
@@ -1570,6 +1761,7 @@ def _evidence_outcome(
         "terminal_id": terminal_id,
         "generation": evidence.get("generation"),
         "model_generation": generation,
+        "physical_occurrence": occurrence,
         "provider": evidence["provider"],
         "provider_version": evidence["provider_version"],
         "native_session_id": evidence["native_session_id"],
@@ -1603,9 +1795,11 @@ def _repair_under_claims(
     claims and the pane input lease."""
     terminal_id = row["id"]
     # Re-verify every exact fact now that the claims are held: drift
-    # between load and claim is drift, and drift means zero bytes.
+    # between load and claim is drift, and drift means zero bytes.  The
+    # returned CURRENT terminal and lineage native ids are the only facts
+    # the known-identity preflight may use — never the pre-claim snapshot.
     with database.SessionLocal() as db:
-        lineage = _verify_exact_facts(
+        current = _verify_exact_facts(
             db,
             terminal_id=terminal_id,
             model_generation=model_generation,
@@ -1619,13 +1813,33 @@ def _repair_under_claims(
             process_identity=process_identity,
         )
 
+    # Recheck the completed-operation evidence now that the lifecycle
+    # claims are held: two concurrent requests that both began before the
+    # first evidence commit serialize here, and the second adopts the
+    # first's evidence (or a changed-request conflict) rather than
+    # proceeding as an ordinary call.
+    prior_evidence = _evidence_by_operation(operation_id)
+    if prior_evidence is not None:
+        return _evidence_outcome(
+            prior_evidence,
+            terminal_id=terminal_id,
+            generation=model_generation,
+            occurrence=occurrence,
+            operation_id=operation_id,
+            request_digest=request_digest,
+        )
+
     # Known-identity preflight before bytes: no /status is ever typed when
-    # the identity is already known, conflicting, or un-attached.
+    # the identity is already known, conflicting, un-attached, or attached
+    # to a non-exact owner.
     preflight = _known_identity_preflight(
         provider=provider,
         terminal_id=terminal_id,
-        terminal_known=row["native_session_id"],
-        lineage_known=lineage["native_session_id"] if lineage else None,
+        occurrence=occurrence,
+        pane_id=pane_id,
+        process_identity=process_identity,
+        terminal_known=current["terminal_native_session_id"],
+        lineage_known=current["native_session_id"],
     )
     if preflight["kind"] == "already-known":
         outcome = dict(base)
@@ -1633,8 +1847,8 @@ def _repair_under_claims(
             status=STATUS_ALREADY_KNOWN,
             reason=None,
             detail=(
-                "the identity is already known and attached; nothing was typed, "
-                "nothing was recorded, and nothing was mutated"
+                "the identity is already known and exactly attached; nothing was "
+                "typed, nothing was recorded, and nothing was mutated"
             ),
             provider=provider,
             native_session_id=preflight["session_id"],
@@ -1646,6 +1860,13 @@ def _repair_under_claims(
             "the identity is already known but no attachment records it; a later "
             "attachment audit/migration owns that concern, not this bounded "
             "missing-identity repair",
+        )
+    if preflight["kind"] == "attachment-reconcile":
+        raise NativeStatusRepairConflict(
+            "attachment-reconcile",
+            "the identity is known but its attachment is not an exact live owner "
+            "for this repair's current facts; reconcile the attachment before "
+            "proceeding",
         )
     if preflight["kind"] == "conflict":
         raise NativeStatusRepairConflict(
@@ -1680,8 +1901,10 @@ def _repair_under_claims(
     )
 
     # Exact-retry convergence: a prior fully-validated status-repair
-    # adoption already names this exact verified owner, so no second
-    # /status is needed.
+    # adoption for THIS exact operation already names this exact verified
+    # owner, so no second /status is needed.  An exact-owner attachment with
+    # an invalid/mismatched receipt is a partial operation and is refused,
+    # never retyped.
     prior = _prior_adoption_facts(
         provider=provider,
         terminal_id=terminal_id,
@@ -1692,7 +1915,13 @@ def _repair_under_claims(
         request_digest=request_digest,
         plan=plan,
     )
-    if prior is not None:
+    if prior["kind"] == "reconcile":
+        raise NativeStatusRepairConflict(
+            "attachment-reconcile",
+            f"the exact-owner attachment's adoption receipt cannot be reconciled: "
+            f"{prior['reason']}; no second /status was typed and nothing was adopted",
+        )
+    if prior["kind"] == "reuse":
         if known_id is not None and prior["session_id"] != known_id:
             raise NativeStatusRepairConflict(
                 "identity-conflict",
@@ -1822,20 +2051,62 @@ def _repair_under_claims(
     )
 
 
+def _attachment_is_exact_live_owner(
+    record: Mapping[str, Any],
+    *,
+    provider: str,
+    session_id: str,
+    terminal_id: str,
+    occurrence: str,
+    pane_id: str,
+    process_identity: Mapping[str, Any],
+) -> bool:
+    """Whether an attachment is a live owner whose identity is exactly this
+    repair's current facts: provider/native id, owner terminal, physical
+    occurrence, native-tui mode, pane, and exact process identity."""
+    if record["state"] not in native_attachment.LIVE_STATES:
+        return False
+    owner = record.get("owner") or {}
+    return (
+        record.get("provider") == provider
+        and record.get("native_session_id") == session_id
+        and owner.get("terminal_id") == terminal_id
+        and owner.get("generation") == occurrence
+        and owner.get("execution_mode") == em.NATIVE_TUI
+        and owner.get("pane_id") == pane_id
+        and owner.get("process_identity") == dict(process_identity)
+    )
+
+
 def _known_identity_preflight(
     *,
     provider: str,
     terminal_id: str,
+    occurrence: str,
+    pane_id: str,
+    process_identity: Mapping[str, Any],
     terminal_known: Optional[str],
     lineage_known: Optional[str],
 ) -> dict[str, Any]:
-    """The zero-byte identity decision: already-known, conflict,
-    attachment-unresolved, or proceed (possibly to verify a known id)."""
+    """The zero-byte identity decision: already-known (only on an exact live
+    owner), conflict, attachment-unresolved, attachment-reconcile, or
+    proceed (possibly to verify a known id)."""
     if terminal_known and lineage_known:
         if terminal_known != lineage_known:
             return {"kind": "conflict"}
-        if native_attachment.get(provider, terminal_known) is None:
+        attachment = native_attachment.get(provider, terminal_known)
+        if attachment is None:
             return {"kind": "attachment-unresolved"}
+        if not _attachment_is_exact_live_owner(
+            attachment,
+            provider=provider,
+            session_id=terminal_known,
+            terminal_id=terminal_id,
+            occurrence=occurrence,
+            pane_id=pane_id,
+            process_identity=process_identity,
+        ):
+            return {"kind": "attachment-reconcile"}
         return {"kind": "already-known", "session_id": terminal_known}
     return {"kind": "proceed", "known_id": terminal_known or lineage_known}
 
@@ -1868,6 +2139,26 @@ def _finish_repair(
     later fails, the conservative attachment remains and an exact retry
     can finish it."""
     terminal_id = row["id"]
+
+    # Revalidate every exact fact — including the terminal and lineage
+    # native ids against the id about to be adopted — immediately before
+    # attachment adoption, so a drift after the observation cannot leave a
+    # wrong conservative claim.
+    with database.SessionLocal() as db:
+        _verify_exact_facts(
+            db,
+            terminal_id=terminal_id,
+            model_generation=model_generation,
+            occurrence=occurrence,
+            provider=provider,
+            pane_id=pane_id,
+            window_id=window_id,
+            session_id=tmux_session_id,
+            server_socket_path=server_socket_path,
+            pane_pid=pane_pid,
+            process_identity=process_identity,
+            expected_session_id=session_id,
+        )
 
     record, adopted = _adopt_running_owner(
         operation_id=operation_id,
@@ -1920,6 +2211,7 @@ def _finish_repair(
             adopted_evidence,
             terminal_id=terminal_id,
             generation=model_generation,
+            occurrence=occurrence,
             operation_id=operation_id,
             request_digest=request_digest,
         )
