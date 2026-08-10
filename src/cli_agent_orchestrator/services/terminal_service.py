@@ -56,6 +56,7 @@ from cli_agent_orchestrator.clients.database import (
     register_v2_terminal_incarnation_outcome,
     report_terminal_missing_from_every_store,
     set_terminal_native_session_id,
+    set_terminal_pre_task_identity_state,
     update_last_active,
     update_terminal_shell_command,
     upgrade_terminal_identity_from_observation,
@@ -77,6 +78,7 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services import unmanaged_native_identity
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -343,7 +345,7 @@ def record_native_session(terminal_id: str, native_session_id: str) -> bool:
     except Exception as exc:  # pragma: no cover - a missing label is not fatal
         logger.warning("Could not record native session for %s: %s", terminal_id, exc)
         return False
-    # M3-A repair seam: bind the observed identity onto the terminal's
+    # Stable-agent repair seam: bind the observed identity onto the terminal's
     # roster lineage when that lineage is still truthfully
     # ``identity_missing``.  Best-effort and never fatal: a conflicting
     # recorded identity is a real conflict and is logged, and the truthful
@@ -1366,7 +1368,7 @@ def _admit_session_creation(session_name: str) -> str:
 
 
 def _roster_retire_incarnation_best_effort(terminal_id: str, generation: Optional[str]) -> None:
-    """M3-A teardown retirement: best-effort and never raised.
+    """Roster teardown retirement: best-effort and never raised.
 
     The physical disposable is already being torn down; a roster failure
     here (missing record, unreadable store) must not block cleanup — Stop
@@ -1396,8 +1398,11 @@ def _roster_bind_unmanaged(
     pane_id: Optional[str],
     pane_pid: Optional[int],
     native_status_source: bool,
+    native_session_id: Optional[str] = None,
+    acquisition_method: Optional[str] = None,
+    continuity_note: Optional[str] = None,
 ) -> None:
-    """M3-A / cond-0377: durably bind the stable CAO agent for an
+    """Durably bind the stable CAO agent for an
     UNMANAGED terminal (the session supervisor and legacy workers).  The
     stable-agent record exists before the launch returns and before any
     message the caller sends at creation; managed reservations bind at
@@ -1405,15 +1410,14 @@ def _roster_bind_unmanaged(
     excludes them.  Role is launch truth: the caller passes the role its
     owning operation decided; ``None`` means worker.
 
-    DARK-FOUNDATION TRUTH, NOT FULL ADMISSION ENFORCEMENT: the native
-    identity is not yet known on this path, so the lineage starts in the
-    truthful ``identity_missing`` state and the repair seam
-    (``record_native_identity``) upgrades it when the provider answers.
-    The roster records identity here, but the legacy unmanaged input
-    lanes are NOT yet gated on native-ID-ready admission — deterministic
-    native capture and status repair are the follow-up cond-0377
-    sub-slices.  The managed-v2 seam's ``assert_admission_ready`` gate IS
-    enforced; this unmanaged path is a dark foundation, not the full gate.
+    PRE-TASK IDENTITY: for providers with an accepted
+    pre-task identity contract (Claude Code and Codex via the shared
+    ``unmanaged_native_identity`` seam), the harness-native session id is
+    resolved BEFORE the provider starts and bound here, so the lineage is
+    never ``identity_missing`` for a supported new launch and no real
+    task input can precede the durable binding.  A provider cell whose
+    installed primitive cannot supply the contract (typed-disabled) keeps
+    the truthful ``identity_missing`` state and the repair seam.
 
     Fail-closed by contract: a newly created terminal whose stable-agent
     row cannot be durably bound is NOT a successfully rostered launch —
@@ -1433,7 +1437,9 @@ def _roster_bind_unmanaged(
             role=stable_agent_role or stable_agent_roster.ROLE_WORKER,
             profile_family=agent_profile or "default",
             harness=provider,
-            native_session_id=None,
+            native_session_id=native_session_id,
+            acquisition_method=acquisition_method,
+            continuity_note=continuity_note,
             terminal_id=terminal_id,
             generation=terminal_generation,
             pane_id=pane_id,
@@ -1441,6 +1447,113 @@ def _roster_bind_unmanaged(
             execution_mode="native_tui" if native_status_source else None,
         )
     )
+
+
+def _pre_task_bind_and_resolve(
+    *,
+    terminal_id: str,
+    session_name: str,
+    stable_agent_role: Optional[str],
+    agent_profile: Optional[str],
+    provider: str,
+    terminal_generation: Optional[str],
+    pane_id: Optional[str],
+    pane_pid: Optional[int],
+    native_status_source: bool,
+    working_directory: Optional[str],
+    expected_model: Optional[str],
+    expected_effort: Optional[str],
+    codex_profile_material: Optional[dict],
+    forwarded_environment: Optional[dict],
+) -> Optional[dict]:
+    """ONE cancellation-owned operation: resolve the pre-task harness-native
+    identity, durably persist it on the terminal row, and bind the roster —
+    all in the same worker thread.
+
+    The stable roster first records this exact incarnation
+    as identity-pending, then the resolved native id is written to BOTH the
+    terminal-incarnation row and that roster lineage before provider start or
+    task input. A refused terminal-row bind or roster repair is a launch
+    failure that unwinds the pane and retires the pending incarnation.
+
+    If the id was minted, the same thread attempts both durable writes BEFORE
+    returning. Cancellation cannot cross that operation: teardown shield-waits
+    for the thread and then retires whatever durable incarnation it reached.
+    Returns the identity record (for the provider launch) or ``None`` for
+    unactivated providers (bound truthfully as identity_missing).  For an
+    activated cell, an identity failure raises and the launch fails closed.
+    """
+    activated = provider in unmanaged_native_identity.UNMANAGED_PRE_TASK_PROVIDERS
+    # Publish the stable-agent incarnation first with a truthful, bounded
+    # identity-pending marker. This is ordinary roster metadata, not a second
+    # claim/lease. It gives concurrent input lanes a durable way to distinguish
+    # this in-flight activated launch from compatible legacy identity-missing
+    # rows while the potentially slow provider bootstrap runs.
+    _roster_bind_unmanaged(
+        terminal_id=terminal_id,
+        session_name=session_name,
+        stable_agent_role=stable_agent_role,
+        agent_profile=agent_profile,
+        provider=provider,
+        terminal_generation=terminal_generation,
+        pane_id=pane_id,
+        pane_pid=pane_pid,
+        native_status_source=native_status_source,
+        continuity_note=(
+            unmanaged_native_identity.PRE_TASK_IDENTITY_PENDING if activated else None
+        ),
+    )
+    if not activated:
+        return None
+
+    identity = unmanaged_native_identity.resolve_pre_task_identity(
+        provider=provider,
+        working_directory=working_directory,
+        expected_model=expected_model,
+        expected_effort=expected_effort,
+        codex_profile_material=codex_profile_material,
+        forwarded_environment=forwarded_environment,
+        terminal_id=terminal_id,
+        session_name=session_name,
+    )
+    if not isinstance(identity, dict) or not identity.get("native_session_id"):
+        raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
+            f"the activated provider {provider!r} returned no pre-task native identity"
+        )
+    # Persist the exact native id on the terminal-incarnation row BEFORE the
+    # roster bind so the two surfaces cannot diverge. A refusal (the row is
+    # gone, or already carries a different native session) is a launch failure
+    # — fail closed rather than publish a roster binding the terminal row
+    # contradicts.  The row state then moves forward to ``captured`` in its
+    # dedicated column (the real id is durably written), before the roster
+    # lineage records the same captured marker; a crash between any of these
+    # writes leaves at least one surface in-flight and the input lanes
+    # closed.
+    if not set_terminal_native_session_id(terminal_id, identity["native_session_id"]):
+        raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
+            f"terminal {terminal_id} refused its pre-task native-session bind "
+            f"(absent row or conflicting native id); the launch fails closed"
+        )
+    if not set_terminal_pre_task_identity_state(
+        terminal_id, unmanaged_native_identity.PRE_TASK_IDENTITY_CAPTURED
+    ):
+        raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
+            f"terminal {terminal_id} refused its pre-task identity captured "
+            f"transition (absent row, legacy row, or non-forward state move); "
+            "the launch fails closed"
+        )
+    from cli_agent_orchestrator.services import stable_agent_roster
+
+    stable_agent_roster.record_native_identity(
+        terminal_id=terminal_id,
+        generation=terminal_generation,
+        native_session_id=identity["native_session_id"],
+        harness=provider,
+        acquisition_method=identity["acquisition_method"],
+        route_provenance={"issuance_source": identity["acquisition_method"]},
+        continuity_note=unmanaged_native_identity.PRE_TASK_IDENTITY_CAPTURED,
+    )
+    return identity
 
 
 async def create_terminal(
@@ -1471,7 +1584,7 @@ async def create_terminal(
     # the FIFO -- it is a line-oriented subprocess. Only the launch verb
     # knows whether the pane it is about to create is a full-screen TUI.
     native_status_source: bool = False,
-    #: The stable-agent role of THIS terminal (M3-A / cond-0377).  Role is
+    #: The stable-agent role of THIS terminal.  Role is
     #: launch truth, never a profile-name heuristic: session creation
     #: passes ``supervisor`` for the session's initial terminal, and every
     #: other terminal is a ``worker`` unless its owning operation
@@ -1526,12 +1639,6 @@ async def create_terminal(
     # delete against the freshly generated — possibly 32-bit-colliding —
     # terminal ID, destroying an unrelated live terminal's state.)
     session_claim = None
-    # M3-A: whether the unmanaged roster bind committed during this
-    # creation.  If a later step fails, the exact incarnation must be
-    # retired during unwind so a dead terminal is never left live.
-    # Initialized at function scope so every cleanup path (new and
-    # add-to-existing sessions alike) sees it bound.
-    roster_bound = False
     if new_session:
         if not session_name:
             session_name = generate_session_name()
@@ -1670,6 +1777,57 @@ async def create_terminal(
                 terminal_id, terminal_generation, window_name, session_name
             )
 
+        # One canonical effective working directory is
+        # resolved ONCE and consumed by both the physical pane launch and
+        # the pre-task native bootstrap, so the resumed TUI and the minted
+        # session agree byte-for-byte on cwd (None resolves to the canonical
+        # current directory; a symlink alias resolves to its real path).
+        activated_unmanaged = (
+            reserved_terminal_id is None
+            and provider in unmanaged_native_identity.UNMANAGED_PRE_TASK_PROVIDERS
+        )
+        effective_working_directory = (
+            unmanaged_native_identity.canonical_working_directory(working_directory)
+            if activated_unmanaged
+            else working_directory
+        )
+        if (
+            reserved_terminal_id is None
+            and provider == ProviderType.CODEX.value
+            and trusted_project_root is not None
+            and os.path.realpath(trusted_project_root) != effective_working_directory
+        ):
+            raise ValueError(
+                "an ordinary Codex launch must use its canonical working directory "
+                "as trusted_project_root so bootstrap and resumed TUI have one contract"
+            )
+
+        # Resolve the pane's effective forwarded overlay once.  Re-reading
+        # session env after pane creation can race an update and give the
+        # bootstrap a different environment from the TUI it is meant to
+        # resume.
+        if reserved_terminal_id is None and not new_session:
+            forwarded_environment: dict[str, str] = {
+                **get_session_env(session_name),
+                **(env_vars or {}),
+            }
+        else:
+            forwarded_environment = dict(env_vars or {})
+        if activated_unmanaged and provider == ProviderType.CODEX.value:
+            # Pin one explicit Codex store into both the pane and zero-turn
+            # bootstrap. Existing tmux sessions may have been born under a
+            # different server environment, so implicit inheritance is not
+            # an exact resume contract.
+            effective_home = forwarded_environment.get("HOME") or os.environ.get("HOME")
+            codex_home = forwarded_environment.get("CODEX_HOME") or os.environ.get("CODEX_HOME")
+            if not codex_home:
+                if not effective_home:
+                    raise ValueError("Codex launch cannot resolve HOME/CODEX_HOME")
+                codex_home = os.path.join(effective_home, ".codex")
+            if not os.path.isabs(codex_home):
+                raise ValueError("CODEX_HOME must be an absolute path for exact resume")
+            forwarded_environment["CODEX_HOME"] = os.path.realpath(codex_home)
+
         # Step 2: Create tmux session or window
         if new_session:
             # Create new tmux session with initial window
@@ -1677,16 +1835,21 @@ async def create_terminal(
                 session_name,
                 window_name,
                 terminal_id,
-                working_directory,
-                extra_env=env_vars,
+                effective_working_directory,
+                extra_env=(forwarded_environment if activated_unmanaged else env_vars),
             )
             session_created = True  # only set after successful creation
 
             # Persist forwarded env only after the tmux session actually
             # exists; the failure path below clears it if a later step
             # tears the session back down.
-            if env_vars:
-                set_session_env(session_name, env_vars)
+            persisted_launch_env = (
+                forwarded_environment
+                if activated_unmanaged and provider == ProviderType.CODEX.value
+                else env_vars
+            )
+            if persisted_launch_env:
+                set_session_env(session_name, persisted_launch_env)
         else:
             # Add window to existing session
             if not get_backend().session_exists(session_name):
@@ -1702,8 +1865,8 @@ async def create_terminal(
                     window_name,
                     terminal_id,
                     managed_native_command,
-                    working_directory,
-                    extra_env=env_vars or {},
+                    effective_working_directory,
+                    extra_env=forwarded_environment,
                 )
             else:
                 # Merge explicit per-step env_vars over the persisted session env
@@ -1714,8 +1877,8 @@ async def create_terminal(
                     session_name,
                     window_name,
                     terminal_id,
-                    working_directory,
-                    extra_env={**get_session_env(session_name), **(env_vars or {})},
+                    effective_working_directory,
+                    extra_env=forwarded_environment,
                 )
             window_created = True  # only set after successful creation
 
@@ -1830,6 +1993,16 @@ async def create_terminal(
                     exc_info=True,
                 )
         else:
+            # An activated launch stamps its row with the pre-task identity
+            # pending state in the DEDICATED closed-state column at
+            # creation, so the row is fail-closed from its first durable
+            # visibility: a concurrent direct-input or control-input call
+            # in the window before the roster marker commits gets the typed
+            # lineage refusal, never the legacy exemption (which remains
+            # only for rows born without the marker).  ``native_session_id``
+            # stays NULL here — it contracts to mean the real provider
+            # session running in the pane and is written only once the
+            # pre-task identity is durably captured.
             db_create_terminal(
                 terminal_id,
                 session_name,
@@ -1849,10 +2022,16 @@ async def create_terminal(
                 # be replaced rather than one that merely reads oddly.
                 session_id=identity.get("session_id"),
                 pane_pid=int(identity["pane_pid"]) if identity.get("pane_pid") else None,
+                pre_task_identity_state=(
+                    unmanaged_native_identity.PRE_TASK_IDENTITY_PENDING
+                    if activated_unmanaged
+                    else None
+                ),
             )
+
             _register_incarnation(terminal_id, terminal_generation, identity)
 
-        # M3-A / cond-0377: bind the stable CAO agent for every UNMANAGED
+        # Bind the stable CAO agent for every UNMANAGED
         # terminal before any real task input can be delivered to it.
         # Fail-closed: a roster bind failure unwinds the launch (typed
         # failure, zero task input) instead of returning a successfully
@@ -1861,16 +2040,53 @@ async def create_terminal(
         # before any task input or a successful return, so SQLite
         # contention and retry backoff never stall unrelated requests.
         #
-        # Cancellation safety (repair-3 P1-1): cancellation does not stop
+        # Cancellation safety: cancellation does not stop
         # the worker thread.  On cancellation we shield-await the worker to
         # a KNOWN outcome before allowing cleanup/lock ownership to end; if
         # it committed, the cleanup fact is set so the cancellation teardown
         # retires the exact incarnation.  A late commit can therefore never
         # cross the teardown boundary.
+        # The pre-task harness-native identity is resolved and
+        # durably bound in ONE cancellation-owned operation BEFORE the
+        # provider starts (off-loop; the Codex zero-turn bootstrap is
+        # provider I/O).  The roster binding and the provider launch both
+        # consume the SAME exact id, and the same canonical working
+        # directory.  For an activated cell, an identity failure fails the
+        # launch closed (zero provider initialization, zero task bytes).
+        pre_task_identity: Optional[dict] = None
+        # Build the Codex profile material ONCE from the
+        # already-loaded profile, so the pre-task bootstrap and the resumed
+        # TUI consume the SAME core args — neither reloads a potentially-
+        # changed profile nor rebuilds a subtly different contract.  Managed
+        # native launches run the provider bridge as the pane's own argv and
+        # never reach provider creation, so they neither need nor consult
+        # this material.
+        codex_profile_material: Optional[dict] = None
+        if (
+            managed_native_command is None
+            and provider == ProviderType.CODEX.value
+            and profile is not None
+        ):
+            from cli_agent_orchestrator.services.managed_provider_bridge import (
+                _profile_material_from_profile,
+            )
+
+            # A malformed profile (e.g. an MCP server entry with no usable
+            # transport) is a pre-task identity failure: the launch fails
+            # closed with the typed refusal, never a raw serializer error.
+            try:
+                codex_profile_material = _profile_material_from_profile(
+                    profile, terminal_id, allowed_tools=allowed_tools
+                )
+            except Exception as exc:  # noqa: BLE001 - record the concrete blocker
+                raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
+                    f"the codex profile material was refused by the pre-task identity "
+                    f"contract: {exc}"
+                ) from exc
         if reserved_terminal_id is None:
             worker = asyncio.create_task(
                 asyncio.to_thread(
-                    _roster_bind_unmanaged,
+                    _pre_task_bind_and_resolve,
                     terminal_id=terminal_id,
                     session_name=session_name,
                     stable_agent_role=stable_agent_role,
@@ -1880,6 +2096,11 @@ async def create_terminal(
                     pane_id=identity.get("pane_id"),
                     pane_pid=(int(identity["pane_pid"]) if identity.get("pane_pid") else None),
                     native_status_source=native_status_source,
+                    working_directory=effective_working_directory,
+                    expected_model=expected_model,
+                    expected_effort=expected_effort,
+                    codex_profile_material=codex_profile_material,
+                    forwarded_environment=forwarded_environment,
                 )
             )
             # The worker is SHIELDED from the very first await: Python
@@ -1902,11 +2123,14 @@ async def create_terminal(
                 try:
                     worker.result()
                 except Exception:
-                    roster_bound = False
-                else:
-                    roster_bound = True
+                    pass
                 raise
-            roster_bound = True
+            try:
+                pre_task_identity = worker.result()
+            except unmanaged_native_identity.UnmanagedIdentityUnavailable:
+                # Activated cell failed closed before provider initialization
+                # or task input. Cleanup below retires any pending incarnation.
+                raise
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -2031,6 +2255,15 @@ async def create_terminal(
         # the skill catalog here; Kiro (skill:// resources) and OpenCode
         # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
         # Copilot gets the catalog baked at install time.
+        # The resumed Codex TUI trusts the SAME canonical cwd the
+        # zero-turn bootstrap pre-authorized, so the TUI's core args match the
+        # bootstrap's (the trust override is part of the shared core).
+        # A divergent explicit root was refused before pane creation above.
+        provider_trust_root = (
+            effective_working_directory
+            if provider == ProviderType.CODEX.value
+            else trusted_project_root
+        )
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,
@@ -2040,9 +2273,22 @@ async def create_terminal(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
-            trusted_project_root=trusted_project_root,
-            expected_model=expected_model,
-            expected_effort=expected_effort,
+            trusted_project_root=provider_trust_root,
+            # The provider launch consumes the exact pre-task minted native
+            # id AND the same effective route (model/effort) the pre-task
+            # bootstrap selected — for Codex the observed actual model and
+            # the effort only when the provider reported one.  For Codex the
+            # exact digest-verified executable from the captured contract is
+            # pinned too, so the resumed TUI never re-resolves a bare
+            # ``codex`` through the pane's ambient PATH.  None keeps the
+            # legacy ambient launch for unactivated providers.
+            expected_model=(pre_task_identity["model"] if pre_task_identity else expected_model),
+            expected_effort=(pre_task_identity["effort"] if pre_task_identity else expected_effort),
+            native_session_id=(
+                pre_task_identity["native_session_id"] if pre_task_identity else None
+            ),
+            codex_profile_material=codex_profile_material,
+            codex_executable=(pre_task_identity.get("binary_path") if pre_task_identity else None),
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -2060,9 +2306,23 @@ async def create_terminal(
                 initial_message,
                 initial_message_orchestration_type,
                 registry,
+                terminal_generation=terminal_generation,
+                pre_task_identity=pre_task_identity,
             )
         else:
             await provider_instance.initialize()
+
+            # The resumed TUI is up: transition the activated launch's
+            # pre-task marker from captured to ready, admitting task input.
+            # Fail-closed by contract: an initialize() that raised never
+            # reaches this transition, so the marker stays in-flight and the
+            # input lanes keep refusing.
+            if pre_task_identity is not None:
+                await asyncio.to_thread(
+                    unmanaged_native_identity.mark_pre_task_identity_ready,
+                    terminal_id=terminal_id,
+                    generation=terminal_generation,
+                )
 
             # Persist shell_command baseline if the provider captured one
             shell_command = provider_instance.shell_baseline
@@ -2164,13 +2424,13 @@ async def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        # M3-A (i-0003): if the unmanaged roster bind committed before this
+        # If the unmanaged roster bind committed before this
         # failure, retire the exact incarnation BEFORE removing the terminal
         # row — a dead terminal must never leave a live roster incarnation
         # that blocks identity reuse and lies to the audit.  Idempotent
         # (retiring a retired/absent incarnation is a no-op), best-effort,
         # and preserves the primary exception below.
-        if roster_bound:
+        if reserved_terminal_id is None:
             _roster_retire_incarnation_best_effort(terminal_id, terminal_generation)
         # Roll back the DB terminal row so a failed create does not leave an
         # orphan record: the stale row would still be listed for the session
@@ -2402,6 +2662,9 @@ def _schedule_deferred_init(
     initial_message: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     registry: PluginRegistry | None,
+    *,
+    terminal_generation: Optional[str] = None,
+    pre_task_identity: Optional[dict] = None,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -2422,6 +2685,17 @@ def _schedule_deferred_init(
         caller_id: Optional[str] = None
         try:
             await provider_instance.initialize()
+            # The resumed TUI is up: transition the activated launch's
+            # pre-task marker from captured to ready BEFORE the initial
+            # message below is sent, so the send_input admission lane passes.
+            # A failed initialize() never reaches this transition and the
+            # marker stays in-flight (fail-closed).
+            if pre_task_identity is not None:
+                await asyncio.to_thread(
+                    unmanaged_native_identity.mark_pre_task_identity_ready,
+                    terminal_id=terminal_id,
+                    generation=terminal_generation,
+                )
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
@@ -2532,7 +2806,6 @@ def get_terminal(terminal_id: str) -> Dict:
         metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
-
         # A pre-identity-persistence terminal is eligible only when BOTH
         # fields are absent.  The backend must prove the candidate pane's
         # process lineage still carries this exact terminal id; the mutable
@@ -2766,6 +3039,19 @@ def send_input(
         metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        from cli_agent_orchestrator.services import stable_agent_roster
+        from cli_agent_orchestrator.services.control_input_contract import (
+            REASON_LINEAGE_UNPROVEN,
+        )
+
+        try:
+            unmanaged_native_identity.assert_unmanaged_admission_ready(terminal_id, metadata)
+        except stable_agent_roster.StableAgentAdmissionRefused as exc:
+            raise TerminalInputRefusedError(
+                REASON_LINEAGE_UNPROVEN,
+                f"stable-agent/native binding is not ready: {exc}",
+            ) from exc
 
         # Prove the recorded pane is still the registered one before any of
         # the work below — the status arming and buffer clear mutate state,
@@ -3588,7 +3874,7 @@ def _delete_terminal_claimed(
                     )
         except Exception as e:
             logger.warning(f"Failed to resolve native session claims for {terminal_id}: {e}")
-        # M3-A: retire the roster incarnation so the physical history is
+        # Retire the roster incarnation so the physical history is
         # truthful while the stable agent survives teardown.  Best-effort
         # and never raised: missing roster records or an unreadable store
         # must not block cleanup (Stop is best-effort for every roster).

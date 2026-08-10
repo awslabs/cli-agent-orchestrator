@@ -107,6 +107,21 @@ _VERSION_POLICY_KEY: dict[str, str] = {
     PROVIDER_MUSE_CLI: PROVIDER_MUSE,
 }
 
+#: The pre-task identity launch markers shared by every admission surface.
+#
+#: One simple launch/readiness marker, not a claim or lease: an activated
+#: ordinary (unmanaged) launch stamps its terminal row with ``PENDING`` at
+#: row creation so the row is fail-closed from its first durable
+#: visibility, keeps the roster lineage on ``PENDING``/``CAPTURED`` while
+#: the pre-task identity is resolved and the provider warms up, and
+#: transitions to ``READY`` only after provider/TUI initialization
+#: succeeds.  The markers live here (a dependency-free contract module) so
+#: the row writer (``clients/database``), the roster, and the admission
+#: seam can all name the same vocabulary without an import cycle.
+PRE_TASK_IDENTITY_PENDING = "pre-task native identity pending"
+PRE_TASK_IDENTITY_CAPTURED = "pre-task native identity captured"
+PRE_TASK_IDENTITY_READY = "pre-task native identity ready"
+
 #: The single *current* pin per provider: the version a fresh mint/proof
 #: is expected to run, and the one a receipt records when it cannot read a
 #: more specific fact.  ``SUPPORTED_VERSIONS`` below is the acceptance

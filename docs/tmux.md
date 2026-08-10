@@ -46,7 +46,9 @@ The flag is repeatable. Values travel in the request body, not the URL, so secre
 
 Rejected at the CLI boundary:
 
-- Keys matching `CLAUDE` / `CODEX_` / `__MISE_` (reserved for provider auth — the 6 `CLAUDE_CODE_USE_*` / `CLAUDE_CODE_SKIP_*` auth flags are explicitly allowlisted).
+- Keys matching `CLAUDE` / `CODEX_` / `__MISE_` (reserved for provider auth and nested-session markers), with two explicit allowlist exceptions:
+  - The 6 `CLAUDE_CODE_USE_*` / `CLAUDE_CODE_SKIP_*` auth flags, which must reach the provider.
+  - `CODEX_HOME`, allowlisted as a shared storage location: the ordinary Codex pre-task bootstrap and its resumed pane are handed the same explicit `CODEX_HOME` value, so a custom Codex store cannot split one native session across two homes. Every other `CODEX_*` variable (auth, session markers) stays rejected.
 - Keys outside `[A-Za-z_][A-Za-z0-9_]*` (non-POSIX names break the shell).
 - Values ≥ 2048 bytes (per-var cap that keeps the tmux argv under the kernel limit — see PR #246).
 

@@ -180,4 +180,6 @@ def test_codex_command_carries_typed_trust_override(tmp_path, monkeypatch):
     )
     command = provider._build_codex_command()
     assert render_trusted_project_override(root) in command
-    assert command.endswith("-c 'model=\"gpt-5.6-sol\"' -c 'model_reasoning_effort=\"xhigh\"'")
+    # The unified composer emits the route last (--model then the
+    # reasoning-effort override), after the canonical trust override.
+    assert command.endswith("--model gpt-5.6-sol -c 'model_reasoning_effort=\"xhigh\"'")

@@ -6,7 +6,8 @@ import os
 import re
 import shlex
 import time
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -227,6 +228,246 @@ def render_trusted_project_override(project_root: str) -> str:
     return f'projects={{{_toml_scalar(project_root)}={{trust_level="trusted"}}}}'
 
 
+# ---------------------------------------------------------------------------
+# The ONE Codex argument composer.
+#
+# The ordinary CodexProvider, the unmanaged pre-task bootstrap, and the
+# managed-v2 adapter all consume ``compose_codex_core_args`` so the zero-turn
+# bootstrap and the resumed TUI cannot drift apart on profile selection,
+# developer instructions, MCP serialization, codexConfig, trust, or route
+# ordering.  Each caller appends only its own suffixes: the bootstrap appends
+# its pinned route and the app-server flags; the TUI appends its TUI flags,
+# the observed/pinned route, and the exact resume id.
+# ---------------------------------------------------------------------------
+
+#: TUI-only flags.  ``--no-alt-screen`` keeps output in scrollback so tmux
+#: capture-pane is reliable; ``--disable shell_snapshot`` avoids TTY input
+#: conflicts in tmux.  Explicit (not buried in the core) because the app-server
+#: bootstrap must NOT receive them.
+CODEX_TUI_FLAGS = ["--no-alt-screen", "--disable", "shell_snapshot"]
+
+#: App-server-only flags.  The resumed TUI must NOT receive them.
+CODEX_APP_SERVER_FLAGS = ["app-server", "--stdio"]
+
+#: Default MCP tool timeout (seconds) as a TOML float.  Codex deserializes
+#: ``tool_timeout_sec`` via ``Option<f64>``, so an integer is silently rejected
+#: and falls back to the 60s default.
+CODEX_DEFAULT_MCP_TOOL_TIMEOUT_SEC = 600.0
+
+
+@dataclass(frozen=True)
+class CodexRoute:
+    """The route a Codex launch pins: model and reasoning effort.
+
+    Both fields optional.  An empty/None ``model`` is the provider-default
+    (omitted from ``thread/start`` and the argv — the bootstrap lets Codex
+    pick, and records the actual).  An empty/None ``effort`` is omitted —
+    effort stays a config/argv selection and the bootstrap records null when
+    the provider reports none.  Never invent a ``provider-default`` or
+    empty-string route.
+    """
+
+    model: Optional[str] = None
+    effort: Optional[str] = None
+
+
+def _codex_mcp_args(mcp_servers: Optional[list]) -> list[str]:
+    """Serialize resolved MCP server material into Codex ``-c`` overrides.
+
+    ``mcp_servers`` is the resolved structure produced once from the loaded
+    profile (by :func:`resolve_codex_mcp_material_entry`): a list of dicts,
+    each carrying exactly one transport.  A command/stdio entry has ``name``,
+    ``command``, ``args``, ``env`` (list of ``{name, value}``), ``env_vars``
+    (list of strings), and ``tool_timeout_sec`` (number or None).  A
+    URL/streamable-HTTP entry has ``name``, ``url``, and an optional
+    ``bearer_token_env_var`` — no subprocess surface at all, so no
+    command/args/env/env_vars and no ``CAO_TERMINAL_ID`` injection.
+
+    One implementation of MCP serialization/timeouts so the bootstrap and TUI
+    agree, and so the same validation closes the same traps on every path: the
+    server name / env key are TOML bare keys (a dot would nest under the wrong
+    table), env_vars are strings, the timeout is a positive number, and an
+    entry with no usable transport is refused rather than silently skipped.
+    ``type: http`` is profile-side information and is never serialized — Codex
+    selects the HTTP transport from ``url`` itself.
+    """
+    args: list[str] = []
+    for server in mcp_servers or []:
+        name = _validate_config_key(server["name"], source="mcpServers name")
+        prefix = f"mcp_servers.{name}"
+        if "url" in server:
+            # URL/streamable-HTTP transport: the URL plus an optional bearer
+            # token env var name.  No command/args/env/env_vars keys, and no
+            # CAO_TERMINAL_ID injection into a subprocess that does not exist.
+            url = server.get("url")
+            if not isinstance(url, str) or not url:
+                raise ValueError(f"mcpServers {name!r} url must be a non-empty string, got {url!r}")
+            args.extend(["-c", f"{prefix}.url={_toml_scalar(url)}"])
+            token = server.get("bearer_token_env_var")
+            if token is not None:
+                if not isinstance(token, str) or not token:
+                    raise ValueError(
+                        f"mcpServers {name!r} bearer_token_env_var must be a non-empty "
+                        f"string, got {token!r}"
+                    )
+                args.extend(["-c", f"{prefix}.bearer_token_env_var={_toml_scalar(token)}"])
+            continue
+        command = server.get("command")
+        if not isinstance(command, str) or not command:
+            raise ValueError(
+                f"mcpServers {name!r} must configure exactly one usable transport "
+                f"(a non-empty command or a non-empty url); got neither"
+            )
+        args.extend(["-c", f"{prefix}.command={_toml_scalar(command)}"])
+        server_args = "[" + ", ".join(_toml_scalar(a) for a in (server.get("args") or [])) + "]"
+        args.extend(["-c", f"{prefix}.args={server_args}"])
+        for item in server.get("env") or []:
+            key = _validate_config_key(item["name"], source="mcpServers env")
+            args.extend(["-c", f"{prefix}.env.{key}={_toml_scalar(str(item['value']))}"])
+        env_vars = list(server.get("env_vars") or [])
+        # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server) can
+        # identify the current session; Codex does not forward env to MCP
+        # subprocesses by default.
+        if "CAO_TERMINAL_ID" not in env_vars:
+            env_vars.append("CAO_TERMINAL_ID")
+        for index, value in enumerate(env_vars):
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"mcpServers {name!r} env_vars[{index}] must be a string, "
+                    f"got {type(value).__name__}"
+                )
+        env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
+        timeout = server.get("tool_timeout_sec")
+        if timeout is None:
+            timeout = CODEX_DEFAULT_MCP_TOOL_TIMEOUT_SEC
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError(f"mcpServers {name!r} tool_timeout_sec must be a positive number")
+        args.extend(
+            [
+                "-c",
+                f"{prefix}.env_vars={env_vars_toml}",
+                "-c",
+                f"{prefix}.tool_timeout_sec={_toml_scalar(float(timeout))}",
+            ]
+        )
+    return args
+
+
+def resolve_codex_mcp_material_entry(
+    *, name: str, config: Mapping[str, Any], terminal_id: str
+) -> dict[str, Any]:
+    """The ONE resolved Codex MCP material entry, from a profile config.
+
+    Both the managed-v2 material builder (``_profile_material_from_profile``)
+    and the ordinary provider fallback (``CodexProvider._resolve_codex_profile_material``)
+    consume this so bootstrap/TUI/managed-v2 can never build different shapes.
+
+    An entry carries exactly one usable transport, never invented: a
+    command/stdio server (non-empty ``command``) or a URL/streamable-HTTP
+    server (non-empty ``url``).  An entry with both, with neither, or with an
+    empty-string transport is refused with a typed ``ValueError`` (the same
+    typed boundary every composer consumer already maps).  ``type: http`` is
+    profile-side information and is not carried into the material: Codex
+    selects the HTTP transport from the ``url`` key itself.
+
+    Command entries keep the established shape byte-for-byte (args, sorted
+    env with the ``CAO_TERMINAL_ID`` default, env_vars, tool timeout).  URL
+    entries carry only ``url`` and an optional non-empty
+    ``bearer_token_env_var`` — there is no subprocess to receive env or a
+    timeout, and ``CAO_TERMINAL_ID`` is never injected into one.
+    """
+    command = config.get("command")
+    url = config.get("url")
+    usable_command = isinstance(command, str) and bool(command)
+    usable_url = isinstance(url, str) and bool(url)
+    if usable_command == usable_url:
+        raise ValueError(
+            f"mcpServers {name!r} must configure exactly one usable transport: "
+            f"got command={command!r} and url={url!r}"
+        )
+    if usable_url:
+        token = config.get("bearer_token_env_var")
+        if token is not None and (not isinstance(token, str) or not token):
+            raise ValueError(
+                f"mcpServers {name!r} bearer_token_env_var must be a non-empty string, "
+                f"got {token!r}"
+            )
+        entry: dict[str, Any] = {"name": name, "url": url}
+        if token is not None:
+            entry["bearer_token_env_var"] = token
+        return entry
+    env = {str(key): str(item) for key, item in (config.get("env") or {}).items()}
+    env.setdefault("CAO_TERMINAL_ID", terminal_id)
+    return {
+        "name": name,
+        "command": command,
+        "args": [str(item) for item in (config.get("args") or [])],
+        "env": [{"name": key, "value": value} for key, value in sorted(env.items())],
+        # env_vars are NAMES of vars to forward — pass them through
+        # verbatim so the shared Codex composer is the single fail-fast
+        # validator (a non-string entry is a malformed profile).
+        "env_vars": list(config.get("env_vars") or []),
+        "tool_timeout_sec": config.get("tool_timeout_sec"),
+    }
+
+
+def compose_codex_core_args(
+    *,
+    codex_profile: Optional[str],
+    codex_config: Optional[dict],
+    system_prompt: str,
+    mcp_servers: Optional[list],
+    allowed_tools: Optional[list[str]],
+    trusted_project_root: Optional[str],
+) -> list[str]:
+    """The shared core Codex argv, in the one canonical order.
+
+    Both the zero-turn bootstrap and the resumed TUI consume these EXACT args:
+    profile/yolo selection, the fully-composed developer instructions, the
+    resolved MCP servers, the profile's ``codexConfig`` overrides, and the
+    canonical trust override.  Each caller then appends only its own route,
+    TUI/app-server, and resume suffixes.
+
+    ``system_prompt`` is the ALREADY-COMPOSED developer instruction (base body
+    + runtime skill catalog + the shared restricted-tool security prompt and
+    explicit tool list); the composer emits it verbatim so the bootstrap and
+    TUI cannot rebuild subtly different contracts from a reloaded profile.
+    """
+    yolo = bool(allowed_tools and "*" in allowed_tools)
+    args: list[str] = []
+    if codex_profile and not yolo:
+        args.extend(["--profile", codex_profile])
+    else:
+        args.extend(["--yolo"])
+    if system_prompt:
+        args.extend(["-c", f"developer_instructions={_toml_scalar(system_prompt)}"])
+    args.extend(_codex_mcp_args(mcp_servers))
+    for key, value in (codex_config or {}).items():
+        args.extend(["-c", _toml_override(key, value)])
+    if trusted_project_root:
+        args.extend(["-c", render_trusted_project_override(trusted_project_root)])
+    return args
+
+
+def codex_route_suffix(route: Optional[CodexRoute]) -> list[str]:
+    """The last-wins route override, emitted AFTER the core args.
+
+    Appended after the core (and therefore after any ``codexConfig`` knob or
+    named profile) so neither can silently select a different route.  An empty
+    model/effort is omitted — the ordinary path's provider-default route
+    emits nothing here, and the bootstrap records the actual model/effort the
+    provider returned.  Never emits an empty-string or invented route.
+    """
+    if route is None:
+        return []
+    args: list[str] = []
+    if route.model:
+        args.extend(["--model", route.model])
+    if route.effort:
+        args.extend(["-c", _toml_override("model_reasoning_effort", route.effort)])
+    return args
+
+
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
     is not an MCP tool-call marker.
@@ -268,146 +509,142 @@ class CodexProvider(BaseProvider):
         trusted_project_root: Optional[str] = None,
         expected_model: Optional[str] = None,
         expected_effort: Optional[str] = None,
+        native_session_id: Optional[str] = None,
+        codex_profile_material: Optional[dict] = None,
+        codex_executable: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
+        # The pre-task bootstrap-minted thread id the launch argv must resume
+        # (``codex ... resume <id>``); None keeps the legacy ambient launch.
+        self._native_session_id = native_session_id
         self._agent_profile = agent_profile
         self._trusted_project_root = trusted_project_root
         self._expected_model = expected_model
         self._expected_effort = expected_effort
+        # The EXACT profile material create_terminal resolved once
+        # (developer instructions, MCP servers, tool policy). When supplied,
+        # the resumed TUI consumes the same core args the zero-turn bootstrap
+        # used and never reloads a potentially-changed profile.  None falls
+        # back to loading ``agent_profile`` for direct/unit construction.
+        self._codex_profile_material = codex_profile_material
+        # The EXACT digest-verified executable the pre-task bootstrap proved.
+        # The resumed TUI launches this absolute path and never re-resolves a
+        # bare ``codex`` through the pane's ambient PATH (an existing tmux
+        # session can inherit a different PATH and resolve another build).
+        # None keeps the legacy bare-name launch for direct/unit construction
+        # that never ran a bootstrap.
+        self._codex_executable = codex_executable
+
+    def _resolve_codex_profile_material(self) -> dict:
+        """The fully-composed Codex profile material the launch argv consumes.
+
+        When ``create_terminal`` resolved the material once, it
+        passes that EXACT material through the provider constructor so the
+        resumed TUI consumes the same developer instructions, MCP servers, and
+        tool policy the zero-turn bootstrap used — never a reloaded profile or
+        a subtly different contract.  The fallback composes from the loaded
+        profile plus this provider's constructor ``allowed_tools`` /
+        ``skill_prompt`` (the same composition the resumed TUI always
+        applied), so direct/unit construction without the pre-task seam still
+        routes through the ONE shared composer.
+        """
+        if self._codex_profile_material is not None:
+            return self._codex_profile_material
+        if self._agent_profile is None:
+            return {
+                "profile": None,
+                "allowed_tools": self._allowed_tools,
+                "system_prompt": self._apply_skill_prompt(""),
+                "mcp_servers": [],
+            }
+        try:
+            profile = load_agent_profile(self._agent_profile)
+        except Exception as e:
+            raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+        # Compose the developer instructions exactly as the resumed TUI always
+        # has: the profile body, the runtime skill catalog supplied to this
+        # provider, then the restricted-tool security prompt.
+        system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+        system_prompt = self._apply_skill_prompt(system_prompt)
+        if self._allowed_tools and "*" not in self._allowed_tools:
+            from cli_agent_orchestrator.constants import SECURITY_PROMPT
+
+            tools_list = ", ".join(self._allowed_tools)
+            tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+            system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
+        mcp_servers: list = []
+        for server_name, server_config in (profile.mcpServers or {}).items():
+            cfg = (
+                dict(server_config)
+                if isinstance(server_config, dict)
+                else server_config.model_dump(exclude_none=True)
+            )
+            cfg = resolve_mcp_server_config(cfg)
+            # The ONE Codex material shape, identical to the managed-v2
+            # builder: exactly one usable transport per entry
+            # (command/stdio or url/streamable-HTTP), validated typed and
+            # fail-closed.
+            mcp_servers.append(
+                resolve_codex_mcp_material_entry(
+                    name=server_name,
+                    config=cfg,
+                    terminal_id=self.terminal_id,
+                )
+            )
+        return {
+            "profile": profile,
+            "allowed_tools": self._allowed_tools,
+            "system_prompt": system_prompt,
+            "mcp_servers": mcp_servers,
+        }
 
     def _build_codex_command(self) -> str:
-        """Build Codex command with agent profile if provided.
+        """Build the Codex launch command via the ONE shared argument composer.
 
-        Returns properly escaped shell command string that can be safely sent via tmux.
-        Uses codex's -c developer_instructions flag to inject agent system prompts.
+        The resumed TUI consumes the same precomposed core args
+        the zero-turn bootstrap used (profile/yolo selection, developer
+        instructions, MCP servers, codexConfig, canonical trust), then adds
+        only its TUI flags, the observed/pinned route, and the exact resume id.
         """
-        # --yolo (alias for --dangerously-bypass-approvals-and-sandbox)
-        # is the default because CAO runs codex non-interactively in tmux
-        # where approval prompts would block handoff/assign. Profiles can
-        # opt out via `codexProfile` (names a [profiles.<name>] block in
-        # ~/.codex/config.toml), unless unrestricted allowed tools are enabled.
-        # In practice, allowed_tools containing "*" is treated as yolo mode
-        # and overrides codexProfile in the same way as an explicit yolo launch.
-        yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
-
-        profile = None
-        if self._agent_profile is not None:
-            try:
-                profile = load_agent_profile(self._agent_profile)
-            except Exception as e:
-                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
-
-        if profile and profile.codexProfile and not yolo:
-            command_parts = ["codex", "--profile", profile.codexProfile]
-        else:
-            command_parts = ["codex", "--yolo"]
-        command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
-
-        if profile is not None:
-            if profile.model:
-                command_parts.extend(["--model", profile.model])
-
-            system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
-            system_prompt = self._apply_skill_prompt(system_prompt)
-
-            # Prepend security constraints for soft enforcement (Codex has no
-            # native tool restriction mechanism). Only applied when tool
-            # restrictions are active (not unrestricted "*").
-            if self._allowed_tools and "*" not in self._allowed_tools:
-                from cli_agent_orchestrator.constants import SECURITY_PROMPT
-
-                tools_list = ", ".join(self._allowed_tools)
-                tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
-                system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
-
-            if system_prompt:
-                # Codex accepts developer_instructions via -c config override.
-                # This is injected as a developer role message before AGENTS.md content.
-                # Escape backslashes, double quotes, and newlines for TOML basic string.
-                # Newlines must become literal \n to prevent tmux send_keys from
-                # splitting the command across multiple lines.
-                command_parts.extend(
-                    ["-c", f"developer_instructions={_toml_scalar(system_prompt)}"]
-                )
-
-            # Add MCP servers via -c config overrides (per-session, no global config changes).
-            # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
-            if profile.mcpServers:
-                for server_name, server_config in profile.mcpServers.items():
-                    # Codex-only validation: the server name becomes part of
-                    # the -c override PATH (a TOML dotted path), so it must be
-                    # a single bare key — a quote/newline would corrupt the
-                    # TOML and a dot would nest the server under the wrong
-                    # table. Other providers write JSON configs where any
-                    # string key is valid, so they don't need this.
-                    _validate_config_key(server_name, source="mcpServers name")
-                    prefix = f"mcp_servers.{server_name}"
-                    if isinstance(server_config, dict):
-                        cfg = dict(server_config)
-                    else:
-                        cfg = server_config.model_dump(exclude_none=True)
-                    # Resolve the bundled cao-mcp-server console script to a
-                    # PATH-independent invocation.
-                    cfg = resolve_mcp_server_config(cfg)
-                    if "command" in cfg:
-                        command_parts.extend(
-                            ["-c", f"{prefix}.command={_toml_scalar(cfg['command'])}"]
-                        )
-                    if "args" in cfg:
-                        args_toml = "[" + ", ".join(_toml_scalar(a) for a in cfg["args"]) + "]"
-                        command_parts.extend(["-c", f"{prefix}.args={args_toml}"])
-                    if "env" in cfg and cfg["env"]:
-                        for env_key, env_val in cfg["env"].items():
-                            _validate_config_key(env_key, source="mcpServers env")
-                            command_parts.extend(
-                                ["-c", f"{prefix}.env.{env_key}={_toml_scalar(str(env_val))}"]
-                            )
-                    # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                    # can identify the current session for handoff/assign operations.
-                    # Codex does not forward env vars to MCP subprocesses by default;
-                    # env_vars lists names to inherit from the parent shell environment.
-                    env_vars = cfg.get("env_vars", [])
-                    if "CAO_TERMINAL_ID" not in env_vars:
-                        env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
-                    env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
-                    command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
-                    # Set a generous tool timeout for MCP calls like handoff, which
-                    # create a new terminal, initialize the provider, send a message,
-                    # wait for the agent to complete, and extract the output.
-                    # Codex defaults to 60s which is too short for multi-step operations.
-                    # Value MUST be a TOML float (600.0, not 600) because Codex
-                    # deserializes tool_timeout_sec via Option<f64>; a TOML integer
-                    # is silently rejected and falls back to the 60s default.
-                    if "tool_timeout_sec" not in cfg:
-                        command_parts.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
-
-            # Inline Codex config overrides (-c key=value). Lets a profile set
-            # per-agent Codex knobs — reasoning effort, service tier, fast mode,
-            # etc. — without editing the global ~/.codex/config.toml or
-            # maintaining named profile files. Keys may be dotted config paths
-            # (e.g. "features.fast_mode"); values are serialized to TOML
-            # scalars. Emitted last so they take precedence over CAO's own
-            # overrides and the profile/config defaults on key conflicts.
-            if profile.codexConfig:
-                for key, value in profile.codexConfig.items():
-                    command_parts.extend(["-c", _toml_override(key, value)])
-
-        if self._trusted_project_root is not None:
-            command_parts.extend(
-                ["-c", render_trusted_project_override(self._trusted_project_root)]
-            )
-        # Managed launches bind the route request to the provider invocation.
-        # These are emitted last so a named profile or generic codexConfig
-        # cannot silently select a different model or reasoning effort than the
-        # provider-native pre-task receipt.
-        if self._expected_model is not None:
-            command_parts.extend(["-c", _toml_override("model", self._expected_model)])
-        if self._expected_effort is not None:
-            command_parts.extend(
-                ["-c", _toml_override("model_reasoning_effort", self._expected_effort)]
-            )
+        material = self._resolve_codex_profile_material()
+        profile = material.get("profile")
+        core = compose_codex_core_args(
+            codex_profile=getattr(profile, "codexProfile", None),
+            codex_config=getattr(profile, "codexConfig", None),
+            system_prompt=material.get("system_prompt") or "",
+            mcp_servers=material.get("mcp_servers") or [],
+            allowed_tools=material.get("allowed_tools") or self._allowed_tools,
+            trusted_project_root=self._trusted_project_root,
+        )
+        # TUI flags sit right after the yolo/profile choice (one arg for
+        # ``--yolo``, two for ``--profile <name>``); the route is appended
+        # last (last-wins) and the resume id is the final positional.
+        choice_len = 2 if core and core[0] == "--profile" else 1
+        executable = self._codex_executable or "codex"
+        command_parts = [executable, *core[:choice_len], *CODEX_TUI_FLAGS, *core[choice_len:]]
+        # The route: a caller-sealed expected model/effort wins; otherwise
+        # the profile's own route — ``codexConfig.model`` override over the
+        # bare ``profile.model`` field, and the codexConfig effort — the
+        # same effective route the pre-task bootstrap pinned.  Either may
+        # be empty.
+        codex_config = getattr(profile, "codexConfig", None)
+        config = codex_config if isinstance(codex_config, dict) else {}
+        effort_cfg = config.get("model_reasoning_effort")
+        config_model = config.get("model")
+        route = CodexRoute(
+            model=self._expected_model
+            or (config_model if isinstance(config_model, str) else "")
+            or (getattr(profile, "model", None) or ""),
+            effort=self._expected_effort or str(effort_cfg or ""),
+        )
+        command_parts.extend(codex_route_suffix(route))
+        # The pre-task minted id is resumed exactly (``codex ... resume
+        # <id>``) — the TUI never silently creates an unrelated fresh
+        # conversation.
+        if self._native_session_id:
+            command_parts.extend(["resume", self._native_session_id])
 
         return shlex.join(command_parts)
 

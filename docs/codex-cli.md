@@ -191,6 +191,35 @@ You implement backend changes from a task spec.
 
 This launches Codex as `codex --yolo … -c model_reasoning_effort="xhigh" -c service_tier="fast" -c features.fast_mode=true`, applying the effort and fast-mode settings to that agent only.
 
+### Pre-Task Native Session Identity and Exact Launch Argv
+
+Every ordinary (unmanaged) Codex launch captures a deterministic
+harness-native session id BEFORE any real task input is admitted:
+
+1. A zero-turn app-server bootstrap (`thread/start` + `thread/name/set`, no
+   `turn/*`) materializes one resumable rollout for the exact profile route
+   and working directory. The bootstrap requires an installed build
+   stage-verified for that contract (`BOOTSTRAP_CAPABLE_VERSIONS`, currently
+   `0.146.0`/`0.147.0` — see [provider-version-policy.md](provider-version-policy.md));
+   an unproven build fails the launch closed with zero provider start and
+   zero task bytes rather than degrading to a session the TUI cannot resume.
+2. The captured id is bound durably (terminal row + stable-agent roster)
+   BEFORE the provider starts.
+3. The resumed TUI launches with the EXACT digest-verified executable the
+   bootstrap proved — an absolute path, never a bare `codex` re-resolved
+   through the pane's ambient `PATH` (an existing tmux session can inherit a
+   different `PATH` and resolve another build) — and resumes exactly that id
+   (`codex … resume <id>`). The bootstrap and the TUI consume the same
+   composed core argv, so they cannot drift on profile, route, MCP,
+   codexConfig, or trust.
+4. Task input (direct or control) is admitted only after the resumed TUI is
+   up; while the identity is pending or captured, input is refused with a
+   typed lineage refusal and zero pane writes.
+
+Stopped-session reincarnation — restoring a stopped session's native
+conversation into a new terminal — remains explicitly deferred and is not
+part of this behavior.
+
 ## Workflows
 
 ### 1. Interactive single-agent task

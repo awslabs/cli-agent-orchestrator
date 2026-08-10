@@ -117,7 +117,7 @@ async def create_session(
         allowed_tools=allowed_tools,
         registry=registry,
         env_vars=env_vars,
-        # M3-A: session creation owns the initial supervisor role and
+        # Session creation owns the initial supervisor role and
         # passes it explicitly — role is launch truth, never a
         # profile-name heuristic.
         stable_agent_role=ROLE_SUPERVISOR,

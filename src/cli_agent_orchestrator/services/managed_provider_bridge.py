@@ -37,6 +37,7 @@ from cli_agent_orchestrator.providers.codex import (
     _toml_scalar,
     _validate_config_key,
     render_trusted_project_override,
+    resolve_codex_mcp_material_entry,
 )
 from cli_agent_orchestrator.services import (
     actor_broker,
@@ -1072,11 +1073,31 @@ def _wait_kimi_turn_start(
     raise BridgeError("Kimi emitted no structured provider turn-start identity")
 
 
-def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
-    profile = load_agent_profile(agent_profile)
+def _profile_material_from_profile(
+    profile: Any,
+    terminal_id: str,
+    *,
+    allowed_tools: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Resolve the fully-composed profile material from an ALREADY-LOADED profile.
+
+    This is the single composition of the developer instructions (base body +
+    runtime skill catalog + the shared restricted-tool security prompt and
+    explicit tool list) and the resolved MCP servers.  Split out from
+    :func:`_profile_material` so the ordinary ``create_terminal`` path can
+    build this ONCE from the profile it already loaded and pass the exact same
+    material to both the pre-task bootstrap and the resumed TUI — neither
+    reloads a potentially-changed profile or rebuilds a subtly different
+    contract.
+
+    ``allowed_tools`` lets the caller pass the tool policy it already resolved
+    (which may be an explicit per-step override, not the profile default), so
+    the yolo/security composition matches what ``create_terminal`` computed.
+    """
     actual_digest = _digest(profile.model_dump(mode="json"))
-    names = list(profile.mcpServers or {}) or None
-    allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, names)
+    if allowed_tools is None:
+        names = list(profile.mcpServers or {}) or None
+        allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, names)
     system_prompt = profile.system_prompt or ""
     skill_prompt = build_skill_catalog(profile.skills)
     if skill_prompt:
@@ -1093,17 +1114,17 @@ def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
     for name, value in (profile.mcpServers or {}).items():
         raw = dict(value) if isinstance(value, dict) else value.model_dump(exclude_none=True)
         config = resolve_mcp_server_config(raw)
-        env = {str(key): str(item) for key, item in (config.get("env") or {}).items()}
-        env.setdefault("CAO_TERMINAL_ID", terminal_id)
+        # The ONE Codex material shape: exactly one usable transport per
+        # entry (command/stdio or url/streamable-HTTP), validated typed and
+        # fail-closed.  ``resolve_mcp_server_config`` passes command-less
+        # (url/type) entries through untouched, so an HTTP entry resolves
+        # here exactly as the profile declared it.
         mcp_servers.append(
-            {
-                "name": name,
-                "command": config["command"],
-                "args": [str(item) for item in (config.get("args") or [])],
-                "env": [{"name": key, "value": value} for key, value in sorted(env.items())],
-                "env_vars": [str(item) for item in (config.get("env_vars") or [])],
-                "tool_timeout_sec": config.get("tool_timeout_sec"),
-            }
+            resolve_codex_mcp_material_entry(
+                name=name,
+                config=config,
+                terminal_id=terminal_id,
+            )
         )
     return {
         "profile": profile,
@@ -1112,6 +1133,10 @@ def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
         "system_prompt": system_prompt,
         "mcp_servers": mcp_servers,
     }
+
+
+def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
+    return _profile_material_from_profile(load_agent_profile(agent_profile), terminal_id)
 
 
 def write_request(reservation_id: str, request: dict[str, Any]) -> dict[str, pathlib.Path]:

@@ -89,6 +89,18 @@ class TerminalModel(Base):
     # join, and will then show a card that cannot be traced back to a
     # resumable session.
     native_session_id = Column(Text, nullable=True)
+    # The pre-task identity launch state of an activated ordinary launch:
+    # a closed vocabulary (``pending`` / ``captured`` / ``ready`` from
+    # ``provider_contracts.PRE_TASK_IDENTITY_*``) that marks the row as
+    # fail-closed from its first durable visibility until provider/TUI
+    # initialization completes.  ``NULL`` is the truthful legacy state: a
+    # row born before the pre-task identity contract never gains the marker
+    # and keeps its compatibility exemption.  This column is deliberately
+    # separate from ``native_session_id``, which contracts to mean the real
+    # provider-native session running in the pane and stays NULL until the
+    # true captured id is durably written — a state string is never exposed
+    # as a resumable id.
+    pre_task_identity_state = Column(Text, nullable=True)
     # Durable lifecycle, so a row that no longer names a live pane can say
     # so instead of reporting a provider status forever. Without it a
     # deleted window's row is indistinguishable from a live worker whose
@@ -583,7 +595,7 @@ class ManagedLaunchV2ReservationModel(Base):
     task_id = Column(Text, nullable=True)
     run_id = Column(Text, nullable=False)
     launch_nonce_digest = Column(Text, nullable=False)
-    # The explicit stable CAO agent id (M3-A / cond-0377), minted at
+    # The explicit stable CAO agent id, minted at
     # reserve and persisted BEFORE any provider effect, so response loss
     # returns the same id.  Null on reservations created before the
     # roster existed; the bind seam derives a deterministic id from the
@@ -721,7 +733,7 @@ class NativeSessionAttachmentModel(Base):
 
 
 class StableAgentModel(Base):
-    """One stable CAO agent (M3-A / cond-0377): the durable identity below
+    """One stable CAO agent: the durable identity below
     a CAO session and above disposable physical incarnations.
 
     A CAO session owns stable ``agent_id`` records for its supervisor and
@@ -1578,7 +1590,7 @@ def _migrate_native_session_attachments() -> None:
 
 
 def _migrate_stable_agent_roster() -> None:
-    """Create the M3-A stable-agent roster tables on older databases.
+    """Create the stable-agent roster tables on older databases.
 
     ``Base.metadata.create_all`` covers fresh databases via the
     ``StableAgentModel`` / ``StableAgentLineageModel`` /
@@ -2032,6 +2044,10 @@ def _migrate_terminals_schema() -> None:
             ("session_id", "ALTER TABLE terminals ADD COLUMN session_id TEXT"),
             ("pane_pid", "ALTER TABLE terminals ADD COLUMN pane_pid INTEGER"),
             ("native_session_id", "ALTER TABLE terminals ADD COLUMN native_session_id TEXT"),
+            (
+                "pre_task_identity_state",
+                "ALTER TABLE terminals ADD COLUMN pre_task_identity_state TEXT",
+            ),
             ("lifecycle_state", "ALTER TABLE terminals ADD COLUMN lifecycle_state TEXT"),
             ("lifecycle_reason", "ALTER TABLE terminals ADD COLUMN lifecycle_reason TEXT"),
             (
@@ -2369,6 +2385,7 @@ def create_terminal(
     session_id: Optional[str] = None,
     pane_pid: Optional[int] = None,
     native_session_id: Optional[str] = None,
+    pre_task_identity_state: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -2392,6 +2409,7 @@ def create_terminal(
             session_id=session_id,
             pane_pid=pane_pid,
             native_session_id=native_session_id,
+            pre_task_identity_state=pre_task_identity_state,
         )
         db.add(terminal)
         db.commit()
@@ -2412,6 +2430,7 @@ def create_terminal(
             "session_id": terminal.session_id,
             "pane_pid": terminal.pane_pid,
             "native_session_id": terminal.native_session_id,
+            "pre_task_identity_state": terminal.pre_task_identity_state,
         }
 
 
@@ -2735,6 +2754,7 @@ def get_terminal_metadata(
             "session_id": terminal.session_id,
             "pane_pid": terminal.pane_pid,
             "native_session_id": terminal.native_session_id,
+            "pre_task_identity_state": terminal.pre_task_identity_state,
             "lifecycle_state": terminal.lifecycle_state,
             "lifecycle_reason": terminal.lifecycle_reason,
             "liveness_checked_at": terminal.liveness_checked_at,
@@ -3155,6 +3175,76 @@ def set_terminal_native_session_id(terminal_id: str, native_session_id: str) -> 
             )
             return False
         terminal.native_session_id = native_session_id
+        db.commit()
+        return True
+
+
+def set_terminal_pre_task_identity_state(terminal_id: str, state: str) -> bool:
+    """Move an activated launch's row pre-task identity state forward.
+
+    A closed, forward-only vocabulary: ``pending`` (stamped at row
+    creation) -> ``captured`` (the real native id is durably written) ->
+    ``ready`` (provider/TUI initialization succeeded).  Each step requires
+    exactly its predecessor — ``captured`` only from ``pending``, and
+    ``ready`` only from ``captured`` — so no caller can skip the captured
+    identity boundary; idempotent for the current state.  Every other
+    transition is refused — a row born without the marker (``NULL``)
+    never gains one, and a state never moves backwards — so a crash or
+    refusal anywhere in the launch leaves the row fail-closed.
+    ``native_session_id`` is never touched here: the state column and the
+    real session id are separate facts.
+    """
+    from cli_agent_orchestrator.services.provider_contracts import (
+        PRE_TASK_IDENTITY_CAPTURED,
+        PRE_TASK_IDENTITY_PENDING,
+        PRE_TASK_IDENTITY_READY,
+    )
+
+    allowed_targets = {
+        PRE_TASK_IDENTITY_PENDING,
+        PRE_TASK_IDENTITY_CAPTURED,
+        PRE_TASK_IDENTITY_READY,
+    }
+    if state not in allowed_targets:
+        logger.warning(
+            "Refusing unknown pre-task identity state %r for terminal %s", state, terminal_id
+        )
+        return False
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            return False
+        current = terminal.pre_task_identity_state
+        if current == state:
+            return True
+        if current is None:
+            # A legacy row keeps its compatibility exemption forever: only
+            # row creation stamps the pending marker.
+            logger.warning(
+                "Refusing to stamp pre-task identity state %s on legacy row %s", state, terminal_id
+            )
+            return False
+        if state == PRE_TASK_IDENTITY_PENDING:
+            logger.warning(
+                "Refusing to move terminal %s pre-task identity state back to pending", terminal_id
+            )
+            return False
+        if state == PRE_TASK_IDENTITY_CAPTURED and current != PRE_TASK_IDENTITY_PENDING:
+            logger.warning(
+                "Refusing to move terminal %s pre-task identity state from %s to captured",
+                terminal_id,
+                current,
+            )
+            return False
+        if state == PRE_TASK_IDENTITY_READY and current != PRE_TASK_IDENTITY_CAPTURED:
+            logger.warning(
+                "Refusing to move terminal %s pre-task identity state from %s to ready; "
+                "only a captured identity may become ready",
+                terminal_id,
+                current,
+            )
+            return False
+        terminal.pre_task_identity_state = state
         db.commit()
         return True
 

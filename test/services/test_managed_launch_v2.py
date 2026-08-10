@@ -75,7 +75,7 @@ def _reserve_request(worktree, tmp_path, **changes):
 
 def _ready_bridge_state(record, monkeypatch):
     # Each reservation mints its own provider-native session id, exactly as
-    # a real launch does; the roster (M3-A) refuses one native id bound to
+    # a real launch does; the roster refuses one native id bound to
     # two live incarnations, so the shared fake id would make every second
     # bind in a test collide with the first.
     session_id = f"thr_{uuid.uuid4().hex[:16]}"

@@ -22,6 +22,18 @@ zero task bytes.
 Why this guard exists: the resume/admission contracts downstream can
 only bind what was provably bound at launch; an unbound admission would
 be unrecoverable except by blind respawn.
+
+Version capability: the Codex cell mints its pre-turn identity through
+the zero-turn app-server bootstrap, which accepts only an installed
+build stage-verified for the exact resume contract
+(``codex_native_bootstrap.BOOTSTRAP_CAPABLE_VERSIONS`` — currently
+0.146.0 and 0.147.0; see also ``docs/provider-version-policy.md``).
+This is a narrow capability table, not the launch-mode policy: an open
+launch-mode build outside the table cannot supply a resumable id and
+the reservation fails closed with zero task bytes rather than degrading
+to a session the TUI cannot resume.  The operator remedy is to install
+a bootstrap-capable build or stage-verify and add the new build to the
+table; unsupported builds never retain exact-session capture.
 """
 
 from __future__ import annotations
@@ -50,13 +62,11 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     ManagedLaunchV2NegativeRequest,
     ManagedLaunchV2ReserveRequest,
 )
-from cli_agent_orchestrator.providers.codex import _toml_override as _codex_toml_override
-from cli_agent_orchestrator.providers.codex import _toml_scalar as _codex_toml_scalar
 from cli_agent_orchestrator.providers.codex import (
-    _validate_config_key as _validate_codex_config_key,
-)
-from cli_agent_orchestrator.providers.codex import (
-    render_trusted_project_override,
+    CODEX_TUI_FLAGS,
+    CodexRoute,
+    codex_route_suffix,
+    compose_codex_core_args,
 )
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import (
@@ -205,79 +215,40 @@ def _codex_profile_launch_args(
 ) -> list[str]:
     """Build the sealed profile and route arguments for native Codex.
 
-    The app-server bootstrap and resumed TUI receive the same profile, model,
-    effort, prompt, and MCP material.  TUI-only rendering flags are omitted
-    from app-server because they are not valid app-server options.
+    The app-server bootstrap and the resumed TUI both consume the
+    ONE shared composer (``compose_codex_core_args``), so they cannot drift on
+    profile selection, developer instructions, MCP serialization, codexConfig,
+    trust, or route ordering.  TUI-only rendering flags are omitted from the
+    app-server because they are not valid app-server options.
     """
     profile = profile_material["profile"]
-    allowed_tools = profile_material.get("allowed_tools") or []
-    yolo = bool("*" in allowed_tools)
-    if profile.codexProfile and not yolo:
-        args = ["--profile", profile.codexProfile]
-    else:
-        args = ["--yolo"]
-
+    try:
+        core = compose_codex_core_args(
+            codex_profile=profile.codexProfile,
+            codex_config=profile.codexConfig,
+            system_prompt=profile_material.get("system_prompt") or "",
+            mcp_servers=profile_material.get("mcp_servers") or [],
+            allowed_tools=profile_material.get("allowed_tools") or [],
+            trusted_project_root=record["working_directory"],
+        )
+    except ValueError as exc:
+        # Preserve the managed protocol's typed refusal boundary. Profile
+        # material is immutable launch intent; malformed MCP/config material
+        # is a caller conflict, never an untyped server failure.
+        raise ManagedLaunchConflict(str(exc)) from exc
+    # The yolo/profile choice is the first core element(s) (one arg for
+    # ``--yolo``, two for ``--profile <name>``); TUI flags sit right after it.
+    # The sealed route is appended last (last-wins) so neither a named profile
+    # nor codexConfig can silently replace it.
+    choice_len = 2 if core and core[0] == "--profile" else 1
+    args = list(core[:choice_len])
     if tui:
-        args.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
-
-    # _profile_material already applies the shared restricted-tool security
-    # prompt. Reapplying it here would duplicate the developer instructions
-    # only on the native Codex route.
-    system_prompt = profile_material.get("system_prompt") or ""
-    if system_prompt:
-        args.extend(["-c", f"developer_instructions={_codex_toml_scalar(system_prompt)}"])
-
-    for server in profile_material.get("mcp_servers") or []:
-        name = _validate_codex_config_key(server["name"], source="mcpServers name")
-        prefix = f"mcp_servers.{name}"
-        args.extend(["-c", f"{prefix}.command={_codex_toml_scalar(server['command'])}"])
-        server_args = (
-            "[" + ", ".join(_codex_toml_scalar(item) for item in server.get("args") or []) + "]"
-        )
-        args.extend(["-c", f"{prefix}.args={server_args}"])
-        for item in server.get("env") or []:
-            key = _validate_codex_config_key(item["name"], source="mcpServers env")
-            args.extend(["-c", f"{prefix}.env.{key}={_codex_toml_scalar(item['value'])}"])
-        env_vars = list(server.get("env_vars") or [])
-        if "CAO_TERMINAL_ID" not in env_vars:
-            env_vars.append("CAO_TERMINAL_ID")
-        for index, value in enumerate(env_vars):
-            if not isinstance(value, str):
-                raise ManagedLaunchConflict(
-                    f"mcpServers {name!r} env_vars[{index}] must be a string"
-                )
-        env_vars_toml = "[" + ", ".join(_codex_toml_scalar(item) for item in env_vars) + "]"
-        timeout = server.get("tool_timeout_sec")
-        if timeout is None:
-            timeout = 600.0
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise ManagedLaunchConflict(
-                f"mcpServers {name!r} tool_timeout_sec must be a positive number"
-            )
-        timeout = float(timeout)
-        args.extend(
-            [
-                "-c",
-                f"{prefix}.env_vars={env_vars_toml}",
-                "-c",
-                f"{prefix}.tool_timeout_sec={_codex_toml_scalar(timeout)}",
-            ]
-        )
-
-    for key, value in (profile.codexConfig or {}).items():
-        args.extend(["-c", _codex_toml_override(key, value)])
-
-    # Route and trust are emitted after profile configuration, so neither a
-    # named profile nor codexConfig can silently replace the sealed request.
+        args.extend(CODEX_TUI_FLAGS)
+    args.extend(core[choice_len:])
     args.extend(
-        [
-            "-c",
-            render_trusted_project_override(record["working_directory"]),
-            "--model",
-            request["expected_model"],
-            "-c",
-            _codex_toml_override("model_reasoning_effort", request["expected_effort"]),
-        ]
+        codex_route_suffix(
+            CodexRoute(model=request["expected_model"], effort=request["expected_effort"])
+        )
     )
     return args
 
@@ -735,7 +706,7 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "task_id": row.task_id,
         "run_id": row.run_id,
         "launch_nonce_digest": row.launch_nonce_digest,
-        # The stable CAO agent id minted at reserve (M3-A).  ``None`` on a
+        # The stable CAO agent id minted at reserve.  ``None`` on a
         # reservation created before the roster existed; the bind derives
         # a deterministic id from the terminal identity for those.
         "stable_agent_id": getattr(row, "stable_agent_id", None),
@@ -1281,7 +1252,7 @@ def reserve(request: ManagedLaunchV2ReserveRequest) -> tuple[dict[str, Any], boo
                 task_id=request.task_id,
                 run_id=request.run_id,
                 launch_nonce_digest=nonce_digest,
-                # M3-A: the stable agent id is minted and persisted BEFORE
+                # The stable agent id is minted and persisted BEFORE
                 # any provider effect, so response loss returns the same id
                 # and a replay adopts the same stable agent.
                 stable_agent_id=str(uuid.uuid4()),
@@ -2473,7 +2444,7 @@ _ROSTER_ACQUISITION_BY_ISSUANCE = {
 def _roster_binding_contract(
     db: Any, row: Any, expected_record: dict[str, Any], reserved_request: dict[str, Any]
 ) -> stable_agent_roster.BindingContract:
-    """The M3-A stable-agent binding for one v2 bind, from durable facts.
+    """The stable-agent binding for one v2 bind, from durable facts.
 
     Built exclusively from the machine-recorded launch contract — the
     reservation row (including the agent id minted at reserve), the
@@ -2530,7 +2501,7 @@ def _roster_binding_contract(
 
 
 def _roster_mark_admitted_best_effort(row: Any, db: Any) -> None:
-    """M3-A (i-0023): record the roster incarnation's admitted state
+    """Record the roster incarnation's admitted state
     best-effort, never aborting the reservation's delivery truth.
 
     The reservation's ``admitted`` transition is the durable fact that the
@@ -2574,7 +2545,7 @@ def _reconcile_and_complete_bind(
     before the SQL commit): it must match the journaled bytes exactly
     and the journaled fencing token must still be the registered one;
     then the row commits ``bound``.  Absent the record, it is published
-    now from the journaled bytes.  The M3-A stable-agent binding commits
+    now from the journaled bytes.  The stable-agent binding commits
     atomically with the ``bound`` transition, so real task admission can
     never precede the durable roster record.
     """
@@ -2635,14 +2606,14 @@ def _reconcile_and_complete_bind(
             # mode grafted on.
             execution_mode=expected_record.get("execution_mode"),
         )
-    # M3-A: bind the stable agent, lineage, and incarnation durably BEFORE
+    # Bind the stable agent, lineage, and incarnation durably BEFORE
     # the reservation commits ``bound`` — the same transaction, so real
     # task admission (which requires ``bound``) can never precede the
     # roster record.  A conflicting immutable roster identity refuses the
     # bind with zero mutation; a replay adopts the existing rows.  The
     # roster is fail-closed after this build's initialization: a store
     # that cannot record the binding refuses the bind (typed), it never
-    # silently keeps a pre-M3-A path.
+    # silently keeps a pre-roster path.
     reserved_request = _parse_json(row.request_json, {})
     try:
         stable_agent_roster.bind_generation(
@@ -2775,7 +2746,7 @@ def claim_admission(
                     "task admission requires the journaled native_bound reference; "
                     "zero task bytes are sent without it"
                 )
-            # M3-A: the stable-agent/native binding must be durably admitted
+            # The stable-agent/native binding must be durably admitted
             # before any real task bytes cross.  The roster record is created
             # in the same transaction as ``bound``, so a missing or
             # identity_missing/retired binding here is a truthful refusal,
@@ -2870,7 +2841,7 @@ def complete_admission(
                     raise ManagedLaunchConflict(
                         "provider submission receipt changed after admission"
                     )
-                # i-0023 / repair-3 P1-2: an idempotent replay re-attempts
+                # An idempotent replay re-attempts
                 # the roster mark so a transient store failure converges on
                 # the roster side without resending the delivered bytes.
                 # The mark only completes a nested savepoint, so finish the
@@ -2922,7 +2893,7 @@ def complete_admission(
             row.admission_json = _canonical_json(admission)
             row.state = "admitted"
             row.updated_at = _now()
-            # M3-A (i-0023): the roster mark is delivery-adjacent
+            # The roster mark is delivery-adjacent
             # bookkeeping, NOT a delivery gate.  The reservation's
             # ``admitted`` transition is the durable delivery truth and is
             # committed even if the roster mark conflicts (e.g. a teardown
@@ -2980,7 +2951,7 @@ def complete_native_admission(
             if admission.get("status") == "admitted":
                 if admission.get("native_submission") != operation:
                     raise ManagedLaunchConflict("native submission record changed after admission")
-                # i-0023 / repair-3 P1-2: same idempotent re-mark as the ACP
+                # Same idempotent re-mark as the ACP
                 # replay path, committed explicitly (delivery untouched).
                 _roster_mark_admitted_best_effort(row, db)
                 db.commit()
@@ -3059,7 +3030,7 @@ def complete_native_admission(
             row.admission_json = _canonical_json(admission)
             row.state = "admitted"
             row.updated_at = _now()
-            # M3-A (i-0023): same best-effort roster mark as the ACP path —
+            # Same best-effort roster mark as the ACP path —
             # the reservation's delivery truth is committed regardless.
             _roster_mark_admitted_best_effort(row, db)
             db.commit()

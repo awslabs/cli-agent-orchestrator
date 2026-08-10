@@ -17,7 +17,7 @@ import pathlib
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from cli_agent_orchestrator.providers.codex import render_trusted_project_override
+from cli_agent_orchestrator.providers.codex import CODEX_APP_SERVER_FLAGS
 from cli_agent_orchestrator.services import (
     codex_native_launch,
     native_attachment,
@@ -32,6 +32,34 @@ from cli_agent_orchestrator.services.codex_trust import (
 BOOTSTRAP_SCHEMA = "cao-codex-native-bootstrap-v1"
 EXIT_PROOF_SCHEMA = "cao-codex-native-bootstrap-exit-v1"
 MATERIALIZATION_METHOD = "thread/name/set"
+
+#: The narrow set of Codex builds proven for the zero-turn bootstrap/resume
+#: contract — ``initialize -> initialized -> config/read ->
+#: thread/start(ephemeral=false) -> thread/name/set -> clean process exit`` with
+#: NO ``turn/*``, returning a canonical UUID, exact cwd/model/effort for an
+#: explicit route, one materialized rollout, and a fresh app-server process
+#: ``thread/resume`` adopting the same UUID.  The default-route probe on
+#: 0.147.0 returned ``model=gpt-5.6-sol`` and ``reasoningEffort=null``.
+#:
+#: This is deliberately NARROWER than the provider ``SUPPORTED_VERSIONS``:
+#: only the bootstrap/resume surface was stage-verified for 0.147.0, not the
+#: composer/control/force-pause and other advanced surfaces, so 0.147.0 stays
+#: out of the broad table until those are independently proven.  An
+#: authenticated visual TUI smoke remains an installed-E2E follow-up.
+BOOTSTRAP_CAPABLE_VERSIONS = ("0.146.0", "0.147.0")
+
+
+def is_bootstrap_capable_build(version_output: Optional[str]) -> bool:
+    """Whether an installed Codex build is proven for the zero-turn bootstrap.
+
+    Exact-set membership in :data:`BOOTSTRAP_CAPABLE_VERSIONS`, independent of
+    the provider-wide version-enforcement mode.  A build that launches in open
+    mode still may not inherit a neighbouring build's bootstrap/resume proof.
+    """
+    if not isinstance(version_output, str):
+        return False
+    normalized = provider_contracts.normalized_version(version_output)
+    return normalized in BOOTSTRAP_CAPABLE_VERSIONS
 
 
 class CodexBootstrapError(RuntimeError):
@@ -54,10 +82,11 @@ def _validate_binary(binary: str, digest: str, version_output: str) -> str:
         raise CodexBootstrapError(
             f"codex binary digest changed: expected {digest}, observed {observed}"
         )
-    if not provider_contracts.is_proven_version(provider_contracts.PROVIDER_CODEX, version_output):
+    if not is_bootstrap_capable_build(version_output):
         raise CodexBootstrapError(
-            "Codex native session proof is unavailable for this provider build; "
-            "stage-verify it before enabling native identity"
+            "Codex native bootstrap/resume capability is unproven for this build; "
+            f"accepted {list(BOOTSTRAP_CAPABLE_VERSIONS)}, installed "
+            f"{(version_output or '').strip()!r}"
         )
     return observed
 
@@ -84,14 +113,26 @@ def mint_session(
     binary_sha256: str,
     version_output: str,
     working_directory: str,
-    model: str,
-    effort: str,
+    model: Optional[str],
+    effort: Optional[str],
     profile_args: Sequence[str],
     environment: Optional[Mapping[str, str]] = None,
     developer_instructions: Optional[str] = None,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
-    """Create one persistent exact-route thread and prove the minter exited."""
+    """Create one persistent thread (exact-route or provider-default) and prove
+    the minter exited.
+
+    The requested ``model`` and ``effort`` are OPTIONAL so
+    an ordinary launch can inherit Codex's own configuration/defaults.  An
+    unset model is omitted from ``thread/start``; effort is never a
+    ``thread/start`` field (Codex's ``ThreadStartParams`` has no
+    reasoning-effort field), so it stays a config/argv selection.  The actual
+    model, effort (which may truthfully be null/unselected), and cwd returned
+    by ``thread/start`` are ALWAYS validated and recorded; when a caller
+    supplied a non-empty expected value the exact equality check is retained.
+    A sealed managed-v2 route still supplies non-empty values and stays strict.
+    """
     digest = _validate_binary(codex_binary, binary_sha256, version_output)
     if (
         not isinstance(working_directory, str)
@@ -99,26 +140,28 @@ def mint_session(
         or os.path.realpath(working_directory) != working_directory
     ):
         raise CodexBootstrapError("working_directory must be an existing canonical directory")
-    if not isinstance(model, str) or not model:
-        raise CodexBootstrapError("model must be a non-empty string")
-    if not isinstance(effort, str) or not effort:
-        raise CodexBootstrapError("effort must be a non-empty string")
+    expected_model = model if isinstance(model, str) and model else None
+    expected_effort = effort if isinstance(effort, str) and effort else None
 
+    # The trust override and route are composed once by the shared Codex
+    # argument composer and arrive in ``profile_args``; the bootstrap appends
+    # only the app-server suffix (one implementation of trust
+    # rendering, owned by the composer).
     argv = [
         codex_binary,
         *list(profile_args),
-        "-c",
-        render_trusted_project_override(working_directory),
-        "app-server",
-        "--stdio",
+        *CODEX_APP_SERVER_FLAGS,
     ]
     thread_params: dict[str, Any] = {
         "cwd": working_directory,
         "ephemeral": False,
         "approvalPolicy": "never",
         "sandbox": "danger-full-access",
-        "model": model,
     }
+    # Omit an unset model so Codex applies its own default; the actual model
+    # is recorded from the thread/start response.
+    if expected_model:
+        thread_params["model"] = expected_model
     if developer_instructions:
         thread_params["developerInstructions"] = developer_instructions
     requests: list[dict[str, Any]] = [
@@ -164,11 +207,13 @@ def mint_session(
 
     child_env = dict(environment) if environment is not None else None
     configured_home = (child_env or os.environ).get("CODEX_HOME")
-    codex_home = (
-        pathlib.Path(configured_home).expanduser()
-        if configured_home
-        else pathlib.Path.home() / ".codex"
-    )
+    effective_home = (child_env or os.environ).get("HOME")
+    if configured_home:
+        codex_home = pathlib.Path(configured_home).expanduser()
+    elif effective_home:
+        codex_home = pathlib.Path(effective_home).expanduser() / ".codex"
+    else:
+        codex_home = pathlib.Path.home() / ".codex"
     config_path = codex_home / "config.toml"
     config_before = _digest_or_absent(config_path)
     probe_error: Optional[Exception] = None
@@ -221,14 +266,21 @@ def mint_session(
     actual_model = thread.get("model")
     actual_effort = thread.get("reasoningEffort")
     actual_cwd = thread.get("cwd")
-    if (actual_model, actual_effort, actual_cwd) != (
-        model,
-        effort,
-        working_directory,
-    ):
+    # cwd is always supplied and always asserted.  Model and effort are
+    # asserted only when the caller supplied a non-empty expected value; an
+    # ordinary default-route launch records the provider's actual (possibly
+    # null) values instead.
+    route_mismatch: list[str] = []
+    if actual_cwd != working_directory:
+        route_mismatch.append(f"cwd={actual_cwd!r}")
+    if expected_model is not None and actual_model != expected_model:
+        route_mismatch.append(f"model={actual_model!r} (expected {expected_model!r})")
+    if expected_effort is not None and actual_effort != expected_effort:
+        route_mismatch.append(f"effort={actual_effort!r} (expected {expected_effort!r})")
+    if route_mismatch:
         raise CodexBootstrapError(
             "Codex persistent thread resolved the wrong route or working directory: "
-            f"model={actual_model!r} effort={actual_effort!r} cwd={actual_cwd!r}"
+            + ", ".join(route_mismatch)
         )
     rollout_path = _rollout_path(codex_home, native_id)
 
@@ -238,11 +290,15 @@ def mint_session(
         "native_session_id": native_id,
         "id_source": provider_contracts.native_id_source(provider_contracts.PROVIDER_CODEX),
         "provider_version": provider_contracts.normalized_version(version_output),
+        "bootstrap_capable_versions": list(BOOTSTRAP_CAPABLE_VERSIONS),
+        "bootstrap_capability": "zero-turn-resume",
         "binary_path": codex_binary,
         "binary_sha256": digest,
         "working_directory": working_directory,
         "model": actual_model,
         "effort": actual_effort,
+        "requested_model": expected_model,
+        "requested_effort": expected_effort,
         "sent_no_turn": True,
         "materialization_method": MATERIALIZATION_METHOD,
         "materialization_sent_no_turn": True,

@@ -76,7 +76,6 @@ def create_mocks():
             # .touch(), and str(), so log-file setup becomes a no-op.
             TERMINAL_LOG_DIR=p("TERMINAL_LOG_DIR"),
         )
-
         m.generate_terminal_id.return_value = TERMINAL_ID
         m.generate_window_name.return_value = "developer-base"
         m.load_agent_profile.return_value = None
@@ -112,7 +111,7 @@ class TestCreateTerminalHerdrRegistration:
 
         # Act
         terminal = await create_terminal(
-            provider="claude_code",
+            provider=ProviderType.MOCK_CLI.value,
             agent_profile="developer",
             session_name=SESSION_NAME,
         )
@@ -132,7 +131,7 @@ class TestCreateTerminalHerdrRegistration:
 
         # Act
         terminal = await create_terminal(
-            provider="claude_code",
+            provider=ProviderType.MOCK_CLI.value,
             agent_profile="developer",
             session_name=SESSION_NAME,
         )
@@ -153,7 +152,7 @@ class TestCreateTerminalHerdrRegistration:
 
         # Act
         terminal = await create_terminal(
-            provider="claude_code",
+            provider=ProviderType.MOCK_CLI.value,
             agent_profile="developer",
             session_name=SESSION_NAME,
         )

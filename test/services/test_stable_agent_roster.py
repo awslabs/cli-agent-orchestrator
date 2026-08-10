@@ -1,4 +1,4 @@
-"""M3-A / cond-0377: stable CAO-agent roster store semantics.
+"""Stable CAO-agent roster store semantics.
 
 The roster is the fork-owned durable record that lets a CAO session
 reclaim disposable panes without erasing the coding agents' identity:
@@ -129,7 +129,7 @@ def _clock(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# P1-1: agent_id is explicit and immutable; same-profile workers are distinct
+# agent_id is explicit and immutable; same-profile workers are distinct
 # ---------------------------------------------------------------------------
 
 
@@ -909,7 +909,7 @@ def test_get_agent_returns_current_incarnation_by_id(isolated_memory_db):
 
 
 # ---------------------------------------------------------------------------
-# pass 2 (coordinator): incarnation identity is (terminal_id, generation)
+# Incarnation identity is (terminal_id, generation)
 # ---------------------------------------------------------------------------
 
 
@@ -1041,7 +1041,7 @@ def test_derive_initial_agent_id_includes_generation(isolated_memory_db):
 
 
 # ---------------------------------------------------------------------------
-# pass 2 (coordinator): one live incarnation per stable agent
+# One live incarnation per stable agent
 # ---------------------------------------------------------------------------
 
 
@@ -1095,7 +1095,7 @@ def test_one_live_incarnation_per_agent_across_lineages(isolated_memory_db):
 
 
 # ---------------------------------------------------------------------------
-# pass 2 (coordinator): repair race stays typed and converges
+# Repair race stays typed and converges
 # ---------------------------------------------------------------------------
 
 
@@ -1179,7 +1179,7 @@ def test_repair_race_same_harness_native_id_is_typed_and_converges(
 
 
 # ---------------------------------------------------------------------------
-# PR #91 review: i-0025 repair refuses a retired incarnation
+# Identity repair refuses a retired incarnation
 # ---------------------------------------------------------------------------
 
 

@@ -1,4 +1,4 @@
-"""M3-A / cond-0377: stable-agent binding at the canonical launch seams.
+"""Stable-agent binding at the canonical launch seams.
 
 The v2 managed worker path binds the roster in the same transaction as
 ``bound``, gates real task admission on the durable roster state, and
@@ -53,7 +53,7 @@ def persisted_terminal(monkeypatch):
 @pytest.fixture
 def strict_close_db(isolated_memory_db, monkeypatch):
     """SessionLocal whose close() strictly rolls back any pending outer
-    transaction — the coordinator's stated replay premise.  The replay-side
+    transaction — the stated replay premise.  The replay-side
     roster repair must be committed EXPLICITLY, never left to close()."""
     from sqlalchemy import create_engine as _ce
     from sqlalchemy.orm import Session as _SA_Session
@@ -256,7 +256,7 @@ def test_v2_admission_gate_and_admitted_state(isolated_memory_db, worktree, tmp_
 def test_completion_after_teardown_race_preserves_admitted(
     isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
-    """i-0023: after the task bytes are posted, a teardown that retires the
+    """After the task bytes are posted, a teardown that retires the
     roster incarnation must not roll the reservation back to ``admitting``:
     the delivery truth (``admitted``) is preserved and the bytes are never
     resent.  The roster's lifecycle (retired) and the reservation's
@@ -292,7 +292,7 @@ def test_completion_after_teardown_race_preserves_admitted(
 
 def _commit_spy(monkeypatch):
     """Wrap SessionLocal so the tests can assert an EXPLICIT commit of the
-    replay-side roster repair — the requirement the coordinator stated —
+    replay-side roster repair — the stated requirement —
     independent of any toolchain's close()/rollback semantics."""
     real_session = roster.database.SessionLocal
     commits: list[int] = []
@@ -316,7 +316,7 @@ def _commit_spy(monkeypatch):
 def test_replay_converges_roster_mark_admitted_after_transient_failure(
     isolated_memory_db, strict_close_db, worktree, tmp_path, monkeypatch
 ):
-    """P1-2 (ACP): the first completion persists reservation ``admitted``
+    """The first completion persists reservation ``admitted``
     even when the roster mark is transiently unavailable; an idempotent
     replay re-marks and the roster durably reads ``admitted`` from a
     fresh session — the replay-side repair must be committed, never
@@ -376,7 +376,7 @@ def test_replay_converges_roster_mark_admitted_after_transient_failure(
 def test_native_replay_converges_roster_mark_admitted_after_transient_failure(
     isolated_memory_db, strict_close_db, worktree, tmp_path, monkeypatch
 ):
-    """P1-2 (native): the same replay-side convergence on the native
+    """The same replay-side convergence on the native
     completion path."""
     from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION as _BV
 
@@ -655,7 +655,7 @@ def test_supervisor_and_worker_share_one_contract_via_launch_seams(
 
 
 # ---------------------------------------------------------------------------
-# P1-3: role is launch truth, never a profile-name heuristic
+# Role is launch truth, never a profile-name heuristic
 # ---------------------------------------------------------------------------
 
 
@@ -717,7 +717,7 @@ def test_additional_terminals_default_to_worker(isolated_memory_db, persisted_te
 
 
 # ---------------------------------------------------------------------------
-# P1-4: a failed new-launch roster bind is a failed launch
+# A failed new-launch roster bind is a failed launch
 # ---------------------------------------------------------------------------
 
 
@@ -846,9 +846,9 @@ def test_muse_v2_enrollment_truthful_not_faked(isolated_memory_db):
     """The roster identity contract supports the Muse harness domain, and
     the managed-v2 capability surface truthfully reports that Muse is not
     v2-launchable — no readiness is fabricated for a path that does not
-    exist yet.  Managed-v2 Muse ENROLLMENT is a required cond-0377
-    follow-up sub-slice; only the installed activation matrix for the
-    enrolled cells is M3-F."""
+    exist yet.  Managed-v2 Muse ENROLLMENT is a required follow-up
+    sub-slice; only the installed activation matrix for the enrolled
+    cells is covered."""
     from cli_agent_orchestrator.services.managed_launch_v2 import NATIVE_TUI_PROVIDERS
 
     assert "muse_cli" not in NATIVE_TUI_PROVIDERS

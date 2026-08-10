@@ -1,11 +1,11 @@
-"""M3-A / cond-0377: unmanaged-terminal roster lifecycle at create time.
+"""Unmanaged-terminal roster lifecycle at create time.
 
-Covers the two PR #91 review repairs on the unmanaged launch seam:
+Covers the two repair invariants on the unmanaged launch seam:
 
-- ``i-0003`` (P1): a launch that fails AFTER the roster bind must retire
+- A launch that fails AFTER the roster bind must retire
   the exact committed incarnation during unwind, so a dead terminal is
   never left live in the roster and the agent can be reincarnated.
-- ``i-0015`` (P2): the standalone synchronous roster bind runs OFF the
+- The standalone synchronous roster bind runs OFF the
   asyncio event loop (``asyncio.to_thread``) while still being awaited
   before any task input or a successful return.
 
@@ -39,6 +39,7 @@ def _patch_clear_session_env():
 def launch_mocks(monkeypatch):
     """Configure the mock stack for a successful unmanaged launch and a
     durable roster row."""
+    from cli_agent_orchestrator.clients import database
     from cli_agent_orchestrator.services import terminal_service as ts
 
     with (
@@ -49,7 +50,8 @@ def launch_mocks(monkeypatch):
             "cli_agent_orchestrator.services.terminal_service.provider_manager"
         ) as provider_manager,
         patch(
-            "cli_agent_orchestrator.services.terminal_service.db_create_terminal"
+            "cli_agent_orchestrator.services.terminal_service.db_create_terminal",
+            side_effect=database.create_terminal,
         ) as db_create_terminal,
         patch("cli_agent_orchestrator.backends.registry._backend") as tmux,
         patch(
@@ -93,7 +95,7 @@ def launch_mocks(monkeypatch):
 async def test_failed_unmanaged_launch_retires_bound_incarnation(
     isolated_memory_db, launch_mocks, monkeypatch
 ):
-    """i-0003: a launch that fails AFTER the roster bind retires the exact
+    """A launch that fails AFTER the roster bind retires the exact
     committed incarnation, so the failed terminal is not left live and the
     same agent can be reincarnated on a fresh terminal."""
     launch_mocks["provider_manager"].create_provider.side_effect = RuntimeError("init boom")
@@ -135,7 +137,7 @@ async def test_failed_unmanaged_launch_retires_bound_incarnation(
 async def test_unmanaged_roster_bind_runs_off_the_event_loop(
     isolated_memory_db, launch_mocks, monkeypatch
 ):
-    """i-0015: the standalone synchronous roster bind executes on a worker
+    """The standalone synchronous roster bind executes on a worker
     thread via ``asyncio.to_thread``, never on the event-loop thread, and
     is awaited before the terminal is returned."""
     loop_thread = threading.current_thread()
@@ -153,7 +155,7 @@ async def test_unmanaged_roster_bind_runs_off_the_event_loop(
 
     monkeypatch.setattr(roster, "bind_generation", _recorder)
 
-    result = await create_terminal("claude_code", "developer", new_session=True)
+    result = await create_terminal("kiro_cli", "developer", new_session=True)
     assert result.id == "test1234"
     assert captured["contract"].agent_id == roster.derive_initial_agent_id("test1234")
     assert captured["thread"] is not loop_thread
@@ -165,7 +167,7 @@ async def test_unmanaged_roster_bind_runs_off_the_event_loop(
 async def test_cancelled_unmanaged_bind_retires_committed_incarnation(
     isolated_memory_db, launch_mocks, monkeypatch
 ):
-    """repair-3 P1-1: cancelling create_terminal while the off-thread bind
+    """Cancelling create_terminal while the off-thread bind
     is in flight must not orphan a live incarnation.  Cleanup/lock
     ownership is held until the worker reaches a known outcome; if it
     committed, the exact incarnation is retired during the cancellation
@@ -219,7 +221,7 @@ async def test_cancelled_unmanaged_bind_retires_committed_incarnation(
 async def test_repeated_cancellation_of_off_thread_bind_converges(
     isolated_memory_db, launch_mocks, monkeypatch
 ):
-    """repair-3 P1-1: repeated cancellation while the worker is in flight
+    """Repeated cancellation while the worker is in flight
     is tolerated — the handler keeps waiting for the worker, then retires
     the committed incarnation and re-raises the cancellation."""
     real_bind = roster.bind_generation

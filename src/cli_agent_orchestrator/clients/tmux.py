@@ -374,6 +374,9 @@ class TmuxClient:
             "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
             "CLAUDE_CODE_SKIP_VERTEX_AUTH",
             "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+            # Storage location, not a nested-session marker. Ordinary Codex
+            # bootstrap and its resumed pane explicitly share this value.
+            "CODEX_HOME",
         }
     )
     # Per-var value cap (PR #246) — keeps the full tmux ``new-session -e`` /
@@ -412,6 +415,53 @@ class TmuxClient:
                 continue
             environment[key] = value
 
+    @classmethod
+    def _filtered_child_environment(
+        cls,
+        extra_env: Optional[Dict[str, str]] = None,
+        *,
+        terminal_id: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Build the bounded environment used for a newly-created pane.
+
+        Keep this as the single construction seam for pre-launch helper
+        processes as well as ``new-session``.  In particular, ambient
+        blocked provider variables must not reach a bootstrap when they will
+        not reach the resumed TUI. ``CODEX_HOME`` is the narrow exception: an
+        allowlisted storage location shared by both processes.
+        """
+        essential_keys = {
+            "HOME",
+            "PATH",
+            "SHELL",
+            "USER",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "SSH_AUTH_SOCK",
+            "DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "DO_NOT_TRACK",
+        }
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if (
+                key in essential_keys
+                or key in cls._BLOCKED_PREFIX_ALLOWLIST
+                or (
+                    not cls._is_blocked_env_key(key)
+                    and key.startswith(("CAO_", "KIRO_", "MISE_", "AWS_"))
+                    and len(value.encode("utf-8")) < cls._MAX_ENV_VALUE_BYTES
+                )
+            )
+        }
+        cls._merge_extra_env(environment, extra_env)
+        if terminal_id is not None:
+            environment["CAO_TERMINAL_ID"] = terminal_id
+        return environment
+
     def create_session(
         self,
         session_name: str,
@@ -424,40 +474,7 @@ class TmuxClient:
         try:
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
-            # Only pass essential env vars to avoid tmux "command too long"
-            essential_keys = {
-                "HOME",
-                "PATH",
-                "SHELL",
-                "USER",
-                "LANG",
-                "LC_ALL",
-                "LC_CTYPE",
-                "TERM",
-                "SSH_AUTH_SOCK",
-                "DISPLAY",
-                "XDG_RUNTIME_DIR",
-                "DO_NOT_TRACK",
-            }
-            environment = {
-                k: v
-                for k, v in os.environ.items()
-                if (
-                    k in essential_keys
-                    or k in self._BLOCKED_PREFIX_ALLOWLIST
-                    or (
-                        not self._is_blocked_env_key(k)
-                        and k.startswith(("CAO_", "KIRO_", "MISE_", "AWS_"))
-                        and len(v.encode("utf-8")) < self._MAX_ENV_VALUE_BYTES
-                    )
-                )
-            }
-            # Operator-forwarded vars (from ``cao launch --env``) merge AFTER
-            # the inherited slice and override on key collision, so an
-            # explicit ``--env AWS_REGION=us-west-2`` wins over the inherited
-            # value. See issue #248.
-            self._merge_extra_env(environment, extra_env)
-            environment["CAO_TERMINAL_ID"] = terminal_id
+            environment = self._filtered_child_environment(extra_env, terminal_id=terminal_id)
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to

@@ -383,7 +383,7 @@ per-item failures and reports how many were removed.
 
 ---
 
-## Stable-Agent Roster (read-only, M3-A / cond-0377)
+## Stable-Agent Roster (read-only)
 
 The roster is the fork-owned durable record of stable CAO agents, their
 harness-native conversation lineages, and their disposable physical

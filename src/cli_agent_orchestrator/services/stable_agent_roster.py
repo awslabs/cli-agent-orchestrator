@@ -1,4 +1,4 @@
-"""M3-A / cond-0377: the fork-owned stable CAO-agent roster.
+"""The fork-owned stable CAO-agent roster.
 
 CAO separates four identities so it can reclaim disposable panes without
 erasing the coding agents' working memory::
@@ -64,7 +64,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from sqlalchemy.exc import IntegrityError
 
@@ -183,7 +183,7 @@ def _now() -> str:
 def roster_store_present(db: Any = None) -> bool:
     """Whether the roster tables exist on this store (read/capability).
 
-    Dark and additive: a store that has never run the M3-A migration has
+    Dark and additive: a store that has never run the roster migration has
     no roster.  This is a READ surface for operators/audit — it is NOT a
     launch gate: the managed bind/admission seams fail closed after this
     build's initialization rather than bypassing on absence.
@@ -1084,7 +1084,7 @@ def record_native_identity(
         # A retired incarnation is a dead physical terminal: repairing its
         # identity would revive a retired record and repoint the agent at a
         # live disposition that no live incarnation backs.  Refused in the
-        # same transaction as the retirement (i-0025).
+        # same transaction as the retirement.
         if incarnation.disposition == INCARNATION_RETIRED:
             raise StableAgentConflict(
                 f"incarnation {incarnation.incarnation_id} of terminal {terminal_id} "
@@ -1218,6 +1218,84 @@ def record_native_identity(
     raise StableAgentUnavailable(
         f"concurrent native-identity repair kept conflicting; refusing after retry: {last_error}"
     )
+
+
+def transition_lineage_note(
+    *,
+    terminal_id: str,
+    continuity_note: str,
+    generation: Optional[str] = None,
+    from_notes: Sequence[str] = (),
+    db: Any = None,
+) -> dict[str, Any]:
+    """Transition one incarnation's lineage continuity note, fail-closed.
+
+    Used by the pre-task identity seam to move a launch's lineage from its
+    in-flight marker (``pre-task native identity pending``/``captured``) to
+    the ready marker once provider/TUI initialization succeeds.  The
+    transition is refused unless the current note is one of ``from_notes``:
+    a lineage that never carried the in-flight marker cannot be declared
+    ready, and an unknown note is never overwritten.  Idempotent when the
+    lineage already carries ``continuity_note``.
+
+    Resolves the exact generation when one is given, else the unique live
+    incarnation — never an arbitrary historical row.  A retired incarnation
+    is refused: a dead physical terminal cannot become ready.
+    """
+    target_note = _optional_text(
+        continuity_note, field="continuity_note", max_len=CONTINUITY_NOTE_MAX
+    )
+    allowed_notes: tuple[Optional[str], ...] = tuple(
+        _optional_text(note, field="from_note", max_len=CONTINUITY_NOTE_MAX)
+        for note in (from_notes or ())
+        if note is not None
+    )
+
+    def _transition(session: Any) -> dict[str, Any]:
+        incarnation = _find_incarnation(session, terminal_id=terminal_id, generation=generation)
+        if incarnation.disposition == INCARNATION_RETIRED:
+            raise StableAgentConflict(
+                f"incarnation {incarnation.incarnation_id} of terminal {terminal_id} "
+                "is retired; its lineage note cannot transition to ready"
+            )
+        if incarnation.lineage_id is None:
+            raise StableAgentConflict(
+                f"incarnation {incarnation.incarnation_id} of terminal {terminal_id} "
+                "has no bound lineage; a lineage note cannot be transitioned"
+            )
+        lineage = _lineage_by_id(session, incarnation.lineage_id)
+        if lineage is None:
+            raise StableAgentUnavailable(
+                f"incarnation {incarnation.incarnation_id} names a missing lineage"
+            )
+        current = lineage.continuity_note
+        if current == target_note:
+            return {
+                "lineage": _lineage_dict(lineage),
+                "incarnation": _incarnation_dict(incarnation),
+            }
+        if allowed_notes and current not in allowed_notes:
+            raise StableAgentConflict(
+                f"lineage {lineage.lineage_id} of terminal {terminal_id} is marked "
+                f"{current!r}; only a lineage marked one of {sorted(n for n in allowed_notes if n is not None)} may "
+                f"transition to {target_note!r}"
+            )
+        lineage.continuity_note = target_note
+        lineage.updated_at = _now()
+        incarnation.updated_at = _now()
+        session.flush()
+        return {
+            "lineage": _lineage_dict(lineage),
+            "incarnation": _incarnation_dict(incarnation),
+        }
+
+    if db is not None:
+        with db.begin_nested():
+            return _transition(db)
+    with database.SessionLocal() as session:
+        result = _transition(session)
+        session.commit()
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1405,7 +1483,7 @@ def audit_dry_run(db: Any = None) -> dict[str, Any]:
                         "detail": f"current_incarnation_id {row.current_incarnation_id!r} has no row",
                     }
                 )
-            # Disposition/incarnation consistency (i-0025): a LIVE agent must
+            # Disposition/incarnation consistency: a LIVE agent must
             # back its live disposition with a live current incarnation, and
             # a retired current incarnation must be reflected as dormant.
             if row.current_incarnation_id is not None:

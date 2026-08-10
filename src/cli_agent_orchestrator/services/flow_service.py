@@ -265,7 +265,7 @@ async def execute_flow(name: str) -> bool:
             provider=flow.provider,
             agent_profile=flow.agent_profile,
             new_session=True,
-            # M3-A / cond-0377 (i-0027): the flow's first terminal IS its
+            # The flow's first terminal IS its
             # conductor; pass the supervisor role explicitly so the roster
             # persists the correct immutable role.  Role is launch truth,
             # never a profile-name heuristic.

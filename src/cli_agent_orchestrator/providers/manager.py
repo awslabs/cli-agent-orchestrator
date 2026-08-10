@@ -40,6 +40,9 @@ class ProviderManager:
         trusted_project_root: Optional[str] = None,
         expected_model: Optional[str] = None,
         expected_effort: Optional[str] = None,
+        native_session_id: Optional[str] = None,
+        codex_profile_material: Optional[dict] = None,
+        codex_executable: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -62,6 +65,7 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    native_session_id=native_session_id,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
@@ -74,6 +78,9 @@ class ProviderManager:
                     trusted_project_root=trusted_project_root,
                     expected_model=expected_model,
                     expected_effort=expected_effort,
+                    native_session_id=native_session_id,
+                    codex_profile_material=codex_profile_material,
+                    codex_executable=codex_executable,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(

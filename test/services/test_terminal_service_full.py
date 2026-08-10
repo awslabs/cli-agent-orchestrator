@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.clients import database as _database
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -287,12 +288,21 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        isolated_memory_db,
     ):
         """Providers that consume runtime prompts should receive the global skill catalog."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
+        mock_db_create.side_effect = _database.create_terminal
+        mock_tmux.window_identity.return_value = {
+            "pane_id": "%88",
+            "window_id": "w88",
+            "server_socket_path": "/tmp/cao.sock",
+            "session_id": "1",
+            "pane_pid": 4321,
+        }
         mock_load_profile.return_value = AgentProfile(
             name="developer",
             description="Developer",
@@ -314,7 +324,28 @@ class TestCreateTerminal:
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        await create_terminal("codex", "developer", new_session=True)
+        # Codex is an activated cell — the pre-task identity
+        # seam must be stubbed or the fail-closed bootstrap rejects the
+        # fake binary. The skill-catalog contract under test is unaffected.
+        with (
+            patch(
+                "cli_agent_orchestrator.services.unmanaged_native_identity._resolve_executable",
+                return_value="/fake/bin/codex",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.unmanaged_native_identity._binary_sha256",
+                return_value="a" * 64,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.unmanaged_native_identity._version_output",
+                return_value="codex-cli 0.146.0",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.codex_native_bootstrap.mint_session",
+                return_value={"native_session_id": "11111111-1111-4111-8111-111111111111"},
+            ),
+        ):
+            await create_terminal("codex", "developer", new_session=True)
 
         skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
         assert skill_prompt == (
@@ -354,12 +385,21 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        isolated_memory_db,
     ):
         """Providers should receive an empty skill prompt when no skills are installed."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
+        mock_db_create.side_effect = _database.create_terminal
+        mock_tmux.window_identity.return_value = {
+            "pane_id": "%88",
+            "window_id": "w88",
+            "server_socket_path": "/tmp/cao.sock",
+            "session_id": "1",
+            "pane_pid": 4321,
+        }
         mock_load_profile.return_value = AgentProfile(
             name="developer",
             description="Developer",
@@ -373,7 +413,28 @@ class TestCreateTerminal:
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        await create_terminal("codex", "developer", new_session=True)
+        # Codex is an activated cell — the pre-task identity
+        # seam must be stubbed or the fail-closed bootstrap rejects the
+        # fake binary. The skill-catalog contract under test is unaffected.
+        with (
+            patch(
+                "cli_agent_orchestrator.services.unmanaged_native_identity._resolve_executable",
+                return_value="/fake/bin/codex",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.unmanaged_native_identity._binary_sha256",
+                return_value="a" * 64,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.unmanaged_native_identity._version_output",
+                return_value="codex-cli 0.146.0",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.codex_native_bootstrap.mint_session",
+                return_value={"native_session_id": "11111111-1111-4111-8111-111111111111"},
+            ),
+        ):
+            await create_terminal("codex", "developer", new_session=True)
 
         skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
         assert skill_prompt == ""
@@ -466,12 +527,21 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        isolated_memory_db,
     ):
         """build_skill_catalog() is called exactly once for runtime-prompt providers."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
+        mock_db_create.side_effect = _database.create_terminal
+        mock_tmux.window_identity.return_value = {
+            "pane_id": "%88",
+            "window_id": "w88",
+            "server_socket_path": "/tmp/cao.sock",
+            "session_id": "1",
+            "pane_pid": 4321,
+        }
         mock_load_profile.return_value = AgentProfile(
             name="developer",
             description="Developer",
@@ -517,6 +587,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        isolated_memory_db,
     ):
         """A `skills: []` deny-all profile threads the empty list through verbatim.
         It must NOT be coerced to None — that would leak the full catalog to an
@@ -525,6 +596,14 @@ class TestCreateTerminal:
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
+        mock_db_create.side_effect = _database.create_terminal
+        mock_tmux.window_identity.return_value = {
+            "pane_id": "%88",
+            "window_id": "w88",
+            "server_socket_path": "/tmp/cao.sock",
+            "session_id": "1",
+            "pane_pid": 4321,
+        }
         mock_load_profile.return_value = AgentProfile(
             name="developer",
             description="Developer",
@@ -570,6 +649,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        isolated_memory_db,
     ):
         """A runtime-prompt provider with no profile in the CAO store builds the
         catalog unfiltered (None). The `profile is None` guard must hold — no
@@ -578,6 +658,14 @@ class TestCreateTerminal:
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
+        mock_db_create.side_effect = _database.create_terminal
+        mock_tmux.window_identity.return_value = {
+            "pane_id": "%88",
+            "window_id": "w88",
+            "server_socket_path": "/tmp/cao.sock",
+            "session_id": "1",
+            "pane_pid": 4321,
+        }
         mock_load_profile.side_effect = FileNotFoundError("Agent profile not found: developer")
         mock_build_skill_catalog.return_value = "## Available Skills\n\n- skill-a"
         mock_provider = AsyncMock()

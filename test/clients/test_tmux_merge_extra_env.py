@@ -47,6 +47,12 @@ def test_merge_keeps_allowlisted_claude_auth_var():
     assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
 
 
+def test_merge_keeps_codex_home_storage_location():
+    env: dict[str, str] = {}
+    TmuxClient._merge_extra_env(env, {"CODEX_HOME": "/state/codex"})
+    assert env["CODEX_HOME"] == "/state/codex"
+
+
 def test_merge_drops_value_at_or_above_cap():
     env: dict[str, str] = {}
     TmuxClient._merge_extra_env(env, {"BIG": "x" * 2048, "SMALL": "x" * 2047})
@@ -57,6 +63,7 @@ def test_merge_drops_value_at_or_above_cap():
 def test_is_blocked_env_key_classification():
     assert TmuxClient._is_blocked_env_key("CLAUDE_SESSION_ID") is True
     assert TmuxClient._is_blocked_env_key("CODEX_TOKEN") is True
+    assert TmuxClient._is_blocked_env_key("CODEX_HOME") is False
     assert TmuxClient._is_blocked_env_key("__MISE_WATCH") is True
     # Allowlist matches the full key, not a prefix — only the exact entries
     # in _BLOCKED_PREFIX_ALLOWLIST are exempted from the blocked prefixes.

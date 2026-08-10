@@ -1,10 +1,10 @@
-"""Read/audit HTTP surface for the M3-A stable-agent roster (cond-0377).
+"""Read/audit HTTP surface for the stable-agent roster.
 
 Kept out of ``api/main.py`` for the same reason the tracker and native
 attachments routers are: this is a small self-contained subsystem with its
 own vocabulary, and main.py is already thousands of lines.
 
-The roster is dark and read-mostly in M3-A: the durable records are written
+The roster is dark and read-mostly: the durable records are written
 by the launch seams (``bind_native``, unmanaged terminal creation, admission
 completion, teardown), and this surface exists so later migration and
 status-repair lanes can enumerate it.  Every route is read-only; the

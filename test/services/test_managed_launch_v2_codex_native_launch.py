@@ -201,3 +201,31 @@ def test_codex_native_profile_preserves_mcp_env_inheritance_and_timeout(tmp_path
 
     assert 'mcp_servers.context7.env_vars=["HOME", "PATH", "CAO_TERMINAL_ID"]' in args
     assert "mcp_servers.context7.tool_timeout_sec=90.0" in args
+
+
+def test_codex_native_malformed_profile_is_a_typed_managed_conflict(tmp_path):
+    with pytest.raises(v2.ManagedLaunchConflict, match=r"env_vars\[1\] must be a string"):
+        v2._codex_profile_launch_args(
+            record={
+                "terminal_id": "term-codex",
+                "generation": "gen-codex",
+                "working_directory": os.path.realpath(tmp_path),
+            },
+            request={"expected_model": MODEL, "expected_effort": EFFORT},
+            profile_material={
+                "profile": SimpleNamespace(codexProfile=None, codexConfig={}),
+                "allowed_tools": ["*"],
+                "system_prompt": "",
+                "mcp_servers": [
+                    {
+                        "name": "context7",
+                        "command": "/usr/bin/env",
+                        "args": ["context7"],
+                        "env": [],
+                        "env_vars": ["HOME", 7],
+                        "tool_timeout_sec": 90,
+                    }
+                ],
+            },
+            tui=True,
+        )
