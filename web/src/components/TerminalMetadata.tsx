@@ -20,10 +20,13 @@ export interface MetadataSection {
   entries: MetadataEntry[]
 }
 
+// Meaning copy is per-status and mostly hand-maintained here. COMPLETED is the
+// deliberate exception: its clarification lives in the generated status config
+// (`explanation` in design-tokens/status.json) so the badge and the evidence
+// card always read the same sentence — see the Meaning entry below.
 const STATUS_MEANINGS: Record<string, string> = {
   IDLE: 'A provider detector currently reads the terminal as ready or idle. This does not prove that the worker has no assigned work.',
   PROCESSING: 'A provider detector currently reads the terminal as working. This is operational evidence, not a durable task or completion record.',
-  COMPLETED: 'A provider detector reports completion. Durable reporting, collection, and task acceptance remain separate.',
   WAITING_USER_ANSWER: 'The provider appears to be waiting for external input before it can continue.',
   ERROR: 'The provider detector found an error state. The derivation reason and evidence below explain what was observed.',
   STOPPED: 'The terminal lifecycle says this worker was stopped; it is not currently running.',
@@ -91,7 +94,7 @@ export function terminalMetadataSections(
   const reachability: MetadataEntry[] = [
     { label: 'Status', value: statusConfig.label },
     { label: 'Status key', value: normalized.toLowerCase() },
-    { label: 'Meaning', value: STATUS_MEANINGS[normalized] ?? 'A server-projected terminal state. See the reason and evidence for its exact meaning.' },
+    { label: 'Meaning', value: statusConfig.explanation ?? STATUS_MEANINGS[normalized] ?? 'A server-projected terminal state. See the reason and evidence for its exact meaning.' },
     ...(evidencePending ? [{ label: 'Evidence snapshot status', value: projectedStatus.toLowerCase() }] : []),
     {
       label: 'Confidence',

@@ -3,7 +3,7 @@
 // STATUS_CONFIG / UNKNOWN_CONFIG are generated from the shared design-token SSOT
 // (design-tokens/status.json + tokens.json) via `node design-tokens/gen.mjs`.
 // Do not hand-edit the status taxonomy here — edit the JSON and regenerate.
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { MutableRefObject } from 'react'
 
 import type { TerminalMeta } from '../api'
@@ -28,6 +28,10 @@ export function StatusBadge({
 }) {
   const normalized = status ? status.toUpperCase() : null
   const config = (normalized && STATUS_CONFIG[normalized]) || UNKNOWN_CONFIG
+  const explanation = config.explanation
+  // The explanation doubles as the badge's accessible description; useId keeps
+  // the id unique when the dashboard renders several badges.
+  const descId = useId()
   const [anchor, setAnchor] = useState<HTMLSpanElement | null>(null)
   const [open, setOpen] = useState(false)
   const openTimer = useRef<number | null>(null)
@@ -62,12 +66,19 @@ export function StatusBadge({
         ref={setAnchor}
         role="note"
         aria-label={terminal ? `${config.label}; pointer hover shows status evidence` : config.label}
+        aria-describedby={explanation ? descId : undefined}
+        // Native title only for a standalone badge: when terminal metadata is
+        // supplied the evidence card is the single hover surface.
+        title={!terminal ? explanation : undefined}
         onMouseEnter={enter}
         onMouseLeave={leave}
         className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${config.bgClass}`}
       >
         <span className={`w-2 h-2 rounded-full ${config.dotClass} ${config.pulse ? 'animate-pulse' : ''}`} />
         <span className={`text-xs font-medium ${config.textClass}`}>{config.label}</span>
+        {explanation && (
+          <span id={descId} className="sr-only">{explanation}</span>
+        )}
       </span>
       <FloatingCard
         anchor={anchor}
@@ -82,6 +93,8 @@ export function StatusBadge({
         {evidence && (
           <div className="max-h-[60vh] overflow-y-auto p-3 space-y-2 select-text bg-gray-900">
             <p className="text-xs font-semibold text-white">{config.label}</p>
+            {/* The explanation itself is the card's Meaning row, built from the
+                generated status config in TerminalMetadata — not duplicated here. */}
             <MetadataRows entries={evidence.entries} dense />
           </div>
         )}

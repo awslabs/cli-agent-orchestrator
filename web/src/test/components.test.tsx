@@ -17,9 +17,70 @@ describe('StatusBadge', () => {
     expect(screen.getByText('Processing')).toBeInTheDocument()
   })
 
-  it('renders completed status', () => {
+  it('renders completed status as turn finished, not task completion', () => {
     render(<StatusBadge status="completed" />)
-    expect(screen.getByText('Completed')).toBeInTheDocument()
+    expect(screen.getByText('Turn finished')).toBeInTheDocument()
+  })
+
+  it('surfaces the turn-finished explanation on a standalone completed badge', () => {
+    render(<StatusBadge status="completed" />)
+    const badge = screen.getByRole('note', { name: 'Turn finished' })
+    // Accessible description: the explanation is reachable without any terminal
+    // metadata, so a screen reader user hears what the status does not imply.
+    expect(badge).toHaveAccessibleDescription(
+      'The provider finished its current turn. This does not mean the assigned task, report, or campaign is complete.'
+    )
+    // Native-title fallback gives sighted hover the same copy on the standalone pill.
+    expect(badge.getAttribute('title')).toBe(
+      'The provider finished its current turn. This does not mean the assigned task, report, or campaign is complete.'
+    )
+  })
+
+  it('gives every standalone completed badge its own accessible-description element', () => {
+    render(
+      <>
+        <StatusBadge status="completed" />
+        <StatusBadge status="completed" />
+      </>
+    )
+    const badges = screen.getAllByRole('note', { name: 'Turn finished' })
+    expect(badges).toHaveLength(2)
+    const [first, second] = badges
+    const firstId = first.getAttribute('aria-describedby')
+    const secondId = second.getAttribute('aria-describedby')
+    // Distinct ids, so a badge's description can never resolve to a sibling's.
+    expect(firstId).not.toBeNull()
+    expect(secondId).not.toBeNull()
+    expect(firstId).not.toBe(secondId)
+    const firstDesc = firstId ? document.getElementById(firstId) : null
+    const secondDesc = secondId ? document.getElementById(secondId) : null
+    expect(firstDesc).not.toBeNull()
+    expect(secondDesc).not.toBeNull()
+    expect(firstDesc).not.toBe(secondDesc)
+    // Each id resolves to an explanation element belonging to its own badge.
+    expect(first.contains(firstDesc)).toBe(true)
+    expect(second.contains(secondDesc)).toBe(true)
+    expect(firstDesc?.textContent).toBe(
+      'The provider finished its current turn. This does not mean the assigned task, report, or campaign is complete.'
+    )
+    expect(secondDesc?.textContent).toBe(firstDesc?.textContent)
+  })
+
+  it('shows the turn-finished explanation inside the hover evidence card when terminal metadata is supplied', async () => {
+    const terminal = projectedTerminal({
+      status: 'completed',
+      status_confidence: 'high',
+      status_reason: 'provider reported its turn finished',
+      status_signals: [],
+    })
+    render(<StatusBadge status="completed" terminal={terminal} />)
+    fireEvent.mouseEnter(screen.getByRole('note', { name: /Turn finished/ }))
+    const card = await screen.findByTestId('status-hovercard')
+    expect(card.textContent).toContain(
+      'The provider finished its current turn. This does not mean the assigned task, report, or campaign is complete.'
+    )
+    // The evidence card is the single hover surface — no stacked native title.
+    expect(screen.getByRole('note', { name: /Turn finished/ }).getAttribute('title')).toBeNull()
   })
 
   it('renders error status', () => {

@@ -54,7 +54,7 @@ describe('DashboardHome status filter row appearance', () => {
       'Idle',
       'Awaiting Input',
       'Error',
-      'Completed',
+      'Turn finished',
       'Stopped',
       'Dead',
       'Superseded',
