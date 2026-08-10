@@ -4466,7 +4466,12 @@ def _discover_muse_session(
     requiring the exact model/effort/profile/provider/cwd and idle/zero-turn
     pre-task state.  Returns ``(discovered_id, status_observation)``.
     """
-    _await_native_pane_input_ready(record, pane_id)
+    readiness = _await_native_pane_input_ready(record, pane_id)
+    if not readiness.get("input_ready"):
+        raise ManagedLaunchConflict(
+            "the Muse pane never became input-ready within the bound, so /status was "
+            "never typed; refusing to observe a pane that cannot accept input"
+        )
     status_observation = _observe_muse_status_panel(
         record,
         pane_id,
@@ -5433,6 +5438,18 @@ async def _admit_native_tui_under_fence(
                 except (asyncio.CancelledError, Exception):
                     pass
             raise
+    except native_control.NativeControlInvalid as exc:
+        # The composer planner (or binding/observation validation) refused
+        # before ``_open``: no control intent was journaled and provably
+        # zero bytes were written.  That is a typed pre-I/O refusal, never
+        # an ambiguity — ambiguity would say the bytes may have landed,
+        # which a planner error that precedes every write cannot do.
+        return mark_admission_refused(
+            reservation_id,
+            request.delivery_id,
+            "composer_plan_invalid",
+            f"the native composer plan is invalid, so zero task bytes were written: {exc}",
+        )
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
         # Deliberately conservative. The adapter turns transport failures
         # into ambiguous records itself, so an exception escaping it is a

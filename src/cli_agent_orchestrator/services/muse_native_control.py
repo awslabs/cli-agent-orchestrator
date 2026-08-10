@@ -227,8 +227,15 @@ def plan_composer_keystrokes(
     build's submit-time normalization cannot change the answer — this
     build's normalization is unproven, so the digest is recorded only for
     payloads invariant under trimming.
+
+    Newlines are *structure*, never literal input: the payload is split
+    into lines and the breaks become the pinned C-j composer keystrokes, so
+    the whole payload is typed as literal lines with C-j between them and
+    one final Enter — never flattened, pasted, split across turns, or sent
+    with a second Enter.  ESC and CR stay prohibited inside every line.
     """
-    assert_artifact_free(text, field=field)
+    if not isinstance(text, str):
+        raise NativeControlInvalid(f"{field} must be a string; got {type(text).__name__}")
 
     content, terminator = split_submission_terminator(text)
     if not content:

@@ -54,6 +54,7 @@ from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services import (
+    muse_native_control,
     muse_native_launch,
     muse_native_status,
     native_attachment,
@@ -1373,6 +1374,135 @@ async def test_muse_admission_refuses_when_the_attachment_is_not_owned(
         await v2.admit_reserved(result["reservation_id"], _admit_request(digest))
     task_writes = [t for t in muse_harness.typed if t["kind"] == "literal"]
     assert [t["text"] for t in task_writes] == ["/status"]
+
+
+# --------------------------------------------------------------------
+# 5b. P1 multi-line planner + typed pre-I/O refusal (Kimi K3 blocker).
+# --------------------------------------------------------------------
+
+
+def test_muse_planner_plans_a_multiline_task_with_the_pinned_c_j():
+    """A multi-line Muse 0.1.0 task plans soft-newline lines then one Enter.
+
+    Newlines are structure, never literal input: the payload is split into
+    lines and the breaks become the pinned C-j composer keystrokes, so the
+    plan is ``soft-newline-lines-then-enter`` and deliverable.
+    """
+    plan = muse_native_control.plan_composer_keystrokes(
+        "review this diff\nline two of the task",
+        provider_version="0.1.0",
+    )
+    assert plan["encoding"] == muse_native_control.ENCODING_SOFT_NEWLINE
+    assert plan["line_count"] == 2
+    assert plan["soft_newline_keystroke"] == "C-j"
+    assert plan["lines"] == ["review this diff", "line two of the task"]
+    assert plan["deliverable"] is True
+    assert plan["final_enter"] is True
+
+
+@pytest.mark.asyncio
+async def test_muse_admission_delivers_a_multiline_task_exactly_once(
+    isolated_memory_db, worktree, tmp_path, muse_harness
+):
+    """A real multiline message types literal-C-j-literal-...-one Enter once."""
+    message = "review this diff\nline two of the task"
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    bound = v2.bind_native(
+        result["reservation_id"],
+        ManagedLaunchV2BindRequest(
+            protocol_version=PROTOCOL_VERSION_V2,
+            terminal_id=result["terminal_id"],
+            generation=result["generation"],
+            attempt_id=str(uuid.uuid4()),
+            fencing_token_id=str(uuid.uuid4()),
+            execution_mode="native_tui",
+        ),
+    )
+    digest = v2.native_binding_digest(bound)
+    assert digest
+    admitted = await v2.admit_reserved(
+        result["reservation_id"],
+        _admit_request(
+            digest,
+            message=message,
+            message_sha256=hashlib.sha256(message.encode()).hexdigest(),
+        ),
+    )
+    assert admitted["admission"]["status"] == "admitted"
+    expected = [
+        {"kind": "literal", "text": "/status"},
+        {"kind": "enter"},
+        {"kind": "literal", "text": "review this diff"},
+        {"kind": "key", "keystroke": "C-j"},
+        {"kind": "literal", "text": "line two of the task"},
+        {"kind": "enter"},
+    ]
+    assert muse_harness.typed == expected
+    # At-most-once replay adds zero bytes.
+    replayed = await v2.admit_reserved(
+        result["reservation_id"],
+        _admit_request(
+            digest,
+            message=message,
+            message_sha256=hashlib.sha256(message.encode()).hexdigest(),
+        ),
+    )
+    assert replayed["admission"]["status"] == "admitted"
+    assert muse_harness.typed == expected
+
+
+@pytest.mark.asyncio
+async def test_muse_admission_refuses_invalid_content_without_ambiguity(
+    isolated_memory_db, worktree, tmp_path, muse_harness
+):
+    """A planner error (ESC/CR) before _open is a typed refusal, never ambiguity."""
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    bound = v2.bind_native(
+        result["reservation_id"],
+        ManagedLaunchV2BindRequest(
+            protocol_version=PROTOCOL_VERSION_V2,
+            terminal_id=result["terminal_id"],
+            generation=result["generation"],
+            attempt_id=str(uuid.uuid4()),
+            fencing_token_id=str(uuid.uuid4()),
+            execution_mode="native_tui",
+        ),
+    )
+    digest = v2.native_binding_digest(bound)
+    assert digest
+    bad = _admit_request(
+        digest,
+        message="bad\x1bcontent",
+        message_sha256=hashlib.sha256(b"bad\x1bcontent").hexdigest(),
+    )
+    admitted = await v2.admit_reserved(result["reservation_id"], bad)
+    assert admitted["admission"]["status"] == "refused"
+    assert admitted["admission"]["refusal_reason"] == "composer_plan_invalid"
+    # Zero composer bytes beyond the /status observation.
+    literals = [t for t in muse_harness.typed if t["kind"] == "literal"]
+    assert [t["text"] for t in literals] == ["/status"]
+    # Deterministic replay: no new bytes, same refusal.
+    before = list(muse_harness.typed)
+    replayed = await v2.admit_reserved(result["reservation_id"], bad)
+    assert replayed["admission"]["status"] == "refused"
+    assert muse_harness.typed == before
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_never_types_when_the_pane_never_becomes_ready(
+    isolated_memory_db, worktree, tmp_path, muse_harness
+):
+    """A pane that never reaches idle is a typed preflight, zero bytes typed."""
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+    muse_harness.pane_status_script = [TerminalStatus.PROCESSING]
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    assert result["state"] == "preflight_blocked"
+    # Neither /status nor any task byte was ever typed into the pane.
+    assert muse_harness.typed == []
+    assert record["terminal_id"] in muse_harness.teardowns
+    assert bridge.read_state(record["reservation_id"]) is None
 
 
 # --------------------------------------------------------------------

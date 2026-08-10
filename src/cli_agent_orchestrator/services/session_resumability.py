@@ -100,7 +100,12 @@ def _supported_providers() -> frozenset[str]:
 #: versions under its own shorter names. They are not the same strings and
 #: nothing translates between them, so a check written against the wrong
 #: vocabulary silently passes for every provider.
-_CONTRACT_NAME = {"codex": "codex", "claude_code": "claude", "kimi_cli": "kimi"}
+_CONTRACT_NAME = {
+    "codex": "codex",
+    "claude_code": "claude",
+    "kimi_cli": "kimi",
+    "muse_cli": "muse",
+}
 
 
 def _version_is_pinned(provider: str, installed_version: Optional[str]) -> tuple[bool, str]:
