@@ -56,6 +56,7 @@ from cli_agent_orchestrator.clients.database import (
     register_v2_terminal_incarnation_outcome,
     report_terminal_missing_from_every_store,
     set_terminal_native_session_id,
+    set_terminal_pre_task_identity_state,
     update_last_active,
     update_terminal_shell_command,
     upgrade_terminal_identity_from_observation,
@@ -1523,11 +1524,23 @@ def _pre_task_bind_and_resolve(
     # roster bind so the two surfaces cannot diverge. A refusal (the row is
     # gone, or already carries a different native session) is a launch failure
     # — fail closed rather than publish a roster binding the terminal row
-    # contradicts.
+    # contradicts.  The row state then moves forward to ``captured`` in its
+    # dedicated column (the real id is durably written), before the roster
+    # lineage records the same captured marker; a crash between any of these
+    # writes leaves at least one surface in-flight and the input lanes
+    # closed.
     if not set_terminal_native_session_id(terminal_id, identity["native_session_id"]):
         raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
             f"terminal {terminal_id} refused its pre-task native-session bind "
             f"(absent row or conflicting native id); the launch fails closed"
+        )
+    if not set_terminal_pre_task_identity_state(
+        terminal_id, unmanaged_native_identity.PRE_TASK_IDENTITY_CAPTURED
+    ):
+        raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
+            f"terminal {terminal_id} refused its pre-task identity captured "
+            f"transition (absent row, legacy row, or non-forward state move); "
+            "the launch fails closed"
         )
     from cli_agent_orchestrator.services import stable_agent_roster
 
@@ -1981,16 +1994,15 @@ async def create_terminal(
                 )
         else:
             # An activated launch stamps its row with the pre-task identity
-            # pending marker at creation, so the row is fail-closed from its
-            # first durable visibility: a concurrent direct-input or
-            # control-input call in the window before the roster marker
-            # commits gets the typed lineage refusal, never the legacy
-            # exemption (which remains only for rows born without the
-            # marker).  The captured native id replaces the marker once the
-            # pre-task identity resolves.
-            row_native_session_id = (
-                unmanaged_native_identity.PRE_TASK_IDENTITY_PENDING if activated_unmanaged else None
-            )
+            # pending state in the DEDICATED closed-state column at
+            # creation, so the row is fail-closed from its first durable
+            # visibility: a concurrent direct-input or control-input call
+            # in the window before the roster marker commits gets the typed
+            # lineage refusal, never the legacy exemption (which remains
+            # only for rows born without the marker).  ``native_session_id``
+            # stays NULL here — it contracts to mean the real provider
+            # session running in the pane and is written only once the
+            # pre-task identity is durably captured.
             db_create_terminal(
                 terminal_id,
                 session_name,
@@ -2010,7 +2022,11 @@ async def create_terminal(
                 # be replaced rather than one that merely reads oddly.
                 session_id=identity.get("session_id"),
                 pane_pid=int(identity["pane_pid"]) if identity.get("pane_pid") else None,
-                native_session_id=row_native_session_id,
+                pre_task_identity_state=(
+                    unmanaged_native_identity.PRE_TASK_IDENTITY_PENDING
+                    if activated_unmanaged
+                    else None
+                ),
             )
 
             _register_incarnation(terminal_id, terminal_generation, identity)

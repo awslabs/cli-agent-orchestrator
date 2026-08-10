@@ -343,7 +343,7 @@ def test_unmanaged_control_refused_while_row_pending_marker_no_roster(
     isolated_memory_db, tmux, journal, monkeypatch
 ):
     """The row is addressable before the pre-task roster marker commits.
-    A row stamped with the new-launch pending marker must refuse a concurrent
+    A row stamped with the new-launch pending state must refuse a concurrent
     control with the typed lineage refusal and zero pane writes — never a
     legacy exemption."""
     from cli_agent_orchestrator.clients import database
@@ -357,7 +357,7 @@ def test_unmanaged_control_refused_while_row_pending_marker_no_roster(
         generation=GENERATION,
         pane_id=PANE,
         pane_pid=PANE_PID,
-        native_session_id=seam.PRE_TASK_IDENTITY_PENDING,
+        pre_task_identity_state=seam.PRE_TASK_IDENTITY_PENDING,
     )
     monkeypatch.setattr(
         service,
@@ -394,6 +394,7 @@ def test_unmanaged_control_refused_after_capture_before_ready(
         pane_id=PANE,
         pane_pid=PANE_PID,
         native_session_id=native_id,
+        pre_task_identity_state=seam.PRE_TASK_IDENTITY_CAPTURED,
     )
     roster.bind_generation(
         roster.BindingContract(
@@ -447,6 +448,7 @@ def test_unmanaged_control_gate_opens_after_readiness_transition(
         pane_id=PANE,
         pane_pid=PANE_PID,
         native_session_id=native_id,
+        pre_task_identity_state=seam.PRE_TASK_IDENTITY_CAPTURED,
     )
     roster.bind_generation(
         roster.BindingContract(
@@ -479,8 +481,12 @@ def test_unmanaged_control_gate_opens_after_readiness_transition(
     with pytest.raises(ControlInputNotFound):
         journal.get(CONTROL)
 
-    # ...and after the transition the same gate opens.
+    # ...and after the transition the same gate opens: the roster lineage
+    # AND the dedicated row state both reached ready.
     seam.mark_pre_task_identity_ready(terminal_id=TERMINAL, generation=GENERATION)
+    row = database.get_terminal_metadata(TERMINAL)
+    assert row["pre_task_identity_state"] == seam.PRE_TASK_IDENTITY_READY
+    assert row["native_session_id"] == native_id
     seam.assert_unmanaged_admission_ready(
         TERMINAL,
         {"provider": "claude_code", "generation": GENERATION},

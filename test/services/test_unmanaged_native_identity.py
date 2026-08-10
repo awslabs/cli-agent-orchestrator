@@ -536,9 +536,11 @@ async def test_concurrent_direct_input_is_refused_until_native_bind(
 def test_row_visible_before_roster_bind_refuses_input(isolated_memory_db):
     """The row-visible/pre-marker window: a newly created activated
     terminal row is addressable before the roster marker commits.  The row
-    itself must visibly carry the pending marker at first durable visibility,
-    so a direct-input or control-input call in that window returns the typed
-    lineage refusal instead of being treated as a legacy row."""
+    itself must visibly carry the pending state in its dedicated
+    ``pre_task_identity_state`` column at first durable visibility — with
+    ``native_session_id`` still NULL — so a direct-input or control-input
+    call in that window returns the typed lineage refusal instead of being
+    treated as a legacy row."""
     from cli_agent_orchestrator.clients import database
     from cli_agent_orchestrator.services import unmanaged_native_identity as seam
 
@@ -551,8 +553,13 @@ def test_row_visible_before_roster_bind_refuses_input(isolated_memory_db):
         generation="gen-1",
         pane_id="%61",
         pane_pid=6161,
-        native_session_id=seam.PRE_TASK_IDENTITY_PENDING,
+        pre_task_identity_state=seam.PRE_TASK_IDENTITY_PENDING,
     )
+    # The state marker never impersonates a session: the real provider id
+    # is still NULL during the pre-marker barrier.
+    row = database.get_terminal_metadata(terminal_id)
+    assert row["native_session_id"] is None
+    assert row["pre_task_identity_state"] == seam.PRE_TASK_IDENTITY_PENDING
     # No roster row exists yet — the pre-task bind thread has not committed.
     with pytest.raises(roster.StableAgentAdmissionRefused, match="pending"):
         seam.assert_unmanaged_admission_ready(
@@ -576,6 +583,71 @@ def test_row_without_pending_marker_keeps_legacy_exemption(isolated_memory_db):
         pane_pid=6262,
     )
     seam.assert_unmanaged_admission_ready(terminal_id, {"provider": "claude_code"})
+
+
+def test_legacy_repaired_row_with_real_id_keeps_exemption(isolated_memory_db):
+    """A legacy row whose repair seam later wrote a real native id but whose
+    dedicated state column stayed NULL keeps the compatibility exemption —
+    the state column, not the id column, decides legacy status."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    terminal_id = "legacy03"
+    database.create_terminal(
+        terminal_id,
+        "cao-session",
+        "developer-abcd",
+        "claude_code",
+        pane_id="%63",
+        pane_pid=6363,
+        native_session_id="019fb17d-0c6d-7161-a408-6b1fa61c8f2d",
+    )
+    seam.assert_unmanaged_admission_ready(terminal_id, {"provider": "claude_code"})
+
+
+def test_row_state_ready_without_roster_ready_fails_closed(isolated_memory_db):
+    """Conflicting state fails closed: a row that reached ready while its
+    roster lineage is still in-flight must not be admitted."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    terminal_id = "conflict1"
+    generation = "gen-1"
+    native_id = "019fb17d-0c6d-7161-a408-6b1fa61c8f2d"
+    database.create_terminal(
+        terminal_id,
+        "cao-session",
+        "developer-abcd",
+        "claude_code",
+        generation=generation,
+        pane_id="%64",
+        pane_pid=6464,
+        native_session_id=native_id,
+        pre_task_identity_state=seam.PRE_TASK_IDENTITY_READY,
+    )
+    roster.bind_generation(
+        roster.BindingContract(
+            agent_id=roster.derive_initial_agent_id(terminal_id, generation),
+            session_name="cao-session",
+            role=roster.ROLE_WORKER,
+            profile_family="developer",
+            harness="claude_code",
+            native_session_id=native_id,
+            acquisition_method=roster.ACQUISITION_CHOSEN_SESSION_ID,
+            terminal_id=terminal_id,
+            generation=generation,
+            pane_id="%64",
+            pane_pid=6464,
+            execution_mode="native_tui",
+            continuity_note=seam.PRE_TASK_IDENTITY_CAPTURED,
+        )
+    )
+    with pytest.raises(
+        roster.StableAgentAdmissionRefused, match="reaches its ready state"
+    ):
+        seam.assert_unmanaged_admission_ready(
+            terminal_id, {"provider": "claude_code", "generation": generation}
+        )
 
 
 @pytest.mark.asyncio
@@ -606,6 +678,15 @@ async def test_concurrent_direct_input_refused_before_roster_marker_commits(
             break
         await asyncio.sleep(0.01)
     assert entered.is_set(), "the pre-task roster bind never started"
+
+    # The pre-marker barrier: the row's dedicated state is pending and the
+    # real native session id is still NULL — a state string never occupies
+    # the session-id column.
+    from cli_agent_orchestrator.clients import database
+
+    row = database.get_terminal_metadata("test1234")
+    assert row["pre_task_identity_state"] == seam.PRE_TASK_IDENTITY_PENDING
+    assert row["native_session_id"] is None
 
     with pytest.raises(TerminalInputRefusedError) as excinfo:
         await asyncio.to_thread(ts.send_input, "test1234", "echo should-not-run")
@@ -660,11 +741,14 @@ async def test_captured_identity_stays_gated_until_provider_ready(
         await asyncio.sleep(0.01)
     assert entered.is_set(), "provider initialization never started"
 
-    # The identity is captured (real id on the row, captured roster note) but
-    # the provider/TUI is not ready: input must be refused with zero bytes.
+    # The identity is captured (real id on the row, captured row state and
+    # roster note) but the provider/TUI is not ready: input must be refused
+    # with zero bytes.
     from cli_agent_orchestrator.clients import database
 
-    assert database.get_terminal_metadata("test1234")["native_session_id"] == native_id
+    row = database.get_terminal_metadata("test1234")
+    assert row["native_session_id"] == native_id
+    assert row["pre_task_identity_state"] == seam.PRE_TASK_IDENTITY_CAPTURED
     agent = roster.get_agent(roster.derive_initial_agent_id("test1234"))
     assert agent["current_lineage"]["continuity_note"] == seam.PRE_TASK_IDENTITY_CAPTURED
 
@@ -677,10 +761,14 @@ async def test_captured_identity_stays_gated_until_provider_ready(
     result = await task
     assert result.id == "test1234"
 
-    # Provider/TUI initialization succeeded: the marker transitions to ready
-    # and the same input lane is now admitted (task bytes flow).
+    # Provider/TUI initialization succeeded: both the roster lineage and the
+    # row state transition to ready and the same input lane is admitted
+    # (task bytes flow).
     agent = roster.get_agent(roster.derive_initial_agent_id("test1234"))
     assert agent["current_lineage"]["continuity_note"] == seam.PRE_TASK_IDENTITY_READY
+    row = database.get_terminal_metadata("test1234")
+    assert row["pre_task_identity_state"] == seam.PRE_TASK_IDENTITY_READY
+    assert row["native_session_id"] == native_id
     # The direct lane reads the real row: provider, session names, and the
     # captured native id all on the durable row.
     monkeypatch.setattr(

@@ -79,9 +79,11 @@ UNMANAGED_PRE_TASK_PROVIDERS = frozenset({"claude_code", "codex"})
 # live in ``provider_contracts`` (the dependency-free contract module) so the
 # row writer and the roster can name the same vocabulary; these re-exports
 # keep every existing import site working.
-#: The terminal row carries this value in its ``native_session_id`` column
-#: from row creation until the pre-task identity is captured, so the row is
-#: visibly pending at its first durable visibility.
+#: The terminal row carries this value in its DEDICATED
+#: ``pre_task_identity_state`` column from row creation until the pre-task
+#: identity is captured, so the row is visibly pending at its first durable
+#: visibility — ``native_session_id`` stays NULL until the real captured id
+#: is durably written and never holds a state string.
 #: The roster lineage note stays ``PENDING`` through identity resolution and
 #: ``CAPTURED`` through provider/TUI initialization, then transitions to
 #: ``READY`` — input is admitted only after that transition.
@@ -166,30 +168,42 @@ def _bootstrap_environment(
     return env
 
 
-def _row_launch_marker(terminal_id: str, metadata: Mapping[str, Any]) -> Optional[str]:
-    """The terminal row's new-launch marker, or ``None`` for a legacy row.
+def _row_pre_task_state(terminal_id: str, metadata: Mapping[str, Any]) -> Optional[str]:
+    """The terminal row's dedicated pre-task identity state, or ``None``.
 
-    An activated launch stamps its row with :data:`PRE_TASK_IDENTITY_PENDING`
-    at row creation, then the real captured id once the pre-task identity
-    resolves.  Either value is the new-launch marker: the row is fail-closed
-    from first durable visibility until the roster lineage reaches
-    :data:`PRE_TASK_IDENTITY_READY`.  ``None`` means the row was born
-    without the contract (a pre-deploy legacy row) and keeps its exemption.
+    An activated launch stamps its row with
+    :data:`PRE_TASK_IDENTITY_PENDING` in the dedicated
+    ``pre_task_identity_state`` column at row creation, then moves it
+    forward to ``captured`` (real native id durably written) and ``ready``
+    (provider/TUI initialization succeeded).  ``None`` means the row was
+    born without the marker (a pre-deploy legacy row) and keeps its
+    compatibility exemption.  The real ``native_session_id`` is never a
+    state marker: it stays ``NULL`` until the true captured provider id is
+    durably written.
 
-    The caller-supplied metadata is used when it carries the marker (the
+    The caller-supplied metadata is used when it carries the state (the
     direct-input lane passes the full row); a caller that passes only a
     provider/generation projection (the control-input lane) falls back to
-    the durable row so both lanes decide on the same evidence.
+    the durable row so both lanes decide on the same evidence.  A store
+    whose schema predates the column (no ``pre_task_identity_state`` yet)
+    reads as a legacy row — the schema is migrated by ``init_db`` at
+    startup, and an unreadable evidence path must degrade truthfully to
+    the legacy exemption rather than crash every input call.
     """
-    marker = metadata.get("native_session_id")
-    if marker is not None:
-        return marker if isinstance(marker, str) else None
+    state = metadata.get("pre_task_identity_state")
+    if state is not None:
+        return state if isinstance(state, str) else None
+    from sqlalchemy.exc import OperationalError
+
     from cli_agent_orchestrator.clients import database
 
-    row = database.get_terminal_metadata(terminal_id, warn_if_missing=False)
+    try:
+        row = database.get_terminal_metadata(terminal_id, warn_if_missing=False)
+    except OperationalError:
+        return None
     if row is None:
         return None
-    value = row.get("native_session_id")
+    value = row.get("pre_task_identity_state")
     return value if isinstance(value, str) else None
 
 
@@ -197,11 +211,12 @@ def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, An
     """Refuse real task bytes until an activated ordinary launch is ready.
 
     The gate is closed for an activated provider from the row's first
-    durable visibility (its pending marker) through identity capture and
-    provider/TUI initialization, and opens only after the readiness
-    transition.  The legacy exemption is preserved exactly for rows that
-    truthfully lack the new-launch marker — pre-deploy rows and unactivated
-    provider rows — which stay usable as before.
+    durable visibility (its dedicated ``pending`` state) through identity
+    capture and provider/TUI initialization, and opens only when BOTH the
+    row state and the roster lineage have reached ``ready``.  A new
+    activated row with missing or conflicting state fails closed; the
+    legacy exemption is preserved exactly for rows born without the marker
+    (``pre_task_identity_state`` NULL), which stay usable as before.
 
     Provider-scoped while the pre-task identity contract is rolling out:
     Claude and Codex new launches have the deterministic pre-task contract;
@@ -212,7 +227,7 @@ def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, An
         return
     from cli_agent_orchestrator.services import stable_agent_roster
 
-    row_marker = _row_launch_marker(terminal_id, metadata)
+    row_state = _row_pre_task_state(terminal_id, metadata)
     try:
         agent = stable_agent_roster.get_agent(
             stable_agent_roster.derive_initial_agent_id(
@@ -220,22 +235,17 @@ def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, An
             )
         )
     except stable_agent_roster.StableAgentNotFound:
-        if row_marker is None:
-            # No roster row and no new-launch marker: a truthful pre-roster
-            # legacy row stays compatible.
+        if row_state is None:
+            # No roster row and no row state: a truthful pre-roster legacy
+            # row stays compatible.
             return
-        if row_marker == PRE_TASK_IDENTITY_PENDING:
-            # The row is visible and pending but the roster bind has not
-            # committed yet — the exact pre-marker race.  Fail closed.
-            raise stable_agent_roster.StableAgentAdmissionRefused(
-                f"terminal {terminal_id} is an activated launch whose stable-agent "
-                "binding has not committed yet; task input is refused until the "
-                "pre-task identity binding is durable"
-            )
-        # A captured id on the row with no roster row is a legacy-repair
-        # write, not a new launch (new launches bind the roster before the
-        # row ever carries a real id): keep the legacy exemption.
-        return
+        # The row is visibly pending/in-flight but the roster bind has not
+        # committed yet — the exact pre-marker race.  Fail closed.
+        raise stable_agent_roster.StableAgentAdmissionRefused(
+            f"terminal {terminal_id} is an activated launch whose stable-agent "
+            "binding has not committed yet; task input is refused until the "
+            "pre-task identity binding is durable"
+        )
     except stable_agent_roster.StableAgentError as exc:
         raise stable_agent_roster.StableAgentAdmissionRefused(
             f"stable-agent roster for terminal {terminal_id} is unreadable or conflicting; "
@@ -243,46 +253,59 @@ def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, An
         ) from exc
     lineage = agent.get("current_lineage") or {}
     note = lineage.get("continuity_note")
-    if note == PRE_TASK_IDENTITY_READY:
+    if row_state is None:
+        # Legacy row surface: exempt unless the roster itself names an
+        # in-flight pre-task launch — a missing row state alongside a
+        # pending/captured lineage is missing/conflicting state and fails
+        # closed rather than admitting.
+        if note in {PRE_TASK_IDENTITY_PENDING, PRE_TASK_IDENTITY_CAPTURED}:
+            raise stable_agent_roster.StableAgentAdmissionRefused(
+                f"terminal {terminal_id} is still {note}; task input is refused until "
+                "the pre-task identity binding reaches its ready state"
+            )
+        if note == PRE_TASK_IDENTITY_READY:
+            raise stable_agent_roster.StableAgentAdmissionRefused(
+                f"terminal {terminal_id} has no pre-task identity row state while its "
+                "roster lineage is ready; task input is refused until the binding is "
+                "reconciled"
+            )
+        return
+    if row_state not in {
+        PRE_TASK_IDENTITY_PENDING,
+        PRE_TASK_IDENTITY_CAPTURED,
+        PRE_TASK_IDENTITY_READY,
+    }:
+        raise stable_agent_roster.StableAgentAdmissionRefused(
+            f"terminal {terminal_id} has an unknown pre-task identity row state "
+            f"{row_state!r}; task input is refused until the binding is reconciled"
+        )
+    if row_state == PRE_TASK_IDENTITY_READY and note == PRE_TASK_IDENTITY_READY:
         stable_agent_roster.assert_admission_ready(
             terminal_id=terminal_id,
             generation=metadata.get("generation") or None,
         )
         return
-    if note in {PRE_TASK_IDENTITY_PENDING, PRE_TASK_IDENTITY_CAPTURED}:
-        # Still in-flight: identity not captured yet (pending) or captured but
-        # the provider/TUI has not finished initializing (captured).  Refused
-        # directly — a captured lineage must NOT be admissible until the
-        # readiness transition.
-        raise stable_agent_roster.StableAgentAdmissionRefused(
-            f"terminal {terminal_id} is still {note}; task input is refused until "
-            "the pre-task identity binding reaches its ready state"
-        )
-    if note is None:
-        # A legacy lineage carries no pre-task marker: exempt unless the row
-        # itself still names the pending marker (an inconsistent state that
-        # must fail closed rather than admit).
-        if row_marker == PRE_TASK_IDENTITY_PENDING:
-            raise stable_agent_roster.StableAgentAdmissionRefused(
-                f"terminal {terminal_id} still carries the pre-task identity pending "
-                "marker but its roster lineage is not marked pending; task input is "
-                "refused until the binding is reconciled"
-            )
-        return
+    # Any other combination is in-flight (pending/captured on either
+    # surface) or inconsistent; either way the binding has not reached its
+    # ready state and input is refused.
     raise stable_agent_roster.StableAgentAdmissionRefused(
-        f"terminal {terminal_id} has an unknown lineage marker {note!r}; task input "
-        "is refused until the pre-task identity binding is reconciled"
+        f"terminal {terminal_id} is {row_state} (roster lineage {note!r}); task input "
+        "is refused until the pre-task identity binding reaches its ready state"
     )
 
 
 def mark_pre_task_identity_ready(*, terminal_id: str, generation: Optional[str] = None) -> None:
-    """Transition an activated launch's roster lineage to the ready marker.
+    """Transition an activated launch's roster lineage and row state to ready.
 
     Called only after provider/TUI initialization succeeds — the resumed TUI
-    is up and input can be admitted.  The transition is refused unless the
-    lineage is still in an in-flight pre-task state, so an identity that was
-    never captured cannot be declared ready.
+    is up and input can be admitted.  The roster lineage transitions first
+    and the row state second, so a crash between the two writes leaves the
+    row (the first-visibility surface) still in-flight and the gate closed.
+    Either transition is refused unless the surface is still in an in-flight
+    pre-task state, so an identity that was never captured cannot be
+    declared ready.
     """
+    from cli_agent_orchestrator.clients import database
     from cli_agent_orchestrator.services import stable_agent_roster
 
     stable_agent_roster.transition_lineage_note(
@@ -291,6 +314,12 @@ def mark_pre_task_identity_ready(*, terminal_id: str, generation: Optional[str] 
         from_notes=(PRE_TASK_IDENTITY_PENDING, PRE_TASK_IDENTITY_CAPTURED),
         continuity_note=PRE_TASK_IDENTITY_READY,
     )
+    if not database.set_terminal_pre_task_identity_state(terminal_id, PRE_TASK_IDENTITY_READY):
+        raise UnmanagedIdentityUnavailable(
+            f"terminal {terminal_id} refused its pre-task identity ready transition "
+            "(absent row, legacy row, or non-forward state move); the launch fails "
+            "closed rather than admitting input on an unready row"
+        )
 
 
 def _version_output(provider: str, executable: str, env: dict[str, str]) -> str:
