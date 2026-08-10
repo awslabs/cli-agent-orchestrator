@@ -244,3 +244,100 @@ def test_delete_profile_does_not_follow_a_name_out_of_the_store(
     with pytest.raises((InvalidProfileNameError, ProfileNotFoundError)):
         delete_profile("../outsider")
     assert outsider.exists()
+
+
+# --------------------------------------------------------------------------
+# replace_profile
+# --------------------------------------------------------------------------
+
+
+def test_replace_profile_updates_an_existing_profile(store: Path) -> None:
+    profile_store.write_profile("agent", "original\n")
+
+    written = profile_store.replace_profile("agent", "updated\n")
+
+    assert written.read_text(encoding="utf-8") == "updated\n"
+
+
+def test_replace_profile_refuses_to_create_a_missing_profile(store: Path) -> None:
+    """The whole point of the function: update-only, never insert.
+
+    ``write_profile(..., overwrite=True)`` is an upsert, which is wrong for an
+    HTTP PUT. Requiring the target to exist is what stops a PUT from creating a
+    file at all.
+    """
+    with pytest.raises(profile_store.ProfileNotFoundError):
+        profile_store.replace_profile("never-installed", "content\n")
+
+    assert not (store / "never-installed.md").exists()
+
+
+def test_replace_profile_will_not_shadow_a_built_in(store: Path) -> None:
+    """A built-in's name is not in the local store, so PUT must reject it.
+
+    ``code_supervisor`` ships in ``cli_agent_orchestrator/agent_store``. An upsert
+    would create a *local* file of the same name that wins on load, silently
+    shadowing the built-in. That is precisely the condition ``duplicated_in``
+    exists to report, so it must not be manufacturable through the write path.
+    """
+    with pytest.raises(profile_store.ProfileNotFoundError):
+        profile_store.replace_profile("code_supervisor", "hijacked\n")
+
+    assert not (store / "code_supervisor.md").exists()
+
+
+def test_replace_profile_rejects_an_unsafe_name_before_touching_disk(store: Path) -> None:
+    with pytest.raises(profile_store.InvalidProfileNameError):
+        profile_store.replace_profile("../escape", "content\n")
+
+    assert not store.exists()
+
+
+def test_replace_profile_can_replace_a_corrupt_store_file(store: Path) -> None:
+    """Undecodable bytes must not make an existing profile unrepairable.
+
+    Same property ``write_profile`` has, for the same reason: the write path must
+    not read the old content first.
+    """
+    store.mkdir(parents=True, exist_ok=True)
+    target = store / "agent.md"
+    target.write_bytes(b"\xff\xfe not utf-8 at all")
+
+    profile_store.replace_profile("agent", "clean\n")
+
+    assert target.read_text(encoding="utf-8") == "clean\n"
+
+
+def test_replace_profile_lets_exactly_one_concurrent_deleter_or_writer_win(store: Path) -> None:
+    """The existence requirement holds under contention, not just serially.
+
+    Two threads race to replace the same profile after it is deleted. Neither may
+    succeed by creating the file, because the check lives inside the lock.
+    """
+    import threading
+
+    profile_store.write_profile("agent", "original\n")
+    profile_store.delete_profile("agent")
+
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def attempt(label: str) -> None:
+        barrier.wait()
+        try:
+            profile_store.replace_profile("agent", f"{label}\n")
+            with lock:
+                outcomes.append(f"created:{label}")
+        except profile_store.ProfileNotFoundError:
+            with lock:
+                outcomes.append(f"rejected:{label}")
+
+    threads = [threading.Thread(target=attempt, args=(name,)) for name in ("FIRST", "SECOND")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["rejected:FIRST", "rejected:SECOND"]
+    assert not (store / "agent.md").exists()

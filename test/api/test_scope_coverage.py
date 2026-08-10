@@ -189,3 +189,52 @@ def test_write_token_still_admitted_on_run_list(client, auth_on):
     app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
     resp = client.get("/workflows/runs")
     assert resp.status_code != 403
+
+
+# --------------------------------------------------------------------------
+# Profile write routes (#510 PR B)
+#
+# Asserts the deliberate asymmetry: POST and PUT accept cao:write, DELETE does
+# not. DELETE is admin-only to match every other destructive route on this
+# service (/sessions, /workflows, /terminals, /flows, /memory), since it is the
+# only irreversible operation in the profile group.
+# --------------------------------------------------------------------------
+
+
+def test_read_token_forbidden_on_profile_create(client, auth_on):
+    """A cao:read token cannot create a profile."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.post("/agents/profiles", json={"name": "x", "content": "---\nname: x\n---\n"})
+    assert resp.status_code == 403
+
+
+def test_write_token_admitted_on_profile_create(client, auth_on):
+    """A cao:write token passes the create dependency."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
+    resp = client.post("/agents/profiles", json={"name": "x", "content": "---\nname: x\n---\n"})
+    assert resp.status_code != 403
+
+
+def test_write_token_admitted_on_profile_replace(client, auth_on):
+    """A cao:write token passes the replace dependency."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
+    resp = client.put("/agents/profiles/x", json={"content": "---\nname: x\n---\n"})
+    assert resp.status_code != 403
+
+
+def test_write_token_forbidden_on_profile_delete(client, auth_on):
+    """A cao:write token is 403'd on profile deletion.
+
+    This is the point of choosing admin-only for DELETE: a token that may create
+    and edit profiles must not be able to remove them.
+    """
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
+    resp = client.delete("/agents/profiles/x")
+    assert resp.status_code == 403
+
+
+def test_admin_token_admitted_on_profile_delete(client, auth_on):
+    """A cao:admin token passes the deletion dependency."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_ADMIN])
+    resp = client.delete("/agents/profiles/x")
+    assert resp.status_code != 403

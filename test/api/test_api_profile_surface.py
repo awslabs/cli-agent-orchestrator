@@ -474,3 +474,331 @@ class TestAgentProfileSchemaEndpoint:
         assert response.status_code == 200
         assert not mock_load.called
         assert "properties" in response.json()
+
+
+class TestValidateEndpointOnMalformedInput:
+    """The endpoint must diagnose bad documents, not 500 on them.
+
+    Regression guard for the P3 finding on #575: these three shapes raised
+    ``TypeError`` inside the handler, which is not caught by its ``except
+    ValueError``, so the client received HTTP 500 instead of the findings it
+    asked for. Asserting the status explicitly is the point of these tests.
+    """
+
+    def test_unhashable_allowed_tools_entry_returns_findings(self, client) -> None:
+        content = "---\nname: x\nallowedTools:\n  - [Read]\n---\n\nBody.\n"
+
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["valid"] is False
+        assert any(m["severity"] == "error" for m in body["messages"])
+
+    def test_unhashable_role_returns_findings(self, client) -> None:
+        content = "---\nname: x\nrole:\n  - developer\n---\n\nBody.\n"
+
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is False
+
+    def test_mixed_type_mapping_keys_return_findings(self, client) -> None:
+        content = "---\nname: x\nmcpServers:\n  1: {}\n  x: {}\n---\n\nBody.\n"
+
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is False
+
+
+# --------------------------------------------------------------------------
+# Write endpoints (POST / PUT / DELETE) and the authoring read
+# --------------------------------------------------------------------------
+
+VALID_PROFILE = "---\nname: {name}\ndescription: A test profile.\n---\n\nYou are a test agent.\n"
+
+
+@pytest.fixture()
+def write_store(tmp_path, monkeypatch):
+    """Point the local profile store at a tmp dir for the write routes.
+
+    Both module references must be patched. ``profile_store`` and
+    ``agent_profiles`` each import ``LOCAL_AGENT_STORE_DIR`` by value, so the
+    write routes read one copy and the source route reads the other. Patching
+    only ``profile_store`` leaves the source route resolving against the real
+    store on the developer's machine.
+    """
+    from cli_agent_orchestrator.services import profile_store
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    target = tmp_path / "agent-store"
+    monkeypatch.setattr(profile_store, "LOCAL_AGENT_STORE_DIR", target)
+    monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", target)
+    return target
+
+
+class TestCreateAgentProfileEndpoint:
+    """POST /agents/profiles -- create from a supplied document."""
+
+    def test_creates_a_profile_and_returns_201(self, client, write_store) -> None:
+        response = client.post(
+            "/agents/profiles",
+            json={"name": "fresh", "content": VALID_PROFILE.format(name="fresh")},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["name"] == "fresh"
+        assert (write_store / "fresh.md").exists()
+
+    def test_conflicting_name_returns_409(self, client, write_store) -> None:
+        """Conflict is detected inside the write lock, not by a pre-check."""
+        body = {"name": "dupe", "content": VALID_PROFILE.format(name="dupe")}
+        assert client.post("/agents/profiles", json=body).status_code == 201
+
+        assert client.post("/agents/profiles", json=body).status_code == 409
+
+    def test_invalid_profile_is_rejected_and_not_written(self, client, write_store) -> None:
+        """Validation runs before persistence, so nothing reaches disk."""
+        content = "---\nname: bad\nengine: v3\n---\n\nBody.\n"
+
+        response = client.post("/agents/profiles", json={"name": "bad", "content": content})
+
+        assert response.status_code == 400
+        assert not (write_store / "bad.md").exists()
+        assert response.json()["detail"]["errors"]
+
+    def test_frontmatter_name_mismatch_is_rejected(self, client, write_store) -> None:
+        """The storage name and the frontmatter name must agree.
+
+        Without this the two silently diverge: the profile loads under its
+        frontmatter name while being addressed by its filename stem.
+        """
+        content = VALID_PROFILE.format(name="something-else")
+
+        response = client.post("/agents/profiles", json={"name": "declared", "content": content})
+
+        assert response.status_code == 400
+        assert "does not match" in response.json()["detail"]["message"]
+        assert not (write_store / "declared.md").exists()
+
+    def test_unsafe_name_is_rejected(self, client, write_store) -> None:
+        content = "---\nname: ok\n---\n\nBody.\n"
+
+        response = client.post("/agents/profiles", json={"name": "../escape", "content": content})
+
+        assert response.status_code == 400
+
+    def test_warnings_do_not_block_the_write(self, client, write_store) -> None:
+        """A warning-only profile is written, with the warnings returned.
+
+        This is the block/allow contract: only errors reject a save.
+        """
+        content = "---\nname: warned\nrole: archaeologist\n---\n\nBody.\n"
+
+        response = client.post("/agents/profiles", json={"name": "warned", "content": content})
+
+        assert response.status_code == 201
+        assert response.json()["warnings"]
+        assert (write_store / "warned.md").exists()
+
+    def test_oversized_content_is_rejected_by_the_model(self, client, write_store) -> None:
+        response = client.post("/agents/profiles", json={"name": "big", "content": "x" * 262_145})
+
+        assert response.status_code == 422
+
+
+class TestReplaceAgentProfileEndpoint:
+    """PUT /agents/profiles/{name} -- update only, never insert."""
+
+    def test_replaces_an_existing_profile(self, client, write_store) -> None:
+        client.post(
+            "/agents/profiles",
+            json={"name": "target", "content": VALID_PROFILE.format(name="target")},
+        )
+        updated = "---\nname: target\ndescription: Updated.\n---\n\nNew body.\n"
+
+        response = client.put("/agents/profiles/target", json={"content": updated})
+
+        assert response.status_code == 200
+        assert "New body." in (write_store / "target.md").read_text(encoding="utf-8")
+
+    def test_missing_profile_returns_404_and_creates_nothing(self, client, write_store) -> None:
+        content = VALID_PROFILE.format(name="ghost")
+
+        response = client.put("/agents/profiles/ghost", json={"content": content})
+
+        assert response.status_code == 404
+        assert not (write_store / "ghost.md").exists()
+
+    def test_built_in_profile_cannot_be_shadowed(self, client, write_store) -> None:
+        """A PUT naming a built-in must 404, not create a shadowing local file.
+
+        ``code_supervisor`` ships with the package. An upsert would write a local
+        file of the same name that wins on load, which is the condition
+        ``duplicated_in`` exists to report.
+        """
+        content = VALID_PROFILE.format(name="code_supervisor")
+
+        response = client.put("/agents/profiles/code_supervisor", json={"content": content})
+
+        assert response.status_code == 404
+        assert not (write_store / "code_supervisor.md").exists()
+
+    def test_frontmatter_name_mismatch_is_rejected(self, client, write_store) -> None:
+        client.post(
+            "/agents/profiles",
+            json={"name": "keeper", "content": VALID_PROFILE.format(name="keeper")},
+        )
+
+        response = client.put(
+            "/agents/profiles/keeper", json={"content": VALID_PROFILE.format(name="renamed")}
+        )
+
+        assert response.status_code == 400
+        assert "does not match" in response.json()["detail"]["message"]
+
+    def test_invalid_profile_does_not_overwrite(self, client, write_store) -> None:
+        client.post(
+            "/agents/profiles",
+            json={"name": "guarded", "content": VALID_PROFILE.format(name="guarded")},
+        )
+        original = (write_store / "guarded.md").read_text(encoding="utf-8")
+
+        response = client.put(
+            "/agents/profiles/guarded",
+            json={"content": "---\nname: guarded\nengine: v3\n---\n\nBody.\n"},
+        )
+
+        assert response.status_code == 400
+        assert (write_store / "guarded.md").read_text(encoding="utf-8") == original
+
+
+class TestDeleteAgentProfileEndpoint:
+    """DELETE /agents/profiles/{name} -- local store only."""
+
+    def test_deletes_an_existing_profile(self, client, write_store) -> None:
+        client.post(
+            "/agents/profiles",
+            json={"name": "doomed", "content": VALID_PROFILE.format(name="doomed")},
+        )
+
+        response = client.delete("/agents/profiles/doomed")
+
+        assert response.status_code == 204
+        assert not (write_store / "doomed.md").exists()
+
+    def test_missing_profile_returns_404(self, client, write_store) -> None:
+        assert client.delete("/agents/profiles/never-existed").status_code == 404
+
+    def test_built_in_profile_cannot_be_deleted(self, client, write_store) -> None:
+        """Built-ins are not in the local store, so they are not deletable."""
+        assert client.delete("/agents/profiles/code_supervisor").status_code == 404
+
+    def test_unsafe_name_is_rejected(self, client, write_store) -> None:
+        """A single-segment unsafe name reaches the handler and is rejected there.
+
+        An encoded traversal such as ``..%2Fescape`` never gets this far: the URL
+        normalises to a different path and routing answers 405, so it does not
+        exercise the name guard.
+        """
+        assert client.delete("/agents/profiles/bad@name").status_code == 400
+
+
+class TestAgentProfileSourceEndpoint:
+    """GET /agents/profiles/{name}/source -- unresolved authoring read."""
+
+    def test_returns_the_document_as_stored(self, client, write_store) -> None:
+        content = VALID_PROFILE.format(name="sourced")
+        client.post("/agents/profiles", json={"name": "sourced", "content": content})
+
+        response = client.get("/agents/profiles/sourced/source")
+
+        assert response.status_code == 200
+        assert response.json()["content"] == content
+
+    def test_placeholders_are_not_resolved(self, client, write_store) -> None:
+        """The whole point of this route.
+
+        ``GET /agents/profiles/{name}`` runs resolve_env_vars over the raw text
+        before parsing, so a managed variable would come back substituted and an
+        edit round-trip would persist the resolved value. Here the placeholder
+        must survive verbatim.
+        """
+        content = "---\nname: templated\ndescription: Uses a variable.\n---\n\nToken: ${MY_TOKEN}\n"
+        client.post("/agents/profiles", json={"name": "templated", "content": content})
+
+        response = client.get("/agents/profiles/templated/source")
+
+        assert "${MY_TOKEN}" in response.json()["content"]
+
+    def test_is_not_shadowed_by_the_name_route(self, client, write_store) -> None:
+        """Route-ordering guard.
+
+        ``GET /agents/profiles/{name}`` is declared first. It must not capture
+        ``foo/source`` as a profile named "foo/source", and this route must not be
+        served by the parsed-profile handler.
+        """
+        client.post(
+            "/agents/profiles",
+            json={"name": "distinct", "content": VALID_PROFILE.format(name="distinct")},
+        )
+
+        source = client.get("/agents/profiles/distinct/source").json()
+        parsed = client.get("/agents/profiles/distinct").json()
+
+        assert set(source) == {"name", "content"}
+        assert "system_prompt" in parsed
+
+    def test_missing_profile_returns_404(self, client, write_store) -> None:
+        assert client.get("/agents/profiles/absent/source").status_code == 404
+
+
+class TestWriteRejectionShape:
+    """Every 400 from a write route uses one ``detail`` shape.
+
+    A client should not have to switch on ``type(detail)``. Before this was
+    unified, a schema failure returned a dict while a name mismatch and a parse
+    failure returned bare strings, from the same endpoint.
+    """
+
+    REJECTIONS = {
+        "schema error": {"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
+        "name mismatch": {"name": "x", "content": "---\nname: other\n---\n\nB.\n"},
+        "unparseable": {"name": "x", "content": "---\nname: [unclosed\n  b: : y\n---\n\nB.\n"},
+        "missing name": {"name": "x", "content": "---\ndescription: none\n---\n\nB.\n"},
+    }
+
+    def test_every_rejection_has_the_same_detail_shape(self, client, write_store) -> None:
+        for label, body in self.REJECTIONS.items():
+            response = client.post("/agents/profiles", json=body)
+
+            assert response.status_code == 400, label
+            detail = response.json()["detail"]
+            assert isinstance(detail, dict), f"{label}: detail was {type(detail).__name__}"
+            assert set(detail) == {"message", "errors"}, label
+            assert isinstance(detail["message"], str), label
+            assert isinstance(detail["errors"], list), label
+
+    def test_field_level_failures_carry_a_path(self, client, write_store) -> None:
+        """A schema failure must say which field, so a form can render it."""
+        response = client.post(
+            "/agents/profiles",
+            json={"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
+        )
+
+        errors = response.json()["detail"]["errors"]
+        assert errors
+        assert any(e["path"] == "engine" for e in errors)
+
+    def test_non_field_failures_carry_an_empty_error_list(self, client, write_store) -> None:
+        """A parse failure is not attributable to a field, so ``errors`` is empty.
+
+        The key is still present, so a client can iterate it unconditionally.
+        """
+        response = client.post(
+            "/agents/profiles",
+            json={"name": "x", "content": "---\nname: [unclosed\n  b: : y\n---\n\nB.\n"},
+        )
+
+        assert response.json()["detail"]["errors"] == []

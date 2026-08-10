@@ -14,7 +14,7 @@ import termios
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, cast
+from typing import Annotated, Any, Dict, List, Literal, Optional, Sequence, Tuple, cast
 
 from fastapi import (
     BackgroundTasks,
@@ -673,6 +673,61 @@ class ProfileValidationResponse(BaseModel):
 
     valid: bool
     messages: List[ProfileValidationMessage] = Field(default_factory=list)
+
+
+class ProfileCreateRequest(BaseModel):
+    """Request body for ``POST /agents/profiles``.
+
+    ``name`` is explicit rather than parsed out of ``content`` so the conflict
+    target is unambiguous even when the document is malformed. When the
+    frontmatter also declares a ``name`` the two must agree; see
+    ``_assert_frontmatter_name_matches``.
+    """
+
+    name: str = Field(description="Profile name, used as the local-store filename stem")
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileReplaceRequest(BaseModel):
+    """Request body for ``PUT /agents/profiles/{name}``.
+
+    No ``name`` field: the path parameter is authoritative. Frontmatter that
+    declares a different name is rejected rather than silently renaming.
+    """
+
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileWriteResponse(BaseModel):
+    """Outcome of a profile create or replace.
+
+    ``warnings`` carries advisory findings that did not block the write, so a
+    client can surface them after a successful save. Errors never reach here;
+    they reject the request with 400.
+    """
+
+    name: str
+    warnings: List[ProfileValidationMessage] = Field(default_factory=list)
+
+
+class ProfileSourceResponse(BaseModel):
+    """A profile's document exactly as stored, with placeholders intact.
+
+    Distinct from ``GET /agents/profiles/{name}``, which returns the *parsed and
+    resolved* profile. That response runs ``resolve_env_vars`` over the raw text
+    before parsing, so managed ``${VAR}`` placeholders come back as their
+    substituted values. Round-tripping that through a write would persist
+    resolved secrets into a plaintext profile, so an editor must read from here.
+    """
+
+    name: str
+    content: str
 
 
 class MemorySummary(BaseModel):
@@ -1884,9 +1939,91 @@ async def get_agent_profile_schema_endpoint() -> Dict:
     return load_profile_schema()
 
 
+def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidationMessage]:
+    """Validate a submitted profile document and enforce name identity.
+
+    Shared by ``POST /agents/profiles`` and ``PUT /agents/profiles/{name}`` so the
+    two cannot drift apart on either rule.
+
+    Runs the same validator the CLI and ``POST /agents/profiles/validate`` use, on
+    the exact document being persisted rather than on a client-side approximation
+    of it. Error-severity findings reject the write; warnings are returned so a
+    client can surface them after a successful save.
+
+    A profile has two identities: the storage key (its filename stem) and the
+    frontmatter ``name``. ``parse_agent_profile_text`` treats the stem only as a
+    fallback when frontmatter omits ``name``, so the two can diverge and nothing
+    reconciles them: ``name: foo`` in ``bar.md`` loads as ``foo`` while being
+    addressed as ``bar``. Requiring them to agree closes that without introducing
+    a rename operation, which has its own failure semantics.
+
+    Args:
+        name: The storage name, authoritative.
+        content: The full profile document.
+
+    Returns:
+        The warning-severity findings, if any.
+
+    Raises:
+        HTTPException: 400 if the document is unparseable, carries an
+            error-severity finding, or declares a conflicting ``name``. Every
+            rejection uses the same ``detail`` shape, ``{"message", "errors"}``,
+            so a client parses one thing rather than switching on the type of
+            ``detail``. ``errors`` is empty for failures that are not per-field.
+    """
+    import frontmatter
+
+    from cli_agent_orchestrator.services.profile_validator import validate_frontmatter
+
+    def _reject(message: str, findings: Sequence[Any] = ()) -> None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": message,
+                "errors": [
+                    {"severity": f.severity, "message": f.message, "path": f.path} for f in findings
+                ],
+            },
+        )
+
+    # Parsed once here, then handed to validate_frontmatter as metadata.
+    # validate_profile_text would parse it again: its docstring exists precisely
+    # to keep callers from duplicating the parse, and this function needs the
+    # metadata anyway for the name check below.
+    try:
+        parsed = frontmatter.loads(content)
+    except Exception as exc:
+        _reject(f"Profile could not be parsed and was not written: {exc}")
+
+    findings = validate_frontmatter(parsed.metadata)
+
+    errors = [f for f in findings if f.severity == "error"]
+    if errors:
+        _reject("Profile failed validation and was not written.", errors)
+
+    declared = parsed.metadata.get("name")
+    if isinstance(declared, str) and declared != name:
+        _reject(
+            f"Frontmatter name '{declared}' does not match the profile name "
+            f"'{name}'. They must agree; renaming a profile is not supported "
+            f"through this endpoint."
+        )
+
+    return [
+        ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
+        for f in findings
+        if f.severity == "warning"
+    ]
+
+
 @app.get("/agents/profiles/{name}")
 async def get_agent_profile_endpoint(name: str) -> Dict:
-    """Return the full parsed content of a named agent profile."""
+    """Return the full parsed content of a named agent profile.
+
+    Note this response is *resolved*: ``load_agent_profile`` applies
+    ``resolve_env_vars`` before parsing. Use ``GET /agents/profiles/{name}/source``
+    when the document is going to be edited and written back.
+    """
     try:
         profile = load_agent_profile(name)
         return profile.model_dump(exclude_none=True)
@@ -1920,6 +2057,130 @@ async def install_agent_profile_endpoint(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
 
     return result
+
+
+@app.post("/agents/profiles", status_code=status.HTTP_201_CREATED)
+async def create_agent_profile_endpoint(
+    request: ProfileCreateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileWriteResponse:
+    """Create a profile in the local store from a supplied document.
+
+    Named distinctly from ``POST /agents/profiles/install``, which installs from a
+    bare name or an https:// URL. This one takes the document itself in the body.
+
+    Validation runs on the exact submitted content before anything is persisted,
+    so an invalid profile never reaches disk. Conflict detection is delegated to
+    ``write_profile(overwrite=False)``, which checks for an existing file inside
+    the write lock; a pre-check here would sit outside that critical section and
+    let two concurrent creators both succeed.
+    """
+    from cli_agent_orchestrator.services.profile_store import (
+        InvalidProfileNameError,
+        ProfileExistsError,
+        write_profile,
+    )
+
+    warnings = _validate_profile_for_write(request.name, request.content)
+
+    try:
+        write_profile(request.name, request.content, overwrite=False)
+    except InvalidProfileNameError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except ProfileExistsError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+    return ProfileWriteResponse(name=request.name, warnings=warnings)
+
+
+@app.put("/agents/profiles/{name}")
+async def replace_agent_profile_endpoint(
+    name: str,
+    request: ProfileReplaceRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileWriteResponse:
+    """Replace an existing local-store profile. Never creates one.
+
+    Backed by ``replace_profile``, which requires the target to exist *inside* the
+    write lock. That is what makes a PUT naming a built-in or provider-managed
+    profile a 404 rather than a silent create: the local store is the only place
+    this resolves, so a built-in's name is simply not there. An upsert would
+    instead write a local file that shadows the built-in on load, manufacturing
+    exactly the condition ``duplicated_in`` exists to report.
+    """
+    from cli_agent_orchestrator.services.profile_store import (
+        InvalidProfileNameError,
+        ProfileNotFoundError,
+        replace_profile,
+    )
+
+    warnings = _validate_profile_for_write(name, request.content)
+
+    try:
+        replace_profile(name, request.content)
+    except InvalidProfileNameError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    return ProfileWriteResponse(name=name, warnings=warnings)
+
+
+@app.delete("/agents/profiles/{name}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_agent_profile_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> None:
+    """Delete a profile from the local store.
+
+    ``SCOPE_ADMIN`` alone rather than write-or-admin, matching every other
+    destructive route on this service (``/sessions``, ``/workflows``,
+    ``/terminals``, ``/flows``, ``/memory``). Deletion is the only irreversible
+    operation in this group, and the asymmetry with POST and PUT is the existing
+    convention rather than a new one.
+
+    Built-in and provider-managed profiles are not deletable for the same reason
+    they are not replaceable: ``delete_profile`` resolves only inside the local
+    store, so their names raise ``ProfileNotFoundError``.
+    """
+    from cli_agent_orchestrator.services.profile_store import (
+        InvalidProfileNameError,
+        ProfileNotFoundError,
+        delete_profile,
+    )
+
+    try:
+        delete_profile(name)
+    except InvalidProfileNameError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@app.get("/agents/profiles/{name}/source")
+async def get_agent_profile_source_endpoint(name: str) -> ProfileSourceResponse:
+    """Return a profile's document exactly as stored, unresolved.
+
+    The authoring counterpart to ``GET /agents/profiles/{name}``. That route calls
+    ``load_agent_profile``, which applies ``resolve_env_vars`` to the raw text
+    *before* parsing, so substitution reaches the Markdown body as well as the
+    frontmatter, and the substitution source is the managed CAO ``.env`` file.
+    Using that response to pre-fill an editor and then PUT it back would persist
+    resolved secret values into a plaintext profile. ``safe_substitute`` leaves
+    unset variables intact, which would make the damage selective and silent.
+
+    Reads across all configured stores, not only the local one, so a built-in can
+    be fetched as the starting point for a clone. Writing it back still requires
+    the local store, which is enforced by the write routes.
+    """
+    from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
+
+    try:
+        return ProfileSourceResponse(name=name, content=_read_agent_profile_source(name))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
 @app.get("/agents/providers")

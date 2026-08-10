@@ -93,15 +93,30 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
             )
 
     # 2. JSON-Schema structural validation.
+    #
+    # The sort key stringifies each path component. Raw components are whatever
+    # the document used as mapping keys, so a profile with mixed-type keys (for
+    # example ``mcpServers: {1: {}, x: {}}``) yields paths that cannot be ordered
+    # against each other and would raise TypeError mid-sort. Such a document is
+    # already schema-invalid; it must be *reported* as invalid rather than crash
+    # the validator.
     validator = Draft202012Validator(load_profile_schema())
-    for error in sorted(validator.iter_errors(metadata), key=lambda e: list(e.path)):
+    for error in sorted(validator.iter_errors(metadata), key=lambda e: [str(p) for p in e.path]):
         path = ".".join(str(p) for p in error.absolute_path) or "(root)"
         messages.append(ValidationMessage("error", error.message, path))
 
     # 3. allowedTools vocabulary check (advisory, not blocking).
+    #
+    # Each entry is type-checked before the membership test. ``_VALID_TOOL_VOCAB``
+    # is a set, so ``tool not in`` hashes ``tool``, and an unhashable element
+    # (``allowedTools: [[Read]]``) would raise TypeError. The schema already
+    # rejects a non-string entry, so this check only has to avoid crashing on
+    # input the caller will be told about anyway.
     allowed = metadata.get("allowedTools")
     if allowed and isinstance(allowed, list):
         for tool in allowed:
+            if not isinstance(tool, str):
+                continue
             if tool not in _VALID_TOOL_VOCAB:
                 messages.append(
                     ValidationMessage(
@@ -112,8 +127,11 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
                 )
 
     # 4. Role check (advisory — custom roles are valid but worth flagging).
+    #
+    # Same hashing hazard as above: ``role: [developer]`` is unhashable. The
+    # schema reports the type error, so this advisory check simply stands aside.
     role = metadata.get("role")
-    if role and role not in _BUILTIN_ROLES:
+    if isinstance(role, str) and role and role not in _BUILTIN_ROLES:
         messages.append(
             ValidationMessage(
                 "warning",

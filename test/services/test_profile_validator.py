@@ -278,3 +278,55 @@ class TestSchemaModelParity:
             f"The schema declares {sorted(extra)} but AgentProfile has no such "
             "field, so a client filling them in would have them silently dropped."
         )
+
+
+class TestMalformedButParseableInput:
+    """Schema-invalid values must be *reported*, never raise.
+
+    Regression guard for the P3 finding on #575. The advisory checks test set
+    membership, which hashes the value, so an unhashable one (a list) raised
+    ``TypeError``; and the schema-error sort key used raw path components, so
+    mixed-type mapping keys could not be ordered. Both escaped the endpoint's
+    ``except ValueError`` and surfaced as HTTP 500 from a route whose entire
+    purpose is reporting what is wrong with a document.
+
+    Every case below is syntactically valid YAML that the schema already rejects,
+    so the correct outcome is an error finding rather than an exception.
+    """
+
+    def test_unhashable_allowed_tools_entry_is_reported(self) -> None:
+        findings = validate_frontmatter({"name": "x", "allowedTools": [["Read"]]})
+
+        assert any(f.severity == "error" for f in findings)
+
+    def test_unhashable_role_is_reported(self) -> None:
+        findings = validate_frontmatter({"name": "x", "role": ["developer"]})
+
+        assert any(f.severity == "error" for f in findings)
+
+    def test_mixed_type_mapping_keys_are_reported(self) -> None:
+        """Path components of different types must not break the error sort."""
+        findings = validate_frontmatter({"name": "x", "mcpServers": {1: {}, "x": {}}})
+
+        assert any(f.severity == "error" for f in findings)
+
+    def test_non_string_role_does_not_produce_a_spurious_warning(self) -> None:
+        """The advisory role check stands aside; the schema owns the type error."""
+        findings = validate_frontmatter({"name": "x", "role": 7})
+
+        assert any(f.severity == "error" for f in findings)
+        assert not any(f.severity == "warning" for f in findings)
+
+    def test_non_string_allowed_tool_does_not_produce_a_spurious_warning(self) -> None:
+        findings = validate_frontmatter({"name": "x", "allowedTools": [{"a": 1}]})
+
+        assert any(f.severity == "error" for f in findings)
+        assert not any(f.severity == "warning" for f in findings)
+
+    def test_well_formed_values_still_warn(self) -> None:
+        """The type guards must not silence the checks they protect."""
+        tool_findings = validate_frontmatter({"name": "x", "allowedTools": ["not_a_real_tool"]})
+        role_findings = validate_frontmatter({"name": "x", "role": "archaeologist"})
+
+        assert any(f.severity == "warning" for f in tool_findings)
+        assert any(f.severity == "warning" for f in role_findings)

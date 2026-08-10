@@ -60,6 +60,31 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   client can render create and edit forms from the server's definition instead
   of duplicating the field list.
 - `POST /agents/profiles/install` installs a profile.
+- `POST /agents/profiles` creates a profile in the local store from a supplied
+  document. Named distinctly from `install`, which takes a bare profile name or
+  an https:// URL rather than the document itself. The request carries `name`
+  and `content`; the two identities of a profile, its storage key and its
+  frontmatter `name`, must agree, so a mismatch is a 400 rather than a silent
+  rename. A conflicting name returns 409. Requires `cao:write` or `cao:admin`.
+- `PUT /agents/profiles/{name}` replaces an existing local-store profile and
+  never creates one. A request naming a built-in or provider-managed profile
+  returns 404 rather than writing a local file that would shadow the original.
+  Requires `cao:write` or `cao:admin`.
+- `DELETE /agents/profiles/{name}` removes a profile from the local store.
+  Requires `cao:admin`, matching the other destructive routes on this service;
+  a `cao:write` token that may create and edit profiles cannot delete them.
+  Built-ins are not deletable, for the same reason they are not replaceable.
+- Both write routes run the profile validator on the exact submitted document
+  before persisting anything, so an invalid profile never reaches disk. Errors
+  reject the request with 400 and the findings attached; warnings do not block
+  the write and are returned in the response so a client can surface them after
+  a successful save.
+- `GET /agents/profiles/{name}/source` returns a profile's document exactly as
+  stored. Use this, not `GET /agents/profiles/{name}`, when the document is
+  going to be edited and written back: that route returns the *resolved*
+  profile, having applied `${VAR}` substitution from the managed environment
+  file to the raw text before parsing. Round-tripping a resolved document
+  through a write would persist substituted values into a plaintext profile.
 - Template validation and preview require the selected template to include a
   `schema.json` file.
 - `/agents/providers` reports provider availability.

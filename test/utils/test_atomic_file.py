@@ -697,3 +697,77 @@ def test_write_times_out_when_the_lock_is_held(tmp_path: Path) -> None:
     with _file_lock(lock_path, timeout=5.0):
         with pytest.raises(LockTimeoutError):
             locked_atomic_write(target, "never lands", lock_timeout=0.2)
+
+
+def test_locked_atomic_write_must_exist_updates_an_existing_target(tmp_path: Path) -> None:
+    target = tmp_path / "f.txt"
+    target.write_text("old\n", encoding="utf-8")
+
+    locked_atomic_write(target, "new\n", must_exist=True)
+
+    assert target.read_text(encoding="utf-8") == "new\n"
+
+
+def test_locked_atomic_write_must_exist_refuses_to_create(tmp_path: Path) -> None:
+    target = tmp_path / "absent.txt"
+
+    with pytest.raises(FileNotFoundError):
+        locked_atomic_write(target, "new\n", must_exist=True)
+
+    assert not target.exists()
+
+
+def test_locked_atomic_write_rejects_the_contradictory_flag_pair(tmp_path: Path) -> None:
+    """``overwrite=False`` with ``must_exist=True`` can never succeed.
+
+    It demands a target that exists and simultaneously refuses to replace one, so
+    it is a caller bug rather than a runtime condition. Failing fast beats always
+    raising FileExistsError and letting the caller think the file was in the way.
+    """
+    target = tmp_path / "f.txt"
+
+    with pytest.raises(ValueError, match="never succeed"):
+        locked_atomic_write(target, "x\n", overwrite=False, must_exist=True)
+
+
+def test_locked_atomic_write_must_exist_leaves_no_temp_debris(tmp_path: Path) -> None:
+    """A refused update must not leave a partially written temp file behind."""
+    target = tmp_path / "absent.txt"
+
+    with pytest.raises(FileNotFoundError):
+        locked_atomic_write(target, "new\n", must_exist=True)
+
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("absent")] == []
+
+
+def test_locked_atomic_write_must_exist_is_enforced_under_the_lock(tmp_path: Path) -> None:
+    """Two concurrent updaters of an absent target must both be refused.
+
+    If the existence test sat outside the critical section, a thread could observe
+    "absent", lose the race, and still publish, converting an update into a create.
+    """
+    import threading
+
+    target = tmp_path / "absent.txt"
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def attempt(label: str) -> None:
+        barrier.wait()
+        try:
+            locked_atomic_write(target, f"{label}\n", must_exist=True)
+            with lock:
+                outcomes.append(f"wrote:{label}")
+        except FileNotFoundError:
+            with lock:
+                outcomes.append(f"refused:{label}")
+
+    threads = [threading.Thread(target=attempt, args=(n,)) for n in ("A", "B")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["refused:A", "refused:B"]
+    assert not target.exists()
