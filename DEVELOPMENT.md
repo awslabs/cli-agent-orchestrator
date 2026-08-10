@@ -256,7 +256,7 @@ Create a pull request on GitHub. CI will automatically run tests and code qualit
 Runs on all pushes to `main` and all PRs targeting `main`:
 - **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, mypy
-- **Security scan**: Trivy vulnerability scanner (CRITICAL/HIGH)
+- **Security scan**: Trivy filesystem scan — fails on a finding of **any** severity (see [SECURITY.md](SECURITY.md#running-security-scans-locally) for why the workflow's `CRITICAL,HIGH` input is ignored)
 - **Dependency review**: License and vulnerability checks on PRs
 
 ### Provider-Specific Workflows (path-triggered)
@@ -270,6 +270,16 @@ Each provider has a dedicated workflow that runs only when its files change:
 | `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
 
 Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
+
+### Docs Site Workflow (`gh-pages.yml`)
+
+Builds the Docusaurus site (`docusaurus/`) on every PR and push to `main` for a
+build signal, but only **deploys** to GitHub Pages on the upstream repo
+(`awslabs/cli-agent-orchestrator`) by default — forks don't have Pages enabled,
+so `actions/deploy-pages` would otherwise fail with a 404. Fork maintainers can
+opt in by enabling GitHub Pages in their fork and setting the `DEPLOY_DOCS_PAGES`
+repository variable to `true`; see [docusaurus/README.md](docusaurus/README.md#deploying-on-a-fork)
+for the full steps.
 
 ## Working with Providers
 

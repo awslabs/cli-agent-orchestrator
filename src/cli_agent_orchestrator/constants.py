@@ -594,7 +594,7 @@ MEMORY_ARCHIVE_MAX_GZIP_RATIO = 100  # reject > 100x expansion
 # Built-in role defaults. A role is a named bundle of allowedTools.
 # Users can define custom roles in settings.json under "roles".
 # CAO vocabulary: execute_bash, fs_read, fs_write, fs_list, fs_*, web_fetch,
-# @builtin, @cao-mcp-server.
+# @builtin, @cao-mcp-server, discovery.
 # web_fetch is granted only to developer: supervisor/reviewer are intentionally
 # kept off the network (no WebFetch/WebSearch), shrinking their exfiltration surface.
 ROLE_TOOL_DEFAULTS = {
@@ -602,6 +602,18 @@ ROLE_TOOL_DEFAULTS = {
     "reviewer": ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"],
     "developer": ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
 }
+
+# Issue #432 design discussion (tedswinyar + klabulan, 2026-07-17/18): sibling
+# discovery (list_siblings/update_metadata) is a distinct capability from the
+# existing handoff/assign/send_message orchestration trio, and must be an
+# explicit, separate opt-in rather than bundled into @cao-mcp-server's
+# all-or-nothing MCP-server-level grant -- a profile should be able to keep
+# orchestration tools while declining peer-to-peer discovery. Deliberately
+# NOT in any built-in role's defaults above; a profile author adds it
+# explicitly (see docs/tool-restrictions.md and
+# docs/discovery-tool-coexistence.md for the full rationale and enforcement
+# mechanism).
+DISCOVERY_TOOL_MARKER = "discovery"
 
 # Security constraints prepended to system prompts for providers without
 # native tool restriction mechanisms (kimi_cli, codex).
@@ -804,3 +816,17 @@ WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
 WORKFLOW_SCRIPT_TIMEOUT = 8700.0
 WORKFLOW_SCRIPT_LOG_CAP = 256 * 1024  # per-stream tail cap, bytes (BR-24/25, Q7=A)
 WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 (BR-30)
+
+# =============================================================================
+# Terminal group/metadata caps (#432 follow-up review, PR #433)
+# =============================================================================
+# ``group`` and (especially) ``metadata`` are written by the terminal's own
+# running agent via the ``update_metadata``/``update_group`` MCP tools, with
+# no operator review in the loop. Left unbounded, a worker could grow the
+# terminals.metadata/group TEXT columns arbitrarily, and that growth is
+# amplified into every sibling's ``list_siblings`` response (call-me-ram, PR
+# #433 review). Same shape as ``WORKFLOW_MAX_SPEC_BYTES``: a structural cap
+# enforced at the request boundary, fail-closed with 422.
+TERMINAL_METADATA_MAX_BYTES = 16 * 1024  # encoded (json.dumps) size cap
+TERMINAL_GROUP_MAX_ELEMENTS = 16
+TERMINAL_GROUP_ELEMENT_MAX_LEN = 128

@@ -10,34 +10,18 @@ from typing import Optional
 
 import click
 import frontmatter
-from jsonschema import Draft202012Validator
 
-from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, ROLE_TOOL_DEFAULTS
+from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR
 from cli_agent_orchestrator.services.profile_store import (
     InvalidProfileNameError,
     ProfileNotFoundError,
     delete_profile,
     store_path,
 )
+from cli_agent_orchestrator.services.profile_validator import validate_frontmatter
 from cli_agent_orchestrator.utils.agent_profiles import (
     list_agent_profiles,
 )
-
-# Known deprecated frontmatter fields that should trigger warnings.
-_DEPRECATED_FIELDS = {"autoApproveTools"}
-
-# Derive valid tool vocabulary from constants (single source of truth).
-_VALID_TOOL_VOCAB: set[str] = set()
-for _tools in ROLE_TOOL_DEFAULTS.values():
-    _VALID_TOOL_VOCAB.update(_tools)
-
-
-def _load_schema() -> dict:
-    """Load the agent profile JSON-Schema from package resources."""
-    schema_path = (
-        Path(__file__).resolve().parent.parent.parent / "schemas" / "agent_profile.schema.json"
-    )
-    return json.loads(schema_path.read_text(encoding="utf-8"))
 
 
 def _resolve_profile_path(name_or_path: str) -> Optional[Path]:
@@ -92,49 +76,23 @@ def _read_profile_text(name_or_path: str) -> Optional[str]:
 
 
 def _validate_frontmatter(metadata: dict) -> list[str]:
-    """Validate frontmatter dict against schema and CAO conventions.
+    """Validate frontmatter and render the findings as display strings.
+
+    Thin adapter over :func:`profile_validator.validate_frontmatter`. The
+    service returns severity-tagged findings; this renders them in the
+    ``[error] path: message`` and ``[warn] message`` form that the CLI prints
+    and that ``validate_cmd``'s exit code keys off.
 
     Returns a list of error/warning messages (empty = valid).
     """
-    messages: list[str] = []
-
-    # 1. Check deprecated fields first (before schema rejects them via
-    #    additionalProperties:false, which gives a less helpful message).
-    for field in _DEPRECATED_FIELDS:
-        if field in metadata:
-            messages.append(
-                f"[warn] '{field}' is deprecated and rejected by CAO 2.2+. "
-                f"Use 'allowedTools' instead."
-            )
-
-    # 2. JSON-Schema structural validation
-    schema = _load_schema()
-    validator = Draft202012Validator(schema)
-    for error in sorted(validator.iter_errors(metadata), key=lambda e: list(e.path)):
-        path = ".".join(str(p) for p in error.absolute_path) or "(root)"
-        messages.append(f"[error] {path}: {error.message}")
-
-    # 3. allowedTools vocabulary check (advisory, not blocking)
-    allowed = metadata.get("allowedTools")
-    if allowed and isinstance(allowed, list):
-        for tool in allowed:
-            if tool not in _VALID_TOOL_VOCAB:
-                messages.append(
-                    f"[warn] allowedTools entry '{tool}' is not in CAO's recognized "
-                    f"vocabulary. It may be silently ignored by some providers."
-                )
-
-    # 4. Role check (advisory — custom roles are valid but worth flagging)
-    _BUILTIN_ROLES = set(ROLE_TOOL_DEFAULTS.keys())
-    role = metadata.get("role")
-    if role and role not in _BUILTIN_ROLES:
-        messages.append(
-            f"[warn] role '{role}' is not a built-in CAO role "
-            f"({', '.join(sorted(_BUILTIN_ROLES))}). "
-            f"Ensure it is defined in your settings.json custom roles."
-        )
-
-    return messages
+    rendered: list[str] = []
+    for finding in validate_frontmatter(metadata):
+        tag = "error" if finding.severity == "error" else "warn"
+        if finding.path is not None:
+            rendered.append(f"[{tag}] {finding.path}: {finding.message}")
+        else:
+            rendered.append(f"[{tag}] {finding.message}")
+    return rendered
 
 
 @click.group()

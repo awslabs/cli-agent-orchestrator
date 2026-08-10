@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, AsyncIterator, Dict, List, Optional, Tuple, cast
+from typing import Annotated, Any, AsyncIterator, Dict, List, Literal, Optional, Tuple, cast
 
 from fastapi import (
     BackgroundTasks,
@@ -61,6 +61,9 @@ from cli_agent_orchestrator.constants import (
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
+    TERMINAL_GROUP_ELEMENT_MAX_LEN,
+    TERMINAL_GROUP_MAX_ELEMENTS,
+    TERMINAL_METADATA_MAX_BYTES,
     TERMINALS_RUN_STEP_ROUTE,
     TRUSTED_FORWARDER_IPS,
     WORKFLOW_ENV_ALLOWLIST,
@@ -244,15 +247,79 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
 
 
+def _check_group_size(group: Optional[List[str]]) -> Optional[List[str]]:
+    """Enforce structural caps on ``group`` (call-me-ram, PR #433 review).
+
+    ``group`` is written by the terminal's own agent via the ``update_group``
+    MCP tool with no operator review in the loop; an uncapped array lets a
+    worker grow the ``terminals.group`` TEXT column arbitrarily. Raises
+    ``ValueError`` (surfaces as 422 at every call site below) rather than
+    silently truncating — an over-cap request should fail loudly, not have
+    part of the caller's intended group silently dropped.
+    """
+    if not group:
+        return group
+    if len(group) > TERMINAL_GROUP_MAX_ELEMENTS:
+        raise ValueError(f"group has {len(group)} elements (max {TERMINAL_GROUP_MAX_ELEMENTS})")
+    for element in group:
+        if len(element) > TERMINAL_GROUP_ELEMENT_MAX_LEN:
+            raise ValueError(
+                f"group element {element!r} is {len(element)} chars "
+                f"(max {TERMINAL_GROUP_ELEMENT_MAX_LEN})"
+            )
+    return group
+
+
+def _check_metadata_size(metadata: Optional[Dict]) -> Optional[Dict]:
+    """Enforce a max-encoded-bytes cap on ``metadata`` (call-me-ram, PR #433 review).
+
+    ``metadata`` is a free-form dict the running agent writes about itself via
+    the ``update_metadata`` MCP tool; an unbounded ``Dict[str, Any]`` lets a
+    worker grow the ``terminals.metadata`` TEXT column arbitrarily, amplified
+    into every sibling's ``list_siblings`` response. Measured on the same
+    ``json.dumps`` encoding actually persisted (``WORKFLOW_MAX_SPEC_BYTES``
+    precedent), not e.g. a naive ``len(str(metadata))``.
+    """
+    if not metadata:
+        return metadata
+    encoded_len = len(json.dumps(metadata).encode("utf-8"))
+    if encoded_len > TERMINAL_METADATA_MAX_BYTES:
+        raise ValueError(
+            f"metadata is {encoded_len} bytes encoded (max {TERMINAL_METADATA_MAX_BYTES})"
+        )
+    return metadata
+
+
 class CreateSessionBody(CreateTerminalBody):
     """Optional JSON body for POST /sessions.
 
     Reuses the terminal-creation message payload and keeps operator-forwarded
     environment variables in the request body, preserving the existing
     ``{"env_vars": {...}}`` wire shape.
+
+    ``group``/``metadata`` are the #432 discovery fields (see
+    ``UpdateGroupBody``/``UpdateMetadataBody`` below for their dedicated PATCH
+    counterparts). They live here — rather than as separate top-level
+    ``Body(embed=True)`` params — so this endpoint keeps its single flat JSON
+    body wire shape (adding a second embedded body param would force FastAPI
+    to nest everything under a ``"body"`` key, breaking existing callers that
+    already POST ``{"env_vars": ..., "initial_message": ...}`` at the top
+    level, e.g. ``ops_mcp_server/server.py``'s ``_launch_session_impl``).
     """
 
     env_vars: Optional[Dict[str, str]] = None
+    group: Optional[List[str]] = None
+    metadata: Optional[Dict] = None
+
+    @field_validator("group")
+    @classmethod
+    def validate_group(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        return _check_group_size(v)
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, v: Optional[Dict]) -> Optional[Dict]:
+        return _check_metadata_size(v)
 
 
 def _validate_model_id(value: str) -> None:
@@ -274,6 +341,42 @@ def _validate_model_id(value: str) -> None:
         raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
     if not re.fullmatch(MODEL_ID_RE, value):
         raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
+
+
+class UpdateGroupBody(BaseModel):
+    """Request body for ``PATCH /terminals/{id}/group`` (#432).
+
+    ``group`` is required (no default) so an omitted field is rejected with
+    422 rather than silently treated the same as an explicit ``null`` —
+    clearing the group is always an explicit choice (``null`` or ``[]``),
+    never an accident of a partial/empty body (Copilot review, PR #433).
+    """
+
+    group: Optional[List[str]]
+
+    @field_validator("group")
+    @classmethod
+    def validate_group(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        return _check_group_size(v)
+
+
+class UpdateMetadataBody(BaseModel):
+    """Request body for ``PATCH /terminals/{id}/metadata`` (#432).
+
+    Called by the running agent itself via the ``update_metadata`` MCP tool.
+
+    ``metadata`` is required (no default) for the same reason as
+    ``UpdateGroupBody.group`` above: an omitted field is rejected with 422
+    instead of being indistinguishable from an explicit clearing ``null``
+    (Copilot review, PR #433).
+    """
+
+    metadata: Optional[Dict]
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, v: Optional[Dict]) -> Optional[Dict]:
+        return _check_metadata_size(v)
 
 
 class RunStepRequest(BaseModel):
@@ -813,6 +916,39 @@ class PreviewTemplateResponse(BaseModel):
 
     template: str
     content: str
+
+
+class ProfileValidationRequest(BaseModel):
+    """Request body for the non-mutating profile validate route."""
+
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileValidationMessage(BaseModel):
+    """One validation finding.
+
+    ``path`` is the dotted frontmatter location for JSON-Schema errors and is
+    absent for convention checks that are not tied to a single key.
+    """
+
+    severity: Literal["error", "warning"]
+    message: str
+    path: Optional[str] = None
+
+
+class ProfileValidationResponse(BaseModel):
+    """Outcome of validating a profile's frontmatter.
+
+    ``valid`` is False only when at least one error-severity finding is
+    present. Warnings are advisory and do not invalidate a profile, so a
+    client should block a save on errors alone.
+    """
+
+    valid: bool
+    messages: List[ProfileValidationMessage] = Field(default_factory=list)
 
 
 class MemorySummary(BaseModel):
@@ -2003,6 +2139,51 @@ async def preview_profile_template_endpoint(
     return PreviewTemplateResponse(template=request.template, content=content)
 
 
+@app.post("/agents/profiles/validate")
+async def validate_agent_profile_endpoint(
+    request: ProfileValidationRequest,
+) -> ProfileValidationResponse:
+    """Validate a profile's frontmatter against the profile schema. Writes nothing.
+
+    Distinct from ``/agents/profiles/templates/validate``, which checks a
+    *template config* against that template's own schema. This checks a
+    *finished profile* against ``agent_profile.schema.json`` plus CAO
+    conventions, and is the HTTP equivalent of ``cao profile validate``.
+
+    Deliberately NOT guarded by ``SCOPE_WRITE``, for the same reason as the
+    template validate route: this is a POST only because the profile content
+    travels in a JSON body rather than a query string, and it mutates no state.
+    """
+    from cli_agent_orchestrator.services.profile_validator import validate_profile_text
+
+    try:
+        findings = validate_profile_text(request.content)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ProfileValidationResponse(
+        valid=not any(f.severity == "error" for f in findings),
+        messages=[
+            ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
+            for f in findings
+        ],
+    )
+
+
+@app.get("/agents/profiles/schema")
+async def get_agent_profile_schema_endpoint() -> Dict:
+    """Return the agent profile JSON-Schema.
+
+    Lets a client render create and edit forms from the server's own schema
+    definition instead of duplicating the field list. Declared above
+    ``GET /agents/profiles/{name}`` because FastAPI matches in declaration
+    order, and the path parameter would otherwise capture "schema" as a name.
+    """
+    from cli_agent_orchestrator.services.profile_validator import load_profile_schema
+
+    return load_profile_schema()
+
+
 @app.get("/agents/profiles/{name}")
 async def get_agent_profile_endpoint(name: str) -> Dict:
     """Return the full parsed content of a named agent profile."""
@@ -2235,9 +2416,18 @@ async def create_session(
 
     ``model`` is an optional per-launch override. It uses the same validation
     and provider handoff as the existing terminal-creation endpoint.
+
+    ``body.group``/``body.metadata`` are the #432 discovery fields, set on
+    the initial terminal at creation time (``group`` is also updatable later
+    via ``PATCH /terminals/{id}/group``, ``metadata`` via the
+    ``update_metadata`` MCP tool).
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
+    # Structural caps on group/metadata (call-me-ram, PR #433 review) are
+    # enforced by CreateSessionBody's own field_validators above — invalid
+    # values fail Pydantic body parsing and FastAPI returns 422 automatically,
+    # before this function body ever runs.
     try:
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
@@ -2284,6 +2474,8 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            group=body.group if body else None,
+            metadata=body.metadata if body else None,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -2554,6 +2746,140 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get terminal: {str(e)}",
+        )
+
+
+@app.patch("/terminals/{terminal_id}/group", response_model=Terminal)
+async def update_terminal_group_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateGroupBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Replace a terminal's group array (#432).
+
+    Lets a consumer whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment,
+    harness-control#92) keep ``group`` from going stale. ``group`` is
+    required in the request body: an explicit ``null`` or ``[]`` clears it
+    (opting the terminal back out of discovery), while omitting the field
+    entirely is rejected with 422 rather than silently clearing it.
+    """
+    try:
+        updated = await asyncio.to_thread(terminal_service.update_group, terminal_id, body.group)
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
+            )
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        return Terminal(**terminal)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update terminal group: {str(e)}",
+        )
+
+
+@app.patch("/terminals/{terminal_id}/metadata", response_model=Terminal)
+async def update_terminal_metadata_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateMetadataBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Replace a terminal's free-form metadata dict (#432).
+
+    Called by the running agent itself via the ``update_metadata`` MCP tool
+    (as well as by any other authorized API caller). Whole-dict replace, not
+    a merge -- concurrent calls are last-write-wins (tedswinyar, PR #433
+    review); an acceptable design for this field, but callers should re-send
+    the full intended dict rather than assuming a partial update accumulates.
+    """
+    try:
+        updated = await asyncio.to_thread(
+            terminal_service.update_metadata, terminal_id, body.metadata
+        )
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
+            )
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        return Terminal(**terminal)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update terminal metadata: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/siblings")
+async def list_terminal_siblings(
+    terminal_id: TerminalId,
+    depth: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description=(
+            "How many leading elements of this terminal's own group to match "
+            "against. Omit for the widest scope this terminal is allowed to "
+            "see (its full own group). Server clamps to at most len(own "
+            "group) — can never exceed it. depth=0 is rejected (422) rather "
+            "than silently reinterpreted as an unscoped, all-terminals query."
+        ),
+    ),
+    cross_session: bool = Query(
+        default=False,
+        description=(
+            "Sibling discovery is session-scoped by default (issue #432 "
+            "design discussion, 2026-07-17/18): results are additionally "
+            "filtered to this terminal's own tmux session unless this is "
+            "explicitly set to true. Prevents two unrelated CAO sessions "
+            "that happen to reuse the same group prefix from silently "
+            "discovering each other."
+        ),
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """List sibling terminals sharing a leading prefix of this terminal's own group (#432).
+
+    ``terminal_id`` in the URL IS the caller's resolved identity — the MCP
+    ``list_siblings`` tool passes its own ``CAO_TERMINAL_ID`` here, never a
+    client-supplied "who am I" claim (same mechanism ``send_message``/
+    ``handoff`` already use). This endpoint only ever compares against THAT
+    terminal's own persisted ``group``, so a caller can never request a scope
+    wider than its own group no matter what ``depth`` is passed. A terminal
+    with no ``group`` set finds no siblings — it participates in no
+    discovery — rather than erroring or matching everything.
+
+    Session-scoped by default: results are also filtered to this terminal's
+    own ``tmux_session`` unless ``cross_session=true`` is explicitly passed
+    (issue #432 design discussion). ``group`` is an organizational label,
+    not a security boundary — on a default install with auth disabled, a
+    worker already has local shell access, so nothing here provides tenant
+    isolation even with session scoping applied; see docs/api.md.
+
+    Each result includes a ``status`` (tedswinyar, PR #433 review): a live,
+    point-in-time snapshot, not a guarantee. A handoff terminal can still
+    complete and delete itself between this call returning and a caller's
+    follow-up message to it, so callers should still expect sends to an
+    apparently-live sibling to occasionally fail.
+    """
+    try:
+        # 404 if the terminal itself doesn't exist, distinct from "exists but
+        # has no group" (empty list result, not an error — #432).
+        await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    try:
+        return await asyncio.to_thread(
+            terminal_service.list_siblings, terminal_id, depth=depth, cross_session=cross_session
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list siblings: {str(e)}",
         )
 
 
