@@ -1035,6 +1035,24 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
     /// Hidden-by-default is not the same as absent. The header states the count and the key that
     /// expands it, so every one of the nine remaining parameters is reachable without leaving the
     /// form — which is what makes NFR-3's keyboard-only requirement hold for them.
+    ///
+    /// # The advertised key changes with the state, because the wired one does
+    ///
+    /// This header used to read `[enter] expand/collapse` in both states, and only the first half
+    /// was true. Once expanded, `Enter` here reaches [`Self::reveal_options_or_run`] with nothing
+    /// left folded, so it falls through to `run_selected()` — the operator reads "collapse" on the
+    /// row carrying their own focus marker, presses it to fold the section back up, and **creates a
+    /// session instead**. That is the failure `reveal_options_or_run`'s docstring describes,
+    /// "running the CLI by accident while trying to open the options", arriving one keystroke later
+    /// than before. #556 is what made it reachable as a *deliberate* keystroke: the new picker folds
+    /// advertise `[enter] collapse` and honour it, and the new footer teaches `[enter]` as the reveal
+    /// key, so the same advertised affordance meant "collapse" on two of three folds and "launch a
+    /// session" on the third. (Review on PR #564.)
+    ///
+    /// So the expanded header advertises **`[esc]`**, which is what `on_key_form` actually collapses
+    /// on. The alternative — giving this section the picker folds' `Enter`-toggles semantics — is
+    /// more consistent, but it costs the "second `[enter]` runs" contract whenever focus happens to
+    /// rest here, so the honest label is what this takes.
     fn optional_section_lines(&self) -> Vec<String> {
         let hidden = self.field_lines(false);
         if hidden.is_empty() {
@@ -1047,8 +1065,13 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
             " "
         };
         let glyph = if self.optional_expanded { "▾" } else { "▸" };
+        let action = if self.optional_expanded {
+            "[esc] collapse"
+        } else {
+            "[enter] expand"
+        };
         let mut lines = vec![format!(
-            "{marker} {glyph} optional ({count}) — [enter] expand/collapse",
+            "{marker} {glyph} optional ({count}) — {action}",
             count = hidden.len()
         )];
 
@@ -1225,10 +1248,17 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         }
 
         let window = self.picker_window();
-        // `min` against a saturating end, so a scroll offset left over from a longer list cannot
-        // index past a shorter one — the pickers are re-fetched by `[ctrl+r]` and the new answer
-        // may be shorter than the old.
-        let start = scroll.min(rows.len().saturating_sub(1));
+        // Clamped to the last WINDOW, not the last row — the same bound `on_key_fold`'s `Down` arm
+        // uses, and the one its docstring states. `saturating_sub(1)` was the bug: it let a stale
+        // offset survive any change to `rows` or `window` that arrives WITHOUT a keypress, and
+        // there are two such paths. A taller terminal grows `window` until the whole list fits, and
+        // the stale offset still pinned the view to the last few rows in a pane with room for all
+        // of them; pressing `Down` then recomputed `last` as 0 and snapped to the top, so the key
+        // the residue line advertises scrolled *upwards*. And `[ctrl+r]` may answer with a shorter
+        // list, where `min(len - 1)` pins `start` one row from the end and leaves the rest
+        // unreachable by `Up` — a row the operator cannot reach by the advertised means, which is
+        // the defect the fold exists to fix. (Review on PR #564.)
+        let start = scroll.min(rows.len().saturating_sub(window));
         let end = (start + window).min(rows.len());
         lines.extend(rows[start..end].iter().cloned());
 
@@ -1988,6 +2018,14 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
 
         match retryable {
             Retryable::Pickers => {
+                // The viewports reset with the answer they were scrolled into. The refetch may
+                // return a SHORTER list, and an offset into the old one names nothing in the new
+                // one — the render clamp keeps that survivable, but leaving the offset would mean
+                // the operator's position is defined by a list that no longer exists. The fold
+                // flags are deliberately NOT reset: the operator opened them, and re-collapsing on
+                // a retry they asked for would hide the answer they were waiting to see.
+                self.agent_scroll = 0;
+                self.provider_scroll = 0;
                 self.populate_pickers();
                 true
             }
@@ -3175,6 +3213,7 @@ mod tests {
     use super::{
         in_app_readiness, paragraph, wrapped_heights, Fatal, Focus, Frame, InAppReadiness,
         JsonSink, LayoutMode, PaneSink, Renderer, Retryable, ServerApi, MIN_COLS, MIN_ROWS,
+        SCROLL_RESIDUE_MARKER,
     };
     use crate::catalog::{self, CommandId, Policy};
     use crate::error::TuiError;
@@ -7896,6 +7935,193 @@ mod tests {
             focus_fg,
             "a focused EMPTY picker must carry `focus` in the drawn cells, like every other \
              focused row — the marker alone is the insufficient-focus case of NFR-3 item 7"
+        );
+    }
+
+    // ── PR #564 review: the two must-fixes ───────────────────────────────────────────────────
+
+    /// **The optional header advertises a key that does what the header says it does.**
+    ///
+    /// The reported must-fix: with the section already expanded and focused, the header read
+    /// `[enter] expand/collapse` while `on_key_form` routed `Enter` through
+    /// [`Renderer::reveal_options_or_run`] — nothing was folded at that point, so it fell straight
+    /// through to `run_selected()` and **created a session**. The operator reads "collapse" on the
+    /// row their own focus marker is on, presses it to fold the section back up, and launches.
+    ///
+    /// That is `reveal_options_or_run`'s own docstring's failure — "running the CLI by accident
+    /// while trying to open the options" — arriving one keystroke later than before. It got worse
+    /// with #556, not better: the new picker folds advertise `[enter] collapse` and *honour* it, so
+    /// the same advertised key meant "collapse" on two of three folds and "launch" on the third.
+    ///
+    /// Asserted on `create_session_calls`, not on the label alone: a test that only read the string
+    /// would pass against a build that relabelled the header and left the launch wired.
+    #[test]
+    fn the_expanded_optional_header_advertises_the_key_that_collapses_it() {
+        let server = FakeServer::healthy().with_session(SessionAnswer::Created(terminal("t")));
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, 100, 40);
+        shell
+            .flow_mut()
+            .set("--agents", "planner")
+            .expect("`planner` is loadable in the fake's answer");
+
+        // The reveal press, made where the operator makes it: on the required field, before they
+        // have gone looking for the options. This is what leaves the section EXPANDED with nothing
+        // else folded, which is the state the launch fired from.
+        assert_eq!(
+            shell.focus(),
+            Focus::RequiredFields,
+            "selecting a command lands on the required fields"
+        );
+        assert!(
+            shell.on_key(KeyCode::Enter),
+            "the first [enter] must be consumed as the reveal, not as a run"
+        );
+        assert!(
+            shell.optional_expanded && !shell.has_folded_options(),
+            "the reveal must open EVERYTHING — with nothing left folded, the next [enter] means \
+             run, which is what makes the header's label load-bearing"
+        );
+
+        while shell.focus() != Focus::OptionalSection {
+            assert!(
+                shell.on_key(KeyCode::Tab),
+                "[tab] must reach the optional section"
+            );
+        }
+
+        // What the operator is reading, on the row carrying their focus marker.
+        let header = joined(&shell.render().optional_section, "\n")
+            .lines()
+            .find(|line| line.contains("optional ("))
+            .expect("the optional header is always rendered (FR-2.3)")
+            .to_string();
+        assert!(
+            !header.contains("[enter]"),
+            "the EXPANDED header must not advertise `[enter]`: that key runs the command from \
+             here, so naming it invites the launch-by-accident this flow exists to prevent. \
+             Got: {header:?}"
+        );
+        assert!(
+            header.contains("[esc] collapse"),
+            "and it must name the key that IS wired to collapse — an unadvertised affordance is a \
+             hidden one (NFR-3), and `Esc` is what `on_key_form` honours. Got: {header:?}"
+        );
+
+        // The advertised key does what it says, with no side effect on the server.
+        assert!(
+            shell.on_key(KeyCode::Esc),
+            "[esc] must be consumed by the expanded section"
+        );
+        assert!(
+            !shell.optional_expanded,
+            "[esc] must actually COLLAPSE the section — an advertised key that does nothing is the \
+             `[c] clear` defect again"
+        );
+        assert_eq!(
+            server.create_session_calls.get(),
+            0,
+            "collapsing the section must never reach `create_session`: the irreversible side \
+             effect is the whole reason this is a must-fix and not a wording nit"
+        );
+        assert!(
+            shell.pending_action.is_none() && !shell.running,
+            "and no launch may be queued for a later tick either — that would be the same defect \
+             one frame further on"
+        );
+    }
+
+    /// **The render-side scroll clamp stops at the last WINDOW, not the last row.**
+    ///
+    /// `fold_lines` clamped with `rows.len().saturating_sub(1)` while `on_key_fold`'s `Down` arm
+    /// clamped with `rows.saturating_sub(window)` and its docstring stated the latter. Any path that
+    /// changes `rows` or `window` **without a keypress** landed in the gap, and there are two:
+    ///
+    /// 1. **A taller terminal.** Scrolled to the bottom of 25 agents at 24 rows, then resized to
+    ///    200: the window becomes 50 and the whole list fits, but the stale offset pinned the view
+    ///    to the last six rows in a pane with room for all 25. Pressing `Down` — the key the residue
+    ///    line advertises — then recomputed `last = 0` and snapped to the top, so `Down` scrolled
+    ///    *up*.
+    /// 2. **A shorter refetch.** `[ctrl+r]` does not reset the offsets, so a stale offset of 19
+    ///    against a 2-row answer drew one row and left the other off-window. `Up` decremented the
+    ///    offset while `min(len - 1)` stayed pinned, so the key advertised to reveal what is above
+    ///    did nothing visible for 18 presses — a row unreachable by the advertised means, which is
+    ///    the exact defect the fold was built to fix.
+    ///
+    /// Both are asserted here because the fix has two halves: the clamp closes them at the render,
+    /// and `retry()` resetting the offsets closes the second at its source.
+    #[test]
+    fn a_stale_scroll_offset_never_hides_rows_that_now_fit() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, 100, 24);
+
+        while shell.focus() != Focus::AgentPicker {
+            assert!(
+                shell.on_key(KeyCode::Tab),
+                "[tab] must reach the agent fold"
+            );
+        }
+        assert!(shell.on_key(KeyCode::Enter), "[enter] must expand the fold");
+        for _ in 0..30 {
+            shell.on_key(KeyCode::Down);
+        }
+        assert!(
+            shell.agent_scroll > 0,
+            "this test needs a NON-ZERO offset to make stale, or both halves below are vacuous"
+        );
+
+        // (1) A taller terminal: the window now holds the whole list.
+        shell.resize(100, 200);
+        let pickers = joined(&shell.render().pickers, "\n");
+        assert!(
+            pickers.contains("agent-00") && pickers.contains("agent-24"),
+            "after a resize that fits all 25 rows, ALL of them must be drawn — a stale offset that \
+             shows six in a pane with room for 25 is a list the operator cannot see. Got: \
+             {pickers:?}"
+        );
+        assert!(
+            !pickers.contains(SCROLL_RESIDUE_MARKER),
+            "and with nothing off-window there must be no residue notice: a standing claim that \
+             rows are hidden when none are is the inverse lie. Got: {pickers:?}"
+        );
+
+        // And `Down` must not scroll UP. The key clamps to a `last` of 0 here, so the offset stays
+        // put rather than snapping the view somewhere the operator did not ask for.
+        let before = joined(&shell.render().pickers, "\n");
+        shell.on_key(KeyCode::Down);
+        assert_eq!(
+            joined(&shell.render().pickers, "\n"),
+            before,
+            "[↓] on a list that entirely fits must be inert — it must never move the view, least \
+             of all upwards, which is what a disagreeing render clamp produced"
+        );
+
+        // (2) A shorter refetch, at the original size: `[ctrl+r]` answers with two profiles.
+        let mut shell = shell_on_the_launch_form(&server, &host, 100, 24);
+        while shell.focus() != Focus::AgentPicker {
+            assert!(shell.on_key(KeyCode::Tab));
+        }
+        assert!(shell.on_key(KeyCode::Enter));
+        for _ in 0..30 {
+            shell.on_key(KeyCode::Down);
+        }
+        *server.profiles.borrow_mut() =
+            Ok(vec![profile("only-one", true), profile("only-two", true)]);
+        assert!(shell.retry(), "[ctrl+r] must re-issue the picker fetch");
+
+        assert_eq!(
+            shell.agent_scroll, 0,
+            "a refetch must reset the viewport at the SOURCE: the answer being scrolled is gone, \
+             so an offset into it is meaningless and only happens to be survivable because the \
+             render clamps"
+        );
+        let refetched = joined(&shell.render().pickers, "\n");
+        assert!(
+            refetched.contains("only-one") && refetched.contains("only-two"),
+            "both rows of the new answer must be on screen — the header saying 2 while one row is \
+             drawn and unreachable by [↑] is the defect the fold was meant to fix. Got: \
+             {refetched:?}"
         );
     }
 }
