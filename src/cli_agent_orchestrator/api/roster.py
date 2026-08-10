@@ -137,17 +137,31 @@ async def roster_audit_dry_run(_: Any = _READ) -> dict[str, Any]:
 
 
 class NativeIdentityRepairBody(BaseModel):
-    """The exact incarnation and build a repair is called for."""
+    """The immutable repair request: an explicit operation id, and the
+    expected incarnation and build the caller believes the terminal runs.
 
-    generation: str = Field(
+    ``generation`` is the *expected model generation* — required for
+    managed/v2 terminals, and refused for legacy rows (whose physical
+    occurrence is the callback-target generation).  ``provider_version``
+    is caller/provider metadata that selects the pre-status interaction
+    plan only; the panel-attested build is what gets recorded, so a legacy
+    row with no durable version metadata may omit it.
+    """
+
+    operation_id: str = Field(
         min_length=1,
-        description="Exact roster generation of the terminal to repair",
+        description="Explicit canonical UUID for crash/retry truth; an exact "
+        "retry with the same id adopts the recorded evidence",
     )
-    provider_version: str = Field(
-        min_length=1,
+    generation: Optional[str] = Field(
+        default=None,
+        description="Expected model generation of a managed terminal; omit for legacy rows",
+    )
+    provider_version: Optional[str] = Field(
+        default=None,
         description=(
-            "Installed provider build (a banner or a bare semver); the repair "
-            "runs only the parser pinned for that exact build"
+            "Installed provider build (a banner or a bare semver) that selects the "
+            "interaction plan; the panel-attested build is what is recorded"
         ),
     )
 
@@ -159,6 +173,7 @@ _REPAIR_REFUSED_HTTP: dict[str, int] = {
     "invalid-input": status.HTTP_400_BAD_REQUEST,
     "provider-unsupported": status.HTTP_400_BAD_REQUEST,
     "unsupported-build": status.HTTP_400_BAD_REQUEST,
+    "generation-required": status.HTTP_400_BAD_REQUEST,
     "terminal-not-found": status.HTTP_404_NOT_FOUND,
     "no-roster-incarnation": status.HTTP_404_NOT_FOUND,
     "roster-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -177,17 +192,18 @@ async def repair_terminal_native_identity(
 
     The bounded cond-0377C health operation: proves the exact stored
     pane/session/window/process identity live, types literal ``/status``
-    once under the exact generation-lifecycle claim and the per-pane input
-    lease, parses only the pinned provider/build identity fields, and
+    once under the canonical lifecycle claim set (model-generation,
+    callback-target-generation, pane) and the per-pane input lease, parses
+    only the panel-attested branded provider/build identity fields, and
     commits the terminal row, the roster lineage, and a bounded evidence
     digest atomically with an exclusive native-session attachment owner.
-    Never a task/control message, and never a blocker for Stop.
+    Never a task/control message.
 
-    The typed outcome is returned as the body: ``repaired`` and
-    ``identity-still-missing`` (Kimi, before its first session-creating
-    action) map to 200; refusals map to their typed HTTP code.  The body
-    never contains raw pane output or secrets — only the bounded digest
-    and typed details.
+    The typed outcome is returned as the body: ``repaired``,
+    ``already-known``, and ``identity-still-missing`` (Kimi, before its
+    first session-creating action) map to 200; refusals map to their typed
+    HTTP code.  The body never contains raw pane output or secrets — only
+    the bounded digest and typed details.
     """
 
     def _run() -> dict[str, Any]:
@@ -195,11 +211,13 @@ async def repair_terminal_native_identity(
             terminal_id=terminal_id,
             generation=body.generation,
             provider_version=body.provider_version,
+            operation_id=body.operation_id,
         )
 
     outcome = await asyncio.to_thread(_run)
     if outcome.get("status") in (
         native_status_repair.STATUS_REPAIRED,
+        native_status_repair.STATUS_ALREADY_KNOWN,
         native_status_repair.STATUS_IDENTITY_STILL_MISSING,
     ):
         return outcome

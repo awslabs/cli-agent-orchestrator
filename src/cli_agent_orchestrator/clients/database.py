@@ -3306,27 +3306,37 @@ def set_terminal_native_session_id(terminal_id: str, native_session_id: str) -> 
 
 def set_terminal_native_session_id_conditional(
     terminal_id: str,
-    generation: str,
-    native_session_id: str,
     *,
+    expected_generation: Optional[str],
+    physical_occurrence: str,
+    native_session_id: str,
     db: Any = None,
 ) -> bool:
-    """Generation-conditional native-id writer for the repair seam.
+    """Generation/occurrence-conditional native-id writer for the repair seam.
 
     ``set_terminal_native_session_id`` is id-only and unsafe here: the
-    cond-0377C repair persists only when the exact terminal ID, exact
-    generation, live lifecycle, and an absent-or-equal stored id all still
-    hold at write time, inside the same transaction as the roster repair
-    and the evidence row.
+    cond-0377C repair persists only when the exact terminal ID, the exact
+    managed model generation **or** the exact legacy callback-target
+    occurrence, the live lifecycle, and an absent-or-equal stored id all
+    still hold at write time, inside the same transaction as the roster
+    repair and the evidence row.
 
-    Writes the v2 row when one exists, else the shared ``terminals`` row
-    (whose generation may be NULL on legacy rows — the exact roster
-    incarnation is the anchor there).  An existing different id is never
-    overwritten: that is a supersession, not an update.  Returns False on
-    any mismatch with nothing written; a caller that re-verified first can
-    treat a False as a concurrent modification.
+    The two branches are mutually exclusive and never conflated:
+
+    * a v2 row requires the expected model generation to equal
+      ``row.generation`` exactly (and the physical occurrence is that same
+      model generation);
+    * a legacy ``terminals`` row requires ``row.generation IS NULL`` and
+      ``row.callback_target_generation`` to equal the physical occurrence
+      exactly.  An arbitrary physical generation is never accepted as a
+      model generation.
+
+    An existing different id is never overwritten: that is a supersession,
+    not an update.  Returns False on any mismatch with nothing written; a
+    caller that re-verified first can treat a False as a concurrent
+    modification.
     """
-    if not (terminal_id and generation and native_session_id):
+    if not (terminal_id and physical_occurrence and native_session_id):
         return False
     session = db if db is not None else SessionLocal()
     owns_session = db is None
@@ -3337,7 +3347,9 @@ def set_terminal_native_session_id_conditional(
             .first()
         )
         if row is not None:
-            if row.generation != generation:
+            if not expected_generation or row.generation != expected_generation:
+                return False
+            if physical_occurrence != row.generation:
                 return False
             if row.v2_lifecycle_state != "live":
                 return False
@@ -3354,8 +3366,19 @@ def set_terminal_native_session_id_conditional(
             row = session.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
             if row is None:
                 return False
-            if row.generation not in (None, generation):
-                return False
+            if row.generation is not None:
+                # A v1-managed terminals row carries a model generation; the
+                # expected model generation must match it exactly.
+                if not expected_generation or row.generation != expected_generation:
+                    return False
+                if physical_occurrence != row.generation:
+                    return False
+            else:
+                # A legacy row binds to its exact callback-target occurrence.
+                if not row.callback_target_generation:
+                    return False
+                if row.callback_target_generation != physical_occurrence:
+                    return False
             if row.lifecycle_state != "live":
                 return False
             if row.native_session_id not in (None, native_session_id):
