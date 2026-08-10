@@ -1072,11 +1072,31 @@ def _wait_kimi_turn_start(
     raise BridgeError("Kimi emitted no structured provider turn-start identity")
 
 
-def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
-    profile = load_agent_profile(agent_profile)
+def _profile_material_from_profile(
+    profile: Any,
+    terminal_id: str,
+    *,
+    allowed_tools: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Resolve the fully-composed profile material from an ALREADY-LOADED profile.
+
+    This is the single composition of the developer instructions (base body +
+    runtime skill catalog + the shared restricted-tool security prompt and
+    explicit tool list) and the resolved MCP servers.  Split out from
+    :func:`_profile_material` so the ordinary ``create_terminal`` path can
+    build this ONCE from the profile it already loaded and pass the exact same
+    material to both the pre-task bootstrap and the resumed TUI — neither
+    reloads a potentially-changed profile or rebuilds a subtly different
+    contract (cond-0377a).
+
+    ``allowed_tools`` lets the caller pass the tool policy it already resolved
+    (which may be an explicit per-step override, not the profile default), so
+    the yolo/security composition matches what ``create_terminal`` computed.
+    """
     actual_digest = _digest(profile.model_dump(mode="json"))
-    names = list(profile.mcpServers or {}) or None
-    allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, names)
+    if allowed_tools is None:
+        names = list(profile.mcpServers or {}) or None
+        allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, names)
     system_prompt = profile.system_prompt or ""
     skill_prompt = build_skill_catalog(profile.skills)
     if skill_prompt:
@@ -1101,7 +1121,10 @@ def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
                 "command": config["command"],
                 "args": [str(item) for item in (config.get("args") or [])],
                 "env": [{"name": key, "value": value} for key, value in sorted(env.items())],
-                "env_vars": [str(item) for item in (config.get("env_vars") or [])],
+                # env_vars are NAMES of vars to forward — pass them through
+                # verbatim so the shared Codex composer is the single fail-fast
+                # validator (a non-string entry is a malformed profile).
+                "env_vars": list(config.get("env_vars") or []),
                 "tool_timeout_sec": config.get("tool_timeout_sec"),
             }
         )
@@ -1112,6 +1135,10 @@ def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
         "system_prompt": system_prompt,
         "mcp_servers": mcp_servers,
     }
+
+
+def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
+    return _profile_material_from_profile(load_agent_profile(agent_profile), terminal_id)
 
 
 def write_request(reservation_id: str, request: dict[str, Any]) -> dict[str, pathlib.Path]:

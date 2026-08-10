@@ -848,6 +848,9 @@ class TestParseEnvPairs:
         # TmuxClient inherits at the server boundary.
         assert _parse_env_pairs(["CLAUDE_CODE_USE_BEDROCK=1"]) == {"CLAUDE_CODE_USE_BEDROCK": "1"}
 
+    def test_codex_home_storage_location_passes(self):
+        assert _parse_env_pairs(["CODEX_HOME=/state/codex"]) == {"CODEX_HOME": "/state/codex"}
+
     def test_value_at_cap_rejected(self):
         import click as _click
 

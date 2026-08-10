@@ -50,13 +50,11 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     ManagedLaunchV2NegativeRequest,
     ManagedLaunchV2ReserveRequest,
 )
-from cli_agent_orchestrator.providers.codex import _toml_override as _codex_toml_override
-from cli_agent_orchestrator.providers.codex import _toml_scalar as _codex_toml_scalar
 from cli_agent_orchestrator.providers.codex import (
-    _validate_config_key as _validate_codex_config_key,
-)
-from cli_agent_orchestrator.providers.codex import (
-    render_trusted_project_override,
+    CODEX_TUI_FLAGS,
+    CodexRoute,
+    codex_route_suffix,
+    compose_codex_core_args,
 )
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import (
@@ -205,79 +203,40 @@ def _codex_profile_launch_args(
 ) -> list[str]:
     """Build the sealed profile and route arguments for native Codex.
 
-    The app-server bootstrap and resumed TUI receive the same profile, model,
-    effort, prompt, and MCP material.  TUI-only rendering flags are omitted
-    from app-server because they are not valid app-server options.
+    cond-0377a: the app-server bootstrap and the resumed TUI both consume the
+    ONE shared composer (``compose_codex_core_args``), so they cannot drift on
+    profile selection, developer instructions, MCP serialization, codexConfig,
+    trust, or route ordering.  TUI-only rendering flags are omitted from the
+    app-server because they are not valid app-server options.
     """
     profile = profile_material["profile"]
-    allowed_tools = profile_material.get("allowed_tools") or []
-    yolo = bool("*" in allowed_tools)
-    if profile.codexProfile and not yolo:
-        args = ["--profile", profile.codexProfile]
-    else:
-        args = ["--yolo"]
-
+    try:
+        core = compose_codex_core_args(
+            codex_profile=profile.codexProfile,
+            codex_config=profile.codexConfig,
+            system_prompt=profile_material.get("system_prompt") or "",
+            mcp_servers=profile_material.get("mcp_servers") or [],
+            allowed_tools=profile_material.get("allowed_tools") or [],
+            trusted_project_root=record["working_directory"],
+        )
+    except ValueError as exc:
+        # Preserve the managed protocol's typed refusal boundary. Profile
+        # material is immutable launch intent; malformed MCP/config material
+        # is a caller conflict, never an untyped server failure.
+        raise ManagedLaunchConflict(str(exc)) from exc
+    # The yolo/profile choice is the first core element(s) (one arg for
+    # ``--yolo``, two for ``--profile <name>``); TUI flags sit right after it.
+    # The sealed route is appended last (last-wins) so neither a named profile
+    # nor codexConfig can silently replace it.
+    choice_len = 2 if core and core[0] == "--profile" else 1
+    args = list(core[:choice_len])
     if tui:
-        args.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
-
-    # _profile_material already applies the shared restricted-tool security
-    # prompt. Reapplying it here would duplicate the developer instructions
-    # only on the native Codex route.
-    system_prompt = profile_material.get("system_prompt") or ""
-    if system_prompt:
-        args.extend(["-c", f"developer_instructions={_codex_toml_scalar(system_prompt)}"])
-
-    for server in profile_material.get("mcp_servers") or []:
-        name = _validate_codex_config_key(server["name"], source="mcpServers name")
-        prefix = f"mcp_servers.{name}"
-        args.extend(["-c", f"{prefix}.command={_codex_toml_scalar(server['command'])}"])
-        server_args = (
-            "[" + ", ".join(_codex_toml_scalar(item) for item in server.get("args") or []) + "]"
-        )
-        args.extend(["-c", f"{prefix}.args={server_args}"])
-        for item in server.get("env") or []:
-            key = _validate_codex_config_key(item["name"], source="mcpServers env")
-            args.extend(["-c", f"{prefix}.env.{key}={_codex_toml_scalar(item['value'])}"])
-        env_vars = list(server.get("env_vars") or [])
-        if "CAO_TERMINAL_ID" not in env_vars:
-            env_vars.append("CAO_TERMINAL_ID")
-        for index, value in enumerate(env_vars):
-            if not isinstance(value, str):
-                raise ManagedLaunchConflict(
-                    f"mcpServers {name!r} env_vars[{index}] must be a string"
-                )
-        env_vars_toml = "[" + ", ".join(_codex_toml_scalar(item) for item in env_vars) + "]"
-        timeout = server.get("tool_timeout_sec")
-        if timeout is None:
-            timeout = 600.0
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise ManagedLaunchConflict(
-                f"mcpServers {name!r} tool_timeout_sec must be a positive number"
-            )
-        timeout = float(timeout)
-        args.extend(
-            [
-                "-c",
-                f"{prefix}.env_vars={env_vars_toml}",
-                "-c",
-                f"{prefix}.tool_timeout_sec={_codex_toml_scalar(timeout)}",
-            ]
-        )
-
-    for key, value in (profile.codexConfig or {}).items():
-        args.extend(["-c", _codex_toml_override(key, value)])
-
-    # Route and trust are emitted after profile configuration, so neither a
-    # named profile nor codexConfig can silently replace the sealed request.
+        args.extend(CODEX_TUI_FLAGS)
+    args.extend(core[choice_len:])
     args.extend(
-        [
-            "-c",
-            render_trusted_project_override(record["working_directory"]),
-            "--model",
-            request["expected_model"],
-            "-c",
-            _codex_toml_override("model_reasoning_effort", request["expected_effort"]),
-        ]
+        codex_route_suffix(
+            CodexRoute(model=request["expected_model"], effort=request["expected_effort"])
+        )
     )
     return args
 

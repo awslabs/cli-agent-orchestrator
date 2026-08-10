@@ -909,8 +909,13 @@ class TestExecuteFlowRosterRole:
     ):
         """The flow's first terminal IS its conductor; the roster must
         persist it with the supervisor role."""
+        from cli_agent_orchestrator.clients import database
         from cli_agent_orchestrator.services import stable_agent_roster as roster
         from cli_agent_orchestrator.services import terminal_service as ts
+
+        # cond-0377a (P1-4): the conductor's pre-task native id is persisted on
+        # the terminal row before the roster bind, so the row must really exist.
+        mock_db_create.side_effect = database.create_terminal
 
         mock_get_flow.return_value = Flow(
             name="my-flow",

@@ -214,11 +214,16 @@ class ClaudeCodeProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        native_session_id: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # cond-0377a: the pre-task minted harness-native id the launch argv
+        # must consume (``--session-id <id>``); None keeps the legacy
+        # ambient launch.
+        self._native_session_id = native_session_id
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -405,6 +410,12 @@ class ClaudeCodeProvider(BaseProvider):
             disallowed = get_disallowed_tools("claude_code", self._allowed_tools)
             for tool in disallowed:
                 command_parts.extend(["--disallowedTools", tool])
+
+        # cond-0377a: the pre-task minted identity is consumed by the launch
+        # argv itself (``--session-id <id>``) — the TUI never silently
+        # creates an unrelated fresh conversation.
+        if self._native_session_id:
+            command_parts.extend(["--session-id", self._native_session_id])
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters

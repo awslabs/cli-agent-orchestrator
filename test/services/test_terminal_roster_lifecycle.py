@@ -39,6 +39,7 @@ def _patch_clear_session_env():
 def launch_mocks(monkeypatch):
     """Configure the mock stack for a successful unmanaged launch and a
     durable roster row."""
+    from cli_agent_orchestrator.clients import database
     from cli_agent_orchestrator.services import terminal_service as ts
 
     with (
@@ -49,7 +50,8 @@ def launch_mocks(monkeypatch):
             "cli_agent_orchestrator.services.terminal_service.provider_manager"
         ) as provider_manager,
         patch(
-            "cli_agent_orchestrator.services.terminal_service.db_create_terminal"
+            "cli_agent_orchestrator.services.terminal_service.db_create_terminal",
+            side_effect=database.create_terminal,
         ) as db_create_terminal,
         patch("cli_agent_orchestrator.backends.registry._backend") as tmux,
         patch(
@@ -153,7 +155,7 @@ async def test_unmanaged_roster_bind_runs_off_the_event_loop(
 
     monkeypatch.setattr(roster, "bind_generation", _recorder)
 
-    result = await create_terminal("claude_code", "developer", new_session=True)
+    result = await create_terminal("kiro_cli", "developer", new_session=True)
     assert result.id == "test1234"
     assert captured["contract"].agent_id == roster.derive_initial_agent_id("test1234")
     assert captured["thread"] is not loop_thread

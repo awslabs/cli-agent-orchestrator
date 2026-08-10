@@ -1792,6 +1792,31 @@ def deliver_control_input(
             f"no terminal {terminal_id!r} is known to this server",
         )
 
+    # Ordinary Claude/Codex rows are observable after their pane/terminal row
+    # exists but before the pre-task native identity operation has durably
+    # bound the stable roster.  Refuse here, before the journal or pane lease,
+    # so a concurrent control cannot type a real task into the bare shell.
+    if not resolved.managed:
+        from cli_agent_orchestrator.services import (
+            stable_agent_roster,
+            unmanaged_native_identity,
+        )
+
+        try:
+            unmanaged_native_identity.assert_unmanaged_admission_ready(
+                terminal_id,
+                {
+                    "provider": resolved.provider,
+                    "generation": resolved.terminal_generation,
+                },
+            )
+        except stable_agent_roster.StableAgentAdmissionRefused as exc:
+            return _refuse(
+                REASON_LINEAGE_UNPROVEN,
+                f"stable-agent/native binding is not ready; nothing was typed: {exc}",
+                resolved=resolved,
+            )
+
     client = _tmux_client()
     if client is None:
         # Not a refusal: a refusal invites a re-attempt, and no re-attempt

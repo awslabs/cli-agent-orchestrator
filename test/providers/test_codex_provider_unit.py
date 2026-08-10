@@ -265,12 +265,14 @@ class TestCodexBuildCommand:
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_mcp_env_vars_non_string_entry_fails_fast(self, mock_load_profile):
-        """A non-string env_vars entry raises TypeError (intentional fail-fast).
+        """A non-string env_vars entry fails fast at launch-command build time.
 
-        _toml_scalar rejects non-scalar values so a malformed profile fails at
-        launch-command build time with a clear error instead of emitting a
-        silently-broken override. Previously the entry was rendered via a raw
-        f-string and never raised; the fail-fast is a deliberate change.
+        cond-0377a: the ONE shared Codex composer validates every env_vars
+        entry is a string, so a malformed profile fails with a clear error
+        instead of emitting a silently-broken override. (Previously the
+        provider stringified the entry and never raised; the unified composer
+        is the single fail-fast validator across the provider, the unmanaged
+        bootstrap, and managed-v2.)
         """
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -286,7 +288,7 @@ class TestCodexBuildCommand:
         mock_load_profile.return_value = mock_profile
 
         provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
-        with pytest.raises(TypeError, match="scalars"):
+        with pytest.raises(ValueError, match="must be a string"):
             provider._build_codex_command()
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")

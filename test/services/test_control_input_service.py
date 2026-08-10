@@ -65,6 +65,7 @@ from cli_agent_orchestrator.services.control_input_journal import (
     STATE_REFUSED,
     ControlInputBinding,
     ControlInputJournal,
+    ControlInputNotFound,
 )
 from cli_agent_orchestrator.services.native_pane_input import (
     NativePaneInputUnavailable,
@@ -298,6 +299,44 @@ def _deliver(journal, **overrides):
     kwargs = {"control_id": CONTROL, "text": TEXT, "enter": True}
     kwargs.update(overrides)
     return service.deliver_control_input(TERMINAL, journal=journal, **kwargs)
+
+
+def test_unmanaged_activated_control_refuses_before_roster_binding(
+    isolated_memory_db, tmux, journal, monkeypatch
+):
+    """A visible ordinary Claude pane is not writable while its pre-task
+    stable-agent/native binding is still absent."""
+    monkeypatch.setattr(
+        service,
+        "_terminal_metadata",
+        lambda terminal_id: _metadata(provider="claude_code"),
+    )
+    from cli_agent_orchestrator.services import stable_agent_roster as roster
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    roster.bind_generation(
+        roster.BindingContract(
+            agent_id=roster.derive_initial_agent_id(TERMINAL, GENERATION),
+            session_name="cao",
+            role=roster.ROLE_WORKER,
+            profile_family="developer",
+            harness="claude_code",
+            terminal_id=TERMINAL,
+            generation=GENERATION,
+            pane_id=PANE,
+            pane_pid=PANE_PID,
+            execution_mode="native_tui",
+            continuity_note=seam.PRE_TASK_IDENTITY_PENDING,
+        )
+    )
+
+    result = _deliver(journal)
+
+    assert result.outcome == REFUSED
+    assert result.reason_code == REASON_LINEAGE_UNPROVEN
+    assert tmux.writes == []
+    with pytest.raises(ControlInputNotFound):
+        journal.get(CONTROL)
 
 
 @contextmanager
