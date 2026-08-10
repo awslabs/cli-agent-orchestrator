@@ -228,6 +228,42 @@ class TestValidateStoredIntent:
         with pytest.raises(na.NativeAttachmentInvalid):
             na.validate_attachment_intent(intent)
 
+    def test_every_builder_produced_intent_validates(self):
+        for method in sorted(na.ACQUISITION_METHODS):
+            kwargs = {
+                "acquisition_method": method,
+                "acquisition_receipt": {"kind": "kimi-session-resume", "session_id": SESSION},
+                "admits_only_new_instructions": True,
+                "replays_task_bytes": False,
+                "note": "a note",
+            }
+            if method in {na.ACQUISITION_ACP_BOOTSTRAP, na.ACQUISITION_ZERO_TURN_BOOTSTRAP}:
+                kwargs["bootstrap_sent_no_turn"] = True
+                kwargs["bootstrap_detached_before_launch"] = True
+            intent = na.acquire_intent(**kwargs)
+            assert na.validate_attachment_intent(intent)["acquisition_method"] == method
+
+    def test_non_bootstrap_method_with_bootstrap_flags_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["bootstrap_sent_no_turn"] = True
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+    def test_malformed_note_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["note"] = ""
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+        intent["note"] = 42
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+    def test_unknown_top_level_v1_key_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["future_unknown_field"] = "x"
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
 
 class TestIntentPrecedesProviderLaunch:
     def test_declare_persists_the_claim_before_any_process_exists(self):

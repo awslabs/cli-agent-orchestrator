@@ -3608,3 +3608,91 @@ def test_sanctioned_ordinary_owner_stays_byte_identical(isolated_memory_db, harn
     assert attachment["adoption_receipt"] is None
     assert _terminal_row().v2_native_session_id == SESSION_ID
     assert _current_lineage()["native_session_id"] == SESSION_ID
+
+
+# ---------------------------------------------------------------------------
+# Follow-up 6: raw receipt presence/readability boundary
+# ---------------------------------------------------------------------------
+
+
+def _insert_exact_with_raw_receipt(raw: Optional[str]):
+    identity = {"pid": PANE_PID, "start_marker": START_MARKER}
+    with database.SessionLocal() as db:
+        db.add(
+            database.NativeSessionAttachmentModel(
+                provider="claude_code",
+                native_session_id=SESSION_ID,
+                state=native_attachment.ATTACHED,
+                owner_terminal_id=TERMINAL_ID,
+                owner_generation=GENERATION,
+                owner_execution_mode=em.NATIVE_TUI,
+                owner_pane_id=PANE_ID,
+                owner_process_identity_json=json.dumps(identity, sort_keys=True),
+                intent_json=json.dumps(_sanctioned_intent(), sort_keys=True),
+                release_proof_json=None,
+                adoption_receipt_json=raw,
+                ambiguity_reason=None,
+                epoch=0,
+                created_at="now",
+                updated_at="now",
+            )
+        )
+        db.commit()
+
+
+def test_raw_invalid_json_receipt_is_present_and_reconciles_before_bytes(
+    isolated_memory_db, harness
+):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _insert_exact_with_raw_receipt("{not-json")
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    _assert_zero_byte_reconcile(harness, outcome)
+
+
+def test_json_null_receipt_is_present_and_reconciles_before_bytes(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _insert_exact_with_raw_receipt("null")
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    _assert_zero_byte_reconcile(harness, outcome)
+
+
+def test_list_parsed_receipt_reconciles_before_bytes(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _insert_exact_with_raw_receipt("[1, 2, 3]")
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    _assert_zero_byte_reconcile(harness, outcome)
+
+
+def test_absent_sql_receipt_is_ordinary_and_green(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _insert_exact_attachment("claude_code", SESSION_ID, intent=_sanctioned_intent())
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "repaired"
+    attachment = native_attachment.get("claude_code", SESSION_ID)
+    assert attachment["adoption_receipt_present"] is False
+    assert attachment["adoption_receipt"] is None
+    assert _terminal_row().v2_native_session_id == SESSION_ID
+    assert _current_lineage()["native_session_id"] == SESSION_ID
+
+
+def test_projection_exposes_only_bounded_presence_facts_never_raw_bytes(
+    isolated_memory_db, harness
+):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _insert_exact_with_raw_receipt("{not-json")
+    record = native_attachment.get("claude_code", SESSION_ID)
+    assert record["adoption_receipt"] is None
+    assert record["adoption_receipt_present"] is True
+    assert record["adoption_receipt_readable"] is False
+    assert "{not-json" not in str(record)

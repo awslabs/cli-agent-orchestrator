@@ -1278,8 +1278,16 @@ def _prior_adoption_facts(
 
     receipt = record.get("adoption_receipt")
     if receipt is None:
-        # "No status-repair adoption receipt" means exactly None.  An
-        # exact live owner with no receipt is a partial cond-0377C
+        # "No status-repair adoption receipt" means exactly absent: the raw
+        # column is SQL NULL.  Raw storage that is present but unreadable
+        # (invalid JSON or a JSON null) is a present malformed receipt, not
+        # absence, and reconciles before pane I/O.
+        if record.get("adoption_receipt_present", False):
+            return _reconcile(
+                "the exact-owner attachment carries a present but unreadable adoption "
+                "receipt; it is corrupt/ambiguous"
+            )
+        # An exact live owner with no receipt is a partial cond-0377C
         # operation only when its intent claims a status-repair discovery.
         # Ordinary managed/native launches truthfully carry a validated
         # pre-launch acquisition intent and no adoption receipt: they are

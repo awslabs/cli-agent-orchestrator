@@ -104,6 +104,22 @@ ACQUISITION_METHODS = frozenset(
 )
 
 INTENT_SCHEMA = "cao-native-attachment-intent-v1"
+
+#: The closed top-level shape of a v1 intent, exactly as ``acquire_intent``
+#: produces it.  A stored intent carrying anything else is not the v1 shape
+#: and is refused by :func:`validate_attachment_intent`.
+_INTENT_V1_KEYS = frozenset(
+    {
+        "schema",
+        "acquisition_method",
+        "acquisition_receipt",
+        "admits_only_new_instructions",
+        "replays_task_bytes",
+        "bootstrap_sent_no_turn",
+        "bootstrap_detached_before_launch",
+        "note",
+    }
+)
 NO_SURVIVOR_PROOF_SCHEMA = "cao-native-attachment-no-survivor-v1"
 #: An operator's adjudication of a frozen row.  Deliberately a *different*
 #: schema from the machine-checked no-survivor proof, and stored in the same
@@ -287,9 +303,10 @@ def validate_attachment_intent(intent: Any) -> dict[str, Any]:
     with the same vocabulary, without re-minting it.  This is that check:
     the exact schema, a sanctioned acquisition method, the core
     ``admits_only_new_instructions`` / ``replays_task_bytes`` obligations, a
-    non-empty mapping acquisition receipt, and the required zero-turn
-    bootstrap assertions.  Unknown future intent forms are refused, never
-    silently accepted.
+    non-empty mapping acquisition receipt, the required zero-turn bootstrap
+    assertions, the exact v1 top-level shape (unknown fields and
+    contradictory bootstrap flags are refused), and a well-formed ``note``.
+    Unknown future intent forms are refused, never silently accepted.
     """
     if not isinstance(intent, Mapping) or intent.get("schema") != INTENT_SCHEMA:
         raise NativeAttachmentInvalid(
@@ -315,10 +332,11 @@ def validate_attachment_intent(intent: Any) -> dict[str, Any]:
     receipt = intent.get("acquisition_receipt")
     if not isinstance(receipt, Mapping) or not receipt:
         raise NativeAttachmentInvalid("acquisition_receipt must be a non-empty mapping")
-    if acquisition_method in {
+    is_bootstrap = acquisition_method in {
         ACQUISITION_ACP_BOOTSTRAP,
         ACQUISITION_ZERO_TURN_BOOTSTRAP,
-    }:
+    }
+    if is_bootstrap:
         if (
             intent.get("bootstrap_sent_no_turn") is not True
             or intent.get("bootstrap_detached_before_launch") is not True
@@ -327,6 +345,20 @@ def validate_attachment_intent(intent: Any) -> dict[str, Any]:
                 "a zero-turn bootstrap intent must assert bootstrap_sent_no_turn=True and "
                 "bootstrap_detached_before_launch=True"
             )
+    elif "bootstrap_sent_no_turn" in intent or "bootstrap_detached_before_launch" in intent:
+        raise NativeAttachmentInvalid(
+            f"bootstrap assertions are meaningless for {acquisition_method!r} and are refused "
+            "rather than recorded as unverified evidence"
+        )
+    note = intent.get("note")
+    if note is not None and (not isinstance(note, str) or not note):
+        raise NativeAttachmentInvalid("intent note, when present, must be a non-empty string")
+    unknown = sorted(set(intent) - _INTENT_V1_KEYS)
+    if unknown:
+        raise NativeAttachmentInvalid(
+            f"intent carries unknown top-level key(s) {unknown}; the {INTENT_SCHEMA!r} "
+            "shape is closed"
+        )
     return dict(intent)
 
 
@@ -372,6 +404,7 @@ def no_survivor_proof(
 
 
 def _row_dict(row: Any) -> dict[str, Any]:
+    adoption_receipt = _parse_json(row.adoption_receipt_json)
     return {
         "provider": row.provider,
         "native_session_id": row.native_session_id,
@@ -385,7 +418,14 @@ def _row_dict(row: Any) -> dict[str, Any]:
         },
         "intent": _parse_json(row.intent_json),
         "release_proof": _parse_json(row.release_proof_json),
-        "adoption_receipt": _parse_json(row.adoption_receipt_json),
+        "adoption_receipt": adoption_receipt,
+        # Raw presence/readability facts for the status-repair receipt
+        # boundary.  ``_parse_json`` collapses SQL NULL and invalid JSON to
+        # None, so a reader that needs "no receipt at all" vs "a present but
+        # unreadable/malformed receipt" must consult the raw column.  Only
+        # these bounded booleans are exposed — never the raw bytes.
+        "adoption_receipt_present": row.adoption_receipt_json is not None,
+        "adoption_receipt_readable": adoption_receipt is not None,
         "ambiguity_reason": row.ambiguity_reason,
         "epoch": row.epoch,
         "created_at": row.created_at,
