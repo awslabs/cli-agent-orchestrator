@@ -13,10 +13,15 @@ the loss.
 The design document's own provider table says ``claude``, ``codex``,
 ``kimi``, ``muse`` and ``glm`` are resumable. Against the code:
 
-- **muse has no resume path at all.** ``muse_native_launch`` defines
-  ``build_launch_argv`` and no ``build_resume_argv``, and the native argv
-  binder ignores ``launch_kind`` entirely — "both launch and recovery
-  therefore re-run the exec command bound to the minted session id".
+- **muse's resume argv exists and is exact — as restoration only.** The
+  fresh managed-v2 launch starts a no-prompt TUI and *discovers* the
+  provider-generated id from ``/status`` (verified on the installed
+  0.1.0-R708.1 build); ``muse resume <id>`` is the restoration form that
+  re-opens a preserved provider-generated id, never a caller-chosen
+  creation.  What muse still lacks is the *machinery* on top: like every
+  provider, the CAO resume route refuses on every branch and no production
+  path re-launches a pane from a recorded id yet, so a muse worker is
+  still structurally one-way until the resume machinery lands.
 - **``glm`` is not a provider.** It is ``claude_code`` carrying
   ``provider_route="glm"``, and its route envelope holds a *one-shot*
   consumed marker, so a GLM resume is a Claude resume plus a re-minted
@@ -95,7 +100,12 @@ def _supported_providers() -> frozenset[str]:
 #: versions under its own shorter names. They are not the same strings and
 #: nothing translates between them, so a check written against the wrong
 #: vocabulary silently passes for every provider.
-_CONTRACT_NAME = {"codex": "codex", "claude_code": "claude", "kimi_cli": "kimi"}
+_CONTRACT_NAME = {
+    "codex": "codex",
+    "claude_code": "claude",
+    "kimi_cli": "kimi",
+    "muse_cli": "muse",
+}
 
 
 def _version_is_pinned(provider: str, installed_version: Optional[str]) -> tuple[bool, str]:

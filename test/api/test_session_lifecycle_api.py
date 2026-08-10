@@ -275,7 +275,11 @@ class TestStopImpactIsComputed:
         assert payload["one_way_for_every_worker"] is True
         assert payload["resume_machinery_available"] is False
         reasons = {v["provider"]: v["reason"] for v in payload["not_resumable"]}
-        assert reasons["muse_cli"] == "provider-has-no-resume-path"
+        # Since cond-0377B muse_cli has a native launch path and an exact
+        # resume argv (`muse resume <id>`), so like Claude it is
+        # structurally resumable; this particular row never recorded a
+        # session id, which is the honest reason it is a one-way door.
+        assert reasons["muse_cli"] == "no-recorded-native-session-id"
         assert reasons["claude_code"] == "no-recorded-native-session-id"
         # Not "drifted": nothing supplied a version, so nobody checked. An
         # operator who "fixed" a drift that was never measured would find

@@ -20,14 +20,23 @@ Status detection: the ``⟩`` prompt stays rendered through a whole turn, so the
 in-flight signal is the spinner text ("esc to interrupt"); otherwise the bare
 ``⟩`` prompt means ready (IDLE before a task, COMPLETED after one).
 
-Known first-version limitations (iterate in a live CAO session):
-  * The profile's system-prompt body is not yet injected into the worker; the
-    worker relies on CAO's initial message + policy guidelines. Muse Code does
-    not expose a kimi-style ``--agent-file``; wiring ``--agents <JSON>`` or a
-    workspace skill is the follow-up.
-  * ``--yolo`` is used for every posture; the reviewer's declared read-only
-    tools are enforced by prompt only (no SECURITY_PROMPT injection yet), so
-    keep review tasks read-only by instruction.
+Profile material: since cond-0377B the managed-v2 native launch composes
+the CAO profile system prompt into the session as base instructions through
+the installed ``TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE`` env surface (see
+``muse_native_launch.PROFILE_SYSTEM_PROMPT_ENV`` and its deterministic
+echo-refusal proof).  The ``--agents <JSON>`` overlay was read on the
+installed 0.1.0-R708.1 build and does NOT compose into the main session
+agent — it registers session agent definitions for the workflow/subagent
+``agentType`` path only — so the managed launch never relies on it for the
+CAO role/profile.  The reviewer's declared read-only tools are enforced by
+prompt + policy only (no SECURITY_PROMPT injection into the model), so keep
+review tasks read-only by instruction.
+
+Identity: a fresh managed launch starts a no-prompt TUI (``muse
+--trust-workspace ... --model <id>``) and *discovers* the provider-generated
+session id from the provider's own ``/status`` panel at zero turns;
+``muse resume <id>`` is the restoration form for a later reincarnation and
+never a caller-chosen creation.
 """
 
 from __future__ import annotations
@@ -146,6 +155,18 @@ class MuseCliProvider(BaseProvider):
 
         self._initialized = True
         return True
+
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        """Detect Muse Code's state from the rendered screen rows.
+
+        Mirrors the Kimi observer contract: the native pane turn-state
+        observers delegate to the provider's own detector so there is
+        exactly one description of what a Muse screen means.  A fresh
+        instance is used (the v2 pane has no shell baseline), so the
+        shell-revert check is skipped and the ``⟩`` composer line decides
+        idle.
+        """
+        return self.get_status("\n".join(screen_lines))
 
     def get_status(self, output: str) -> TerminalStatus:
         """Detect Muse Code's state from the tmux capture buffer.

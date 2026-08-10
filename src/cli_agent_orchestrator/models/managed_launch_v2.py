@@ -40,7 +40,7 @@ class ManagedLaunchV2ReserveRequest(BaseModel):
     # is only the executable name and never appears here — the two are
     # kept apart deliberately, because a surface that accepted both would
     # make "which provider is this?" answerable two ways.
-    provider: Literal["codex", "kimi_cli", "claude_code"]
+    provider: Literal["codex", "kimi_cli", "claude_code", "muse_cli"]
     agent_profile: str
     caller_id: str
     working_directory: str

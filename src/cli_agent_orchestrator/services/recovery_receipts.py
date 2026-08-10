@@ -39,12 +39,13 @@ from cli_agent_orchestrator.services.canonical_json import (
 RECEIPT_DOMAIN = "cao-receipt-v1"
 SEGMENT_DOMAIN = "cao-route-segment-v1"
 
-PROVIDERS = ("codex", "claude", "kimi")
+PROVIDERS = ("codex", "claude", "kimi", "muse")
 ISSUANCE_SOURCES = (
     "app_server_thread_start",
     "acp_session_new",
     "cli_session_id",
     "trusted_hook",
+    "provider_status_discovered",
 )
 RECEIPT_KINDS = (
     "creation",

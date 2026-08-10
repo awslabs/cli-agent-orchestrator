@@ -1,10 +1,10 @@
 """Unit tests for the Muse native launch argv + identity binding.
 
-Muse Code 0.1.0's accepted interactive lifecycle resumes a caller-chosen
-session id through the TUI: ``muse resume <id>`` (verified on the installed
-0.1.0-R708.1 build).  The native identity is chosen (an input), like
-Claude's, and the argv is ``muse resume <id>`` — never the superseded
-one-shot ``muse exec --session-id`` form.
+The fresh managed launch is a no-prompt TUI (``muse <route args>``) with no
+identity form; the provider generates the session id and the managed launch
+discovers it from ``/status``.  ``muse resume <id>`` is retained strictly as
+the restoration form for a later reincarnation slice and accepts a known,
+preserved id — never a freshly chosen one.
 """
 
 import pytest
@@ -14,7 +14,9 @@ from cli_agent_orchestrator.services import native_tui_launch, provider_contract
 
 
 def _uuid() -> str:
-    return mnl.mint_session_id()
+    import uuid
+
+    return str(uuid.uuid4())
 
 
 class TestBuildResumeArgv:
@@ -96,11 +98,13 @@ class TestTuiBinderRegistration:
         assert binder["binds_exactly"](argv, sid)
 
     def test_binder_refuses_new_launch_kind(self):
-        # Muse has no interactive NEW launch kind: the id is minted first
-        # and the TUI always resumes it.
+        # The resume binder is the restoration path only; a fresh launch
+        # goes through the no-identity discovery launch, never this binder.
         sid = _uuid()
         binder = native_tui_launch._ARGV_BINDERS["muse_cli"]
-        with pytest.raises(native_tui_launch.NativeLaunchInvalid, match="resume the exact id"):
+        with pytest.raises(
+            native_tui_launch.NativeLaunchInvalid, match="discovered from the provider"
+        ):
             binder["build"](
                 session_id=sid,
                 binary="muse",

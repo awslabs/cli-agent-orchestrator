@@ -1110,7 +1110,7 @@ def test_only_providers_with_a_native_branch_may_launch_native():
     not fall back: the mode gate above would pass it, so the provider
     gate is the one that catches it.
     """
-    assert v2.NATIVE_TUI_PROVIDERS == frozenset({"codex", "kimi_cli", "claude_code"})
+    assert v2.NATIVE_TUI_PROVIDERS == frozenset({"codex", "kimi_cli", "claude_code", "muse_cli"})
     # The set is *derived* from the adapters that exist, not written out
     # by hand, so a provider cannot be advertised as native-launchable
     # while one of the three surfaces it needs is missing. Asserted as an

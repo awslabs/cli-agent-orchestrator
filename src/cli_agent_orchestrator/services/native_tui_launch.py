@@ -13,28 +13,42 @@ not: everything here either changes durable ownership or starts a
 process, and the ordering between those two is the whole point.
 
 The binder is chosen by canonical provider rather than hardcoded, because
-the two supported providers acquire their identity in opposite
-directions. Kimi's session is minted by a separate ACP process and the
-TUI *resumes* it, so a Kimi launch is always a resume. Claude's identity
-is a uuid chosen before any provider I/O and handed to the TUI as
-``--session-id``, so a first Claude launch *starts* the session and only
-a recovery resumes it. That is why :func:`start` takes ``launch_kind``:
-the difference is not a detail of argv formatting, it is which of the two
-things is happening, and a caller that gets it wrong must be refused
-rather than quietly given the other form.
+the supported providers acquire their identity in different directions.
+Kimi's session is minted by a separate ACP process and the TUI *resumes*
+it, so a Kimi launch is always a resume. Codex's session is minted by a
+zero-turn app-server bootstrap and the TUI resumes it, so a Codex launch is
+also a resume. Claude's identity is a uuid chosen before any provider I/O
+and handed to the TUI as ``--session-id``, so a first Claude launch
+*starts* the session and only a recovery resumes it. Muse's fresh identity
+is *discovered*: a fresh no-prompt TUI generates the session id itself and
+the managed launch reads it back from the provider's own ``/status`` panel
+at zero turns, then claims the attachment for that id (see
+:func:`start_discovered`); ``muse resume <id>`` remains only as the
+restoration form for a later reincarnation. That is why :func:`start`
+takes ``launch_kind``: the difference is not a detail of argv formatting,
+it is which of the two things is happening, and a caller that gets it
+wrong must be refused rather than quietly given the other form.
 
 Three orderings are load-bearing, and each exists because of a specific
 way a native launch corrupts a live provider session:
 
-**Ownership is claimed before the process starts.**  A launch that
-started the TUI first and recorded ownership afterwards would have a
-window in which a running process holds a provider session that no
-durable record names.  A second launcher reading the store in that window
-sees the session as free and attaches to it, and neither side can
-subsequently tell that the transcript it is reading contains another
-controller's turns.  So :func:`native_attachment.declare` and
-:func:`native_attachment.mark_starting` are both crossed before the
-first byte of process creation.
+**Ownership is claimed before the process starts** — except for a
+provider that generates its own session id, where the pane must run first
+for the id to exist.  A launch that started the TUI first and recorded
+ownership afterwards would have a window in which a running process holds
+a provider session that no durable record names.  A second launcher
+reading the store in that window sees the session as free and attaches to
+it, and neither side can subsequently tell that the transcript it is
+reading contains another controller's turns.  So
+:func:`native_attachment.declare` and :func:`native_attachment.mark_starting`
+are both crossed before the first byte of process creation for every
+provider whose id is known in advance (Claude, Kimi, Codex).  Muse is the
+one exception: :func:`start_discovered` starts the fresh no-prompt TUI,
+reads the provider-generated id from its own status panel, and only then
+claims ownership for that exact id — the pre-claim window is fenced so
+nothing but the internal status observation reaches the pane, and a
+failure there attempts the exact pane teardown and surfaces any cleanup
+failure rather than silently claiming the session is gone.
 
 **The pane is proven to be running the session we claimed.**  The
 installed Kimi resume option takes an *optional* argument: given no id it
@@ -75,7 +89,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Mapping, NoReturn, Optional, Protocol, Sequence
+from typing import Any, Callable, Mapping, NoReturn, Optional, Protocol, Sequence
 
 from cli_agent_orchestrator.services import (
     claude_native_launch,
@@ -146,7 +160,14 @@ OUTCOMES = frozenset({OUTCOME_LAUNCHED, OUTCOME_ALREADY_ATTACHED, OUTCOME_RECONC
 #: reaching publication fails closed rather than silently behaving like argv.
 SESSION_PROOF_ARGV = "argv"
 SESSION_PROOF_KIMI_RENDERED = kimi_native_launch.RULE_KIMI_NATIVE_HEADER
-SESSION_PROOFS = frozenset({SESSION_PROOF_ARGV, SESSION_PROOF_KIMI_RENDERED})
+#: The provider's own status panel named the session on a fresh launch that
+#: generated the id itself (Muse).  The fresh argv carries no identity, so
+#: the argv can prove nothing about *which* session; the provider's own
+#: zero-turn statement is the proof that stands in its place.
+SESSION_PROOF_STATUS_DISCOVERED = "provider_status_discovered"
+SESSION_PROOFS = frozenset(
+    {SESSION_PROOF_ARGV, SESSION_PROOF_KIMI_RENDERED, SESSION_PROOF_STATUS_DISCOVERED}
+)
 
 #: Freeze reasons.  Each names the exact boundary that was crossed with
 #: an unknown result, because "ambiguous" alone tells a later reconciler
@@ -204,6 +225,29 @@ class NativeLaunchUnavailable(NativeLaunchError):
     """A dependency this module needs could not be reached."""
 
     code = "native-tui-launch-unavailable"
+
+
+class NativeLaunchDiscoverFailed(NativeLaunchError):
+    """A fresh launch failed before its session could be durably attached.
+
+    The pane may or may not exist; ``discovered_session_id`` carries the
+    provider id read from the status panel when one was seen (so the caller
+    can freeze the attachment if it was ever declared), and ``None`` when
+    the id was never discovered.  The caller is responsible for tearing the
+    exact pane down so no untracked provider session is orphaned.
+    """
+
+    code = "native-tui-launch-discover-failed"
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        discovered_session_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.discovered_session_id = discovered_session_id
 
 
 class NativePaneTransport(Protocol):
@@ -450,9 +494,9 @@ def _verify_argv_resumes_session(
             reason=AMBIGUOUS_ARGV_MISMATCH,
             detail=(
                 f"the pane's primary process does not bind exactly {native_session_id!r}; "
-                "on both supported providers a resume that lost its id opens an "
-                "interactive picker rather than failing, so the running session may be "
-                "a different one"
+                "on the picker-backed resume forms (Claude, Kimi, and Muse) a resume that "
+                "lost its id opens an interactive picker rather than failing, so the "
+                "running session may be a different one"
             ),
         )
 
@@ -1070,15 +1114,15 @@ def _claude_argv(
 def _muse_argv(
     *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
 ) -> list[str]:
-    # Muse's accepted interactive lifecycle resumes a caller-chosen id:
-    # ``muse resume <id>`` starts the multi-turn TUI bound to that exact id
-    # (verified on the installed 0.1.0-R708.1 build).  There is no NEW
-    # interactive launch kind — the id is minted before any provider I/O and
-    # the TUI always resumes it.
+    # The resume binder is the RESTORATION form only: ``muse resume <id>``
+    # re-opens an exact preserved provider-generated id.  A fresh launch
+    # carries no identity and goes through ``start_discovered``, never this
+    # binder — there is no caller-chosen NEW interactive launch kind.
     if launch_kind != LAUNCH_KIND_RESUME:
         raise NativeLaunchInvalid(
-            "Muse native sessions are minted by a caller-chosen session id; "
-            f"the TUI must resume the exact id, got launch_kind {launch_kind!r}"
+            "Muse fresh sessions are discovered from the provider's /status "
+            "panel, not resumed; the resume binder re-opens a preserved id, "
+            f"got launch_kind {launch_kind!r}"
         )
     try:
         return muse_native_launch.build_resume_argv(
@@ -1379,6 +1423,311 @@ def start(
         session_proof=session_proof,
         **common,
     )
+
+
+def _observe_fresh(transport: NativePaneTransport) -> dict[str, Any]:
+    """Observe the pane without touching an attachment (none exists yet).
+
+    The fresh-discovered launch has no attachment before the id is known,
+    so the usual ``_observe`` freeze cannot apply — there is nothing to
+    freeze.  Absence and unreadability still raise typed ambiguity so the
+    caller tears the pane down rather than guessing.
+    """
+    try:
+        raw = transport.observe()
+    except Exception as exc:  # noqa: BLE001 - an unreadable pane is never "no pane"
+        raise NativeLaunchAmbiguous(
+            AMBIGUOUS_PANE_UNREADABLE,
+            f"the fresh pane could not be observed at all: {exc}",
+        ) from exc
+    if raw is None:
+        raise NativeLaunchAmbiguous(
+            AMBIGUOUS_PANE_ABSENT_AFTER_CREATE,
+            "the fresh pane is provably absent, which cannot distinguish a process that "
+            "never started from one that started and exited",
+        )
+    try:
+        return _validated_observation(raw)
+    except NativeLaunchInvalid as exc:
+        raise NativeLaunchAmbiguous(
+            AMBIGUOUS_PANE_UNREADABLE, f"the fresh pane observation was incomplete: {exc}"
+        ) from exc
+
+
+def start_discovered(
+    *,
+    provider: str,
+    terminal_id: str,
+    generation: str,
+    execution_mode: str,
+    binary: str,
+    binary_sha256: str,
+    working_directory: str,
+    fresh_argv: Sequence[str],
+    transport: NativePaneTransport,
+    discover_session: Callable[[str], tuple[str, Mapping[str, Any]]],
+    build_intent: Callable[[str], Mapping[str, Any]],
+    teardown: Callable[[Optional[str]], Optional[str]],
+    is_fresh_launch_argv: Callable[[Sequence[str]], bool],
+    expected_inner_executable: Optional[str] = None,
+    provider_version: Optional[str] = None,
+) -> dict[str, Any]:
+    """Start a provider pane whose session id is only knowable from its screen.
+
+    The fresh launch (Muse) carries no identity in its argv: the provider
+    generates the session id itself, and the managed launch types the
+    provider's own status command once to *discover* it at zero turns.
+    Because the id cannot be claimed before the pane exists, the ordering
+    is reversed from :func:`start`: create the pane, discover the id from
+    the provider's own screen, then declare/attach for that exact id, prove
+    the pane is still the same process, and publish.
+
+    The pre-claim window is deliberately fenced: nothing is typed into the
+    pane except the internal status observation inside ``discover_session``
+    (no task/control bytes), and every failure between pane creation and
+    publication calls ``teardown(discovered_id_or_None)`` — the caller
+    kills the exact pane — before raising, so a fresh launch never orphans
+    an untracked provider session.
+
+    Returns the same shape as :func:`start`, plus the discovery's status
+    observation under ``status_observation``.
+    """
+    provider = _require_text(provider, field="provider")
+    terminal_id = _require_text(terminal_id, field="terminal_id")
+    generation = _require_text(generation, field="generation")
+
+    try:
+        mode = em.validate_mode(execution_mode)
+    except em.ExecutionModeError as exc:
+        raise NativeLaunchInvalid(str(exc)) from exc
+    if mode != em.NATIVE_TUI:
+        raise NativeLaunchInvalid(
+            f"the native TUI launch branch refuses execution_mode {mode!r}; the two modes "
+            "are separate launch branches and never fall back to one another"
+        )
+
+    binary = _validate_binary(binary, binary_sha256)
+    working_directory = _validate_working_directory(working_directory)
+    if not is_fresh_launch_argv(fresh_argv):
+        raise NativeLaunchInvalid(
+            "a fresh-discovered launch argv must carry no identity/resume form, no "
+            "recency selector, and no positional prompt"
+        )
+
+    discovered_session_id: Optional[str] = None
+    try:
+        handle = transport.create_pane(argv=list(fresh_argv))
+    except Exception as exc:  # noqa: BLE001 - a failed create may still have created
+        cleanup_error = _run_teardown(teardown, None)
+        detail = (
+            f"fresh pane creation raised, so whether a provider process exists is "
+            f"unknown: {exc}"
+        )
+        if cleanup_error:
+            # The teardown itself failed: a live orphan may remain, and that
+            # is never reported as success.
+            detail = f"{detail}; cleanup: {cleanup_error}"
+        else:
+            detail = f"{detail}; the pane was torn down"
+        raise NativeLaunchAmbiguous(AMBIGUOUS_PANE_CREATE, detail) from exc
+    if not isinstance(handle, str) or not handle:
+        cleanup_error = _run_teardown(teardown, None)
+        detail = f"fresh pane creation returned no usable handle ({handle!r})"
+        if cleanup_error:
+            detail = f"{detail}; cleanup: {cleanup_error}"
+        else:
+            detail = f"{detail}; torn down"
+        raise NativeLaunchAmbiguous(AMBIGUOUS_PANE_CREATE, detail)
+
+    # Every failure from here on — discovery, intent construction, the
+    # attachment claim, the fence, and publication — tears the exact pane
+    # down exactly once (with the discovered id when one was read) and
+    # re-raises the original typed cause with any cleanup failure detail
+    # attached.  There is no path past ``create_pane`` that lets an
+    # exception escape with the pane still live.
+    try:
+        observation = _observe_fresh(transport)
+        discovered_session_id, status_observation = discover_session(observation["pane_id"])
+        if not isinstance(discovered_session_id, str) or not discovered_session_id:
+            raise NativeLaunchDiscoverFailed(
+                "the provider's status observation returned no session id",
+                discovered_session_id=discovered_session_id,
+            )
+        intent = build_intent(discovered_session_id)
+        try:
+            record, acquired = native_attachment.declare(
+                provider=provider,
+                native_session_id=discovered_session_id,
+                terminal_id=terminal_id,
+                generation=generation,
+                execution_mode=em.NATIVE_TUI,
+                intent=intent,
+                pane_id=observation["pane_id"],
+            )
+        except native_attachment.NativeAttachmentInvalid as exc:
+            raise NativeLaunchInvalid(str(exc)) from exc
+        except native_attachment.NativeAttachmentConflict as exc:
+            raise NativeLaunchConflict(str(exc)) from exc
+        except native_attachment.NativeAttachmentError as exc:
+            raise NativeLaunchUnavailable(str(exc)) from exc
+        _assert_fresh_discovery_claim(record, acquired, provider, discovered_session_id)
+
+        native_attachment.mark_starting(
+            provider=provider,
+            native_session_id=discovered_session_id,
+            terminal_id=terminal_id,
+            generation=generation,
+            execution_mode=em.NATIVE_TUI,
+            pane_id=observation["pane_id"],
+        )
+
+        # Fence the discovery: the status was read from an observation
+        # taken just after the pane was created.  Re-observe and require
+        # the same process before publishing, so the attachment records
+        # the live process and not a stale one that was replaced
+        # mid-discovery.
+        fenced = _observe_fresh(transport)
+        fenced_identity = (fenced["pane_id"], fenced["pid"], fenced["start_marker"])
+        initial_identity = (
+            observation["pane_id"],
+            observation["pid"],
+            observation["start_marker"],
+        )
+        if fenced_identity != initial_identity:
+            raise NativeLaunchDiscoverFailed(
+                "the pane process identity changed between the /status discovery and "
+                f"the attachment fence: expected {initial_identity}, observed "
+                f"{fenced_identity}",
+                discovered_session_id=discovered_session_id,
+            )
+        _verify_pane_cwd(
+            provider=provider,
+            native_session_id=discovered_session_id,
+            working_directory=working_directory,
+            observation=fenced,
+        )
+        if not is_fresh_launch_argv(fenced["argv"]):
+            raise NativeLaunchDiscoverFailed(
+                "the fresh pane's argv changed away from the no-identity launch form; "
+                "refusing to attach a pane that no longer runs the fresh TUI",
+                discovered_session_id=discovered_session_id,
+            )
+        if expected_inner_executable is not None:
+            observed_executable = fenced["argv"][0] if fenced["argv"] else ""
+            if os.path.realpath(observed_executable) != expected_inner_executable:
+                raise NativeLaunchDiscoverFailed(
+                    f"the pane process image {observed_executable!r} is not the declared "
+                    f"inner executable {expected_inner_executable!r}",
+                    discovered_session_id=discovered_session_id,
+                )
+        attachment = native_attachment.mark_attached(
+            provider=provider,
+            native_session_id=discovered_session_id,
+            terminal_id=terminal_id,
+            generation=generation,
+            execution_mode=em.NATIVE_TUI,
+            process_identity=native_attachment.process_identity(
+                pid=fenced["pid"], start_marker=fenced["start_marker"]
+            ),
+            pane_id=fenced["pane_id"],
+        )
+    except Exception as exc:  # noqa: BLE001 - teardown once, then re-raise typed
+        _teardown_and_reraise(exc, teardown=teardown, discovered_session_id=discovered_session_id)
+
+    return dict(
+        _result(
+            outcome=OUTCOME_LAUNCHED,
+            provider=provider,
+            native_session_id=discovered_session_id,
+            terminal_id=terminal_id,
+            generation=generation,
+            binary=binary,
+            binary_sha256=binary_sha256,
+            argv=list(fresh_argv),
+            pane_handle=handle,
+            observation=fenced,
+            attachment=attachment,
+            session_proof=SESSION_PROOF_STATUS_DISCOVERED,
+        ),
+        status_observation=status_observation,
+    )
+
+
+def _run_teardown(
+    teardown: Callable[[Optional[str]], Optional[str]],
+    discovered_session_id: Optional[str],
+) -> Optional[str]:
+    """Run the exact teardown once; return any cleanup failure detail.
+
+    ``discovered_session_id`` is ``None`` before the id was read, in which
+    case there is no attachment to freeze and a ``NotFound`` freeze is
+    expected, not a cleanup failure.
+    """
+    try:
+        return teardown(discovered_session_id)
+    except Exception as exc:  # noqa: BLE001 - teardown must not mask the cause
+        return f"teardown raised: {exc}"
+
+
+def _teardown_and_reraise(
+    exc: Exception,
+    *,
+    teardown: Callable[[Optional[str]], Optional[str]],
+    discovered_session_id: Optional[str],
+) -> NoReturn:
+    """Tear the exact pane down once, then re-raise the original typed cause.
+
+    Cleanup is best-effort but never silent: a cleanup failure is appended
+    to the raised error, so a caller (and the durable preflight detail) can
+    see that a live orphan may exist.  ``exc`` is preserved as the
+    ``__cause__`` of the re-raised same-type error.
+    """
+    cleanup_error = _run_teardown(teardown, discovered_session_id)
+    detail = str(exc)
+    if cleanup_error:
+        detail = f"{detail}; cleanup: {cleanup_error}"
+    raise _same_type(exc, detail) from exc
+
+
+def _same_type(exc: Exception, detail: str) -> Exception:
+    """A new exception of the same typed class carrying ``detail``.
+
+    The typed class is preserved so a caller can branch on it, while the
+    message carries the original detail plus any cleanup failure.
+    """
+    if isinstance(exc, NativeLaunchDiscoverFailed):
+        return NativeLaunchDiscoverFailed(detail, discovered_session_id=exc.discovered_session_id)
+    if isinstance(exc, NativeLaunchAmbiguous):
+        return NativeLaunchAmbiguous(exc.reason, detail)
+    cls = type(exc)
+    try:
+        return cls(detail)
+    except Exception:  # noqa: BLE001 - never fall back to a bare re-raise
+        return NativeLaunchDiscoverFailed(detail, discovered_session_id=None)
+
+
+def _assert_fresh_discovery_claim(
+    record: Mapping[str, Any],
+    acquired: bool,
+    provider: str,
+    native_session_id: str,
+) -> None:
+    """A fresh provider-generated id must be newly claimed by this launch.
+
+    The outer ``claim_launch`` is at-most-once and cross-process crash
+    recovery is not implemented in this slice, so an existing
+    DECLARED/STARTING/ATTACHED/DRAINING or frozen row under the discovered
+    id is a collision, never an adoption: the fresh path refuses rather
+    than overwrite or adopt another owner (or a prior incarnation) on id
+    equality alone.  The newly observed pane is torn down by the caller.
+    """
+    if not acquired:
+        raise NativeLaunchConflict(
+            f"{provider} session {native_session_id} already has an attachment "
+            f"({record['state']!r}); a fresh discovery never adopts an existing row "
+            "(cross-process crash recovery is a later slice), so the newly observed "
+            "pane is torn down and no ownership is claimed"
+        )
 
 
 class TmuxNativePane:
