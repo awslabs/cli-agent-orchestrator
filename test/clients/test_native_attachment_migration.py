@@ -81,6 +81,9 @@ def test_migrated_ddl_matches_the_orm_model(legacy_db, tmp_path):
     from sqlalchemy import create_engine
 
     database._migrate_native_session_attachments()
+    # The status-repair column is a later additive migration (cond-0377C);
+    # both paths together must yield the ORM schema.
+    database._migrate_native_status_repair()
 
     fresh = tmp_path / "fresh.db"
     engine = create_engine(f"sqlite:///{fresh}")
@@ -91,9 +94,29 @@ def test_migrated_ddl_matches_the_orm_model(legacy_db, tmp_path):
     assert _primary_key(legacy_db) == _primary_key(fresh)
 
 
+def test_repair_migration_adds_the_column_and_the_evidence_table(legacy_db):
+    """The cond-0377C surfaces reach a database that predates them."""
+    database._migrate_native_session_attachments()
+    database._migrate_native_status_repair()
+    with sqlite3.connect(str(legacy_db)) as conn:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({TABLE})")}
+        assert "adoption_receipt_json" in columns
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "native_status_repair_evidence" in tables
+    # Idempotent: a second pass changes nothing.
+    database._migrate_native_status_repair()
+    with sqlite3.connect(str(legacy_db)) as conn:
+        assert "adoption_receipt_json" in {
+            row[1] for row in conn.execute(f"PRAGMA table_info({TABLE})")
+        }
+
+
 def test_init_db_applies_the_migration():
     """The migration is unreachable unless init_db actually calls it."""
     import inspect
 
     source = inspect.getsource(database.init_db)
     assert "_migrate_native_session_attachments()" in source
+    assert "_migrate_native_status_repair()" in source

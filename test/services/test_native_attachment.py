@@ -173,6 +173,98 @@ class TestIntentObligations:
             _declare(intent={"acquisition_method": na.ACQUISITION_RESUME})
 
 
+class TestValidateStoredIntent:
+    """The closed stored-intent validator mirrors acquire_intent so a reader
+    (the status-repair ordinary-owner boundary) can trust a stored intent
+    without re-minting it.  Unknown future forms are refused, never silently
+    accepted."""
+
+    def test_a_built_intent_validates(self):
+        for method in (
+            na.ACQUISITION_CHOSEN_SESSION_ID,
+            na.ACQUISITION_RESUME,
+            na.ACQUISITION_ACP_BOOTSTRAP,
+        ):
+            validated = na.validate_attachment_intent(_intent(method))
+            assert validated["acquisition_method"] == method
+
+    def test_missing_or_non_mapping_intent_refused(self):
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(None)
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent("not-a-mapping")
+
+    def test_wrong_schema_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["schema"] = "wrong"
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+    def test_unknown_acquisition_method_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["acquisition_method"] = "unknown-future-method"
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+    def test_broken_core_assertions_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["replays_task_bytes"] = True
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["admits_only_new_instructions"] = False
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+    def test_missing_acquisition_receipt_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        del intent["acquisition_receipt"]
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+    def test_zero_turn_bootstrap_assertions_required(self):
+        intent = _intent(na.ACQUISITION_ACP_BOOTSTRAP)
+        del intent["bootstrap_detached_before_launch"]
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+    def test_every_builder_produced_intent_validates(self):
+        for method in sorted(na.ACQUISITION_METHODS):
+            kwargs = {
+                "acquisition_method": method,
+                "acquisition_receipt": {"kind": "kimi-session-resume", "session_id": SESSION},
+                "admits_only_new_instructions": True,
+                "replays_task_bytes": False,
+                "note": "a note",
+            }
+            if method in {na.ACQUISITION_ACP_BOOTSTRAP, na.ACQUISITION_ZERO_TURN_BOOTSTRAP}:
+                kwargs["bootstrap_sent_no_turn"] = True
+                kwargs["bootstrap_detached_before_launch"] = True
+            intent = na.acquire_intent(**kwargs)
+            assert na.validate_attachment_intent(intent)["acquisition_method"] == method
+
+    def test_non_bootstrap_method_with_bootstrap_flags_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["bootstrap_sent_no_turn"] = True
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+    def test_malformed_note_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["note"] = ""
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+        intent["note"] = 42
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+    def test_unknown_top_level_v1_key_refused(self):
+        intent = _intent(na.ACQUISITION_RESUME)
+        intent["future_unknown_field"] = "x"
+        with pytest.raises(na.NativeAttachmentInvalid):
+            na.validate_attachment_intent(intent)
+
+
 class TestIntentPrecedesProviderLaunch:
     def test_declare_persists_the_claim_before_any_process_exists(self):
         record, acquired = _declare()

@@ -20,6 +20,8 @@ import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -27,6 +29,7 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_WRITE,
     require_any_scope,
 )
+from cli_agent_orchestrator.services import native_status_repair
 from cli_agent_orchestrator.services import stable_agent_roster as roster
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["roster"])
 
 _READ = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN))
+_WRITE = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN))
 
 _STATUS_FOR_CODE = {
     "stable-agent-invalid": status.HTTP_400_BAD_REQUEST,
@@ -130,3 +134,113 @@ async def roster_audit_dry_run(_: Any = _READ) -> dict[str, Any]:
         return await asyncio.to_thread(_audit)
     except roster.StableAgentError as exc:
         raise _http(exc) from exc
+
+
+class NativeIdentityRepairBody(BaseModel):
+    """The immutable repair request: an explicit operation id, and the
+    expected incarnation and build the caller believes the terminal runs.
+
+    ``generation`` is the *expected model generation* — required for
+    managed/v2 terminals, and refused for legacy rows (whose physical
+    occurrence is the callback-target generation).  ``provider_version``
+    is caller/provider metadata that selects the pre-status interaction
+    plan only; the panel-attested build is what gets recorded, so a legacy
+    row with no durable version metadata may omit it.
+    """
+
+    operation_id: str = Field(
+        min_length=1,
+        description="Explicit canonical UUID for crash/retry truth; an exact "
+        "retry with the same id adopts the recorded evidence",
+    )
+    generation: Optional[str] = Field(
+        default=None,
+        description="Expected model generation of a managed terminal; omit for legacy rows",
+    )
+    provider_version: Optional[str] = Field(
+        default=None,
+        description=(
+            "Installed provider build (a banner or a bare semver) that selects the "
+            "interaction plan; the panel-attested build is what is recorded"
+        ),
+    )
+    physical_occurrence: Optional[str] = Field(
+        default=None,
+        description=(
+            "The durable physical identity of the terminal (its callback-target "
+            "generation for a legacy row, or its model generation for a managed "
+            "row). Required for legacy rows and bound into the operation identity."
+        ),
+    )
+
+
+#: HTTP mapping for the repair's typed refusal reasons.  Everything not
+#: listed defaults to 409 (a conflict the caller may not silently retry
+#: against different state); transient persistence failures are 503.
+_REPAIR_REFUSED_HTTP: dict[str, int] = {
+    "invalid-input": status.HTTP_400_BAD_REQUEST,
+    "provider-unsupported": status.HTTP_400_BAD_REQUEST,
+    "unsupported-build": status.HTTP_400_BAD_REQUEST,
+    "generation-required": status.HTTP_400_BAD_REQUEST,
+    "physical-occurrence-required": status.HTTP_400_BAD_REQUEST,
+    "version-drift": status.HTTP_409_CONFLICT,
+    "binding-unreadable": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "terminal-not-found": status.HTTP_404_NOT_FOUND,
+    "no-roster-incarnation": status.HTTP_404_NOT_FOUND,
+    "roster-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "persistence-failed": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "attachment-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "attachment-reconcile": status.HTTP_409_CONFLICT,
+}
+
+
+@router.post("/roster/terminals/{terminal_id}/native-identity-repair")
+async def repair_terminal_native_identity(
+    terminal_id: str,
+    body: NativeIdentityRepairBody,
+    _: Any = _WRITE,
+) -> Any:
+    """Repair one currently live rostered terminal's missing native session id.
+
+    The bounded cond-0377C health operation: proves the exact stored
+    pane/session/window/process identity live, types literal ``/status``
+    once under the canonical lifecycle claim set (model-generation,
+    callback-target-generation, pane) and the per-pane input lease, parses
+    only the panel-attested branded provider/build identity fields, and
+    commits the terminal row, the roster lineage, and a bounded evidence
+    digest atomically with an exclusive native-session attachment owner.
+    Never a task/control message.
+
+    The typed outcome is returned as the body: ``repaired``,
+    ``already-known``, and ``identity-still-missing`` (Kimi, before its
+    first session-creating action) map to 200; refusals map to their typed
+    HTTP code.  The body never contains raw pane output or secrets — only
+    the bounded digest and typed details.
+    """
+
+    def _run() -> dict[str, Any]:
+        return native_status_repair.repair_terminal_native_identity(
+            terminal_id=terminal_id,
+            generation=body.generation,
+            provider_version=body.provider_version,
+            physical_occurrence=body.physical_occurrence,
+            operation_id=body.operation_id,
+        )
+
+    outcome = await asyncio.to_thread(_run)
+    if outcome.get("status") in (
+        native_status_repair.STATUS_REPAIRED,
+        native_status_repair.STATUS_ALREADY_KNOWN,
+        native_status_repair.STATUS_IDENTITY_STILL_MISSING,
+    ):
+        return outcome
+    if outcome.get("status") == native_status_repair.STATUS_ERRORED:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=outcome,
+        )
+    code = _REPAIR_REFUSED_HTTP.get(outcome.get("reason") or "", status.HTTP_409_CONFLICT)
+    # The typed outcome is the body at the mapped HTTP code (never wrapped
+    # in a generic error envelope), so a caller branches on ``reason``
+    # without re-deciding what happened here.
+    return JSONResponse(status_code=code, content=outcome)
