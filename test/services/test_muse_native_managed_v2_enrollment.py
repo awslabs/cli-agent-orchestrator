@@ -69,6 +69,7 @@ from cli_agent_orchestrator.services import (
 from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
 
 MUSE_BANNER = "Muse Code 0.1.0 (0.1.0-R708.1)"
+MUSE_INNER_SHA256 = "4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c"
 MUSE_MODEL = "muse-spark-1.2-contributor"
 MUSE_EFFORT = "high"
 DELIVERY_ID = "44444444-4444-4444-8444-444444444444"
@@ -247,8 +248,21 @@ def test_muse_is_enrolled_in_the_derived_native_tui_provider_set():
     assert v2.NATIVE_TUI_PROVIDERS <= native_tui_launch.SUPPORTED_NATIVE_PROVIDERS
 
 
-def test_muse_capability_payload_is_truthful():
+def test_muse_capability_payload_is_truthful(monkeypatch):
     """The capability block names Muse's real kind, source, and executable."""
+    accepted_carrier = muse_native_launch.MuseProfileCarrierCapability(
+        True,
+        "",
+        cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+        full_banner=MUSE_BANNER,
+        inner_executable="/fixture/muse-bin-0.1.0-R708.1",
+        inner_executable_sha256=MUSE_INNER_SHA256,
+    )
+    monkeypatch.setattr(
+        muse_native_launch,
+        "installed_profile_carrier_capability",
+        lambda: accepted_carrier,
+    )
     capabilities = v2.native_tui_capabilities()
     block = capabilities["providers"]["muse_cli"]
     assert block["supported"] is True
@@ -257,6 +271,8 @@ def test_muse_capability_payload_is_truthful():
     assert block["readiness_receipt_kind"] == "muse-native-status-idle"
     assert block["executable"] == "muse"
     assert "0.1.0" in block["supported_versions"]
+    assert block["profile_carrier_capability"] == muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL
+    assert block["profile_carrier_inner_sha256"] == MUSE_INNER_SHA256
 
 
 def test_the_other_native_providers_are_unchanged_by_muse_enrollment():
