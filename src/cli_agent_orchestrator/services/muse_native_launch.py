@@ -268,8 +268,8 @@ def validate_profile_system_prompt(system_prompt: Optional[str]) -> str:
     composed profile text through :data:`PROFILE_SYSTEM_PROMPT_ENV`, and a
     profile with no system prompt would launch a worker whose role
     material exists only in the task prompt.  That is refused here, before
-    the session id is minted, so nothing starts for a profile that cannot
-    be truthfully applied.
+    the fresh pane starts (and before a provider-generated id exists), so
+    nothing starts for a profile that cannot be truthfully applied.
     """
     if not isinstance(system_prompt, str) or not system_prompt.strip():
         raise MuseNativeLaunchError(

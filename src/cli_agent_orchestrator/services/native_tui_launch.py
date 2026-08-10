@@ -32,15 +32,23 @@ wrong must be refused rather than quietly given the other form.
 Three orderings are load-bearing, and each exists because of a specific
 way a native launch corrupts a live provider session:
 
-**Ownership is claimed before the process starts.**  A launch that
-started the TUI first and recorded ownership afterwards would have a
-window in which a running process holds a provider session that no
-durable record names.  A second launcher reading the store in that window
-sees the session as free and attaches to it, and neither side can
-subsequently tell that the transcript it is reading contains another
-controller's turns.  So :func:`native_attachment.declare` and
-:func:`native_attachment.mark_starting` are both crossed before the
-first byte of process creation.
+**Ownership is claimed before the process starts** — except for a
+provider that generates its own session id, where the pane must run first
+for the id to exist.  A launch that started the TUI first and recorded
+ownership afterwards would have a window in which a running process holds
+a provider session that no durable record names.  A second launcher
+reading the store in that window sees the session as free and attaches to
+it, and neither side can subsequently tell that the transcript it is
+reading contains another controller's turns.  So
+:func:`native_attachment.declare` and :func:`native_attachment.mark_starting`
+are both crossed before the first byte of process creation for every
+provider whose id is known in advance (Claude, Kimi, Codex).  Muse is the
+one exception: :func:`start_discovered` starts the fresh no-prompt TUI,
+reads the provider-generated id from its own status panel, and only then
+claims ownership for that exact id — the pre-claim window is fenced so
+nothing but the internal status observation reaches the pane, and a
+failure there tears the pane down rather than leaving an untracked
+session.
 
 **The pane is proven to be running the session we claimed.**  The
 installed Kimi resume option takes an *optional* argument: given no id it
@@ -1510,18 +1518,26 @@ def start_discovered(
     try:
         handle = transport.create_pane(argv=list(fresh_argv))
     except Exception as exc:  # noqa: BLE001 - a failed create may still have created
-        _run_teardown(teardown, None)
-        raise NativeLaunchAmbiguous(
-            AMBIGUOUS_PANE_CREATE,
+        cleanup_error = _run_teardown(teardown, None)
+        detail = (
             f"fresh pane creation raised, so whether a provider process exists is "
-            f"unknown; the pane was torn down: {exc}",
-        ) from exc
-    if not isinstance(handle, str) or not handle:
-        _run_teardown(teardown, None)
-        raise NativeLaunchAmbiguous(
-            AMBIGUOUS_PANE_CREATE,
-            f"fresh pane creation returned no usable handle ({handle!r}); torn down",
+            f"unknown: {exc}"
         )
+        if cleanup_error:
+            # The teardown itself failed: a live orphan may remain, and that
+            # is never reported as success.
+            detail = f"{detail}; cleanup: {cleanup_error}"
+        else:
+            detail = f"{detail}; the pane was torn down"
+        raise NativeLaunchAmbiguous(AMBIGUOUS_PANE_CREATE, detail) from exc
+    if not isinstance(handle, str) or not handle:
+        cleanup_error = _run_teardown(teardown, None)
+        detail = f"fresh pane creation returned no usable handle ({handle!r})"
+        if cleanup_error:
+            detail = f"{detail}; cleanup: {cleanup_error}"
+        else:
+            detail = f"{detail}; torn down"
+        raise NativeLaunchAmbiguous(AMBIGUOUS_PANE_CREATE, detail)
 
     # Every failure from here on — discovery, intent construction, the
     # attachment claim, the fence, and publication — tears the exact pane

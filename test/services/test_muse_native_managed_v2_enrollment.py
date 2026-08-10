@@ -1193,6 +1193,72 @@ async def test_muse_launch_does_not_strand_on_call_cancellation(
     assert len(muse_harness.terminals) == 1
 
 
+@pytest.mark.asyncio
+async def test_muse_launch_exposes_a_teardown_failure_when_pane_creation_raises(
+    isolated_memory_db, worktree, tmp_path, muse_harness, monkeypatch
+):
+    """A failed teardown after a raising create_pane is never hidden.
+
+    create_pane may have created the pane before it raised; the exact
+    teardown is attempted, and when that teardown itself fails the typed
+    error must expose the cleanup failure and must never claim the pane
+    was torn down.
+    """
+
+    def _create_terminal_boom(**kwargs):
+        raise RuntimeError("pane creation failed")
+
+    def _delete_terminal_fail(terminal_id, **kwargs):
+        muse_harness.teardowns.append(terminal_id)
+        raise RuntimeError("cleanup also failed")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.create_terminal",
+        _create_terminal_boom,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal",
+        _delete_terminal_fail,
+    )
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    assert result["state"] == "preflight_blocked"
+    detail = str(result.get("preflight_failure") or {})
+    assert "pane creation failed" in detail
+    assert "cleanup: " in detail
+    assert "cleanup also failed" in detail
+    # A teardown that failed must never be reported as success.
+    assert "was torn down" not in detail
+    assert bridge.read_state(record["reservation_id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_exposes_a_teardown_failure_when_the_pane_handle_is_invalid(
+    isolated_memory_db, worktree, tmp_path, muse_harness, monkeypatch
+):
+    """An invalid/missing pane handle with a failing teardown is exposed."""
+
+    def _create_pane_invalid(self, *, argv=None):
+        return None
+
+    def _delete_terminal_fail(terminal_id, **kwargs):
+        muse_harness.teardowns.append(terminal_id)
+        raise RuntimeError("cleanup also failed")
+
+    monkeypatch.setattr(v2._V2NativePane, "create_pane", _create_pane_invalid)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal",
+        _delete_terminal_fail,
+    )
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    assert result["state"] == "preflight_blocked"
+    detail = str(result.get("preflight_failure") or {})
+    assert "no usable handle" in detail
+    assert "cleanup: " in detail
+    assert "cleanup also failed" in detail
+    assert "torn down" not in detail
+    assert bridge.read_state(record["reservation_id"]) is None
+
+
 # --------------------------------------------------------------------
 # 5. Bind and admission — one task delivery, at-most-once, on the
 #    discovered provider session.
