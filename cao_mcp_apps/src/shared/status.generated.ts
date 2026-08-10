@@ -7,30 +7,40 @@
 // in tokens.generated.css, host-overridable). `pulse` drives the animation.
 
 export type SemanticRole =
-  | "success"
-  | "info"
-  | "accent"
-  | "warning"
-  | "danger"
-  | "neutral";
+  "success" | "info" | "accent" | "warning" | "danger" | "neutral";
 
 export interface StatusSemantics {
   label: string;
+  explanation?: string;
   semanticRole: SemanticRole;
   pulse: boolean;
 }
 
 export const STATUS: Record<string, StatusSemantics> = {
-  "idle": { label: "Idle", semanticRole: "success", pulse: false },
-  "processing": { label: "Processing", semanticRole: "info", pulse: true },
-  "completed": { label: "Completed", semanticRole: "accent", pulse: false },
-  "waiting_user_answer": { label: "Awaiting Input", semanticRole: "warning", pulse: false },
-  "not_fifo_monitored": { label: "Managed Live", semanticRole: "info", pulse: false },
-  "error": { label: "Error", semanticRole: "danger", pulse: false },
-  "stopped": { label: "Stopped", semanticRole: "neutral", pulse: false },
-  "dead": { label: "Dead", semanticRole: "danger", pulse: false },
-  "superseded": { label: "Superseded", semanticRole: "neutral", pulse: false },
-  "unknown": { label: "Unknown", semanticRole: "neutral", pulse: false },
+  idle: { label: "Idle", semanticRole: "success", pulse: false },
+  processing: { label: "Processing", semanticRole: "info", pulse: true },
+  completed: {
+    label: "Turn finished",
+    semanticRole: "accent",
+    pulse: false,
+    explanation:
+      "The provider finished its current turn. This does not mean the assigned task, report, or campaign is complete.",
+  },
+  waiting_user_answer: {
+    label: "Awaiting Input",
+    semanticRole: "warning",
+    pulse: false,
+  },
+  not_fifo_monitored: {
+    label: "Managed Live",
+    semanticRole: "info",
+    pulse: false,
+  },
+  error: { label: "Error", semanticRole: "danger", pulse: false },
+  stopped: { label: "Stopped", semanticRole: "neutral", pulse: false },
+  dead: { label: "Dead", semanticRole: "danger", pulse: false },
+  superseded: { label: "Superseded", semanticRole: "neutral", pulse: false },
+  unknown: { label: "Unknown", semanticRole: "neutral", pulse: false },
 };
 
 /** The canonical set of known status keys (render/validation order). */

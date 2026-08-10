@@ -46,6 +46,26 @@ const HEADER_HASH =
 // else flows from color.role in tokens.json.
 const ROLE_ORDER = ["success", "info", "accent", "warning", "danger", "neutral"];
 
+// The generated TS artifacts are committed and must survive the repo's Prettier
+// contract (defaults: no config file, so printWidth 80). An object entry stays
+// on one line when it fits; otherwise it becomes one property per line, with a
+// value that still overflows (e.g. a long explanation) on its own line.
+const PRETTIER_PRINT_WIDTH = 80;
+const PROP_INDENT = "    ";
+const VALUE_INDENT = "      ";
+
+/** Prettier `quoteProps: "as-needed"`: identifier keys are emitted unquoted. */
+function objKey(key) {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) ? key : JSON.stringify(key);
+}
+
+/** The lines for one property, breaking an overflowing value onto its own line. */
+function prettierValueLines(prop, value) {
+  const line = `${PROP_INDENT}${prop}: ${value},`;
+  if (line.length <= PRETTIER_PRINT_WIDTH) return [line];
+  return [`${PROP_INDENT}${prop}:`, `${VALUE_INDENT}${value},`];
+}
+
 function lightDark(pair) {
   return `light-dark(${pair.light}, ${pair.dark})`;
 }
@@ -112,6 +132,10 @@ function genWebStatus() {
         `    textClass: "text-cao-${role}",`,
       ];
       if (s.pulse) lines.push("    pulse: true,");
+      if (s.explanation)
+        lines.push(
+          ...prettierValueLines("explanation", JSON.stringify(s.explanation)),
+        );
       lines.push("  },");
       return lines.join("\n");
     })
@@ -125,6 +149,7 @@ function genWebStatus() {
     "\n" +
     "export interface StatusStyle {\n" +
     "  label: string;\n" +
+    "  explanation?: string;\n" +
     "  dotClass: string;\n" +
     "  bgClass: string;\n" +
     "  textClass: string;\n" +
@@ -188,12 +213,20 @@ function genMcpStatus() {
   const entries = Object.entries(status.statuses);
   const body = entries
     .map(([key, s]) => {
-      return (
-        `  ${JSON.stringify(key)}: { ` +
-        `label: ${JSON.stringify(s.label)}, ` +
-        `semanticRole: ${JSON.stringify(s.semanticRole)}, ` +
-        `pulse: ${s.pulse ? "true" : "false"} },`
-      );
+      const parts = [
+        `label: ${JSON.stringify(s.label)}`,
+        `semanticRole: ${JSON.stringify(s.semanticRole)}`,
+        `pulse: ${s.pulse ? "true" : "false"}`,
+      ];
+      if (s.explanation)
+        parts.push(`explanation: ${JSON.stringify(s.explanation)}`);
+      const single = `  ${objKey(key)}: { ${parts.join(", ")} },`;
+      if (single.length <= PRETTIER_PRINT_WIDTH) return single;
+      const lines = parts.flatMap((p) => {
+        const sep = p.indexOf(": ");
+        return prettierValueLines(p.slice(0, sep), p.slice(sep + 2));
+      });
+      return `  ${objKey(key)}: {\n${lines.join("\n")}\n  },`;
     })
     .join("\n");
 
@@ -204,12 +237,12 @@ function genMcpStatus() {
     "// `semanticRole` resolves to the `--cao-status-<role>` CSS variable (defined\n" +
     "// in tokens.generated.css, host-overridable). `pulse` drives the animation.\n" +
     "\n" +
-    'export type SemanticRole =\n' +
-    ROLE_ORDER.map((r) => `  | ${JSON.stringify(r)}`).join("\n") +
-    ";\n" +
+    "export type SemanticRole =\n" +
+    `  ${ROLE_ORDER.map((r) => JSON.stringify(r)).join(" | ")};\n` +
     "\n" +
     "export interface StatusSemantics {\n" +
     "  label: string;\n" +
+    "  explanation?: string;\n" +
     "  semanticRole: SemanticRole;\n" +
     "  pulse: boolean;\n" +
     "}\n" +

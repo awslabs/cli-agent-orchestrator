@@ -7,6 +7,7 @@
 
 export interface StatusStyle {
   label: string;
+  explanation?: string;
   dotClass: string;
   bgClass: string;
   textClass: string;
@@ -28,10 +29,12 @@ export const STATUS_CONFIG: Record<string, StatusStyle> = {
     pulse: true,
   },
   COMPLETED: {
-    label: "Completed",
+    label: "Turn finished",
     dotClass: "bg-cao-accent",
     bgClass: "bg-cao-accent/10",
     textClass: "text-cao-accent",
+    explanation:
+      "The provider finished its current turn. This does not mean the assigned task, report, or campaign is complete.",
   },
   WAITING_USER_ANSWER: {
     label: "Awaiting Input",

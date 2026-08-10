@@ -25,7 +25,7 @@ vi.mock('../status.generated', () => ({
   STATUS_CONFIG: {
     IDLE: { label: 'Idle', dotClass: 'bg-cao-success', bgClass: 'bg-cao-success/10', textClass: 'text-cao-success' },
     PROCESSING: { label: 'Processing', dotClass: 'bg-cao-info', bgClass: 'bg-cao-info/10', textClass: 'text-cao-info', pulse: true },
-    COMPLETED: { label: 'Completed', dotClass: 'bg-cao-accent', bgClass: 'bg-cao-accent/10', textClass: 'text-cao-accent' },
+    COMPLETED: { label: 'Turn finished', dotClass: 'bg-cao-accent', bgClass: 'bg-cao-accent/10', textClass: 'text-cao-accent' },
     WAITING_USER_ANSWER: { label: 'Awaiting Input', dotClass: 'bg-cao-warning', bgClass: 'bg-cao-warning/10', textClass: 'text-cao-warning' },
     ERROR: { label: 'Error', dotClass: 'bg-cao-danger', bgClass: 'bg-cao-danger/10', textClass: 'text-cao-danger' },
     STOPPED: { label: 'Stopped', dotClass: 'bg-cao-neutral', bgClass: 'bg-cao-neutral/10', textClass: 'text-cao-neutral' },
