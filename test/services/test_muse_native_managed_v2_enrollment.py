@@ -32,8 +32,11 @@ recorded in ``muse_native_launch`` and ``muse_native_status``:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import subprocess
+import threading
+import time
 import uuid
 from typing import Any, Optional
 
@@ -599,6 +602,12 @@ class _MuseHarness:
         # provider id is discovered before the attachment exists.
         self.events: list[str] = []
         self.teardowns: list[str] = []
+        # When set, the pane observation reports this cwd instead of the
+        # reserved directory (used to inject a fence cwd mismatch).
+        self.observe_cwd: Optional[str] = None
+        # When set, the /status capture blocks on this threading.Event
+        # (used to hold a launch mid-discovery for cancellation tests).
+        self.block: Optional["threading.Event"] = None
 
     @property
     def launched_argv(self) -> list[str]:
@@ -639,7 +648,7 @@ def muse_harness(monkeypatch):
             "pid": state.observed_pid,
             "start_marker": "Thu Jul 24 10:00:00 2026",
             "argv": state.launched_argv,
-            "cwd": self_record_working_directory(),
+            "cwd": state.observe_cwd or self_record_working_directory(),
         }
 
     def self_record_working_directory():
@@ -647,6 +656,8 @@ def muse_harness(monkeypatch):
 
     def _capture_render(self, pane_id):
         state.events.append("capture")
+        if state.block is not None:
+            state.block.wait(timeout=10)
         if state.capture_failures:
             raise state.capture_failures.pop(0)
         assert state.captures, "no scripted status panel rows"
@@ -986,6 +997,200 @@ async def test_muse_launch_never_observes_model_or_effort_from_the_request(
     assert receipt["expected_model"] == MUSE_MODEL
     assert receipt["model"] == MUSE_MODEL
     assert receipt["effort"] == MUSE_EFFORT
+
+
+# --------------------------------------------------------------------
+# 4b. P1 cleanup/cancellation — every post-create failure tears the exact
+#     pane down once and never claims a success it did not achieve.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_tears_down_when_intent_construction_fails(
+    isolated_memory_db, worktree, tmp_path, muse_harness, monkeypatch
+):
+    """A build_intent failure after the pane exists must tear it down."""
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("intent construction failed")
+
+    monkeypatch.setattr(v2, "_muse_bootstrap_intent", _boom)
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    assert result["state"] == "preflight_blocked"
+    assert "intent construction failed" in str(result.get("preflight_failure") or {})
+    # The exact pane was torn down, nothing was claimed or advertised.
+    assert record["terminal_id"] in muse_harness.teardowns
+    assert native_attachment.get("muse_cli", PROVIDER_SESSION_ID) is None
+    assert bridge.read_state(record["reservation_id"]) is None
+    literals = [t["text"] for t in muse_harness.typed if t["kind"] == "literal"]
+    assert literals == ["/status"]
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_tears_down_on_cwd_mismatch_at_the_fence(
+    isolated_memory_db, worktree, tmp_path, muse_harness
+):
+    """A pane that drifts to the wrong cwd before publication is torn down."""
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+    muse_harness.observe_cwd = str(tmp_path / "elsewhere")
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    assert result["state"] == "preflight_blocked"
+    assert record["terminal_id"] in muse_harness.teardowns
+    attachment = native_attachment.get("muse_cli", PROVIDER_SESSION_ID)
+    # The claimed attachment is frozen, never published live.
+    assert attachment is not None
+    assert attachment["state"] != native_attachment.ATTACHED
+    assert bridge.read_state(record["reservation_id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_refuses_an_existing_attachment_without_adopting_it(
+    isolated_memory_db, worktree, tmp_path, muse_harness
+):
+    """A fresh provider-generated id must be newly claimed, never adopted.
+
+    An existing ATTACHED row under the discovered id is a collision: the
+    launch refuses, tears the newly observed pane down, and never returns
+    an unproved ``already-attached`` outcome.
+    """
+    record, _ = v2.reserve(_reserve_request(worktree, tmp_path))
+    intent = native_attachment.acquire_intent(
+        acquisition_method=native_attachment.ACQUISITION_STATUS_DISCOVERED,
+        acquisition_receipt={
+            "schema": "test-intent-v1",
+            "native_session_id": PROVIDER_SESSION_ID,
+        },
+        admits_only_new_instructions=True,
+        replays_task_bytes=False,
+    )
+    native_attachment.declare(
+        provider="muse_cli",
+        native_session_id=PROVIDER_SESSION_ID,
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+        execution_mode=em.NATIVE_TUI,
+        intent=intent,
+    )
+    native_attachment.mark_starting(
+        provider="muse_cli",
+        native_session_id=PROVIDER_SESSION_ID,
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+        execution_mode=em.NATIVE_TUI,
+    )
+    native_attachment.mark_attached(
+        provider="muse_cli",
+        native_session_id=PROVIDER_SESSION_ID,
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+        execution_mode=em.NATIVE_TUI,
+        process_identity=native_attachment.process_identity(pid=999, start_marker="pre-staged"),
+    )
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+    result = await v2.launch_reserved(record["reservation_id"])
+    assert result["state"] == "preflight_blocked"
+    # Teardown of the newly observed pane; zero task bytes; no readiness.
+    assert record["terminal_id"] in muse_harness.teardowns
+    literals = [t["text"] for t in muse_harness.typed if t["kind"] == "literal"]
+    assert literals == ["/status"]
+    assert result.get("admission") is None
+    assert bridge.read_state(record["reservation_id"]) is None
+    # The pre-existing attachment was not overwritten by the launch.
+    attachment = native_attachment.get("muse_cli", PROVIDER_SESSION_ID)
+    assert attachment is not None
+    assert attachment["state"] != native_attachment.ATTACHED
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_exposes_a_cleanup_failure_in_the_preflight_detail(
+    isolated_memory_db, worktree, tmp_path, muse_harness, monkeypatch
+):
+    """A failed pane teardown is never hidden by a "torn down" claim."""
+    muse_harness.captures.append(
+        status_panel_rows(worktree, PROVIDER_SESSION_ID, model="muse-spark-1.2")
+    )
+
+    def _delete_terminal_fail(terminal_id, **kwargs):
+        muse_harness.teardowns.append(terminal_id)
+        raise RuntimeError("terminal deletion failed")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal",
+        _delete_terminal_fail,
+    )
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    assert result["state"] == "preflight_blocked"
+    detail = str(result.get("preflight_failure") or {})
+    assert "terminal deletion failed" in detail
+    assert record["terminal_id"] in muse_harness.teardowns
+    assert bridge.read_state(record["reservation_id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_does_not_strand_on_call_cancellation(
+    isolated_memory_db, worktree, tmp_path, muse_harness
+):
+    """A cancelled caller never strands a live discovered launch.
+
+    The native launch branch runs shielded: cancelling the caller must not
+    return while the child is mid-flight, and after the child settles the
+    durable outcome (ready) is published and the caller observes the
+    cancellation.  A replay creates no second pane.
+    """
+    release = threading.Event()
+    muse_harness.block = release
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+    record, _ = v2.reserve(_reserve_request(worktree, tmp_path))
+    task = asyncio.create_task(v2.launch_reserved(record["reservation_id"]))
+
+    # Wait until the discovery is genuinely blocked (pane created, /status
+    # typed, capture waiting on the barrier).
+    deadline = time.monotonic() + 5.0
+    while "capture" not in muse_harness.events and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert "capture" in muse_harness.events, "the launch never reached /status"
+    assert muse_harness.typed and muse_harness.typed[0] == {
+        "kind": "literal",
+        "text": "/status",
+    }
+
+    # Cancel the caller, repeatedly, while the child is mid-flight.
+    task.cancel()
+    task.cancel()
+    task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.3)
+        raise AssertionError("launch returned while the child was still active")
+    except asyncio.TimeoutError:
+        pass  # the caller is still waiting on the shielded child — correct
+    except asyncio.CancelledError:
+        raise AssertionError("launch released while the child was still active") from None
+
+    # Release the barrier; the shielded child settles the launch durably.
+    release.set()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        raise AssertionError("a cancelled launch must not return a result")
+    except asyncio.CancelledError:
+        pass  # the caller observes cancellation after the child settled
+    except asyncio.TimeoutError:
+        raise AssertionError("the launch did not settle after the barrier released") from None
+
+    # The durable outcome was published despite the cancellation.
+    state = bridge.read_state(record["reservation_id"])
+    assert state is not None and state["state"] == "ready"
+    receipt = state["readiness"]
+    assert receipt["provider_session_id"] == PROVIDER_SESSION_ID
+    terminal = _v2_terminal(record["terminal_id"])
+    assert terminal is not None and terminal.v2_native_session_id == PROVIDER_SESSION_ID
+
+    # A replay creates no second pane.
+    await asyncio.wait_for(
+        asyncio.shield(asyncio.create_task(v2.launch_reserved(record["reservation_id"]))),
+        timeout=5.0,
+    )
+    assert len(muse_harness.terminals) == 1
 
 
 # --------------------------------------------------------------------

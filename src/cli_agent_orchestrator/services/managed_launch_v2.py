@@ -3484,7 +3484,9 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
     # in exactly the same shape.  Below this line they share no code, so
     # neither can partially become the other.
     if reserved_mode == em.NATIVE_TUI:
-        return await _launch_native_tui(reservation_id, record, bridge_request)
+        return await _await_native_launch_shielded(
+            reservation_id, record, bridge_request, registry=registry
+        )
 
     try:
         await terminal_service.create_terminal(
@@ -3700,6 +3702,50 @@ async def _teardown_published_native_terminal(
         cleanup_errors.append(f"native terminal teardown failed: {exc}")
 
     return "; ".join(cleanup_errors) or None
+
+
+async def _await_native_launch_shielded(
+    reservation_id: str,
+    record: dict[str, Any],
+    bridge_request: dict[str, Any],
+    *,
+    registry=None,
+) -> dict[str, Any]:
+    """Run the native launch branch under the shared shield/handoff pattern.
+
+    The native launch (Muse's fresh discovery in particular) awaits
+    ``asyncio.to_thread(start_discovered)``; a cancelled caller cannot
+    cancel that worker thread, so the launch branch is run as its own
+    shielded child task and awaited through ``asyncio.shield``.  On caller
+    cancellation the child is allowed to reach a durable ready/blocked
+    outcome (repeated cancellations are tolerated while it runs), then the
+    caller's cancellation is re-raised — a cancelled request never strands
+    a live discovered launch mid-publication, and a replay of the
+    ``launching`` reservation does not relaunch.
+    """
+    import asyncio
+
+    launch = asyncio.create_task(
+        _launch_native_tui(reservation_id, record, bridge_request, registry=registry)
+    )
+    try:
+        return await asyncio.shield(launch)
+    except asyncio.CancelledError:
+        while not launch.done():
+            try:
+                await asyncio.shield(launch)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if launch.done():
+            try:
+                launch.result()
+            except (asyncio.CancelledError, Exception):
+                # The launch's durable outcome is already recorded; the
+                # caller's cancellation remains primary.
+                pass
+        raise
 
 
 async def _launch_native_tui(
@@ -4460,6 +4506,12 @@ def _teardown_muse_fresh_pane(
                 native_session_id=discovered_session_id,
                 reason=reason,
             )
+        except native_attachment.NativeAttachmentNotFound:
+            # The id was read from the status panel but the attachment was
+            # never declared (the failure happened before the claim): there
+            # is nothing to freeze, and that is expected, not a cleanup
+            # failure.
+            pass
         except Exception as exc:  # noqa: BLE001 - best-effort freeze
             cleanup_errors.append(f"native attachment freeze failed: {exc}")
     try:

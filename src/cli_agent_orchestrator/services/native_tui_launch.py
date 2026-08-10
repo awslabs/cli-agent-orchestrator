@@ -1459,7 +1459,7 @@ def start_discovered(
     transport: NativePaneTransport,
     discover_session: Callable[[str], tuple[str, Mapping[str, Any]]],
     build_intent: Callable[[str], Mapping[str, Any]],
-    teardown: Callable[[Optional[str]], None],
+    teardown: Callable[[Optional[str]], Optional[str]],
     is_fresh_launch_argv: Callable[[Sequence[str]], bool],
     expected_inner_executable: Optional[str] = None,
     provider_version: Optional[str] = None,
@@ -1510,99 +1510,52 @@ def start_discovered(
     try:
         handle = transport.create_pane(argv=list(fresh_argv))
     except Exception as exc:  # noqa: BLE001 - a failed create may still have created
-        teardown(None)
+        _run_teardown(teardown, None)
         raise NativeLaunchAmbiguous(
             AMBIGUOUS_PANE_CREATE,
             f"fresh pane creation raised, so whether a provider process exists is "
             f"unknown; the pane was torn down: {exc}",
         ) from exc
     if not isinstance(handle, str) or not handle:
-        teardown(None)
+        _run_teardown(teardown, None)
         raise NativeLaunchAmbiguous(
             AMBIGUOUS_PANE_CREATE,
             f"fresh pane creation returned no usable handle ({handle!r}); torn down",
         )
 
+    # Every failure from here on — discovery, intent construction, the
+    # attachment claim, the fence, and publication — tears the exact pane
+    # down exactly once (with the discovered id when one was read) and
+    # re-raises the original typed cause with any cleanup failure detail
+    # attached.  There is no path past ``create_pane`` that lets an
+    # exception escape with the pane still live.
     try:
         observation = _observe_fresh(transport)
         discovered_session_id, status_observation = discover_session(observation["pane_id"])
-    except NativeLaunchDiscoverFailed:
-        raise
-    except Exception as exc:  # noqa: BLE001 - discovery failed
-        teardown(discovered_session_id)
-        raise NativeLaunchDiscoverFailed(
-            f"the fresh session id could not be discovered from the provider's own "
-            f"status panel: {exc}",
-            discovered_session_id=discovered_session_id,
-        ) from exc
-
-    if not isinstance(discovered_session_id, str) or not discovered_session_id:
-        teardown(discovered_session_id)
-        raise NativeLaunchDiscoverFailed(
-            "the provider's status observation returned no session id; the fresh pane "
-            "was torn down",
-            discovered_session_id=discovered_session_id,
-        )
-    intent = build_intent(discovered_session_id)
-
-    try:
-        record, acquired = native_attachment.declare(
-            provider=provider,
-            native_session_id=discovered_session_id,
-            terminal_id=terminal_id,
-            generation=generation,
-            execution_mode=em.NATIVE_TUI,
-            intent=intent,
-            pane_id=observation["pane_id"],
-        )
-    except native_attachment.NativeAttachmentInvalid as exc:
-        teardown(discovered_session_id)
-        raise NativeLaunchInvalid(str(exc)) from exc
-    except native_attachment.NativeAttachmentConflict as exc:
-        teardown(discovered_session_id)
-        raise NativeLaunchConflict(str(exc)) from exc
-    except native_attachment.NativeAttachmentError as exc:
-        teardown(discovered_session_id)
-        raise NativeLaunchUnavailable(str(exc)) from exc
-
-    if not acquired and record["state"] not in (
-        native_attachment.DECLARED,
-        native_attachment.STARTING,
-        native_attachment.ATTACHED,
-    ):
-        teardown(discovered_session_id)
-        raise NativeLaunchConflict(
-            f"{provider} session {discovered_session_id} could not be claimed "
-            f"({record['state']!r}); the fresh pane was torn down"
-        )
-    if record["state"] == native_attachment.ATTACHED:
-        # Re-entry: this generation already published the attachment for the
-        # discovered id; the pane we created is the one it runs.
-        return dict(
-            _result(
-                outcome=OUTCOME_ALREADY_ATTACHED,
+        if not isinstance(discovered_session_id, str) or not discovered_session_id:
+            raise NativeLaunchDiscoverFailed(
+                "the provider's status observation returned no session id",
+                discovered_session_id=discovered_session_id,
+            )
+        intent = build_intent(discovered_session_id)
+        try:
+            record, acquired = native_attachment.declare(
                 provider=provider,
                 native_session_id=discovered_session_id,
                 terminal_id=terminal_id,
                 generation=generation,
-                binary=binary,
-                binary_sha256=binary_sha256,
-                argv=list(fresh_argv),
-                pane_handle=handle,
-                observation=observation,
-                attachment=record,
-                session_proof=SESSION_PROOF_STATUS_DISCOVERED,
-            ),
-            status_observation=status_observation,
-        )
-    if record["state"] == native_attachment.DRAINING:
-        teardown(discovered_session_id)
-        raise NativeLaunchConflict(
-            f"{provider} session {discovered_session_id} is draining for this generation; "
-            "a draining owner is winding the session down and must not be relaunched into"
-        )
+                execution_mode=em.NATIVE_TUI,
+                intent=intent,
+                pane_id=observation["pane_id"],
+            )
+        except native_attachment.NativeAttachmentInvalid as exc:
+            raise NativeLaunchInvalid(str(exc)) from exc
+        except native_attachment.NativeAttachmentConflict as exc:
+            raise NativeLaunchConflict(str(exc)) from exc
+        except native_attachment.NativeAttachmentError as exc:
+            raise NativeLaunchUnavailable(str(exc)) from exc
+        _assert_fresh_discovery_claim(record, acquired, provider, discovered_session_id)
 
-    try:
         native_attachment.mark_starting(
             provider=provider,
             native_session_id=discovered_session_id,
@@ -1611,59 +1564,46 @@ def start_discovered(
             execution_mode=em.NATIVE_TUI,
             pane_id=observation["pane_id"],
         )
-    except native_attachment.NativeAttachmentError as exc:
-        teardown(discovered_session_id)
-        raise NativeLaunchDiscoverFailed(
-            f"could not record the start of {provider} session {discovered_session_id}: {exc}",
-            discovered_session_id=discovered_session_id,
-        ) from exc
 
-    # Fence the discovery: the status was read from an observation taken
-    # just after the pane was created.  Re-observe and require the same
-    # process before publishing, so the attachment records the live process
-    # and not a stale one that was replaced mid-discovery.
-    try:
+        # Fence the discovery: the status was read from an observation
+        # taken just after the pane was created.  Re-observe and require
+        # the same process before publishing, so the attachment records
+        # the live process and not a stale one that was replaced
+        # mid-discovery.
         fenced = _observe_fresh(transport)
-    except NativeLaunchError:
-        teardown(discovered_session_id)
-        raise
-    fenced_identity = (fenced["pane_id"], fenced["pid"], fenced["start_marker"])
-    initial_identity = (
-        observation["pane_id"],
-        observation["pid"],
-        observation["start_marker"],
-    )
-    if fenced_identity != initial_identity:
-        teardown(discovered_session_id)
-        raise NativeLaunchDiscoverFailed(
-            "the pane process identity changed between the /status discovery and the "
-            f"attachment fence: expected {initial_identity}, observed {fenced_identity}",
-            discovered_session_id=discovered_session_id,
+        fenced_identity = (fenced["pane_id"], fenced["pid"], fenced["start_marker"])
+        initial_identity = (
+            observation["pane_id"],
+            observation["pid"],
+            observation["start_marker"],
         )
-    _verify_pane_cwd(
-        provider=provider,
-        native_session_id=discovered_session_id,
-        working_directory=working_directory,
-        observation=fenced,
-    )
-    if not is_fresh_launch_argv(fenced["argv"]):
-        teardown(discovered_session_id)
-        raise NativeLaunchDiscoverFailed(
-            "the fresh pane's argv changed away from the no-identity launch form; "
-            "refusing to attach a pane that no longer runs the fresh TUI",
-            discovered_session_id=discovered_session_id,
-        )
-    if expected_inner_executable is not None:
-        observed_executable = fenced["argv"][0] if fenced["argv"] else ""
-        if os.path.realpath(observed_executable) != expected_inner_executable:
-            teardown(discovered_session_id)
+        if fenced_identity != initial_identity:
             raise NativeLaunchDiscoverFailed(
-                f"the pane process image {observed_executable!r} is not the declared "
-                f"inner executable {expected_inner_executable!r}",
+                "the pane process identity changed between the /status discovery and "
+                f"the attachment fence: expected {initial_identity}, observed "
+                f"{fenced_identity}",
                 discovered_session_id=discovered_session_id,
             )
-
-    try:
+        _verify_pane_cwd(
+            provider=provider,
+            native_session_id=discovered_session_id,
+            working_directory=working_directory,
+            observation=fenced,
+        )
+        if not is_fresh_launch_argv(fenced["argv"]):
+            raise NativeLaunchDiscoverFailed(
+                "the fresh pane's argv changed away from the no-identity launch form; "
+                "refusing to attach a pane that no longer runs the fresh TUI",
+                discovered_session_id=discovered_session_id,
+            )
+        if expected_inner_executable is not None:
+            observed_executable = fenced["argv"][0] if fenced["argv"] else ""
+            if os.path.realpath(observed_executable) != expected_inner_executable:
+                raise NativeLaunchDiscoverFailed(
+                    f"the pane process image {observed_executable!r} is not the declared "
+                    f"inner executable {expected_inner_executable!r}",
+                    discovered_session_id=discovered_session_id,
+                )
         attachment = native_attachment.mark_attached(
             provider=provider,
             native_session_id=discovered_session_id,
@@ -1675,15 +1615,8 @@ def start_discovered(
             ),
             pane_id=fenced["pane_id"],
         )
-    except Exception as exc:  # noqa: BLE001 - any publish failure tears the pane down
-        # The process is running and holding the session, but its identity
-        # is not on record.  Tear the pane down so no orphaned live
-        # ownership survives, then report the failure.
-        teardown(discovered_session_id)
-        raise NativeLaunchDiscoverFailed(
-            f"the fresh pane is live but its identity could not be published: {exc}",
-            discovered_session_id=discovered_session_id,
-        ) from exc
+    except Exception as exc:  # noqa: BLE001 - teardown once, then re-raise typed
+        _teardown_and_reraise(exc, teardown=teardown, discovered_session_id=discovered_session_id)
 
     return dict(
         _result(
@@ -1702,6 +1635,83 @@ def start_discovered(
         ),
         status_observation=status_observation,
     )
+
+
+def _run_teardown(
+    teardown: Callable[[Optional[str]], Optional[str]],
+    discovered_session_id: Optional[str],
+) -> Optional[str]:
+    """Run the exact teardown once; return any cleanup failure detail.
+
+    ``discovered_session_id`` is ``None`` before the id was read, in which
+    case there is no attachment to freeze and a ``NotFound`` freeze is
+    expected, not a cleanup failure.
+    """
+    try:
+        return teardown(discovered_session_id)
+    except Exception as exc:  # noqa: BLE001 - teardown must not mask the cause
+        return f"teardown raised: {exc}"
+
+
+def _teardown_and_reraise(
+    exc: Exception,
+    *,
+    teardown: Callable[[Optional[str]], Optional[str]],
+    discovered_session_id: Optional[str],
+) -> NoReturn:
+    """Tear the exact pane down once, then re-raise the original typed cause.
+
+    Cleanup is best-effort but never silent: a cleanup failure is appended
+    to the raised error, so a caller (and the durable preflight detail) can
+    see that a live orphan may exist.  ``exc`` is preserved as the
+    ``__cause__`` of the re-raised same-type error.
+    """
+    cleanup_error = _run_teardown(teardown, discovered_session_id)
+    detail = str(exc)
+    if cleanup_error:
+        detail = f"{detail}; cleanup: {cleanup_error}"
+    raise _same_type(exc, detail) from exc
+
+
+def _same_type(exc: Exception, detail: str) -> Exception:
+    """A new exception of the same typed class carrying ``detail``.
+
+    The typed class is preserved so a caller can branch on it, while the
+    message carries the original detail plus any cleanup failure.
+    """
+    if isinstance(exc, NativeLaunchDiscoverFailed):
+        return NativeLaunchDiscoverFailed(detail, discovered_session_id=exc.discovered_session_id)
+    if isinstance(exc, NativeLaunchAmbiguous):
+        return NativeLaunchAmbiguous(exc.reason, detail)
+    cls = type(exc)
+    try:
+        return cls(detail)
+    except Exception:  # noqa: BLE001 - never fall back to a bare re-raise
+        return NativeLaunchDiscoverFailed(detail, discovered_session_id=None)
+
+
+def _assert_fresh_discovery_claim(
+    record: Mapping[str, Any],
+    acquired: bool,
+    provider: str,
+    native_session_id: str,
+) -> None:
+    """A fresh provider-generated id must be newly claimed by this launch.
+
+    The outer ``claim_launch`` is at-most-once and cross-process crash
+    recovery is not implemented in this slice, so an existing
+    DECLARED/STARTING/ATTACHED/DRAINING or frozen row under the discovered
+    id is a collision, never an adoption: the fresh path refuses rather
+    than overwrite or adopt another owner (or a prior incarnation) on id
+    equality alone.  The newly observed pane is torn down by the caller.
+    """
+    if not acquired:
+        raise NativeLaunchConflict(
+            f"{provider} session {native_session_id} already has an attachment "
+            f"({record['state']!r}); a fresh discovery never adopts an existing row "
+            "(cross-process crash recovery is a later slice), so the newly observed "
+            "pane is torn down and no ownership is claimed"
+        )
 
 
 class TmuxNativePane:
