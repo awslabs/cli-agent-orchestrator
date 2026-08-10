@@ -1,6 +1,6 @@
 """Pre-task harness-native identity for the ordinary/new-terminal path.
 
-cond-0377a: every newly launched unmanaged supervisor/worker on Claude Code
+Every newly launched unmanaged supervisor/worker on Claude Code
 or Codex must obtain a deterministic harness-native session id BEFORE any
 real task prompt/input is admitted, and the full-screen TUI must start by
 resuming/attaching that exact id.  The managed-v2 path already does this;
@@ -20,11 +20,12 @@ Truth rules:
   by BOTH the physical pane launch and the native bootstrap, so the resumed
   TUI and the minted session agree byte-for-byte on cwd.
 - Codex's route (model and ``model_reasoning_effort``) is derived from the
-  loaded profile (``profile.model`` and ``codexConfig.model_reasoning_effort``),
-  respecting an explicit expected model/effort when present — the same
-  composed profile/route material the resumed TUI consumes.  An omitted
-  route stays omitted until Codex reports the actual route; no placeholder
-  route string is invented.
+  loaded profile with the documented precedence — an explicit expected
+  model/effort wins, then the profile's ``codexConfig`` overrides
+  (``codexConfig.model`` / ``codexConfig.model_reasoning_effort``) win over
+  the bare ``profile.model`` field — the same composed profile/route
+  material the resumed TUI consumes.  An omitted route stays omitted until
+  Codex reports the actual route; no placeholder route string is invented.
 - For an activated cell, the contract is fail-closed: an unresolvable
   executable, an unproven build, or a refused bootstrap raises
   :class:`UnmanagedIdentityUnavailable`, and the launch fails before
@@ -39,7 +40,7 @@ cwd, additional directories, and ephemeral MCP servers; ``--agent-file``
 plus ``--session`` is refused because the agent is bound at session
 creation), and the only public profile-capable bootstrap necessarily
 performs a real paid model turn.  That cell stays truthfully unactivated
-under cond-0377 pending the product decision.
+pending the product decision.
 """
 
 from __future__ import annotations
@@ -60,18 +61,35 @@ from cli_agent_orchestrator.services import (
     native_attachment,
     provider_contracts,
 )
+from cli_agent_orchestrator.services.provider_contracts import (
+    PRE_TASK_IDENTITY_CAPTURED,
+    PRE_TASK_IDENTITY_PENDING,
+    PRE_TASK_IDENTITY_READY,
+)
 
 #: The provider wire names whose ordinary/new-terminal launches consume a
 #: pre-task bound identity contract.  Kimi is deliberately absent: its
 #: zero-turn ACP bootstrap cannot bind a CAO profile (verified blocker).
 UNMANAGED_PRE_TASK_PROVIDERS = frozenset({"claude_code", "codex"})
 
-# A bounded roster marker, not a lock or claim: it distinguishes an activated
-# launch that is currently between terminal-row creation and native-ID binding
-# from an older identity-missing terminal that must remain usable while the
-# later status-repair slice learns its ID.
-PRE_TASK_IDENTITY_PENDING = "pre-task native identity pending"
-PRE_TASK_IDENTITY_CAPTURED = "pre-task native identity captured"
+# A bounded launch/readiness marker, not a lock or claim: it distinguishes an
+# activated launch that is currently between terminal-row creation and
+# native-ID binding from an older identity-missing terminal that must remain
+# usable while the later status-repair slice learns its ID.  The constants
+# live in ``provider_contracts`` (the dependency-free contract module) so the
+# row writer and the roster can name the same vocabulary; these re-exports
+# keep every existing import site working.
+#: The terminal row carries this value in its ``native_session_id`` column
+#: from row creation until the pre-task identity is captured, so the row is
+#: visibly pending at its first durable visibility.
+#: The roster lineage note stays ``PENDING`` through identity resolution and
+#: ``CAPTURED`` through provider/TUI initialization, then transitions to
+#: ``READY`` — input is admitted only after that transition.
+__all__ = [
+    "PRE_TASK_IDENTITY_PENDING",
+    "PRE_TASK_IDENTITY_CAPTURED",
+    "PRE_TASK_IDENTITY_READY",
+]
 
 #: Executable name per provider wire key, for resolution via ``PATH``.
 _PROVIDER_EXECUTABLE = {
@@ -148,10 +166,44 @@ def _bootstrap_environment(
     return env
 
 
-def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, Any]) -> None:
-    """Refuse real task bytes until an activated ordinary launch is bound.
+def _row_launch_marker(terminal_id: str, metadata: Mapping[str, Any]) -> Optional[str]:
+    """The terminal row's new-launch marker, or ``None`` for a legacy row.
 
-    This is deliberately provider-scoped while cond-0377 is rolling out:
+    An activated launch stamps its row with :data:`PRE_TASK_IDENTITY_PENDING`
+    at row creation, then the real captured id once the pre-task identity
+    resolves.  Either value is the new-launch marker: the row is fail-closed
+    from first durable visibility until the roster lineage reaches
+    :data:`PRE_TASK_IDENTITY_READY`.  ``None`` means the row was born
+    without the contract (a pre-deploy legacy row) and keeps its exemption.
+
+    The caller-supplied metadata is used when it carries the marker (the
+    direct-input lane passes the full row); a caller that passes only a
+    provider/generation projection (the control-input lane) falls back to
+    the durable row so both lanes decide on the same evidence.
+    """
+    marker = metadata.get("native_session_id")
+    if marker is not None:
+        return marker if isinstance(marker, str) else None
+    from cli_agent_orchestrator.clients import database
+
+    row = database.get_terminal_metadata(terminal_id, warn_if_missing=False)
+    if row is None:
+        return None
+    value = row.get("native_session_id")
+    return value if isinstance(value, str) else None
+
+
+def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, Any]) -> None:
+    """Refuse real task bytes until an activated ordinary launch is ready.
+
+    The gate is closed for an activated provider from the row's first
+    durable visibility (its pending marker) through identity capture and
+    provider/TUI initialization, and opens only after the readiness
+    transition.  The legacy exemption is preserved exactly for rows that
+    truthfully lack the new-launch marker — pre-deploy rows and unactivated
+    provider rows — which stay usable as before.
+
+    Provider-scoped while the pre-task identity contract is rolling out:
     Claude and Codex new launches have the deterministic pre-task contract;
     Kimi and legacy provider rows remain truthful ``identity_missing`` rows
     without being retroactively bricked by this slice.
@@ -160,6 +212,7 @@ def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, An
         return
     from cli_agent_orchestrator.services import stable_agent_roster
 
+    row_marker = _row_launch_marker(terminal_id, metadata)
     try:
         agent = stable_agent_roster.get_agent(
             stable_agent_roster.derive_initial_agent_id(
@@ -167,8 +220,21 @@ def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, An
             )
         )
     except stable_agent_roster.StableAgentNotFound:
-        # Pre-roster legacy rows remain compatible. New activated launches
-        # create the pending roster marker before starting their bootstrap.
+        if row_marker is None:
+            # No roster row and no new-launch marker: a truthful pre-roster
+            # legacy row stays compatible.
+            return
+        if row_marker == PRE_TASK_IDENTITY_PENDING:
+            # The row is visible and pending but the roster bind has not
+            # committed yet — the exact pre-marker race.  Fail closed.
+            raise stable_agent_roster.StableAgentAdmissionRefused(
+                f"terminal {terminal_id} is an activated launch whose stable-agent "
+                "binding has not committed yet; task input is refused until the "
+                "pre-task identity binding is durable"
+            )
+        # A captured id on the row with no roster row is a legacy-repair
+        # write, not a new launch (new launches bind the roster before the
+        # row ever carries a real id): keep the legacy exemption.
         return
     except stable_agent_roster.StableAgentError as exc:
         raise stable_agent_roster.StableAgentAdmissionRefused(
@@ -176,20 +242,55 @@ def assert_unmanaged_admission_ready(terminal_id: str, metadata: Mapping[str, An
             "task input is refused until the binding can be reconciled"
         ) from exc
     lineage = agent.get("current_lineage") or {}
-    if lineage.get("native_session_id"):
+    note = lineage.get("continuity_note")
+    if note == PRE_TASK_IDENTITY_READY:
         stable_agent_roster.assert_admission_ready(
             terminal_id=terminal_id,
             generation=metadata.get("generation") or None,
         )
         return
-    if lineage.get("continuity_note") in {
-        PRE_TASK_IDENTITY_PENDING,
-        PRE_TASK_IDENTITY_CAPTURED,
-    }:
-        stable_agent_roster.assert_admission_ready(
-            terminal_id=terminal_id,
-            generation=metadata.get("generation") or None,
+    if note in {PRE_TASK_IDENTITY_PENDING, PRE_TASK_IDENTITY_CAPTURED}:
+        # Still in-flight: identity not captured yet (pending) or captured but
+        # the provider/TUI has not finished initializing (captured).  Refused
+        # directly — a captured lineage must NOT be admissible until the
+        # readiness transition.
+        raise stable_agent_roster.StableAgentAdmissionRefused(
+            f"terminal {terminal_id} is still {note}; task input is refused until "
+            "the pre-task identity binding reaches its ready state"
         )
+    if note is None:
+        # A legacy lineage carries no pre-task marker: exempt unless the row
+        # itself still names the pending marker (an inconsistent state that
+        # must fail closed rather than admit).
+        if row_marker == PRE_TASK_IDENTITY_PENDING:
+            raise stable_agent_roster.StableAgentAdmissionRefused(
+                f"terminal {terminal_id} still carries the pre-task identity pending "
+                "marker but its roster lineage is not marked pending; task input is "
+                "refused until the binding is reconciled"
+            )
+        return
+    raise stable_agent_roster.StableAgentAdmissionRefused(
+        f"terminal {terminal_id} has an unknown lineage marker {note!r}; task input "
+        "is refused until the pre-task identity binding is reconciled"
+    )
+
+
+def mark_pre_task_identity_ready(*, terminal_id: str, generation: Optional[str] = None) -> None:
+    """Transition an activated launch's roster lineage to the ready marker.
+
+    Called only after provider/TUI initialization succeeds — the resumed TUI
+    is up and input can be admitted.  The transition is refused unless the
+    lineage is still in an in-flight pre-task state, so an identity that was
+    never captured cannot be declared ready.
+    """
+    from cli_agent_orchestrator.services import stable_agent_roster
+
+    stable_agent_roster.transition_lineage_note(
+        terminal_id=terminal_id,
+        generation=generation,
+        from_notes=(PRE_TASK_IDENTITY_PENDING, PRE_TASK_IDENTITY_CAPTURED),
+        continuity_note=PRE_TASK_IDENTITY_READY,
+    )
 
 
 def _version_output(provider: str, executable: str, env: dict[str, str]) -> str:
@@ -213,15 +314,22 @@ def _effective_codex_route(
 ) -> CodexRoute:
     """The effective Codex route of an ordinary launch.
 
-    An explicit expected model/effort wins; otherwise the loaded profile's
-    own route is used (``profile.model`` and
-    ``codexConfig.model_reasoning_effort``) — the same route the resumed TUI
-    consumes.  Either may be empty: an empty model is the provider-default
-    (the bootstrap lets Codex pick and records the actual); an empty effort
-    is omitted.  Never invents a ``provider-default`` or empty-string route.
+    Route precedence, in order: a caller-sealed expected model/effort wins;
+    otherwise the profile's own ``codexConfig`` override
+    (``codexConfig.model`` / ``codexConfig.model_reasoning_effort``) wins
+    over the bare ``profile.model`` field for the model; the effort has only
+    the config seam.  The resumed TUI consumes this same effective route, so
+    the bootstrap and the TUI can never select different routes.  Either may
+    be empty: an empty model is the provider-default (the bootstrap lets
+    Codex pick and records the actual); an empty effort is omitted.  Never
+    invents a ``provider-default`` or empty-string route.
     """
     codex_config = dict(getattr(profile, "codexConfig", None) or {})
-    model = expected_model or (getattr(profile, "model", None) or "")
+    profile_model = getattr(profile, "model", None) or ""
+    config_model = codex_config.get("model")
+    model = (
+        expected_model or (config_model if isinstance(config_model, str) else "") or profile_model
+    )
     effort = expected_effort or str(codex_config.get("model_reasoning_effort") or "")
     return CodexRoute(model=model, effort=effort)
 
@@ -246,8 +354,7 @@ def resolve_pre_task_identity(
     consumes; it is never reloaded here.  ``forwarded_environment`` is the
     effective env overlay the pane received (operator ``env_vars`` + persisted
     session env, merged with the backend's new/existing semantics), so the
-    bootstrap subprocess and the pane agree byte-for-byte on the environment
-    (cond-0377a).
+    bootstrap subprocess and the pane agree byte-for-byte on the environment.
 
     Returns a bounded evidence record:
 
@@ -306,16 +413,25 @@ def resolve_pre_task_identity(
     # The bootstrap and the resumed TUI consume the SAME composed core args
     # (profile/yolo, developer instructions, MCP, codexConfig, canonical
     # trust); the bootstrap appends its pinned route, the TUI appends its
-    # observed route, TUI flags, and resume id.
-    core_args = compose_codex_core_args(
-        codex_profile=getattr(profile, "codexProfile", None),
-        codex_config=getattr(profile, "codexConfig", None),
-        system_prompt=codex_profile_material.get("system_prompt") or "",
-        mcp_servers=codex_profile_material.get("mcp_servers") or [],
-        allowed_tools=codex_profile_material.get("allowed_tools") or [],
-        trusted_project_root=canonical_cwd,
-    )
-    profile_args = core_args + codex_route_suffix(effective_route)
+    # observed route, TUI flags, and resume id.  A malformed profile
+    # composition (e.g. an invalid codexConfig key) is a pre-task identity
+    # failure: the launch fails closed with the typed refusal, never a raw
+    # serializer error leaking out of the pre-task seam.
+    try:
+        core_args = compose_codex_core_args(
+            codex_profile=getattr(profile, "codexProfile", None),
+            codex_config=getattr(profile, "codexConfig", None),
+            system_prompt=codex_profile_material.get("system_prompt") or "",
+            mcp_servers=codex_profile_material.get("mcp_servers") or [],
+            allowed_tools=codex_profile_material.get("allowed_tools") or [],
+            trusted_project_root=canonical_cwd,
+        )
+        profile_args = core_args + codex_route_suffix(effective_route)
+    except Exception as exc:  # noqa: BLE001 - record the concrete blocker
+        raise UnmanagedIdentityUnavailable(
+            f"the {provider!r} launch composition was refused by the pre-task "
+            f"identity contract: {exc}"
+        ) from exc
 
     try:
         receipt = codex_native_bootstrap.mint_session(
@@ -348,5 +464,11 @@ def resolve_pre_task_identity(
         "working_directory": canonical_cwd,
         "model": receipt.get("model") or "",
         "effort": receipt.get("effort") or "",
+        # The EXACT digest-verified executable the bootstrap proved.  The
+        # resumed TUI launches this path (never a bare ``codex`` resolved
+        # through the pane's ambient PATH), so a later launch can never
+        # silently run a different build against the minted session.
+        "binary_path": receipt.get("binary_path") or executable,
+        "binary_sha256": receipt.get("binary_sha256") or digest,
         "bootstrap": dict(receipt),
     }

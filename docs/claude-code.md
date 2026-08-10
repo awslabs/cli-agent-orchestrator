@@ -113,6 +113,25 @@ permissionMode: auto
 You review code for quality and correctness.
 ```
 
+### Pre-Task Native Session Identity and Exact Launch Argv
+
+Every ordinary (unmanaged) Claude Code launch captures a deterministic
+harness-native session id BEFORE any real task input is admitted:
+
+1. A canonical session UUID is minted before any provider I/O.
+2. The id is bound durably (terminal row + stable-agent roster) BEFORE the
+   provider starts.
+3. The provider launch argv carries the exact pre-task id as
+   `--session-id <id>`, so the TUI starts the very session that was bound —
+   never an ambient or recency-derived session.
+4. Task input (direct or control) is admitted only after provider/TUI
+   initialization succeeds; while the identity is pending or captured, input
+   is refused with a typed lineage refusal and zero pane writes.
+
+Stopped-session reincarnation — restoring a stopped session's native
+conversation into a new terminal — remains explicitly deferred and is not
+part of this behavior.
+
 ## Eager Inbox Delivery
 
 Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO exploits this to deliver queued inbox messages during PROCESSING and WAITING_USER_ANSWER states, eliminating inter-turn latency. Enable with `CAO_EAGER_INBOX_DELIVERY=true`.

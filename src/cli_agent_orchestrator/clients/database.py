@@ -583,7 +583,7 @@ class ManagedLaunchV2ReservationModel(Base):
     task_id = Column(Text, nullable=True)
     run_id = Column(Text, nullable=False)
     launch_nonce_digest = Column(Text, nullable=False)
-    # The explicit stable CAO agent id (M3-A / cond-0377), minted at
+    # The explicit stable CAO agent id, minted at
     # reserve and persisted BEFORE any provider effect, so response loss
     # returns the same id.  Null on reservations created before the
     # roster existed; the bind seam derives a deterministic id from the
@@ -721,7 +721,7 @@ class NativeSessionAttachmentModel(Base):
 
 
 class StableAgentModel(Base):
-    """One stable CAO agent (M3-A / cond-0377): the durable identity below
+    """One stable CAO agent: the durable identity below
     a CAO session and above disposable physical incarnations.
 
     A CAO session owns stable ``agent_id`` records for its supervisor and
@@ -1578,7 +1578,7 @@ def _migrate_native_session_attachments() -> None:
 
 
 def _migrate_stable_agent_roster() -> None:
-    """Create the M3-A stable-agent roster tables on older databases.
+    """Create the stable-agent roster tables on older databases.
 
     ``Base.metadata.create_all`` covers fresh databases via the
     ``StableAgentModel`` / ``StableAgentLineageModel`` /
@@ -3136,17 +3136,26 @@ def set_terminal_native_session_id(terminal_id: str, native_session_id: str) -> 
     launcher *intended* to use, would record an assertion rather than an
     observation.
 
+    An activated launch stamps its row with the pre-task identity pending
+    marker at creation (``provider_contracts.PRE_TASK_IDENTITY_PENDING``)
+    so the row is fail-closed from first visibility; that marker is a
+    launch state, not a session, and is replaced by the captured id.
+
     Refuses to re-point: a row already carrying a different native session
     is left alone, because a pane that is running someone else's session is
     a supersession, not an update.
     """
     if not native_session_id:
         return False
+    from cli_agent_orchestrator.services.provider_contracts import (
+        PRE_TASK_IDENTITY_PENDING,
+    )
+
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal is None:
             return False
-        if terminal.native_session_id not in (None, native_session_id):
+        if terminal.native_session_id not in (None, PRE_TASK_IDENTITY_PENDING, native_session_id):
             logger.warning(
                 "Refusing to re-point terminal %s from native session %s to %s",
                 terminal_id,

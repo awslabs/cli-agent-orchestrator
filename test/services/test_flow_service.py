@@ -864,7 +864,7 @@ class TestGetFlowsToRun:
 
 
 class TestExecuteFlowRosterRole:
-    """M3-A / cond-0377 (i-0027): the flow conductor is created with the
+    """The flow conductor is created with the
     supervisor role, so the roster persists the correct immutable role."""
 
     @pytest.mark.asyncio
@@ -913,7 +913,7 @@ class TestExecuteFlowRosterRole:
         from cli_agent_orchestrator.services import stable_agent_roster as roster
         from cli_agent_orchestrator.services import terminal_service as ts
 
-        # cond-0377a (P1-4): the conductor's pre-task native id is persisted on
+        # The conductor's pre-task native id is persisted on
         # the terminal row before the roster bind, so the row must really exist.
         mock_db_create.side_effect = database.create_terminal
 

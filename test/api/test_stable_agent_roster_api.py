@@ -1,4 +1,4 @@
-"""HTTP read/audit surface for the M3-A stable-agent roster (cond-0377).
+"""HTTP read/audit surface for the stable-agent roster.
 
 All routes are read-only and must never crash on legacy, missing, corrupt,
 or unknown-version rows.  The mutating seams (launch binding, admission,

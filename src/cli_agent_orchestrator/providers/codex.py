@@ -229,7 +229,7 @@ def render_trusted_project_override(project_root: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The ONE Codex argument composer (cond-0377a).
+# The ONE Codex argument composer.
 #
 # The ordinary CodexProvider, the unmanaged pre-task bootstrap, and the
 # managed-v2 adapter all consume ``compose_codex_core_args`` so the zero-turn
@@ -423,29 +423,36 @@ class CodexProvider(BaseProvider):
         expected_effort: Optional[str] = None,
         native_session_id: Optional[str] = None,
         codex_profile_material: Optional[dict] = None,
+        codex_executable: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
-        # cond-0377a: the pre-task bootstrap-minted thread id the launch
-        # argv must resume (``codex ... resume <id>``); None keeps the
-        # legacy ambient launch.
+        # The pre-task bootstrap-minted thread id the launch argv must resume
+        # (``codex ... resume <id>``); None keeps the legacy ambient launch.
         self._native_session_id = native_session_id
         self._agent_profile = agent_profile
         self._trusted_project_root = trusted_project_root
         self._expected_model = expected_model
         self._expected_effort = expected_effort
-        # cond-0377a: the EXACT profile material create_terminal resolved once
+        # The EXACT profile material create_terminal resolved once
         # (developer instructions, MCP servers, tool policy). When supplied,
         # the resumed TUI consumes the same core args the zero-turn bootstrap
         # used and never reloads a potentially-changed profile.  None falls
         # back to loading ``agent_profile`` for direct/unit construction.
         self._codex_profile_material = codex_profile_material
+        # The EXACT digest-verified executable the pre-task bootstrap proved.
+        # The resumed TUI launches this absolute path and never re-resolves a
+        # bare ``codex`` through the pane's ambient PATH (an existing tmux
+        # session can inherit a different PATH and resolve another build).
+        # None keeps the legacy bare-name launch for direct/unit construction
+        # that never ran a bootstrap.
+        self._codex_executable = codex_executable
 
     def _resolve_codex_profile_material(self) -> dict:
         """The fully-composed Codex profile material the launch argv consumes.
 
-        cond-0377a: when ``create_terminal`` resolved the material once, it
+        When ``create_terminal`` resolved the material once, it
         passes that EXACT material through the provider constructor so the
         resumed TUI consumes the same developer instructions, MCP servers, and
         tool policy the zero-turn bootstrap used — never a reloaded profile or
@@ -509,7 +516,7 @@ class CodexProvider(BaseProvider):
     def _build_codex_command(self) -> str:
         """Build the Codex launch command via the ONE shared argument composer.
 
-        cond-0377a: the resumed TUI consumes the same precomposed core args
+        The resumed TUI consumes the same precomposed core args
         the zero-turn bootstrap used (profile/yolo selection, developer
         instructions, MCP servers, codexConfig, canonical trust), then adds
         only its TUI flags, the observed/pinned route, and the exact resume id.
@@ -528,22 +535,27 @@ class CodexProvider(BaseProvider):
         # ``--yolo``, two for ``--profile <name>``); the route is appended
         # last (last-wins) and the resume id is the final positional.
         choice_len = 2 if core and core[0] == "--profile" else 1
-        command_parts = ["codex", *core[:choice_len], *CODEX_TUI_FLAGS, *core[choice_len:]]
-        # The route: an explicit expected model/effort wins; otherwise the
-        # profile's own model/effort (the same effective route the bootstrap
-        # pinned).  Either may be empty.
+        executable = self._codex_executable or "codex"
+        command_parts = [executable, *core[:choice_len], *CODEX_TUI_FLAGS, *core[choice_len:]]
+        # The route: a caller-sealed expected model/effort wins; otherwise
+        # the profile's own route — ``codexConfig.model`` override over the
+        # bare ``profile.model`` field, and the codexConfig effort — the
+        # same effective route the pre-task bootstrap pinned.  Either may
+        # be empty.
         codex_config = getattr(profile, "codexConfig", None)
-        effort_cfg = (
-            codex_config.get("model_reasoning_effort") if isinstance(codex_config, dict) else None
-        )
+        config = codex_config if isinstance(codex_config, dict) else {}
+        effort_cfg = config.get("model_reasoning_effort")
+        config_model = config.get("model")
         route = CodexRoute(
-            model=self._expected_model or (getattr(profile, "model", None) or ""),
+            model=self._expected_model
+            or (config_model if isinstance(config_model, str) else "")
+            or (getattr(profile, "model", None) or ""),
             effort=self._expected_effort or str(effort_cfg or ""),
         )
         command_parts.extend(codex_route_suffix(route))
-        # cond-0377a: the pre-task minted id is resumed exactly
-        # (``codex ... resume <id>``) — the TUI never silently creates an
-        # unrelated fresh conversation.
+        # The pre-task minted id is resumed exactly (``codex ... resume
+        # <id>``) — the TUI never silently creates an unrelated fresh
+        # conversation.
         if self._native_session_id:
             command_parts.extend(["resume", self._native_session_id])
 

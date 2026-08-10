@@ -1298,7 +1298,7 @@ def test_managed_control_identity_does_not_hide_missing_columns(isolated_memory_
 
     from sqlalchemy import text
 
-    # The v2 table exists but is missing the M3-A additive column the
+    # The v2 table exists but is missing the roster additive column the
     # roster owns — the narrow projection must still resolve the managed
     # identity rather than erasing it.
     with isolated_memory_db.begin() as conn:

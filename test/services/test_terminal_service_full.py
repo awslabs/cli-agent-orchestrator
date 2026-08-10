@@ -324,7 +324,7 @@ class TestCreateTerminal:
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        # cond-0377a: codex is an activated cell — the pre-task identity
+        # Codex is an activated cell — the pre-task identity
         # seam must be stubbed or the fail-closed bootstrap rejects the
         # fake binary. The skill-catalog contract under test is unaffected.
         with (
@@ -413,7 +413,7 @@ class TestCreateTerminal:
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        # cond-0377a: codex is an activated cell — the pre-task identity
+        # Codex is an activated cell — the pre-task identity
         # seam must be stubbed or the fail-closed bootstrap rejects the
         # fake binary. The skill-catalog contract under test is unaffected.
         with (

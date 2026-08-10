@@ -123,7 +123,7 @@ def mint_session(
     """Create one persistent thread (exact-route or provider-default) and prove
     the minter exited.
 
-    cond-0377a (P1-2): the requested ``model`` and ``effort`` are OPTIONAL so
+    The requested ``model`` and ``effort`` are OPTIONAL so
     an ordinary launch can inherit Codex's own configuration/defaults.  An
     unset model is omitted from ``thread/start``; effort is never a
     ``thread/start`` field (Codex's ``ThreadStartParams`` has no
@@ -145,7 +145,7 @@ def mint_session(
 
     # The trust override and route are composed once by the shared Codex
     # argument composer and arrive in ``profile_args``; the bootstrap appends
-    # only the app-server suffix (cond-0377a: one implementation of trust
+    # only the app-server suffix (one implementation of trust
     # rendering, owned by the composer).
     argv = [
         codex_binary,

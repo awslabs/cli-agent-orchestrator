@@ -267,7 +267,7 @@ class TestCodexBuildCommand:
     def test_mcp_env_vars_non_string_entry_fails_fast(self, mock_load_profile):
         """A non-string env_vars entry fails fast at launch-command build time.
 
-        cond-0377a: the ONE shared Codex composer validates every env_vars
+        The ONE shared Codex composer validates every env_vars
         entry is a string, so a malformed profile fails with a clear error
         instead of emitting a silently-broken override. (Previously the
         provider stringified the entry and never raised; the unified composer

@@ -104,6 +104,42 @@ For a provider temporarily held strict, only steps 1 and 2 are needed before
 the exact build can launch. Return it to open after the compatibility fix is
 merged and deployed.
 
+## Narrow capability tables: the ordinary Codex bootstrap exception
+
+The ordinary (unmanaged) Codex launch path captures its pre-task harness-native
+session id through a zero-turn app-server bootstrap (`thread/start` +
+`thread/name/set` with no `turn/*`) so the resumed TUI can guarantee an exact,
+resumable session before any task byte reaches the pane.  That guarantee is a
+capability claim about the installed build: the full exchange
+(`initialize -> initialized -> config/read -> thread/start -> thread/name/set ->
+clean process exit`, canonical UUID, exact cwd/model/effort, one materialized
+rollout, fresh `thread/resume` adopting the same id) must have been
+stage-verified for the exact binary.  Builds proven for that contract are
+listed in `codex_native_bootstrap.BOOTSTRAP_CAPABLE_VERSIONS` — currently
+`0.146.0` and `0.147.0`.
+
+This is deliberately a NARROW exception table, independent of the launch-mode
+policy:
+
+- **Open launch mode does NOT carry exact-session capture.** A build accepted
+  at the launch identity boundary may still be unproven for the bootstrap
+  contract.  The ordinary Codex path keeps its fail-closed capability
+  boundary: an installed build outside `BOOTSTRAP_CAPABLE_VERSIONS` cannot
+  supply the pre-task identity contract, and the launch fails closed with a
+  typed refusal — zero provider initialization, zero task bytes — rather than
+  silently degrading to a launch that cannot resume its own session.
+- **Unsupported builds do not retain exact-session capture.**  Do not
+  configure, document, or operate an ordinary Codex launch as if an unproven
+  semver could mint a resumable id; it cannot, by design.
+
+**Operator remediation:** install (or pin) a Codex build that is in
+`BOOTSTRAP_CAPABLE_VERSIONS`; if a newer build must serve the ordinary path,
+stage-verify it against the exact bootstrap contract above, add it to the
+table, and re-verify the resumed-TUI surface before removing any version
+override.  While the installed build is unproven, ordinary Codex launches
+refuse fail-closed; the managed-v2 path (which pins its executable and
+resumes through `native_tui_launch`) is unaffected by this table.
+
 ## Fail-closed invariants
 
 These hold regardless of mode:

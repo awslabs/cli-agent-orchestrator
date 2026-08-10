@@ -1087,7 +1087,7 @@ def _profile_material_from_profile(
     build this ONCE from the profile it already loaded and pass the exact same
     material to both the pre-task bootstrap and the resumed TUI — neither
     reloads a potentially-changed profile or rebuilds a subtly different
-    contract (cond-0377a).
+    contract.
 
     ``allowed_tools`` lets the caller pass the tool policy it already resolved
     (which may be an explicit per-step override, not the profile default), so

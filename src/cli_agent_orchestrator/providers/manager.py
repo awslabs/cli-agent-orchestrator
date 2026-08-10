@@ -42,6 +42,7 @@ class ProviderManager:
         expected_effort: Optional[str] = None,
         native_session_id: Optional[str] = None,
         codex_profile_material: Optional[dict] = None,
+        codex_executable: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -79,6 +80,7 @@ class ProviderManager:
                     expected_effort=expected_effort,
                     native_session_id=native_session_id,
                     codex_profile_material=codex_profile_material,
+                    codex_executable=codex_executable,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(

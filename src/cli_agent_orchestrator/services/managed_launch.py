@@ -1511,7 +1511,7 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
         )
         try:
             # Narrow compatible projection: only the columns this identity
-            # decision reads.  Additive columns the roster owns (M3-A
+            # decision reads.  Additive columns the roster owns
             # ``stable_agent_id``) are deliberately NOT selected, so a
             # store that has not run the latest migration still resolves
             # the managed-v2 identity.  Any OTHER missing column is schema

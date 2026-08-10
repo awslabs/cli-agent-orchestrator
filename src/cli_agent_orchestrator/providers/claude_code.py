@@ -220,7 +220,7 @@ class ClaudeCodeProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
-        # cond-0377a: the pre-task minted harness-native id the launch argv
+        # The pre-task minted harness-native id the launch argv
         # must consume (``--session-id <id>``); None keeps the legacy
         # ambient launch.
         self._native_session_id = native_session_id
@@ -411,7 +411,7 @@ class ClaudeCodeProvider(BaseProvider):
             for tool in disallowed:
                 command_parts.extend(["--disallowedTools", tool])
 
-        # cond-0377a: the pre-task minted identity is consumed by the launch
+        # The pre-task minted identity is consumed by the launch
         # argv itself (``--session-id <id>``) — the TUI never silently
         # creates an unrelated fresh conversation.
         if self._native_session_id:

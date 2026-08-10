@@ -339,6 +339,156 @@ def test_unmanaged_activated_control_refuses_before_roster_binding(
         journal.get(CONTROL)
 
 
+def test_unmanaged_control_refused_while_row_pending_marker_no_roster(
+    isolated_memory_db, tmux, journal, monkeypatch
+):
+    """The row is addressable before the pre-task roster marker commits.
+    A row stamped with the new-launch pending marker must refuse a concurrent
+    control with the typed lineage refusal and zero pane writes — never a
+    legacy exemption."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    database.create_terminal(
+        TERMINAL,
+        "cao",
+        "worker-abcd",
+        "claude_code",
+        generation=GENERATION,
+        pane_id=PANE,
+        pane_pid=PANE_PID,
+        native_session_id=seam.PRE_TASK_IDENTITY_PENDING,
+    )
+    monkeypatch.setattr(
+        service,
+        "_terminal_metadata",
+        lambda terminal_id: _metadata(provider="claude_code"),
+    )
+
+    result = _deliver(journal)
+
+    assert result.outcome == REFUSED
+    assert result.reason_code == REASON_LINEAGE_UNPROVEN
+    assert tmux.writes == []
+    with pytest.raises(ControlInputNotFound):
+        journal.get(CONTROL)
+
+
+def test_unmanaged_control_refused_after_capture_before_ready(
+    isolated_memory_db, tmux, journal, monkeypatch
+):
+    """Identity capture alone is not admission.  Between the durable
+    native-id capture and provider/TUI readiness, a concurrent control must
+    be refused with the typed lineage refusal and zero pane writes."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import stable_agent_roster as roster
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    native_id = "019fb17d-0c6d-7161-a408-6b1fa61c8f2d"
+    database.create_terminal(
+        TERMINAL,
+        "cao",
+        "worker-abcd",
+        "claude_code",
+        generation=GENERATION,
+        pane_id=PANE,
+        pane_pid=PANE_PID,
+        native_session_id=native_id,
+    )
+    roster.bind_generation(
+        roster.BindingContract(
+            agent_id=roster.derive_initial_agent_id(TERMINAL, GENERATION),
+            session_name="cao",
+            role=roster.ROLE_WORKER,
+            profile_family="developer",
+            harness="claude_code",
+            native_session_id=native_id,
+            acquisition_method=roster.ACQUISITION_CHOSEN_SESSION_ID,
+            terminal_id=TERMINAL,
+            generation=GENERATION,
+            pane_id=PANE,
+            pane_pid=PANE_PID,
+            execution_mode="native_tui",
+            continuity_note=seam.PRE_TASK_IDENTITY_CAPTURED,
+        )
+    )
+    monkeypatch.setattr(
+        service,
+        "_terminal_metadata",
+        lambda terminal_id: _metadata(provider="claude_code"),
+    )
+
+    result = _deliver(journal)
+
+    assert result.outcome == REFUSED
+    assert result.reason_code == REASON_LINEAGE_UNPROVEN
+    assert tmux.writes == []
+    with pytest.raises(ControlInputNotFound):
+        journal.get(CONTROL)
+
+
+def test_unmanaged_control_gate_opens_after_readiness_transition(
+    isolated_memory_db, tmux, journal, monkeypatch
+):
+    """The same row becomes control-admissible only after the readiness
+    transition: the shared admission seam passes (the rest of the
+    identity-bound checks then decide the write)."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import stable_agent_roster as roster
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    native_id = "019fb17d-0c6d-7161-a408-6b1fa61c8f2d"
+    database.create_terminal(
+        TERMINAL,
+        "cao",
+        "worker-abcd",
+        "claude_code",
+        generation=GENERATION,
+        pane_id=PANE,
+        pane_pid=PANE_PID,
+        native_session_id=native_id,
+    )
+    roster.bind_generation(
+        roster.BindingContract(
+            agent_id=roster.derive_initial_agent_id(TERMINAL, GENERATION),
+            session_name="cao",
+            role=roster.ROLE_WORKER,
+            profile_family="developer",
+            harness="claude_code",
+            native_session_id=native_id,
+            acquisition_method=roster.ACQUISITION_CHOSEN_SESSION_ID,
+            terminal_id=TERMINAL,
+            generation=GENERATION,
+            pane_id=PANE,
+            pane_pid=PANE_PID,
+            execution_mode="native_tui",
+            continuity_note=seam.PRE_TASK_IDENTITY_CAPTURED,
+        )
+    )
+    monkeypatch.setattr(
+        service,
+        "_terminal_metadata",
+        lambda terminal_id: _metadata(provider="claude_code"),
+    )
+
+    # Before the transition the control is refused at the lineage gate...
+    result = _deliver(journal)
+    assert result.outcome == REFUSED
+    assert result.reason_code == REASON_LINEAGE_UNPROVEN
+    assert tmux.writes == []
+    with pytest.raises(ControlInputNotFound):
+        journal.get(CONTROL)
+
+    # ...and after the transition the same gate opens.
+    seam.mark_pre_task_identity_ready(terminal_id=TERMINAL, generation=GENERATION)
+    seam.assert_unmanaged_admission_ready(
+        TERMINAL,
+        {"provider": "claude_code", "generation": GENERATION},
+    )
+    result = _deliver(journal)
+    assert result.reason_code != REASON_LINEAGE_UNPROVEN or result.outcome == ACCEPTED
+
+
 @contextmanager
 def _pane_held_elsewhere(pane_id=PANE):
     """Hold the pane lease from another thread.

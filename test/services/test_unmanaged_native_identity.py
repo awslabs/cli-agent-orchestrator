@@ -1,4 +1,4 @@
-"""cond-0377a (coordinator repairs): pre-task bound identity on the UNMANAGED
+"""Pre-task bound identity on the UNMANAGED
 new-terminal path.
 
 The ordinary ``create_terminal`` path consumes a pre-task bound identity
@@ -12,19 +12,19 @@ contract for the activated cells:
 
 Repair invariants covered here:
 
-- P1-1: identity resolution + roster binding are ONE cancellation-owned
+- Identity resolution + roster binding are ONE cancellation-owned
   operation — cancellation cannot outlive teardown or lose a minted id; a
   cancelled launch whose bind committed retires the exact incarnation
   RETAINING the minted id, with zero task bytes.
-- P1-2: for an activated cell, executable/version/bootstrap/refusal failure
+- For an activated cell, executable/version/bootstrap/refusal failure
   FAILS the new launch (zero provider initialization, zero task bytes, no
   live roster incarnation) — never a silent identity_missing fallback.
-- P1-3: one canonical effective working directory (None / symlink alias /
+- One canonical effective working directory (None / symlink alias /
   explicit canonical path) consumed by both pane launch and bootstrap;
   profile-derived model/effort with explicit expectations winning.
 - Kimi: NOT activated (verified blocker) — the ordinary Kimi path is
   byte-for-byte unchanged and the pre-task capability does not advertise it.
-- P2: integration-shaped event-order oracles for Claude and Codex:
+- Integration-shaped event-order oracles for Claude and Codex:
   bootstrap complete -> roster ID durable -> provider initialize -> initial
   task, with the exact minted id in both the roster and the launch argv.
 """
@@ -250,7 +250,7 @@ async def test_unmanaged_codex_new_launch_binds_profile_route(
 async def test_unmanaged_codex_canonical_cwd_none_and_symlink(
     isolated_memory_db, launch_mocks, monkeypatch, tmp_path
 ):
-    """P1-3: None and a symlink alias both resolve to the same canonical
+    """None and a symlink alias both resolve to the same canonical
     cwd used by the pane and the bootstrap."""
     native_id = str(uuid.uuid4())
     captured = _codex_seam_harness(monkeypatch, native_id=native_id)
@@ -275,7 +275,7 @@ async def test_unmanaged_codex_canonical_cwd_none_and_symlink(
 async def test_unmanaged_codex_explicit_route_wins(
     isolated_memory_db, launch_mocks, monkeypatch, tmp_path
 ):
-    """P1-3: an explicit expected model/effort wins over the profile route."""
+    """An explicit expected model/effort wins over the profile route."""
     native_id = str(uuid.uuid4())
     captured = _codex_seam_harness(
         monkeypatch, native_id=native_id, model="profile-model", effort="high"
@@ -295,6 +295,59 @@ async def test_unmanaged_codex_explicit_route_wins(
         captured["kwargs"]["profile_args"][captured["kwargs"]["profile_args"].index("--model") + 1]
         == "explicit-model"
     )
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_codex_codexconfig_model_beats_profile_model(
+    isolated_memory_db, launch_mocks, monkeypatch, tmp_path
+):
+    """Conflicting values: for an ordinary profile route, the profile's
+    ``codexConfig.model`` override wins over the bare ``profile.model``
+    field, and a caller-sealed expected model still wins over both — the
+    same precedence the resumed TUI consumes."""
+    native_id = str(uuid.uuid4())
+    profile = AgentProfile(
+        name="developer",
+        description="Developer",
+        model="profile-model",
+        codexConfig={"model": "config-model", "model_reasoning_effort": "high"},
+    )
+    captured = _codex_seam_harness(monkeypatch, native_id=native_id, profile=profile)
+
+    # No sealed expectation: the codexConfig.model override wins.
+    await create_terminal("codex", "developer", new_session=True, working_directory=str(tmp_path))
+    route_args = captured["kwargs"]["profile_args"]
+    assert route_args[route_args.index("--model") + 1] == "config-model"
+    assert captured["kwargs"]["model"] == "config-model"
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_codex_sealed_model_beats_codexconfig_and_profile(
+    isolated_memory_db, launch_mocks, monkeypatch, tmp_path
+):
+    """The caller-sealed expected model wins over both the codexConfig
+    override and the profile model on the bootstrap side too."""
+    native_id = str(uuid.uuid4())
+    profile = AgentProfile(
+        name="developer",
+        description="Developer",
+        model="profile-model",
+        codexConfig={"model": "config-model", "model_reasoning_effort": "high"},
+    )
+    captured = _codex_seam_harness(monkeypatch, native_id=native_id, profile=profile)
+
+    await create_terminal(
+        "codex",
+        "developer",
+        new_session=True,
+        working_directory=str(tmp_path),
+        expected_model="sealed-model",
+        expected_effort="max",
+    )
+    route_args = captured["kwargs"]["profile_args"]
+    assert route_args[route_args.index("--model") + 1] == "sealed-model"
+    assert captured["kwargs"]["model"] == "sealed-model"
+    assert captured["kwargs"]["effort"] == "max"
 
 
 def test_codex_bootstrap_environment_uses_the_pane_filter(monkeypatch):
@@ -347,7 +400,7 @@ def test_captured_marker_without_native_id_refuses_input(isolated_memory_db):
         )
     )
 
-    with pytest.raises(roster.StableAgentAdmissionRefused, match="no native session id"):
+    with pytest.raises(roster.StableAgentAdmissionRefused, match="reaches its ready state"):
         seam.assert_unmanaged_admission_ready(
             terminal_id,
             {"provider": "codex", "generation": generation},
@@ -355,7 +408,7 @@ def test_captured_marker_without_native_id_refuses_input(isolated_memory_db):
 
 
 def test_legacy_identity_missing_row_remains_compatible(isolated_memory_db):
-    """M3-A does not retroactively brick an unmarked pre-existing row."""
+    """An unmarked pre-existing row is not retroactively bricked."""
     from cli_agent_orchestrator.services import unmanaged_native_identity as seam
 
     terminal_id = "legacy01"
@@ -480,8 +533,173 @@ async def test_concurrent_direct_input_is_refused_until_native_bind(
     assert result.id == "test1234"
 
 
+def test_row_visible_before_roster_bind_refuses_input(isolated_memory_db):
+    """The row-visible/pre-marker window: a newly created activated
+    terminal row is addressable before the roster marker commits.  The row
+    itself must visibly carry the pending marker at first durable visibility,
+    so a direct-input or control-input call in that window returns the typed
+    lineage refusal instead of being treated as a legacy row."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    terminal_id = "pending01"
+    database.create_terminal(
+        terminal_id,
+        "cao-session",
+        "developer-abcd",
+        "claude_code",
+        generation="gen-1",
+        pane_id="%61",
+        pane_pid=6161,
+        native_session_id=seam.PRE_TASK_IDENTITY_PENDING,
+    )
+    # No roster row exists yet — the pre-task bind thread has not committed.
+    with pytest.raises(roster.StableAgentAdmissionRefused, match="pending"):
+        seam.assert_unmanaged_admission_ready(
+            terminal_id, {"provider": "claude_code", "generation": "gen-1"}
+        )
+
+
+def test_row_without_pending_marker_keeps_legacy_exemption(isolated_memory_db):
+    """A row born without the new-launch marker stays legacy-compatible even
+    when it names no roster row (pre-deploy rows never saw the marker)."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    terminal_id = "legacy02"
+    database.create_terminal(
+        terminal_id,
+        "cao-session",
+        "developer-abcd",
+        "claude_code",
+        pane_id="%62",
+        pane_pid=6262,
+    )
+    seam.assert_unmanaged_admission_ready(terminal_id, {"provider": "claude_code"})
+
+
+@pytest.mark.asyncio
+async def test_concurrent_direct_input_refused_before_roster_marker_commits(
+    isolated_memory_db, launch_mocks, monkeypatch
+):
+    """End-to-end reproduction: block the very first roster write (the
+    bind that publishes the pending marker) and prove the visible row is
+    fail-closed — the concurrent direct-input call is refused with the typed
+    lineage refusal and zero pane writes."""
+    from cli_agent_orchestrator.services import stable_agent_roster as real_roster
+    from cli_agent_orchestrator.services import terminal_service as ts
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_bind = real_roster.bind_generation
+
+    def _blocked_bind(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=10)
+        return original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(real_roster, "bind_generation", _blocked_bind)
+    task = asyncio.create_task(create_terminal("claude_code", "developer", new_session=True))
+    for _ in range(400):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set(), "the pre-task roster bind never started"
+
+    with pytest.raises(TerminalInputRefusedError) as excinfo:
+        await asyncio.to_thread(ts.send_input, "test1234", "echo should-not-run")
+    assert excinfo.value.reason_code == "lineage-unproven"
+    launch_mocks["tmux"].send_keys.assert_not_called()
+
+    release.set()
+    result = await task
+    assert result.id == "test1234"
+
+
+@pytest.mark.asyncio
+async def test_captured_identity_stays_gated_until_provider_ready(
+    isolated_memory_db, launch_mocks, monkeypatch, tmp_path
+):
+    """After native-ID capture the roster must NOT be
+    admissible while the provider is still warming up and has not launched
+    the resumed TUI.  Direct input in the post-capture/pre-init window is
+    refused with zero pane writes; once provider initialization succeeds and
+    the readiness marker transitions, the same input lane is admitted."""
+    from cli_agent_orchestrator.services import terminal_service as ts
+    from cli_agent_orchestrator.services import unmanaged_native_identity as seam
+
+    native_id = str(uuid.uuid4())
+    _codex_seam_harness(monkeypatch, native_id=native_id)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _blocked_provider(*args, **kwargs):
+        instance = MagicMock()
+        instance.shell_baseline = None
+
+        async def _blocked_initialize():
+            entered.set()
+            # Yield to the loop: initialize() is awaited on the event loop,
+            # so a blocking wait here would freeze the test body too.
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return True
+
+        instance.initialize = _blocked_initialize
+        return instance
+
+    launch_mocks["provider_manager"].create_provider.side_effect = _blocked_provider
+    task = asyncio.create_task(
+        create_terminal("codex", "developer", new_session=True, working_directory=str(tmp_path))
+    )
+    for _ in range(400):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set(), "provider initialization never started"
+
+    # The identity is captured (real id on the row, captured roster note) but
+    # the provider/TUI is not ready: input must be refused with zero bytes.
+    from cli_agent_orchestrator.clients import database
+
+    assert database.get_terminal_metadata("test1234")["native_session_id"] == native_id
+    agent = roster.get_agent(roster.derive_initial_agent_id("test1234"))
+    assert agent["current_lineage"]["continuity_note"] == seam.PRE_TASK_IDENTITY_CAPTURED
+
+    with pytest.raises(TerminalInputRefusedError) as excinfo:
+        await asyncio.to_thread(ts.send_input, "test1234", "echo should-not-run")
+    assert excinfo.value.reason_code == "lineage-unproven"
+    launch_mocks["tmux"].send_keys.assert_not_called()
+
+    release.set()
+    result = await task
+    assert result.id == "test1234"
+
+    # Provider/TUI initialization succeeded: the marker transitions to ready
+    # and the same input lane is now admitted (task bytes flow).
+    agent = roster.get_agent(roster.derive_initial_agent_id("test1234"))
+    assert agent["current_lineage"]["continuity_note"] == seam.PRE_TASK_IDENTITY_READY
+    # The direct lane reads the real row: provider, session names, and the
+    # captured native id all on the durable row.
+    monkeypatch.setattr(
+        ts,
+        "get_terminal_metadata",
+        lambda terminal_id, **_kwargs: {
+            "provider": "codex",
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "generation": None,
+            "native_session_id": native_id,
+        },
+    )
+    await asyncio.to_thread(ts.send_input, "test1234", "echo now-ok")
+    assert launch_mocks["tmux"].send_keys.called
+
+
 # ---------------------------------------------------------------------------
-# P1-2: activated cells fail closed — no silent identity_missing fallback
+# Activated cells fail closed — no silent identity_missing fallback
 # ---------------------------------------------------------------------------
 
 
@@ -539,7 +757,7 @@ async def test_unmanaged_claude_mint_failure_emits_zero_input(
 
 
 # ---------------------------------------------------------------------------
-# P1-1: identity resolution + roster binding are one cancellation-owned op
+# Identity resolution + roster binding are one cancellation-owned operation
 # ---------------------------------------------------------------------------
 
 

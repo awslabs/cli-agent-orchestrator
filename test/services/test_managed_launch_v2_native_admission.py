@@ -401,7 +401,7 @@ async def test_a_native_generation_reaches_admitted_without_any_bridge(
 
     assert admitted["state"] == "admitted"
     assert harness.bridge_calls == []
-    # i-0031 hardening: the roster incarnation reflects the admitted state.
+    # Hardening: the roster incarnation reflects the admitted state.
     incarnation = roster.get_incarnation_by_terminal(
         admitted["terminal_id"], generation=admitted["generation"]
     )

@@ -1,4 +1,4 @@
-"""cond-0377a (coordinator repairs 2): the ONE Codex argument composer.
+"""The ONE Codex argument composer.
 
 The ordinary ``CodexProvider``, the unmanaged pre-task bootstrap, and the
 managed-v2 adapter must all consume the same pure composer so the bootstrap
@@ -391,3 +391,130 @@ def test_explicit_route_bootstrap_and_tui_share_core(tmp_path):
     # Only the suffix-bearing tails differ.
     assert "app-server" in boot and "app-server" not in tui
     assert "resume" in tui and "resume" not in boot
+
+
+# ---------------------------------------------------------------------------
+# The resumed TUI launches the EXACT digest-verified executable
+# ---------------------------------------------------------------------------
+
+
+def test_resumed_tui_uses_pinned_verified_executable_not_bare_codex(tmp_path):
+    """PATH-divergence regression: the pre-task bootstrap digest-verified one
+    absolute executable, and the resumed TUI must launch THAT path, never a
+    bare ``codex`` that an existing tmux session's different PATH could
+    resolve to another build."""
+    canonical = os.path.realpath(str(tmp_path))
+    pinned = "/opt/codex-0.147.0/bin/codex"
+    profile = SimpleNamespace(codexProfile=None, codexConfig=None, model=None)
+    material = {
+        "profile": profile,
+        "allowed_tools": ["*"],
+        "system_prompt": "",
+        "mcp_servers": [],
+    }
+    provider = CodexProvider(
+        "terminal-1",
+        "session-1",
+        "window-1",
+        trusted_project_root=canonical,
+        native_session_id="019fb17d-0c6d-7161-a408-6b1fa61c8f2d",
+        codex_profile_material=material,
+        codex_executable=pinned,
+    )
+    argv = shlex.split(provider._build_codex_command())
+    assert argv[0] == pinned
+    assert argv.count("codex") == 0  # the bare name never appears as an argv
+    assert argv[-2:] == ["resume", "019fb17d-0c6d-7161-a408-6b1fa61c8f2d"]
+
+
+def test_legacy_provider_without_pinned_executable_keeps_bare_codex(tmp_path):
+    """Direct/unit construction without the pre-task seam still launches
+    ``codex`` (legacy ambient form); the pin is additive, never guessed."""
+    canonical = os.path.realpath(str(tmp_path))
+    profile = SimpleNamespace(codexProfile=None, codexConfig=None, model=None)
+    material = {
+        "profile": profile,
+        "allowed_tools": ["*"],
+        "system_prompt": "",
+        "mcp_servers": [],
+    }
+    provider = CodexProvider(
+        "terminal-1",
+        "session-1",
+        "window-1",
+        trusted_project_root=canonical,
+        native_session_id="019fb17d-0c6d-7161-a408-6b1fa61c8f2d",
+        codex_profile_material=material,
+    )
+    assert shlex.split(provider._build_codex_command())[0] == "codex"
+
+
+# ---------------------------------------------------------------------------
+# P2: codexConfig.model wins over profile.model; sealed expected wins both
+# ---------------------------------------------------------------------------
+
+
+def _route_provider(profile, *, expected_model=None, expected_effort=None, **kwargs):
+    material = {
+        "profile": profile,
+        "allowed_tools": ["Read"],
+        "system_prompt": "instructions",
+        "mcp_servers": [],
+    }
+    return CodexProvider(
+        "terminal-1",
+        "session-1",
+        "window-1",
+        expected_model=expected_model,
+        expected_effort=expected_effort,
+        codex_profile_material=material,
+        **kwargs,
+    )
+
+
+def test_codexconfig_model_beats_profile_model_for_ordinary_route():
+    """The documented ordinary-route precedence: an explicit ``codexConfig
+    model`` override wins over the profile's own ``model`` field."""
+    profile = SimpleNamespace(
+        codexProfile=None,
+        codexConfig={"model": "config-model"},
+        model="profile-model",
+    )
+    provider = _route_provider(profile)
+    argv = shlex.split(provider._build_codex_command())
+    assert argv[argv.index("--model") + 1] == "config-model"
+
+
+def test_sealed_expected_model_beats_codexconfig_and_profile_models():
+    """A caller-sealed expected_model (managed-v2 sealed route) still wins
+    over both the codexConfig override and the profile model."""
+    profile = SimpleNamespace(
+        codexProfile=None,
+        codexConfig={"model": "config-model"},
+        model="profile-model",
+    )
+    provider = _route_provider(profile, expected_model="sealed-model")
+    argv = shlex.split(provider._build_codex_command())
+    assert argv[argv.index("--model") + 1] == "sealed-model"
+
+
+def test_codexconfig_model_alone_selects_route_when_profile_model_empty():
+    profile = SimpleNamespace(
+        codexProfile=None,
+        codexConfig={"model": "config-model"},
+        model=None,
+    )
+    provider = _route_provider(profile)
+    argv = shlex.split(provider._build_codex_command())
+    assert argv[argv.index("--model") + 1] == "config-model"
+
+
+def test_profile_model_still_selected_when_no_codexconfig_model():
+    profile = SimpleNamespace(
+        codexProfile=None,
+        codexConfig={"model_reasoning_effort": "high"},
+        model="profile-model",
+    )
+    provider = _route_provider(profile)
+    argv = shlex.split(provider._build_codex_command())
+    assert argv[argv.index("--model") + 1] == "profile-model"

@@ -1,10 +1,10 @@
-"""M3-A / cond-0377: roster schema fidelity (PR #91 review).
+"""Roster schema fidelity regression coverage.
 
-- ``i-0014``: the roster partial unique indexes are declared in ORM
+- The roster partial unique indexes are declared in ORM
   metadata, so ``Base.metadata.create_all`` and the production startup
   migration enforce equivalent native-lineage and incarnation
   uniqueness.
-- ``i-0018``: the raw legacy/draft migration has direct regression
+- The raw legacy/draft migration has direct regression
   coverage — idempotent rerun, row preservation, expected columns, and
   the exact partial-index set.
 """
@@ -47,7 +47,7 @@ def _assert_index_set(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# i-0014: ORM metadata parity with the production migration
+# ORM metadata parity with the production migration
 # ---------------------------------------------------------------------------
 
 
@@ -120,7 +120,7 @@ def test_init_db_creates_equivalent_roster_schema(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# i-0018: legacy/draft migration regression
+# Legacy/draft migration regression
 # ---------------------------------------------------------------------------
 
 
