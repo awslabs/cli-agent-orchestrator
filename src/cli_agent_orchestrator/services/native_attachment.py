@@ -79,6 +79,9 @@ ACQUISITION_ACP_BOOTSTRAP = "zero_prompt_acp_bootstrap"
 # it ACP would make the durable attachment receipt claim a route that was not
 # used.
 ACQUISITION_ZERO_TURN_BOOTSTRAP = "zero_turn_provider_bootstrap"
+#: A controlled model turn (e.g. print-mode initial prompt) minted the persistent
+#: session before TUI attachment.
+ACQUISITION_CONTROLLED_BOOTSTRAP_TURN = "controlled_bootstrap_turn"
 ACQUISITION_RESUME = "pinned_resume"
 #: The id was *chosen* by this system and handed to the provider at launch
 #: rather than obtained from it.  Distinct from the other two because both
@@ -91,6 +94,7 @@ ACQUISITION_METHODS = frozenset(
     {
         ACQUISITION_ACP_BOOTSTRAP,
         ACQUISITION_ZERO_TURN_BOOTSTRAP,
+        ACQUISITION_CONTROLLED_BOOTSTRAP_TURN,
         ACQUISITION_RESUME,
         ACQUISITION_CHOSEN_SESSION_ID,
     }

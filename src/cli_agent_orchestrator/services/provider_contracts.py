@@ -36,7 +36,8 @@ PROVIDER_CODEX = "codex"
 PROVIDER_KIMI = "kimi"
 PROVIDER_CLAUDE = "claude"
 PROVIDER_MUSE = "muse"
-PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE, PROVIDER_MUSE)
+PROVIDER_ANTIGRAVITY = "antigravity"
+PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE, PROVIDER_MUSE, PROVIDER_ANTIGRAVITY)
 
 #: The *canonical wire keys*, which are a different namespace from the
 #: three above. Those name the executable and key the version-pin tables;
@@ -49,6 +50,7 @@ PROVIDER_CODEX_WIRE = "codex"
 PROVIDER_KIMI_CLI = "kimi_cli"
 PROVIDER_CLAUDE_CODE = "claude_code"
 PROVIDER_MUSE_CLI = "muse_cli"
+PROVIDER_ANTIGRAVITY_CLI = "antigravity_cli"
 
 #: Version-enforcement modes for the provider-version policy.
 #:
@@ -80,6 +82,7 @@ VERSION_ENFORCEMENT_MODE: dict[str, str] = {
     PROVIDER_KIMI: VERSION_ENFORCEMENT_OPEN,
     PROVIDER_CLAUDE: VERSION_ENFORCEMENT_OPEN,
     PROVIDER_MUSE: VERSION_ENFORCEMENT_OPEN,
+    PROVIDER_ANTIGRAVITY: VERSION_ENFORCEMENT_OPEN,
 }
 
 # Runtime configuration is documented in the short provider vocabulary
@@ -95,6 +98,8 @@ _VERSION_ENV_SUFFIX: dict[str, str] = {
     PROVIDER_CLAUDE_CODE: "CLAUDE",
     PROVIDER_MUSE: "MUSE",
     PROVIDER_MUSE_CLI: "MUSE",
+    PROVIDER_ANTIGRAVITY: "ANTIGRAVITY",
+    PROVIDER_ANTIGRAVITY_CLI: "ANTIGRAVITY",
 }
 
 # The launch layer uses wire identifiers, while the default policy table is
@@ -105,6 +110,7 @@ _VERSION_POLICY_KEY: dict[str, str] = {
     PROVIDER_KIMI_CLI: PROVIDER_KIMI,
     PROVIDER_CLAUDE_CODE: PROVIDER_CLAUDE,
     PROVIDER_MUSE_CLI: PROVIDER_MUSE,
+    PROVIDER_ANTIGRAVITY_CLI: PROVIDER_ANTIGRAVITY,
 }
 
 #: The single *current* pin per provider: the version a fresh mint/proof
@@ -119,6 +125,7 @@ PINNED_VERSIONS = {
     PROVIDER_KIMI: "0.34.0",
     PROVIDER_CLAUDE: "2.1.220",
     PROVIDER_MUSE: "0.1.0",
+    PROVIDER_ANTIGRAVITY: "1.1.11",
 }
 
 #: Every exact version accepted for a provider, current first.  A tuple of
@@ -211,7 +218,9 @@ SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
     PROVIDER_KIMI: ("0.34.0", "0.33.0", "0.32.0", "0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0"),
     PROVIDER_CLAUDE: ("2.1.220",),
     PROVIDER_MUSE: ("0.1.0",),
+    PROVIDER_ANTIGRAVITY: ("1.1.11",),
 }
+
 # The current pin must always be an accepted version — asserted here so the
 # two maps cannot silently drift apart.
 assert all(
@@ -287,6 +296,8 @@ NATIVE_ID_SOURCES = {
     # the id source is the minted session id, chosen before any provider
     # I/O exactly like Claude's.
     PROVIDER_MUSE: "cli_session_id",
+    PROVIDER_ANTIGRAVITY: "controlled_bootstrap_turn",
+    PROVIDER_ANTIGRAVITY_CLI: "controlled_bootstrap_turn",
 }
 
 #: The reserved ``expected_effort`` meaning "this route selects no effort;
@@ -697,6 +708,24 @@ def validate_resume_argv(provider: str, argv: list[str]) -> ResumeForm:
                 raise ResumeFormRefused("muse resume native id must be a canonical lowercase UUID")
             return ResumeForm(provider, tuple(args), native_id)
         raise ResumeFormRefused("muse resume accepts exactly `muse resume <id>`")
+    if provider in (PROVIDER_ANTIGRAVITY, PROVIDER_ANTIGRAVITY_CLI):
+        conv_idx = -1
+        for i, arg in enumerate(args):
+            if arg == "--conversation" and i + 1 < len(args):
+                conv_idx = i + 1
+                break
+        if conv_idx != -1 and args[conv_idx] and not args[conv_idx].startswith("-"):
+            native_id = args[conv_idx]
+            try:
+                parsed = _uuid_module.UUID(native_id)
+            except ValueError as exc:
+                raise ResumeFormRefused(
+                    f"antigravity resume native id must be a canonical UUID; got {native_id!r}"
+                ) from exc
+            if str(parsed) != native_id:
+                raise ResumeFormRefused("antigravity resume native id must be a canonical lowercase UUID")
+            return ResumeForm(provider, tuple(args), native_id)
+        raise ResumeFormRefused("antigravity resume accepts `--conversation <uuid>`")
     raise ResumeFormRefused("claude resume accepts exactly `--resume <uuid>`")
 
 

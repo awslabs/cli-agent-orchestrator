@@ -816,7 +816,7 @@ async def test_unmanaged_antigravity_new_launch_binds_pre_task_identity(
     def _mock_mint(*args, **kwargs):
         return {
             "native_session_id": native_id,
-            "acquisition_method": roster.ACQUISITION_ZERO_TURN_BOOTSTRAP,
+            "acquisition_method": roster.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN,
             "working_directory": kwargs.get("working_directory", "/tmp"),
             "model": kwargs.get("expected_model") or "",
             "effort": kwargs.get("expected_effort") or "",
@@ -833,6 +833,7 @@ async def test_unmanaged_antigravity_new_launch_binds_pre_task_identity(
     lineage = agent["current_lineage"]
     assert lineage["native_session_id"] == native_id
     assert lineage["harness"] == "antigravity_cli"
+    assert lineage["acquisition_method"] == roster.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN
     from cli_agent_orchestrator.clients import database
 
     assert database.get_terminal_metadata("test1234")["native_session_id"] == native_id
@@ -843,6 +844,28 @@ def test_antigravity_launch_argv_resumes_minted_id():
 
     sid = str(uuid.uuid4())
     provider = AntigravityCliProvider("t1", "cao-s", "w1", native_session_id=sid, model="gemini-3.6-flash", effort="high")
+    command = provider._build_agy_command()
+    assert f"--conversation {sid}" in command
+    assert "--model gemini-3.6-flash" in command
+    assert "--effort high" in command
+    assert "-i" not in command
+
+
+def test_provider_manager_creates_antigravity_provider_with_native_id_and_effort():
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    manager = ProviderManager()
+    sid = str(uuid.uuid4())
+    provider = manager.create_provider(
+        "antigravity_cli",
+        "t1",
+        "cao-s",
+        "w1",
+        agent_profile="implementer-gemini",
+        native_session_id=sid,
+        expected_model="gemini-3.6-flash",
+        expected_effort="high",
+    )
     command = provider._build_agy_command()
     assert f"--conversation {sid}" in command
     assert "--model gemini-3.6-flash" in command

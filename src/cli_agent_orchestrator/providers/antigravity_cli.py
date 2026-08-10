@@ -271,6 +271,10 @@ class AntigravityCliProvider(BaseProvider):
 
         command_parts = ["agy", "--dangerously-skip-permissions"]
 
+        log_file = Path.home() / ".gemini" / "antigravity-cli" / "log" / f"terminal_{self.terminal_id}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        command_parts.extend(["--log-file", str(log_file)])
+
         if self._native_session_id:
             command_parts.extend(["--conversation", self._native_session_id])
 
@@ -542,8 +546,68 @@ class AntigravityCliProvider(BaseProvider):
                 f"Antigravity CLI initialization timed out after {ready_timeout} seconds"
             )
 
+        # Verify that the running process owns self._native_session_id.
+        self._verify_running_conversation_id()
+
         self._initialized = True
         return True
+
+    def _verify_running_conversation_id(self) -> None:
+        """Verify that the running agy process actually owns self._native_session_id.
+
+        Raises ProviderError if the requested ID was ignored, missing, or mismatched.
+        """
+        if not self._native_session_id:
+            return
+
+        req_id = self._native_session_id
+        log_file = Path.home() / ".gemini" / "antigravity-cli" / "log" / f"terminal_{self.terminal_id}.log"
+        default_log = Path.home() / ".gemini" / "antigravity-cli" / "cli.log"
+
+        logs_to_check = [p for p in (log_file, default_log) if p.exists()]
+        observed_id = None
+        found_requested = False
+
+        for path in logs_to_check:
+            try:
+                content = path.read_text(errors="ignore")
+                if f"Conversation {req_id} not found" in content or "ignoring --conversation flag" in content:
+                    raise ProviderError(
+                        f"Antigravity CLI ignored requested conversation {req_id!r} (conversation not found on disk)"
+                    )
+                if f"found conversation {req_id}" in content or f"Conversation {req_id}" in content:
+                    found_requested = True
+                    break
+                matches = re.findall(r"(?:found|Created) conversation ([0-9a-fA-F-]+)", content)
+                if matches:
+                    observed_id = matches[-1]
+            except ProviderError:
+                raise
+            except Exception:
+                pass
+
+        lock_file = Path.home() / ".gemini" / "antigravity-cli" / "presence" / f"{req_id}.lock"
+        if lock_file.exists():
+            found_requested = True
+
+        output = get_backend().get_history(self.session_name, self.window_name)
+        if output:
+            clean = strip_terminal_escapes(output)
+            if f'conversation "{req_id}" not found' in clean or f'Conversation "{req_id}" not found' in clean:
+                raise ProviderError(
+                    f"Antigravity CLI ignored requested conversation {req_id!r} (warning displayed on terminal)"
+                )
+
+        if not found_requested and observed_id and observed_id != req_id:
+            raise ProviderError(
+                f"Antigravity CLI native session mismatch: requested {req_id!r}, "
+                f"but observed running conversation {observed_id!r}"
+            )
+
+        if not found_requested:
+            raise ProviderError(
+                f"Antigravity CLI failed to verify native session {req_id!r} on startup"
+            )
 
     # ------------------------------------------------------------------ #
     # Status detection

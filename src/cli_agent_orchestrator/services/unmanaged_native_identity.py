@@ -232,6 +232,8 @@ def _effective_codex_route(
 
 def _mint_antigravity_session(
     *,
+    terminal_id: str,
+    session_name: str,
     working_directory: str,
     expected_model: Optional[str],
     expected_effort: Optional[str],
@@ -239,8 +241,17 @@ def _mint_antigravity_session(
     environment: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+    from cli_agent_orchestrator.providers.antigravity_cli import SECURITY_PROMPT
+    from cli_agent_orchestrator.utils.skill_injection import apply_skill_prompt
 
     executable = _resolve_executable("antigravity_cli")
+    digest = _binary_sha256(executable)
+    env = _bootstrap_environment(
+        terminal_id=terminal_id,
+        session_name=session_name,
+        forwarded_environment=environment,
+    )
+    version_output = _version_output("antigravity_cli", executable, env)
 
     profile = None
     if agent_profile:
@@ -255,6 +266,14 @@ def _mint_antigravity_session(
     effort = expected_effort or ""
 
     system_prompt = (getattr(profile, "system_prompt", None) or "") if profile else ""
+    if system_prompt:
+        system_prompt = apply_skill_prompt(system_prompt)
+        allowed_tools = getattr(profile, "allowedTools", None) or []
+        if allowed_tools and "*" not in allowed_tools:
+            system_prompt = (
+                f"{system_prompt}\n\n{SECURITY_PROMPT}" if system_prompt else SECURITY_PROMPT
+            )
+
     role_name = (getattr(profile, "name", None) or "agent") if profile else "agent"
     guarded_prompt = (
         f"{system_prompt}\n\n---\n"
@@ -274,7 +293,6 @@ def _mint_antigravity_session(
     if effort:
         cmd.extend(["--effort", effort])
 
-    env = dict(environment or os.environ)
     try:
         res = subprocess.run(
             cmd,
@@ -313,10 +331,19 @@ def _mint_antigravity_session(
         "working_directory": working_directory,
         "model": model,
         "effort": effort,
+        "executable_path": executable,
+        "executable_hash": digest,
+        "executable_version": version_output,
+        "agent_profile": agent_profile,
+        "role": getattr(profile, "role", None) if profile else None,
         "bootstrap": {
             "provider": "antigravity_cli",
             "conversation_id": cid,
+            "id_source": provider_contracts.native_id_source(provider_contracts.PROVIDER_ANTIGRAVITY_CLI),
             "working_directory": working_directory,
+            "executable": executable,
+            "executable_hash": digest,
+            "executable_version": version_output,
             "duration_seconds": data.get("duration_seconds", 0),
         },
     }
@@ -328,25 +355,13 @@ def resolve_pre_task_identity(
     working_directory: Optional[str],
     expected_model: Optional[str],
     expected_effort: Optional[str],
-    codex_profile_material: Optional[Mapping[str, Any]],
-    forwarded_environment: Optional[Mapping[str, str]],
     terminal_id: str,
     session_name: str,
     agent_profile: Optional[str] = None,
+    codex_profile_material: Optional[Mapping[str, Any]] = None,
+    forwarded_environment: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
-    """Resolve the deterministic harness-native session id for an unmanaged
-    new launch, BEFORE the provider starts.
-
-    ``codex_profile_material`` is the EXACT material ``create_terminal``
-    resolved once from the already-loaded profile (developer instructions,
-    resolved MCP servers, tool policy) — the same core args the resumed TUI
-    consumes; it is never reloaded here.  ``forwarded_environment`` is the
-    effective env overlay the pane received (operator ``env_vars`` + persisted
-    session env, merged with the backend's new/existing semantics), so the
-    bootstrap subprocess and the pane agree byte-for-byte on the environment
-    (cond-0377a).
-
-    Returns a bounded evidence record:
+    """Resolve pre-task native identity for an activated ordinary launch.
 
     ``native_session_id``   the exact id the TUI must resume/attach
     ``acquisition_method``  how the id came to exist (chosen / bootstrap)
@@ -386,6 +401,8 @@ def resolve_pre_task_identity(
 
     if provider == "antigravity_cli":
         return _mint_antigravity_session(
+            terminal_id=terminal_id,
+            session_name=session_name,
             working_directory=canonical_cwd,
             expected_model=expected_model,
             expected_effort=expected_effort,

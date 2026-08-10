@@ -19,6 +19,7 @@ Terminal Workflow:
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -1532,13 +1533,30 @@ def _pre_task_bind_and_resolve(
         )
     from cli_agent_orchestrator.services import stable_agent_roster
 
+    route_data = {
+        k: v
+        for k, v in {
+            "model": identity.get("model"),
+            "effort": identity.get("effort"),
+            "executable_path": identity.get("executable_path"),
+            "executable_hash": identity.get("executable_hash"),
+            "executable_version": identity.get("executable_version"),
+            "working_directory": identity.get("working_directory"),
+            "agent_profile": identity.get("agent_profile"),
+            "role": identity.get("role"),
+        }.items()
+        if v
+    }
+    route_prov: dict[str, Any] = {"issuance_source": identity["acquisition_method"]}
+    if route_data:
+        route_prov["provider_route"] = json.dumps(route_data, sort_keys=True)[:512]
     stable_agent_roster.record_native_identity(
         terminal_id=terminal_id,
         generation=terminal_generation,
         native_session_id=identity["native_session_id"],
         harness=provider,
         acquisition_method=identity["acquisition_method"],
-        route_provenance={"issuance_source": identity["acquisition_method"]},
+        route_provenance=route_prov,
         continuity_note=unmanaged_native_identity.PRE_TASK_IDENTITY_CAPTURED,
     )
     return identity
