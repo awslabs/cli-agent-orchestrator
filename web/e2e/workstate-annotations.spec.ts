@@ -332,7 +332,8 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await stubBackend(page, {
       annotations: payload([
         annotation({
-          kind: "work-state.display",
+          namespace: "cao.work-state",
+          kind: "work-item",
           label: "waiting",
           semantic_role: "warning",
           priority: 80,
@@ -354,11 +355,12 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await expect(chip).toContainText("waiting");
     // The parked age is on the chip's own face, not only in the hover.
     await expect(chip).toContainText(/2d/);
-    // Alongside, never instead of: the fork's own badge is still on the row.
+    // The current durable checkpoint refines the managed headline while the
+    // raw fork/provider observation remains available in its hover evidence.
     // Two levels up — the chips live in their own group wrapper so they can
     // drop to a second line at 390px without shrinking the identity row.
     const row = chip.locator("xpath=../..");
-    await expect(row.getByText("Managed Live")).toBeVisible();
+    await expect(row.getByText("Managed Parked")).toBeVisible();
     // THE ROW STILL SAYS WHICH WORKER IT IS. At 390 a single chip used to
     // delete the agent-profile name outright and clip the rest off the card.
     const profile = row.getByText("spec-writer-k3");
@@ -379,13 +381,14 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await assertNoSeriousAxeViolations(page, '[data-testid="annotation-chip"]');
   });
 
-  test("(b) an active worker reads as active, in the info role", async ({
+  test("(b) an open round does not overclaim current model activity", async ({
     page,
   }, testInfo) => {
     await stubBackend(page, {
       annotations: payload([
         annotation({
-          kind: "work-state.display",
+          namespace: "cao.work-state",
+          kind: "work-item",
           label: "active",
           semantic_role: "info",
           priority: 90,
@@ -405,7 +408,8 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await expect(chip).toBeVisible();
     await expect(chip).toHaveAttribute("data-role", "info");
     await expect(chip).toHaveAttribute("data-stale", "false");
-    await expect(chip).toContainText("active");
+    await expect(chip).toContainText("round open");
+    await expect(page.getByText("Managed Active").first()).toBeVisible();
 
     await page.screenshot({
       path: `${SHOTS}/${testInfo.project.name}-b-active-worker.png`,
@@ -418,7 +422,8 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await stubBackend(page, {
       annotations: payload([
         annotation({
-          kind: "work-state.display",
+          namespace: "cao.work-state",
+          kind: "work-item",
           label: "blocked",
           // A danger role that has expired: the whole point is that it does NOT
           // keep its alarming colour.
@@ -480,7 +485,8 @@ test.describe("conductor annotation chips (§9.5)", () => {
           details: { dependencies: "route-domain breaker", since: hoursAgo(30) },
         }),
         annotation({
-          kind: "work-state.display",
+          namespace: "cao.work-state",
+          kind: "work-item",
           label: "orphaned run",
           semantic_role: "neutral",
           priority: 40,
@@ -519,7 +525,7 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await assertNoSeriousAxeViolations(page, '[data-testid="campaign-annotations"]');
   });
 
-  test("(e) the no-annotations control renders exactly as today", async ({
+  test("(e) the no-annotations control derives recent managed activity from the pane", async ({
     page,
   }, testInfo) => {
     // The stub's default is the §9.5 "no conductor installed" answer, which is
@@ -530,10 +536,10 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await expect(page.getByText("cao-fleet")).toBeVisible();
     await expect(page.getByTestId("annotation-chip")).toHaveCount(0);
     await expect(page.getByTestId("campaign-annotations")).toHaveCount(0);
-    // The fork's own surface is untouched: the status badge is still the row's
-    // only statement about this worker.
+    // Without conductor annotations, the fork can still make the brief active
+    // claim from the projected 10-second pane-render clock.
     await expect(
-      page.locator("#session-cao-fleet-terminals").getByText("Managed Live"),
+      page.locator("#session-cao-fleet-terminals").getByText("Managed Active"),
     ).toBeVisible();
 
     await page.screenshot({
@@ -1231,7 +1237,9 @@ test.describe("conductor annotation chips (§9.5)", () => {
 
     const chip = page.getByTestId("annotation-chip").first();
     await expect(chip).toBeVisible();
-    await chip.hover();
+    // Use the chip's own edge rather than the centre of its truncated child
+    // label, so this exercises the anchor's pointer contract deterministically.
+    await chip.hover({ position: { x: 2, y: 2 } });
     const card = page.getByTestId("annotation-hovercard");
     await expect(card).toBeVisible();
 
