@@ -140,29 +140,40 @@ def status_panel_rows(
     directory: Optional[str] = None,
     run: str = "idle",
     tokens: str = "0 tokens / 0 turns",
-    reasoning: Optional[str] = MUSE_EFFORT,  # None = the line is absent
+    #: The effort rendered inside the Model line as the exact installed
+    #: `` (reasoning <effort>)`` suffix; ``None`` renders a bare model.
+    reasoning: Optional[str] = MUSE_EFFORT,
+    #: An optional separate ``Reasoning:`` row (a separately-supported
+    #: panel variant); ``None`` renders no such row.
+    reasoning_line: Optional[str] = None,
+    reasoning_label: str = "Reasoning:",
     session_line: Optional[str] = None,
 ) -> list[str]:
     """The ``/status`` panel rows, in the installed 0.1.0 rendering.
 
-    The coordinator no-prompt canary on 2026-08-10 rendered this exact
-    panel for a meta session: model, reasoning effort, agent profile,
-    provider, cwd, session, idle run, and zero tokens/turns.  The echo
-    provider's panel omits the Reasoning line, so the parser must treat it
-    as present-when-rendered.
+    The coordinator no-prompt canary on 2026-08-10 rendered the meta panel
+    with model and effort in ONE line::
+
+        Model: muse-spark-1.2-contributor (reasoning high)
+
+    (there is no separate Reasoning row).  The echo provider renders a
+    bare model with no effort at all.  ``reasoning_line``/``reasoning_label``
+    let a test build the separate-row variant some builds render, so the
+    parser's duplicate-source handling can be exercised.
     """
     width = 45
     directory = directory or str(worktree)
+    model_value = f"{model} (reasoning {reasoning})" if reasoning is not None else model
     rows = [
         "  Muse Code 0.1.0",
         "",
         "╭" + "─" * (width + 2) + "╮",
         "│  >_ Muse Code (0.1.0)" + " " * (width - 20) + " │",
         "│" + " " * (width + 2) + "│",
-        f"│  Model:{model:>{width - 7}} │",
+        f"│  Model:{model_value:>{width - 7}} │",
     ]
-    if reasoning is not None:
-        rows.append(f"│  Reasoning:{reasoning:>{width - 11}} │")
+    if reasoning_line is not None:
+        rows.append(f"│  {reasoning_label}{reasoning_line:>{width - len(reasoning_label) - 1}} │")
     rows += [
         f"│  Agent profile:{agent_profile:>{width - 14}} │",
         f"│  Model provider:{provider:>{width - 15}} │",
@@ -319,8 +330,66 @@ def test_status_parser_accepts_the_coordinator_canary_panel():
     assert required["idle"] is True
 
 
-def test_status_parser_accepts_a_panel_without_a_reasoning_line():
-    """The echo provider omits the Reasoning line; the parse must not fail."""
+def test_status_parser_splits_the_combined_model_reasoning_line():
+    """The installed meta panel renders effort inside the Model line."""
+    session_id = muse_native_launch.mint_session_id()
+    parsed = muse_native_status.parse_status_panel(
+        status_panel_rows(None, session_id, directory="/worktree")
+    )
+    assert parsed["model"] == MUSE_MODEL
+    assert parsed["reasoning"] == MUSE_EFFORT
+
+
+def test_status_parser_refuses_duplicate_required_singleton_fields():
+    """More than one Model/Session/... line is ambiguity, never ``[0]``."""
+    session_id = muse_native_launch.mint_session_id()
+    rows = status_panel_rows(None, session_id)
+    rows.insert(6, "│  Model:                 muse-other                  │")
+    with pytest.raises(muse_native_status.MuseStatusParseError):
+        muse_native_status.parse_status_panel(rows)
+    # A second Session line is the same refusal, now for the same reason.
+    rows2 = status_panel_rows(None, session_id)
+    rows2.insert(8, "│  Session:              another-session-id         │")
+    with pytest.raises(muse_native_status.MuseStatusParseError):
+        muse_native_status.parse_status_panel(rows2)
+
+
+def test_status_parser_refuses_a_malformed_reasoning_suffix():
+    """An empty or unknown reasoning effort is refused, never guessed."""
+    session_id = muse_native_launch.mint_session_id()
+    for bad in ("", " "):
+        rows = status_panel_rows(None, session_id, reasoning=bad)
+        with pytest.raises(muse_native_status.MuseStatusParseError):
+            muse_native_status.parse_status_panel(rows)
+    # An unknown effort inside an exact-looking suffix is refused.
+    rows = status_panel_rows(
+        None, session_id, model=f"{MUSE_MODEL} (reasoning banana)", reasoning=None
+    )
+    with pytest.raises(muse_native_status.MuseStatusParseError):
+        muse_native_status.parse_status_panel(rows)
+
+
+def test_status_parser_keeps_arbitrary_parenthetical_text_in_the_model():
+    """A parenthetical that is not the exact reasoning form is not split."""
+    session_id = muse_native_launch.mint_session_id()
+    rows = status_panel_rows(None, session_id, model=f"{MUSE_MODEL} (preview)", reasoning=None)
+    parsed = muse_native_status.parse_status_panel(rows)
+    assert parsed["model"] == f"{MUSE_MODEL} (preview)"
+    assert parsed["reasoning"] is None
+
+
+def test_duplicate_reasoning_sources_converge_or_refuse():
+    """Model-suffix and separate-label reasoning converge or refuse as one."""
+    session_id = muse_native_launch.mint_session_id()
+    same = status_panel_rows(None, session_id, reasoning=MUSE_EFFORT, reasoning_line=MUSE_EFFORT)
+    assert muse_native_status.parse_status_panel(same)["reasoning"] == MUSE_EFFORT
+    conflict = status_panel_rows(None, session_id, reasoning=MUSE_EFFORT, reasoning_line="low")
+    with pytest.raises(muse_native_status.MuseStatusParseError):
+        muse_native_status.parse_status_panel(conflict)
+
+
+def test_status_parser_accepts_a_panel_with_a_bare_model():
+    """The echo provider renders a bare model with no effort at all."""
     session_id = muse_native_launch.mint_session_id()
     parsed = muse_native_status.parse_status_panel(
         status_panel_rows(None, session_id, reasoning=None)

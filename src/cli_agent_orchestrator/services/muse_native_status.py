@@ -6,21 +6,28 @@ panel rather than from a SessionStart hook (Claude) or a minting bootstrap
 running session, model, reasoning effort, agent profile, provider, cwd, and
 pre-task run state — the coordinator no-prompt canary on 2026-08-10 rendered
 exactly this panel for a launched ``muse resume <id>`` session (exact
-session ``adcb742e-2ab5-4239-9fe2-b503005db341``, model
-``muse-spark-1.2-contributor``, reasoning ``high``, agent profile
+session ``adcb742e-2ab5-4239-9fe2-b503005db341``, agent profile
 ``native-basic``, provider ``meta``, exact cwd, ``Run: idle``,
 ``0 tokens / 0 turns``).
+
+The installed 0.1.0-R708.1 meta panel renders model and effort together in
+one line::
+
+    Model: muse-spark-1.2-contributor (reasoning high)
+
+There is no separate Reasoning row on that build; the echo provider renders
+a bare model with no effort at all.  The parser therefore splits an exact
+trailing `` (reasoning <effort>)`` suffix off the Model value into canonical
+``model`` and ``reasoning`` fields, and treats a separate
+``Reasoning:``/``Reasoning effort:`` row (a separately-supported variant)
+as an additional source that must converge with the suffix or be refused as
+ambiguous.
 
 The panel is *printed output*: Muse writes it into the output area and the
 composer line stays rendered at the bottom, so no modal dismiss is required
 after observation.  That is also why the parse is strict: a panel that is
 missing, ambiguous, truncated, or naming anything other than the minted
 session is not readiness, and nothing is admitted on it.
-
-The Reasoning line is present on the meta provider (the canary read it back)
-and absent on the echo provider, so the parser treats it as
-present-when-rendered and the caller requires it exactly when an effort was
-requested.
 """
 
 from __future__ import annotations
@@ -46,11 +53,12 @@ DEFAULT_AGENT_PROFILE = "native-basic"
 #: bootstrap and the readiness receipt.
 STATUS_PANEL_SCHEMA = "cao-muse-status-panel-v1"
 
-#: Panel row labels.  The Reasoning label is the meta provider's rendering
-#: of the requested effort; the alternate spelling is accepted because the
-#: coordinator canary recorded the value ("reasoning high") without a
-#: machine capture of the exact label, and a panel that renders the value
-#: under either label is the same evidence.
+#: Panel row labels for a *separate* reasoning row.  The installed
+#: 0.1.0-R708.1 meta panel does NOT render one — it puts the effort inside
+#: the Model line — but some builds do, and a duplicate source must be
+#: handled strictly (identical values converge; conflicting values refuse
+#: as ambiguous) rather than ignored.  Both spellings are accepted because
+#: a panel that renders the value under either label is the same evidence.
 _REASONING_LABELS = ("Reasoning:", "Reasoning effort:")
 
 _REQUIRED_LABELS = (
@@ -63,10 +71,63 @@ _REQUIRED_LABELS = (
     "Token usage:",
 )
 
+#: The exact reasoning-effort vocabulary the installed build accepts for
+#: ``--reasoning-effort`` (``muse --help``).  A suffix or separate value
+#: outside this set is malformed evidence and is refused, never guessed.
+_MUSE_EFFORT_VOCABULARY = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "ultra"})
+
+#: The exact trailing `` (reasoning <effort>)`` suffix the installed meta
+#: panel appends to the Model value.  Only this exact form is split off;
+#: any other parenthetical remains part of the model value.
+_REASONING_SUFFIX = re.compile(r"^(.*?)\s+\(reasoning\s+([^()]*)\)$")
+
 #: Pre-task state required before any durable readiness may be published:
 #: the panel's own statement that the session is idle with zero turns.
 PRE_TASK_RUN_STATE = "idle"
 PRE_TASK_TOKEN_USAGE = (0, 0)
+
+
+def _split_model_reasoning(value: str) -> tuple[str, Optional[str]]:
+    """Split an optional exact `` (reasoning <effort>)`` suffix off a Model.
+
+    Only the exact installed form is split; any other parenthetical is part
+    of the model value (never guessed at).  A suffix that looks like the
+    form but carries an empty or unknown effort is refused rather than
+    guessed, because binding a session on an effort nobody selected is the
+    failure this parse exists to prevent.
+    """
+    value = value.strip()
+    match = _REASONING_SUFFIX.fullmatch(value)
+    if match is None:
+        return value, None
+    model, effort = match.group(1).strip(), match.group(2).strip()
+    if not effort or effort not in _MUSE_EFFORT_VOCABULARY:
+        raise MuseStatusParseError(
+            f"the /status Model value carries a malformed reasoning suffix: {value!r}; "
+            "refusing rather than guessing an effort from arbitrary parenthetical text"
+        )
+    return model, effort
+
+
+def _converge_reasoning(sources: Sequence[Optional[str]]) -> Optional[str]:
+    """Converge identical reasoning values, or refuse conflicting ones.
+
+    The model-line suffix and a separate Reasoning row are two sources for
+    the same fact.  Identical values agree and converge; conflicting values
+    mean the capture cannot prove which effort the session runs, so it is
+    refused as ambiguous rather than resolved by a guess.
+    """
+    present = [source for source in sources if source is not None]
+    if not present:
+        return None
+    first = present[0]
+    if any(source != first for source in present[1:]):
+        raise MuseStatusParseError(
+            "the /status panel reports conflicting reasoning values "
+            f"{sorted(set(present))}; refusing rather than guessing which is the "
+            "session's effort"
+        )
+    return first
 
 
 class MuseStatusParseError(ValueError):
@@ -94,10 +155,18 @@ def _strip_panel_row(row: str) -> str:
 def parse_status_panel(rows: Sequence[str]) -> dict[str, Any]:
     """Parse one ``/status`` capture into typed fields, or refuse.
 
+    The Model value may carry the installed `` (reasoning <effort>)``
+    suffix, which is split into the canonical ``model`` and ``reasoning``
+    fields.  A separate ``Reasoning:``/``Reasoning effort:`` row is an
+    additional source that must converge with the suffix or be refused as
+    ambiguous.
+
     Raises:
         MuseStatusParseError: The capture is empty, has no session line,
-            has more than one session line (ambiguous — the capture cannot
-            prove which session the pane runs), or lacks a required line.
+            has more than one of any required singleton line (including
+            the Session line — the capture cannot prove which session the
+            pane runs), carries a malformed reasoning suffix or value, or
+            lacks a required line.
     """
     fields: dict[str, list[str]] = {}
     reasoning_values: list[str] = []
@@ -115,16 +184,17 @@ def parse_status_panel(rows: Sequence[str]) -> dict[str, Any]:
                     fields.setdefault(label, []).append(row[len(label) :].strip())
                     break
 
-    session_lines = fields.get("Session:", [])
-    if not session_lines:
+    # Every required field is a singleton; a second one is ambiguity, never
+    # a value to pick.  The Session line is the identity and the rest are
+    # the route facts, and a capture that cannot prove any one of them
+    # proves nothing.
+    duplicates = [label for label, values in fields.items() if len(values) > 1]
+    if duplicates:
         raise MuseStatusParseError(
-            "the captured screen carries no /status Session line; the pane may still be "
-            "booting or the capture may be empty"
-        )
-    if len(session_lines) > 1:
-        raise MuseStatusParseError(
-            "the captured screen carries more than one /status Session line, so it cannot "
-            "prove which session the pane runs; refusing rather than guessing"
+            "the /status panel renders more than one "
+            + ", ".join(sorted(duplicates))
+            + " line, so it cannot prove the session it names; refusing rather than "
+            "choosing a value"
         )
     missing = [label for label in _REQUIRED_LABELS if label not in fields]
     if missing:
@@ -133,6 +203,20 @@ def parse_status_panel(rows: Sequence[str]) -> dict[str, Any]:
             + ", ".join(sorted(missing))
             + "; a truncated capture is not an observation"
         )
+
+    # Model + optional exact reasoning suffix, then the separate-row
+    # reasoning values (each validated against the effort vocabulary).
+    model, model_reasoning = _split_model_reasoning(fields["Model:"][0])
+    label_reasoning: list[Optional[str]] = []
+    for value in reasoning_values:
+        cleaned = value.strip()
+        if not cleaned or cleaned not in _MUSE_EFFORT_VOCABULARY:
+            raise MuseStatusParseError(
+                f"the /status reasoning value is not a known Muse effort: {value!r}; "
+                "refusing rather than guessing"
+            )
+        label_reasoning.append(cleaned)
+    reasoning = _converge_reasoning([model_reasoning, *label_reasoning])
 
     usage = fields["Token usage:"][0]
     match = re.fullmatch(r"(\d+)\s+tokens\s*/\s*(\d+)\s+turns", usage)
@@ -145,9 +229,9 @@ def parse_status_panel(rows: Sequence[str]) -> dict[str, Any]:
 
     return {
         "schema": STATUS_PANEL_SCHEMA,
-        "session_id": session_lines[0].strip(),
-        "model": fields["Model:"][0].strip(),
-        "reasoning": reasoning_values[0] if reasoning_values else None,
+        "session_id": fields["Session:"][0].strip(),
+        "model": model,
+        "reasoning": reasoning,
         "agent_profile": fields["Agent profile:"][0].strip(),
         "model_provider": fields["Model provider:"][0].strip(),
         "directory": fields["Directory:"][0].strip(),
