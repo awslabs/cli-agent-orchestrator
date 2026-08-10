@@ -383,17 +383,19 @@ per-item failures and reports how many were removed.
 
 ---
 
-## Stable-Agent Roster (read-only)
+## Stable-Agent Roster
 
 The roster is the fork-owned durable record of stable CAO agents, their
 harness-native conversation lineages, and their disposable physical
-incarnations.  All roster endpoints are **read-only**: they never mutate
-roster state.  The durable records are written by the launch seams
-(managed-v2 `bind_native`, unmanaged terminal creation, admission
-completion, teardown retirement) and by the native-identity repair seam.
+incarnations.  The roster read surface is **read-only** — it never
+mutates roster state — and the durable records are written by the launch
+seams (managed-v2 `bind_native`, unmanaged terminal creation, admission
+completion, teardown retirement) and by the **write-scoped**
+native-identity repair route documented below.
 
-All four routes require at least the **read** authorization scope
-(`cao:read`); write and admin scopes also satisfy them.  Legacy, missing,
+The four read routes require at least the **read** authorization scope
+(`cao:read`); write and admin scopes also satisfy them.  The repair
+`POST` requires the **write** or **admin** scope.  Legacy, missing,
 corrupt, or unknown-version rows are reported truthfully and never crash
 a read or audit.
 
@@ -492,6 +494,75 @@ unknown resume-contract versions, dangling current pointers, and
 agent/incarnation disposition inconsistencies — never fatal.  The audit
 never mutates roster state.
 
+### POST /roster/terminals/{terminal_id}/native-identity-repair
+
+**Dark/manual, write-scoped.**  Repair one currently live rostered
+terminal's missing native session id from its provider's exact
+panel-attested `/status`.  The operation proves the exact stored
+pane/session/window/process identity is live and the provider composer
+idle, types literal `/status` once under the canonical lifecycle claim
+set and the per-pane input lease, parses only the pinned
+provider/build identity fields, adopts an exclusive native-session
+attachment owner, and commits the terminal row, the roster lineage, and
+a bounded evidence digest atomically.  It is a manual health operation,
+never an automatic migration, reincarnation, or Pause/Stop behavior.
+
+Requires the **write** or **admin** authorization scope.
+
+**Request body** (all fields are strings; `operation_id` is required and
+must be a canonical lowercase UUID):
+
+```json
+{
+  "operation_id": "00000000-0000-4000-8000-0000000000bb",
+  "generation": "00000000-0000-4000-8000-000000000001",
+  "provider_version": "2.1.226",
+  "physical_occurrence": "00000000-0000-4000-8000-0000000000aa"
+}
+```
+
+- `operation_id` — explicit canonical UUID bound to a server-derived
+  digest of the immutable resolved request facts; an exact retry is
+  idempotent, a changed request is a typed conflict.
+- `generation` — expected model generation of a managed terminal; omit
+  for legacy rows (which have none).
+- `provider_version` — installed provider build that selects the
+  interaction plan; the panel-attested build is what is recorded.
+- `physical_occurrence` — the durable physical identity of the terminal
+  (its callback-target generation for a legacy row, or its model
+  generation for a managed row); required for legacy rows.
+
+**Response:** the typed outcome is returned directly as the body
+(not wrapped in the generic `{"detail": ...}` envelope — see the error
+format note below):
+
+```json
+{
+  "schema": "cao-native-status-repair-v1",
+  "status": "repaired",
+  "reason": null,
+  "detail": null,
+  "operation_id": "…",
+  "request_digest": "…",
+  "terminal_id": "…",
+  "generation": "…",
+  "native_session_id": "…",
+  "evidence_sha256": "…",
+  "parser_key": "…",
+  "task_bytes_submitted": false
+}
+```
+
+`status` is one of `repaired`, `already-known`, `identity-still-missing`
+(Kimi, before its first session-creating action), `refused`, or
+`errored`.  `repaired`, `already-known`, and `identity-still-missing`
+map to **200**; `refused` maps by its `reason` (400 for invalid
+input/unsupported build/missing generation or physical occurrence, 404
+for a missing terminal or roster incarnation, 409 for identity/version/
+attachment/binding conflicts, 503 for transient store or binding
+failures); `errored` maps to **500**.  The body never contains raw pane
+output, raw exceptions, or evidence from another operation.
+
 ## Error Responses
 
 All endpoints return standard HTTP status codes:
@@ -511,5 +582,13 @@ Error response format:
   "detail": "Error message"
 }
 ```
+
+**Exception:** the write-scoped
+`POST /roster/terminals/{terminal_id}/native-identity-repair` route
+returns its **typed outcome dict as the body** for every outcome —
+including refusals and errors — instead of the generic `{"detail": ...}`
+envelope, so a caller branches on the typed `status`/`reason` fields
+without re-deciding what happened.  It never leaks raw pane output, raw
+exceptions, or evidence from another operation.
 
 ---

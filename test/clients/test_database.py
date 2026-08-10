@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     Base,
     FlowModel,
@@ -1492,3 +1493,231 @@ class TestListPendingReceiverIdsOlderThanCrossVintage:
             assert result.status == MessageStatus.PENDING
             with pytest.raises(ValueError, match="not found"):
                 create_inbox_message("sender-1", "no-such-terminal", "hello")
+
+
+class TestSetTerminalNativeSessionIdConditional:
+    """Direct hermetic tests for the generation/occurrence-conditional
+    native-id writer's refusal and success branches."""
+
+    def _v2_row(self, session, *, generation="g1", lifecycle="live", native_id=None):
+        row = database.ManagedLaunchV2TerminalModel(
+            id="v2term",
+            tmux_session="cao-s",
+            tmux_window="w",
+            provider="claude_code",
+            generation=generation,
+            protocol_vintage="v2",
+            pane_id="%7",
+            window_id="@7",
+            server_socket_path="/tmp/s.sock",
+            v2_session_id="$1",
+            v2_pane_pid=4242,
+            v2_native_session_id=native_id,
+            v2_lifecycle_state=lifecycle,
+        )
+        session.add(row)
+        session.commit()
+        return row
+
+    def _legacy_row(self, session, *, callback_target="ct1", lifecycle="live", native_id=None):
+        row = database.TerminalModel(
+            id="legacyterm",
+            tmux_session="cao-s",
+            tmux_window="w",
+            provider="claude_code",
+            generation=None,
+            callback_target_generation=callback_target,
+            pane_id="%7",
+            window_id="@7",
+            server_socket_path="/tmp/s.sock",
+            session_id="$1",
+            pane_pid=4242,
+            native_session_id=native_id,
+            lifecycle_state=lifecycle,
+        )
+        session.add(row)
+        session.commit()
+        return row
+
+    def test_v2_exact_match_writes(self, test_db):
+        session = test_db()
+        self._v2_row(session)
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "v2term",
+                expected_generation="g1",
+                physical_occurrence="g1",
+                native_session_id="id-A",
+                db=session,
+            )
+            is True
+        )
+        session.refresh(session.query(database.ManagedLaunchV2TerminalModel).one())
+        assert (
+            session.query(database.ManagedLaunchV2TerminalModel).one().v2_native_session_id
+            == "id-A"
+        )
+
+    def test_v2_generation_mismatch_refuses(self, test_db):
+        session = test_db()
+        self._v2_row(session)
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "v2term",
+                expected_generation="g-other",
+                physical_occurrence="g-other",
+                native_session_id="id-A",
+                db=session,
+            )
+            is False
+        )
+        assert (
+            session.query(database.ManagedLaunchV2TerminalModel).one().v2_native_session_id is None
+        )
+
+    def test_v2_occurrence_mismatch_refuses(self, test_db):
+        session = test_db()
+        self._v2_row(session)
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "v2term",
+                expected_generation="g1",
+                physical_occurrence="not-the-generation",
+                native_session_id="id-A",
+                db=session,
+            )
+            is False
+        )
+
+    def test_v2_non_live_lifecycle_refuses(self, test_db):
+        session = test_db()
+        self._v2_row(session, lifecycle="dead")
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "v2term",
+                expected_generation="g1",
+                physical_occurrence="g1",
+                native_session_id="id-A",
+                db=session,
+            )
+            is False
+        )
+
+    def test_v2_existing_different_id_never_overwritten(self, test_db):
+        session = test_db()
+        self._v2_row(session, native_id="existing")
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "v2term",
+                expected_generation="g1",
+                physical_occurrence="g1",
+                native_session_id="id-A",
+                db=session,
+            )
+            is False
+        )
+        assert (
+            session.query(database.ManagedLaunchV2TerminalModel).one().v2_native_session_id
+            == "existing"
+        )
+
+    def test_v2_same_id_is_idempotent(self, test_db):
+        session = test_db()
+        self._v2_row(session, native_id="id-A")
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "v2term",
+                expected_generation="g1",
+                physical_occurrence="g1",
+                native_session_id="id-A",
+                db=session,
+            )
+            is True
+        )
+
+    def test_legacy_exact_match_writes(self, test_db):
+        session = test_db()
+        self._legacy_row(session)
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "legacyterm",
+                expected_generation=None,
+                physical_occurrence="ct1",
+                native_session_id="id-A",
+                db=session,
+            )
+            is True
+        )
+        assert session.query(database.TerminalModel).one().native_session_id == "id-A"
+
+    def test_legacy_missing_callback_target_refuses(self, test_db):
+        session = test_db()
+        self._legacy_row(session, callback_target=None)
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "legacyterm",
+                expected_generation=None,
+                physical_occurrence="ct1",
+                native_session_id="id-A",
+                db=session,
+            )
+            is False
+        )
+
+    def test_legacy_callback_target_mismatch_refuses(self, test_db):
+        session = test_db()
+        self._legacy_row(session)
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "legacyterm",
+                expected_generation=None,
+                physical_occurrence="other-ct",
+                native_session_id="id-A",
+                db=session,
+            )
+            is False
+        )
+
+    def test_legacy_non_live_lifecycle_refuses(self, test_db):
+        session = test_db()
+        self._legacy_row(session, lifecycle="dead")
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "legacyterm",
+                expected_generation=None,
+                physical_occurrence="ct1",
+                native_session_id="id-A",
+                db=session,
+            )
+            is False
+        )
+
+    def test_legacy_existing_different_id_refuses(self, test_db):
+        session = test_db()
+        self._legacy_row(session, native_id="existing")
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "legacyterm",
+                expected_generation=None,
+                physical_occurrence="ct1",
+                native_session_id="id-A",
+                db=session,
+            )
+            is False
+        )
+
+    def test_v1_managed_generation_mismatch_refuses(self, test_db):
+        session = test_db()
+        row = self._legacy_row(session)
+        row.generation = "g1"
+        session.commit()
+        assert (
+            database.set_terminal_native_session_id_conditional(
+                "legacyterm",
+                expected_generation="g-other",
+                physical_occurrence="g-other",
+                native_session_id="id-A",
+                db=session,
+            )
+            is False
+        )

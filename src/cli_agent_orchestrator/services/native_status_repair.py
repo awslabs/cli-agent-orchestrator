@@ -410,6 +410,18 @@ def parse_kimi_status(rows: Sequence[str], *, pinned_version: str = "0.34.0") ->
             "the Kimi status panel must render exactly one 'Session session_<uuid>' row"
         )
     if session_rows:
+        # A live session row is exclusive with the 'Session none' marker and
+        # any other Session row: a mixed capture (e.g. a stale 'Session
+        # none' remnant alongside the fresh row) is ambiguous, not a valid
+        # identity.
+        if any(
+            row.startswith("Session ") and not row.startswith("Session session_")
+            for row in normalized
+        ):
+            raise PanelParseError(
+                "the Kimi status panel mixes a live session row with another Session "
+                "row; a contradictory panel cannot prove the session it names"
+            )
         raw = session_rows[0][len("Session ") :].strip()
         uuid_part = raw[len("session_") :] if raw.startswith("session_") else raw
         _canonical_uuid(uuid_part, label="Kimi session id")
@@ -1472,6 +1484,11 @@ def _commit_repair(db: Any, facts: Mapping[str, Any]) -> Optional[Mapping[str, A
     recorded evidence when a concurrent exact retry committed the same
     operation id first (the idempotent-adopt case), else None.
     """
+    # The final exact-facts fence: every exact fact — terminal, lineage,
+    # managed binding identity/version, and the LIVE pane/server/process
+    # start marker — must still match immediately before the durable writes.
+    # A binding rewrite in the narrow final window, or a pane process that
+    # died/was recycled after the observation, refuses with zero mutation.
     _verify_exact_facts(
         db,
         terminal_id=facts["terminal_id"],
@@ -1485,6 +1502,17 @@ def _commit_repair(db: Any, facts: Mapping[str, Any]) -> Optional[Mapping[str, A
         pane_pid=facts["pane_pid"],
         process_identity=facts["process_identity"],
         expected_session_id=facts["session_id"],
+        expected_binding_native_id=facts.get("binding_native_id"),
+        expected_binding_version=facts.get("binding_provider_version"),
+    )
+    _verify_live_pane(
+        pane_id=facts["pane_id"],
+        window_id=facts["window_id"],
+        session_id=facts["tmux_session_id"],
+        server_socket_path=facts["server_socket_path"],
+        pane_pid=facts["pane_pid"],
+        process_identity=facts["process_identity"],
+        operation_id=facts["operation_id"],
     )
     written = database.set_terminal_native_session_id_conditional(
         terminal_id=facts["terminal_id"],
@@ -2001,6 +2029,12 @@ def _evidence_outcome(
     """
 
     def _conflict(detail: str) -> dict[str, Any]:
+        # A conflict about ANOTHER completed operation must never disclose
+        # that operation's stored evidence.  Until the caller's request is
+        # proven to bind to this exact evidence, only bounded conflict
+        # information and the caller's own resolved request facts are
+        # returned: no native session id, evidence digest, parser key, or
+        # provider/build from the stored record.
         return {
             "schema": REPAIR_SCHEMA,
             "status": STATUS_REFUSED,
@@ -2009,14 +2043,14 @@ def _evidence_outcome(
             "operation_id": operation_id,
             "request_digest": request_digest,
             "terminal_id": terminal_id,
-            "generation": evidence.get("generation"),
+            "generation": occurrence,
             "model_generation": generation,
             "physical_occurrence": occurrence,
-            "provider": evidence.get("provider"),
-            "provider_version": evidence.get("provider_version"),
-            "native_session_id": evidence.get("native_session_id"),
-            "evidence_sha256": evidence.get("evidence_sha256"),
-            "parser_key": evidence.get("parser_key"),
+            "provider": provider,
+            "provider_version": None,
+            "native_session_id": None,
+            "evidence_sha256": None,
+            "parser_key": None,
             "attachment": None,
             "composer_restored": None,
             "task_bytes_submitted": False,
@@ -2303,11 +2337,12 @@ def _repair_under_claims(
             provider, pane_id, plan, deadline=observation_deadline, operation_id=operation_id
         )
         if verdict["kind"] == "still-missing":
-            if known_id is not None:
+            if known_id is not None or ordinary_session is not None:
                 raise NativeStatusRepairConflict(
                     "identity-conflict",
-                    "a known native id exists but the Kimi panel renders no session; "
-                    "the known id could not be verified and nothing was mutated",
+                    "a known native id exists (including one recorded on the exact "
+                    "live owner) but the Kimi panel renders no session; the known id "
+                    "could not be verified and nothing was mutated",
                 )
             outcome = dict(base)
             outcome.update(
@@ -2494,9 +2529,11 @@ def _finish_repair(
     binding_version = binding["provider_version"] if binding else None
 
     # Revalidate every exact fact — including the terminal, lineage, and
-    # managed-binding native ids against the id about to be adopted —
-    # immediately before attachment adoption, so a drift after the
-    # observation cannot leave a wrong conservative claim.
+    # managed-binding native ids against the id about to be adopted — and
+    # re-prove the LIVE pane/server/process start marker, immediately before
+    # attachment adoption, so a drift after the observation cannot leave a
+    # wrong conservative claim for a pane that no longer runs the observed
+    # process.
     with database.SessionLocal() as db:
         _verify_exact_facts(
             db,
@@ -2514,6 +2551,15 @@ def _finish_repair(
             expected_binding_native_id=binding_native_id,
             expected_binding_version=binding_version,
         )
+    _verify_live_pane(
+        pane_id=pane_id,
+        window_id=window_id,
+        session_id=tmux_session_id,
+        server_socket_path=server_socket_path,
+        pane_pid=pane_pid,
+        process_identity=process_identity,
+        operation_id=operation_id,
+    )
 
     record, adopted = _adopt_running_owner(
         operation_id=operation_id,
@@ -2549,6 +2595,8 @@ def _finish_repair(
         "server_socket_path": server_socket_path,
         "pane_pid": pane_pid,
         "process_identity": dict(process_identity),
+        "binding_native_id": binding_native_id,
+        "binding_provider_version": binding_version,
     }
     try:
         with database.SessionLocal() as db:

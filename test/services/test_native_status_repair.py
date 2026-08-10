@@ -677,6 +677,17 @@ class TestClaudeParser:
             )
 
 
+class TestClaudeComposerProof:
+    def test_rejects_a_modal_remnant_despite_prompt_and_divider(self):
+        # Prompt + divider markers present but a Session ID: modal remnant
+        # still on screen: not a restored composer.
+        rows = ["---", "> ", "Session ID: 00000000-0000-4000-8000-000000000001", "---"]
+        assert nsr._claude_composer_restored(rows) is False
+
+    def test_accepts_the_clean_composer_boundary(self):
+        assert nsr._claude_composer_restored(claude_composer_rows()) is True
+
+
 class TestCodexParser:
     def test_accepts_the_pinned_branded_panel(self):
         parsed = nsr.parse_codex_status(codex_panel_rows())
@@ -745,6 +756,10 @@ class TestKimiParser:
     def test_refuses_duplicate_session_rows(self):
         with pytest.raises(nsr.PanelParseError):
             nsr.parse_kimi_status(kimi_panel_rows(extra=(f"Session session_{_uuid()}",)))
+
+    def test_refuses_duplicate_session_none_rows(self):
+        with pytest.raises(nsr.PanelParseError):
+            nsr.parse_kimi_status(kimi_panel_rows(session_id=None, extra=("Session none",)))
 
     def test_refuses_a_malformed_session_id_without_echoing_it(self):
         with pytest.raises(nsr.PanelParseError) as exc:
@@ -1457,23 +1472,6 @@ def test_unsupported_build_and_provider_refuse_before_any_io(isolated_memory_db,
     assert outcome["status"] == "refused"
     assert outcome["reason"] == "provider-unsupported"
     assert harness.typed == []
-
-
-def test_stored_same_id_with_attachment_is_already_known_zero_bytes(isolated_memory_db, harness):
-    # Both sides know the same id and the attachment is an exact live owner:
-    # a typed no-op with zero /status, zero evidence, zero mutation.
-    _seed_terminal("claude_code", native_session_id=SESSION_ID)
-    _seed_roster("claude_code", native_session_id=SESSION_ID)
-    _seed_exact_attached_attachment(
-        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
-    )
-
-    outcome = _claude_call()
-    assert outcome["status"] == "already-known"
-    assert outcome["native_session_id"] == SESSION_ID
-    assert harness.typed == []
-    assert _terminal_row().v2_native_session_id == SESSION_ID
-    assert _evidence_rows() == []
 
 
 def test_stored_different_id_is_never_overwritten(isolated_memory_db, harness):
@@ -3696,3 +3694,216 @@ def test_projection_exposes_only_bounded_presence_facts_never_raw_bytes(
     assert record["adoption_receipt_present"] is True
     assert record["adoption_receipt_readable"] is False
     assert "{not-json" not in str(record)
+
+
+# ---------------------------------------------------------------------------
+# PR #99 curated review fixes
+# ---------------------------------------------------------------------------
+
+# --- i-0001: operation-conflict must not disclose stored evidence ---
+
+
+def test_operation_conflict_does_not_disclose_stored_evidence(isolated_memory_db, harness):
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    op = _uuid()
+
+    first = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert first["status"] == "repaired"
+
+    # Reuse the same operation id against a DIFFERENT valid terminal.
+    other_id, other_gen = "e5f60708", _uuid()
+    _seed_terminal("claude_code", terminal_id=other_id, generation=other_gen)
+    _seed_roster("claude_code", terminal_id=other_id, generation=other_gen)
+    second = nsr.repair_terminal_native_identity(
+        terminal_id=other_id,
+        generation=other_gen,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert second["status"] == "refused"
+    assert second["reason"] == "operation-conflict"
+    # No stored evidence from the completed operation leaks into the body.
+    assert second["native_session_id"] is None
+    assert second["evidence_sha256"] is None
+    assert second["parser_key"] is None
+    assert second["provider_version"] is None
+    assert SESSION_ID not in str(second)
+    assert first["evidence_sha256"] not in str(second)
+
+
+# --- i-0006: live pane/server/process refusal branches ---
+
+
+@pytest.mark.parametrize(
+    "seam_mutate, expected_reason",
+    [
+        pytest.param(
+            lambda s: setattr(s, "pane_identity_error", RuntimeError("tmux gone")),
+            "pane-identity-drift",
+            id="pane-unobservable",
+        ),
+        pytest.param(
+            lambda s: setattr(
+                s,
+                "pane_identity",
+                PaneControlIdentity(
+                    pane_id=PANE_ID,
+                    window_id=WINDOW_ID,
+                    session_id=TMUX_SESSION_ID,
+                    pane_pid=9999,
+                    session_name=SESSION_NAME,
+                    window_name=f"w-{TERMINAL_ID}",
+                    bracketed_paste_proven=False,
+                    dead=False,
+                    server_socket_path=SERVER_SOCKET,
+                ),
+            ),
+            "pane-identity-drift",
+            id="pane-recycled",
+        ),
+        pytest.param(
+            lambda s: setattr(s, "server_identity", None),
+            "server-identity-drift",
+            id="server-unobservable",
+        ),
+        pytest.param(
+            lambda s: setattr(s, "server_identity", "/tmp/other.sock"),
+            "server-identity-drift",
+            id="server-drift",
+        ),
+        pytest.param(
+            lambda s: setattr(s, "live_start_marker", None),
+            "process-identity-unobservable",
+            id="marker-unreadable",
+        ),
+        pytest.param(
+            lambda s: setattr(s, "live_start_marker", "Mon Jan 1 00:00:00 2024"),
+            "process-identity-drift",
+            id="marker-drift",
+        ),
+    ],
+)
+def test_live_observation_refusals_are_directly_protected(
+    isolated_memory_db, harness, seam_mutate, expected_reason
+):
+    # Stored row/roster facts stay valid; only the LIVE observation drifts.
+    _seed_all("claude_code")
+    seam_mutate(harness)
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == expected_reason
+    assert harness.typed == []
+    assert _terminal_row().v2_native_session_id is None
+    assert _evidence_rows() == []
+
+
+# --- i-0013: final live-occurrence fence before adoption/commit ---
+
+
+def test_pane_process_drift_after_observation_before_adoption_refuses(
+    isolated_memory_db, harness, monkeypatch
+):
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    real_verdict = nsr._capture_panel_verdict
+
+    def _mutating_verdict(provider, pane_id, plan, **kwargs):
+        verdict = real_verdict(provider, pane_id, plan, **kwargs)
+        harness.live_start_marker = "Mon Jan 1 00:00:00 2024"
+        return verdict
+
+    monkeypatch.setattr(nsr, "_capture_panel_verdict", _mutating_verdict)
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "process-identity-drift"
+    assert _terminal_row().v2_native_session_id is None
+    assert _current_lineage()["native_session_id"] is None
+    assert _evidence_rows() == []
+    assert native_attachment.get("claude_code", SESSION_ID) is None
+
+
+# --- i-0018: contradictory Kimi panel refused ---
+
+
+def test_kimi_mixed_live_session_and_none_panel_is_refused():
+    with pytest.raises(nsr.PanelParseError):
+        nsr.parse_kimi_status(kimi_panel_rows() + ["Session none"])
+
+
+def test_kimi_mixed_panel_operation_refuses_without_mutation(isolated_memory_db, harness):
+    _seed_legacy("kimi_cli")
+    _seed_roster("kimi_cli", generation=None)
+    harness.screens.append(kimi_panel_rows() + ["Session none"])
+    outcome = _call(
+        provider_version=KIMI_VERSION,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+    )
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "panel-unparsed"
+    assert _legacy_row().native_session_id is None
+    assert _evidence_rows() == []
+
+
+# --- i-0019: Kimi Session none + exact ordinary owner -> conflict ---
+
+
+def test_kimi_session_none_with_exact_ordinary_owner_is_a_conflict(isolated_memory_db, harness):
+    _seed_legacy("kimi_cli")
+    _seed_roster("kimi_cli", generation=None)
+    _insert_exact_attachment(
+        "kimi_cli", KIMI_SESSION_ID, intent=_sanctioned_intent(), generation=CALLBACK_TARGET
+    )
+    harness.screens.append(kimi_panel_rows(session_id=None))
+    outcome = _call(
+        provider_version=KIMI_VERSION,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+    )
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "identity-conflict"
+    assert _legacy_row().native_session_id is None
+    # The exact ordinary owner is untouched.
+    attachment = native_attachment.get("kimi_cli", KIMI_SESSION_ID)
+    assert attachment["state"] == native_attachment.ATTACHED
+    assert _evidence_rows() == []
+
+
+# --- i-0020: binding drift in the final commit window ---
+
+
+def test_binding_drift_in_the_final_commit_window_refuses(isolated_memory_db, harness, monkeypatch):
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    real_adopt = nsr._adopt_running_owner
+
+    def _rewrite_binding(**kwargs):
+        with database.SessionLocal() as db:
+            row = (
+                db.query(database.ManagedLaunchV2ReservationModel)
+                .filter_by(terminal_id=TERMINAL_ID)
+                .one()
+            )
+            row.binding_json = json.dumps(
+                _default_binding("claude_code", "99999999-8888-4777-8666-5555555555aa")
+            )
+            db.commit()
+        return real_adopt(**kwargs)
+
+    monkeypatch.setattr(nsr, "_adopt_running_owner", _rewrite_binding)
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "binding-drift"
+    assert _terminal_row().v2_native_session_id is None
+    assert _current_lineage()["native_session_id"] is None
+    assert _evidence_rows() == []
