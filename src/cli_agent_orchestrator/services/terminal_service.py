@@ -1531,7 +1531,43 @@ def _pre_task_bind_and_resolve(
             f"terminal {terminal_id} refused its pre-task native-session bind "
             f"(absent row or conflicting native id); the launch fails closed"
         )
-    from cli_agent_orchestrator.services import stable_agent_roster
+    from cli_agent_orchestrator.services import execution_mode as em, native_attachment, stable_agent_roster
+
+    try:
+        acq_method = identity["acquisition_method"]
+        if acq_method in {
+            native_attachment.ACQUISITION_ZERO_TURN_BOOTSTRAP,
+            native_attachment.ACQUISITION_ACP_BOOTSTRAP,
+        }:
+            no_turn = True
+            detached = True
+        elif acq_method == native_attachment.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN:
+            no_turn = False
+            detached = True
+        else:
+            no_turn = None
+            detached = None
+
+        intent = native_attachment.acquire_intent(
+            acquisition_method=acq_method,
+            acquisition_receipt=identity.get("bootstrap") or {"provider": provider, "native_session_id": identity["native_session_id"]},
+            admits_only_new_instructions=True,
+            replays_task_bytes=False,
+            bootstrap_sent_no_turn=no_turn,
+            bootstrap_detached_before_launch=detached,
+        )
+        native_attachment.declare(
+            provider=provider,
+            native_session_id=identity["native_session_id"],
+            terminal_id=terminal_id,
+            generation=terminal_generation or "1",
+            execution_mode=em.NATIVE_TUI,
+            intent=intent,
+        )
+    except native_attachment.NativeAttachmentError as exc:
+        raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
+            f"terminal {terminal_id} refused native attachment claim for session {identity['native_session_id']!r}: {exc}"
+        ) from exc
 
     route_data = {
         k: v

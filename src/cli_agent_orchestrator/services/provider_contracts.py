@@ -639,9 +639,11 @@ def validate_resume_argv(provider: str, argv: list[str]) -> ResumeForm:
       kimi:   ``--session <id>`` · ``-S <id>`` · ``-r <id>``
       claude: ``--resume <uuid>``
       muse:   ``muse resume <id>``
+      antigravity: ``--conversation <uuid>``
     Forbidden forms refuse with zero provider I/O.
     """
-    if provider not in PROVIDERS:
+    provider_key = _VERSION_POLICY_KEY.get(provider, provider)
+    if provider not in PROVIDERS and provider_key not in PROVIDERS:
         raise ResumeFormRefused(f"unknown provider: {provider!r}")
     args = list(argv)
     forbidden = {

@@ -146,7 +146,7 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
-                    model=model,
+                    model=expected_model or model,
                     skill_prompt=skill_prompt,
                     native_session_id=native_session_id,
                     effort=expected_effort,

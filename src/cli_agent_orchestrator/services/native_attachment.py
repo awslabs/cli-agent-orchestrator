@@ -255,6 +255,13 @@ def acquire_intent(
             )
         intent["bootstrap_sent_no_turn"] = True
         intent["bootstrap_detached_before_launch"] = True
+    elif acquisition_method == ACQUISITION_CONTROLLED_BOOTSTRAP_TURN:
+        if bootstrap_detached_before_launch is not True:
+            raise NativeAttachmentInvalid(
+                "a controlled bootstrap turn must assert bootstrap_detached_before_launch=True"
+            )
+        intent["bootstrap_sent_no_turn"] = False
+        intent["bootstrap_detached_before_launch"] = True
     elif bootstrap_sent_no_turn is not None or bootstrap_detached_before_launch is not None:
         raise NativeAttachmentInvalid(
             f"bootstrap assertions are meaningless for {acquisition_method!r} and are refused "

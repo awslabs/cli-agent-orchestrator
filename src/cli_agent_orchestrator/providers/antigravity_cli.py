@@ -513,6 +513,10 @@ class AntigravityCliProvider(BaseProvider):
 
         command = self._build_agy_command()
 
+        log_file = Path.home() / ".gemini" / "antigravity-cli" / "log" / f"terminal_{self.terminal_id}.log"
+        log_offset = log_file.stat().st_size if log_file.exists() else 0
+        launch_start = time.time()
+
         # Arm the StatusMonitor stickiness gate so the launch drives a fresh
         # PROCESSING transition past any stale ready latch. Imported lazily to
         # avoid a circular import (status_monitor imports provider_manager).
@@ -547,13 +551,16 @@ class AntigravityCliProvider(BaseProvider):
             )
 
         # Verify that the running process owns self._native_session_id.
-        self._verify_running_conversation_id()
+        self._verify_running_conversation_id(log_offset=log_offset, launch_start=launch_start)
 
         self._initialized = True
         return True
 
-    def _verify_running_conversation_id(self) -> None:
+    def _verify_running_conversation_id(self, log_offset: int = 0, launch_start: float = 0.0) -> None:
         """Verify that the running agy process actually owns self._native_session_id.
+
+        Only log entries written AFTER log_offset and presence lock files updated
+        AFTER launch_start are accepted, ensuring stale global logs or prior runs cannot false-pass.
 
         Raises ProviderError if the requested ID was ignored, missing, or mismatched.
         """
@@ -562,33 +569,38 @@ class AntigravityCliProvider(BaseProvider):
 
         req_id = self._native_session_id
         log_file = Path.home() / ".gemini" / "antigravity-cli" / "log" / f"terminal_{self.terminal_id}.log"
-        default_log = Path.home() / ".gemini" / "antigravity-cli" / "cli.log"
-
-        logs_to_check = [p for p in (log_file, default_log) if p.exists()]
-        observed_id = None
         found_requested = False
 
-        for path in logs_to_check:
+        if log_file.exists():
             try:
-                content = path.read_text(errors="ignore")
-                if f"Conversation {req_id} not found" in content or "ignoring --conversation flag" in content:
+                with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    f.seek(log_offset)
+                    new_content = f.read()
+
+                if f"Conversation {req_id} not found" in new_content or "ignoring --conversation flag" in new_content:
                     raise ProviderError(
                         f"Antigravity CLI ignored requested conversation {req_id!r} (conversation not found on disk)"
                     )
-                if f"found conversation {req_id}" in content or f"Conversation {req_id}" in content:
+                if f"found conversation {req_id}" in new_content or f"Conversation {req_id}" in new_content:
                     found_requested = True
-                    break
-                matches = re.findall(r"(?:found|Created) conversation ([0-9a-fA-F-]+)", content)
+
+                matches = re.findall(r"(?:found|Created) conversation ([0-9a-fA-F-]+)", new_content)
                 if matches:
                     observed_id = matches[-1]
+                    if observed_id != req_id:
+                        raise ProviderError(
+                            f"Antigravity CLI native session mismatch: requested {req_id!r}, "
+                            f"but observed running conversation {observed_id!r}"
+                        )
             except ProviderError:
                 raise
             except Exception:
                 pass
 
-        lock_file = Path.home() / ".gemini" / "antigravity-cli" / "presence" / f"{req_id}.lock"
-        if lock_file.exists():
-            found_requested = True
+        if not found_requested:
+            lock_file = Path.home() / ".gemini" / "antigravity-cli" / "presence" / f"{req_id}.lock"
+            if lock_file.exists() and lock_file.stat().st_mtime >= (launch_start - 2.0):
+                found_requested = True
 
         output = get_backend().get_history(self.session_name, self.window_name)
         if output:
@@ -598,11 +610,6 @@ class AntigravityCliProvider(BaseProvider):
                     f"Antigravity CLI ignored requested conversation {req_id!r} (warning displayed on terminal)"
                 )
 
-        if not found_requested and observed_id and observed_id != req_id:
-            raise ProviderError(
-                f"Antigravity CLI native session mismatch: requested {req_id!r}, "
-                f"but observed running conversation {observed_id!r}"
-            )
 
         if not found_requested:
             raise ProviderError(

@@ -76,17 +76,17 @@ PRE_TASK_IDENTITY_PENDING = "pre-task native identity pending"
 PRE_TASK_IDENTITY_CAPTURED = "pre-task native identity captured"
 
 #: Executable name per provider wire key, for resolution via ``PATH``.
-_PROVIDER_EXECUTABLE = {
+_POLICY_KEY_BY_PROVIDER = {
     "claude_code": provider_contracts.PROVIDER_CLAUDE,
     "codex": provider_contracts.PROVIDER_CODEX,
-    "antigravity_cli": "agy",
+    "antigravity_cli": provider_contracts.PROVIDER_ANTIGRAVITY_CLI,
 }
 
 #: Acquisition method per provider, matching the managed-v2 issuance sources.
 _ACQUISITION_BY_PROVIDER = {
     "claude_code": native_attachment.ACQUISITION_CHOSEN_SESSION_ID,
     "codex": native_attachment.ACQUISITION_ZERO_TURN_BOOTSTRAP,
-    "antigravity_cli": native_attachment.ACQUISITION_ZERO_TURN_BOOTSTRAP,
+    "antigravity_cli": native_attachment.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN,
 }
 
 
@@ -240,9 +240,10 @@ def _mint_antigravity_session(
     agent_profile: Optional[str],
     environment: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
+    import json
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
     from cli_agent_orchestrator.providers.antigravity_cli import SECURITY_PROMPT
-    from cli_agent_orchestrator.utils.skill_injection import apply_skill_prompt
+    from cli_agent_orchestrator.utils.skills import build_skill_catalog
 
     executable = _resolve_executable("antigravity_cli")
     digest = _binary_sha256(executable)
@@ -252,6 +253,14 @@ def _mint_antigravity_session(
         forwarded_environment=environment,
     )
     version_output = _version_output("antigravity_cli", executable, env)
+
+    version_mode = provider_contracts.version_enforcement_mode(provider_contracts.PROVIDER_ANTIGRAVITY_CLI)
+    if version_mode == provider_contracts.VERSION_ENFORCEMENT_STRICT and not provider_contracts.is_proven_version(
+        provider_contracts.PROVIDER_ANTIGRAVITY_CLI, version_output
+    ):
+        raise UnmanagedIdentityUnavailable(
+            f"executable {executable} returned unproven version banner {version_output!r}"
+        )
 
     profile = None
     if agent_profile:
@@ -267,7 +276,9 @@ def _mint_antigravity_session(
 
     system_prompt = (getattr(profile, "system_prompt", None) or "") if profile else ""
     if system_prompt:
-        system_prompt = apply_skill_prompt(system_prompt)
+        skill_catalog = build_skill_catalog(getattr(profile, "skills", None))
+        if skill_catalog:
+            system_prompt = f"{system_prompt}\n\n{skill_catalog}"
         allowed_tools = getattr(profile, "allowedTools", None) or []
         if allowed_tools and "*" not in allowed_tools:
             system_prompt = (

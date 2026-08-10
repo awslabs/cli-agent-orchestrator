@@ -812,21 +812,31 @@ async def test_unmanaged_antigravity_new_launch_binds_pre_task_identity(
     isolated_memory_db, launch_mocks, monkeypatch
 ):
     """Antigravity: pre-task 1-turn bootstrap mints a conversation id, durable in roster and metadata."""
+    import json
+    import subprocess
     native_id = str(uuid.uuid4())
-    def _mock_mint(*args, **kwargs):
-        return {
-            "native_session_id": native_id,
-            "acquisition_method": roster.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN,
-            "working_directory": kwargs.get("working_directory", "/tmp"),
-            "model": kwargs.get("expected_model") or "",
-            "effort": kwargs.get("expected_effort") or "",
-            "bootstrap": {"conversation_id": native_id},
-        }
+
+    def _mock_subprocess_run(cmd, *args, **kwargs):
+        if "--version" in cmd or "version" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="Antigravity CLI 1.1.11\n", stderr="")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"conversation_id": native_id}), stderr=""
+        )
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.unmanaged_native_identity._mint_antigravity_session",
-        _mock_mint,
+        "cli_agent_orchestrator.services.unmanaged_native_identity._resolve_executable",
+        lambda provider: "/usr/local/bin/agy",
     )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.unmanaged_native_identity._binary_sha256",
+        lambda exe: "a" * 64,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.unmanaged_native_identity._version_output",
+        lambda provider, exe, env: "Antigravity CLI 1.1.11",
+    )
+    monkeypatch.setattr(subprocess, "run", _mock_subprocess_run)
+
     result = await create_terminal("antigravity_cli", "implementer-gemini", new_session=True)
     assert result.id == "test1234"
     agent = roster.get_agent(roster.derive_initial_agent_id("test1234"))
