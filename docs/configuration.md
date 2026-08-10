@@ -229,6 +229,8 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 | `CAO_CORS_ORIGINS` | `network.cors_origins` | comma-separated list |
 | `CAO_WS_ALLOWED_CLIENTS` | `network.ws_allowed_clients` | comma-separated list |
 
+- `CAO_LEGACY_MIGRATION_PRODUCER_ENABLED` (default `1`) — the opt-in legacy native-identity migration producer (cond-0377D). Setting `0` disables only new migration operations: already-started operations remain queryable/adoptable and every additive roster, repair, evidence, and canary row is retained for roll-forward. Reads (legacy audit, provider capability cells, and exact-live-pane resolution) are unaffected.
+
 ### Not yet routed through ConfigService
 
 A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TERMINAL_ID`, `CAO_SESSION_NAME`, `CAO_WORKFLOW_RUN_ID`; provider-tuning vars like `CAO_HERMES_*`, `CAO_AGENTS_DIR`, `CAO_API_HOST`/`CAO_API_PORT`, `CAO_PYTE_STATUS`, `CAO_EAGER_INBOX_DELIVERY`; and `CAO_AUTH_LOCAL_TOKEN`) are still read ad hoc via `os.getenv` at their call sites, mostly in `constants.py`, `mcp_server/server.py`, `security/auth.py`, and the `providers/*` modules. These were deliberately left out of this pass to keep the diff scoped to the two surfaces issue #357 named explicitly (`settings.json` + `config.json`); folding them into the registry is a natural follow-up but not required for config unification.

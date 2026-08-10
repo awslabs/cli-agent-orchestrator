@@ -563,6 +563,334 @@ attachment/binding conflicts, 503 for transient store or binding
 failures); `errored` maps to **500**.  The body never contains raw pane
 output, raw exceptions, or evidence from another operation.
 
+The repair's `/status` observation is **at-most-once**: an exact
+observation-attempt journal is written atomically at the byte seam, so
+exactly one caller may ever type `/status` for a given operation id.
+An exact retry adopts the committed evidence, adopts the journaled
+`identity-still-missing` verdict, or returns a typed
+`observation-attempt-ambiguous` refusal — it never sends `/status`
+again.  A changed request under the same operation id is a typed
+conflict before any pane I/O.
+
+### GET /roster/legacy-audit
+
+**Read-scoped** (requires `cao:read`; write/admin also satisfy it).
+The truthful, strictly read-only live legacy audit (cond-0377D):
+classifies every currently live terminal row as an eligible migration
+candidate or a typed refusal.  It never types bytes, never initializes a
+provider session, never reserves an attachment, never calls self-healing
+metadata readers, and never persists an audit receipt.
+
+**Response (200):**
+```json
+{
+  "schema": "cao-m3-legacy-audit-v1",
+  "occurrence_id": "…",
+  "generated_at": "…",
+  "terminals_total": 1,
+  "eligible_count": 1,
+  "refusals_count": 0,
+  "candidates": [
+    {
+      "terminal_id": "…", "vintage": "legacy|v2", "managed": false,
+      "generation": null, "physical_occurrence": "…",
+      "provider": "claude_code", "session_name": "…",
+      "pane_id": "…", "window_id": "…", "session_id": "…",
+      "server_socket_path": "…", "pane_pid": 4242,
+      "process_identity": { "pid": 4242, "start_marker": "…" },
+      "pane_live": true, "server_live": true, "process_live": true,
+      "agent_id": "…", "agent_role": "worker",
+      "agent_profile_family": "developer",
+      "lineage_id": "…", "incarnation_id": "…",
+      "incarnation_disposition": "bound",
+      "terminal_native_session_id": null,
+      "lineage_native_session_id": null,
+      "binding_native_session_id": null,
+      "attachment_state": null,
+      "attachment_owner_terminal_id": null,
+      "attachment_owner_generation": null,
+      "attachment_native_session_id": null,
+      "session_probe_required": false,
+      "build_provenance": {
+        "source": "pinned-legacy-plan-fallback|managed-v2-binding",
+        "observed": false, "provider_version": null, "plan_pin": "2.1.226"
+      },
+      "occurrence_id": "…",
+      "classification": "eligible",
+      "reason": null,
+      "observed_at": "…",
+      "evidence_digest": "…"
+    }
+  ]
+}
+```
+
+- Liveness is never inferred from a DB row alone: an eligible candidate
+  binds the DB lifecycle state, the exact stored/live tmux tuple, and PID
+  start-marker equality.  Unreadable, dead, ambiguous, mismatched,
+  corrupt, missing-occurrence, unsupported-provider, known-id, retired,
+  conflicting-owner, and missing-agent shapes are explicit typed refusals
+  (`classification` + closed `reason`).
+- `session_probe_required` is `true` for a missing-ID Kimi candidate:
+  its session existence is truthfully unknown before the bounded probe,
+  and `/status` never creates a session.
+- `build_provenance` states whether the provider build came from a
+  durable managed-v2 binding (`observed: true`) or is an explicit
+  unaudited pinned-legacy-plan fallback (`observed: false`) — a fallback
+  is never described as observed build proof.
+- `evidence_digest` is a canonical SHA-256 of the bounded candidate facts
+  (including `build_provenance`); one later migration request binds it.
+
+### POST /roster/legacy-migrations
+
+**Write-scoped** (requires `cao:write` or `cao:admin`).  The explicit
+opt-in one-candidate migration coordinator (cond-0377D): consumes
+exactly one eligible audit candidate and invokes the exact
+native-identity repair operation under a repair operation id derived
+deterministically from the migration operation id.  The read-only audit
+endpoint is not a migration switch; this route is the only producer, and
+nothing runs automatically at launch.
+
+**Request body:**
+```json
+{
+  "operation_id": "00000000-0000-4000-8000-0000000000bb",
+  "terminal_id": "a1b2c3d4",
+  "provider": "claude_code",
+  "generation": null,
+  "physical_occurrence": "00000000-0000-4000-8000-0000000000aa",
+  "provider_version": "2.1.226",
+  "audit_occurrence_id": "00000000-0000-4000-8000-0000000000dd",
+  "audit_candidate_digest": "d" * 64
+}
+```
+
+- `operation_id` — the caller's stable canonical UUID; the durable
+  intent row (with the audit digest and the deterministic repair
+  operation id) is persisted before any repair interaction.
+- `audit_occurrence_id` + `audit_candidate_digest` — the exact audit
+  occurrence and candidate digest the caller observed; the candidate is
+  revalidated from current facts (including the digest) before any repair
+  interaction and again at the irreversible persistence seam.
+- `provider_version` — plan selection only; the response's
+  `build_provenance` carries the audit-derived build fact and is never
+  presented as observed proof.
+
+**Semantics — at-most-once and response loss:**
+- The `pending -> attempt-started` transition is an atomic execution
+  claim: exactly one caller may invoke the repair; every loser
+  query-adopts or returns a typed `in-progress`/`unresolved` outcome with
+  zero repair invocation.  Combined with the repair's observation-attempt
+  journal, the total `/status` interaction count for one operation is
+  exactly one.
+- An exact duplicate retry query-adopts the same migration AND repair
+  operations (identical `repair_operation_id`, identical evidence).
+- A changed request under the same `operation_id` is a typed
+  `operation-conflict` before any provider or roster effect.
+- Response loss: committed repair evidence is the authoritative
+  `migrated` truth (a pane that exits after the commit is a separate
+  lifecycle fact and never downgrades it); a journaled
+  `identity-still-missing` verdict is adopted without resending; a
+  journaled observation without committed evidence is typed
+  `repair-attempt-ambiguous`; a total absence is `repair-attempt-unresolved`.
+- Never replays task input, never creates a fresh conversation, never
+  reincarnates a pane, never changes task/role/profile, never
+  auto-creates Kimi's lazy session, and never overwrites a known native
+  id.  Additive history only; rollback
+  (`CAO_LEGACY_MIGRATION_PRODUCER_ENABLED=0`) disables only new
+  operations while prior rows remain queryable/adoptable.
+
+**Response:** the typed outcome dict is returned as the body:
+```json
+{
+  "schema": "cao-m3-legacy-migration-v1",
+  "status": "migrated", "reason": null, "detail": null,
+  "operation_id": "…", "request_digest": "…",
+  "repair_operation_id": "…", "repair_status": "repaired",
+  "repair_reason": null,
+  "terminal_id": "…", "provider": "…",
+  "generation": null, "physical_occurrence": "…",
+  "provider_version": "2.1.226",
+  "build_provenance": { "source": "pinned-legacy-plan-fallback",
+                        "observed": false, "provider_version": null,
+                        "plan_pin": "2.1.226" },
+  "audit_occurrence_id": "…", "audit_candidate_digest": "…",
+  "native_session_id": "…", "evidence_sha256": "…",
+  "parser_key": "…", "attachment": { "…": "…" },
+  "task_bytes_submitted": false
+}
+```
+
+`status` is one of `migrated`, `already-known`, `identity-still-missing`
+(Kimi pristine panel — no synthetic turn, no session fabricated), or
+`refused`/`errored` with the same HTTP mapping rules as the repair route
+(the refusal `reason` vocabulary adds `operation-conflict`,
+`producer-disabled`, `candidate-drift`, `provider-drift`,
+`generation-mismatch`, `occurrence-mismatch`, `seam-drift`,
+`repair-attempt-ambiguous`, `repair-attempt-unresolved`, `in-progress`,
+and `missing-agent`).
+
+### GET /roster/provider-capabilities
+
+**Read-scoped.**  The versioned truthful provider capability read
+(cond-0377D): one cell per provider (`claude_code`, `codex`,
+`kimi_cli`, `muse_cli`).  DeepSeek/Z.ai are Claude Code route provenance,
+not separate harness identity domains.
+
+**Response (200):**
+```json
+{
+  "schema": "cao-m3-provider-capabilities-v1",
+  "generated_at": "…",
+  "route_provenance_note": "deepseek and zai run Claude Code with route provenance; …",
+  "providers": [
+    {
+      "provider": "claude_code",
+      "harness_domain": "claude_code",
+      "route_provenance_domains": ["deepseek", "zai"],
+      "build_identity": {
+        "installed_build": {
+          "banner": "Claude Code 2.1.226",
+          "normalized": "2.1.226",
+          "sha256": "…",
+          "executable_path": "/opt/claude-code/claude"
+        },
+        "installed_build_source": "canary-receipt"
+      },
+      "parser_support": {
+        "code_supported": true, "parser_key": "claude-modal-v1",
+        "capability_schema": "cao-native-status-repair-v1",
+        "supported_builds": ["2.1.226"], "escape": true
+      },
+      "status_observation_repair_code_supported": true,
+      "canary": {
+        "present": true, "state": "matching|stale|failed|absent",
+        "build": "2.1.226", "operation_id": "…",
+        "migration_operation_id": "…",
+        "evidence_sha256": "…", "native_session_id": "…",
+        "status_action_count": 1, "parser_key": "claude-modal-v1",
+        "attachment_outcome": "attached", "recorded_at": "…"
+      },
+      "installed_live_repair_proven": true,
+      "cell_state": "enabled",
+      "reason": "…"
+    }
+  ]
+}
+```
+
+- `cell_state` is `enabled`, `disabled`, `unsupported`, `unavailable`, or
+  `unresolved` with a closed `reason`.  A cell is `enabled` ONLY with
+  code support AND an installed live canary receipt DERIVED from the
+  actual committed records (migration operation/request, deterministic
+  repair operation, observation-attempt journal with exactly one status
+  action, repair evidence/request/evidence digest, provider/parser/plan,
+  native identity, attachment/adoption outcome) AND a **read-time
+  revalidation**: on every read the current canonical executable is
+  re-hashed and its bounded `--version` banner re-observed, and both must
+  exactly match the receipt (path, full banner including Muse `R`
+  revision, normalized build, and service-computed SHA-256).  A deleted,
+  replaced, or drifted executable is a typed stale/disabled cell — never
+  green, never an exception.  Static parser support appears only under
+  `parser_support.supported_builds` (there is no static
+  `build_identity.durable_builds` field); `build_identity.installed_build`
+  is null without an observed canary and carries the canonical
+  `executable_path` when present.
+- `build_identity.installed_build` is OBSERVED at receipt time, never
+  caller-asserted: the record seam accepts a canonical absolute existing
+  executable path, computes the SHA-256 of that exact file itself, and
+  runs the bounded provider `--version` probe against it in the bounded
+  child environment, retaining the complete banner — Muse's
+  `0.1.0-R708.1` revision is never normalized away, and a future
+  same-semver build with a different digest never inherits the proven
+  build's identity.  The canonical path, banner, and observed digest are
+  bound into the receipt's request digest: a changed path/banner/digest
+  under the same canary id conflicts, and a build or file change before
+  persistence refuses and leaves the cell non-green.  If a truthful exact
+  executable cannot be resolved or rechecked, the cell stays
+  absent/disabled/unresolved.
+- Kimi without a session stays `unresolved`/`disabled` and receives no
+  synthetic turn.
+
+
+### GET /roster/pane-identity
+
+**Read-scoped** (requires `cao:read`; write/admin also satisfy it).  The
+bounded exact-live-pane identity resolution (cond-0377D M3-A read seam):
+resolves one exact live tmux pane to its registered CAO terminal, unique
+LIVE stable-agent incarnation, and stable agent/lineage identity — the
+fork primitive the conductor's `conduct whoami` will consume.
+
+**Query parameters** (the only two accepted; anything else is ignored):
+- `pane_id` — the immutable tmux pane id.
+- `server_socket_path` — the canonical identity of the tmux server the
+  caller observed the pane on.
+
+The service **re-observes** the pane (`pane_control_identity`) and its
+server (`observe_pane_server_identity`) through the bounded tmux seams
+and binds the canonical server identity plus the immutable
+`pane_id`/`window_id`/`session_id` and positive `pane_pid` — never
+session/window names.  A caller-supplied `TMUX_PANE`, `TMUX`,
+`CAO_TERMINAL_ID`, window name, or terminal id can never override the
+pane mapping, because the request accepts none of them.
+
+**Response (200):**
+```json
+{
+  "schema": "cao-m3-pane-identity-resolution-v1",
+  "status": "resolved",
+  "reason": null,
+  "observed_at": "…",
+  "pane": {
+    "pane_id": "%7", "window_id": "@7", "session_id": "$1",
+    "pane_pid": 4242, "server_socket_path": "/private/tmp/cao-native.sock"
+  },
+  "terminal": {
+    "terminal_id": "a1b2c3d4", "generation": null,
+    "physical_occurrence": "00000000-0000-4000-8000-0000000000aa",
+    "vintage": "legacy"
+  },
+  "incarnation": {
+    "incarnation_id": "…", "disposition": "bound", "lineage_id": "…"
+  },
+  "agent": {
+    "agent_id": "…", "lineage_id": "…", "harness": "claude_code",
+    "native_session_id": "…", "disposition": "live"
+  }
+}
+```
+
+`status` is `resolved` or one of the typed non-identity reasons
+(all 200 — absence and ambiguity are normal typed answers, never guessed
+identities; `pane`/`terminal`/`incarnation`/`agent` are `null` for
+non-identity):
+
+- `pane-unreadable-or-dead` — the pane is not provably live on exactly
+  the caller's canonical server (dead, unreadable, or on a different
+  server: identical pane ids on two isolated servers never cross-resolve).
+- `pane-unregistered` — live and on the right server, but no terminal row
+  claims this pane id on this server.
+- `terminal-pane-mismatch-or-superseded` — the registered row's exact
+  tuple no longer matches (pane id reused with a changed
+  window/session/pid), the row is superseded/dead, or multiple rows claim
+  the exact tuple.
+- `roster-incarnation-missing` — no roster incarnation, or the
+  incarnation is retired/non-live: a stopped/dead or superseded
+  incarnation cannot resolve even if historical records remain.
+- `roster-incarnation-ambiguous-or-invalid` — two live incarnations share
+  the terminal (ambiguous; never picks the first), the incarnation's
+  pane/pid or the agent's current pointers disagree, or the roster/agent
+  store is unreadable.
+
+The lookup is **byte-for-byte read-only** (no terminal liveness, roster,
+attachment, or journal mutation; no write lease is taken to perform a
+read), every tmux subprocess is bounded through the existing timeout
+mechanism, and the trust boundary is explicitly **cooperative-local
+routing, not a security gate**: it does not authenticate the human or
+process that asked the question, and it issues no credentials, tokens, or
+approvals.
+
+
 ## Error Responses
 
 All endpoints return standard HTTP status codes:
