@@ -5,7 +5,7 @@ import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileTex
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
-import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
+import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 import { CampaignAnnotations, TerminalAnnotations } from './AnnotationChips'
 import { WorkStateInfoButton } from './AnnotationDetails'
@@ -13,6 +13,7 @@ import { GlobalFilterBar, SessionFilterBar } from './FilterBar'
 import type { StatusOption } from './FilterBar'
 import { placeAnnotations, readAnnotations } from '../lib/annotations'
 import { fmtAbs, fmtRel } from '../lib/time'
+import { DISPLAY_STATUS_CONFIG } from '../lib/terminalDisplay'
 import {
   activeFilterCount,
   callerVocabulary,
@@ -33,17 +34,13 @@ import {
 
 // STATUS_ORDER / RENDERABLE_STATUSES / displayStatus live in lib/filters.ts
 // now: the fold exists so that counting and filtering can never drift, and the
-// filter predicate is the second consumer that forced it out of this file. The
-// comments recording the two omissions that made it a defect (NOT_FIFO_MONITORED
-// uncounted on a native-TUI fleet; STOPPED silently folding to UNKNOWN) moved
-// with it. The render-side tables built from it stay here, because
-// STATUS_META[s].dot is dereferenced unguarded below and every STATUS_ORDER
-// entry MUST have a STATUS_CONFIG counterpart — see
-// dashboardStatusOrderContract.test.tsx for what happens when one does not.
+// filter predicate is the second consumer that forced it out of this file.
+// DISPLAY_STATUS_CONFIG carries the derived managed states alongside the raw
+// provider/lifecycle states; the render table stays here because it is purely
+// Tailwind presentation.
 const STATUS_META: Record<string, { label: string; dot: string; text: string; pulse?: boolean }> = Object.fromEntries(
-  Object.entries(STATUS_CONFIG).map(([k, v]) => [k, { label: v.label, dot: v.dotClass, text: v.textClass, pulse: v.pulse }])
+  Object.entries(DISPLAY_STATUS_CONFIG).map(([k, v]) => [k, { label: v.label, dot: v.dotClass, text: v.textClass, pulse: v.pulse }])
 )
-STATUS_META['UNKNOWN'] = { label: 'Unknown', dot: 'bg-gray-500', text: 'text-gray-500' }
 
 // Selected-pill backgrounds. Each entry uses the raw Tailwind palette family
 // whose 400 shade IS that status's semantic-role token in tailwind.preset.cjs —
@@ -55,10 +52,13 @@ STATUS_META['UNKNOWN'] = { label: 'Unknown', dot: 'bg-gray-500', text: 'text-gra
 // selected appearance. NOT_FIFO_MONITORED is `info` in status.json, the same
 // role as PROCESSING, so it takes the blue family.
 const STATUS_ACTIVE_BG: Record<string, string> = {
+  MANAGED_ACTIVE: 'bg-emerald-900/40 border-emerald-500/50 text-emerald-300',
+  MANAGED_PARKED: 'bg-purple-900/40 border-purple-500/50 text-purple-300',
+  MANAGED_LIVE: 'bg-blue-900/40 border-blue-500/50 text-blue-300',
   PROCESSING: 'bg-blue-900/40 border-blue-500/50 text-blue-300',
-  NOT_FIFO_MONITORED: 'bg-blue-900/40 border-blue-500/50 text-blue-300',
   IDLE: 'bg-emerald-900/40 border-emerald-500/50 text-emerald-300',
   WAITING_USER_ANSWER: 'bg-amber-900/40 border-amber-500/50 text-amber-300',
+  MANAGED_STALLED: 'bg-red-900/40 border-red-500/50 text-red-300',
   ERROR: 'bg-red-900/40 border-red-500/50 text-red-300',
   COMPLETED: 'bg-purple-900/40 border-purple-500/50 text-purple-300',
   STOPPED: 'bg-gray-800/40 border-gray-500/50 text-gray-300',
@@ -71,10 +71,10 @@ function StatusSummary({ counts }: { counts: Record<string, number> }) {
   return (
     <div className="flex items-center gap-3 flex-wrap">
       {STATUS_ORDER.filter(s => counts[s] > 0).map(s => {
-        const meta = STATUS_META[s]
+        const meta = STATUS_META[s] ?? STATUS_META.UNKNOWN
         return (
           <span key={s} className="flex items-center gap-1 text-xs">
-            <span className={`w-1.5 h-1.5 rounded-full ${meta.dot} ${meta.pulse ? 'animate-pulse' : ''}`} />
+            <span className={`w-1.5 h-1.5 rounded-full ${meta.dot} ${meta.pulse ? 'animate-pulse motion-reduce:animate-none' : ''}`} />
             <span className={meta.text}>{counts[s]}</span>
             <span className="text-gray-500">{meta.label}</span>
           </span>
@@ -196,7 +196,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   const getStatusCounts = (terminals: TerminalMeta[]) => {
     const counts: Record<string, number> = {}
     terminals.forEach(t => {
-      const s = displayStatus(terminalStatuses[t.id] ?? t.status)
+      const s = displayStatus(terminalStatuses[t.id] ?? t.status, t, annotationsFor(t.id))
       counts[s] = (counts[s] || 0) + 1
     })
     return counts
@@ -341,25 +341,16 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
       annotations.coverage === 'truncated' ||
       annotations.items_omitted > 0)
 
-  // The reachability dimension's options, handed to the global chip bar.
-  //
-  // Computed UNCONDITIONALLY on every render, and the STATUS_META dereference
-  // is deliberately unguarded: dashboardStatusOrderContract.test.tsx renders
-  // the dashboard against a STATUS_CONFIG missing an entry and requires the
-  // throw to happen at render, with no session or terminal data staged. When
-  // the reachability row became a chip+popover, this eager build is what kept
-  // the unguarded `STATUS_META[s].dot` lookup on the unconditional render
-  // path — a missing counterpart must go blank loudly, never silently.
+  // The worker-state dimension's options, handed to the global chip bar.
+  // STATUS_ORDER and DISPLAY_STATUS_CONFIG share one presentation module; the
+  // fallback remains defensive so a future drift cannot blank the dashboard.
   const statusOptions = useMemo<StatusOption[]>(
     () =>
       STATUS_ORDER.map(s => ({
         value: s,
-        // `.dot` is dereferenced FIRST, on purpose: the contract suite pins
-        // the property name in the throw, and it is the lookup the
-        // StatusSummary and the old pill row have always made.
-        dot: STATUS_META[s].dot,
-        label: STATUS_META[s].label,
-        activeClass: STATUS_ACTIVE_BG[s],
+        dot: (STATUS_META[s] ?? STATUS_META.UNKNOWN).dot,
+        label: (STATUS_META[s] ?? STATUS_META.UNKNOWN).label,
+        activeClass: STATUS_ACTIVE_BG[s] ?? STATUS_ACTIVE_BG.UNKNOWN,
       })),
     [],
   )
@@ -609,14 +600,13 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
           own popover editor — and everything else is one "+ Filter" picker
           (ranked by derived usefulness, so the pill-shaped phase-like
           vocabularies sort to the top on their measured merit) or the
-          Advanced modal away. Reachability is a chip like any other; its
+          Advanced modal away. Worker state is a chip like any other; its
           editor's options container holds exactly the STATUS_ORDER entries,
           which is what the status-order suites pin now.
 
-          Named "Reachability", never "status" and never "working": every live
-          native-TUI v2 row reports NOT_FIFO_MONITORED unconditionally, which
-          is a "this pane exists and answers" claim and says nothing about
-          activity. */}
+          Named "Worker state": recent rendering supports the brief Active
+          claim, while Live means only that the pane remains available and a
+          fresh durable checkpoint can state Parked. */}
       <GlobalFilterBar
         filters={globalFilters}
         onChange={setGlobalFilters}
@@ -847,7 +837,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                         is the only reachability statement the
                                         fork can make, and `not_fifo_monitored`
                                         already IS one. */}
-                                    <StatusBadge status={currentStatus} terminal={t} />
+                                    <StatusBadge status={currentStatus} terminal={t} annotations={annotationsFor(t.id)} />
                                     <TerminalAnnotations annotations={annotationsFor(t.id)} />
                                     {/* Same fallback the modals use: a blank
                                         gap and the word "unknown" are the same

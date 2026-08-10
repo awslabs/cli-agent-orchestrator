@@ -25,7 +25,13 @@ export type TerminalFixture = TerminalMeta
 
 // Ids are exactly 8 characters: the terminal row renders `t.id.slice(0, 8)`,
 // so a longer id would not be findable by its own name.
-function terminal(id: string, status: string, profile: string, lastActive: string): TerminalFixture {
+function terminal(
+  id: string,
+  status: string,
+  profile: string,
+  lastActive: string,
+  overrides: Partial<TerminalFixture> = {},
+): TerminalFixture {
   return projectedTerminal({
     id,
     tmux_window: `${profile}-${id}`,
@@ -33,6 +39,7 @@ function terminal(id: string, status: string, profile: string, lastActive: strin
     agent_profile: profile,
     last_active: lastActive,
     status,
+    ...overrides,
   })
 }
 
@@ -41,7 +48,9 @@ function terminal(id: string, status: string, profile: string, lastActive: strin
 // exclude.
 export const TERMINALS: TerminalFixture[] = [
   terminal('nfm-0001', 'not_fifo_monitored', 'implementer', '2026-07-28T12:00:00Z'),
-  terminal('nfm-0002', 'not_fifo_monitored', 'implementer', '2026-07-28T11:00:00Z'),
+  terminal('nfm-0002', 'not_fifo_monitored', 'implementer', '2026-07-28T11:00:00Z', {
+    status_signals: [{ name: 'liveness', state: 'available', value: 90 }],
+  }),
   terminal('idle-001', 'idle', 'reviewer', '2026-07-28T10:30:00Z'),
 ]
 
@@ -138,7 +147,7 @@ export function summaryTotal(): number {
  * The reachability editor's options container — the chip-bar successor of
  * the old always-on pill row, and the container the appearance suite pins.
  *
- * THE CONTAINER MOVED, THE CONTRACT DID NOT. Reachability is a chip now: the
+ * THE CONTAINER MOVED, THE CONTRACT DID NOT. Worker state is a chip now: the
  * options live in the chip's popover editor, reached from the "+ Filter"
  * picker (or by clicking the chip once it is active). The container still
  * holds exactly the STATUS_ORDER entries and nothing else — a stray
@@ -156,7 +165,7 @@ export function openReachabilityEditor(): HTMLElement {
     fireEvent.click(chip)
   } else {
     fireEvent.click(screen.getByTestId('global-picker-button'))
-    fireEvent.click(within(screen.getByTestId('global-picker')).getByText('Reachability'))
+    fireEvent.click(within(screen.getByTestId('global-picker')).getByText('Worker state'))
   }
   return screen.getByTestId('global-editor-options')
 }

@@ -175,6 +175,22 @@ describe('annotations render alongside StatusBadge, never instead of it', () => 
     expect(classes).not.toContain('bg-blue-900')
   })
 
+  it('labels an open work round without claiming real-time activity', async () => {
+    stubFetch(payload([
+      annotation({
+        namespace: 'cao.work-state',
+        kind: 'work-item',
+        label: 'active',
+        details: { task: 't', phase: 'in-round' },
+      }),
+    ]))
+    await renderDashboard()
+
+    await waitFor(() => expect(chips().length).toBe(1))
+    expect(chips()[0].textContent).toContain('round open')
+    expect(chips()[0].textContent).not.toContain('active')
+  })
+
   it('shows the parked age on the chip itself, from the conductor timestamp', async () => {
     const parked = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString()
     stubFetch(payload([annotation({ details: { task: 't', parked_at: parked } })]))

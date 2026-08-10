@@ -6,8 +6,9 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import type { MutableRefObject } from 'react'
 
-import type { TerminalMeta } from '../api'
-import { STATUS_CONFIG, UNKNOWN_CONFIG } from '../status.generated'
+import type { Annotation, TerminalMeta } from '../api'
+import { DISPLAY_STATUS_CONFIG, terminalDisplayState } from '../lib/terminalDisplay'
+import { STATUS_CONFIG } from '../status.generated'
 import { FloatingCard } from './FloatingCard'
 import { MetadataRows, terminalMetadataSections } from './TerminalMetadata'
 
@@ -21,13 +22,16 @@ const CLOSE_DELAY = 180
 export function StatusBadge({
   status,
   terminal,
+  annotations,
 }: {
   status: TerminalStatus
   /** Optional so standalone badges and existing callers remain useful. */
   terminal?: TerminalMeta
+  /** Current, generation-fenced conductor observations for this terminal. */
+  annotations?: Annotation[]
 }) {
-  const normalized = status ? status.toUpperCase() : null
-  const config = (normalized && STATUS_CONFIG[normalized]) || UNKNOWN_CONFIG
+  const display = terminalDisplayState(status, terminal, annotations)
+  const config = DISPLAY_STATUS_CONFIG[display.key] || DISPLAY_STATUS_CONFIG.UNKNOWN
   const explanation = config.explanation
   // The explanation doubles as the badge's accessible description; useId keeps
   // the id unique when the dashboard renders several badges.
@@ -59,6 +63,12 @@ export function StatusBadge({
   }, [])
 
   const evidence = terminal ? terminalMetadataSections(terminal, status)[0] : null
+  const headlineEntries = terminal
+    ? [
+        ...(config.explanation ? [{ label: 'Headline meaning', value: config.explanation }] : []),
+        { label: 'Headline basis', value: display.reason },
+      ]
+    : []
 
   return (
     <>
@@ -72,9 +82,10 @@ export function StatusBadge({
         title={!terminal ? explanation : undefined}
         onMouseEnter={enter}
         onMouseLeave={leave}
+        data-status={display.key.toLowerCase()}
         className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${config.bgClass}`}
       >
-        <span className={`w-2 h-2 rounded-full ${config.dotClass} ${config.pulse ? 'animate-pulse' : ''}`} />
+        <span className={`w-2 h-2 rounded-full ${config.dotClass} ${config.pulse ? 'animate-pulse motion-reduce:animate-none' : ''}`} />
         <span className={`text-xs font-medium ${config.textClass}`}>{config.label}</span>
         {explanation && (
           <span id={descId} className="sr-only">{explanation}</span>
@@ -93,8 +104,10 @@ export function StatusBadge({
         {evidence && (
           <div className="max-h-[60vh] overflow-y-auto p-3 space-y-2 select-text bg-gray-900">
             <p className="text-xs font-semibold text-white">{config.label}</p>
-            {/* The explanation itself is the card's Meaning row, built from the
-                generated status config in TerminalMetadata — not duplicated here. */}
+            {headlineEntries.length > 0 && <MetadataRows entries={headlineEntries} dense />}
+            <p className="pt-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+              Provider and lifecycle evidence
+            </p>
             <MetadataRows entries={evidence.entries} dense />
           </div>
         )}

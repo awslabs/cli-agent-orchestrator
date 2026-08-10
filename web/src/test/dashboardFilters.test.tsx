@@ -233,7 +233,7 @@ describe('STOPPED reaches the summary and the pills as itself', () => {
 
   it('filters the fleet to stopped rows from the Stopped option', async () => {
     await renderDashboard()
-    openGlobalEditor('Reachability')
+    openGlobalEditor('Worker state')
     fireEvent.click(screen.getByRole('button', { name: 'Stopped' }))
     expect(visibleIds('cao-alpha')).toEqual(['aa-0004'])
     expect(cardPresent('cao-beta')).toBe(false)
@@ -241,7 +241,7 @@ describe('STOPPED reaches the summary and the pills as itself', () => {
 
   it('filters the fleet to proven-dead rows from the Dead option', async () => {
     await renderDashboard()
-    openGlobalEditor('Reachability')
+    openGlobalEditor('Worker state')
     fireEvent.click(screen.getByRole('button', { name: 'Dead' }))
     expect(visibleIds('cao-alpha')).toEqual(['aa-0005'])
     expect(cardPresent('cao-beta')).toBe(false)
@@ -256,11 +256,11 @@ describe('STOPPED reaches the summary and the pills as itself', () => {
   })
 })
 
-describe('reachability is multi-select: OR within, AND across', () => {
-  it('selecting two reachability options shows the union', async () => {
+describe('worker state is multi-select: OR within, AND across', () => {
+  it('selecting two worker-state options shows the union', async () => {
     await renderDashboard()
-    openGlobalEditor('Reachability')
-    fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
+    openGlobalEditor('Worker state')
+    fireEvent.click(screen.getByRole('button', { name: 'Managed Active' }))
     fireEvent.click(screen.getByRole('button', { name: 'Processing' }))
     expect(visibleIds('cao-alpha')).toEqual(['aa-0001', 'aa-0002'])
     // bb-0002 is itself a managed worker: OR within the dimension means both.
@@ -363,11 +363,11 @@ describe('the summary chips keep counting ALL terminals while a filter runs', ()
     const card = sessionCard('cao-alpha')
     // One row survives…
     expect(within(card).getByTestId('session-filter-count').textContent).toBe('1 of 5 shown')
-    // …but the summary still describes the session: Managed Live 2, Idle 1,
+    // …but the summary still describes the session: Managed Active 2, Idle 1,
     // Stopped 1, Unknown 1. Pinned by dashboardStatusOrder.test.tsx — the
     // summary describes the session, the filter describes the view.
     const meta = metadataOf(card)
-    expect(within(meta).getByText('Managed Live').parentElement!.textContent).toContain('2')
+    expect(within(meta).getByText('Managed Active').parentElement!.textContent).toContain('2')
     expect(within(meta).getByText('Idle').parentElement!.textContent).toContain('1')
   })
 })
@@ -401,7 +401,7 @@ describe('the global empty state names the filters and offers the clear', () => 
     const twoSessions = SESSION_LIST.slice(0, 2)
     stubFetch(twoSessions)
     await renderDashboard(twoSessions)
-    openGlobalEditor('Reachability')
+    openGlobalEditor('Worker state')
     fireEvent.click(screen.getByRole('button', { name: 'Error' }))
     expect(cardPresent('cao-alpha')).toBe(false)
     expect(screen.getByText('No sessions match the current filter.')).toBeTruthy()
@@ -425,13 +425,13 @@ describe('the bar itself is the summary of what is hidden', () => {
   // `Dimension: selection`, and recovery is the always-visible Clear all.
   it('shows each active filter as a chip with its selection, and clears in one click', async () => {
     await renderDashboard()
-    openGlobalEditor('Reachability')
-    fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
+    openGlobalEditor('Worker state')
+    fireEvent.click(screen.getByRole('button', { name: 'Managed Active' }))
     fireEvent.click(screen.getByRole('button', { name: 'Processing' }))
 
     const bar = screen.getByTestId('filter-bar')
     const chip = bar.querySelector('[data-testid="global-chip"][data-dimension="reachability"]')!
-    expect(chip.textContent).toContain('Managed Live')
+    expect(chip.textContent).toContain('Managed Active')
     expect(chip.textContent).toContain('Processing')
 
     fireEvent.click(within(bar).getByRole('button', { name: 'Clear all' }))
