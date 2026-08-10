@@ -914,6 +914,136 @@ class NativeStatusRepairEvidenceModel(Base):
     )
 
 
+class LegacyIdentityMigrationModel(Base):
+    """One explicit opt-in one-candidate legacy identity migration (cond-0377D).
+
+    The intent (with the audit digest and the deterministic repair operation
+    id) is persisted BEFORE any repair interaction, and a durable
+    ``attempt-started`` marker is written before the first ``/status`` byte,
+    so a crash or a lost response resolves by the explicit migration
+    operation id: completion is derived from the repair evidence, and a
+    response loss without adoptable evidence is typed ambiguous/unresolved —
+    never resent.  Additive and dark: nothing invokes migration
+    automatically, and an old binary never reads this table.
+    """
+
+    __tablename__ = "legacy_identity_migrations"
+
+    migration_operation_id = Column(Text, primary_key=True)
+    request_digest = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    provider = Column(Text, nullable=False)
+    generation = Column(Text, nullable=True)
+    physical_occurrence = Column(Text, nullable=False)
+    provider_version = Column(Text, nullable=True)
+    audit_occurrence_id = Column(Text, nullable=False)
+    audit_candidate_digest = Column(Text, nullable=False)
+    repair_operation_id = Column(Text, nullable=False)
+    # pending | attempt-started | migrated | already-known |
+    # identity-still-missing | refused | errored
+    status = Column(Text, nullable=False)
+    repair_status = Column(Text, nullable=True)
+    repair_reason = Column(Text, nullable=True)
+    native_session_id = Column(Text, nullable=True)
+    evidence_sha256 = Column(Text, nullable=True)
+    parser_key = Column(Text, nullable=True)
+    # Bounded canonical JSON of the recorded outcome (typed detail and the
+    # bounded attachment facts); never raw pane output.
+    outcome_json = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (Index("ix_legacy_identity_migrations_terminal", "terminal_id"),)
+
+
+class NativeStatusObservationAttemptModel(Base):
+    """One at-most-once claim of a native ``/status`` observation (cond-0377D).
+
+    Written atomically at PR #99's real byte seam — immediately before the
+    sole ``/status`` send — so the manual repair API and the migration
+    coordinator share the same at-most-once truth: exactly one caller may
+    claim the attempt; every loser observes the journal and sends nothing.
+    The journal also makes Kimi's ``identity-still-missing`` verdict an
+    adoptable terminal outcome (PR #99 writes no normal repair evidence for
+    it) so an exact retry never resends ``/status``.
+    """
+
+    __tablename__ = "native_status_observation_attempts"
+
+    operation_id = Column(Text, primary_key=True)
+    request_digest = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    #: The physical occurrence (callback-target generation for a legacy row,
+    #: the model generation for a managed row).
+    generation = Column(Text, nullable=False)
+    provider = Column(Text, nullable=False)
+    # attempted | observed | identity-still-missing
+    status = Column(Text, nullable=False)
+    # 0 while claimed, 1 once the sole /status action produced a verdict.
+    status_action_count = Column(Integer, nullable=False)
+    observed_at = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
+class ProviderCanaryReceiptModel(Base):
+    """One installed live-repair canary receipt (cond-0377D read seam).
+
+    The receipt is written only by an installed canary that really ran the
+    bounded status observation against a live pane — never by a parser
+    fixture, an executable banner, or a unit test.  A successful receipt is
+    DERIVED from the actual committed records — the migration operation/
+    request, its deterministic repair operation, the observation-attempt
+    journal, the repair evidence/request/evidence digest, provider/parser/
+    plan, native identity, and the attachment/adoption outcome — never from
+    caller-supplied copies of those fields.  Installed build identity keeps
+    the full provider banner and the resolved executable SHA-256 (Muse's
+    ``R`` revision is never normalized away).  Its presence is what promotes
+    a provider cell from code-supported to installed-live-proven.  The
+    schema is fixed so later installed canaries can record without changing
+    the read surface.
+    """
+
+    __tablename__ = "provider_canary_receipts"
+
+    canary_id = Column(Text, primary_key=True)
+    provider = Column(Text, nullable=False)
+    #: The normalized build for parser-plan matching; the full identity
+    #: lives in installed_build_banner / installed_build_sha256.
+    build = Column(Text, nullable=False)
+    receipt_schema = Column(Text, nullable=False)
+    #: The DERIVED repair operation the canary exercised (uuid5 of the
+    #: migration operation id; never caller-chosen).
+    operation_id = Column(Text, nullable=False)
+    migration_operation_id = Column(Text, nullable=False)
+    #: Digest of the derived receipt content for response-loss-safe
+    #: exact-duplicate adoption vs changed-content conflict.
+    request_digest = Column(Text, nullable=False)
+    #: The backing migration operation's own request digest (derived).
+    migration_request_digest = Column(Text, nullable=True)
+    #: The backing repair evidence's request digest (derived).
+    evidence_request_digest = Column(Text, nullable=True)
+    evidence_sha256 = Column(Text, nullable=True)
+    native_session_id = Column(Text, nullable=True)
+    # The derived zero/one status action count of the bounded observation.
+    status_action_count = Column(Integer, nullable=False)
+    parser_key = Column(Text, nullable=True)
+    attachment_outcome = Column(Text, nullable=True)
+    #: The full installed provider banner observed from the executable's
+    #: own bounded ``--version`` output (e.g. ``Muse Code (0.1.0-R708.1)``).
+    installed_build_banner = Column(Text, nullable=False)
+    #: The SHA-256 of the exact executable file, computed by the service.
+    installed_build_sha256 = Column(Text, nullable=False)
+    #: The canonical absolute path of the exact executable that was probed.
+    executable_path = Column(Text, nullable=False)
+    # ok | failed
+    state = Column(Text, nullable=False)
+    recorded_at = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+
+    __table_args__ = (Index("ix_provider_canary_receipts_provider", "provider"),)
+
+
 class KimiNativeControlOperationModel(Base):
     """One human/orchestrator control operation against a native Kimi TUI.
 
@@ -1283,6 +1413,9 @@ def init_db() -> None:
     _migrate_managed_launch_v2()
     _migrate_stable_agent_roster()
     _migrate_native_status_repair()
+    _migrate_native_status_observation_attempt()
+    _migrate_legacy_identity_migration()
+    _migrate_provider_canary_receipts()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1858,6 +1991,126 @@ def _migrate_native_status_repair() -> None:
                 )
     except Exception as e:  # noqa: BLE001 - the repair path fails closed
         logger.warning(f"native status-repair migration failed: {e}")
+
+
+def _migrate_legacy_identity_migration() -> None:
+    """Create the cond-0377D migration intent/outcome store on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via
+    ``LegacyIdentityMigrationModel``; this idempotent step covers databases
+    created before cond-0377D.  Additive and dark: nothing invokes migration
+    automatically, and an old binary never reads this table.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS legacy_identity_migrations ("
+                "migration_operation_id TEXT NOT NULL PRIMARY KEY, "
+                "request_digest TEXT NOT NULL, "
+                "terminal_id TEXT NOT NULL, "
+                "provider TEXT NOT NULL, "
+                "generation TEXT, "
+                "physical_occurrence TEXT NOT NULL, "
+                "provider_version TEXT, "
+                "audit_occurrence_id TEXT NOT NULL, "
+                "audit_candidate_digest TEXT NOT NULL, "
+                "repair_operation_id TEXT NOT NULL, "
+                "status TEXT NOT NULL, "
+                "repair_status TEXT, "
+                "repair_reason TEXT, "
+                "native_session_id TEXT, "
+                "evidence_sha256 TEXT, "
+                "parser_key TEXT, "
+                "outcome_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_legacy_identity_migrations_terminal "
+                "ON legacy_identity_migrations(terminal_id)"
+            )
+    except Exception as e:  # noqa: BLE001 - the migration path fails closed
+        logger.warning(f"legacy identity migration store migration failed: {e}")
+
+
+def _migrate_provider_canary_receipts() -> None:
+    """Create the cond-0377D canary receipt store on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via
+    ``ProviderCanaryReceiptModel``; this idempotent step covers databases
+    created before cond-0377D.  Additive: an old binary ignores the table.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS provider_canary_receipts ("
+                "canary_id TEXT NOT NULL PRIMARY KEY, "
+                "provider TEXT NOT NULL, "
+                "build TEXT NOT NULL, "
+                "receipt_schema TEXT NOT NULL, "
+                "operation_id TEXT NOT NULL, "
+                "migration_operation_id TEXT NOT NULL, "
+                "request_digest TEXT NOT NULL, "
+                "migration_request_digest TEXT, "
+                "evidence_request_digest TEXT, "
+                "evidence_sha256 TEXT, "
+                "native_session_id TEXT, "
+                "status_action_count INTEGER NOT NULL, "
+                "parser_key TEXT, "
+                "attachment_outcome TEXT, "
+                "installed_build_banner TEXT NOT NULL, "
+                "installed_build_sha256 TEXT NOT NULL, "
+                "executable_path TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "recorded_at TEXT NOT NULL, "
+                "created_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_provider_canary_receipts_provider "
+                "ON provider_canary_receipts(provider)"
+            )
+    except Exception as e:  # noqa: BLE001 - the migration path fails closed
+        logger.warning(f"provider canary receipt store migration failed: {e}")
+
+
+def _migrate_native_status_observation_attempt() -> None:
+    """Create the cond-0377D at-most-once observation-attempt journal on older
+    databases.  ``Base.metadata.create_all`` covers fresh databases via
+    ``NativeStatusObservationAttemptModel``; this idempotent step covers
+    databases created before cond-0377D.  Additive: an old binary ignores
+    the table."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS native_status_observation_attempts ("
+                "operation_id TEXT NOT NULL PRIMARY KEY, "
+                "request_digest TEXT NOT NULL, "
+                "terminal_id TEXT NOT NULL, "
+                "generation TEXT NOT NULL, "
+                "provider TEXT NOT NULL, "
+                "status TEXT NOT NULL, "
+                "status_action_count INTEGER NOT NULL, "
+                "observed_at TEXT, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - the migration path fails closed
+        logger.warning(f"native status observation attempt migration failed: {e}")
 
 
 def _migrate_session_lifecycle() -> None:

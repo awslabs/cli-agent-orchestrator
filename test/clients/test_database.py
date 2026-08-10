@@ -1721,3 +1721,195 @@ class TestSetTerminalNativeSessionIdConditional:
             )
             is False
         )
+
+
+class TestLegacyIdentityMigrationSchema:
+    """cond-0377D additive stores: fresh create_all and raw migrations agree."""
+
+    def _legacy_db(self, tmp_path):
+        import sqlite3
+
+        db_file = tmp_path / "legacy.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL)")
+            conn.commit()
+        return db_file
+
+    def test_migration_creates_migration_table_with_exact_schema(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = self._legacy_db(tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        db_mod._migrate_legacy_identity_migration()
+        with sqlite3.connect(str(db_file)) as conn:
+            cols = {c[1] for c in conn.execute("PRAGMA table_info(legacy_identity_migrations)")}
+        assert {
+            "migration_operation_id",
+            "request_digest",
+            "terminal_id",
+            "provider",
+            "generation",
+            "physical_occurrence",
+            "provider_version",
+            "audit_occurrence_id",
+            "audit_candidate_digest",
+            "repair_operation_id",
+            "status",
+            "repair_status",
+            "repair_reason",
+            "native_session_id",
+            "evidence_sha256",
+            "parser_key",
+            "outcome_json",
+            "created_at",
+            "updated_at",
+        } <= cols
+
+    def test_migration_is_idempotent_and_preserves_rows(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = self._legacy_db(tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        db_mod._migrate_legacy_identity_migration()
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "INSERT INTO legacy_identity_migrations VALUES ("
+                "'00000000-0000-4000-8000-000000000001', 'a' * 64, 't1', 'claude_code', "
+                "NULL, 'occ-1', NULL, 'audit-1', 'b' * 64, "
+                "'00000000-0000-4000-8000-000000000002', 'pending', NULL, NULL, NULL, "
+                "NULL, NULL, NULL, 'now', 'now')"
+            )
+            conn.commit()
+        db_mod._migrate_legacy_identity_migration()  # second run must not raise or clobber
+        with sqlite3.connect(str(db_file)) as conn:
+            rows = conn.execute(
+                "SELECT migration_operation_id, status FROM legacy_identity_migrations"
+            )
+            assert list(rows) == [("00000000-0000-4000-8000-000000000001", "pending")]
+
+    def test_fresh_model_schema_matches_raw_migration_ddl(self):
+        from sqlalchemy.schema import CreateTable
+
+        from cli_agent_orchestrator.clients.database import LegacyIdentityMigrationModel
+
+        ddl = str(CreateTable(LegacyIdentityMigrationModel.__table__).compile())
+        assert "migration_operation_id TEXT NOT NULL" in ddl
+        assert "PRIMARY KEY (migration_operation_id)" in ddl
+        assert "repair_operation_id TEXT NOT NULL" in ddl
+        assert "outcome_json TEXT" in ddl
+
+    def test_canary_receipt_migration_and_idempotence(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = self._legacy_db(tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        db_mod._migrate_provider_canary_receipts()
+        with sqlite3.connect(str(db_file)) as conn:
+            cols = {c[1] for c in conn.execute("PRAGMA table_info(provider_canary_receipts)")}
+        assert {
+            "canary_id",
+            "provider",
+            "build",
+            "receipt_schema",
+            "operation_id",
+            "migration_operation_id",
+            "request_digest",
+            "evidence_sha256",
+            "native_session_id",
+            "status_action_count",
+            "parser_key",
+            "attachment_outcome",
+            "installed_build_banner",
+            "installed_build_sha256",
+            "state",
+            "recorded_at",
+            "created_at",
+        } <= cols
+        db_mod._migrate_provider_canary_receipts()  # idempotent
+
+    def test_fresh_canary_model_schema_matches_raw_migration_ddl(self):
+        from sqlalchemy.schema import CreateTable
+
+        from cli_agent_orchestrator.clients.database import ProviderCanaryReceiptModel
+
+        ddl = str(CreateTable(ProviderCanaryReceiptModel.__table__).compile())
+        assert "canary_id TEXT NOT NULL" in ddl
+        assert "PRIMARY KEY (canary_id)" in ddl
+        assert "status_action_count INTEGER NOT NULL" in ddl
+        assert "migration_operation_id TEXT" in ddl
+        assert "request_digest TEXT NOT NULL" in ddl
+        assert "installed_build_banner TEXT NOT NULL" in ddl
+        assert "installed_build_sha256 TEXT NOT NULL" in ddl
+
+    def test_observation_attempt_migration_and_idempotence(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = self._legacy_db(tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        db_mod._migrate_native_status_observation_attempt()
+        with sqlite3.connect(str(db_file)) as conn:
+            cols = {
+                c[1] for c in conn.execute("PRAGMA table_info(native_status_observation_attempts)")
+            }
+        assert {
+            "operation_id",
+            "request_digest",
+            "terminal_id",
+            "generation",
+            "provider",
+            "status",
+            "status_action_count",
+            "observed_at",
+            "created_at",
+            "updated_at",
+        } <= cols
+        db_mod._migrate_native_status_observation_attempt()  # idempotent
+
+    def test_fresh_observation_attempt_model_matches_raw_migration_ddl(self):
+        from sqlalchemy.schema import CreateTable
+
+        from cli_agent_orchestrator.clients.database import NativeStatusObservationAttemptModel
+
+        ddl = str(CreateTable(NativeStatusObservationAttemptModel.__table__).compile())
+        assert "operation_id TEXT NOT NULL" in ddl
+        assert "PRIMARY KEY (operation_id)" in ddl
+        assert "status TEXT NOT NULL" in ddl
+        assert "status_action_count INTEGER NOT NULL" in ddl
+
+    def test_downgrade_harmless_new_db_with_old_migrations(self, tmp_path, monkeypatch):
+        """Old code on a new DB: extra tables are ignored and rows untouched."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = self._legacy_db(tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE legacy_identity_migrations (migration_operation_id TEXT "
+                "PRIMARY KEY, status TEXT NOT NULL)"
+            )
+            conn.execute("INSERT INTO legacy_identity_migrations VALUES ('op-1', 'migrated')")
+            conn.commit()
+        db_mod._migrate_legacy_identity_migration()  # old migration on a new DB: no-op
+        with sqlite3.connect(str(db_file)) as conn:
+            rows = conn.execute("SELECT * FROM legacy_identity_migrations")
+            assert list(rows) == [("op-1", "migrated")]

@@ -514,6 +514,76 @@ _REPAIR_PARSER_PLANS: dict[str, dict[str, Any]] = {
 }
 
 
+def repair_parser_plans() -> dict[str, dict[str, Any]]:
+    """The pinned repair interaction plans as a bounded static read.
+
+    The versioned capability surface reads the same closed plan table the
+    repair itself runs: one parser key per provider, the exact builds with
+    proven status-observation evidence, and whether the modal needs its
+    single Escape.  A build with no plan has no status-observation support.
+    """
+    return {
+        provider: {
+            "parser_key": plan["parser_key"],
+            "supported_versions": tuple(plan["supported_versions"]),
+            "escape": bool(plan["escape"]),
+        }
+        for provider, plan in _REPAIR_PARSER_PLANS.items()
+    }
+
+
+def terminal_occurrence_snapshot(terminal_id: str, db: Any = None) -> Optional[dict[str, Any]]:
+    """Public read-only occurrence snapshot of one terminal row, or None.
+
+    The v2 vintage is read first, then the shared table.  Read-only: never
+    self-heals metadata, never registers anything, never mutates.  The
+    cond-0377D audit/migration seams read through this instead of private
+    helpers.
+    """
+
+    def _snap(session: Any) -> Optional[dict[str, Any]]:
+        return _terminal_row_from(session, terminal_id)
+
+    if db is not None:
+        return _snap(db)
+    with database.SessionLocal() as session:
+        return _snap(session)
+
+
+def repair_outcome_by_operation(operation_id: str) -> Optional[dict[str, Any]]:
+    """The bounded recorded repair evidence for one operation, or None.
+
+    Read-only response-loss seam: a coordinator derives completion from this
+    after a crash instead of resending ``/status``.  An absent row means the
+    repair never reached its atomic commit (nothing adoptable exists).
+    """
+    return _evidence_by_operation(operation_id)
+
+
+def managed_binding_snapshot(
+    session: Any,
+    *,
+    terminal_id: str,
+    model_generation: Optional[str],
+    provider: str,
+) -> Optional[dict[str, Any]]:
+    """The strictly validated managed-v2 native binding for a v2 terminal.
+
+    Read-only: uses the repair's own strict validator (absent, malformed,
+    incomplete, or non-native bindings raise the repair's typed
+    ``NativeStatusRepairError``; a legacy row never consumes a stale v2
+    reservation).  Public read seam for the cond-0377D audit so the audit
+    and the repair can never disagree about a binding.
+    """
+    return _load_validated_binding(
+        session,
+        terminal_id=terminal_id,
+        model_generation=model_generation,
+        provider=provider,
+        require_binding=True,
+    )
+
+
 def _resolve_plan(
     provider: str,
     provider_version: Optional[str],
@@ -687,8 +757,9 @@ def _terminal_row_from(session: Any, terminal_id: str) -> Optional[dict[str, Any
 
     The v2 row lives only in ``managed_launch_v2_terminals``; the shared
     ``terminals`` row covers legacy launches.  The dict retains the
-    ``callback_target_generation``, the current ``native_session_id``, and
-    the ``vintage`` provenance needed for exact decisions.
+    ``callback_target_generation``, the current ``native_session_id``, the
+    supersession pointers for both vintages, and the ``vintage`` provenance
+    needed for exact decisions.
     """
     row = (
         session.query(database.ManagedLaunchV2TerminalModel)
@@ -710,6 +781,8 @@ def _terminal_row_from(session: Any, terminal_id: str) -> Optional[dict[str, Any
             "pane_pid": row.v2_pane_pid,
             "tmux_session": row.tmux_session,
             "tmux_window": row.tmux_window,
+            "superseded_by_terminal_id": row.v2_superseded_by_terminal_id,
+            "superseded_by_generation": row.v2_superseded_by_generation,
             "vintage": "v2",
         }
     row = (
@@ -733,6 +806,8 @@ def _terminal_row_from(session: Any, terminal_id: str) -> Optional[dict[str, Any
         "pane_pid": row.pane_pid,
         "tmux_session": row.tmux_session,
         "tmux_window": row.tmux_window,
+        "superseded_by_terminal_id": row.superseded_by_terminal_id,
+        "superseded_by_generation": row.superseded_by_generation,
         "vintage": "legacy",
     }
 
@@ -1604,6 +1679,142 @@ def _evidence_by_operation(operation_id: str) -> Optional[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# cond-0377D: the at-most-once observation-attempt journal
+# ---------------------------------------------------------------------------
+
+OBSERVATION_ATTEMPTED = "attempted"
+#: The sole /status action was confirmed submitted (Enter succeeded).  A
+#: zero status-action count never means "no action occurred": the count
+#: becomes 1 at SUBMIT time, before any verdict exists.
+OBSERVATION_SUBMITTED = "submitted"
+OBSERVATION_OBSERVED = "observed"
+OBSERVATION_IDENTITY_STILL_MISSING = "identity-still-missing"
+OBSERVATION_ATTEMPT_STATUSES = frozenset(
+    {
+        OBSERVATION_ATTEMPTED,
+        OBSERVATION_SUBMITTED,
+        OBSERVATION_OBSERVED,
+        OBSERVATION_IDENTITY_STILL_MISSING,
+    }
+)
+
+
+def _claim_observation_attempt(
+    *,
+    operation_id: str,
+    request_digest: str,
+    terminal_id: str,
+    generation: str,
+    provider: str,
+) -> bool:
+    """The atomic at-most-once claim immediately before the sole ``/status``
+    send.  Exactly one caller inserts the attempt row (the primary key is
+    the operation id); every loser observes the journal and must not send
+    ``/status`` again.  A database failure fails closed: no claim, no bytes.
+    """
+    stamp = _now()
+    try:
+        with database.SessionLocal() as db:
+            db.add(
+                database.NativeStatusObservationAttemptModel(
+                    operation_id=operation_id,
+                    request_digest=request_digest,
+                    terminal_id=terminal_id,
+                    generation=generation,
+                    provider=provider,
+                    status=OBSERVATION_ATTEMPTED,
+                    status_action_count=0,
+                    created_at=stamp,
+                    updated_at=stamp,
+                )
+            )
+            db.commit()
+            return True
+    except Exception:  # noqa: BLE001 - a concurrent duplicate loses the claim
+        return False
+
+
+def _record_observation_submitted(operation_id: str) -> None:
+    """Confirm the sole /status action was submitted (Enter succeeded).
+
+    Best-effort: the conservative no-resend rule holds even if this write
+    fails (the attempt row still exists); a failure merely degrades the
+    retry outcome from ambiguous-with-submitted to ambiguous-attempted.
+    The count moves to 1 HERE — a submitted action is never reported as
+    zero action."""
+    try:
+        with database.SessionLocal() as db:
+            row: Any = (
+                db.query(database.NativeStatusObservationAttemptModel)
+                .filter(database.NativeStatusObservationAttemptModel.operation_id == operation_id)
+                .one_or_none()
+            )
+            if row is None:
+                return
+            row.status = OBSERVATION_SUBMITTED
+            row.status_action_count = 1
+            row.updated_at = _now()
+            db.commit()
+    except Exception as exc:  # noqa: BLE001 - best-effort, never masks the primary
+        logger.warning("repair %s: observation submit record failed: %s", operation_id, exc)
+
+
+def _record_observation_verdict(*, operation_id: str, status: str, observed_at: str) -> None:
+    """Best-effort verdict update after the sole ``/status`` action produced
+    one.  For ``identity-still-missing`` this verdict IS the adoptable
+    terminal outcome (PR #99 writes no normal repair evidence for it); the
+    authoritative success remains the atomic evidence commit."""
+    if status not in OBSERVATION_ATTEMPT_STATUSES:
+        raise ValueError(f"unknown observation verdict: {status!r}")
+    try:
+        with database.SessionLocal() as db:
+            row: Any = (
+                db.query(database.NativeStatusObservationAttemptModel)
+                .filter(database.NativeStatusObservationAttemptModel.operation_id == operation_id)
+                .one_or_none()
+            )
+            if row is None:
+                return
+            row.status = status
+            row.status_action_count = 1
+            row.observed_at = observed_at
+            row.updated_at = _now()
+            db.commit()
+    except Exception as exc:  # noqa: BLE001 - best-effort, never masks the primary
+        logger.warning("repair %s: observation verdict record failed: %s", operation_id, exc)
+
+
+def repair_observation_attempt(operation_id: str) -> Optional[dict[str, Any]]:
+    """The recorded observation-attempt journal for one repair operation, or
+    None.  Read-only response-loss seam: the migration coordinator derives
+    at-most-once truth and Kimi ``identity-still-missing`` replayability
+    from it.  An unreadable journal reads as None (conservative: no bytes
+    are ever resent)."""
+    try:
+        with database.SessionLocal() as db:
+            row = (
+                db.query(database.NativeStatusObservationAttemptModel)
+                .filter(database.NativeStatusObservationAttemptModel.operation_id == operation_id)
+                .one_or_none()
+            )
+            if row is None:
+                return None
+            return {
+                "operation_id": row.operation_id,
+                "request_digest": row.request_digest,
+                "terminal_id": row.terminal_id,
+                "generation": row.generation,
+                "provider": row.provider,
+                "status": row.status,
+                "status_action_count": row.status_action_count,
+                "observed_at": row.observed_at,
+            }
+    except Exception as exc:  # noqa: BLE001 - conservative None
+        logger.warning("repair %s: observation attempt read failed: %s", operation_id, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # The operation
 # ---------------------------------------------------------------------------
 
@@ -2303,7 +2514,48 @@ def _repair_under_claims(
             composer_restored=prior.get("composer_restored"),
         )
 
-    # The one observation: literal /status and exactly one Enter.
+    # The one observation: literal /status and exactly one Enter.  The
+    # observation-attempt journal is the at-most-once barrier at the actual
+    # byte seam: exactly one caller may claim the attempt; a loser observes
+    # the journal and returns a typed outcome with zero bytes (never a
+    # second /status).  Kimi's identity-still-missing verdict is journaled
+    # so an exact retry adopts it instead of resending.
+    if not _claim_observation_attempt(
+        operation_id=operation_id,
+        request_digest=request_digest,
+        terminal_id=terminal_id,
+        generation=occurrence,
+        provider=provider,
+    ):
+        attempt = repair_observation_attempt(operation_id)
+        if attempt is None:
+            raise NativeStatusRepairConflict(
+                "observation-attempt-ambiguous",
+                "the observation attempt could not be claimed; refusing without typing",
+            )
+        if attempt["request_digest"] != request_digest:
+            raise NativeStatusRepairConflict(
+                "operation-conflict",
+                "the operation id is already bound to a different request digest",
+            )
+        if attempt["status"] == OBSERVATION_IDENTITY_STILL_MISSING:
+            outcome = dict(base)
+            outcome.update(
+                status=STATUS_IDENTITY_STILL_MISSING,
+                reason=STATUS_IDENTITY_STILL_MISSING,
+                detail=(
+                    "the exact repair observation already rendered identity-still-missing; "
+                    "an exact retry adopts that verdict and never resends /status"
+                ),
+                provider=provider,
+                provider_version=plan["plan_version"],
+            )
+            return outcome
+        raise NativeStatusRepairConflict(
+            "observation-attempt-ambiguous",
+            "the observation for this operation was already attempted but no committed "
+            "verdict exists; an exact retry will not send /status again",
+        )
     typed = npi.TmuxPaneInput(pane_id)
     try:
         typed.send_literal(STATUS_COMMAND)
@@ -2313,6 +2565,8 @@ def _repair_under_claims(
         raise NativeStatusRepairConflict(
             "pane-unwritable", "the /status write was refused by tmux"
         ) from exc
+    # Enter succeeded: the sole status action is confirmed submitted.
+    _record_observation_submitted(operation_id)
 
     # From here the /status has been submitted.  For the Claude modal the
     # single Escape and the post-Escape composer proof run in a finally
@@ -2344,6 +2598,13 @@ def _repair_under_claims(
                     "live owner) but the Kimi panel renders no session; the known id "
                     "could not be verified and nothing was mutated",
                 )
+            # The verdict is the adoptable terminal outcome: journaled so an
+            # exact retry (manual or migration) adopts it without resending.
+            _record_observation_verdict(
+                operation_id=operation_id,
+                status=OBSERVATION_IDENTITY_STILL_MISSING,
+                observed_at=_now(),
+            )
             outcome = dict(base)
             outcome.update(
                 status=STATUS_IDENTITY_STILL_MISSING,
@@ -2385,6 +2646,13 @@ def _repair_under_claims(
             "the panel names a different session than the exact live owner; a "
             "second owner is never created for the same pane",
         )
+    # The observation produced a verdict: journal it (best-effort; the
+    # authoritative success remains the atomic evidence commit below).
+    _record_observation_verdict(
+        operation_id=operation_id,
+        status=OBSERVATION_OBSERVED,
+        observed_at=verdict["observed_at"],
+    )
 
     return _finish_repair(
         operation_id=operation_id,
