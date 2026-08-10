@@ -22,6 +22,7 @@ Covers the reviewed contract end to end over fakes:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import threading
 import time
@@ -322,6 +323,73 @@ def harness(monkeypatch):
     return state
 
 
+PINNED_VERSION = {
+    "claude_code": CLAUDE_VERSION,
+    "codex": CODEX_VERSION,
+    "kimi_cli": KIMI_VERSION,
+    "muse_cli": MUSE_VERSION,
+}
+
+#: Sentinel: seed the default valid managed-v2 binding in _seed_terminal.
+_BINDING_DEFAULT = object()
+
+
+def _seed_v2_reservation(
+    provider: str,
+    *,
+    terminal_id: str = TERMINAL_ID,
+    generation: str = GENERATION,
+    binding: Optional[dict] = None,
+    state: str = "bound",
+) -> None:
+    """Create or update the managed-v2 reservation for a v2 terminal.
+    ``binding`` of None means the reservation exists with no binding_json."""
+    import json as _json
+
+    with database.SessionLocal() as db:
+        existing = (
+            db.query(database.ManagedLaunchV2ReservationModel)
+            .filter_by(terminal_id=terminal_id)
+            .first()
+        )
+        if existing is None:
+            db.add(
+                database.ManagedLaunchV2ReservationModel(
+                    reservation_id=_uuid(),
+                    terminal_id=terminal_id,
+                    generation=generation,
+                    protocol_vintage="v2",
+                    session_name=SESSION_NAME,
+                    provider=provider,
+                    agent_profile="developer",
+                    caller_id="deadbeef",
+                    working_directory="/Users/x/repo",
+                    obligation_generation=generation,
+                    run_id="run-1",
+                    launch_nonce_digest="a" * 64,
+                    state=state,
+                    request_json=_json.dumps({"expected_model": "m", "expected_effort": "high"}),
+                    binding_json=_json.dumps(binding) if binding is not None else None,
+                    created_at="now",
+                    updated_at="now",
+                )
+            )
+        else:
+            existing.generation = generation
+            existing.state = state
+            existing.binding_json = _json.dumps(binding) if binding is not None else None
+        db.commit()
+
+
+def _default_binding(provider: str, session_id: str, version: Optional[str] = None) -> dict:
+    return {
+        "schema": "cao-managed-v2-native-binding-v1",
+        "execution_mode": "native_tui",
+        "native_session_id": session_id,
+        "provider_version": version or PINNED_VERSION[provider],
+    }
+
+
 def _seed_terminal(
     provider: str,
     *,
@@ -333,6 +401,9 @@ def _seed_terminal(
     window_id: str = WINDOW_ID,
     pane_pid: int = PANE_PID,
     server_socket: str = SERVER_SOCKET,
+    binding_session_id: str = SESSION_ID,
+    binding_version: Optional[str] = None,
+    binding: Optional[dict] = _BINDING_DEFAULT,
 ) -> None:
     database.create_terminal_v2(
         terminal_id,
@@ -355,6 +426,12 @@ def _seed_terminal(
         row.v2_lifecycle_state = lifecycle
         row.v2_native_session_id = native_session_id
         db.commit()
+    if provider in PINNED_VERSION:
+        if binding is _BINDING_DEFAULT:
+            binding = _default_binding(provider, binding_session_id, binding_version)
+        _seed_v2_reservation(
+            provider, terminal_id=terminal_id, generation=generation, binding=binding
+        )
 
 
 def _seed_legacy(
@@ -417,8 +494,8 @@ def _seed_roster(
     )
 
 
-def _seed_all(provider: str) -> dict[str, Any]:
-    _seed_terminal(provider)
+def _seed_all(provider: str, *, binding_session_id: str = SESSION_ID) -> dict[str, Any]:
+    _seed_terminal(provider, binding_session_id=binding_session_id)
     return _seed_roster(provider)
 
 
@@ -778,7 +855,7 @@ def test_repair_happy_path_per_provider(
     harness.screens.append(panel)
     if provider == "claude_code":
         harness.styled_screens.append(claude_composer_rows())
-    _seed_all(provider)
+    _seed_all(provider, binding_session_id=expected_id)
 
     outcome = nsr.repair_terminal_native_identity(
         terminal_id=TERMINAL_ID,
@@ -834,17 +911,25 @@ def test_repair_happy_path_per_provider(
 
 
 def test_kimi_no_id_is_typed_still_missing_with_zero_mutation(isolated_memory_db, harness):
+    # A fresh, never-sessioned Kimi pane has no binding to constrain it: use
+    # a legacy Kimi row (generation None) so the only identity surface is
+    # the panel's exact 'Session none' verdict.
     harness.screens.append(kimi_panel_rows(session_id=None))
-    _seed_all("kimi_cli")
+    _seed_legacy("kimi_cli")
+    _seed_roster("kimi_cli", generation=None)
 
-    outcome = _call(provider_version=KIMI_VERSION, generation=GENERATION)
+    outcome = _call(
+        provider_version=KIMI_VERSION,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+    )
     assert outcome["status"] == "identity-still-missing"
     assert outcome["native_session_id"] is None
     assert outcome["evidence_sha256"] is None
     assert outcome["provider_version"] == KIMI_VERSION
     assert _typed_bytes(harness) == [("literal", "/status"), ("enter", "")]
-    assert _terminal_row().v2_native_session_id is None
-    assert _current_lineage()["native_session_id"] is None
+    assert _legacy_row().native_session_id is None
+    assert _current_lineage(generation=None)["native_session_id"] is None
     assert native_attachment.get("kimi_cli", "anything") is None
     assert _evidence_rows() == []
 
@@ -1099,7 +1184,12 @@ def test_claude_escape_exactly_once_on_capture_exception(isolated_memory_db, har
     assert _terminal_row().v2_native_session_id is None
 
 
-def test_claude_escape_exactly_once_on_identity_conflict(isolated_memory_db, harness):
+def test_claude_identity_conflict_before_bytes_when_durable_ids_disagree(
+    isolated_memory_db, harness
+):
+    # The managed binding names SESSION_ID while the roster lineage is bound
+    # to a different id: any disagreement among durable known identities is
+    # refused before a single pane byte.
     _seed_all("claude_code")
     roster.record_native_identity(
         terminal_id=TERMINAL_ID,
@@ -1112,9 +1202,9 @@ def test_claude_escape_exactly_once_on_identity_conflict(isolated_memory_db, har
     harness.styled_screens.append(claude_composer_rows())
 
     outcome = _claude_call()
-    _assert_escape_contract(
-        harness, outcome, expected_status="refused", expected_reason="identity-conflict"
-    )
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "identity-conflict"
+    assert harness.typed == []
     assert _current_lineage()["native_session_id"] == "11111111-2222-4333-8444-555555555555"
 
 
@@ -1330,8 +1420,26 @@ def test_retired_or_missing_roster_incarnation_refuses(isolated_memory_db, harne
 
 
 def test_unsupported_build_and_provider_refuse_before_any_io(isolated_memory_db, harness):
+    # On a v2 terminal the durable binding is authoritative: a caller build
+    # that disagrees with it is version-drift before any I/O.
     _seed_all("claude_code")
     outcome = _claude_call(provider_version="9.9.9")
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "version-drift"
+    assert harness.typed == []
+
+    # On a legacy row with no durable binding, an unsupported build is the
+    # fail-closed refusal.
+    legacy_id = "c3d4e5f6"
+    _seed_legacy("claude_code", terminal_id=legacy_id)
+    _seed_roster("claude_code", generation=None, terminal_id=legacy_id)
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=legacy_id,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+        provider_version="9.9.9",
+        operation_id=_uuid(),
+    )
     assert outcome["status"] == "refused"
     assert outcome["reason"] == "unsupported-build"
     assert harness.typed == []
@@ -1424,12 +1532,14 @@ def test_both_known_equal_with_no_attachment_is_attachment_unresolved(isolated_m
 
 
 def test_terminal_only_known_must_match_the_panel(isolated_memory_db, harness):
-    _seed_terminal("claude_code", native_session_id=SESSION_ID)
-    _seed_roster("claude_code")
+    # Legacy row (no binding) with exactly one known durable source: the
+    # terminal native id.  The panel must attest it.
+    _seed_legacy("claude_code", native_session_id=SESSION_ID)
+    _seed_roster("claude_code", generation=None)
     harness.screens.append(claude_panel_rows())
     harness.styled_screens.append(claude_composer_rows())
 
-    outcome = _claude_call()
+    outcome = _claude_call(generation=None, physical_occurrence=CALLBACK_TARGET)
     assert outcome["status"] == "repaired"
     assert outcome["native_session_id"] == SESSION_ID
 
@@ -1437,57 +1547,63 @@ def test_terminal_only_known_must_match_the_panel(isolated_memory_db, harness):
 def test_terminal_only_known_mismatch_is_a_typed_refusal_with_durable_unchanged(
     isolated_memory_db, harness
 ):
-    _seed_terminal("claude_code", native_session_id=SESSION_ID)
-    _seed_roster("claude_code")
+    _seed_legacy("claude_code", native_session_id=SESSION_ID)
+    _seed_roster("claude_code", generation=None)
     harness.screens.append(claude_panel_rows(session_id="11111111-2222-4333-8444-555555555555"))
     harness.styled_screens.append(claude_composer_rows())
 
-    outcome = _claude_call()
+    outcome = _claude_call(generation=None, physical_occurrence=CALLBACK_TARGET)
     assert outcome["status"] == "refused"
     assert outcome["reason"] == "identity-conflict"
-    assert _terminal_row().v2_native_session_id == SESSION_ID
-    assert _current_lineage()["native_session_id"] is None
+    assert _legacy_row().native_session_id == SESSION_ID
+    assert _current_lineage(generation=None)["native_session_id"] is None
     assert _evidence_rows() == []
 
 
 def test_lineage_only_known_must_match_the_panel(isolated_memory_db, harness):
-    _seed_terminal("claude_code")
-    _seed_roster("claude_code", native_session_id=SESSION_ID)
+    _seed_legacy("claude_code")
+    _seed_roster("claude_code", native_session_id=SESSION_ID, generation=None)
     harness.screens.append(claude_panel_rows())
     harness.styled_screens.append(claude_composer_rows())
 
-    outcome = _claude_call()
+    outcome = _claude_call(generation=None, physical_occurrence=CALLBACK_TARGET)
     assert outcome["status"] == "repaired"
     assert outcome["native_session_id"] == SESSION_ID
 
 
 def test_kimi_still_missing_cannot_silently_ignore_a_known_id(isolated_memory_db, harness):
-    # A known id exists but the Kimi panel renders no session: the known id
-    # could not be verified, so it is a typed refusal with durable unchanged.
-    _seed_terminal("kimi_cli", native_session_id=KIMI_SESSION_ID)
-    _seed_roster("kimi_cli")
+    # A known id exists (only the terminal source) but the Kimi panel
+    # renders no session: the known id could not be verified, so it is a
+    # typed refusal with durable unchanged.  A legacy Kimi row keeps the
+    # binding out of the picture so exactly one durable source is known.
+    _seed_legacy("kimi_cli", native_session_id=KIMI_SESSION_ID)
+    _seed_roster("kimi_cli", generation=None)
     harness.screens.append(kimi_panel_rows(session_id=None))
 
-    outcome = _call(provider_version=KIMI_VERSION, generation=GENERATION)
+    outcome = _call(
+        provider_version=KIMI_VERSION,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+    )
     assert outcome["status"] == "refused"
     assert outcome["reason"] == "identity-conflict"
-    assert _terminal_row().v2_native_session_id == KIMI_SESSION_ID
+    assert _legacy_row().native_session_id == KIMI_SESSION_ID
     assert _evidence_rows() == []
 
 
 def test_lineage_only_known_mismatch_is_a_typed_refusal_with_durable_unchanged(
     isolated_memory_db, harness
 ):
-    _seed_terminal("claude_code")
-    _seed_roster("claude_code", native_session_id=SESSION_ID)
+    _seed_legacy("claude_code")
+    _seed_roster("claude_code", native_session_id=SESSION_ID, generation=None)
     harness.screens.append(claude_panel_rows(session_id="11111111-2222-4333-8444-555555555555"))
     harness.styled_screens.append(claude_composer_rows())
 
-    outcome = _claude_call()
+    outcome = _claude_call(generation=None, physical_occurrence=CALLBACK_TARGET)
     assert outcome["status"] == "refused"
     assert outcome["reason"] == "identity-conflict"
-    assert _terminal_row().v2_native_session_id is None
-    assert _current_lineage()["native_session_id"] == SESSION_ID
+    assert _legacy_row().native_session_id is None
+    assert _current_lineage(generation=None)["native_session_id"] == SESSION_ID
     assert _evidence_rows() == []
 
 
@@ -1551,8 +1667,10 @@ def test_same_operation_id_with_changed_request_is_conflict_before_pane_io(
         provider_version=CODEX_VERSION,
         operation_id=op,
     )
+    # The caller's provider version disagrees with the durable managed-v2
+    # binding: a typed version-drift refusal, never a recorded success.
     assert second["status"] == "refused"
-    assert second["reason"] == "operation-conflict"
+    assert second["reason"] == "version-drift"
     assert harness.typed == []
     assert len(_evidence_rows()) == 1
 
@@ -2303,9 +2421,13 @@ def test_concurrent_exact_retry_adopts_evidence_after_the_claim(isolated_memory_
     assert len(_evidence_rows()) == 1
 
 
-def test_concurrent_changed_request_gets_operation_conflict_after_the_claim(
+def test_concurrent_semantic_equivalent_request_converges_after_the_claim(
     isolated_memory_db, harness
 ):
+    """Two concurrent requests with the SAME effective facts (one omits the
+    provider version, the other supplies the identical pinned build) are
+    canonically the same operation: the second adopts the first's evidence
+    instead of conflicting."""
     _seed_legacy_all("claude_code")
     harness.screens.append(claude_panel_rows())
     harness.styled_screens.append(claude_composer_rows())
@@ -2345,8 +2467,8 @@ def test_concurrent_changed_request_gets_operation_conflict_after_the_claim(
     second_thread.join(timeout=30)
 
     assert results["first"]["status"] == "repaired"
-    assert results["second"]["status"] == "refused"
-    assert results["second"]["reason"] == "operation-conflict"
+    assert results["second"]["status"] == "repaired"
+    assert results["second"]["evidence_sha256"] == results["first"]["evidence_sha256"]
     assert _typed_bytes(harness) == [
         ("literal", "/status"),
         ("enter", ""),
@@ -2371,7 +2493,7 @@ def _partial_exact_owner(harness, receipt_mutate):
     digest = "b" * 64
     receipt = native_attachment.status_repair_adoption_receipt(
         operation_id=op,
-        request_digest=canonical_digest_for(TERMINAL_ID, GENERATION, CLAUDE_VERSION, None),
+        request_digest=canonical_digest_for("claude_code", TERMINAL_ID, GENERATION),
         provider="claude_code",
         native_session_id=SESSION_ID,
         terminal_id=TERMINAL_ID,
@@ -2450,7 +2572,7 @@ def test_exact_owner_partial_with_matching_receipt_converges_without_second_stat
     digest = "b" * 64
     receipt = native_attachment.status_repair_adoption_receipt(
         operation_id=op,
-        request_digest=canonical_digest_for(TERMINAL_ID, GENERATION, CLAUDE_VERSION, None),
+        request_digest=canonical_digest_for("claude_code", TERMINAL_ID, GENERATION),
         provider="claude_code",
         native_session_id=SESSION_ID,
         terminal_id=TERMINAL_ID,
@@ -2495,12 +2617,20 @@ def test_exact_owner_partial_with_matching_receipt_converges_without_second_stat
     assert len(_evidence_rows()) == 1
 
 
-def canonical_digest_for(terminal_id, generation, provider_version, physical_occurrence):
-    return nsr.canonical_request_digest(
+def canonical_digest_for(
+    provider: str, terminal_id: str, generation: str, physical_occurrence: Optional[str] = None
+):
+    """The resolved canonical digest a repair computes for a managed
+    terminal carrying the default test binding (native session SESSION_ID)."""
+    binding = _default_binding(provider, SESSION_ID)
+    occurrence = physical_occurrence or generation
+    return nsr.resolved_request_digest(
         terminal_id=terminal_id,
-        generation=generation,
-        provider_version=provider_version,
-        physical_occurrence=physical_occurrence,
+        model_generation=generation,
+        occurrence=occurrence,
+        provider=provider,
+        effective_version=PINNED_VERSION[provider],
+        binding_native_id=binding["native_session_id"],
     )
 
 
@@ -2597,49 +2727,11 @@ def test_same_operation_id_with_changed_occurrence_is_operation_conflict(
     assert harness.typed == []
 
 
-# --- 7: managed-v2 binding version is authoritative where available ---
-
-
-def _seed_binding_version(version: Optional[str]):
-    import json as _json
-
-    with database.SessionLocal() as db:
-        existing = (
-            db.query(database.ManagedLaunchV2ReservationModel)
-            .filter_by(terminal_id=TERMINAL_ID)
-            .first()
-        )
-        if existing is None:
-            db.add(
-                database.ManagedLaunchV2ReservationModel(
-                    reservation_id=_uuid(),
-                    terminal_id=TERMINAL_ID,
-                    generation=GENERATION,
-                    protocol_vintage="v2",
-                    session_name=SESSION_NAME,
-                    provider="claude_code",
-                    agent_profile="developer",
-                    caller_id="deadbeef",
-                    working_directory="/Users/x/repo",
-                    obligation_generation=GENERATION,
-                    run_id="run-1",
-                    launch_nonce_digest="a" * 64,
-                    state="bound",
-                    request_json=_json.dumps({"expected_model": "m", "expected_effort": "high"}),
-                    binding_json=(_json.dumps({"provider_version": version}) if version else None),
-                    created_at="now",
-                    updated_at="now",
-                )
-            )
-            db.commit()
-        else:
-            existing.binding_json = _json.dumps({"provider_version": version}) if version else None
-            db.commit()
+# --- 7: managed-v2 binding is authoritative where available ---
 
 
 def test_managed_binding_version_match_repairs(isolated_memory_db, harness):
     _seed_all("claude_code")
-    _seed_binding_version(CLAUDE_VERSION)
     harness.screens.append(claude_panel_rows())
     harness.styled_screens.append(claude_composer_rows())
 
@@ -2650,7 +2742,6 @@ def test_managed_binding_version_match_repairs(isolated_memory_db, harness):
 
 def test_managed_binding_version_caller_mismatch_refuses_zero_mutation(isolated_memory_db, harness):
     _seed_all("claude_code")
-    _seed_binding_version(CLAUDE_VERSION)
     harness.screens.append(claude_panel_rows())
 
     outcome = _claude_call(provider_version="2.1.225")
@@ -2664,7 +2755,6 @@ def test_managed_binding_version_rendered_panel_mismatch_refuses_zero_mutation(
     isolated_memory_db, harness
 ):
     _seed_all("claude_code")
-    _seed_binding_version(CLAUDE_VERSION)
     harness.screens.append(claude_panel_rows(version="2.1.225"))
 
     outcome = _claude_call(provider_version=None)
@@ -2679,15 +2769,28 @@ def test_managed_binding_version_rendered_panel_mismatch_refuses_zero_mutation(
     assert _evidence_rows() == []
 
 
-def test_managed_binding_version_missing_falls_back_to_pinned_plan(isolated_memory_db, harness):
-    _seed_all("claude_code")
-    _seed_binding_version(None)
+def test_managed_v2_without_a_bound_binding_refuses(isolated_memory_db, harness):
+    # A v2 terminal whose exact reservation has no binding (or no
+    # reservation) fails closed: a pre-bind process is never typed into.
+    _seed_terminal("claude_code", binding=None)
+    _seed_roster("claude_code")
     harness.screens.append(claude_panel_rows())
-    harness.styled_screens.append(claude_composer_rows())
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "binding-unavailable"
+    assert harness.typed == []
 
-    outcome = _claude_call(provider_version=None)
-    assert outcome["status"] == "repaired"
-    assert outcome["provider_version"] == CLAUDE_VERSION
+    with database.SessionLocal() as db:
+        (
+            db.query(database.ManagedLaunchV2ReservationModel)
+            .filter_by(terminal_id=TERMINAL_ID)
+            .delete()
+        )
+        db.commit()
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "binding-unavailable"
+    assert harness.typed == []
 
 
 # --- 8: no raw internal exception text in public outcomes ---
@@ -2731,3 +2834,343 @@ def test_roster_failure_secret_is_absent_from_the_public_result(
     assert outcome["status"] == "refused"
     assert outcome["reason"] == "persistence-failed"
     assert secret not in str(outcome)
+
+
+# ---------------------------------------------------------------------------
+# Follow-up 3: fixes 1-4
+# ---------------------------------------------------------------------------
+
+
+# --- 1: a partial receipt can never name a different native session ---
+
+
+@pytest.mark.parametrize(
+    "mutate_receipt, label, expect_b_absent",
+    [
+        pytest.param(
+            lambda r: r.__setitem__("native_session_id", "99999999-8888-4777-8666-5555555555aa"),
+            "receipt-native-id-B",
+            True,
+        ),
+        pytest.param(lambda r: r.__setitem__("provider", "codex"), "receipt-provider", False),
+        pytest.param(lambda r: r.__setitem__("terminal_id", "d4e5f607"), "receipt-terminal", False),
+        pytest.param(lambda r: r.__setitem__("generation", _uuid()), "receipt-generation", False),
+        pytest.param(lambda r: r.__setitem__("execution_mode", "acp"), "receipt-mode", False),
+        pytest.param(lambda r: r.__setitem__("pane_id", "%99"), "receipt-pane", False),
+        pytest.param(
+            lambda r: r.__setitem__("process_identity", {"pid": 1, "start_marker": "x"}),
+            "receipt-process",
+            False,
+        ),
+        pytest.param(lambda r: r.__setitem__("evidence_sha256", "zzz"), "receipt-evidence", False),
+        pytest.param(lambda r: r.__setitem__("observed_at", ""), "receipt-observed-missing", False),
+    ],
+)
+def test_receipt_cross_check_reconciles_without_nominating_a_new_session(
+    isolated_memory_db, harness, mutate_receipt, label, expect_b_absent
+):
+    op = _partial_exact_owner(harness, mutate_receipt)
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-reconcile"
+    assert harness.typed == []
+    assert _evidence_rows() == []
+    # A corrupted receipt must never nominate a new session key.
+    if expect_b_absent:
+        assert native_attachment.get("claude_code", "99999999-8888-4777-8666-5555555555aa") is None
+    assert native_attachment.get("claude_code", SESSION_ID) is not None
+
+
+# --- 2: complete managed-v2 binding is authoritative ---
+
+
+def test_binding_a_panel_b_refuses_with_no_mutation(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    harness.screens.append(claude_panel_rows(session_id="11111111-2222-4333-8444-555555555555"))
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "identity-conflict"
+    assert _terminal_row().v2_native_session_id is None
+    assert _current_lineage()["native_session_id"] is None
+    assert _evidence_rows() == []
+    assert native_attachment.get("claude_code", SESSION_ID) is None
+
+
+def test_terminal_lineage_b_binding_a_refuses_zero_bytes(isolated_memory_db, harness):
+    _seed_terminal("claude_code", native_session_id="22222222-2222-4222-8222-222222222222")
+    _seed_roster("claude_code", native_session_id="22222222-2222-4222-8222-222222222222")
+    # The default binding names SESSION_ID (A), disagreeing with B.
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "identity-conflict"
+    assert harness.typed == []
+    assert _evidence_rows() == []
+
+
+def test_binding_only_known_must_match_the_panel(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "repaired"
+    assert outcome["native_session_id"] == SESSION_ID
+
+
+@pytest.mark.parametrize(
+    "binding, expected_reason",
+    [
+        pytest.param(
+            {
+                "schema": "cao-managed-v2-native-binding-v1",
+                "execution_mode": "acp",
+                "native_session_id": SESSION_ID,
+                "provider_version": CLAUDE_VERSION,
+            },
+            "binding-unreadable",
+            id="wrong-mode-acp",
+        ),
+        pytest.param(
+            {
+                "schema": "not-the-schema",
+                "execution_mode": "native_tui",
+                "native_session_id": SESSION_ID,
+                "provider_version": CLAUDE_VERSION,
+            },
+            "binding-unreadable",
+            id="wrong-schema",
+        ),
+        pytest.param(
+            {
+                "schema": "cao-managed-v2-native-binding-v1",
+                "execution_mode": "native_tui",
+                "provider_version": CLAUDE_VERSION,
+            },
+            "binding-unreadable",
+            id="missing-native-id",
+        ),
+        pytest.param(
+            {
+                "schema": "cao-managed-v2-native-binding-v1",
+                "execution_mode": "native_tui",
+                "native_session_id": SESSION_ID,
+            },
+            "binding-unreadable",
+            id="missing-version",
+        ),
+    ],
+)
+def test_malformed_or_incomplete_binding_fails_closed(
+    isolated_memory_db, harness, binding, expected_reason
+):
+    _seed_terminal("claude_code", binding=binding)
+    _seed_roster("claude_code")
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == expected_reason
+    assert harness.typed == []
+
+
+def test_binding_wrong_generation_provider_or_state_fails_closed(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding=_default_binding("claude_code", SESSION_ID))
+    _seed_roster("claude_code")
+
+    def _mutate_reservation(mutator):
+        with database.SessionLocal() as db:
+            row = (
+                db.query(database.ManagedLaunchV2ReservationModel)
+                .filter_by(terminal_id=TERMINAL_ID)
+                .one()
+            )
+            mutator(row)
+            db.commit()
+
+    # Wrong reservation generation: the exact lookup finds nothing.
+    _mutate_reservation(lambda row: setattr(row, "generation", _uuid()))
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "binding-unavailable"
+    assert harness.typed == []
+
+    # Wrong provider.
+    _mutate_reservation(lambda row: setattr(row, "provider", "codex"))
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "binding-unavailable"
+    assert harness.typed == []
+
+    # Unbound reservation state.
+    _mutate_reservation(lambda row: setattr(row, "state", "reserved"))
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "binding-unavailable"
+    assert harness.typed == []
+
+
+def test_binding_malformed_json_fails_closed(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding=_default_binding("claude_code", SESSION_ID))
+    _seed_roster("claude_code")
+    with database.SessionLocal() as db:
+        row = (
+            db.query(database.ManagedLaunchV2ReservationModel)
+            .filter_by(terminal_id=TERMINAL_ID)
+            .one()
+        )
+        row.binding_json = "{not valid json"
+        db.commit()
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "binding-unreadable"
+    assert harness.typed == []
+
+
+def test_legacy_repair_ignores_an_unrelated_v2_reservation(isolated_memory_db, harness):
+    # A legacy terminal (no model generation) never consumes a stale v2
+    # reservation whose terminal id merely collides.
+    _seed_legacy_all("claude_code")
+    _seed_v2_reservation(
+        "claude_code",
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        binding=_default_binding("claude_code", SESSION_ID),
+    )
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _call(generation=None, physical_occurrence=CALLBACK_TARGET)
+    assert outcome["status"] == "repaired"
+
+
+# --- 3: canonical digest over resolved facts ---
+
+
+def test_managed_omitted_occurrence_matches_explicit_same_occurrence(isolated_memory_db, harness):
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    op = _uuid()
+
+    first = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert first["status"] == "repaired"
+    harness.typed.clear()
+
+    second = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        physical_occurrence=GENERATION,
+        operation_id=op,
+    )
+    assert second["status"] == "repaired"
+    assert second["evidence_sha256"] == first["evidence_sha256"]
+    assert harness.typed == []
+    assert len(_evidence_rows()) == 1
+
+
+def test_omitted_version_matches_explicit_same_effective_version(isolated_memory_db, harness):
+    _seed_legacy_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    op = _uuid()
+
+    first = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+        provider_version=None,
+        operation_id=op,
+    )
+    assert first["status"] == "repaired"
+    harness.typed.clear()
+
+    second = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=None,
+        physical_occurrence=CALLBACK_TARGET,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert second["status"] == "repaired"
+    assert second["evidence_sha256"] == first["evidence_sha256"]
+    assert harness.typed == []
+    assert len(_evidence_rows()) == 1
+
+
+def test_managed_binding_native_id_drift_refuses_under_the_same_operation(
+    isolated_memory_db, harness
+):
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    op = _uuid()
+
+    first = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert first["status"] == "repaired"
+    harness.typed.clear()
+
+    # The durable binding now names a different native session.
+    with database.SessionLocal() as db:
+        row = (
+            db.query(database.ManagedLaunchV2ReservationModel)
+            .filter_by(terminal_id=TERMINAL_ID)
+            .one()
+        )
+        row.binding_json = json.dumps(
+            _default_binding("claude_code", "99999999-8888-4777-8666-5555555555aa")
+        )
+        db.commit()
+
+    second = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert second["status"] == "refused"
+    assert second["reason"] == "operation-conflict"
+    assert harness.typed == []
+    assert len(_evidence_rows()) == 1
+
+
+# --- 4: typed/redacted attachment lookup failure ---
+
+
+def test_attachment_lookup_failure_is_typed_and_secret_absent(
+    isolated_memory_db, harness, monkeypatch
+):
+    secret = "super_secret_lookup_zz9"
+    _seed_terminal("claude_code", native_session_id=SESSION_ID)
+    _seed_roster("claude_code", native_session_id=SESSION_ID)
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
+
+    def _exploding_get(*args, **kwargs):
+        raise native_attachment.NativeAttachmentUnavailable(f"lookup {secret}")
+
+    monkeypatch.setattr(native_attachment, "get", _exploding_get)
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-unavailable"
+    assert secret not in str(outcome)
+    assert harness.typed == []
