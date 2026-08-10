@@ -9,6 +9,15 @@
 # toolchain exists.
 cd "$(dirname "$0")/.."
 
+# cond-0386: Git invokes hooks with local repository variables (GIT_DIR,
+# GIT_WORK_TREE, GIT_INDEX_FILE, etc.) set. Clear them before running any
+# external test command so nested temporary repositories cannot accidentally
+# bind back to the source worktree and mutate the branch being pushed.
+for _cao_git_var in $(git rev-parse --local-env-vars); do
+  unset $_cao_git_var
+done
+unset _cao_git_var
+
 echo "[pre-push] Python unit tests"
 if command -v uv >/dev/null 2>&1; then
   uv run --project .. pytest ../test -m "not e2e" -q || exit 1
