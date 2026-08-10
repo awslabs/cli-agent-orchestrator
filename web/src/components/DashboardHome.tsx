@@ -539,7 +539,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             </div>
             <div>
               <div className="text-2xl font-bold text-white">{totalTerminals}</div>
-              <div className="text-xs text-gray-400 uppercase tracking-wide">Running Agents</div>
+              <div className="text-xs text-gray-400 uppercase tracking-wide">Agent Terminals</div>
             </div>
           </div>
         </div>

@@ -139,6 +139,17 @@ describe('DashboardHome status summary totals (terminal lifecycle statuses)', ()
     // The same count the card's own header reports, from the same terminals.
     expect(metadata().textContent).toContain(`${TERMINALS_WITH_UNRENDERABLE.length} agents`)
   })
+
+  it('describes the fleet total as terminal records rather than running work', async () => {
+    await renderDashboard(TERMINALS_WITH_UNRENDERABLE)
+
+    // The total deliberately includes proven-dead and superseded rows. Calling
+    // that population "running" contradicts the lifecycle statuses rendered
+    // immediately below it.
+    expect(screen.getByText('Agent Terminals')).toBeInTheDocument()
+    expect(screen.queryByText('Running Agents')).toBeNull()
+  })
+
   it('lets the operator filter each exact and residual disposition', async () => {
     await renderDashboard(TERMINALS_WITH_UNRENDERABLE)
 
