@@ -125,6 +125,12 @@ body {
 .cao-status-stopped {
   color: var(--cao-status-neutral);
 }
+.cao-status-dead {
+  color: var(--cao-status-danger);
+}
+.cao-status-superseded {
+  color: var(--cao-status-neutral);
+}
 .cao-status-unknown {
   color: var(--cao-status-neutral);
 }

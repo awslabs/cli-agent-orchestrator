@@ -57,6 +57,18 @@ export const STATUS_CONFIG: Record<string, StatusStyle> = {
     bgClass: "bg-cao-neutral/10",
     textClass: "text-cao-neutral",
   },
+  DEAD: {
+    label: "Dead",
+    dotClass: "bg-cao-danger",
+    bgClass: "bg-cao-danger/10",
+    textClass: "text-cao-danger",
+  },
+  SUPERSEDED: {
+    label: "Superseded",
+    dotClass: "bg-cao-neutral",
+    bgClass: "bg-cao-neutral/10",
+    textClass: "text-cao-neutral",
+  },
 };
 
 export const UNKNOWN_CONFIG: StatusStyle = {

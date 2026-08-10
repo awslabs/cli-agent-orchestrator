@@ -45,14 +45,15 @@ export const TERMINALS: TerminalFixture[] = [
   terminal('idle-001', 'idle', 'reviewer', '2026-07-28T10:30:00Z'),
 ]
 
-// The same fleet plus two rows whose recorded identity no longer resolves.
+// The same fleet plus three rows whose recorded identity no longer resolves.
 // terminal_projection.project_row reports the lifecycle vocabulary in `status`
-// for those (services/terminal_projection.py: LIFECYCLE_DEAD /
-// LIFECYCLE_SUPERSEDED), and neither is a status the dashboard can draw.
+// for those. DEAD and SUPERSEDED are exact dispositions; UNKNOWN_LIVENESS is
+// deliberately residual because the evidence cannot prove either one.
 export const TERMINALS_WITH_UNRENDERABLE: TerminalFixture[] = [
   ...TERMINALS,
   terminal('dead-001', 'dead', 'implementer', '2026-07-28T09:00:00Z'),
   terminal('supr-001', 'superseded', 'implementer', '2026-07-28T08:00:00Z'),
+  terminal('unkn-001', 'unknown-liveness', 'implementer', '2026-07-28T07:00:00Z'),
 ]
 
 function jsonResponse(body: unknown): Response {

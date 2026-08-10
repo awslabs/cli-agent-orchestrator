@@ -56,6 +56,8 @@ describe('DashboardHome status filter row appearance', () => {
       'Error',
       'Completed',
       'Stopped',
+      'Dead',
+      'Superseded',
       'Unknown',
     ])
   })
@@ -90,5 +92,16 @@ describe('DashboardHome status filter row appearance', () => {
     openReachabilityEditor()
     fireEvent.click(screen.getByRole('button', { name: 'Idle' }))
     expect(screen.getByRole('button', { name: 'Idle' }).className).toContain('bg-emerald-900/40')
+  })
+
+  it('dresses selected lifecycle dispositions in their semantic palette families', async () => {
+    await renderDashboard()
+
+    openReachabilityEditor()
+    fireEvent.click(screen.getByRole('button', { name: 'Dead' }))
+    expect(screen.getByRole('button', { name: 'Dead' }).className).toContain('bg-red-900/40')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Superseded' }))
+    expect(screen.getByRole('button', { name: 'Superseded' }).className).toContain('bg-gray-800/40')
   })
 })

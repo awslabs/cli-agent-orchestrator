@@ -60,9 +60,10 @@ describe('displayStatus is one fold for counting and filtering', () => {
     expect(displayStatus('NOT_FIFO_MONITORED')).toBe('NOT_FIFO_MONITORED')
   })
 
-  it('folds the lifecycle vocabulary and the absent to UNKNOWN', () => {
-    expect(displayStatus('dead')).toBe('UNKNOWN')
-    expect(displayStatus('SUPERSEDED')).toBe('UNKNOWN')
+  it('renders proven lifecycle dispositions and folds only unknown evidence', () => {
+    expect(displayStatus('dead')).toBe('DEAD')
+    expect(displayStatus('SUPERSEDED')).toBe('SUPERSEDED')
+    expect(displayStatus('unknown-liveness')).toBe('UNKNOWN')
     expect(displayStatus(undefined)).toBe('UNKNOWN')
     expect(displayStatus(null)).toBe('UNKNOWN')
   })
@@ -73,6 +74,8 @@ describe('displayStatus is one fold for counting and filtering', () => {
     expect(displayStatus('stopped')).toBe('STOPPED')
     expect(STATUS_ORDER.indexOf('STOPPED')).toBeGreaterThan(STATUS_ORDER.indexOf('COMPLETED'))
     expect(STATUS_ORDER.indexOf('STOPPED')).toBeLessThan(STATUS_ORDER.indexOf('UNKNOWN'))
+    expect(STATUS_ORDER.indexOf('DEAD')).toBeLessThan(STATUS_ORDER.indexOf('UNKNOWN'))
+    expect(STATUS_ORDER.indexOf('SUPERSEDED')).toBeLessThan(STATUS_ORDER.indexOf('UNKNOWN'))
   })
 })
 
@@ -88,10 +91,15 @@ describe('matchesFilters: OR within a dimension, AND across dimensions', () => {
     expect(matchesFilters(row, undefined, f)).toBe(false)
     expect(matchesFilters(projectedTerminal({ id: 'x', status: 'idle' }), undefined, f)).toBe(true)
     expect(matchesFilters(projectedTerminal({ id: 'y', status: 'error' }), undefined, f)).toBe(true)
-    // A lifecycle word in the polled status folds to UNKNOWN before comparing,
-    // so the Unknown selection finds the rows the Unknown chip counted.
+    // Proven lifecycle words are first-class reachability values.
     const dead = projectedTerminal({ id: 'z', status: 'dead', lifecycle_state: 'dead' })
-    expect(matchesFilters(dead, undefined, { ...emptyFilters(), reachability: ['UNKNOWN'] })).toBe(true)
+    expect(matchesFilters(dead, undefined, { ...emptyFilters(), reachability: ['DEAD'] })).toBe(true)
+    const unknown = projectedTerminal({
+      id: 'u', status: 'unknown-liveness', lifecycle_state: 'unknown-liveness',
+    })
+    expect(matchesFilters(unknown, undefined, {
+      ...emptyFilters(), reachability: ['UNKNOWN'],
+    })).toBe(true)
   })
 
   it('prefers the polled status from the context over the row’s stored one', () => {

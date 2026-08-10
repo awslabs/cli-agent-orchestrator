@@ -62,6 +62,8 @@ const STATUS_ACTIVE_BG: Record<string, string> = {
   ERROR: 'bg-red-900/40 border-red-500/50 text-red-300',
   COMPLETED: 'bg-purple-900/40 border-purple-500/50 text-purple-300',
   STOPPED: 'bg-gray-800/40 border-gray-500/50 text-gray-300',
+  DEAD: 'bg-red-900/40 border-red-500/50 text-red-300',
+  SUPERSEDED: 'bg-gray-800/40 border-gray-500/50 text-gray-300',
   UNKNOWN: 'bg-gray-800/40 border-gray-500/50 text-gray-300',
 }
 
@@ -185,17 +187,16 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   // terminal_projection.project_row reports the *lifecycle* vocabulary in
   // `status` ('superseded' / 'dead' / 'unknown-liveness') for every row whose
   // recorded identity no longer resolves, and the store uppercases those into
-  // buckets STATUS_ORDER has never contained. Folding any unrecognised status
-  // into UNKNOWN keeps the chips summing to the terminal count: an
-  // unrecognised status must be visibly unknown, never invisible. It is
-  // deliberately not fixed by extending STATUS_ORDER — see the note there.
+  // buckets. Proven dead and superseded lifecycle values have first-class
+  // entries; every other unrecognised status must remain visibly unknown,
+  // never invisible.
   //
   // Uses the same displayStatus() fold as both filter sites, so every count in
   // the summary is reachable by clicking its pill.
   const getStatusCounts = (terminals: TerminalMeta[]) => {
     const counts: Record<string, number> = {}
     terminals.forEach(t => {
-      const s = displayStatus(terminalStatuses[t.id])
+      const s = displayStatus(terminalStatuses[t.id] ?? t.status)
       counts[s] = (counts[s] || 0) + 1
     })
     return counts

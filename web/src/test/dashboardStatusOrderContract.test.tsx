@@ -11,11 +11,11 @@ import { DashboardHome } from '../components/DashboardHome'
 // so an entry with no counterpart does not degrade — it throws, and the whole
 // dashboard goes blank.
 //
-// This exists so nobody "fixes" the dropped-status residual (rows reporting the
-// lifecycle vocabulary 'dead' / 'superseded' / 'unknown-liveness') by appending
-// those names to STATUS_ORDER. That change typechecks and reads as obvious; it
-// is a hard render error. The fix lives at the counting site instead, where
-// unrenderable statuses fold into UNKNOWN — see dashboardStatusOrder.test.tsx.
+// This exists so nobody adds a status to STATUS_ORDER without first adding it
+// to the generated token source. That change typechecks and reads as obvious;
+// it is a hard render error. Proven DEAD and SUPERSEDED dispositions therefore
+// live in both sources, while unproven `unknown-liveness` still folds through
+// the residual UNKNOWN path.
 //
 // The simulation: keep STATUS_ORDER exactly as shipped and take
 // NOT_FIFO_MONITORED *out* of the generated config, which is the same shape as
@@ -28,6 +28,9 @@ vi.mock('../status.generated', () => ({
     COMPLETED: { label: 'Completed', dotClass: 'bg-cao-accent', bgClass: 'bg-cao-accent/10', textClass: 'text-cao-accent' },
     WAITING_USER_ANSWER: { label: 'Awaiting Input', dotClass: 'bg-cao-warning', bgClass: 'bg-cao-warning/10', textClass: 'text-cao-warning' },
     ERROR: { label: 'Error', dotClass: 'bg-cao-danger', bgClass: 'bg-cao-danger/10', textClass: 'text-cao-danger' },
+    STOPPED: { label: 'Stopped', dotClass: 'bg-cao-neutral', bgClass: 'bg-cao-neutral/10', textClass: 'text-cao-neutral' },
+    DEAD: { label: 'Dead', dotClass: 'bg-cao-danger', bgClass: 'bg-cao-danger/10', textClass: 'text-cao-danger' },
+    SUPERSEDED: { label: 'Superseded', dotClass: 'bg-cao-neutral', bgClass: 'bg-cao-neutral/10', textClass: 'text-cao-neutral' },
   },
   UNKNOWN_CONFIG: { label: 'Unknown', dotClass: 'bg-cao-neutral', bgClass: 'bg-cao-neutral/10', textClass: 'text-cao-neutral' },
 }))

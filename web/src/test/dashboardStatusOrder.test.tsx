@@ -102,7 +102,7 @@ describe('DashboardHome status order (NOT_FIFO_MONITORED)', () => {
   })
 })
 
-describe('DashboardHome status summary totals (unrenderable statuses)', () => {
+describe('DashboardHome status summary totals (terminal lifecycle statuses)', () => {
   beforeEach(() => {
     useStore.setState({ sessions: [SESSION], terminalStatuses: {} })
     stubDashboardFetch(TERMINALS_WITH_UNRENDERABLE)
@@ -114,18 +114,22 @@ describe('DashboardHome status summary totals (unrenderable statuses)', () => {
     useStore.setState({ sessions: [], terminalStatuses: {} })
   })
 
-  it('counts rows whose status the summary cannot draw, instead of dropping them', async () => {
+  it('distinguishes proven dispositions from genuinely unknown liveness', async () => {
     await renderDashboard(TERMINALS_WITH_UNRENDERABLE)
 
-    // 'dead' and 'superseded' are lifecycle states that terminal_projection
-    // reports in `status`; the store uppercases them and STATUS_ORDER has no
-    // entry for either. Before the fold they were counted into buckets nothing
-    // renders, so the session showed 3 agents in its summary while its header
-    // said 5 — the read failure produced a more confident state than the truth
-    // warranted. They are now visibly Unknown.
+    // terminal_projection reports these lifecycle states in `status` for rows
+    // without a live pane. DEAD and SUPERSEDED are exact evidence and must not
+    // look unknown; only UNKNOWN_LIVENESS remains in the residual bucket.
     expect(useStore.getState().terminalStatuses['dead-001']).toBe('DEAD')
     expect(useStore.getState().terminalStatuses['supr-001']).toBe('SUPERSEDED')
-    expect(summaryCounts()).toEqual({ 'Managed Live': 2, Idle: 1, Unknown: 2 })
+    expect(useStore.getState().terminalStatuses['unkn-001']).toBe('UNKNOWN-LIVENESS')
+    expect(summaryCounts()).toEqual({
+      'Managed Live': 2,
+      Idle: 1,
+      Dead: 1,
+      Superseded: 1,
+      Unknown: 1,
+    })
   })
 
   it('keeps the summary total equal to the session terminal count', async () => {
@@ -135,23 +139,20 @@ describe('DashboardHome status summary totals (unrenderable statuses)', () => {
     // The same count the card's own header reports, from the same terminals.
     expect(metadata().textContent).toContain(`${TERMINALS_WITH_UNRENDERABLE.length} agents`)
   })
-  it('lets the operator click through the folded Unknown count to the rows behind it', async () => {
+  it('lets the operator filter each exact and residual disposition', async () => {
     await renderDashboard(TERMINALS_WITH_UNRENDERABLE)
 
-    // The fold has to apply to counting AND filtering from one accessor. When
-    // it applied only to the count, the Unknown chip read 2 while the Unknown
-    // pill compared the raw 'DEAD'/'SUPERSEDED' and matched nothing -- so
-    // selecting it emptied the whole card. A count the operator cannot click
-    // through to is worse than no count: it reads as a broken dashboard.
-    expect(summaryCounts()['Unknown']).toBe(2)
+    expect(summaryCounts()['Dead']).toBe(1)
+    expect(summaryCounts()['Superseded']).toBe(1)
+    expect(summaryCounts()['Unknown']).toBe(1)
 
     const unknownOption = Array.from(openReachabilityEditor().querySelectorAll('button'))
       .find(b => (b.textContent || '').includes('Unknown'))
     expect(unknownOption).toBeTruthy()
     fireEvent.click(unknownOption!)
 
-    // The session card survives the filter, and shows exactly the two rows the
-    // Unknown chip was counting.
-    expect(visibleTerminalIds(TERMINALS_WITH_UNRENDERABLE).sort()).toEqual(['dead-001', 'supr-001'])
+    // Unknown now means only the row whose liveness evidence is actually
+    // unknown, not the rows already proven dead or superseded.
+    expect(visibleTerminalIds(TERMINALS_WITH_UNRENDERABLE)).toEqual(['unkn-001'])
   })
 })

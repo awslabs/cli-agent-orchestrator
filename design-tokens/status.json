@@ -8,6 +8,8 @@
     "not_fifo_monitored": { "label": "Managed Live", "semanticRole": "info", "pulse": false },
     "error": { "label": "Error", "semanticRole": "danger", "pulse": false },
     "stopped": { "label": "Stopped", "semanticRole": "neutral", "pulse": false },
+    "dead": { "label": "Dead", "semanticRole": "danger", "pulse": false },
+    "superseded": { "label": "Superseded", "semanticRole": "neutral", "pulse": false },
     "unknown": { "label": "Unknown", "semanticRole": "neutral", "pulse": false }
   }
 }

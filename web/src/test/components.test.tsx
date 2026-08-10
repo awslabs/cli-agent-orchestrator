@@ -36,6 +36,13 @@ describe('StatusBadge', () => {
     expect(screen.getByText('Managed Live')).toBeInTheDocument()
   })
 
+  it('renders proven-dead and superseded dispositions explicitly', () => {
+    const { rerender } = render(<StatusBadge status="dead" />)
+    expect(screen.getByText('Dead')).toBeInTheDocument()
+    rerender(<StatusBadge status="superseded" />)
+    expect(screen.getByText('Superseded')).toBeInTheDocument()
+  })
+
   it('renders null status as unknown', () => {
     render(<StatusBadge status={null} />)
     expect(screen.getByText('Unknown')).toBeInTheDocument()

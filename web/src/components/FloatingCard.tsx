@@ -68,9 +68,19 @@ function useAnchoredPosition(anchor: HTMLElement | null, card: HTMLElement | nul
       return
     }
     place()
+    // Portalled cards can change size after their first measured paint (for
+    // example when asynchronously-fetched filter dimensions arrive). Keep the
+    // fixed coordinates truthful instead of leaving newly-added controls past
+    // the viewport edge until the next scroll or window resize.
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(place)
+    if (observer && anchor && card) {
+      observer.observe(anchor)
+      observer.observe(card)
+    }
     window.addEventListener('scroll', place, true)
     window.addEventListener('resize', place)
     return () => {
+      observer?.disconnect()
       window.removeEventListener('scroll', place, true)
       window.removeEventListener('resize', place)
     }
