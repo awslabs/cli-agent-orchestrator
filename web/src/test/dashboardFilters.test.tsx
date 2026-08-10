@@ -227,8 +227,8 @@ describe('STOPPED reaches the summary and the pills as itself', () => {
     await renderDashboard()
     const meta = metadataOf(sessionCard('cao-alpha'))
     expect(within(meta).getByText('Stopped')).toBeTruthy()
-    // …and the dead row still folds to Unknown, so the two are visibly distinct.
-    expect(within(meta).getByText('Unknown')).toBeTruthy()
+    // …and the proven-dead row is named rather than presented as missing data.
+    expect(within(meta).getByText('Dead')).toBeTruthy()
   })
 
   it('filters the fleet to stopped rows from the Stopped option', async () => {
@@ -236,6 +236,14 @@ describe('STOPPED reaches the summary and the pills as itself', () => {
     openGlobalEditor('Reachability')
     fireEvent.click(screen.getByRole('button', { name: 'Stopped' }))
     expect(visibleIds('cao-alpha')).toEqual(['aa-0004'])
+    expect(cardPresent('cao-beta')).toBe(false)
+  })
+
+  it('filters the fleet to proven-dead rows from the Dead option', async () => {
+    await renderDashboard()
+    openGlobalEditor('Reachability')
+    fireEvent.click(screen.getByRole('button', { name: 'Dead' }))
+    expect(visibleIds('cao-alpha')).toEqual(['aa-0005'])
     expect(cardPresent('cao-beta')).toBe(false)
   })
 
@@ -270,6 +278,8 @@ describe('the derived dimensions appear where their shape puts them', () => {
     await renderDashboard()
     fireEvent.click(screen.getByTestId('global-picker-button'))
     const picker = screen.getByTestId('global-picker')
+    expect(picker.className).toContain('max-h-[calc(100vh-1rem)]')
+    expect(picker.className).toContain('!overflow-y-auto')
     expect(within(picker).getByText('phase')).toBeTruthy()
     expect(within(picker).getByText('attention')).toBeTruthy()
     // The 13-value task facet is NOT here — an unbounded pill wall is exactly

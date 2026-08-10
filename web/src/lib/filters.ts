@@ -51,11 +51,12 @@ import { parseTimestamp } from './time'
 //    (terminal_projection.project_row assigns it to any lifecycle-live
 //    native-TUI row), so on a native-TUI fleet nearly every agent was
 //    uncounted by StatusSummary and unreachable from the filter pills.
-//  * STOPPED — it has shipped in the generated STATUS_CONFIG since the
-//    design-token SSOT landed, but was absent here, so a stopped row folded
-//    silently to UNKNOWN. It sits after COMPLETED, the other terminal state,
-//    and ahead of UNKNOWN, which is the residual bucket and always closes
-//    the row.
+//  * STOPPED, DEAD and SUPERSEDED — each is a truthful terminal/lifecycle
+//    disposition the projection can publish. Folding the last two into
+//    UNKNOWN made exact evidence look missing and hid the distinction between
+//    an absent pane, a replaced incarnation and genuinely unknown liveness.
+//    They sit after COMPLETED and ahead of UNKNOWN, which remains the residual
+//    bucket and always closes the row.
 //
 // Every entry here MUST have a counterpart in the generated STATUS_CONFIG (or
 // be the hand-added 'UNKNOWN' below): STATUS_META is built only from
@@ -70,6 +71,8 @@ const STATUS_ORDER = [
   'ERROR',
   'COMPLETED',
   'STOPPED',
+  'DEAD',
+  'SUPERSEDED',
   'UNKNOWN',
 ]
 
@@ -81,10 +84,11 @@ const RENDERABLE_STATUSES = new Set(STATUS_ORDER)
 export { STATUS_ORDER }
 
 /**
- * The single status accessor for counting AND filtering. A row whose reported
- * status has no chip (the lifecycle vocabulary 'dead' / 'superseded' /
- * 'unknown-liveness' that terminal_projection assigns to non-live rows) folds
- * to UNKNOWN so it stays visible in the totals.
+ * The single status accessor for counting AND filtering. The projection's
+ * proven DEAD and SUPERSEDED lifecycle values are first-class display states.
+ * A row whose reported status still has no chip (including
+ * `unknown-liveness`, which is explicitly not proof of death) folds to UNKNOWN
+ * so it stays visible in the totals.
  *
  * Counting and filtering MUST use this same fold. Folding only at the counting
  * site produces an Unknown chip reading "2" whose pill then matches nothing and

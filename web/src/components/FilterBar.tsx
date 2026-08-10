@@ -900,7 +900,7 @@ function ChipBar({
         role="dialog"
         labelledBy="Add filter"
         testId={`${idPrefix}-picker`}
-        className="w-[min(20rem,calc(100vw-1rem))]"
+        className="max-h-[calc(100vh-1rem)] w-[min(20rem,calc(100vw-1rem))] !overflow-y-auto overscroll-contain"
       >
         <div data-filter-popover className="p-2">
           <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-gray-400">Add filter</p>

@@ -56,6 +56,8 @@ describe('DashboardHome status filter row appearance', () => {
       'Error',
       'Completed',
       'Stopped',
+      'Dead',
+      'Superseded',
       'Unknown',
     ])
   })
