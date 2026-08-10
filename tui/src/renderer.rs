@@ -1375,10 +1375,23 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         // where a documented key did nothing. Ctrl+R and Ctrl+C work in EVERY focus, so they are
         // what a text-entry focus advertises. (#321)
         lines.push(if self.focus_is_text_entry() {
-            "[tab] focus · [←] commands · [enter] select/run · [ctrl+r] retry · [ctrl+c] quit".to_string()
-        } else {
-            "[tab] focus · [←] commands · [enter] run · [k] stop following · [ctrl+r] retry · [q] quit"
+            "[tab] focus · [←] commands · [enter] select/run · [ctrl+r] retry · [ctrl+c] quit"
                 .to_string()
+        } else {
+            // `[k]` is advertised ONLY in `Focus::Results`, because that is the only focus that
+            // routes it anywhere: `on_key`'s `Focus::Results` arm hands the key to the pane, and
+            // every other arm never sees a `Char('k')` as a command. Advertising it from the command
+            // list or a picker fold was #547's unwired-key defect verbatim — the operator presses
+            // the documented key, nothing happens, and the footer stops being evidence of anything.
+            //
+            // `[q]`, by contrast, genuinely works in every non-text-entry focus (its `on_key` arm is
+            // guarded on `!focus_is_text_entry()`, not on a focus), so it stays in both branches.
+            let stop = if self.focus == Focus::Results {
+                " · [k] stop following"
+            } else {
+                ""
+            };
+            format!("[tab] focus · [←] commands · [enter] run{stop} · [ctrl+r] retry · [q] quit")
         });
         lines
     }
@@ -2472,10 +2485,33 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
 
         let frame = self.render();
 
+        // Sized by WRAPPED height, not by `Vec::len()`, and that distinction was a live truncation
+        // bug rather than a tidiness point.
+        //
+        // `len()` counts LOGICAL lines. The footer's non-text-entry hint is 89 characters, so at the
+        // 80-column floor it occupies two screen rows while `len()` reported the footer as 2 lines
+        // (gating reason + hint) and therefore reserved 2 rows. The hint's second row had nowhere to
+        // go: measured at 80x24, `[q] quit` and `stop following` were BOTH absent from the drawn
+        // buffer. NFR-6's rule is "wrap, never truncate", and losing the quit key off the right-hand
+        // edge is a truncation — the worst one available, since it is the documented way out.
+        //
+        // `wrapped_heights` is the same measurement the left column's viewport already uses, so the
+        // header and footer are now sized against what ratatui will actually paint rather than
+        // against a count that silently disagrees with it once a line is wider than the terminal.
+        // `.max(1)` survives for the empty-region case, where a zero-length constraint would give
+        // the region no row at all.
+        let header_rows = wrapped_heights(&frame.header, area.width)
+            .iter()
+            .sum::<usize>()
+            .max(1) as u16;
+        let footer_rows = wrapped_heights(&frame.footer, area.width)
+            .iter()
+            .sum::<usize>()
+            .max(1) as u16;
         let [header, main, footer] = Layout::vertical([
-            Constraint::Length(frame.header.len().max(1) as u16),
+            Constraint::Length(header_rows),
             Constraint::Min(1),
-            Constraint::Length(frame.footer.len().max(1) as u16),
+            Constraint::Length(footer_rows),
         ])
         .areas(area);
 
@@ -8165,6 +8201,140 @@ mod tests {
             "both rows of the new answer must be on screen — the header saying 2 while one row is \
              drawn and unreachable by [↑] is the defect the fold was meant to fix. Got: \
              {refetched:?}"
+        );
+    }
+
+    /// **The footer's keys survive the 80-column floor — `[q] quit` is DRAWN, not wrapped away.**
+    ///
+    /// The reported defect, measured: `draw` sized the footer with `frame.footer.len()`, which counts
+    /// LOGICAL lines. In `Focus::Results` the footer is 2 logical lines whose hint is **89
+    /// characters** — wider than the 80-column floor, so it occupies 3 screen rows once wrapped. The
+    /// layout reserved 2. The hint's overflow row had nowhere to go and `[q] quit` was simply absent
+    /// from the drawn buffer: at 80x24, `drawn.contains("[q] quit")` was `false`, and so was
+    /// `stop following`. NFR-6's rule is "wrap, never truncate", and silently dropping the documented
+    /// way out of the program is the worst truncation on offer.
+    ///
+    /// Asserted on the DRAWN BUFFER and not on `frame.footer`, which is the whole point: the frame
+    /// always contained the right text. The defect lived entirely in the gap between the text and
+    /// the rows allotted to it, so a frame-level assertion cannot see this class of bug at all — it
+    /// would have been green throughout.
+    ///
+    /// `Focus::Results` specifically, because it is the ONLY focus whose hint exceeds 80 columns
+    /// (measured: 89 there, 68 in the other non-text-entry focuses, 80 in text entry). A test parked
+    /// on the launch form's default focus would not reproduce it.
+    #[test]
+    fn the_footers_quit_key_is_drawn_and_not_truncated_at_the_minimum_supported_size() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, MIN_COLS, MIN_ROWS);
+        while shell.focus() != Focus::Results {
+            assert!(
+                shell.on_key(KeyCode::Tab),
+                "[tab] must reach the results pane, or this test cannot reach the long hint"
+            );
+        }
+
+        // ANTI-VACUITY: the hint must genuinely be wider than the screen. If a future edit shortens
+        // it below the floor the truncation becomes unreproducible, and this test would go on
+        // passing while guarding nothing — so it fails loudly instead and asks to be re-pointed.
+        let footer = shell.render().footer;
+        let hint: String = footer
+            .last()
+            .expect("the footer always carries a hint line")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            hint.chars().count() > MIN_COLS as usize,
+            "this test needs a hint WIDER than {MIN_COLS} columns to exercise wrapping (got {} \
+             chars: {hint:?}). Re-point it at a focus whose hint still overflows, or the \
+             truncation it guards can no longer occur here",
+            hint.chars().count()
+        );
+        assert!(
+            footer.len() < wrapped_heights(&footer, MIN_COLS).iter().sum::<usize>(),
+            "the logical line count must UNDERSTATE the wrapped height, or `len()`-based sizing \
+             would have been correct and this test would prove nothing"
+        );
+
+        let drawn = screen(&shell, MIN_COLS, MIN_ROWS);
+        for needle in ["[q] quit", "[k] stop following", "[ctrl+r] retry"] {
+            assert!(
+                drawn.contains(needle),
+                "{needle:?} must be ON SCREEN at {MIN_COLS}x{MIN_ROWS}. A key the footer promises \
+                 and the layout then clips is a key the operator cannot discover — and for [q] it \
+                 is the documented way to quit. Screen:\n{drawn}"
+            );
+        }
+
+        // The footer must not have eaten the screen to achieve that: the regions above it are still
+        // there. Growing the footer at the expense of the form would trade one invisible region for
+        // another, which is not a fix.
+        for (region, needle) in [
+            ("the command list", "cao launch"),
+            ("the required fields", "--agents"),
+            ("the results pane", "results ("),
+        ] {
+            assert!(
+                drawn.contains(needle),
+                "{region} must survive the taller footer at {MIN_COLS}x{MIN_ROWS} — {needle:?} was \
+                 not drawn. Reclaiming rows for the footer by pushing the form off screen is the \
+                 same clipping defect one region over. Screen:\n{drawn}"
+            );
+        }
+    }
+
+    /// **`[k]` is advertised only where it does something.**
+    ///
+    /// The hint named `[k] stop following` in every non-text-entry focus, but `on_key` routes
+    /// `Char('k')` to the pane from the `Focus::Results` arm ALONE — from the command list or a
+    /// picker fold the press does nothing at all. That is #547's unwired-key defect verbatim: the
+    /// operator presses a documented key, gets silence, and the footer stops being evidence.
+    ///
+    /// Both halves are asserted. Without the positive half, deleting `[k]` from the hint entirely
+    /// would leave this test green while removing the operator's only cue that the key exists.
+    #[test]
+    fn the_stop_following_hint_appears_only_in_the_focus_that_handles_the_key() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+
+        for focus in [
+            Focus::CommandList,
+            Focus::OptionalSection,
+            Focus::AgentPicker,
+            Focus::ProviderPicker,
+        ] {
+            let mut shell = shell_on_the_launch_form(&server, &host, MIN_COLS, MIN_ROWS);
+            let mut guard = 0;
+            while shell.focus() != focus {
+                assert!(shell.on_key(KeyCode::Tab));
+                guard += 1;
+                assert!(guard < 20, "[tab] must reach {focus:?}");
+            }
+            let hint = joined(&shell.render().footer, " ");
+            assert!(
+                !hint.contains("stop following"),
+                "in {focus:?} the footer must NOT advertise [k]: `on_key` only routes it from \
+                 Focus::Results, so here it is a documented key that does nothing. Got: {hint:?}"
+            );
+            // ...and the focus must still be told how to quit, so the trim above is a correction
+            // rather than a hint that quietly lost its contents.
+            assert!(
+                hint.contains("[q] quit"),
+                "in {focus:?} the footer must still name the working quit key. Got: {hint:?}"
+            );
+        }
+
+        let mut shell = shell_on_the_launch_form(&server, &host, MIN_COLS, MIN_ROWS);
+        while shell.focus() != Focus::Results {
+            assert!(shell.on_key(KeyCode::Tab));
+        }
+        let hint = joined(&shell.render().footer, " ");
+        assert!(
+            hint.contains("[k] stop following"),
+            "in Focus::Results the footer MUST advertise [k] — that is the focus where the key \
+             works, and an unadvertised working key is the mirror-image defect. Got: {hint:?}"
         );
     }
 }
