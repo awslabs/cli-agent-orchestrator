@@ -229,17 +229,17 @@ test.beforeEach(async ({ page }) => {
   await expect(page.getByTestId("annotation-chip").first()).toBeVisible();
 });
 
-test("reachability is a chip: multi-select OR within, AND across with a second dimension", async ({
+test("worker state is a chip: multi-select OR within, AND across with a second dimension", async ({
   page,
 }) => {
   const editor = await addFilter(page, "global", "reachability");
-  await editor.getByRole("button", { name: "Managed Live" }).click();
+  await editor.getByRole("button", { name: "Managed Active" }).click();
   await editor.getByRole("button", { name: "Idle" }).click();
   await expect.poll(() => visibleIds(page, "cao-alpha")).toEqual(["aa-0001", "aa-0002", "aa-0003"]);
   await expect.poll(() => visibleIds(page, "cao-beta")).toEqual(["bb-0002"]);
 
   // The chip reads the selection, not just the dimension name.
-  await expect(chip(page, "global", "reachability")).toContainText("Reachability: Managed Live, Idle");
+  await expect(chip(page, "global", "reachability")).toContainText("Worker state: Managed Active, Idle");
 
   // AND across dimensions: the reviewer profile leaves only bb-0002's card.
   const profiles = await addFilter(page, "global", "profiles");
@@ -380,7 +380,7 @@ test("the advanced sheet holds everything, traps focus, and closes on Escape", a
   // (fleet-wide by the sharing rule, picker-omitted because selecting it
   // could only ever pass) and the fork-owned dimensions.
   await expect(advanced.getByText("lane source", { exact: true })).toBeVisible();
-  await expect(advanced.getByText("Reachability", { exact: true })).toBeVisible();
+  await expect(advanced.getByText("Worker state", { exact: true })).toBeVisible();
 
   // Focus starts inside the dialog and Tab never leaves it.
   await expect
@@ -427,8 +427,8 @@ test("the default bar is one row at both viewports — evidence screenshots", as
 
   // Three chips active: the bar wraps at 390px — it does not stack into a
   // form, and nothing leaves the viewport sideways.
-  const reachability = await addFilter(page, "global", "reachability");
-  await reachability.getByRole("button", { name: "Managed Live" }).click();
+  const workerState = await addFilter(page, "global", "reachability");
+  await workerState.getByRole("button", { name: "Managed Active" }).click();
   const phase = await addFilter(page, "global", "phase");
   await phase.getByRole("button", { name: /^reported/ }).click();
   const attention = await addFilter(page, "global", "attention");
@@ -479,6 +479,10 @@ test("free text is case-insensitive end to end, at both bars", async ({ page }) 
 test("every control the bar adds meets the 44px AAA target, and the bar scans clean", async ({
   page,
 }) => {
+  // Annotation placement can settle before the independently fetched session
+  // details. Wait for the card whose controls this test measures so a fast
+  // campaign-annotation response cannot turn the size gate vacuous.
+  await expect(page.locator("#session-cao-alpha-terminals")).toBeVisible();
   // Nonzero counts asserted: the bars are full of controls, and a vacuous
   // measurement would read as a pass. Chips, the X on each chip, picker
   // items, popover options and modal rows are all measured here.

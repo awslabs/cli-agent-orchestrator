@@ -1,9 +1,10 @@
 // Fleet filtering — one predicate, two layers of vocabulary.
 //
-// LAYER 1 IS THE FORK'S OWN SCHEMA. Reachability (`status` folded through
-// displayStatus), liveness (`lifecycle_state`), agent profile, provider,
-// session, caller, freshness (`valid_until`) and chip colour (`semantic_role`)
-// are fields the fork publishes and may legitimately filter on.
+// LAYER 1 IS THE FORK'S OWN SCHEMA. Worker state (`status`, recent rendering,
+// and a fresh parked checkpoint folded through displayStatus), liveness
+// (`lifecycle_state`), agent profile, provider, session, caller, freshness
+// (`valid_until`) and chip colour (`semantic_role`) are fields available to the
+// dashboard and may legitimately filter rows.
 //
 // LAYER 2 IS DERIVED, AND MUST STAY DERIVED. The facet dimensions are the union
 // of `Object.keys(details)` over the current payload, in the producer's own
@@ -17,16 +18,13 @@
 //
 // TWO THINGS THIS MODULE REFUSES, on measured grounds:
 //
-//  * A "working"/"active" dimension backed by `status`. Every live native-TUI
-//    v2 row reports NOT_FIFO_MONITORED unconditionally
-//    (terminal_projection.project_row): it is a REACHABILITY claim — "this pane
-//    exists and answers" — not an activity claim. On the fleet that motivated
-//    this work, 34 of 44 rows in one session read "Managed Live" while every
-//    one of them had been idle for over twelve hours. A filter that says
-//    "working" and means "alive" converts uncertainty into false confidence,
-//    which is worse than no filter. Reachability and work phase are therefore
-//    two separately-named dimensions, and the operator can see that the answer
-//    to their real question is an intersection.
+//  * A "working"/"active" dimension backed by provider `status` alone. A
+//    native-TUI row reports NOT_FIFO_MONITORED even while parked, and a provider
+//    can leave a PROCESSING frame painted long after rendering stops. The
+//    terminal-display join therefore uses recent pane rendering for the short
+//    activity claim and a fresh conductor checkpoint for parking. Durable work
+//    phase remains a separately visible facet; an open round is not itself
+//    proof that the model is producing output.
 //  * Any control built on `last_active`. Only send_input / send_special_key
 //    move it, and on a v2 managed row the value is frozen at row creation
 //    forever (update_last_active touches only the v1 table). It is labelled
@@ -35,15 +33,13 @@
 
 import type { Annotation, TerminalMeta } from '../api'
 import { freshness, orderedFacets, resolveRole, splitFacetKey } from './annotations'
+import { DISPLAY_STATUS_ORDER, terminalDisplayState } from './terminalDisplay'
 import { parseTimestamp } from './time'
 
-// Render/filter order for the per-session status summary and the reachability
-// filter pills. NOT_FIFO_MONITORED sits second, immediately after PROCESSING,
-// because the two share the `info` semantic role in design-tokens/status.json:
-// both are "this agent is alive" statements, and keeping them adjacent keeps
-// that read at the head of the row. It is not first, because PROCESSING is the
-// stronger claim (a turn is running) while NOT_FIFO_MONITORED is only
-// reachability.
+// Render/filter order for the per-session worker-state summary and its filter
+// pills. For conductor-managed rows the headline is a presentation join:
+// durable parking and the pane-render clock refine raw provider status without
+// overwriting it. The raw observation remains available in the evidence card.
 //
 // Omitting entries was twice a real defect, not a style choice:
 //
@@ -58,23 +54,9 @@ import { parseTimestamp } from './time'
 //    They sit after COMPLETED and ahead of UNKNOWN, which remains the residual
 //    bucket and always closes the row.
 //
-// Every entry here MUST have a counterpart in the generated STATUS_CONFIG (or
-// be the hand-added 'UNKNOWN' below): STATUS_META is built only from
-// STATUS_CONFIG, and `STATUS_META[s].dot` is dereferenced unguarded in both
-// StatusSummary and the reachability pill row, so an entry with no counterpart
-// is a TypeError at render, not a missing dot.
-const STATUS_ORDER = [
-  'PROCESSING',
-  'NOT_FIFO_MONITORED',
-  'IDLE',
-  'WAITING_USER_ANSWER',
-  'ERROR',
-  'COMPLETED',
-  'STOPPED',
-  'DEAD',
-  'SUPERSEDED',
-  'UNKNOWN',
-]
+// DISPLAY_STATUS_ORDER and its config live together in terminalDisplay.ts; the
+// contract suite verifies every entry has a complete style.
+const STATUS_ORDER = DISPLAY_STATUS_ORDER
 
 // The statuses the summary and the filter row can actually draw. Held as a
 // set so the counting site can ask "is this renderable?" against the same list
@@ -99,9 +81,13 @@ export { STATUS_ORDER }
  * and a fold that accepted only one case filed every row read straight from
  * `/sessions/{name}` under UNKNOWN.
  */
-export function displayStatus(raw: string | null | undefined): string {
-  const reported = (raw || 'UNKNOWN').toUpperCase()
-  return RENDERABLE_STATUSES.has(reported) ? reported : 'UNKNOWN'
+export function displayStatus(
+  raw: string | null | undefined,
+  terminal?: TerminalMeta,
+  annotations?: Annotation[],
+): string {
+  const presented = terminalDisplayState(raw, terminal, annotations).key
+  return RENDERABLE_STATUSES.has(presented) ? presented : 'UNKNOWN'
 }
 
 /** A tri-state dimension: unconstrained, or only rows carrying a true/false claim. */
@@ -125,7 +111,7 @@ export interface FacetSelection {
  * and the per-session bar never sets the fleet-stable dimensions.
  */
 export interface FilterState {
-  /** displayStatus() vocabulary — reachability, never activity. */
+  /** displayStatus() vocabulary — worker presentation state. */
   reachability: string[]
   /** lifecycle_state vocabulary, scanned from the fleet. */
   liveness: string[]
@@ -345,10 +331,10 @@ export function matchesFilters(
   filters: FilterState,
   ctx: MatchContext = {},
 ): boolean {
-  // Reachability routes through displayStatus — the same fold the summary
+  // Worker state routes through displayStatus — the same fold the summary
   // counts with, so a count is always click-through-able to its rows.
   if (filters.reachability.length > 0) {
-    if (!filters.reachability.includes(displayStatus(ctx.status ?? terminal.status))) return false
+    if (!filters.reachability.includes(displayStatus(ctx.status ?? terminal.status, terminal, annotations))) return false
   }
   if (filters.liveness.length > 0 && !filters.liveness.includes(terminal.lifecycle_state)) {
     return false

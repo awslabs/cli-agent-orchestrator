@@ -126,9 +126,7 @@ type Dimension = DimensionBase &
     | { editor: 'text'; text: string; setText: (text: string) => void }
   )
 
-/** The reachability option row the chip bar offers. Built in DashboardHome
- *  from STATUS_META/STATUS_ACTIVE_BG — see the call site for why that build
- *  is deliberately unguarded. */
+/** The headline worker-state option row built by DashboardHome. */
 export interface StatusOption {
   value: string
   label: string
@@ -1003,7 +1001,7 @@ function buildSections(specs: Dimension[], facetDims: FacetDimension[]): ModalSe
 }
 
 /**
- * The global bar: fleet-stable vocabulary, one chip row. Reachability is a
+ * The global bar: fleet-stable vocabulary, one chip row. Worker state is a
  * chip here like everything else — its editor's options container is what
  * the status-order appearance suite now pins, with exactly the STATUS_ORDER
  * entries and nothing else.
@@ -1037,15 +1035,17 @@ export function GlobalFilterBar({
 }) {
   const specs: Dimension[] = []
 
-  // Reachability is ALWAYS offered — a fixed fork vocabulary, not a measured
-  // one — and its editor options carry the per-status palette.
+  // Worker state is ALWAYS offered — a fixed fork vocabulary, not a measured
+  // one — and its editor options carry the per-status palette. The legacy
+  // state-field name remains `reachability` so saved in-memory selections and
+  // the predicate shape do not need a migration.
   {
     const stats = builtinStats(statusOptions.length, totalRows)
     const merit = dimensionMerit(stats, totalRows)
     const selected = statusOptions.filter(o => filters.reachability.includes(o.value))
     specs.push({
       key: 'reachability',
-      label: 'Reachability',
+      label: 'Worker state',
       origin: 'builtin',
       stats,
       tier: merit.tier,

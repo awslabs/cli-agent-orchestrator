@@ -51,45 +51,44 @@ describe('DashboardHome status order (NOT_FIFO_MONITORED)', () => {
   it('counts managed native workers in the per-session status summary', async () => {
     await renderDashboard()
 
-    // Both managed workers are counted under the generated "Managed Live"
-    // label, and the FIFO-monitored one is still counted separately.
-    expect(summaryCounts()).toEqual({ 'Managed Live': 2, Idle: 1 })
+    // The recent renderer is active; the quiet-but-present one is live.
+    expect(summaryCounts()).toEqual({ 'Managed Active': 1, 'Managed Live': 1, Idle: 1 })
     expect(summaryTotal()).toBe(TERMINALS.length)
   })
 
-  it('offers a Managed Live reachability option', async () => {
+  it('offers both managed activity states', async () => {
     await renderDashboard()
 
     // The option lives in the chip's popover editor now; the container it is
     // found in is the one the appearance suite pins to exactly STATUS_ORDER.
     const options = openReachabilityEditor()
-    const option = screen.getByRole('button', { name: 'Managed Live' })
-    expect(options.contains(option)).toBe(true)
+    expect(options.contains(screen.getByRole('button', { name: 'Managed Active' }))).toBe(true)
+    expect(options.contains(screen.getByRole('button', { name: 'Managed Live' }))).toBe(true)
   })
 
-  it('filters the terminal list to managed native workers when the option is selected', async () => {
+  it('filters recent activity separately from a quiet live pane', async () => {
     await renderDashboard()
     expect(visibleTerminalIds()).toEqual(['nfm-0001', 'nfm-0002', 'idle-001'])
 
     openReachabilityEditor()
-    fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
-    expect(visibleTerminalIds()).toEqual(['nfm-0001', 'nfm-0002'])
+    fireEvent.click(screen.getByRole('button', { name: 'Managed Active' }))
+    expect(visibleTerminalIds()).toEqual(['nfm-0001'])
 
     // Selecting it again clears the filter rather than sticking — the editor
     // stays open across toggles, so the second click lands on the same option.
-    fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Managed Active' }))
     expect(visibleTerminalIds()).toEqual(['nfm-0001', 'nfm-0002', 'idle-001'])
   })
 
-  it('gives the selected Managed Live option a real background, not an undefined class', async () => {
+  it('gives the selected Managed Active option a real background, not an undefined class', async () => {
     await renderDashboard()
 
     // A STATUS_ORDER entry with no STATUS_ACTIVE_BG key still typechecks
     // (Record<string, string>, no noUncheckedIndexedAccess) and renders
     // `class="... undefined"` — a selected option with no selected appearance.
     openReachabilityEditor()
-    fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
-    expect(screen.getByRole('button', { name: 'Managed Live' }).className).not.toContain('undefined')
+    fireEvent.click(screen.getByRole('button', { name: 'Managed Active' }))
+    expect(screen.getByRole('button', { name: 'Managed Active' }).className).not.toContain('undefined')
   })
 
   it('still filters an existing status, so the added entry did not disturb them', async () => {
@@ -124,7 +123,8 @@ describe('DashboardHome status summary totals (terminal lifecycle statuses)', ()
     expect(useStore.getState().terminalStatuses['supr-001']).toBe('SUPERSEDED')
     expect(useStore.getState().terminalStatuses['unkn-001']).toBe('UNKNOWN-LIVENESS')
     expect(summaryCounts()).toEqual({
-      'Managed Live': 2,
+      'Managed Active': 1,
+      'Managed Live': 1,
       Idle: 1,
       Dead: 1,
       Superseded: 1,
