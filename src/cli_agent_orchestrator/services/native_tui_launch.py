@@ -1105,6 +1105,9 @@ def _codex_argv(
             extra_args=extra_args,
         )
     except codex_native_launch.CodexNativeLaunchError as exc:
+        raise NativeLaunchInvalid(str(exc)) from exc
+
+
 def _antigravity_argv(
     *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
 ) -> list[str]:

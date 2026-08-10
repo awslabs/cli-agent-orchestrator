@@ -2127,3 +2127,49 @@ def test_reentry_over_a_pane_in_the_wrong_directory_freezes_too(
     # of starting a second process.
     assert pane.created == []
     _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_WORKDIR_MISMATCH)
+
+
+def test_antigravity_native_tui_launch_argv_and_binding(
+    isolated_memory_db: Any, tmp_path: Any
+) -> None:
+    """Antigravity CLI native TUI launch constructs correct agy argv and binds native session id."""
+    binary = tmp_path / "agy"
+    binary.write_bytes(b"#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    path = os.path.realpath(str(binary))
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+
+    sid = "550e8400-e29b-41d4-a716-446655440000"
+    intent = native_attachment.acquire_intent(
+        acquisition_method=native_attachment.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN,
+        acquisition_receipt={"conversation_id": sid},
+        admits_only_new_instructions=True,
+        replays_task_bytes=False,
+        bootstrap_sent_no_turn=False,
+        bootstrap_detached_before_launch=True,
+    )
+    workdir = os.path.realpath(tempfile.gettempdir())
+    pane = FakePane(
+        observation={
+            "pane_id": "pane-1234",
+            "argv": [path, "--dangerously-skip-permissions", "--conversation", sid],
+            "cwd": workdir,
+            "pid": 1234,
+            "start_marker": "marker",
+        }
+    )
+
+    result = native_tui_launch.start(
+        provider="antigravity_cli",
+        native_session_id=sid,
+        terminal_id="term-ag-1",
+        generation="gen-ag-1",
+        execution_mode=em.NATIVE_TUI,
+        intent=intent,
+        binary=path,
+        binary_sha256=digest,
+        working_directory=workdir,
+        transport=pane,
+    )
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert pane.created == [[path, "--dangerously-skip-permissions", "--conversation", sid]]

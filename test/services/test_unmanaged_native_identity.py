@@ -882,3 +882,43 @@ def test_provider_manager_creates_antigravity_provider_with_native_id_and_effort
     assert "--effort high" in command
     assert "-i" not in command
 
+
+def test_validate_resume_argv_accepts_antigravity_wire_names():
+    from cli_agent_orchestrator.services import provider_contracts
+
+    sid = str(uuid.uuid4())
+    argv = ["/usr/local/bin/agy", "--dangerously-skip-permissions", "--conversation", sid]
+
+    parsed = provider_contracts.validate_resume_argv("antigravity_cli", argv)
+    assert parsed.native_id == sid
+
+    parsed_alias = provider_contracts.validate_resume_argv("antigravity", argv)
+    assert parsed_alias.native_id == sid
+
+
+def test_provider_manager_get_provider_reconstructs_antigravity_metadata(monkeypatch):
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    manager = ProviderManager()
+    sid = str(uuid.uuid4())
+
+    fake_metadata = {
+        "provider": "antigravity_cli",
+        "tmux_session": "cao-s",
+        "tmux_window": "w1",
+        "agent_profile": "implementer-gemini",
+        "native_session_id": sid,
+        "model": "gemini-3.6-flash",
+        "effort": "high",
+    }
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        lambda tid: fake_metadata,
+    )
+
+    provider = manager.get_provider("t1")
+    assert provider._native_session_id == sid
+    assert provider._model == "gemini-3.6-flash"
+    assert provider._effort == "high"
+
