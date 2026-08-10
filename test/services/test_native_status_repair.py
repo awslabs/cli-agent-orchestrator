@@ -3429,3 +3429,182 @@ def test_evidence_terminal_id_mismatch_is_operation_conflict(isolated_memory_db,
     assert harness.typed == []
     assert "d4e5f607" not in str(second)
     assert len(_evidence_rows()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Follow-up 5: ordinary-attachment exact boundary
+# ---------------------------------------------------------------------------
+
+
+def _insert_exact_attachment(
+    provider: str,
+    session_id: str,
+    *,
+    intent: dict,
+    receipt: Optional[dict] = None,
+    mode: str = em.NATIVE_TUI,
+    terminal_id: str = TERMINAL_ID,
+    generation: str = GENERATION,
+) -> None:
+    """Directly insert an attachment whose owner matches the exact current
+    facts, with a caller-supplied intent and optional receipt."""
+    identity = {"pid": PANE_PID, "start_marker": START_MARKER}
+    with database.SessionLocal() as db:
+        db.add(
+            database.NativeSessionAttachmentModel(
+                provider=provider,
+                native_session_id=session_id,
+                state=native_attachment.ATTACHED,
+                owner_terminal_id=terminal_id,
+                owner_generation=generation,
+                owner_execution_mode=mode,
+                owner_pane_id=PANE_ID,
+                owner_process_identity_json=json.dumps(identity, sort_keys=True),
+                intent_json=json.dumps(intent, sort_keys=True),
+                release_proof_json=None,
+                adoption_receipt_json=json.dumps(receipt, sort_keys=True) if receipt else None,
+                ambiguity_reason=None,
+                epoch=0,
+                created_at="now",
+                updated_at="now",
+            )
+        )
+        db.commit()
+
+
+def _sanctioned_intent(method: str = native_attachment.ACQUISITION_CHOSEN_SESSION_ID) -> dict:
+    return native_attachment.acquire_intent(
+        acquisition_method=method,
+        acquisition_receipt={"schema": "test-intent"},
+        admits_only_new_instructions=True,
+        replays_task_bytes=False,
+    )
+
+
+def _assert_zero_byte_reconcile(harness, outcome):
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-reconcile"
+    assert harness.typed == []
+    assert _terminal_row().v2_native_session_id is None
+    assert _evidence_rows() == []
+
+
+def test_non_mapping_present_adoption_receipt_reconciles_before_bytes(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    with database.SessionLocal() as db:
+        identity = {"pid": PANE_PID, "start_marker": START_MARKER}
+        db.add(
+            database.NativeSessionAttachmentModel(
+                provider="claude_code",
+                native_session_id=SESSION_ID,
+                state=native_attachment.ATTACHED,
+                owner_terminal_id=TERMINAL_ID,
+                owner_generation=GENERATION,
+                owner_execution_mode=em.NATIVE_TUI,
+                owner_pane_id=PANE_ID,
+                owner_process_identity_json=json.dumps(identity, sort_keys=True),
+                intent_json=json.dumps(_sanctioned_intent(), sort_keys=True),
+                release_proof_json=None,
+                adoption_receipt_json='"corrupt-receipt"',
+                ambiguity_reason=None,
+                epoch=0,
+                created_at="now",
+                updated_at="now",
+            )
+        )
+        db.commit()
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    _assert_zero_byte_reconcile(harness, outcome)
+
+
+def test_missing_or_unknown_acquisition_intent_reconciles_before_bytes(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    # Missing intent entirely.
+    _insert_exact_attachment("claude_code", SESSION_ID, intent={})
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    _assert_zero_byte_reconcile(harness, outcome)
+
+    # Unknown future acquisition method in a schema-correct intent.
+    other_id, other_gen = "d4e5f607", _uuid()
+    _seed_terminal(
+        "claude_code", terminal_id=other_id, generation=other_gen, binding_session_id=SESSION_ID
+    )
+    _seed_roster("claude_code", terminal_id=other_id, generation=other_gen)
+    _insert_exact_attachment(
+        "claude_code",
+        "22222222-2222-4222-8222-222222222222",
+        intent={
+            "schema": native_attachment.INTENT_SCHEMA,
+            "acquisition_method": "unknown-future-method",
+            "acquisition_receipt": {"schema": "x"},
+            "admits_only_new_instructions": True,
+            "replays_task_bytes": False,
+        },
+        terminal_id=other_id,
+        generation=other_gen,
+    )
+    harness.screens.append(claude_panel_rows())
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=other_id,
+        generation=other_gen,
+        provider_version=CLAUDE_VERSION,
+        operation_id=_uuid(),
+    )
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-reconcile"
+    assert harness.typed == []
+
+
+def test_broken_core_intent_assertion_reconciles_before_bytes(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    intent = _sanctioned_intent()
+    intent["replays_task_bytes"] = True
+    _insert_exact_attachment("claude_code", SESSION_ID, intent=intent)
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    _assert_zero_byte_reconcile(harness, outcome)
+
+
+def test_acp_exact_owner_reconciles_before_bytes(isolated_memory_db, harness):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _insert_exact_attachment("claude_code", SESSION_ID, intent=_sanctioned_intent(), mode=em.ACP)
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    _assert_zero_byte_reconcile(harness, outcome)
+
+
+def test_invalid_ordinary_attachment_session_id_reconciles_before_bytes(
+    isolated_memory_db, harness
+):
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _insert_exact_attachment("claude_code", "not-a-canonical-session", intent=_sanctioned_intent())
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    _assert_zero_byte_reconcile(harness, outcome)
+
+
+def test_sanctioned_ordinary_owner_stays_byte_identical(isolated_memory_db, harness):
+    # The sanctioned ordinary exact owner remains green, and its original
+    # intent and receipt-null state stay byte-identical after the repair.
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    intent = _sanctioned_intent()
+    _insert_exact_attachment("claude_code", SESSION_ID, intent=intent)
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "repaired"
+    assert outcome["task_bytes_submitted"] is False
+    attachment = native_attachment.get("claude_code", SESSION_ID)
+    assert attachment["intent"] == intent
+    assert attachment["adoption_receipt"] is None
+    assert _terminal_row().v2_native_session_id == SESSION_ID
+    assert _current_lineage()["native_session_id"] == SESSION_ID

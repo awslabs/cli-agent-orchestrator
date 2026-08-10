@@ -277,6 +277,59 @@ def acquire_intent(
     return intent
 
 
+def validate_attachment_intent(intent: Any) -> dict[str, Any]:
+    """Validate a stored attachment intent against the closed acquisition
+    contract, or raise :class:`NativeAttachmentInvalid`.
+
+    ``acquire_intent`` builds and validates the intent before a launch;
+    readers that reuse an already-existing attachment owner (for example
+    the status-repair ordinary-owner boundary) must check a *stored* intent
+    with the same vocabulary, without re-minting it.  This is that check:
+    the exact schema, a sanctioned acquisition method, the core
+    ``admits_only_new_instructions`` / ``replays_task_bytes`` obligations, a
+    non-empty mapping acquisition receipt, and the required zero-turn
+    bootstrap assertions.  Unknown future intent forms are refused, never
+    silently accepted.
+    """
+    if not isinstance(intent, Mapping) or intent.get("schema") != INTENT_SCHEMA:
+        raise NativeAttachmentInvalid(
+            f"intent must be a mapping with schema {INTENT_SCHEMA!r}; an unknown or "
+            "missing intent is not a truthful acquisition"
+        )
+    acquisition_method = intent.get("acquisition_method")
+    if acquisition_method not in ACQUISITION_METHODS:
+        raise NativeAttachmentInvalid(
+            f"acquisition_method must be one of {sorted(ACQUISITION_METHODS)}; "
+            f"got {acquisition_method!r}"
+        )
+    if intent.get("admits_only_new_instructions") is not True:
+        raise NativeAttachmentInvalid(
+            "intent must assert admits_only_new_instructions=True; an attachment that "
+            "may re-admit old instructions is not a truthful acquisition"
+        )
+    if intent.get("replays_task_bytes") is not False:
+        raise NativeAttachmentInvalid(
+            "intent must assert replays_task_bytes=False; a resumed session already "
+            "contains the original task and must never be re-sent it"
+        )
+    receipt = intent.get("acquisition_receipt")
+    if not isinstance(receipt, Mapping) or not receipt:
+        raise NativeAttachmentInvalid("acquisition_receipt must be a non-empty mapping")
+    if acquisition_method in {
+        ACQUISITION_ACP_BOOTSTRAP,
+        ACQUISITION_ZERO_TURN_BOOTSTRAP,
+    }:
+        if (
+            intent.get("bootstrap_sent_no_turn") is not True
+            or intent.get("bootstrap_detached_before_launch") is not True
+        ):
+            raise NativeAttachmentInvalid(
+                "a zero-turn bootstrap intent must assert bootstrap_sent_no_turn=True and "
+                "bootstrap_detached_before_launch=True"
+            )
+    return dict(intent)
+
+
 def no_survivor_proof(
     *,
     provider: str,

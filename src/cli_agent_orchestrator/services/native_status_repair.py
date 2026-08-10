@@ -1251,7 +1251,7 @@ def _prior_adoption_facts(
         raise NativeStatusRepairConflict(
             "attachment-unavailable", "the attachment store could not be read"
         ) from exc
-    matches = [
+    exact_facts = [
         record
         for record in records
         if record["state"] in native_attachment.LIVE_STATES
@@ -1260,26 +1260,49 @@ def _prior_adoption_facts(
         and record["owner"].get("pane_id") == pane_id
         and record["owner"].get("process_identity") == dict(process_identity)
     ]
-    if len(matches) > 1:
+    if len(exact_facts) > 1:
         return _reconcile("multiple exact-owner attachments exist; ambiguity is not absence")
-    if not matches:
+    if not exact_facts:
         return {"kind": "absent"}
-    record = matches[0]
+    record = exact_facts[0]
+    record_owner = record.get("owner") or {}
+    # An exact owner whose execution mode is not native_tui (e.g. an ACP
+    # owner sharing the same terminal/occurrence/pane/process) is surfaced
+    # as a pre-byte reconcile, never filtered into apparent absence and
+    # never discovered only after /status bytes.
+    if record_owner.get("execution_mode") != em.NATIVE_TUI:
+        return _reconcile(
+            "the exact owner holds a different execution mode; a TUI-only repair is "
+            "refused before any pane bytes"
+        )
+
     receipt = record.get("adoption_receipt")
-    if not isinstance(receipt, Mapping):
-        # An exact live owner with NO status-repair adoption receipt is a
-        # partial cond-0377C operation only when its intent claims a
-        # status-repair discovery.  Ordinary managed/native launches
-        # truthfully carry a pre-launch acquisition intent and no adoption
-        # receipt: they are not a partial status repair, and the exact live
-        # owner already IS the duplicate-attach barrier.
-        intent = record.get("intent") or {}
+    if receipt is None:
+        # "No status-repair adoption receipt" means exactly None.  An
+        # exact live owner with no receipt is a partial cond-0377C
+        # operation only when its intent claims a status-repair discovery.
+        # Ordinary managed/native launches truthfully carry a validated
+        # pre-launch acquisition intent and no adoption receipt: they are
+        # not a partial status repair, and the exact live owner already IS
+        # the duplicate-attach barrier.
+        try:
+            intent = native_attachment.validate_attachment_intent(record.get("intent"))
+        except native_attachment.NativeAttachmentInvalid as exc:
+            logger.warning("repair %s: ordinary attachment intent invalid: %s", operation_id, exc)
+            return _reconcile(
+                "the exact-owner attachment's acquisition intent is invalid or unknown"
+            )
+        if not _valid_native_id_for_provider(provider, record.get("native_session_id")):
+            return _reconcile("the exact-owner attachment names an invalid provider session")
         if intent.get("acquisition_method") == native_attachment.ACQUISITION_STATUS_DISCOVERED:
             return _reconcile(
                 "the exact-owner attachment is a status repair with no adoption receipt; "
                 "it is incomplete/corrupt"
             )
         return {"kind": "ordinary", "session_id": record.get("native_session_id")}
+    if not isinstance(receipt, Mapping):
+        # A present non-mapping receipt is corrupt/ambiguous, not absence.
+        return _reconcile("the exact-owner attachment carries a malformed adoption receipt")
 
     # A reusable status-repair receipt must match the stored record AND the
     # current operation on every exact fact.  A corrupted receipt never
