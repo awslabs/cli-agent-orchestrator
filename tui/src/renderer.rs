@@ -943,20 +943,30 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         lines.extend(rows[start..end].iter().cloned());
         // The residue names what is off-screen in each direction, so a partial list never reads as
         // the whole catalog.
+        //
+        // The total is folded into the FIRST direction rather than trailing the whole join, because
+        // trailing it produced `34 below of 42 commands` — every number correct and the word order
+        // fighting the reader, who parses "below of" as a broken phrase and has to re-read to learn
+        // that 42 is the catalog size and not a second offset. Attaching the total to the noun once,
+        // where the noun first appears, makes each shape read as a sentence: `34 of 42 commands
+        // below`, and `18 of 42 commands above, 11 below`.
         let (above, below) = (start, rows.len() - end);
         if above > 0 || below > 0 {
+            let total = rows.len();
             let mut parts = Vec::new();
             if above > 0 {
-                parts.push(format!("{above} above"));
+                parts.push(format!("{above} of {total} commands above"));
             }
             if below > 0 {
-                parts.push(format!("{below} below"));
+                // Only the leading part carries the total; repeating `of 42 commands` on both would
+                // read as two different populations rather than two ends of one list.
+                parts.push(if above > 0 {
+                    format!("{below} below")
+                } else {
+                    format!("{below} of {total} commands below")
+                });
             }
-            lines.push(format!(
-                "  … {} of {} commands, {SCROLL_RESIDUE_MARKER}",
-                parts.join(", "),
-                rows.len()
-            ));
+            lines.push(format!("  … {}, {SCROLL_RESIDUE_MARKER}", parts.join(", ")));
         }
         lines
     }
@@ -2575,15 +2585,32 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         if below > 0 {
             parts.push(format!("{below} below"));
         }
+        // `parts` cannot be empty here, so there is no "scrolled, but nothing is off-screen"
+        // wording to fall back to — this notice always has a direction and a count to name.
+        //
+        // The proof, because the previous fallback branch looked like defensive coding and was in
+        // fact dead code: emptiness needs `scroll == 0 && below == 0`. `scroll` is clamped to at
+        // most `total - viewport`, so `below == 0` forces `scroll == total - viewport` exactly —
+        // and that quantity is strictly positive, because this function returned early unless
+        // `total > area.height`, and `viewport == body.height <= area.height < total`. So
+        // `below == 0` implies `scroll > 0`, and the two conditions can never hold together.
+        //
+        // Verified rather than merely argued: an `assert!(!parts.is_empty())` left in this position
+        // survived the whole 193-test suite, an exhaustive sweep of `render_form`'s own arguments
+        // (1..40 lines x every anchor x 9 widths x 1..40 heights) and an integration sweep over
+        // 7 terminal widths x 15 heights x every reveal state, focus stop and scroll depth. Zero
+        // hits. The `debug_assert!` stays so that a future change to the early-return guard above
+        // breaks a test rather than silently resurrecting an unreachable message.
+        debug_assert!(
+            !parts.is_empty(),
+            "a scrolled column must have something above or below it: total={total} \
+             viewport={viewport} scroll={scroll} below={below}"
+        );
         // `[tab]` and not `[↑↓]`: the arrows belong to whichever region holds focus, and this
         // viewport follows focus rather than being steered directly. Promising `[↑↓]` here would
         // name a key that scrolls the *fold*, not the column, which is the "documented key does
         // nothing" defect the module already had once.
-        let text = if parts.is_empty() {
-            "  … form scrolled".to_string()
-        } else {
-            format!("  … {} — [tab] moves focus", parts.join(", "))
-        };
+        let text = format!("  … {} — [tab] moves focus", parts.join(", "));
         paragraph(&[Line::styled(text, self.theme.dim)]).render(notice, buf);
     }
 
@@ -7703,21 +7730,37 @@ mod tests {
              non-scrolling column would satisfy it and the regression would return unnoticed"
         );
 
-        for region in [
-            Focus::OptionalSection,
-            Focus::AgentPicker,
-            Focus::ProviderPicker,
+        // The label each region's own header carries, so the assertion below proves the marker is
+        // on the row belonging to THE FOCUSED REGION rather than merely somewhere on screen.
+        //
+        // Asserting only "some line starts with `>`" was the weakness: the left column always
+        // holds three marker-capable headers, and once one of them is on screen the bare-marker
+        // check passes even if `[tab]` moved focus to a region that scrolled away. That is exactly
+        // the invisible-focus defect this test is named for, so the old form could have gone green
+        // through the wrong region's marker.
+        //
+        // Matched as a SUBSTRING, not a whole line: at 80x24 the layout puts the results strip on
+        // the same screen row as the optional header (`> ▾ optional (9) — [esc] collapse ▸ results
+        // (0)`), so an equality check would fail on the layout rather than on the property.
+        for (region, label) in [
+            (Focus::OptionalSection, "optional ("),
+            (Focus::AgentPicker, "agents (25)"),
+            (Focus::ProviderPicker, "providers ("),
         ] {
             while shell.focus() != region {
                 assert!(shell.on_key(KeyCode::Tab));
             }
             let drawn = screen(&shell, MIN_COLS, MIN_ROWS);
-            let marked = drawn.lines().any(|line| line.starts_with('>'));
+            let marked = drawn
+                .lines()
+                .any(|line| line.starts_with('>') && line.contains(label));
             assert!(
                 marked,
-                "with focus on {region:?} at {MIN_COLS}x{MIN_ROWS} the focused row must be ON \
-                 SCREEN. A focused region scrolled out of the viewport is invisible focus, and \
-                 [tab] then appears to do nothing. Screen:\n{drawn}"
+                "with focus on {region:?} at {MIN_COLS}x{MIN_ROWS} the marked row must be ON \
+                 SCREEN *and* must be {region:?}'s own row — the one carrying {label:?}. A focused \
+                 region scrolled out of the viewport is invisible focus, and [tab] then appears to \
+                 do nothing; a marker on some OTHER region's header is the same defect wearing a \
+                 disguise this assertion is written to strip off. Screen:\n{drawn}"
             );
         }
     }
