@@ -842,16 +842,31 @@ def test_corrupt_roster_rows_do_not_block_a_v2_launch(
 # ---------------------------------------------------------------------------
 
 
-def test_muse_v2_enrollment_truthful_not_faked(isolated_memory_db):
+def test_muse_v2_enrollment_truthful_not_faked(isolated_memory_db, monkeypatch):
     """The managed-v2 capability surface truthfully reports that Muse is
     v2-launchable only after the full enrollment slice landed: every one
     of the three surfaces a native launch needs (argv binder, readiness
     receipt kind, issuance source) is implemented for ``muse_cli`` before
     it appears in the derived set.  Nothing here fabricates readiness for
     a path that does not exist."""
+    from cli_agent_orchestrator.services import muse_native_launch
     from cli_agent_orchestrator.services.managed_launch_v2 import NATIVE_TUI_PROVIDERS
 
     assert "muse_cli" in NATIVE_TUI_PROVIDERS
+    monkeypatch.setattr(
+        muse_native_launch,
+        "installed_profile_carrier_capability",
+        lambda: muse_native_launch.MuseProfileCarrierCapability(
+            True,
+            "",
+            cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+            full_banner="Muse Code 0.1.0 (0.1.0-R708.1)",
+            inner_executable="/fixture/muse-bin-0.1.0-R708.1",
+            inner_executable_sha256=(
+                "4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c"
+            ),
+        ),
+    )
     capabilities = v2.native_tui_capabilities()
     assert capabilities["providers"]["muse_cli"]["supported"] is True
     assert (

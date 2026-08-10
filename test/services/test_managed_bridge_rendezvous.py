@@ -239,16 +239,24 @@ def test_long_cond0081_worktree_kept_exact_while_socket_is_bounded(
     monkeypatch.setattr(bridge, "_build_actor_broker", lambda *_: None)
     thread = threading.Thread(target=bridge._serve, args=(request, target), daemon=True)
     thread.start()
+    client: socket.socket | None = None
     for _ in range(200):
-        if target["socket"].exists():
+        candidate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            candidate.connect(str(target["socket"]))
+            client = candidate
             break
+        except (FileNotFoundError, ConnectionRefusedError):
+            candidate.close()
+        except Exception:
+            candidate.close()
+            raise
         time.sleep(0.01)
     else:
-        raise AssertionError("unchanged cond0081 bridge socket never appeared")
+        raise AssertionError("unchanged cond0081 bridge socket never accepted a connection")
 
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    assert client is not None
     try:
-        client.connect(str(target["socket"]))
         client.sendall(
             json.dumps(
                 {

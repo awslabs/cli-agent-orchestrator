@@ -31,8 +31,14 @@ past ``_validated_extra_args``.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
+import shutil
+import subprocess
 import uuid as _uuid_module
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
 from cli_agent_orchestrator.services import provider_contracts
@@ -73,9 +79,9 @@ FORBIDDEN_OPTIONS = frozenset(
 #:
 #: The variable is an internal build surface (``TBH_EVAL_*``), not a
 #: documented end-user option, so this enrollment is pinned to the exact
-#: proven build (``SUPPORTED_VERSIONS["muse"] == ("0.1.0",)``) and fails
-#: closed if a future build stops honoring it — an unproven build never
-#: inherits the capability.  The file is generation-private and
+#: full-banner-plus-inner-digest carrier cell below and fails closed if a
+#: future build stops honoring it — an unproven build never inherits the
+#: capability.  The file is generation-private and
 #: content-addressed, so the same stable material and digest feed the
 #: launch and any later exact ``muse resume <id>`` of the same pane.
 PROFILE_SYSTEM_PROMPT_ENV = "TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE"
@@ -84,9 +90,148 @@ PROFILE_SYSTEM_PROMPT_ENV = "TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE"
 #: to, under the managed-v2 companion dir for the terminal/generation.
 PROFILE_SYSTEM_PROMPT_FILENAME = "muse-profile-system-prompt.txt"
 
+# The carrier is an internal build surface, so its authority is intentionally
+# narrower than Muse's semver-level identity/resume support.  This one cell is
+# backed by the disposable 2026-08-10 fresh -> kill -> exact-resume canary.
+# It records no canary profile bytes, sentinel, or native session id.
+PROFILE_CARRIER_CAPABILITY_CELL = "muse-profile-carrier-2026-08-10-r708.1"
+_PROFILE_CARRIER_CAPABILITIES = {
+    (
+        "Muse Code 0.1.0 (0.1.0-R708.1)",
+        "4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c",
+    ): PROFILE_CARRIER_CAPABILITY_CELL,
+}
+_MUSE_BANNER_REVISION = re.compile(
+    r"^Muse Code (?P<semver>\d+\.\d+\.\d+) \((?P<revision>\d+\.\d+\.\d+-R\d+(?:\.\d+)?)\)$"
+)
+
+
+@dataclass(frozen=True)
+class MuseProfileCarrierCapability:
+    """A closed, runtime-observed profile-carrier capability cell."""
+
+    supported: bool
+    reason: str
+    cell: Optional[str] = None
+    full_banner: Optional[str] = None
+    inner_executable: Optional[str] = None
+    inner_executable_sha256: Optional[str] = None
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_profile_carrier_inner_executable(wrapper_executable: str, full_banner: str) -> str:
+    """Resolve the exact ``muse-bin-*`` the launcher will exec for ``full_banner``.
+
+    Meta's launcher records its active revision in ``.muse-version`` and
+    executes ``<launcher-dir>/muse-bin-<revision>``.  Deriving the inner path
+    from that same revision avoids treating the update-capable shell wrapper
+    as the profile carrier.  The managed child sets ``MUSE_NO_AUTO_UPDATE=1``
+    before this is used, so the wrapper cannot silently replace the selected
+    binary between this preflight and pane creation.
+    """
+    if not isinstance(wrapper_executable, str) or not wrapper_executable:
+        raise MuseProfileCarrierUnverified("profile_carrier_unverified: Muse wrapper is absent")
+    wrapper = os.path.realpath(wrapper_executable)
+    if not os.path.isabs(wrapper) or not os.path.isfile(wrapper):
+        raise MuseProfileCarrierUnverified(
+            "profile_carrier_unverified: Muse wrapper must be an existing canonical file"
+        )
+    match = _MUSE_BANNER_REVISION.fullmatch(full_banner.strip())
+    if match is None:
+        raise MuseProfileCarrierUnverified(
+            "profile_carrier_unverified: Muse full version banner is not a supported release form"
+        )
+    revision = match.group("revision")
+    version_file = Path(wrapper).parent / ".muse-version"
+    try:
+        active_revision = version_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise MuseProfileCarrierUnverified(
+            "profile_carrier_unverified: Muse launcher active revision is unreadable"
+        ) from exc
+    if active_revision != revision:
+        raise MuseProfileCarrierUnverified(
+            "profile_carrier_unverified: Muse wrapper active revision differs from its version banner"
+        )
+    inner = os.path.realpath(str(Path(wrapper).parent / f"muse-bin-{revision}"))
+    if not os.path.isabs(inner) or not os.path.isfile(inner) or not os.access(inner, os.X_OK):
+        raise MuseProfileCarrierUnverified(
+            "profile_carrier_unverified: Muse inner executable is absent or not executable"
+        )
+    return inner
+
+
+def profile_carrier_capability(
+    *, wrapper_executable: str, full_banner: str
+) -> MuseProfileCarrierCapability:
+    """Return the one proven carrier cell for a resolved Muse installation."""
+    try:
+        inner = resolve_profile_carrier_inner_executable(wrapper_executable, full_banner)
+        digest = _sha256_file(inner)
+    except MuseProfileCarrierUnverified as exc:
+        return MuseProfileCarrierCapability(
+            False, "profile_carrier_unverified", full_banner=full_banner
+        )
+    except OSError:
+        return MuseProfileCarrierCapability(
+            False, "profile_carrier_unverified", full_banner=full_banner
+        )
+    cell = _PROFILE_CARRIER_CAPABILITIES.get((full_banner.strip(), digest))
+    if cell is None:
+        return MuseProfileCarrierCapability(
+            False,
+            "profile_carrier_unverified",
+            full_banner=full_banner.strip(),
+            inner_executable=inner,
+            inner_executable_sha256=digest,
+        )
+    return MuseProfileCarrierCapability(
+        True,
+        "",
+        cell=cell,
+        full_banner=full_banner.strip(),
+        inner_executable=inner,
+        inner_executable_sha256=digest,
+    )
+
+
+def installed_profile_carrier_capability() -> MuseProfileCarrierCapability:
+    """Observe the currently selected Muse wrapper without granting a fallback."""
+    wrapper = shutil.which("muse")
+    if not wrapper:
+        return MuseProfileCarrierCapability(False, "profile_carrier_unverified")
+    wrapper = os.path.realpath(wrapper)
+    try:
+        result = subprocess.run(
+            [wrapper, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+            env={**os.environ, "MUSE_NO_AUTO_UPDATE": "1"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return MuseProfileCarrierCapability(False, "profile_carrier_unverified")
+    if result.returncode != 0:
+        return MuseProfileCarrierCapability(False, "profile_carrier_unverified")
+    return profile_carrier_capability(
+        wrapper_executable=wrapper, full_banner=(result.stdout or result.stderr or "").strip()
+    )
+
 
 class MuseNativeLaunchError(ValueError):
     """A Muse native launch contract was violated."""
+
+
+class MuseProfileCarrierUnverified(MuseNativeLaunchError):
+    """The installed Muse wrapper/binary pair has no proven profile carrier."""
 
 
 class MuseNativeModelError(MuseNativeLaunchError):
