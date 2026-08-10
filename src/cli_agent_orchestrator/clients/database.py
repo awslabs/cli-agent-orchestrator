@@ -988,6 +988,40 @@ class ClaudeNativeControlOperationModel(Base):
     updated_at = Column(Text, nullable=False)
 
 
+class MuseNativeControlOperationModel(Base):
+    """One at-most-once admission operation against a native Muse TUI.
+
+    Structurally the twin of the other providers' control stores and
+    deliberately a *separate table*: Muse's composer facts and refusal
+    reasons are its own, and one shared table would make cross-provider
+    confusion a query away rather than impossible.  Only the queue kind
+    exists — steer, slash-control, and operator-message facts for Muse are
+    unproven on the installed build, so those kinds are never opened.
+    """
+
+    __tablename__ = "muse_native_control_operations"
+
+    operation_id = Column(Text, primary_key=True)
+    kind = Column(Text, nullable=False)
+    state = Column(Text, nullable=False)
+    provider = Column(Text, nullable=False)
+    native_session_id = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    generation = Column(Text, nullable=False)
+    execution_mode = Column(Text, nullable=False)
+    turn_id = Column(Text, nullable=True)
+    payload_sha256 = Column(Text, nullable=False)
+    intent_json = Column(Text, nullable=False)
+    transport_json = Column(Text, nullable=True)
+    observation_json = Column(Text, nullable=True)
+    posted_at = Column(Text, nullable=True)
+    refusal_reason = Column(Text, nullable=True)
+    ambiguity_reason = Column(Text, nullable=True)
+    epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
 class CodexNativeControlOperationModel(Base):
     """One at-most-once control operation against a native Codex TUI.
 

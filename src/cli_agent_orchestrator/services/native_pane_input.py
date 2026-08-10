@@ -354,6 +354,38 @@ def observe_codex_turn_state(
     return provider.get_status_from_screen(rows)
 
 
+def observe_muse_turn_state(
+    pane_id: str,
+    *,
+    terminal_id: str,
+    session_name: str,
+    window_name: str,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+    screen: Optional[Sequence[str]] = None,
+) -> TerminalStatus:
+    """Read whether the Muse TUI in ``pane_id`` is mid-turn, right now.
+
+    Delegates to the Muse provider's own detector for the same reason the
+    other observers delegate: there must be exactly one description of
+    what a Muse screen means.  The ``⟩`` composer line stays rendered
+    through a whole turn on the installed build, so the in-flight signal
+    is the spinner text ("esc to interrupt") rather than the prompt line —
+    a fact the detector owns and this observer never re-derives.
+
+    Raises rather than returning ``UNKNOWN`` when the pane cannot be
+    read at all.
+    """
+    from cli_agent_orchestrator.providers.muse_cli import MuseCliProvider
+
+    rows = list(screen) if screen is not None else capture_pane_screen(pane_id, timeout=timeout)
+    provider = MuseCliProvider(
+        terminal_id=terminal_id,
+        session_name=session_name,
+        window_name=window_name,
+    )
+    return provider.get_status_from_screen(rows)
+
+
 def observe_claude_turn_state(
     pane_id: str,
     *,

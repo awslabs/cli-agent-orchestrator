@@ -843,17 +843,20 @@ def test_corrupt_roster_rows_do_not_block_a_v2_launch(
 
 
 def test_muse_v2_enrollment_truthful_not_faked(isolated_memory_db):
-    """The roster identity contract supports the Muse harness domain, and
-    the managed-v2 capability surface truthfully reports that Muse is not
-    v2-launchable — no readiness is fabricated for a path that does not
-    exist yet.  Managed-v2 Muse ENROLLMENT is a required follow-up
-    sub-slice; only the installed activation matrix for the enrolled
-    cells is covered."""
+    """The managed-v2 capability surface truthfully reports that Muse is
+    v2-launchable only after the full enrollment slice landed: every one
+    of the three surfaces a native launch needs (argv binder, readiness
+    receipt kind, issuance source) is implemented for ``muse_cli`` before
+    it appears in the derived set.  Nothing here fabricates readiness for
+    a path that does not exist."""
     from cli_agent_orchestrator.services.managed_launch_v2 import NATIVE_TUI_PROVIDERS
 
-    assert "muse_cli" not in NATIVE_TUI_PROVIDERS
+    assert "muse_cli" in NATIVE_TUI_PROVIDERS
     capabilities = v2.native_tui_capabilities()
-    assert "muse_cli" not in capabilities["providers"]
+    assert capabilities["providers"]["muse_cli"]["supported"] is True
+    assert (
+        capabilities["providers"]["muse_cli"]["readiness_receipt_kind"] == "muse-native-status-idle"
+    )
 
     # The identity contract for the Muse harness is real: caller-chosen id.
     bound = roster.bind_generation(

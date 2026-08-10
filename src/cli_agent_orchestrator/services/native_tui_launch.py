@@ -13,13 +13,17 @@ not: everything here either changes durable ownership or starts a
 process, and the ordering between those two is the whole point.
 
 The binder is chosen by canonical provider rather than hardcoded, because
-the two supported providers acquire their identity in opposite
-directions. Kimi's session is minted by a separate ACP process and the
-TUI *resumes* it, so a Kimi launch is always a resume. Claude's identity
-is a uuid chosen before any provider I/O and handed to the TUI as
-``--session-id``, so a first Claude launch *starts* the session and only
-a recovery resumes it. That is why :func:`start` takes ``launch_kind``:
-the difference is not a detail of argv formatting, it is which of the two
+the supported providers acquire their identity in two directions. Kimi's
+session is minted by a separate ACP process and the TUI *resumes* it, so a
+Kimi launch is always a resume. Codex's session is minted by a zero-turn
+app-server bootstrap and the TUI resumes it, so a Codex launch is also a
+resume. Claude's identity is a uuid chosen before any provider I/O and
+handed to the TUI as ``--session-id``, so a first Claude launch *starts*
+the session and only a recovery resumes it. Muse's identity is chosen the
+same way — a canonical uuid minted before any provider I/O and handed to
+the TUI as ``muse resume <id>`` — so a Muse launch is always a resume of
+the chosen id. That is why :func:`start` takes ``launch_kind``: the
+difference is not a detail of argv formatting, it is which of the two
 things is happening, and a caller that gets it wrong must be refused
 rather than quietly given the other form.
 
@@ -450,9 +454,9 @@ def _verify_argv_resumes_session(
             reason=AMBIGUOUS_ARGV_MISMATCH,
             detail=(
                 f"the pane's primary process does not bind exactly {native_session_id!r}; "
-                "on both supported providers a resume that lost its id opens an "
-                "interactive picker rather than failing, so the running session may be "
-                "a different one"
+                "on the picker-backed resume forms (Claude, Kimi, and Muse) a resume that "
+                "lost its id opens an interactive picker rather than failing, so the "
+                "running session may be a different one"
             ),
         )
 

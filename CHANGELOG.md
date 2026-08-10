@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Muse managed-v2 native enrollment (cond-0377B)** — `muse_cli` joins the native-TUI launchable providers with its own launch path: a canonical UUID minted before any provider I/O, `muse resume <id>` as the exact identity form, the provider's own `/status` panel observed (typed once, bounded, parsed strictly) as the pre-task readiness proof naming the exact session/model/effort/profile/provider/cwd and idle zero-turn state, and the CAO profile system prompt composed into the session as base instructions through the installed `TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE` surface (deterministically verified on the installed 0.1.0-R708.1 build on both launch and exact resume; `--agents <JSON>` does not compose into the main session on this build and is not used for the role/profile). Admission delivers the task once through a Muse queue operation scoped to managed-v2 admission; the generic `/control-input` surface stays closed for Muse. Capability payload, roster binding (`chosen_session_id`), and bind receipts name `muse-native-status-idle` / `cli_session_id` / executable `muse` pinned to `0.1.0`
 - `cao profile find <query>` CLI verb and `find_profiles` MCP tool for keyword/BM25 profile discovery over metadata (name, description, tags, capabilities); metadata-only, never exposes prompt bodies (#340)
 - Optional `capabilities` and `tags` arrays in the agent profile frontmatter schema (#340)
 

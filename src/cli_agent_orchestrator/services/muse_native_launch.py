@@ -54,6 +54,32 @@ FORBIDDEN_OPTIONS = frozenset(
     }
 )
 
+#: The installed surface that carries the CAO profile system prompt into
+#: the main session as base instructions.  ``muse --agents <JSON>`` was
+#: read on the installed 0.1.0-R708.1 build and does NOT compose into the
+#: main session agent: the overlay registers session agent definitions for
+#: the workflow/subagent ``agentType`` path, and an echo-provider probe
+#: with the overlay set ran a clean turn with the profile line unchanged.
+#: The env-addressed file below *does* compose: with it set, an
+#: echo-provider launch and an exact ``muse resume <id>`` both refuse with
+#: "provider does not support base instructions" — the same
+#: run-configuration refusal a built-in preset with base instructions
+#: (``--preset miniswe``) produces, which is deterministic proof the file's
+#: exact bytes become the session's base instructions on the meta provider.
+#:
+#: The variable is an internal build surface (``TBH_EVAL_*``), not a
+#: documented end-user option, so this enrollment is pinned to the exact
+#: proven build (``SUPPORTED_VERSIONS["muse"] == ("0.1.0",)``) and fails
+#: closed if a future build stops honoring it — an unproven build never
+#: inherits the capability.  The file is generation-private and
+#: content-addressed, so the same stable material and digest feed the
+#: launch and any later exact ``muse resume <id>`` of the same pane.
+PROFILE_SYSTEM_PROMPT_ENV = "TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE"
+
+#: The generation-private filename the profile system prompt is written
+#: to, under the managed-v2 companion dir for the terminal/generation.
+PROFILE_SYSTEM_PROMPT_FILENAME = "muse-profile-system-prompt.txt"
+
 
 class MuseNativeLaunchError(ValueError):
     """A Muse native launch contract was violated."""
@@ -159,6 +185,26 @@ def validate_requested_model(model: Optional[str]) -> str:
     if not isinstance(model, str) or not model:
         raise MuseNativeModelError("muse native launch requires a model id")
     return model
+
+
+def validate_profile_system_prompt(system_prompt: Optional[str]) -> str:
+    """The CAO profile system prompt that must be composed into the session.
+
+    Profile fidelity is not optional: the enrollment carries the exact
+    composed profile text through :data:`PROFILE_SYSTEM_PROMPT_ENV`, and a
+    profile with no system prompt would launch a worker whose role
+    material exists only in the task prompt.  That is refused here, before
+    the session id is minted, so nothing starts for a profile that cannot
+    be truthfully applied.
+    """
+    if not isinstance(system_prompt, str) or not system_prompt.strip():
+        raise MuseNativeLaunchError(
+            "the CAO agent profile carries no system prompt; the Muse enrollment "
+            "composes the profile through the installed "
+            f"{PROFILE_SYSTEM_PROMPT_ENV} surface, and a profile with no material to "
+            "compose cannot be truthfully applied to the session"
+        )
+    return system_prompt
 
 
 #: Provider wire name this module serves, for the launch-surface dispatcher.
