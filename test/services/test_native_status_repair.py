@@ -370,6 +370,7 @@ def _seed_v2_reservation(
                     state=state,
                     request_json=_json.dumps({"expected_model": "m", "expected_effort": "high"}),
                     binding_json=_json.dumps(binding) if binding is not None else None,
+                    execution_mode="native_tui",
                     created_at="now",
                     updated_at="now",
                 )
@@ -378,6 +379,7 @@ def _seed_v2_reservation(
             existing.generation = generation
             existing.state = state
             existing.binding_json = _json.dumps(binding) if binding is not None else None
+            existing.execution_mode = "native_tui"
         db.commit()
 
 
@@ -3174,3 +3176,256 @@ def test_attachment_lookup_failure_is_typed_and_secret_absent(
     assert outcome["reason"] == "attachment-unavailable"
     assert secret not in str(outcome)
     assert harness.typed == []
+
+
+# ---------------------------------------------------------------------------
+# Follow-up 4: fixes 1-4
+# ---------------------------------------------------------------------------
+
+
+def _binding_native_id() -> Optional[str]:
+    with database.SessionLocal() as db:
+        row = (
+            db.query(database.ManagedLaunchV2ReservationModel)
+            .filter_by(terminal_id=TERMINAL_ID)
+            .first()
+        )
+        if row is None or not row.binding_json:
+            return None
+        return json.loads(row.binding_json).get("native_session_id")
+
+
+# --- 1: already-known requires BOTH repair targets ---
+
+
+def test_terminal_binding_known_lineage_missing_repairs_the_lineage(isolated_memory_db, harness):
+    # terminal=A + binding=A, lineage missing, exact attachment A: the
+    # binding must NOT make the missing lineage look complete — the repair
+    # verifies the panel and fills the lineage to A.
+    _seed_terminal("claude_code", native_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "repaired"
+    assert outcome["task_bytes_submitted"] is False
+    # The missing lineage is filled; the terminal and binding are unchanged.
+    assert _current_lineage()["native_session_id"] == SESSION_ID
+    assert _terminal_row().v2_native_session_id == SESSION_ID
+    assert _binding_native_id() == SESSION_ID
+
+
+def test_lineage_binding_known_terminal_missing_repairs_the_terminal(isolated_memory_db, harness):
+    _seed_terminal("claude_code")
+    _seed_roster("claude_code", native_session_id=SESSION_ID)
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "repaired"
+    assert outcome["task_bytes_submitted"] is False
+    assert _terminal_row().v2_native_session_id == SESSION_ID
+    assert _current_lineage()["native_session_id"] == SESSION_ID
+    assert _binding_native_id() == SESSION_ID
+
+
+# --- 2: an ordinary exact attachment is not a partial status repair ---
+
+
+def test_ordinary_attachment_reuse_without_a_status_receipt(isolated_memory_db, harness):
+    # binding-only (both targets missing) + an ordinary exact attachment
+    # (pre-launch chosen-session intent, no adoption receipt): the repair
+    # verifies the panel and fills BOTH targets while preserving the
+    # attachment owner and its original intent.
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "repaired"
+    assert outcome["task_bytes_submitted"] is False
+    assert _terminal_row().v2_native_session_id == SESSION_ID
+    assert _current_lineage()["native_session_id"] == SESSION_ID
+    # The ordinary attachment is preserved, intent and all.
+    attachment = native_attachment.get("claude_code", SESSION_ID)
+    assert attachment["state"] == native_attachment.ATTACHED
+    assert attachment["owner"]["terminal_id"] == TERMINAL_ID
+    assert (
+        attachment["intent"]["acquisition_method"]
+        == native_attachment.ACQUISITION_CHOSEN_SESSION_ID
+    )
+    assert attachment["adoption_receipt"] is None
+
+
+def test_partial_target_ordinary_attachment_repairs_only_missing_target(
+    isolated_memory_db, harness
+):
+    _seed_terminal("claude_code", native_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "repaired"
+    assert _current_lineage()["native_session_id"] == SESSION_ID
+    assert _terminal_row().v2_native_session_id == SESSION_ID
+    attachment = native_attachment.get("claude_code", SESSION_ID)
+    assert (
+        attachment["intent"]["acquisition_method"]
+        == native_attachment.ACQUISITION_CHOSEN_SESSION_ID
+    )
+
+
+def test_status_discovered_intent_without_receipt_is_reconcile_zero_bytes(
+    isolated_memory_db, harness
+):
+    # A record whose intent says provider_status_discovered but lacks the
+    # required adoption receipt is incomplete/corrupt status repair.
+    _seed_all("claude_code")
+    identity = {"pid": PANE_PID, "start_marker": START_MARKER}
+    with database.SessionLocal() as db:
+        db.add(
+            database.NativeSessionAttachmentModel(
+                provider="claude_code",
+                native_session_id=SESSION_ID,
+                state=native_attachment.ATTACHED,
+                owner_terminal_id=TERMINAL_ID,
+                owner_generation=GENERATION,
+                owner_execution_mode=em.NATIVE_TUI,
+                owner_pane_id=PANE_ID,
+                owner_process_identity_json=json.dumps(identity, sort_keys=True),
+                intent_json=json.dumps(
+                    {
+                        "schema": native_attachment.INTENT_SCHEMA,
+                        "acquisition_method": native_attachment.ACQUISITION_STATUS_DISCOVERED,
+                        "acquisition_receipt": {},
+                        "admits_only_new_instructions": True,
+                        "replays_task_bytes": False,
+                    }
+                ),
+                release_proof_json=None,
+                adoption_receipt_json=None,
+                ambiguity_reason=None,
+                epoch=0,
+                created_at="now",
+                updated_at="now",
+            )
+        )
+        db.commit()
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-reconcile"
+    assert harness.typed == []
+    assert _evidence_rows() == []
+
+
+def test_malformed_non_null_adoption_receipt_remains_zero_byte_reconcile(
+    isolated_memory_db, harness
+):
+    op = _partial_exact_owner(harness, lambda r: r.__setitem__("schema", "wrong"))
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "attachment-reconcile"
+    assert harness.typed == []
+    assert _evidence_rows() == []
+
+
+def test_ordinary_attachment_panel_mismatch_never_creates_a_second_owner(
+    isolated_memory_db, harness
+):
+    # The panel attests B while the exact ordinary owner holds A: a second
+    # owner is never created, and nothing is mutated.
+    _seed_terminal("claude_code", binding_session_id=SESSION_ID)
+    _seed_roster("claude_code")
+    _seed_exact_attached_attachment(
+        "claude_code", SESSION_ID, terminal_id=TERMINAL_ID, generation=GENERATION
+    )
+    harness.screens.append(claude_panel_rows(session_id="11111111-2222-4333-8444-555555555555"))
+    harness.styled_screens.append(claude_composer_rows())
+
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "identity-conflict"
+    assert _terminal_row().v2_native_session_id is None
+    assert native_attachment.get("claude_code", "11111111-2222-4333-8444-555555555555") is None
+
+
+# --- 3: reservation execution_mode exactness ---
+
+
+def test_acp_reservation_with_native_binding_fails_closed_before_pane_io(
+    isolated_memory_db, harness
+):
+    _seed_terminal("claude_code", binding=_default_binding("claude_code", SESSION_ID))
+    _seed_roster("claude_code")
+    with database.SessionLocal() as db:
+        row = (
+            db.query(database.ManagedLaunchV2ReservationModel)
+            .filter_by(terminal_id=TERMINAL_ID)
+            .one()
+        )
+        row.execution_mode = "acp"
+        db.commit()
+    harness.screens.append(claude_panel_rows())
+    outcome = _claude_call()
+    assert outcome["status"] == "refused"
+    assert outcome["reason"] == "binding-unavailable"
+    assert harness.typed == []
+    assert _terminal_row().v2_native_session_id is None
+
+
+# --- 4: evidence terminal_id exactness ---
+
+
+def test_evidence_terminal_id_mismatch_is_operation_conflict(isolated_memory_db, harness):
+    _seed_all("claude_code")
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    op = _uuid()
+
+    first = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert first["status"] == "repaired"
+    harness.typed.clear()
+
+    # Corrupt the stored evidence's terminal id.
+    with database.SessionLocal() as db:
+        row = db.query(database.NativeStatusRepairEvidenceModel).filter_by(operation_id=op).one()
+        row.terminal_id = "d4e5f607"
+        db.commit()
+
+    second = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=op,
+    )
+    assert second["status"] == "refused"
+    assert second["reason"] == "operation-conflict"
+    assert harness.typed == []
+    assert "d4e5f607" not in str(second)
+    assert len(_evidence_rows()) == 1

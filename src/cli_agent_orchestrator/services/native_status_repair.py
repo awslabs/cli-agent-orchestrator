@@ -610,6 +610,17 @@ def _load_validated_binding(
             "binding-unavailable",
             "the managed-v2 reservation is not bound; a pre-bind process is never " "typed into",
         )
+    # The reservation row's own persisted execution mode must resolve
+    # exactly to native_tui for this TUI-only repair.  A legacy/null
+    # execution mode resolves ACP and is refused even if the binding JSON
+    # carries native-looking facts — the row is authoritative, never the
+    # JSON alone.
+    if str(row.execution_mode or "") != em.NATIVE_TUI:
+        raise NativeStatusRepairConflict(
+            "binding-unavailable",
+            "the managed-v2 reservation is not a native-tui reservation; a TUI-only "
+            "repair is refused",
+        )
     if not row.binding_json:
         raise NativeStatusRepairConflict(
             "binding-unavailable",
@@ -1256,7 +1267,19 @@ def _prior_adoption_facts(
     record = matches[0]
     receipt = record.get("adoption_receipt")
     if not isinstance(receipt, Mapping):
-        return _reconcile("the exact-owner attachment has no status-repair adoption receipt")
+        # An exact live owner with NO status-repair adoption receipt is a
+        # partial cond-0377C operation only when its intent claims a
+        # status-repair discovery.  Ordinary managed/native launches
+        # truthfully carry a pre-launch acquisition intent and no adoption
+        # receipt: they are not a partial status repair, and the exact live
+        # owner already IS the duplicate-attach barrier.
+        intent = record.get("intent") or {}
+        if intent.get("acquisition_method") == native_attachment.ACQUISITION_STATUS_DISCOVERED:
+            return _reconcile(
+                "the exact-owner attachment is a status repair with no adoption receipt; "
+                "it is incomplete/corrupt"
+            )
+        return {"kind": "ordinary", "session_id": record.get("native_session_id")}
 
     # A reusable status-repair receipt must match the stored record AND the
     # current operation on every exact fact.  A corrupted receipt never
@@ -1970,6 +1993,8 @@ def _evidence_outcome(
 
     if evidence["request_digest"] != request_digest:
         return _conflict("the operation id is already bound to a different request digest")
+    if evidence.get("terminal_id") != terminal_id:
+        return _conflict("the operation id is bound to a different terminal")
     if str(evidence.get("generation") or "") != occurrence:
         return _conflict(
             "the operation id is bound to a different physical occurrence than the "
@@ -2162,12 +2187,26 @@ def _repair_under_claims(
         request_digest=request_digest,
         plan=plan,
     )
+    ordinary_session: Optional[str] = None
     if prior["kind"] == "reconcile":
         raise NativeStatusRepairConflict(
             "attachment-reconcile",
             f"the exact-owner attachment's adoption receipt cannot be reconciled: "
             f"{prior['reason']}; no second /status was typed and nothing was adopted",
         )
+    if prior["kind"] == "ordinary":
+        # An ordinary exact live owner (pre-launch intent, no status-repair
+        # receipt) is NOT a partial status repair: it is the duplicate-attach
+        # barrier.  Proceed to panel verification; the panel must attest the
+        # ordinary owner's session, and adoption reuses the same exact owner
+        # without rewriting its intent.
+        ordinary_session = prior["session_id"]
+        if known_id is not None and ordinary_session != known_id:
+            raise NativeStatusRepairConflict(
+                "identity-conflict",
+                "the exact live owner names a different id than the already-known "
+                "identity; nothing was mutated",
+            )
     if prior["kind"] == "reuse":
         if known_id is not None and prior["session_id"] != known_id:
             raise NativeStatusRepairConflict(
@@ -2274,6 +2313,12 @@ def _repair_under_claims(
             "the panel names a different id than the already-known identity; "
             "durable state was left unchanged",
         )
+    if ordinary_session is not None and session_id != ordinary_session:
+        raise NativeStatusRepairConflict(
+            "identity-conflict",
+            "the panel names a different session than the exact live owner; a "
+            "second owner is never created for the same pane",
+        )
 
     return _finish_repair(
         operation_id=operation_id,
@@ -2339,27 +2384,32 @@ def _known_identity_preflight(
     binding_known: Optional[str],
     operation_id: str,
 ) -> dict[str, Any]:
-    """The zero-byte identity decision: already-known (only on an exact live
-    owner), conflict, attachment-unresolved, attachment-reconcile, or
-    proceed (possibly to verify a known id).
+    """The zero-byte identity decision: already-known (only when BOTH repair
+    targets are present with the exact live owner), conflict,
+    attachment-unresolved, attachment-reconcile, or proceed (possibly to
+    verify a single distinct known id).
 
     The durable known-identity facts are the terminal row, the roster
     lineage, and (for a managed-v2 terminal) the validated binding native
-    id.  Any disagreement among known sources is a typed conflict; two or
-    more sources agreeing on the same id require the exact live attachment
-    (already-known / attachment-unresolved / attachment-reconcile); a
-    single known source is verified by the panel."""
+    id.  Any disagreement among known sources is a typed conflict.
+    ``already-known`` requires BOTH actual repair targets — the terminal row
+    and the current roster lineage — to be non-null, agree, agree with the
+    binding when present, and be owned by the exact live attachment.  The
+    binding never makes a missing target look complete: if either target is
+    missing, the operation proceeds to verify the single distinct known id
+    and fills the missing target(s) atomically."""
     known_ids = [
         value for value in (terminal_known, lineage_known, binding_known) if value is not None
     ]
     distinct = set(known_ids)
     if len(distinct) > 1:
         return {"kind": "conflict"}
-    if not known_ids:
-        return {"kind": "proceed", "known_id": None}
-    known_id = known_ids[0]
-    if len(known_ids) < 2:
-        return {"kind": "proceed", "known_id": known_id}
+    if terminal_known is None or lineage_known is None:
+        # At least one actual repair target is missing: the binding alone
+        # (or the present target) is a constraint to verify, never a
+        # substitute for the missing target.
+        return {"kind": "proceed", "known_id": known_ids[0] if known_ids else None}
+    known_id = terminal_known  # == lineage_known after the disagreement check
     try:
         attachment = native_attachment.get(provider, known_id)
     except native_attachment.NativeAttachmentError as exc:
