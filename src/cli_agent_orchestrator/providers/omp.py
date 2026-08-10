@@ -45,13 +45,16 @@ _STATUS_LINE_PATTERN = re.compile(
 _ERROR_PATTERN = re.compile(r"^\s*Error:\s+No model selected\.\s*$", re.MULTILINE)
 # The bottom OMP title frame is present in the captured idle/completed viewport.
 _READY_FRAME_PATTERN = re.compile(r"^╰─.*─╯\s*$", re.MULTILINE)
+_WAITING_COMPANION_PATTERN = re.compile(r"(?:❯\s*Approve|up/down navigate)")
+_ERROR_COMPANION_PATTERN = re.compile(r"Use /login,")
+_WORKING_COMPANION_PATTERN = re.compile(r"[\u2800-\u28ff]\s+(?:Working|Running)\b")
 
 # OMP 17.2.10 renders user turns on the terminal's page background and begins
 # assistant text by resetting that background. Keep this boundary in the raw
 # capture until the final assistant block is isolated; ANSI stripping alone
 # would make a canceled user turn indistinguishable from an assistant response.
+_ASSISTANT_BLOCK_START_PATTERN = re.compile(r"\x1b\[49m[ \t]*")
 _USER_BLOCK_START_PATTERN = re.compile(r"\x1b\[48;2;5;5;5m(?:\r?\n)?\s*")
-_ASSISTANT_BLOCK_START_PATTERN = re.compile(r"\x1b\[49m[ \t]*(?=[^\x1b\r\n╭╰├│─])")
 
 _TOOL_BORDER_PATTERN = re.compile(r"^[╭╰├│].*[╮╯┤│]$|^─{20,}$")
 _OMP_CHROME_PATTERN = re.compile(
@@ -102,6 +105,10 @@ class OmpProvider(BaseProvider):
         init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
+
+        self.shell_baseline = get_backend().get_pane_current_command(
+            self.session_name, self.window_name
+        )
 
         command = self._build_omp_command()
         get_backend().send_keys(self.session_name, self.window_name, command)
@@ -199,27 +206,52 @@ class OmpProvider(BaseProvider):
         return TerminalStatus.COMPLETED if self._turns else TerminalStatus.IDLE
 
     @staticmethod
-    def _has_later_ready_frame(clean: str, marker_start: int) -> bool:
-        return any(
+    def _has_later_ready_frame(
+        clean: str,
+        marker_start: int,
+        companion_pattern: Optional[re.Pattern] = None,
+    ) -> bool:
+        if any(
             match.start() > marker_start
             for pattern in (_STATUS_LINE_PATTERN,)
             for match in pattern.finditer(clean)
-        )
+        ):
+            return True
+
+        if not any(match.start() > marker_start for match in _READY_FRAME_PATTERN.finditer(clean)):
+            return False
+
+        if companion_pattern is None:
+            return True
+        line_start = clean.rfind("\n", 0, marker_start) + 1
+        return companion_pattern.search(clean, line_start) is None
 
     def _get_status_from_clean(self, clean: str) -> TerminalStatus:
+        if self._initialized and self.shell_baseline:
+            current_cmd = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            if current_cmd == self.shell_baseline:
+                return TerminalStatus.ERROR
+
         if not clean.strip():
             return TerminalStatus.UNKNOWN
-
         waiting = list(_WAITING_PATTERN.finditer(clean))
-        if waiting and not self._has_later_ready_frame(clean, waiting[-1].start()):
+        if waiting and not self._has_later_ready_frame(
+            clean, waiting[-1].start(), _WAITING_COMPANION_PATTERN
+        ):
             return TerminalStatus.WAITING_USER_ANSWER
 
         errors = list(_ERROR_PATTERN.finditer(clean))
-        if errors and not self._has_later_ready_frame(clean, errors[-1].start()):
+        if errors and not self._has_later_ready_frame(
+            clean, errors[-1].start(), _ERROR_COMPANION_PATTERN
+        ):
             return TerminalStatus.ERROR
 
         working = list(_WORKING_PATTERN.finditer(clean))
-        if working and not self._has_later_ready_frame(clean, working[-1].start()):
+        if working and not self._has_later_ready_frame(
+            clean, working[-1].start(), _WORKING_COMPANION_PATTERN
+        ):
             return TerminalStatus.PROCESSING
 
         if _STATUS_LINE_PATTERN.search(clean) or _READY_FRAME_PATTERN.search(clean):

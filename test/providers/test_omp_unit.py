@@ -5,7 +5,7 @@ import json
 import shlex
 import stat
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -116,6 +116,51 @@ def test_later_ready_status_line_makes_active_marker_stale(marker, expected):
     assert provider.get_status(buffer) == expected
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "Allow tool: bash",
+        "Working… ⟨esc⟩",
+        "Error: No model selected.",
+    ],
+)
+def test_later_ready_frame_makes_active_marker_stale_without_status_line(marker):
+    provider = make_provider()
+    frame = f"{marker}\n╰─ ready ─╯"
+
+    assert provider.get_status(frame) == TerminalStatus.IDLE
+    provider.mark_input_received()
+    assert provider.get_status(frame) == TerminalStatus.COMPLETED
+    assert provider.get_status_from_screen([marker, "╰─ ready ─╯"]) == (TerminalStatus.COMPLETED)
+
+
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        ("omp_processing.txt", TerminalStatus.PROCESSING),
+        ("omp_processing.raw.txt", TerminalStatus.PROCESSING),
+        ("omp_waiting.txt", TerminalStatus.WAITING_USER_ANSWER),
+        ("omp_error.txt", TerminalStatus.ERROR),
+    ],
+)
+def test_live_fixture_companions_survive_a_later_ready_frame(fixture, expected):
+    output = load_fixture(fixture) + "\n╰─ ready ─╯\n"
+
+    assert make_provider().get_status(output) == expected
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Allow tool: bash\n❯ Approve\nin: 1 out: 2 t: 1s tok/s: 1",
+        "Error: No model selected.\nUse /login, set an API key\nin: 1 out: 2 t: 1s tok/s: 1",
+        "⠋ Working… ⟨esc⟩\nin: 1 out: 2 t: 1s tok/s: 1",
+    ],
+)
+def test_later_status_line_is_stale_even_with_live_companion(output):
+    assert make_provider().get_status(output) == TerminalStatus.IDLE
+
+
 def test_screen_detection_uses_same_precedence():
     provider = make_provider()
     assert (
@@ -129,6 +174,66 @@ def test_screen_detection_uses_same_precedence():
         provider.get_status_from_screen(["in: 1 out: 2 cache 1 t: 1s tok/s: 1"])
         == TerminalStatus.COMPLETED
     )
+
+
+def test_raw_status_reports_error_when_omp_exits():
+    provider = make_provider()
+    provider._initialized = True
+    provider.shell_baseline = "zsh"
+    with patch("cli_agent_orchestrator.providers.omp.get_backend") as backend:
+        backend.return_value.get_pane_current_command.return_value = "zsh"
+
+        assert (
+            provider.get_status("Allow tool: bash\n╰─ stale ready frame ─╯") == TerminalStatus.ERROR
+        )
+
+    backend.return_value.get_pane_current_command.assert_called_once_with(
+        "test-session", "window-0"
+    )
+
+
+def test_rendered_screen_status_reports_error_when_omp_exits():
+    provider = make_provider()
+    provider._initialized = True
+    provider.shell_baseline = "zsh"
+    with patch("cli_agent_orchestrator.providers.omp.get_backend") as backend:
+        backend.return_value.get_pane_current_command.return_value = "zsh"
+
+        assert provider.get_status_from_screen(["Allow tool: bash", "╰─ ready ─╯"]) == (
+            TerminalStatus.ERROR
+        )
+
+    backend.return_value.get_pane_current_command.assert_called_once_with(
+        "test-session", "window-0"
+    )
+
+
+def test_live_omp_command_does_not_trigger_shell_exit_error():
+    provider = make_provider()
+    provider._initialized = True
+    provider.shell_baseline = "zsh"
+    with patch("cli_agent_orchestrator.providers.omp.get_backend") as backend:
+        backend.return_value.get_pane_current_command.return_value = "omp"
+
+        assert provider.get_status("Working… ⟨esc⟩") == TerminalStatus.PROCESSING
+
+    backend.return_value.get_pane_current_command.assert_called_once_with(
+        "test-session", "window-0"
+    )
+
+
+@pytest.mark.parametrize(
+    ("initialized", "baseline"),
+    [(False, "zsh"), (True, None)],
+)
+def test_shell_exit_probe_skips_uninitialized_or_missing_baseline(initialized, baseline):
+    provider = make_provider()
+    provider._initialized = initialized
+    provider.shell_baseline = baseline
+    with patch("cli_agent_orchestrator.providers.omp.get_backend") as backend:
+        assert provider.get_status("╰─ ready ─╯") == TerminalStatus.IDLE
+
+    backend.return_value.get_pane_current_command.assert_not_called()
 
 
 # ── Launch command and generated artifacts ──────────────────────────────
@@ -274,6 +379,8 @@ def test_cleanup_removes_only_generated_terminal_artifacts(tmp_path, monkeypatch
 
 def test_initialize_starts_omp_and_waits_for_ready():
     backend = MagicMock()
+    backend.get_pane_current_command.return_value = "zsh"
+    provider = make_provider()
     with (
         patch(
             "cli_agent_orchestrator.providers.omp.wait_for_shell", new=AsyncMock(return_value=True)
@@ -287,8 +394,13 @@ def test_initialize_starts_omp_and_waits_for_ready():
             "cli_agent_orchestrator.providers.omp.shutil.which", return_value="/usr/local/bin/omp"
         ),
     ):
-        assert asyncio.run(make_provider().initialize()) is True
+        assert asyncio.run(provider.initialize()) is True
 
+    assert provider.shell_baseline == "zsh"
+    assert backend.method_calls == [
+        call.get_pane_current_command("test-session", "window-0"),
+        call.send_keys("test-session", "window-0", "omp"),
+    ]
     backend.send_keys.assert_called_once_with("test-session", "window-0", "omp")
     assert wait.call_args.args[1] == {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
 
@@ -332,6 +444,18 @@ def test_extracts_final_response_and_preserves_error_prose():
         "Error: working and cancel are ordinary prose."
     )
     assert provider.extract_last_message_from_script(two_turns) == "second answer"
+
+
+def test_extract_accepts_box_prefixed_assistant_content():
+    output = (
+        "\x1b[48;2;5;5;5m\n user prompt\n\n"
+        "\x1b[49m╭ assistant response starts with a box glyph\n"
+        "and continues normally\n\n╰─ ready ─╯\n"
+    )
+
+    assert make_provider().extract_last_message_from_script(output) == (
+        "╭ assistant response starts with a box glyph\nand continues normally"
+    )
 
 
 def test_extract_uses_ansi_turn_boundary_and_rejects_canceled_user_turn():
