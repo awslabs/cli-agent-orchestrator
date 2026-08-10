@@ -537,8 +537,17 @@ class AgentHandoffWithApproval(AguiConstruct):
             # already under way. The first decision to reach here wins.
             task = self._inflight.get(interrupt_id)
             if task is None:
-                # First resume: validate THIS decision under the lock so an
-                # invalid decision is rejected without starting any delivery.
+                # Once a multi-key action has physically delivered a prefix,
+                # retries must remain pinned to that original decision. The
+                # presence of a pinned decision proves that at least one key
+                # was delivered; with zero delivered keys, callers may retry
+                # with a different valid decision.
+                pinned_decision = self._delivery_decisions.get(interrupt_id)
+                if pinned_decision is not None:
+                    decision = pinned_decision
+
+                # Validate the effective decision under the lock so an invalid
+                # decision is rejected without starting any delivery.
                 if decision.value not in interrupt.options:
                     raise ValueError(
                         f"Decision '{decision.value}' not supported for this interrupt. "
@@ -551,13 +560,6 @@ class AgentHandoffWithApproval(AguiConstruct):
                         raise ValueError(
                             f"edited_text too long ({len(edited_text)} chars, max 4000)"
                         )
-                # Once a multi-key action has physically delivered a prefix,
-                # retries must remain pinned to that original decision. With
-                # zero delivered keys, no decision is pinned and callers may
-                # retry with a different valid decision.
-                pinned_decision = self._delivery_decisions.get(interrupt_id)
-                if pinned_decision is not None and self._delivery_progress.get(interrupt_id, 0) > 0:
-                    decision = pinned_decision
 
                 terminal_id = interrupt.metadata.get("terminal_id")
                 provider = interrupt.metadata.get("provider", "")

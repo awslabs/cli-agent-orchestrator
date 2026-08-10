@@ -236,23 +236,21 @@ class OmpProvider(BaseProvider):
 
         if not clean.strip():
             return TerminalStatus.UNKNOWN
-        waiting = list(_WAITING_PATTERN.finditer(clean))
-        if waiting and not self._has_later_ready_frame(
-            clean, waiting[-1].start(), _WAITING_COMPANION_PATTERN
+        candidates = []
+        for pattern, status, companion_pattern in (
+            (_WAITING_PATTERN, TerminalStatus.WAITING_USER_ANSWER, _WAITING_COMPANION_PATTERN),
+            (_ERROR_PATTERN, TerminalStatus.ERROR, _ERROR_COMPANION_PATTERN),
+            (_WORKING_PATTERN, TerminalStatus.PROCESSING, _WORKING_COMPANION_PATTERN),
         ):
-            return TerminalStatus.WAITING_USER_ANSWER
+            matches = list(pattern.finditer(clean))
+            if not matches:
+                continue
+            marker_start = matches[-1].start()
+            if not self._has_later_ready_frame(clean, marker_start, companion_pattern):
+                candidates.append((marker_start, status))
 
-        errors = list(_ERROR_PATTERN.finditer(clean))
-        if errors and not self._has_later_ready_frame(
-            clean, errors[-1].start(), _ERROR_COMPANION_PATTERN
-        ):
-            return TerminalStatus.ERROR
-
-        working = list(_WORKING_PATTERN.finditer(clean))
-        if working and not self._has_later_ready_frame(
-            clean, working[-1].start(), _WORKING_COMPANION_PATTERN
-        ):
-            return TerminalStatus.PROCESSING
+        if candidates:
+            return max(candidates, key=lambda candidate: candidate[0])[1]
 
         if _STATUS_LINE_PATTERN.search(clean) or _READY_FRAME_PATTERN.search(clean):
             return self._ready_status()

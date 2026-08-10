@@ -161,6 +161,24 @@ def test_later_status_line_is_stale_even_with_live_companion(output):
     assert make_provider().get_status(output) == TerminalStatus.IDLE
 
 
+def test_live_spinner_wins_over_complete_stale_approval_block():
+    output = load_fixture("omp_waiting.txt") + "\n╰─ ready ─╯\n⠋ Working… ⟨esc⟩"
+
+    assert make_provider().get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_live_spinner_wins_over_complete_stale_model_error_block():
+    output = load_fixture("omp_error.txt") + "\n╰─ ready ─╯\n⠋ Working… ⟨esc⟩"
+
+    assert make_provider().get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_later_live_approval_wins_over_stale_error_block():
+    output = load_fixture("omp_error.txt") + "\n╰─ ready ─╯\n" + load_fixture("omp_waiting.txt")
+
+    assert make_provider().get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+
 def test_screen_detection_uses_same_precedence():
     provider = make_provider()
     assert (

@@ -616,7 +616,9 @@ class TestDeliveryFailureRetryable:
         assert not interrupt.resolved
         assert delivery.calls == ["Down", "Enter"]
 
-        result = await construct.resume(interrupt.id, ApprovalDecision.DENY)
+        # Contrary retry asks for approve, but the physically started deny
+        # selection remains pinned and only its unsent Enter is delivered.
+        result = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
 
         assert result.resolved
         assert result.outcome == "deny"
