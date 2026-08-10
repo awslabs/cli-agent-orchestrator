@@ -1,27 +1,33 @@
 """Muse managed-v2 native enrollment (cond-0377B), end to end over fakes.
 
 Muse's managed-v2 launch differs from the other three native providers in
-one deliberate way: its identity is *chosen* (a canonical UUID minted before
-any provider I/O, exactly like Claude's), and its pre-task readiness is
-observed from the provider's own ``/status`` panel rather than from a
-SessionStart hook (Claude) or a minting bootstrap (Kimi/Codex).
+one deliberate way: its identity is *discovered*, not chosen or minted.
+The fresh launch starts a no-prompt TUI (``muse --trust-workspace
+--reasoning-effort high --model <id>`` — no ``resume``, no ``--session-id``,
+no prompt, no task bytes) and the provider itself generates the session id;
+the managed launch types ``/status`` once and parses the provider-generated
+canonical UUID at zero turns, then acquires the native attachment for that
+exact id.  ``muse resume <known-id>`` is retained strictly as a separate
+restoration form for a later reincarnation slice.
 
 Everything this suite asserts is pinned to the installed build evidence
 recorded in ``muse_native_launch`` and ``muse_native_status``:
 
-* ``muse resume <id>`` is the only accepted identity form, root options
-  follow the id, and no recency selector, second identity, or initial task
-  prompt may appear in a managed argv.
+* The fresh launch argv carries no identity/resume form, prompt, or recency
+  selector.
 * The CAO profile system prompt is carried into the main session as base
   instructions through the installed ``TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE``
   surface (verified deterministically on the installed 0.1.0-R708.1 build:
   with the env var set, an echo-provider launch *and* an exact
   ``muse resume <id>`` both refuse with "provider does not support base
   instructions", the same run-configuration refusal a built-in preset with
-  base instructions produces).
-* The ``/status`` panel reports the exact session id, model, reasoning
-  effort, agent profile, provider, cwd, and idle/zero-turn pre-task state,
-  and the panel is printed output — the composer stays ready.
+  base instructions produces; the coordinator's real Meta canary proved the
+  file's bytes reach the model with a private sentinel).
+* The ``/status`` panel reports the exact provider session id, model,
+  reasoning effort, agent profile, provider, cwd, and idle/zero-turn
+  pre-task state, and the panel is printed output — the composer stays
+  ready.  Model and effort render together: ``Model: <id> (reasoning
+  <effort>)``.
 """
 
 from __future__ import annotations
@@ -44,9 +50,16 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
-from cli_agent_orchestrator.services import muse_native_launch, muse_native_status
+from cli_agent_orchestrator.services import (
+    muse_native_launch,
+    muse_native_status,
+    native_attachment,
+)
 from cli_agent_orchestrator.services import native_pane_input as npi
-from cli_agent_orchestrator.services import native_tui_launch, terminal_service
+from cli_agent_orchestrator.services import (
+    native_tui_launch,
+    terminal_service,
+)
 from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
 
 MUSE_BANNER = "Muse Code 0.1.0 (0.1.0-R708.1)"
@@ -54,6 +67,20 @@ MUSE_MODEL = "muse-spark-1.2-contributor"
 MUSE_EFFORT = "high"
 DELIVERY_ID = "44444444-4444-4444-8444-444444444444"
 TASK_MESSAGE = "review this diff"
+
+#: A provider-generated session id the mocked /status panel supplies — the
+#: coordinator's real provider-generated id on the installed 0.1.0-R708.1
+#: build (``fresh muse TUI -> /status``).  The fresh launch must discover
+#: exactly this and never mint one of its own.
+PROVIDER_SESSION_ID = "ebab9822-608f-470b-8b35-ada098e0cf29"
+
+#: A preserved id used only by the restoration ``muse resume <id>`` argv
+#: tests.  No fresh launch ever carries it.
+KNOWN_SESSION_ID = "11111111-2222-4333-8444-555555555555"
+
+
+def _uuid() -> str:
+    return str(uuid.uuid4())
 
 
 def _admit_request(digest: str, **changes) -> ManagedLaunchV2AdmitRequest:
@@ -219,7 +246,8 @@ def test_muse_capability_payload_is_truthful():
     capabilities = v2.native_tui_capabilities()
     block = capabilities["providers"]["muse_cli"]
     assert block["supported"] is True
-    assert block["id_source"] == "cli_session_id"
+    # The id is provider-status-discovered, never a caller-chosen one.
+    assert block["id_source"] == "provider_status_discovered"
     assert block["readiness_receipt_kind"] == "muse-native-status-idle"
     assert block["executable"] == "muse"
     assert "0.1.0" in block["supported_versions"]
@@ -242,12 +270,53 @@ def test_the_native_kind_stays_disjoint_from_the_acp_kinds():
 
 
 # --------------------------------------------------------------------
-# 2. The argv contract — exact resume, no prompt, no recency forms.
+# 2. The argv contract — fresh launch is no-identity; the resume form is
+#    retained strictly for restoration.
 # --------------------------------------------------------------------
 
 
-def test_muse_resume_argv_binds_the_exact_minted_id_exactly_once():
-    session_id = muse_native_launch.mint_session_id()
+def test_muse_fresh_launch_argv_is_no_prompt_with_no_identity_form():
+    """The fresh managed launch argv has no resume/--session-id/prompt."""
+    argv = muse_native_launch.build_fresh_launch_argv(
+        muse_binary="/usr/local/bin/muse",
+        extra_args=["--trust-workspace", "--model", MUSE_MODEL, "--reasoning-effort", MUSE_EFFORT],
+    )
+    assert argv == [
+        "/usr/local/bin/muse",
+        "--trust-workspace",
+        "--model",
+        MUSE_MODEL,
+        "--reasoning-effort",
+        MUSE_EFFORT,
+    ]
+    assert muse_native_launch.fresh_launch_has_no_identity(argv)
+    assert not any(
+        token in argv for token in ("resume", "--session-id", "-s", "--exec", "--last", "-c")
+    )
+    # No positional prompt may be smuggled in.
+    with pytest.raises(muse_native_launch.MuseNativeLaunchError):
+        muse_native_launch.build_fresh_launch_argv(extra_args=["do the task"])
+    with pytest.raises(muse_native_launch.MuseNativeLaunchError):
+        muse_native_launch.build_fresh_launch_argv(extra_args=["--exec"])
+
+
+def test_muse_fresh_launch_argv_refuses_recency_and_identity_forms():
+    for smuggled in (
+        "--last",
+        "-c",
+        "--continue",
+        "--exec",
+        "--fork-session",
+        "--no-session-log",
+        "--session-id",
+    ):
+        with pytest.raises(muse_native_launch.MuseNativeLaunchError):
+            muse_native_launch.build_fresh_launch_argv(extra_args=[smuggled, "x"])
+
+
+def test_muse_resume_argv_restoration_binds_a_preserved_id_exactly():
+    """The retained restoration form resumes exactly a known preserved id."""
+    session_id = KNOWN_SESSION_ID
     argv = muse_native_launch.build_resume_argv(
         session_id=session_id,
         muse_binary="/usr/local/bin/muse",
@@ -264,19 +333,19 @@ def test_muse_resume_argv_binds_the_exact_minted_id_exactly_once():
     ]
     assert argv.count(session_id) == 1
     assert muse_native_launch.resumes_exactly(argv, session_id)
-    # The minted id is canonical and fresh.
-    assert str(uuid.UUID(session_id)) == session_id
+    # The fresh-launch checker correctly refuses the resume form.
+    assert not muse_native_launch.fresh_launch_has_no_identity(argv)
+    assert not muse_native_launch.resumes_exactly(argv, PROVIDER_SESSION_ID)
 
 
 def test_muse_resume_argv_refuses_recency_and_identity_rebinding_forms():
-    session_id = muse_native_launch.mint_session_id()
     for smuggled in ("--last", "-c", "--continue", "--exec", "--fork-session", "--no-session-log"):
         with pytest.raises(muse_native_launch.MuseNativeLaunchError):
-            muse_native_launch.build_resume_argv(session_id=session_id, extra_args=[smuggled])
+            muse_native_launch.build_resume_argv(session_id=KNOWN_SESSION_ID, extra_args=[smuggled])
 
 
-def test_muse_managed_launch_extra_args_carry_model_effort_trust_and_no_prompt():
-    """The managed launch argv is the resume contract plus profile args."""
+def test_muse_fresh_launch_extra_args_carry_model_effort_trust_and_no_prompt():
+    """The fresh launch argv is the route/profile args with no identity."""
     record, request, bootstrap = _mint_with_harness_state()
     args = v2._muse_profile_launch_args(
         record=record,
@@ -284,17 +353,13 @@ def test_muse_managed_launch_extra_args_carry_model_effort_trust_and_no_prompt()
         profile_material=_fake_profile_material(),
         bootstrap=bootstrap,
     )
-    argv = muse_native_launch.build_resume_argv(
-        session_id=bootstrap["native_session_id"], extra_args=args
-    )
-    assert "resume" in argv
+    argv = muse_native_launch.build_fresh_launch_argv(extra_args=args)
     assert "--model" in argv and argv[argv.index("--model") + 1] == MUSE_MODEL
     assert "--reasoning-effort" in argv
     assert argv[argv.index("--reasoning-effort") + 1] == MUSE_EFFORT
-    # No positional prompt may follow the identity pair.
-    for token in argv[argv.index("resume") + 2 :]:
-        assert not token.startswith("resume ")
-        assert token not in {"--last", "-c", "--continue", "--exec", "--fork-session"}
+    assert "--trust-workspace" in argv
+    assert muse_native_launch.fresh_launch_has_no_identity(argv)
+    assert not any(token in argv for token in ("resume", "--session-id", "--exec", "--last"))
 
 
 # --------------------------------------------------------------------
@@ -303,7 +368,7 @@ def test_muse_managed_launch_extra_args_carry_model_effort_trust_and_no_prompt()
 
 
 def test_status_parser_accepts_the_coordinator_canary_panel():
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     parsed = muse_native_status.parse_status_panel(
         status_panel_rows(None, session_id, directory="/private/tmp/cao-muse-canary")
     )
@@ -332,7 +397,7 @@ def test_status_parser_accepts_the_coordinator_canary_panel():
 
 def test_status_parser_splits_the_combined_model_reasoning_line():
     """The installed meta panel renders effort inside the Model line."""
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     parsed = muse_native_status.parse_status_panel(
         status_panel_rows(None, session_id, directory="/worktree")
     )
@@ -342,7 +407,7 @@ def test_status_parser_splits_the_combined_model_reasoning_line():
 
 def test_status_parser_refuses_duplicate_required_singleton_fields():
     """More than one Model/Session/... line is ambiguity, never ``[0]``."""
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     rows = status_panel_rows(None, session_id)
     rows.insert(6, "│  Model:                 muse-other                  │")
     with pytest.raises(muse_native_status.MuseStatusParseError):
@@ -356,7 +421,7 @@ def test_status_parser_refuses_duplicate_required_singleton_fields():
 
 def test_status_parser_refuses_a_malformed_reasoning_suffix():
     """An empty or unknown reasoning effort is refused, never guessed."""
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     for bad in ("", " "):
         rows = status_panel_rows(None, session_id, reasoning=bad)
         with pytest.raises(muse_native_status.MuseStatusParseError):
@@ -371,7 +436,7 @@ def test_status_parser_refuses_a_malformed_reasoning_suffix():
 
 def test_status_parser_keeps_arbitrary_parenthetical_text_in_the_model():
     """A parenthetical that is not the exact reasoning form is not split."""
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     rows = status_panel_rows(None, session_id, model=f"{MUSE_MODEL} (preview)", reasoning=None)
     parsed = muse_native_status.parse_status_panel(rows)
     assert parsed["model"] == f"{MUSE_MODEL} (preview)"
@@ -380,7 +445,7 @@ def test_status_parser_keeps_arbitrary_parenthetical_text_in_the_model():
 
 def test_duplicate_reasoning_sources_converge_or_refuse():
     """Model-suffix and separate-label reasoning converge or refuse as one."""
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     same = status_panel_rows(None, session_id, reasoning=MUSE_EFFORT, reasoning_line=MUSE_EFFORT)
     assert muse_native_status.parse_status_panel(same)["reasoning"] == MUSE_EFFORT
     conflict = status_panel_rows(None, session_id, reasoning=MUSE_EFFORT, reasoning_line="low")
@@ -390,7 +455,7 @@ def test_duplicate_reasoning_sources_converge_or_refuse():
 
 def test_status_parser_accepts_a_panel_with_a_bare_model():
     """The echo provider renders a bare model with no effort at all."""
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     parsed = muse_native_status.parse_status_panel(
         status_panel_rows(None, session_id, reasoning=None)
     )
@@ -399,7 +464,7 @@ def test_status_parser_accepts_a_panel_with_a_bare_model():
 
 def test_provider_default_effort_sentinel_requires_no_reasoning_line():
     """The ``provider-default`` sentinel is not an effort to observe."""
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     parsed = muse_native_status.parse_status_panel(
         status_panel_rows(None, session_id, reasoning=None, directory="/worktree")
     )
@@ -428,7 +493,7 @@ def test_provider_default_effort_sentinel_requires_no_reasoning_line():
     ],
 )
 def test_require_pre_task_status_rejects_every_mismatch(mutate):
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     rows = mutate(None, session_id)
     parsed = muse_native_status.parse_status_panel(rows)
     with pytest.raises(muse_native_status.MuseStatusMismatch):
@@ -443,7 +508,7 @@ def test_require_pre_task_status_rejects_every_mismatch(mutate):
 
 
 def test_status_parser_rejects_ambiguity_and_truncation():
-    session_id = muse_native_launch.mint_session_id()
+    session_id = _uuid()
     ambiguous = status_panel_rows(None, session_id)
     ambiguous.insert(8, "│  Session:              another-session-id         │")
     with pytest.raises(muse_native_status.MuseStatusParseError):
@@ -505,7 +570,7 @@ def _mint_with_harness_state():
         "request": request.model_dump(),
     }
     bootstrap = {
-        "native_session_id": muse_native_launch.mint_session_id(),
+        "native_session_id": _uuid(),
         "requested_model": MUSE_MODEL,
         "requested_effort": MUSE_EFFORT,
     }
@@ -528,7 +593,12 @@ class _MuseHarness:
         self.terminals: list[dict[str, Any]] = []
         self.observed_pid = 4321
         self.pane_status_script: list[TerminalStatus] = [TerminalStatus.IDLE]
-        self.session_id: Optional[str] = None
+        # Ordered boundary crossings: "capture" when the /status panel is
+        # read, "declare:<id>" when the attachment is claimed, "teardown"
+        # when the fresh pane is killed.  Lets a test assert that the
+        # provider id is discovered before the attachment exists.
+        self.events: list[str] = []
+        self.teardowns: list[str] = []
 
     @property
     def launched_argv(self) -> list[str]:
@@ -544,6 +614,7 @@ class _MuseHarness:
 @pytest.fixture
 def muse_harness(monkeypatch):
     state = _MuseHarness()
+    real_declare = native_attachment.declare
 
     async def _create_terminal(**kwargs):
         state.terminals.append(kwargs)
@@ -575,6 +646,7 @@ def muse_harness(monkeypatch):
         return state.terminals[-1]["working_directory"]
 
     def _capture_render(self, pane_id):
+        state.events.append("capture")
         if state.capture_failures:
             raise state.capture_failures.pop(0)
         assert state.captures, "no scripted status panel rows"
@@ -599,9 +671,20 @@ def muse_harness(monkeypatch):
             raise status
         return status
 
+    def _declare(**kwargs):
+        state.events.append("declare:" + str(kwargs["native_session_id"]))
+        return real_declare(**kwargs)
+
+    def _delete_terminal(terminal_id, **kwargs):
+        state.teardowns.append(terminal_id)
+        return {"terminal_id": terminal_id}
+
     monkeypatch.setattr(bridge, "provider_version_banner", lambda *a, **k: MUSE_BANNER)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.create_terminal", _create_terminal
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal", _delete_terminal
     )
     monkeypatch.setattr(v2._V2NativePane, "observe", _observe)
     monkeypatch.setattr(v2._V2NativePane, "capture_render", _capture_render)
@@ -612,13 +695,11 @@ def muse_harness(monkeypatch):
     )
     monkeypatch.setattr(npi, "observe_muse_turn_state", _turn_state)
     monkeypatch.setattr(npi, "TmuxPaneInput", _FakeTmuxPaneInput.for_state(state))
+    # Record the attachment claim without changing its behaviour, so a
+    # test can assert the status discovery preceded it.
+    monkeypatch.setattr(native_attachment, "declare", _declare)
     monkeypatch.setattr(v2, "NATIVE_PANE_READY_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setattr(v2, "_NATIVE_PANE_READY_POLL_SECONDS", 0.005)
-    monkeypatch.setattr(
-        muse_native_launch,
-        "mint_session_id",
-        lambda: (state.session_id or "ffffffff-ffff-4fff-8fff-ffffffffffff"),
-    )
     return state
 
 
@@ -676,32 +757,69 @@ def _published_receipt(reservation_id: str) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_muse_launch_resumes_the_exact_minted_id_with_no_prompt(
+async def test_muse_fresh_launch_argv_is_no_prompt_with_no_identity(
     isolated_memory_db, worktree, tmp_path, muse_harness
 ):
-    muse_harness.captures.append(
-        status_panel_rows(
-            worktree, muse_harness.session_id or "ffffffff-ffff-4fff-8fff-ffffffffffff"
-        )
-    )
+    """The pane runs a fresh no-prompt TUI; no identity form is present."""
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
     record, result = await _launch(worktree, tmp_path, muse_harness)
     argv = muse_harness.launched_argv
     assert argv[0] == record["request"]["provider_executable"]
-    assert argv[1] == "resume"
-    assert argv[2] == "ffffffff-ffff-4fff-8fff-ffffffffffff"
-    assert argv.count("ffffffff-ffff-4fff-8fff-ffffffffffff") == 1
-    # No positional prompt anywhere after the identity pair.
-    for token in argv[3:]:
-        assert not token.startswith("resume ")
+    assert muse_native_launch.fresh_launch_has_no_identity(argv)
+    assert not any(
+        token in argv
+        for token in ("resume", "--session-id", "-s", "--exec", "--last", "-c", "--continue")
+    )
+    assert "--model" in argv and argv[argv.index("--model") + 1] == MUSE_MODEL
+    assert "--reasoning-effort" in argv
+    assert argv[argv.index("--reasoning-effort") + 1] == MUSE_EFFORT
+    assert "--trust-workspace" in argv
     assert result["execution_mode"] == em.NATIVE_TUI
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_discovers_the_provider_generated_session(
+    isolated_memory_db, worktree, tmp_path, muse_harness
+):
+    """The /status panel's provider UUID becomes the durable identity."""
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    assert result["state"] == "launching"
+
+    # The durable v2 terminal row carries the discovered provider id.
+    terminal = (
+        database.SessionLocal()
+        .query(database.ManagedLaunchV2TerminalModel)
+        .filter(database.ManagedLaunchV2TerminalModel.id == record["terminal_id"])
+        .first()
+    )
+    assert terminal is not None
+    assert terminal.v2_native_session_id == PROVIDER_SESSION_ID
+
+    # The attachment is keyed by the discovered id and claims a
+    # provider-discovered acquisition, never a chosen-session one.
+    attachment = native_attachment.get("muse_cli", PROVIDER_SESSION_ID)
+    assert attachment is not None
+    owner = attachment["owner"]
+    assert owner["terminal_id"] == record["terminal_id"]
+    assert owner["generation"] == record["generation"]
+    intent = attachment["intent"]
+    assert intent["acquisition_method"] == native_attachment.ACQUISITION_STATUS_DISCOVERED
+    assert intent["acquisition_receipt"]["id_source"] == "provider_status_discovered"
+
+    # The /status capture preceded the attachment claim.
+    assert "capture" in muse_harness.events
+    assert "declare:" + PROVIDER_SESSION_ID in muse_harness.events
+    assert muse_harness.events.index("capture") < muse_harness.events.index(
+        "declare:" + PROVIDER_SESSION_ID
+    )
 
 
 @pytest.mark.asyncio
 async def test_muse_launch_observes_status_before_persisting_or_publishing_readiness(
     isolated_memory_db, worktree, tmp_path, muse_harness
 ):
-    session_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
-    muse_harness.captures.append(status_panel_rows(worktree, session_id))
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
     record, _result = await _launch(worktree, tmp_path, muse_harness)
 
     # The /status command was typed exactly once, as literal + one enter.
@@ -715,29 +833,18 @@ async def test_muse_launch_observes_status_before_persisting_or_publishing_readi
     assert receipt["provider_receipt_kind"] == "muse-native-status-idle"
     assert receipt["model"] == MUSE_MODEL
     assert receipt["effort"] == MUSE_EFFORT
-    assert receipt["provider_session_id"] == session_id
+    assert receipt["provider_session_id"] == PROVIDER_SESSION_ID
     # The provider's own /status statement is the session-start proof.
     assert receipt["provider_session_start"] is not None
     assert receipt["provider_session_start"]["session_matches"] is True
     assert receipt["model_input_ready"] is True
-    # The durable v2 terminal row names the proven session only after the
-    # observation (the row exists and carries the id).
-    terminal = (
-        database.SessionLocal()
-        .query(database.ManagedLaunchV2TerminalModel)
-        .filter(database.ManagedLaunchV2TerminalModel.id == record["terminal_id"])
-        .first()
-    )
-    assert terminal is not None
-    assert terminal.v2_native_session_id == session_id
 
 
 @pytest.mark.asyncio
 async def test_muse_launch_carries_the_profile_system_prompt_through_the_env_surface(
     isolated_memory_db, worktree, tmp_path, muse_harness
 ):
-    session_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
-    muse_harness.captures.append(status_panel_rows(worktree, session_id))
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
     record, _result = await _launch(worktree, tmp_path, muse_harness)
 
     env = muse_harness.env_vars
@@ -761,11 +868,20 @@ def _profile_material_for(record) -> dict[str, Any]:
     return _profile_material(record["agent_profile"], record["terminal_id"])
 
 
+def _v2_terminal(terminal_id) -> Any:
+    return (
+        database.SessionLocal()
+        .query(database.ManagedLaunchV2TerminalModel)
+        .filter(database.ManagedLaunchV2TerminalModel.id == terminal_id)
+        .first()
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "broken",
     [
-        "wrong_session",
+        "non_canonical_id",
         "wrong_model",
         "wrong_effort",
         "wrong_profile",
@@ -774,47 +890,86 @@ def _profile_material_for(record) -> dict[str, Any]:
         "turns",
         "ambiguous",
         "unreadable",
+        "status_timeout",
     ],
 )
-async def test_muse_launch_blocks_with_zero_task_bytes_when_the_status_observation_fails(
+async def test_muse_launch_blocks_tears_down_and_never_advertises_when_discovery_fails(
     isolated_memory_db, worktree, tmp_path, muse_harness, broken
 ):
-    session_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
-    if broken == "wrong_session":
-        rows = status_panel_rows(worktree, session_id, session_line=str(uuid.uuid4()))
+    if broken == "non_canonical_id":
+        rows = status_panel_rows(worktree, "not-a-canonical-uuid")
     elif broken == "wrong_model":
-        rows = status_panel_rows(worktree, session_id, model="muse-spark-1.2")
+        rows = status_panel_rows(worktree, PROVIDER_SESSION_ID, model="muse-spark-1.2")
     elif broken == "wrong_effort":
-        rows = status_panel_rows(worktree, session_id, reasoning="low")
+        rows = status_panel_rows(worktree, PROVIDER_SESSION_ID, reasoning="low")
     elif broken == "wrong_profile":
-        rows = status_panel_rows(worktree, session_id, agent_profile="miniswe")
+        rows = status_panel_rows(worktree, PROVIDER_SESSION_ID, agent_profile="miniswe")
     elif broken == "wrong_cwd":
-        rows = status_panel_rows(worktree, session_id, directory=str(tmp_path / "elsewhere"))
+        rows = status_panel_rows(
+            worktree, PROVIDER_SESSION_ID, directory=str(tmp_path / "elsewhere")
+        )
     elif broken == "busy":
-        rows = status_panel_rows(worktree, session_id, run="running")
+        rows = status_panel_rows(worktree, PROVIDER_SESSION_ID, run="running")
     elif broken == "turns":
-        rows = status_panel_rows(worktree, session_id, tokens="4 tokens / 1 turns")
+        rows = status_panel_rows(worktree, PROVIDER_SESSION_ID, tokens="4 tokens / 1 turns")
     elif broken == "ambiguous":
-        rows = status_panel_rows(worktree, session_id)
+        rows = status_panel_rows(worktree, PROVIDER_SESSION_ID)
         rows.insert(8, "│  Session:              another-session-id         │")
-    else:  # unreadable
+    elif broken == "unreadable":
         muse_harness.capture_failures.append(RuntimeError("pane gone"))
+        rows = []
+    else:  # status_timeout: the capture never parses within the bound
         rows = []
     muse_harness.captures.append(rows)
 
     record, result = await _launch(worktree, tmp_path, muse_harness)
     assert result["state"] == "preflight_blocked"
-    # Zero task bytes: no admission claim, no delivery, and the durable
-    # session id was never persisted for the failed observation.
-    admission = result.get("admission")
-    assert admission is None
-    terminal = (
-        database.SessionLocal()
-        .query(database.TerminalModel)
-        .filter(database.TerminalModel.id == record["terminal_id"])
-        .first()
-    )
+    # Zero task bytes and no admission claim.
+    assert result.get("admission") is None
+    literals = [t["text"] for t in muse_harness.typed if t["kind"] == "literal"]
+    assert literals == ["/status"]
+    # The exact fresh pane was torn down; nothing durable was advertised.
+    assert record["terminal_id"] in muse_harness.teardowns
+    terminal = _v2_terminal(record["terminal_id"])
     assert terminal is None or terminal.v2_native_session_id is None
+    state = bridge.read_state(record["reservation_id"])
+    assert state is None or state.get("state") != "ready"
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_tears_down_on_attachment_publish_failure(
+    isolated_memory_db, worktree, tmp_path, muse_harness, monkeypatch
+):
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+    real_mark_attached = native_attachment.mark_attached
+
+    def _boom(**kwargs):
+        raise RuntimeError("publication failed")
+
+    monkeypatch.setattr(native_attachment, "mark_attached", _boom)
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    assert result["state"] == "preflight_blocked"
+    assert record["terminal_id"] in muse_harness.teardowns
+    # No orphaned live ownership: the claimed attachment is frozen.
+    attachment = native_attachment.get("muse_cli", PROVIDER_SESSION_ID)
+    assert attachment is not None
+    assert attachment["state"] != native_attachment.ATTACHED
+    assert bridge.read_state(record["reservation_id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_muse_launch_tears_down_on_durable_id_persistence_failure(
+    isolated_memory_db, worktree, tmp_path, muse_harness, monkeypatch
+):
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
+    monkeypatch.setattr(database, "set_terminal_v2_native_session_id", lambda *a, **k: False)
+    record, result = await _launch(worktree, tmp_path, muse_harness)
+    assert result["state"] == "preflight_blocked"
+    assert record["terminal_id"] in muse_harness.teardowns
+    attachment = native_attachment.get("muse_cli", PROVIDER_SESSION_ID)
+    assert attachment is not None
+    assert attachment["state"] != native_attachment.ATTACHED
+    assert bridge.read_state(record["reservation_id"]) is None
 
 
 @pytest.mark.asyncio
@@ -822,9 +977,8 @@ async def test_muse_launch_never_observes_model_or_effort_from_the_request(
     isolated_memory_db, worktree, tmp_path, muse_harness
 ):
     """Requested model/effort are never treated as observed without evidence."""
-    session_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
     muse_harness.captures.append(
-        status_panel_rows(worktree, session_id, model=MUSE_MODEL, reasoning=MUSE_EFFORT)
+        status_panel_rows(worktree, PROVIDER_SESSION_ID, model=MUSE_MODEL, reasoning=MUSE_EFFORT)
     )
     record, _result = await _launch(worktree, tmp_path, muse_harness)
     receipt = _published_receipt(record["reservation_id"])
@@ -835,16 +989,16 @@ async def test_muse_launch_never_observes_model_or_effort_from_the_request(
 
 
 # --------------------------------------------------------------------
-# 5. Bind and admission — one task delivery, at-most-once.
+# 5. Bind and admission — one task delivery, at-most-once, on the
+#    discovered provider session.
 # --------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_muse_bind_binds_the_stable_roster_to_the_exact_session(
+async def test_muse_bind_binds_the_stable_roster_to_the_discovered_session(
     isolated_memory_db, worktree, tmp_path, muse_harness
 ):
-    session_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
-    muse_harness.captures.append(status_panel_rows(worktree, session_id))
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
     record, result = await _launch(worktree, tmp_path, muse_harness)
     assert result["state"] == "launching"
 
@@ -861,28 +1015,28 @@ async def test_muse_bind_binds_the_stable_roster_to_the_exact_session(
     )
     assert bound["state"] == "bound"
     binding = bound["binding"]
-    assert binding["native_session_id"] == session_id
+    assert binding["native_session_id"] == PROVIDER_SESSION_ID
     assert binding["execution_mode"] == "native_tui"
 
     from cli_agent_orchestrator.services import stable_agent_roster as roster
 
-    # The durable roster lineage binds the exact harness-scoped session.
+    # The durable roster lineage binds the exact harness-scoped session
+    # with a provider-status-discovered acquisition.
     agents = roster.list_agents(session_name="cao-test")
     assert len(agents) == 1
     assert agents[0]["profile_family"] == "reviewer"
     lineages = roster.list_lineages(agent_id=agents[0]["agent_id"])
     assert len(lineages) == 1
     assert lineages[0]["harness"] == "muse_cli"
-    assert lineages[0]["native_session_id"] == session_id
-    assert lineages[0]["acquisition_method"] == roster.ACQUISITION_CHOSEN_SESSION_ID
+    assert lineages[0]["native_session_id"] == PROVIDER_SESSION_ID
+    assert lineages[0]["acquisition_method"] == roster.ACQUISITION_STATUS_DISCOVERED
 
 
 @pytest.mark.asyncio
 async def test_muse_admission_delivers_exactly_once_after_readiness(
     isolated_memory_db, worktree, tmp_path, muse_harness
 ):
-    session_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
-    muse_harness.captures.append(status_panel_rows(worktree, session_id))
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
     record, result = await _launch(worktree, tmp_path, muse_harness)
     bound = v2.bind_native(
         result["reservation_id"],
@@ -926,8 +1080,7 @@ async def test_muse_admission_delivers_exactly_once_after_readiness(
 async def test_muse_admission_refuses_when_the_attachment_is_not_owned(
     isolated_memory_db, worktree, tmp_path, muse_harness
 ):
-    session_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
-    muse_harness.captures.append(status_panel_rows(worktree, session_id))
+    muse_harness.captures.append(status_panel_rows(worktree, PROVIDER_SESSION_ID))
     record, result = await _launch(worktree, tmp_path, muse_harness)
     bound = v2.bind_native(
         result["reservation_id"],

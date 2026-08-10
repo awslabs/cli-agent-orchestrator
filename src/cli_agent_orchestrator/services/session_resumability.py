@@ -13,14 +13,15 @@ the loss.
 The design document's own provider table says ``claude``, ``codex``,
 ``kimi``, ``muse`` and ``glm`` are resumable. Against the code:
 
-- **muse's resume argv exists and is exact.** ``muse_native_launch``
-  accepts exactly ``muse resume <id>`` (a caller-chosen canonical UUID,
-  verified on the installed 0.1.0-R708.1 build), the same way the
-  managed-v2 launch starts it.  What muse still lacks is the *machinery*
-  on top: like every provider, the CAO resume route refuses on every
-  branch and no production path re-launches a pane from a recorded id
-  yet, so a muse worker is still structurally one-way until the resume
-  machinery lands.
+- **muse's resume argv exists and is exact — as restoration only.** The
+  fresh managed-v2 launch starts a no-prompt TUI and *discovers* the
+  provider-generated id from ``/status`` (verified on the installed
+  0.1.0-R708.1 build); ``muse resume <id>`` is the restoration form that
+  re-opens a preserved provider-generated id, never a caller-chosen
+  creation.  What muse still lacks is the *machinery* on top: like every
+  provider, the CAO resume route refuses on every branch and no production
+  path re-launches a pane from a recorded id yet, so a muse worker is
+  still structurally one-way until the resume machinery lands.
 - **``glm`` is not a provider.** It is ``claude_code`` carrying
   ``provider_route="glm"``, and its route envelope holds a *one-shot*
   consumed marker, so a GLM resume is a Claude resume plus a re-minted

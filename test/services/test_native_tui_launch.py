@@ -1459,7 +1459,11 @@ def test_the_session_proof_vocabulary_is_closed_and_unknown_values_freeze(
     through to argv behaviour.
     """
     assert native_tui_launch.SESSION_PROOFS == frozenset(
-        {native_tui_launch.SESSION_PROOF_ARGV, native_tui_launch.SESSION_PROOF_KIMI_RENDERED}
+        {
+            native_tui_launch.SESSION_PROOF_ARGV,
+            native_tui_launch.SESSION_PROOF_KIMI_RENDERED,
+            native_tui_launch.SESSION_PROOF_STATUS_DISCOVERED,
+        }
     )
     assert (
         native_tui_launch.SESSION_PROOF_KIMI_RENDERED

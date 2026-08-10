@@ -31,6 +31,12 @@ agent — it registers session agent definitions for the workflow/subagent
 CAO role/profile.  The reviewer's declared read-only tools are enforced by
 prompt + policy only (no SECURITY_PROMPT injection into the model), so keep
 review tasks read-only by instruction.
+
+Identity: a fresh managed launch starts a no-prompt TUI (``muse
+--trust-workspace ... --model <id>``) and *discovers* the provider-generated
+session id from the provider's own ``/status`` panel at zero turns;
+``muse resume <id>`` is the restoration form for a later reincarnation and
+never a caller-chosen creation.
 """
 
 from __future__ import annotations

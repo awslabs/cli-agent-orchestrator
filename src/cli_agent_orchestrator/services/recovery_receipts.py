@@ -45,6 +45,7 @@ ISSUANCE_SOURCES = (
     "acp_session_new",
     "cli_session_id",
     "trusted_hook",
+    "provider_status_discovered",
 )
 RECEIPT_KINDS = (
     "creation",

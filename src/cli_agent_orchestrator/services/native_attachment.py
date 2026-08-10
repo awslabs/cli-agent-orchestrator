@@ -87,12 +87,19 @@ ACQUISITION_RESUME = "pinned_resume"
 #: Recording either of those for a freshly chosen id would make the
 #: journaled receipt say the session pre-dated the launch when it did not.
 ACQUISITION_CHOSEN_SESSION_ID = "chosen_session_id"
+#: The provider generated the session id itself on a fresh launch and this
+#: system *discovered* it from the provider's own status surface (Muse: a
+#: no-prompt TUI whose ``/status`` panel names the session it created).
+#: Truthfully neither "chosen by us" (we did not mint it) nor "resumed"
+#: (nothing existed for us to resume before this launch).
+ACQUISITION_STATUS_DISCOVERED = "provider_status_discovered"
 ACQUISITION_METHODS = frozenset(
     {
         ACQUISITION_ACP_BOOTSTRAP,
         ACQUISITION_ZERO_TURN_BOOTSTRAP,
         ACQUISITION_RESUME,
         ACQUISITION_CHOSEN_SESSION_ID,
+        ACQUISITION_STATUS_DISCOVERED,
     }
 )
 

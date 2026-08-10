@@ -1,28 +1,32 @@
 """The Muse argv forms a managed native session is allowed to use.
 
-Muse Code 0.1.0's accepted interactive lifecycle resumes a caller-provided
-session id through the TUI: ``muse resume <id>`` starts the interactive,
-multi-turn interface bound to exactly that id (verified on the installed
-0.1.0-R708.1 build: caller-chosen id, exact fresh-pane TUI resume, context
-carry, pane-kill/process exit, and explicit model/effort changes).  Like
-Claude's native path, Muse's native identity is *chosen* (an input) rather
-than discovered (a result): a canonical UUID is minted before any provider
-I/O and handed to ``muse resume <id>``.
+Muse Code 0.1.0's *fresh* interactive lifecycle is a no-prompt TUI:
+``muse [route/profile args]`` starts the interactive, multi-turn interface
+and the provider itself generates the session id (verified on the installed
+0.1.0-R708.1 build: the coordinator's real Meta canary ran
+``muse --trust-workspace --yolo --reasoning-effort high --model <id>`` with
+no prompt, reached the composer at zero turns, and ``/status`` reported the
+provider-generated session ``ebab9822-...``).  The managed launch therefore
+*discovers* the id from the provider's own ``/status`` panel — it is never
+minted, chosen, or handed in before the provider runs.
 
-This supersedes the earlier one-shot ``muse exec --session-id <uuid>``
-contract.  ``muse exec`` pre-bound the assigned task as the invocation's
-initial prompt and produced no usable interactive provider UI; the accepted
-interactive lifecycle resumes the id and admits task bytes into the running
-TUI exactly like the other native harnesses.
+``muse resume <id>`` is the separate *restoration* form: it re-opens an
+exact previously-generated session (the canary proved ``muse resume
+<id>`` with the same cwd/profile/route restores the same id and first
+turn).  It is not a creation form — a caller-chosen UUID deterministically
+exits with "retained session not found: ... has no saved log".
 
-Two argv forms exist and nothing else is accepted:
+Three argv forms exist and nothing else is accepted:
 
-    launch    muse resume <id> [profile args]
-    recover   muse resume <id> [profile args]
+    launch     muse [route/profile args]        (fresh TUI, no identity)
+    restore    muse resume <id> [route args]    (re-open a preserved id)
+    recover    muse resume <id> [route args]    (same restoration form)
 
-Every recency-derived form is refused by construction.  The identity
-subcommand ``resume`` leads and its argument is the exact id; a caller
-cannot smuggle a second identity option past ``_validated_extra_args``.
+Every recency-derived form is refused by construction.  The fresh form must
+carry no identity subcommand, no ``--session-id``, no positional prompt, and
+no task bytes; the resume form's ``resume`` leads and its argument is the
+exact preserved id, so a caller cannot smuggle a second identity option
+past ``_validated_extra_args``.
 """
 
 from __future__ import annotations
@@ -89,16 +93,6 @@ class MuseNativeModelError(MuseNativeLaunchError):
     """A requested model cannot be pinned, or the running one is not it."""
 
 
-def mint_session_id() -> str:
-    """A fresh canonical lowercase UUID for a managed Muse session.
-
-    Deliberately trivial, and deliberately here rather than inline at the call
-    site: this is the moment a session acquires its identity, and the contract
-    that it is a canonical uuid4 belongs next to the argv forms that carry it.
-    """
-    return str(_uuid_module.uuid4())
-
-
 def validate_session_id(session_id: str) -> str:
     """Return ``session_id`` if it is a canonical lowercase UUID.
 
@@ -133,17 +127,97 @@ def _validated_extra_args(extra_args: Optional[Iterable[str]]) -> List[str]:
     return extra
 
 
+#: Flags that take a value, so the token that follows them is their value,
+#: never a positional prompt.  A fresh launch may only carry route/profile
+#: flags; anything else that does not begin with ``-`` is a prompt and is
+#: refused.
+_VALUE_FLAGS = frozenset(
+    {
+        "--agents",
+        "--provider",
+        "--preset",
+        "--model",
+        "--reasoning-effort",
+        "--base-url",
+        "--image",
+        "--workspace",
+        "--worktree",
+        "--worktree-base",
+        "--worktree-existing",
+        "--approval-mode",
+        "--approval-judge",
+        "--sandbox-network",
+        "--echo-delay-ms",
+    }
+)
+
+
+def build_fresh_launch_argv(
+    *,
+    muse_binary: str = "muse",
+    extra_args: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """``muse [route/profile args]`` — a fresh launch with no identity.
+
+    The fresh interactive lifecycle never names a session: the provider
+    generates the id itself and the managed launch discovers it from
+    ``/status``.  No ``resume``, ``--session-id``, recency form, or
+    positional prompt may appear; a caller-chosen id would deterministically
+    exit with "retained session not found".
+    """
+    if not isinstance(muse_binary, str) or not muse_binary:
+        raise MuseNativeLaunchError("muse_binary must be a non-empty string")
+    extra = list(extra_args or [])
+    for index, arg in enumerate(extra):
+        if arg in FORBIDDEN_OPTIONS or arg == RESUME_COMMAND:
+            raise MuseNativeLaunchError(
+                f"{arg} is an identity/recency form and never belongs in a fresh "
+                "managed Muse launch; the provider generates the session id"
+            )
+        if not arg.startswith("-") and not (index > 0 and extra[index - 1] in _VALUE_FLAGS):
+            raise MuseNativeLaunchError(
+                f"{arg!r} would be a positional prompt, which a fresh Muse launch "
+                "must never carry; task bytes are admitted after bind, never at launch"
+            )
+    return [muse_binary, *extra]
+
+
+def fresh_launch_has_no_identity(argv: Sequence[str]) -> bool:
+    """Whether ``argv`` is a fresh no-identity launch (nothing to restore).
+
+    The fresh form must carry no ``resume`` subcommand, no identity/recency
+    option, and no positional prompt.  Used both to build the fresh argv and
+    to prove the launched pane still runs the fresh TUI (the pane's observed
+    argv after creation must still be identity-free).
+    """
+    if not argv:
+        return False
+    values = list(argv)
+    for value in values[1:]:
+        if value in FORBIDDEN_OPTIONS or value == RESUME_COMMAND:
+            return False
+    for index, value in enumerate(values[1:], start=1):
+        if value.startswith("-"):
+            continue
+        if index > 1 and values[index - 1] in _VALUE_FLAGS:
+            continue
+        return False
+    return True
+
+
 def build_resume_argv(
     *,
     session_id: str,
     muse_binary: str = "muse",
     extra_args: Optional[Iterable[str]] = None,
 ) -> List[str]:
-    """``muse resume <id> [profile args]``.
+    """``muse resume <id> [profile args]`` — the restoration form only.
 
-    The identity subcommand leads and its argument is the exact id, so no
-    optional positional prompt can be confused with the session id.  Muse's
-    global/profile options are placed after the identity pair.
+    This re-opens an exact *preserved* provider-generated id (later
+    reincarnation); it is never used for a fresh launch, which carries no
+    identity.  The identity subcommand leads and its argument is the exact
+    id, so no optional positional prompt can be confused with the session
+    id.  Muse's global/profile options are placed after the identity pair.
     """
     native_id = validate_session_id(session_id)
     if not isinstance(muse_binary, str) or not muse_binary:

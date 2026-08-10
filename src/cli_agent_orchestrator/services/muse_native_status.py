@@ -26,8 +26,9 @@ ambiguous.
 The panel is *printed output*: Muse writes it into the output area and the
 composer line stays rendered at the bottom, so no modal dismiss is required
 after observation.  That is also why the parse is strict: a panel that is
-missing, ambiguous, truncated, or naming anything other than the minted
-session is not readiness, and nothing is admitted on it.
+missing, ambiguous, truncated, or naming anything other than the expected
+(or a canonical provider-generated) session is not readiness, and nothing is
+admitted on it.
 """
 
 from __future__ import annotations
@@ -241,10 +242,37 @@ def parse_status_panel(rows: Sequence[str]) -> dict[str, Any]:
     }
 
 
+def validate_discovered_session_id(session_id: Any) -> str:
+    """Return a provider-generated session id proven to be a canonical UUID.
+
+    The fresh launch discovers the id from the panel; a session id that is
+    not a canonical lowercase UUID cannot be a Muse session identity, so it
+    is refused rather than bound.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        raise MuseStatusMismatch(
+            f"the /status panel names a session id that is not a canonical UUID: " f"{session_id!r}"
+        )
+    import uuid as _uuid_module
+
+    try:
+        parsed = _uuid_module.UUID(session_id)
+    except ValueError as exc:
+        raise MuseStatusMismatch(
+            f"the /status panel names a session id that is not a canonical UUID: " f"{session_id!r}"
+        ) from exc
+    if str(parsed) != session_id:
+        raise MuseStatusMismatch(
+            f"the /status panel names a session id that is not a canonical lowercase "
+            f"UUID: {session_id!r}"
+        )
+    return session_id
+
+
 def require_pre_task_status(
     parsed: Mapping[str, Any],
     *,
-    session_id: str,
+    session_id: Optional[str],
     expected_model: str,
     expected_effort: Optional[str],
     working_directory: str,
@@ -252,21 +280,32 @@ def require_pre_task_status(
 ) -> dict[str, Any]:
     """Require the parsed panel to name exactly the claimed pre-task session.
 
-    Every mismatch raises :class:`MuseStatusMismatch` naming the exact
-    field and the observed vs required values, so a blocked launch records
-    *which* evidence was wrong.  ``expected_effort`` is the requested
-    effort when the route selected one (the panel must render it) and
-    ``None`` for a provider-default route (no effort line is required and
-    none is claimed observed).
+    ``session_id`` is ``None`` on a fresh launch, where the id is
+    *discovered*: the panel's session id is validated as a canonical UUID
+    and returned as the identity.  When a ``session_id`` is supplied (an
+    exact restore), the panel must name exactly it.  Every mismatch raises
+    :class:`MuseStatusMismatch` naming the exact field and the observed vs
+    required values, so a blocked launch records *which* evidence was
+    wrong.  ``expected_effort`` is the requested effort when the route
+    selected one (the panel must render it) and ``None`` for a
+    provider-default route (no effort line is required and none is claimed
+    observed).
     """
     mismatches: list[str] = []
 
     observed_session = str(parsed.get("session_id") or "")
-    session_matches = observed_session == session_id
-    if not session_matches:
-        mismatches.append(
-            f"session: the panel names {observed_session!r}, not the minted " f"{session_id!r}"
-        )
+    if session_id is None:
+        # Fresh launch: the provider generated the id and this panel names
+        # it.  Requiring it to be a canonical UUID is the discovery proof.
+        validate_discovered_session_id(observed_session)
+        session_matches = True
+    else:
+        session_matches = observed_session == session_id
+        if not session_matches:
+            mismatches.append(
+                f"session: the panel names {observed_session!r}, not the expected "
+                f"{session_id!r}"
+            )
 
     observed_model = str(parsed.get("model") or "")
     model_matches = bool(expected_model) and observed_model == expected_model

@@ -137,7 +137,7 @@ def test_capability_handshake_is_exact_and_versioned(client):
                 },
                 "muse_cli": {
                     "supported": True,
-                    "id_source": "cli_session_id",
+                    "id_source": "provider_status_discovered",
                     "readiness_receipt_kind": "muse-native-status-idle",
                     "executable": "muse",
                     "pinned_version": "0.1.0",

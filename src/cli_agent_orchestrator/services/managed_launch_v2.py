@@ -375,10 +375,12 @@ _ISSUANCE_SOURCES = {
     # Claude's identity is chosen, not discovered: a canonical uuid minted
     # before any provider I/O and handed to the launch as --session-id.
     "claude_code": "cli_session_id",
-    # Muse's identity is chosen the same way: a canonical uuid minted
-    # before any provider I/O and handed to the launch as `muse resume
-    # <id>` (verified on the installed 0.1.0-R708.1 build).
-    "muse_cli": "cli_session_id",
+    # Muse's identity is *discovered*, not chosen: a fresh no-prompt TUI
+    # generates the session id itself and the managed launch reads it back
+    # from the provider's own /status panel at zero turns (verified on the
+    # installed 0.1.0-R708.1 build: fresh `muse <route>` -> /status ->
+    # provider UUID, then `muse resume <id>` restores it).
+    "muse_cli": "provider_status_discovered",
 }
 #: Canonical provider key to the *executable* name the version-pin tables
 #: are keyed by.  The mapping exists because these are two different
@@ -2506,6 +2508,7 @@ _ROSTER_ACQUISITION_BY_ISSUANCE = {
     "cli_session_id": stable_agent_roster.ACQUISITION_CHOSEN_SESSION_ID,
     "acp_session_new": stable_agent_roster.ACQUISITION_ACP_BOOTSTRAP,
     "app_server_thread_start": stable_agent_roster.ACQUISITION_ZERO_TURN_BOOTSTRAP,
+    "provider_status_discovered": stable_agent_roster.ACQUISITION_STATUS_DISCOVERED,
 }
 
 
@@ -3869,21 +3872,21 @@ async def _launch_native_tui(
                 tui=True,
             )
         elif provider == "muse_cli":
-            # Muse's identity is chosen like Claude's: a canonical uuid
-            # minted before any provider I/O and handed to the TUI as
-            # ``muse resume <id>``.  The profile system prompt is written
-            # once to a generation-private file and addressed to the pane
-            # through the installed env surface, so the exact same bytes
-            # compose at launch and at any later exact resume.
+            # Muse's fresh launch carries NO identity: the provider
+            # generates the session id itself and the managed launch
+            # discovers it from /status at zero turns.  Only the
+            # route/profile material is prepared here (profile file + env),
+            # so nothing minted or chosen exists before the provider runs —
+            # a caller-chosen id deterministically exits with "retained
+            # session not found: ... has no saved log".
             bootstrap = await asyncio.to_thread(
-                _mint_muse_native_session,
+                _prepare_muse_fresh_launch,
                 record=record,
                 request=request,
                 version_output=version_output,
                 digest=digest,
                 profile_material=profile_material,
             )
-            launch_kind = native_tui_launch.LAUNCH_KIND_RESUME
             launch_extra_args = _muse_profile_launch_args(
                 record=record,
                 request=request,
@@ -3914,18 +3917,6 @@ async def _launch_native_tui(
         )
 
     try:
-        if provider == "claude_code":
-            intent = _claude_bootstrap_intent(bootstrap, reservation_id=reservation_id)
-        elif provider == "codex":
-            intent = codex_native_bootstrap.bootstrap_intent(
-                bootstrap, note=f"v2 native launch of reservation {reservation_id}"
-            )
-        elif provider == "muse_cli":
-            intent = _muse_bootstrap_intent(bootstrap, reservation_id=reservation_id)
-        else:
-            intent = kimi_native_bootstrap.bootstrap_intent(
-                bootstrap, note=f"v2 native launch of reservation {reservation_id}"
-            )
         transport = _V2NativePane(
             record=record,
             request=request,
@@ -3940,23 +3931,76 @@ async def _launch_native_tui(
             launch_executable = route_envelope["wrapper_executable"]
             launch_digest = route_envelope["wrapper_executable_sha256"]
             expected_inner_executable = route_envelope["inner_executable"]
-        outcome = await asyncio.to_thread(
-            native_tui_launch.start,
-            provider=provider,
-            native_session_id=bootstrap["native_session_id"],
-            terminal_id=record["terminal_id"],
-            generation=record["generation"],
-            execution_mode=em.NATIVE_TUI,
-            intent=intent,
-            binary=launch_executable,
-            binary_sha256=launch_digest,
-            working_directory=record["working_directory"],
-            transport=transport,
-            extra_args=launch_extra_args,
-            launch_kind=launch_kind,
-            expected_inner_executable=expected_inner_executable,
-            provider_version=bootstrap.get("provider_version"),
-        )
+        if provider == "muse_cli":
+            fresh_argv = muse_native_launch.build_fresh_launch_argv(
+                muse_binary=launch_executable,
+                extra_args=launch_extra_args,
+            )
+            # The fresh pane is started with no identity, the session id is
+            # discovered from the provider's own /status panel, and only
+            # then is the attachment claimed and published for that exact
+            # id.  Nothing else is typed into the pane before the claim.
+            outcome = await asyncio.to_thread(
+                native_tui_launch.start_discovered,
+                provider=provider,
+                terminal_id=record["terminal_id"],
+                generation=record["generation"],
+                execution_mode=em.NATIVE_TUI,
+                binary=launch_executable,
+                binary_sha256=launch_digest,
+                working_directory=record["working_directory"],
+                fresh_argv=fresh_argv,
+                transport=transport,
+                discover_session=partial(
+                    _discover_muse_session,
+                    record=record,
+                    capture=transport.capture_render,
+                    bootstrap=bootstrap,
+                    request=request,
+                ),
+                build_intent=partial(
+                    _muse_bootstrap_intent, bootstrap, reservation_id=reservation_id
+                ),
+                teardown=partial(
+                    _teardown_muse_fresh_pane,
+                    record,
+                    registry=registry,
+                    reason="muse-fresh-launch-discovery-failed",
+                ),
+                is_fresh_launch_argv=muse_native_launch.fresh_launch_has_no_identity,
+                expected_inner_executable=expected_inner_executable,
+                provider_version=bootstrap["provider_version"],
+            )
+            bootstrap["native_session_id"] = outcome["native_session_id"]
+            _apply_muse_status_observation(bootstrap, outcome, request)
+        else:
+            if provider == "claude_code":
+                intent = _claude_bootstrap_intent(bootstrap, reservation_id=reservation_id)
+            elif provider == "codex":
+                intent = codex_native_bootstrap.bootstrap_intent(
+                    bootstrap, note=f"v2 native launch of reservation {reservation_id}"
+                )
+            else:
+                intent = kimi_native_bootstrap.bootstrap_intent(
+                    bootstrap, note=f"v2 native launch of reservation {reservation_id}"
+                )
+            outcome = await asyncio.to_thread(
+                native_tui_launch.start,
+                provider=provider,
+                native_session_id=bootstrap["native_session_id"],
+                terminal_id=record["terminal_id"],
+                generation=record["generation"],
+                execution_mode=em.NATIVE_TUI,
+                intent=intent,
+                binary=launch_executable,
+                binary_sha256=launch_digest,
+                working_directory=record["working_directory"],
+                transport=transport,
+                extra_args=launch_extra_args,
+                launch_kind=launch_kind,
+                expected_inner_executable=expected_inner_executable,
+                provider_version=bootstrap.get("provider_version"),
+            )
     except Exception as exc:  # noqa: BLE001 - the attachment store holds the detail
         return _mark_preflight_blocked(
             reservation_id,
@@ -4008,52 +4052,58 @@ async def _launch_native_tui(
     # session id.
     session_start: Optional[dict[str, Any]] = None
     if provider == "muse_cli":
-        # Muse's authoritative readiness is its own /status panel.  The
-        # pane is first proven input-ready (the composer line rendered),
-        # then `/status` is typed exactly once and the capture is parsed
-        # and required to name the exact minted session, model, reasoning
-        # effort, profile, provider, cwd, and idle/zero-turn pre-task
-        # state.  The panel is printed output, so the composer stays ready
-        # after the observation.  Nothing is persisted, published, or
-        # admitted until this observation succeeds — zero task bytes have
-        # crossed, so a refusal costs a finalizable reservation.
+        # The /status discovery already happened inside start_discovered:
+        # the provider-generated id is proven, the attachment is published
+        # for it, and the pane is input-ready.  From here the durable id is
+        # persisted and readiness is published — and ANY failure tears the
+        # exact fresh pane down (freeze the attachment, kill the window) so
+        # no untracked session, orphaned live ownership, or advertised
+        # readiness survives.
         pane_id = ((outcome.get("attachment") or {}).get("owner") or {}).get("pane_id")
+        session_start = outcome["status_observation"]
         try:
-            await asyncio.to_thread(_await_native_pane_input_ready, record, pane_id)
-            status_observation = await asyncio.to_thread(
-                _observe_muse_status_panel,
-                record,
-                pane_id,
-                capture=transport.capture_render,
-                session_id=bootstrap["native_session_id"],
-                expected_model=bootstrap["requested_model"],
-                expected_effort=bootstrap["requested_effort"],
-                working_directory=record["working_directory"],
-                expected_profile_identity=muse_native_status.DEFAULT_AGENT_PROFILE,
+            persisted = await asyncio.to_thread(
+                database.set_terminal_v2_native_session_id,
+                record["terminal_id"],
+                bootstrap["native_session_id"],
             )
-        except Exception as exc:  # noqa: BLE001 - the observation is the gate
+            if not persisted:
+                raise ManagedLaunchConflict(
+                    "the discovered native session id could not be durably recorded "
+                    "against the terminal"
+                )
+            readiness = await asyncio.to_thread(_await_native_pane_input_ready, record, pane_id)
+            await asyncio.to_thread(
+                publish_native_ready_state,
+                reservation_id,
+                _native_readiness_receipt(
+                    record=record,
+                    request=request,
+                    bootstrap=bootstrap,
+                    outcome=outcome,
+                    version_output=version_output,
+                    bridge_version=BRIDGE_VERSION,
+                    readiness=readiness,
+                    session_start=session_start,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - tear down and block
+            cleanup_error = await asyncio.to_thread(
+                _teardown_muse_fresh_pane,
+                record,
+                bootstrap["native_session_id"],
+                registry=registry,
+                reason="muse-fresh-launch-post-discovery-failure",
+            )
+            detail = f"muse native launch failed after discovery: {exc}"
+            if cleanup_error:
+                detail = f"{detail}; teardown: {cleanup_error}"
             return _mark_preflight_blocked(
                 reservation_id,
-                f"muse /status observation failed before readiness: {exc}",
+                detail,
                 reason=PREFLIGHT_REASON_READINESS,
             )
-        observed = status_observation["observed"]
-        bootstrap["observed_model"] = observed["model"]
-        bootstrap["status_observation"] = status_observation
-        bootstrap["observed_agent_profile"] = observed["agent_profile"]
-        bootstrap["observed_cwd"] = observed["directory"]
-        if provider_contracts.route_selects_effort(request.get("expected_effort")):
-            bootstrap["observed_effort"] = observed["effort"]
-        else:
-            # A provider-default route requests no effort; the panel's
-            # rendered reasoning is the provider's own default and none is
-            # claimed observed.
-            bootstrap["observed_effort"] = None
-            bootstrap["effort_unobserved_reason"] = (
-                "no effort was requested (provider-default route); the panel's rendered "
-                "reasoning is the provider's own default and none is claimed observed"
-            )
-        session_start = status_observation
+        return get(reservation_id)
     if provider == "claude_code" and readiness_hook is not None:
         try:
             session_start = await asyncio.to_thread(
@@ -4183,13 +4233,18 @@ def _observe_muse_status_panel(
     pane_id: Optional[str],
     *,
     capture: Any,
-    session_id: str,
+    session_id: Optional[str],
     expected_model: str,
     expected_effort: Optional[str],
     working_directory: str,
     expected_profile_identity: str,
 ) -> dict[str, Any]:
     """Type ``/status`` once into the pane, then capture until it parses.
+
+    ``session_id`` is ``None`` on a fresh launch, where the id is
+    *discovered*: the panel's session id is validated as a canonical UUID
+    and returned as the identity.  When a ``session_id`` is supplied (an
+    exact restore), the panel must name exactly it.
 
     The observation is bounded by :data:`NATIVE_PANE_READY_TIMEOUT_SECONDS`
     (the shared cold-start runway) and never retyped: a second ``/status``
@@ -4246,7 +4301,7 @@ def _observe_muse_status_panel(
         time.sleep(_NATIVE_PANE_READY_POLL_SECONDS)
 
 
-def _mint_muse_native_session(
+def _prepare_muse_fresh_launch(
     *,
     record: dict[str, Any],
     request: dict[str, Any],
@@ -4254,20 +4309,14 @@ def _mint_muse_native_session(
     digest: str,
     profile_material: dict[str, Any],
 ) -> dict[str, Any]:
-    """Choose a Muse session identity and arrange its profile material.
+    """Prepare a fresh Muse launch: profile file and route facts, no identity.
 
-    Spends no provider I/O whatsoever, like the Claude mint: the identity
-    is a canonical uuid minted here, and the second half of the work is
-    writing the generation-private profile file the pane's environment
-    will address — both done *before* the launch, so the material exists
-    the instant Muse starts and the identity is recorded even if the
-    launch never succeeds.
-
-    The version is checked before the id is minted, and the model and the
-    profile system prompt are validated before the id too: a drifted
-    build, an unpinnable model, or a profile with no material to compose
-    is a refusal, and refusing after minting would leave a recorded
-    identity for a session that was never going to be started.
+    Spends no provider I/O and mints NO session id: the provider generates
+    the id on the fresh TUI, and the managed launch discovers it from
+    ``/status``.  The version, the model, and the profile system prompt are
+    validated here, before the pane starts, so a drifted build, an
+    unpinnable model, or a profile with no material to compose is a refusal
+    with nothing launched.
     """
     if not provider_contracts.is_proven_version(_PINNED_PROVIDER["muse_cli"], version_output):
         raise ManagedLaunchConflict(
@@ -4287,14 +4336,14 @@ def _mint_muse_native_session(
         filename=muse_native_launch.PROFILE_SYSTEM_PROMPT_FILENAME,
         content=system_prompt,
     )
-    native_session_id = muse_native_launch.mint_session_id()
     return {
         "schema": MUSE_BOOTSTRAP_SCHEMA,
         "provider": "muse_cli",
-        "native_session_id": native_session_id,
-        # Named so a receipt reader knows the identity was *assigned*,
-        # not read back from the provider — the same chosen-id convention
-        # as Claude's bootstrap.
+        # The provider generates the id; it is discovered from /status and
+        # filled in only after the observation succeeds.  Deliberately
+        # absent before the pane runs — a caller-chosen id deterministically
+        # exits with "retained session not found: ... has no saved log".
+        "native_session_id": None,
         "id_source": _ISSUANCE_SOURCES["muse_cli"],
         "provider_version": normalized_version(version_output),
         "binary_sha256": digest,
@@ -4312,8 +4361,8 @@ def _mint_muse_native_session(
         # The CAO profile material that will be composed into the session:
         # the profile digest of the loaded profile and the exact digest of
         # the composed system-prompt text written to the generation-private
-        # file.  The same material and digests feed the launch and any
-        # later exact resume of the same pane.
+        # file.  The same material and digests feed the fresh launch and any
+        # later exact restore of the same pane.
         "profile_sha256": profile_material["profile_sha256"],
         "profile_system_prompt_sha256": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
         "profile_system_prompt_env": muse_native_launch.PROFILE_SYSTEM_PROMPT_ENV,
@@ -4323,24 +4372,127 @@ def _mint_muse_native_session(
         "observed_agent_profile": None,
         "observed_cwd": None,
         "task_bytes_submitted": False,
-        "minted_at": _now(),
+        "prepared_at": _now(),
     }
 
 
-def _muse_bootstrap_intent(bootstrap: dict[str, Any], *, reservation_id: str) -> dict[str, Any]:
-    """The launch intent recorded against a chosen Muse identity.
+def _apply_muse_status_observation(
+    bootstrap: dict[str, Any],
+    outcome: dict[str, Any],
+    request: dict[str, Any],
+) -> None:
+    """Record the observed panel facts onto the fresh Muse bootstrap."""
+    status_observation = outcome["status_observation"]
+    observed = status_observation["observed"]
+    bootstrap["observed_model"] = observed["model"]
+    bootstrap["status_observation"] = status_observation
+    bootstrap["observed_agent_profile"] = observed["agent_profile"]
+    bootstrap["observed_cwd"] = observed["directory"]
+    if provider_contracts.route_selects_effort(request.get("expected_effort")):
+        bootstrap["observed_effort"] = observed["effort"]
+    else:
+        # A provider-default route requests no effort; the panel's rendered
+        # reasoning is the provider's own default and none is claimed
+        # observed.
+        bootstrap["observed_effort"] = None
+        bootstrap["effort_unobserved_reason"] = (
+            "no effort was requested (provider-default route); the panel's rendered "
+            "reasoning is the provider's own default and none is claimed observed"
+        )
 
-    The same chosen-session-id contract as Claude's: the identity is an
-    input, not a discovery, so the acquisition receipt carries the exact
-    minted facts — including the profile material digests that must feed
-    the resume contract.
+
+def _discover_muse_session(
+    pane_id: str,
+    *,
+    record: dict[str, Any],
+    capture: Any,
+    bootstrap: dict[str, Any],
+    request: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Wait for the composer, type ``/status`` once, and discover the id.
+
+    ``pane_id`` is the first positional because this is handed to
+    ``native_tui_launch.start_discovered`` as the ``discover_session``
+    callable, which calls it with the pane id alone.  The provider
+    generated the session id on the fresh TUI; the panel names it.
+    ``session_id=None`` makes ``require_pre_task_status`` validate the
+    discovered id as a canonical UUID (the discovery proof) while still
+    requiring the exact model/effort/profile/provider/cwd and idle/zero-turn
+    pre-task state.  Returns ``(discovered_id, status_observation)``.
+    """
+    _await_native_pane_input_ready(record, pane_id)
+    status_observation = _observe_muse_status_panel(
+        record,
+        pane_id,
+        capture=capture,
+        session_id=None,
+        expected_model=bootstrap["requested_model"],
+        expected_effort=bootstrap["requested_effort"],
+        working_directory=record["working_directory"],
+        expected_profile_identity=muse_native_status.DEFAULT_AGENT_PROFILE,
+    )
+    discovered = status_observation["observed"]["session_id"]
+    return discovered, status_observation
+
+
+def _teardown_muse_fresh_pane(
+    record: dict[str, Any],
+    discovered_session_id: Optional[str] = None,
+    *,
+    registry: Any,
+    reason: str,
+) -> Optional[str]:
+    """Kill the exact fresh pane; freeze the attachment if one was declared.
+
+    A fresh launch has no attachment before the id is discovered, so a
+    failure there only kills the pane (there is no session to freeze).
+    Once the id is known the freeze runs first, so a pane killed after the
+    claim was declared can never be silently reused — no orphaned live
+    ownership survives a failed launch.
+    """
+    from cli_agent_orchestrator.services import terminal_service
+
+    cleanup_errors: list[str] = []
+    if discovered_session_id:
+        try:
+            native_attachment.mark_ambiguous(
+                provider="muse_cli",
+                native_session_id=discovered_session_id,
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort freeze
+            cleanup_errors.append(f"native attachment freeze failed: {exc}")
+    try:
+        terminal_service.delete_terminal(
+            record["terminal_id"],
+            registry=registry,
+            expected_generation=record["generation"],
+            expected_session=record["session_name"],
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the blocked state
+        cleanup_errors.append(f"native terminal teardown failed: {exc}")
+    return "; ".join(cleanup_errors) or None
+
+
+def _muse_bootstrap_intent(
+    bootstrap: dict[str, Any],
+    native_session_id: str,
+    *,
+    reservation_id: str,
+) -> dict[str, Any]:
+    """The launch intent recorded against a provider-discovered Muse identity.
+
+    The identity is a *discovery* (a result the provider generated), never
+    an input: the acquisition method says so and never claims the id was
+    chosen.  The receipt carries the exact discovered facts, including the
+    profile material digests that must feed the restore contract.
     """
     return native_attachment.acquire_intent(
-        acquisition_method=native_attachment.ACQUISITION_CHOSEN_SESSION_ID,
+        acquisition_method=native_attachment.ACQUISITION_STATUS_DISCOVERED,
         acquisition_receipt={
             "schema": MUSE_BOOTSTRAP_INTENT_SCHEMA,
             "provider": "muse_cli",
-            "native_session_id": bootstrap["native_session_id"],
+            "native_session_id": native_session_id,
             "id_source": bootstrap["id_source"],
             "provider_version": bootstrap["provider_version"],
             "working_directory": bootstrap["working_directory"],
@@ -4351,10 +4503,10 @@ def _muse_bootstrap_intent(bootstrap: dict[str, Any], *, reservation_id: str) ->
             "profile_system_prompt_env": bootstrap["profile_system_prompt_env"],
             "task_bytes_submitted": False,
         },
-        # A chosen id names a session that did not exist until this launch,
-        # so there is nothing prior for it to re-admit or replay. Asserted
-        # explicitly anyway: these are obligations the store checks, not
-        # descriptions it records.
+        # The discovered id names a session the provider generated on this
+        # very launch; nothing prior exists for it to re-admit or replay.
+        # Asserted explicitly anyway: these are obligations the store
+        # checks, not descriptions it records.
         admits_only_new_instructions=True,
         replays_task_bytes=False,
         note=f"v2 native launch of reservation {reservation_id}",

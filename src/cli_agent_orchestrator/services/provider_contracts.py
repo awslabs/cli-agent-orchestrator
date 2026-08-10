@@ -297,11 +297,13 @@ NATIVE_ID_SOURCES = {
     PROVIDER_CODEX: "app_server_thread_start",  # app-server thread/start id
     PROVIDER_KIMI: "acp_session_new",  # ACP session/new sessionId
     PROVIDER_CLAUDE: "cli_session_id",  # explicit --session-id <uuid> at start
-    # Muse's accepted interactive lifecycle resumes a caller-chosen id
-    # (`muse resume <id>`, verified on the installed 0.1.0-R708.1 build);
-    # the id source is the minted session id, chosen before any provider
-    # I/O exactly like Claude's.
-    PROVIDER_MUSE: "cli_session_id",
+    # Muse's fresh launch starts a no-prompt TUI that generates the session
+    # id itself; the managed launch discovers it from the provider's own
+    # /status panel at zero turns (verified on the installed 0.1.0-R708.1
+    # build: fresh `muse <route>` -> /status -> provider UUID, then
+    # `muse resume <id>` restores it).  `muse resume <known-id>` is the
+    # restoration form, not a caller-chosen creation.
+    PROVIDER_MUSE: "provider_status_discovered",
 }
 
 #: The reserved ``expected_effort`` meaning "this route selects no effort;

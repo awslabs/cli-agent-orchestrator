@@ -858,7 +858,9 @@ def test_muse_v2_enrollment_truthful_not_faked(isolated_memory_db):
         capabilities["providers"]["muse_cli"]["readiness_receipt_kind"] == "muse-native-status-idle"
     )
 
-    # The identity contract for the Muse harness is real: caller-chosen id.
+    # The identity contract for the Muse harness is real: a
+    # provider-status-discovered id, never a caller-chosen one.
+    assert capabilities["providers"]["muse_cli"]["id_source"] == "provider_status_discovered"
     bound = roster.bind_generation(
         roster.BindingContract(
             agent_id=roster.derive_initial_agent_id("e5f60718"),
@@ -867,10 +869,10 @@ def test_muse_v2_enrollment_truthful_not_faked(isolated_memory_db):
             profile_family="developer",
             harness="muse_cli",
             native_session_id="11111111-2222-4333-8444-5555555555dd",
-            acquisition_method=roster.ACQUISITION_CHOSEN_SESSION_ID,
+            acquisition_method=roster.ACQUISITION_STATUS_DISCOVERED,
             terminal_id="e5f60718",
             generation="00000000-0000-4000-8000-0000000000cc",
         )
     )
     assert bound["lineage"]["harness"] == "muse_cli"
-    assert bound["lineage"]["acquisition_method"] == roster.ACQUISITION_CHOSEN_SESSION_ID
+    assert bound["lineage"]["acquisition_method"] == roster.ACQUISITION_STATUS_DISCOVERED
