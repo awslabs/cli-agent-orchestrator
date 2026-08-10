@@ -122,15 +122,15 @@ export function terminalDisplayState(
   const workItem = freshWorkItem(annotations)
   const managed = reported === 'NOT_FIFO_MONITORED' || workItem !== undefined
 
+  if (OVERRIDING_RAW_STATUSES.has(reported)) {
+    return { key: reported, reason: 'An explicit provider or terminal-lifecycle state outranks managed activity presentation.' }
+  }
+
   if (terminal?.wedged && managed) {
     return {
       key: 'MANAGED_STALLED',
       reason: 'The terminal projection joined a sustained working claim with independent render and input silence.',
     }
-  }
-
-  if (OVERRIDING_RAW_STATUSES.has(reported)) {
-    return { key: reported, reason: 'An explicit provider or terminal-lifecycle state outranks managed activity presentation.' }
   }
 
   if (reported === 'UNKNOWN' && terminal?.lifecycle_state !== 'live') {

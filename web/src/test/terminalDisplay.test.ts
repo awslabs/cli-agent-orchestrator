@@ -71,4 +71,11 @@ describe('terminalDisplayState', () => {
       ).key,
     ).toBe('MANAGED_STALLED')
   })
+
+  it('lets an explicit input wait outrank a stale wedged bit during poll skew', () => {
+    const terminal = projectedTerminal({ status: 'waiting_user_answer', wedged: true })
+    expect(
+      terminalDisplayState('waiting_user_answer', terminal, [workItem('in-round')]).key,
+    ).toBe('WAITING_USER_ANSWER')
+  })
 })
