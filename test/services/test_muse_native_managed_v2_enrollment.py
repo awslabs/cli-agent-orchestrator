@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 import pytest
@@ -609,11 +611,18 @@ class _MuseHarness:
         # When set, the /status capture blocks on this threading.Event
         # (used to hold a launch mid-discovery for cancellation tests).
         self.block: Optional["threading.Event"] = None
+        self.carrier_inner: Optional[str] = None
 
     @property
     def launched_argv(self) -> list[str]:
         assert self.terminals, "no pane was ever created"
         return list(self.terminals[-1]["managed_native_command"])
+
+    @property
+    def observed_argv(self) -> list[str]:
+        """The wrapper execs the carrier-pinned binary as the pane primary."""
+        assert self.carrier_inner is not None
+        return [self.carrier_inner, *self.launched_argv[1:]]
 
     @property
     def env_vars(self) -> dict[str, str]:
@@ -648,7 +657,7 @@ def muse_harness(monkeypatch):
             "pane_id": "%7",
             "pid": state.observed_pid,
             "start_marker": "Thu Jul 24 10:00:00 2026",
-            "argv": state.launched_argv,
+            "argv": state.observed_argv,
             "cwd": state.observe_cwd or self_record_working_directory(),
         }
 
@@ -692,6 +701,26 @@ def muse_harness(monkeypatch):
         return {"terminal_id": terminal_id}
 
     monkeypatch.setattr(bridge, "provider_version_banner", lambda *a, **k: MUSE_BANNER)
+
+    # Model the real split between the update-capable wrapper and its fixed
+    # inner image.  Carrier resolution itself has dedicated closed-cell
+    # tests; this fixture proves the wrapper starts the pinned inner image.
+    def _carrier(*, wrapper_executable, full_banner):
+        inner_path = Path(wrapper_executable).with_name("fake-muse-inner")
+        inner_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        inner_path.chmod(0o755)
+        inner = os.path.realpath(inner_path)
+        state.carrier_inner = inner
+        return muse_native_launch.MuseProfileCarrierCapability(
+            True,
+            "",
+            cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+            full_banner=full_banner,
+            inner_executable=inner,
+            inner_executable_sha256=hashlib.sha256(Path(inner).read_bytes()).hexdigest(),
+        )
+
+    monkeypatch.setattr(muse_native_launch, "profile_carrier_capability", _carrier)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.create_terminal", _create_terminal
     )
@@ -726,7 +755,7 @@ class _FakeTmuxNativePane:
             "pane_id": "%7",
             "pid": self._state.observed_pid,
             "start_marker": "Thu Jul 24 10:00:00 2026",
-            "argv": self._state.launched_argv,
+            "argv": self._state.observed_argv,
             "cwd": self._state.terminals[-1]["working_directory"],
         }
 
@@ -777,6 +806,7 @@ async def test_muse_fresh_launch_argv_is_no_prompt_with_no_identity(
     record, result = await _launch(worktree, tmp_path, muse_harness)
     argv = muse_harness.launched_argv
     assert argv[0] == record["request"]["provider_executable"]
+    assert muse_harness.observed_argv[0] == muse_harness.carrier_inner
     assert muse_native_launch.fresh_launch_has_no_identity(argv)
     assert not any(
         token in argv
@@ -787,6 +817,45 @@ async def test_muse_fresh_launch_argv_is_no_prompt_with_no_identity(
     assert argv[argv.index("--reasoning-effort") + 1] == MUSE_EFFORT
     assert "--trust-workspace" in argv
     assert result["execution_mode"] == em.NATIVE_TUI
+
+
+@pytest.mark.asyncio
+async def test_muse_probe_disables_updater_before_wrapper_execution_and_mismatch_has_no_effects(
+    isolated_memory_db, worktree, tmp_path, muse_harness, monkeypatch
+):
+    """The first wrapper execution is fenced and a rejected carrier starts no pane."""
+    probe_environments = []
+    profile_writes = []
+
+    def _version_probe(_request, *, environment=None, **_kwargs):
+        # The version probe is the first managed wrapper invocation.  A pane
+        # would mean an earlier provider execution escaped this fence.
+        assert muse_harness.terminals == []
+        assert environment is not None
+        probe_environments.append(dict(environment))
+        return MUSE_BANNER
+
+    def _write_profile(**_kwargs):
+        profile_writes.append(True)
+        raise AssertionError("a rejected carrier must not write a profile")
+
+    monkeypatch.setattr(bridge, "provider_version_banner", _version_probe)
+    monkeypatch.setattr(
+        muse_native_launch,
+        "profile_carrier_capability",
+        lambda **_kwargs: muse_native_launch.MuseProfileCarrierCapability(
+            False, "profile_carrier_unverified"
+        ),
+    )
+    monkeypatch.setattr(v2, "_write_native_profile_file", _write_profile)
+
+    _record, result = await _launch(worktree, tmp_path, muse_harness)
+
+    assert probe_environments
+    assert probe_environments[0]["MUSE_NO_AUTO_UPDATE"] == "1"
+    assert profile_writes == []
+    assert muse_harness.terminals == []
+    assert result["state"] == "preflight_blocked"
 
 
 @pytest.mark.asyncio
@@ -818,6 +887,11 @@ async def test_muse_launch_discovers_the_provider_generated_session(
     intent = attachment["intent"]
     assert intent["acquisition_method"] == native_attachment.ACQUISITION_STATUS_DISCOVERED
     assert intent["acquisition_receipt"]["id_source"] == "provider_status_discovered"
+    assert (
+        intent["acquisition_receipt"]["profile_carrier_capability"]
+        == muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL
+    )
+    assert intent["acquisition_receipt"]["profile_carrier_inner_sha256"]
 
     # The /status capture preceded the attachment claim.
     assert "capture" in muse_harness.events
@@ -860,6 +934,7 @@ async def test_muse_launch_carries_the_profile_system_prompt_through_the_env_sur
     record, _result = await _launch(worktree, tmp_path, muse_harness)
 
     env = muse_harness.env_vars
+    assert env["MUSE_NO_AUTO_UPDATE"] == "1"
     assert muse_native_launch.PROFILE_SYSTEM_PROMPT_ENV in env
     profile_path = env[muse_native_launch.PROFILE_SYSTEM_PROMPT_ENV]
     material = _profile_material_for(record)

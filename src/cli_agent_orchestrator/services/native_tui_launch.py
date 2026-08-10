@@ -343,6 +343,14 @@ def _validate_binary(binary: str, binary_sha256: str) -> str:
     return binary
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _validate_working_directory(working_directory: str) -> str:
     """Accept only the canonical directory the bound session was minted in.
 
@@ -1470,6 +1478,7 @@ def start_discovered(
     teardown: Callable[[Optional[str]], Optional[str]],
     is_fresh_launch_argv: Callable[[Sequence[str]], bool],
     expected_inner_executable: Optional[str] = None,
+    expected_inner_executable_sha256: Optional[str] = None,
     provider_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """Start a provider pane whose session id is only knowable from its screen.
@@ -1507,6 +1516,15 @@ def start_discovered(
         )
 
     binary = _validate_binary(binary, binary_sha256)
+    if expected_inner_executable_sha256 is not None:
+        if expected_inner_executable is None:
+            raise NativeLaunchInvalid("an inner executable digest requires an inner executable")
+        inner = _validate_binary(expected_inner_executable, expected_inner_executable_sha256)
+        # Resolve before process creation as well as requiring the observed
+        # pane image below. The wrapper's updater must not be able to swap a
+        # same-path inner binary after the carrier gate ran.
+        if inner != expected_inner_executable:
+            raise NativeLaunchInvalid("inner executable must be canonical")
     working_directory = _validate_working_directory(working_directory)
     if not is_fresh_launch_argv(fresh_argv):
         raise NativeLaunchInvalid(
@@ -1620,6 +1638,19 @@ def start_discovered(
                     f"inner executable {expected_inner_executable!r}",
                     discovered_session_id=discovered_session_id,
                 )
+            if expected_inner_executable_sha256 is not None:
+                try:
+                    observed_digest = _sha256_file(expected_inner_executable)
+                except OSError as exc:
+                    raise NativeLaunchDiscoverFailed(
+                        "the declared inner executable became unreadable after pane launch",
+                        discovered_session_id=discovered_session_id,
+                    ) from exc
+                if observed_digest != expected_inner_executable_sha256:
+                    raise NativeLaunchDiscoverFailed(
+                        "the declared inner executable digest changed after pane launch",
+                        discovered_session_id=discovered_session_id,
+                    )
         attachment = native_attachment.mark_attached(
             provider=provider,
             native_session_id=discovered_session_id,

@@ -140,6 +140,17 @@ override.  While the installed build is unproven, ordinary Codex launches
 refuse fail-closed; the managed-v2 path (which pins its executable and
 resumes through `native_tui_launch`) is unaffected by this table.
 
+## Muse profile-carrier exception
+
+Muse's managed native profile uses an internal file environment surface. Its
+authority is narrower than Muse's semver-level resume support: it is enabled
+only when the runtime observes the exact full banner `Muse Code 0.1.0
+(0.1.0-R708.1)` and the resolved inner `muse-bin-*` executable has the
+stage-proven SHA-256 recorded in the closed profile-carrier cell. The
+update-capable `muse` launcher script is never that evidence. A same-semver R
+revision or changed inner digest advertises and launches as
+`profile_carrier_unverified` until separately stage-verified.
+
 ## Fail-closed invariants
 
 These hold regardless of mode:
