@@ -231,6 +231,13 @@ def resolve_pane_identity(
                 f"terminal {row['id']} is {row['lifecycle_state']!r} or carries a "
                 "supersession pointer and cannot resolve to the current worker",
             )
+        if row["generation"] is None and row.get("callback_target_generation") is None:
+            return non_identity(
+                STATUS_ROSTER_AMBIGUOUS_OR_INVALID,
+                "the terminal row has no physical occurrence (generation and "
+                "callback-target generation are both null); the exact occurrence cannot be "
+                "resolved",
+            )
         base["terminal"] = {
             "terminal_id": row["id"],
             "generation": row["generation"],

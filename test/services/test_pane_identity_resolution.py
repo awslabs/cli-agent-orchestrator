@@ -93,6 +93,7 @@ def _seed_legacy(
     session_id: str = TMUX_SESSION_ID,
     pane_pid: int = PANE_PID,
     server_socket: str = SERVER_SOCKET,
+    callback_target: Optional[str] = CALLBACK_TARGET,
 ) -> None:
     with database.SessionLocal() as db:
         db.add(
@@ -102,7 +103,7 @@ def _seed_legacy(
                 tmux_window=f"w-{terminal_id}",
                 provider="claude_code",
                 generation=None,
-                callback_target_generation=CALLBACK_TARGET,
+                callback_target_generation=callback_target,
                 pane_id=pane_id,
                 window_id=window_id,
                 server_socket_path=server_socket,
@@ -399,6 +400,17 @@ class TestPaneResolution:
 
 
 class TestRoundFourPaneGates:
+    def test_legacy_row_without_occurrence_is_typed_non_identity(self, isolated_memory_db, harness):
+        _seed_legacy(callback_target=None)
+        _seed_roster(generation=None)
+
+        outcome = _resolve()
+
+        assert outcome["status"] == "roster-incarnation-ambiguous-or-invalid"
+        assert outcome["terminal"] is None
+        assert outcome["incarnation"] is None
+        assert outcome["agent"] is None
+
     def test_superseded_pointer_on_live_row_refuses(self, isolated_memory_db, harness):
         """A live-lifecycle row that still carries a supersession pointer
         cannot resolve (the pointer is exposed truthfully for both vintages)."""

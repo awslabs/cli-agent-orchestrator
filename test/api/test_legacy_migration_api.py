@@ -175,7 +175,7 @@ def test_migration_terminal_outcomes_are_200(client, _stub_migration):
     "reason, expected_status",
     [
         ("invalid-input", 400),
-        ("provider-unsupported", 400),
+        ("unsupported-provider", 400),
         ("missing-occurrence", 400),
         ("producer-disabled", 409),
         ("operation-conflict", 409),
@@ -192,7 +192,8 @@ def test_migration_terminal_outcomes_are_200(client, _stub_migration):
         ("roster-unavailable", 503),
         ("attachment-unreadable", 503),
         ("binding-unreadable", 503),
-        ("already-known", 200),
+        ("persistence-unavailable", 503),
+        ("already-known", 409),
         ("ambiguous", 409),
         ("unknown-liveness", 409),
         ("dead", 409),

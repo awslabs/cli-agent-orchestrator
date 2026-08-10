@@ -298,7 +298,7 @@ class LegacyMigrationBody(BaseModel):
 #: persistence failures are 503.
 _MIGRATION_REFUSED_HTTP: dict[str, int] = {
     "invalid-input": status.HTTP_400_BAD_REQUEST,
-    "provider-unsupported": status.HTTP_400_BAD_REQUEST,
+    "unsupported-provider": status.HTTP_400_BAD_REQUEST,
     "missing-occurrence": status.HTTP_400_BAD_REQUEST,
     "producer-disabled": status.HTTP_409_CONFLICT,
     "operation-conflict": status.HTTP_409_CONFLICT,
@@ -316,7 +316,7 @@ _MIGRATION_REFUSED_HTTP: dict[str, int] = {
     "roster-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
     "attachment-unreadable": status.HTTP_503_SERVICE_UNAVAILABLE,
     "binding-unreadable": status.HTTP_503_SERVICE_UNAVAILABLE,
-    "already-known": status.HTTP_200_OK,
+    "persistence-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
 }
 
 

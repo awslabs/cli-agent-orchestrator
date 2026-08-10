@@ -73,7 +73,9 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Collection, Mapping, Optional, Sequence
+
+from sqlalchemy.exc import OperationalError
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import native_attachment
@@ -912,6 +914,17 @@ def _persist_migration_intent(
         try:
             db.commit()
             return True
+        except OperationalError:
+            # Ordinary writer contention: adopt a concurrently persisted
+            # operation when possible, otherwise surface a typed retryable
+            # result instead of leaking a raw database error.
+            db.rollback()
+            if _migration_row(db, operation_id) is not None:
+                return False
+            raise _MigrationRefusal(
+                "persistence-unavailable",
+                "the migration store is contended; the intent could not be persisted",
+            )
         except Exception:  # noqa: BLE001 - a concurrent duplicate resolves below
             db.rollback()
             if _migration_row(db, operation_id) is None:
@@ -929,40 +942,123 @@ def _cas_pending_to_attempt_started(operation_id: str) -> bool:
     under SQLite's single writer.
     """
     with database.SessionLocal() as db:
-        updated = (
-            db.query(database.LegacyIdentityMigrationModel)
-            .filter(
-                database.LegacyIdentityMigrationModel.migration_operation_id == operation_id,
-                database.LegacyIdentityMigrationModel.status == MIGRATION_PENDING,
+        try:
+            updated = (
+                db.query(database.LegacyIdentityMigrationModel)
+                .filter(
+                    database.LegacyIdentityMigrationModel.migration_operation_id == operation_id,
+                    database.LegacyIdentityMigrationModel.status == MIGRATION_PENDING,
+                )
+                .update(
+                    {
+                        database.LegacyIdentityMigrationModel.status: MIGRATION_ATTEMPT_STARTED,
+                        database.LegacyIdentityMigrationModel.updated_at: _now(),
+                    }
+                )
             )
-            .update(
-                {
-                    database.LegacyIdentityMigrationModel.status: MIGRATION_ATTEMPT_STARTED,
-                    database.LegacyIdentityMigrationModel.updated_at: _now(),
-                }
-            )
-        )
-        db.commit()
+            db.commit()
+        except OperationalError:
+            # A claim whose UPDATE or commit contended was never a license to
+            # invoke the repair. The caller re-reads and returns a typed
+            # outcome.
+            db.rollback()
+            return False
         return updated == 1
 
 
 def _record_migration_outcome(
-    *, operation_id: str, status: str, outcome: Mapping[str, Any]
-) -> None:
-    """Record the bounded migration outcome on the intent row (additive)."""
+    *,
+    operation_id: str,
+    status: str,
+    outcome: Mapping[str, Any],
+    expected_statuses: Collection[str],
+) -> dict[str, Any]:
+    """Record and return the authoritative bounded migration outcome.
+
+    The conditional update is the sole outcome persistence transition: it
+    may update only from the caller's expected source state. A concurrent
+    winner's final row is immutable, so a caller that loses the race adopts
+    and returns that winner rather than overwriting it or projecting its
+    stale local result. A non-final source-state mismatch is typed
+    in-progress and never authorizes another repair interaction.
+    """
+    encoded_outcome = json.dumps(dict(outcome), sort_keys=True, separators=(",", ":"))
     with database.SessionLocal() as db:
-        row = _migration_row(db, operation_id)
-        if row is None:
-            return  # the intent row vanished; nothing to record against
-        row.status = status
-        row.repair_status = outcome.get("repair_status")
-        row.repair_reason = outcome.get("repair_reason")
-        row.native_session_id = outcome.get("native_session_id")
-        row.evidence_sha256 = outcome.get("evidence_sha256")
-        row.parser_key = outcome.get("parser_key")
-        row.outcome_json = json.dumps(dict(outcome), sort_keys=True, separators=(",", ":"))
-        row.updated_at = _now()
-        db.commit()
+        try:
+            updated = (
+                db.query(database.LegacyIdentityMigrationModel)
+                .filter(
+                    database.LegacyIdentityMigrationModel.migration_operation_id == operation_id,
+                    database.LegacyIdentityMigrationModel.status.in_(expected_statuses),
+                )
+                .update(
+                    {
+                        database.LegacyIdentityMigrationModel.status: status,
+                        database.LegacyIdentityMigrationModel.repair_status: outcome.get(
+                            "repair_status"
+                        ),
+                        database.LegacyIdentityMigrationModel.repair_reason: outcome.get(
+                            "repair_reason"
+                        ),
+                        database.LegacyIdentityMigrationModel.native_session_id: outcome.get(
+                            "native_session_id"
+                        ),
+                        database.LegacyIdentityMigrationModel.evidence_sha256: outcome.get(
+                            "evidence_sha256"
+                        ),
+                        database.LegacyIdentityMigrationModel.parser_key: outcome.get("parser_key"),
+                        database.LegacyIdentityMigrationModel.outcome_json: encoded_outcome,
+                        database.LegacyIdentityMigrationModel.updated_at: _now(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+        except OperationalError:
+            db.rollback()
+            winner = _migration_row(db, operation_id)
+            if winner is not None and winner.status in _FINAL_MIGRATION_STATUSES:
+                return _recorded_outcome(winner)
+            raise _MigrationRefusal(
+                "persistence-unavailable",
+                "the migration store is contended; the outcome could not be persisted",
+            )
+
+        winner = _migration_row(db, operation_id)
+        if winner is None:
+            raise _MigrationRefusal(
+                "persistence-unavailable",
+                "the migration outcome row could not be read after persistence",
+            )
+        if winner.status in _FINAL_MIGRATION_STATUSES:
+            return _recorded_outcome(winner)
+        if updated != 1:
+            raise _MigrationRefusal(
+                MIGRATION_REFUSED_IN_PROGRESS,
+                "the migration operation advanced while this caller was working; "
+                "no additional repair interaction was performed",
+            )
+        return _recorded_outcome(winner)
+
+
+def _record_outcome_or_refuse(
+    *,
+    operation_id: str,
+    status: str,
+    outcome: Mapping[str, Any],
+    expected_statuses: Collection[str],
+    refused: Callable[[str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Project a recorded winner or make outcome contention a typed refusal."""
+    try:
+        return _record_migration_outcome(
+            operation_id=operation_id,
+            status=status,
+            outcome=outcome,
+            expected_statuses=expected_statuses,
+        )
+    except _MigrationRefusal as exc:
+        return refused(exc.reason, exc.detail)
 
 
 def _partial_repair_evidence(
@@ -1033,10 +1129,21 @@ def _resolve_existing_row(row: Any, base: Mapping[str, Any]) -> Optional[dict[st
         and evidence.get("generation") == occurrence
     ):
         outcome = _outcome_from_evidence(base, evidence)
-        _record_migration_outcome(
-            operation_id=operation_id, status=MIGRATION_MIGRATED, outcome=outcome
-        )
-        return outcome
+        try:
+            return _record_migration_outcome(
+                operation_id=operation_id,
+                status=MIGRATION_MIGRATED,
+                outcome=outcome,
+                expected_statuses=(MIGRATION_ATTEMPT_STARTED,),
+            )
+        except _MigrationRefusal as exc:
+            refused_outcome = dict(base)
+            refused_outcome.update(
+                status=MIGRATION_REFUSED,
+                reason=exc.reason,
+                detail=_bounded(exc.detail),
+            )
+            return refused_outcome
     journal = nsr.repair_observation_attempt(row.repair_operation_id)
     if journal is not None and (
         journal.get("terminal_id") == row.terminal_id
@@ -1055,12 +1162,21 @@ def _resolve_existing_row(row: Any, base: Mapping[str, Any]) -> Optional[dict[st
                 repair_status=nsr.STATUS_IDENTITY_STILL_MISSING,
                 repair_reason=nsr.STATUS_IDENTITY_STILL_MISSING,
             )
-            _record_migration_outcome(
-                operation_id=operation_id,
-                status=MIGRATION_IDENTITY_STILL_MISSING,
-                outcome=outcome,
-            )
-            return outcome
+            try:
+                return _record_migration_outcome(
+                    operation_id=operation_id,
+                    status=MIGRATION_IDENTITY_STILL_MISSING,
+                    outcome=outcome,
+                    expected_statuses=(MIGRATION_ATTEMPT_STARTED,),
+                )
+            except _MigrationRefusal as exc:
+                refused_outcome = dict(base)
+                refused_outcome.update(
+                    status=MIGRATION_REFUSED,
+                    reason=exc.reason,
+                    detail=_bounded(exc.detail),
+                )
+                return refused_outcome
         # observed/attempted without a committed verdict: bytes were sent,
         # no evidence exists — conservative ambiguous.
         outcome = dict(base)
@@ -1431,18 +1547,22 @@ def migrate_terminal_native_identity(
         except _MigrationRefusal as exc:
             return refused(exc.reason, exc.detail)
         base["physical_occurrence"] = resolved_occurrence
-        if not _persist_migration_intent(
-            operation_id=operation_id,
-            request_digest=base["request_digest"],
-            terminal_id=terminal_id,
-            provider=provider,
-            generation=generation,
-            physical_occurrence=resolved_occurrence,
-            provider_version=base["provider_version"],
-            audit_occurrence_id=audit_occurrence_id,
-            audit_candidate_digest=audit_candidate_digest,
-            repair_operation_id=base["repair_operation_id"],
-        ):
+        try:
+            persisted = _persist_migration_intent(
+                operation_id=operation_id,
+                request_digest=base["request_digest"],
+                terminal_id=terminal_id,
+                provider=provider,
+                generation=generation,
+                physical_occurrence=resolved_occurrence,
+                provider_version=base["provider_version"],
+                audit_occurrence_id=audit_occurrence_id,
+                audit_candidate_digest=audit_candidate_digest,
+                repair_operation_id=base["repair_operation_id"],
+            )
+        except _MigrationRefusal as exc:
+            return refused(exc.reason, exc.detail)
+        if not persisted:
             raced = _read_migration(operation_id)
             if raced is not None:
                 resolved = _resolve_existing_row(raced, base)
@@ -1463,10 +1583,13 @@ def migrate_terminal_native_identity(
         )
     except _MigrationRefusal as exc:
         outcome = refused(exc.reason, exc.detail)
-        _record_migration_outcome(
-            operation_id=operation_id, status=MIGRATION_REFUSED, outcome=outcome
+        return _record_outcome_or_refuse(
+            operation_id=operation_id,
+            status=MIGRATION_REFUSED,
+            outcome=outcome,
+            expected_statuses=(MIGRATION_PENDING,),
+            refused=refused,
         )
-        return outcome
     base["build_provenance"] = candidate.get("build_provenance")
 
     # The atomic pending -> attempt-started execution claim: exactly one
@@ -1475,15 +1598,15 @@ def migrate_terminal_native_identity(
     # outcome).
     if not _cas_pending_to_attempt_started(operation_id):
         raced = _read_migration(operation_id)
+        retry_claimed = False
         if raced is not None:
             resolved = _resolve_existing_row(raced, base)
             if resolved is not None:
                 return resolved
             if raced.status == MIGRATION_PENDING:
                 # A concurrent transition race: retry the claim once.
-                if _cas_pending_to_attempt_started(operation_id):
-                    pass
-                else:
+                retry_claimed = _cas_pending_to_attempt_started(operation_id)
+                if not retry_claimed:
                     raced = _read_migration(operation_id)
                     if raced is not None:
                         resolved = _resolve_existing_row(raced, base)
@@ -1494,11 +1617,12 @@ def migrate_terminal_native_identity(
                         "another executor holds this migration operation; this caller "
                         "performed no repair interaction",
                     )
-        return refused(
-            MIGRATION_REFUSED_IN_PROGRESS,
-            "another executor holds this migration operation; this caller performed "
-            "no repair interaction",
-        )
+        if not retry_claimed:
+            return refused(
+                MIGRATION_REFUSED_IN_PROGRESS,
+                "another executor holds this migration operation; this caller performed "
+                "no repair interaction",
+            )
 
     # A concurrent exact duplicate may have finished while we revalidated.
     after = _read_migration(operation_id)
@@ -1537,31 +1661,43 @@ def migrate_terminal_native_identity(
                 evidence_sha256=repair_outcome.get("evidence_sha256"),
                 parser_key=repair_outcome.get("parser_key"),
             )
-            _record_migration_outcome(
-                operation_id=operation_id, status=MIGRATION_REFUSED, outcome=outcome
+            return _record_outcome_or_refuse(
+                operation_id=operation_id,
+                status=MIGRATION_REFUSED,
+                outcome=outcome,
+                expected_statuses=(MIGRATION_ATTEMPT_STARTED,),
+                refused=refused,
             )
-            return outcome
         outcome = _migration_outcome_from_repair(base, repair_outcome, status=MIGRATION_MIGRATED)
-        _record_migration_outcome(
-            operation_id=operation_id, status=MIGRATION_MIGRATED, outcome=outcome
+        return _record_outcome_or_refuse(
+            operation_id=operation_id,
+            status=MIGRATION_MIGRATED,
+            outcome=outcome,
+            expected_statuses=(MIGRATION_ATTEMPT_STARTED,),
+            refused=refused,
         )
-        return outcome
     if repair_status == nsr.STATUS_ALREADY_KNOWN:
         outcome = _migration_outcome_from_repair(
             base, repair_outcome, status=MIGRATION_ALREADY_KNOWN
         )
-        _record_migration_outcome(
-            operation_id=operation_id, status=MIGRATION_ALREADY_KNOWN, outcome=outcome
+        return _record_outcome_or_refuse(
+            operation_id=operation_id,
+            status=MIGRATION_ALREADY_KNOWN,
+            outcome=outcome,
+            expected_statuses=(MIGRATION_ATTEMPT_STARTED,),
+            refused=refused,
         )
-        return outcome
     if repair_status == nsr.STATUS_IDENTITY_STILL_MISSING:
         outcome = _migration_outcome_from_repair(
             base, repair_outcome, status=MIGRATION_IDENTITY_STILL_MISSING
         )
-        _record_migration_outcome(
-            operation_id=operation_id, status=MIGRATION_IDENTITY_STILL_MISSING, outcome=outcome
+        return _record_outcome_or_refuse(
+            operation_id=operation_id,
+            status=MIGRATION_IDENTITY_STILL_MISSING,
+            outcome=outcome,
+            expected_statuses=(MIGRATION_ATTEMPT_STARTED,),
+            refused=refused,
         )
-        return outcome
     if repair_status == nsr.STATUS_REFUSED:
         outcome = _migration_outcome_from_repair(
             base,
@@ -1569,21 +1705,32 @@ def migrate_terminal_native_identity(
             status=MIGRATION_REFUSED,
             reason=repair_outcome.get("reason") or "refused",
         )
-        _record_migration_outcome(
-            operation_id=operation_id, status=MIGRATION_REFUSED, outcome=outcome
+        return _record_outcome_or_refuse(
+            operation_id=operation_id,
+            status=MIGRATION_REFUSED,
+            outcome=outcome,
+            expected_statuses=(MIGRATION_ATTEMPT_STARTED,),
+            refused=refused,
         )
-        return outcome
     if repair_status == nsr.STATUS_ERRORED:
         outcome = _migration_outcome_from_repair(
             base, repair_outcome, status=MIGRATION_ERRORED, reason="errored"
         )
-        _record_migration_outcome(
-            operation_id=operation_id, status=MIGRATION_ERRORED, outcome=outcome
+        return _record_outcome_or_refuse(
+            operation_id=operation_id,
+            status=MIGRATION_ERRORED,
+            outcome=outcome,
+            expected_statuses=(MIGRATION_ATTEMPT_STARTED,),
+            refused=refused,
         )
-        return outcome
     outcome = refused("errored", "the repair returned an unknown status")
-    _record_migration_outcome(operation_id=operation_id, status=MIGRATION_ERRORED, outcome=outcome)
-    return outcome
+    return _record_outcome_or_refuse(
+        operation_id=operation_id,
+        status=MIGRATION_ERRORED,
+        outcome=outcome,
+        expected_statuses=(MIGRATION_ATTEMPT_STARTED,),
+        refused=refused,
+    )
 
 
 def iterate_migration_candidates(
