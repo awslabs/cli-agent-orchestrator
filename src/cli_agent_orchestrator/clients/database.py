@@ -724,6 +724,14 @@ class NativeSessionAttachmentModel(Base):
     # Canonical JSON of the accepted no-survivor proof that permitted the
     # last release.  Retained as evidence; never cleared by a later claim.
     release_proof_json = Column(Text, nullable=True)
+    # Canonical JSON of the bounded status-repair adoption receipt
+    # (cond-0377C): the operation id, request digest, exact observed
+    # pane/process identity, parser/build, and evidence digest that
+    # licensed creating this row directly in ``attached`` for an
+    # already-running legacy pane.  NULL for ordinary pre-launch claims,
+    # which journal their intent in ``intent_json`` instead.  A row is
+    # never created directly as ``attached`` without one.
+    adoption_receipt_json = Column(Text, nullable=True)
     ambiguity_reason = Column(Text, nullable=True)
     # Monotonic per-row counter; every CAS transition bumps it so a
     # lost-update race is detectable rather than silently last-write-wins.
@@ -868,6 +876,40 @@ class StableAgentIncarnationModel(Base):
             "terminal_id",
             unique=True,
             sqlite_where=text("terminal_id IS NOT NULL AND generation IS NULL"),
+        ),
+    )
+
+
+class NativeStatusRepairEvidenceModel(Base):
+    """One immutable bounded record of a native /status identity repair.
+
+    Append-only evidence for the cond-0377C repair: keyed by the explicit
+    operation id so a lost response or a crash/retry resolves by exact id,
+    and carrying only the bounded SHA-256 digest of the normalized status
+    capture — never raw status output, which may contain secrets.  The
+    row commits atomically with the terminal row and the roster lineage
+    repair, so a recorded digest always describes a committed identity.
+    """
+
+    __tablename__ = "native_status_repair_evidence"
+
+    operation_id = Column(Text, primary_key=True)
+    request_digest = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    generation = Column(Text, nullable=False)
+    provider = Column(Text, nullable=False)
+    provider_version = Column(Text, nullable=False)
+    native_session_id = Column(Text, nullable=False)
+    parser_key = Column(Text, nullable=False)
+    evidence_sha256 = Column(Text, nullable=False)
+    observed_at = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_native_status_repair_terminal_generation",
+            "terminal_id",
+            "generation",
         ),
     )
 
@@ -1240,6 +1282,7 @@ def init_db() -> None:
     _migrate_managed_launch_reservations()
     _migrate_managed_launch_v2()
     _migrate_stable_agent_roster()
+    _migrate_native_status_repair()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1767,6 +1810,54 @@ def _migrate_stable_agent_roster() -> None:
                 )
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"stable-agent roster migration failed: {e}")
+
+
+def _migrate_native_status_repair() -> None:
+    """Create the repair evidence table and attachment receipt column.
+
+    ``Base.metadata.create_all`` covers fresh databases via the
+    ``NativeStatusRepairEvidenceModel`` model and the
+    ``adoption_receipt_json`` column on ``NativeSessionAttachmentModel``;
+    these idempotent steps cover databases created before cond-0377C.
+    The DDL is byte-compatible with the ORM models so both paths yield one
+    schema.  Additive and dark: the repair is the only writer, and an old
+    binary never reads either surface.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS native_status_repair_evidence ("
+                "operation_id TEXT NOT NULL PRIMARY KEY, "
+                "request_digest TEXT NOT NULL, "
+                "terminal_id TEXT NOT NULL, "
+                "generation TEXT NOT NULL, "
+                "provider TEXT NOT NULL, "
+                "provider_version TEXT NOT NULL, "
+                "native_session_id TEXT NOT NULL, "
+                "parser_key TEXT NOT NULL, "
+                "evidence_sha256 TEXT NOT NULL, "
+                "observed_at TEXT NOT NULL, "
+                "created_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_native_status_repair_terminal_generation "
+                "ON native_status_repair_evidence(terminal_id, generation)"
+            )
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(native_session_attachments)")
+            }
+            if "adoption_receipt_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE native_session_attachments "
+                    "ADD COLUMN adoption_receipt_json TEXT"
+                )
+    except Exception as e:  # noqa: BLE001 - the repair path fails closed
+        logger.warning(f"native status-repair migration failed: {e}")
 
 
 def _migrate_session_lifecycle() -> None:
@@ -3211,6 +3302,79 @@ def set_terminal_native_session_id(terminal_id: str, native_session_id: str) -> 
         terminal.native_session_id = native_session_id
         db.commit()
         return True
+
+
+def set_terminal_native_session_id_conditional(
+    terminal_id: str,
+    generation: str,
+    native_session_id: str,
+    *,
+    db: Any = None,
+) -> bool:
+    """Generation-conditional native-id writer for the repair seam.
+
+    ``set_terminal_native_session_id`` is id-only and unsafe here: the
+    cond-0377C repair persists only when the exact terminal ID, exact
+    generation, live lifecycle, and an absent-or-equal stored id all still
+    hold at write time, inside the same transaction as the roster repair
+    and the evidence row.
+
+    Writes the v2 row when one exists, else the shared ``terminals`` row
+    (whose generation may be NULL on legacy rows — the exact roster
+    incarnation is the anchor there).  An existing different id is never
+    overwritten: that is a supersession, not an update.  Returns False on
+    any mismatch with nothing written; a caller that re-verified first can
+    treat a False as a concurrent modification.
+    """
+    if not (terminal_id and generation and native_session_id):
+        return False
+    session = db if db is not None else SessionLocal()
+    owns_session = db is None
+    try:
+        row = (
+            session.query(ManagedLaunchV2TerminalModel)
+            .filter(ManagedLaunchV2TerminalModel.id == terminal_id)
+            .first()
+        )
+        if row is not None:
+            if row.generation != generation:
+                return False
+            if row.v2_lifecycle_state != "live":
+                return False
+            if row.v2_native_session_id not in (None, native_session_id):
+                logger.warning(
+                    "Refusing to re-point v2 terminal %s from native session %s to %s",
+                    terminal_id,
+                    row.v2_native_session_id,
+                    native_session_id,
+                )
+                return False
+            row.v2_native_session_id = native_session_id
+        else:
+            row = session.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+            if row is None:
+                return False
+            if row.generation not in (None, generation):
+                return False
+            if row.lifecycle_state != "live":
+                return False
+            if row.native_session_id not in (None, native_session_id):
+                logger.warning(
+                    "Refusing to re-point terminal %s from native session %s to %s",
+                    terminal_id,
+                    row.native_session_id,
+                    native_session_id,
+                )
+                return False
+            row.native_session_id = native_session_id
+        session.flush()
+        if owns_session:
+            session.commit()
+        return True
+    except Exception:
+        if owns_session:
+            session.rollback()
+        raise
 
 
 def set_terminal_pre_task_identity_state(terminal_id: str, state: str) -> bool:

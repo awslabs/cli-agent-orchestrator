@@ -111,6 +111,14 @@ NO_SURVIVOR_PROOF_SCHEMA = "cao-native-attachment-no-survivor-v1"
 #: a session.  Collapsing the two would make a human's judgement call
 #: indistinguishable from an observed absence.
 ADJUDICATION_SCHEMA = "cao-native-attachment-adjudication-v1"
+#: The bounded receipt that licenses creating an attachment row directly
+#: in ``attached`` for an already-running legacy pane (cond-0377C status
+#: repair).  The ordinary ``declare`` contract journals intent *before*
+#: launch; a status repair adopts an owner that observation has already
+#: proven, so it carries its own evidence instead.  Only this schema is
+#: accepted by the adoption seam, and a row is never created directly as
+#: ``attached`` without one.
+STATUS_REPAIR_ADOPTION_SCHEMA = "cao-native-attachment-status-repair-adoption-v1"
 
 #: The one outcome an operator may assert.  A closed literal rather than
 #: free text: "the owner is gone" is the only claim that licenses handing
@@ -324,6 +332,7 @@ def _row_dict(row: Any) -> dict[str, Any]:
         },
         "intent": _parse_json(row.intent_json),
         "release_proof": _parse_json(row.release_proof_json),
+        "adoption_receipt": _parse_json(row.adoption_receipt_json),
         "ambiguity_reason": row.ambiguity_reason,
         "epoch": row.epoch,
         "created_at": row.created_at,
@@ -654,6 +663,250 @@ def mark_attached(
         to_state=ATTACHED,
         extra=extra,
     )
+
+
+def status_repair_adoption_receipt(
+    *,
+    operation_id: str,
+    request_digest: str,
+    provider: str,
+    native_session_id: str,
+    terminal_id: str,
+    generation: str,
+    execution_mode: str,
+    pane_id: Optional[str],
+    process_identity: Mapping[str, Any],
+    parser_key: str,
+    provider_version: str,
+    evidence_sha256: str,
+    observed_at: str,
+    composer_restored: Optional[bool] = None,
+) -> dict[str, Any]:
+    """The bounded receipt that licenses one status-repair adoption.
+
+    Every field is validated and bounded because the receipt is the
+    immutable evidence a reader later uses to distinguish "this claim was
+    journaled before launch" from "this claim adopted an already-running
+    pane after observation".  It names the exact observed pane/process,
+    the exact generation, the parser/build, and the evidence digest —
+    never raw status output.
+    """
+    identity = dict(process_identity)
+    if not isinstance(identity.get("pid"), int) or isinstance(identity.get("pid"), bool):
+        raise NativeAttachmentInvalid("process_identity requires an integer pid")
+    _require_text(identity.get("start_marker"), field="process_identity.start_marker")
+    receipt: dict[str, Any] = {
+        "schema": STATUS_REPAIR_ADOPTION_SCHEMA,
+        "operation_id": _require_text(operation_id, field="operation_id"),
+        "request_digest": _require_text(request_digest, field="request_digest"),
+        "provider": _require_text(provider, field="provider"),
+        "native_session_id": _require_text(native_session_id, field="native_session_id"),
+        "terminal_id": _require_text(terminal_id, field="terminal_id"),
+        "generation": _require_text(generation, field="generation"),
+        "execution_mode": em.validate_mode(execution_mode),
+        "pane_id": _require_text(pane_id, field="pane_id"),
+        "process_identity": identity,
+        "parser_key": _require_text(parser_key, field="parser_key"),
+        "provider_version": _require_text(provider_version, field="provider_version"),
+        "evidence_sha256": _require_text(evidence_sha256, field="evidence_sha256"),
+        "observed_at": _require_text(observed_at, field="observed_at"),
+        "admits_only_new_instructions": True,
+        "replays_task_bytes": False,
+    }
+    if len(receipt["evidence_sha256"]) != 64 or any(
+        ch not in "0123456789abcdef" for ch in receipt["evidence_sha256"]
+    ):
+        raise NativeAttachmentInvalid(
+            f"evidence_sha256 must be 64 lowercase hex characters; got {evidence_sha256!r}"
+        )
+    if composer_restored is not None:
+        if not isinstance(composer_restored, bool):
+            raise NativeAttachmentInvalid("composer_restored must be a bool or None")
+        receipt["composer_restored"] = composer_restored
+    return receipt
+
+
+def adopt_running_owner(
+    *,
+    provider: str,
+    native_session_id: str,
+    terminal_id: str,
+    generation: str,
+    execution_mode: str,
+    pane_id: Optional[str],
+    process_identity: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    intent: Mapping[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Claim an already-running exact owner, observed, not declared.
+
+    The smallest status-repair adoption seam (cond-0377C): the ordinary
+    launch contract journals intent *before* the provider process exists;
+    this adopts an owner that observation has already proven live, so it
+    is the honest legacy/live counterpart — the row is created directly
+    in ``attached``, which is refused without a bounded
+    ``status_repair_adoption_receipt`` naming the exact pane/process.
+
+    Returns ``(record, adopted)``.  ``adopted`` is ``True`` only for the
+    call that created or re-adopted the row; an existing same live owner
+    (exact terminal/generation/mode/pane/process identity) adopts
+    idempotently with the receipt untouched, so a response-loss retry of
+    the same exact operation never overwrites the first receipt and a
+    conflict never tears down the user's legacy pane.  Any other live or
+    frozen owner refuses.  A released (``detached``) row is re-adopted
+    only by winning the CAS on its exact observed epoch, preserving the
+    release proof; a concurrent re-acquirer loses visibly.  The ordinary
+    pre-launch ``declare`` contract is not weakened: this seam is never
+    used before a launch.
+    """
+    provider = _require_text(provider, field="provider")
+    native_session_id = _require_text(native_session_id, field="native_session_id")
+    terminal_id = _require_text(terminal_id, field="terminal_id")
+    generation = _require_text(generation, field="generation")
+    mode = em.validate_mode(execution_mode)
+    if pane_id is not None:
+        pane_id = _require_text(pane_id, field="pane_id")
+    identity = dict(process_identity)
+    if not isinstance(identity.get("pid"), int) or isinstance(identity.get("pid"), bool):
+        raise NativeAttachmentInvalid("process_identity requires an integer pid")
+    _require_text(identity.get("start_marker"), field="process_identity.start_marker")
+    if not isinstance(receipt, Mapping) or receipt.get("schema") != STATUS_REPAIR_ADOPTION_SCHEMA:
+        raise NativeAttachmentInvalid(
+            f"adopt_running_owner requires a receipt built by status_repair_adoption_receipt "
+            f"(schema {STATUS_REPAIR_ADOPTION_SCHEMA!r}); a row is never created directly as "
+            "attached without one"
+        )
+    # The receipt must describe this exact adoption, or it proves nothing
+    # about the pane being claimed.
+    receipt_owner = {
+        "provider": receipt.get("provider"),
+        "native_session_id": receipt.get("native_session_id"),
+        "terminal_id": receipt.get("terminal_id"),
+        "generation": receipt.get("generation"),
+        "execution_mode": receipt.get("execution_mode"),
+        "pane_id": receipt.get("pane_id"),
+        "process_identity": receipt.get("process_identity"),
+    }
+    if receipt_owner != {
+        "provider": provider,
+        "native_session_id": native_session_id,
+        "terminal_id": terminal_id,
+        "generation": generation,
+        "execution_mode": mode,
+        "pane_id": pane_id,
+        "process_identity": identity,
+    }:
+        raise NativeAttachmentInvalid(
+            "the adoption receipt does not describe this exact owner; a receipt about a "
+            "different pane/process claims nothing"
+        )
+    if not isinstance(intent, Mapping) or intent.get("schema") != INTENT_SCHEMA:
+        raise NativeAttachmentInvalid(
+            f"intent must be built by acquire_intent (schema {INTENT_SCHEMA!r}); "
+            "an unvalidated intent cannot be journaled"
+        )
+    receipt_json = _canonical(dict(receipt))
+    intent_json = _canonical(dict(intent))
+    stamp = _now()
+
+    try:
+        with database.SessionLocal() as db:
+            row = _fetch(db, provider, native_session_id)
+
+            if row is None:
+                db.add(
+                    database.NativeSessionAttachmentModel(
+                        provider=provider,
+                        native_session_id=native_session_id,
+                        state=ATTACHED,
+                        owner_terminal_id=terminal_id,
+                        owner_generation=generation,
+                        owner_execution_mode=mode,
+                        owner_pane_id=pane_id,
+                        owner_process_identity_json=_canonical(identity),
+                        intent_json=intent_json,
+                        release_proof_json=None,
+                        adoption_receipt_json=receipt_json,
+                        ambiguity_reason=None,
+                        epoch=0,
+                        created_at=stamp,
+                        updated_at=stamp,
+                    )
+                )
+                try:
+                    db.commit()
+                except IntegrityError:
+                    # Another acquirer inserted the same key between the read
+                    # and this commit.  The primary key is the arbiter; the
+                    # loser re-reads and takes the ordinary adoption path.
+                    db.rollback()
+                    row = _fetch(db, provider, native_session_id)
+                    if row is None:  # pragma: no cover - key exists by construction
+                        raise
+                else:
+                    return _row_dict(_fetch(db, provider, native_session_id)), True
+
+            _guard_frozen(row)
+
+            if row.state in LIVE_STATES:
+                same_owner = (
+                    row.owner_terminal_id == terminal_id
+                    and row.owner_generation == generation
+                    and row.owner_execution_mode == mode
+                    and row.owner_pane_id == pane_id
+                    and _parse_json(row.owner_process_identity_json) == identity
+                )
+                if same_owner:
+                    return _row_dict(row), False
+                _refuse_live_owner(row, terminal_id=terminal_id, generation=generation, mode=mode)
+
+            if row.state != DETACHED:
+                raise NativeAttachmentConflict(
+                    f"{row.provider} session {row.native_session_id} is {row.state!r}; "
+                    "a status repair adopts only an absent row, the exact same live owner, "
+                    "or a released row re-adopted by winning the epoch CAS"
+                )
+
+            # Released: re-adopt by winning the CAS on the exact observed
+            # epoch, so a concurrent re-acquirer loses visibly instead of
+            # overwriting the winner.  The release proof stays on record.
+            observed_epoch = row.epoch
+            updated = (
+                db.query(database.NativeSessionAttachmentModel)
+                .filter(
+                    database.NativeSessionAttachmentModel.provider == provider,
+                    database.NativeSessionAttachmentModel.native_session_id == native_session_id,
+                    database.NativeSessionAttachmentModel.state == DETACHED,
+                    database.NativeSessionAttachmentModel.epoch == observed_epoch,
+                )
+                .update(
+                    {
+                        "state": ATTACHED,
+                        "owner_terminal_id": terminal_id,
+                        "owner_generation": generation,
+                        "owner_execution_mode": mode,
+                        "owner_pane_id": pane_id,
+                        "owner_process_identity_json": _canonical(identity),
+                        "intent_json": intent_json,
+                        "adoption_receipt_json": receipt_json,
+                        "epoch": observed_epoch + 1,
+                        "updated_at": stamp,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if updated != 1:
+                current = _fetch(db, provider, native_session_id)
+                raise NativeAttachmentConflict(
+                    f"lost the race to adopt {provider} session {native_session_id}; "
+                    f"it is now {current.state!r} held by {_describe_owner(current)}"
+                )
+            return _row_dict(_fetch(db, provider, native_session_id)), True
+    except NativeAttachmentError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - fail closed; never attach unrecorded
+        raise NativeAttachmentUnavailable(f"native attachment adoption failed: {exc}") from exc
 
 
 def mark_draining(
