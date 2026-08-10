@@ -104,6 +104,16 @@ export interface SessionDetail {
   terminals: TerminalMeta[]
 }
 
+/** One auditable input to the terminal status-fusion decision. */
+export interface TerminalStatusSignal {
+  /** Open by design: the server may add evidence sources without a web release. */
+  name: string
+  /** `available` | `absent` | `unreadable` today; open for the same reason. */
+  state: string
+  value?: string | number | boolean | null
+  detail?: string | null
+}
+
 /**
  * One row of the shared terminal projection.
  *
@@ -154,6 +164,15 @@ export interface TerminalMeta {
   fifo_monitored: boolean
   /** Provider status for a live pane; the lifecycle word otherwise. */
   status: string | null
+  /** Strength of the evidence behind `status`, not a task-quality judgement. */
+  status_confidence: string
+  /** Server-authored explanation of how the status was selected. */
+  status_reason: string
+  /** Every input used by the status-fusion decision. */
+  status_signals: TerminalStatusSignal[]
+  /** A working claim contradicted by both render and activity clocks. */
+  wedged: boolean
+  /** When CAO last sent input to this pane; not general model activity. */
   last_active: string | null
 }
 

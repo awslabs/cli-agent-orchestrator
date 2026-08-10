@@ -9,6 +9,7 @@ import { CustomSelect, SelectOption } from './CustomSelect'
 import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { WorkStateInfoButton } from './AnnotationDetails'
 
 export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli']
 
@@ -353,17 +354,20 @@ export function AgentPanel() {
           )}
 
           <div className="space-y-2">
-            {activeSessionDetail.terminals.map(t => (
-              <div key={t.id} className="bg-gray-900/50 border border-gray-700/30 rounded-lg p-3 space-y-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <TermIcon size={14} className="text-gray-400" />
-                    <span className="text-sm font-mono text-gray-300">{t.id}</span>
-                    <StatusBadge status={terminalStatuses[t.id] || null} />
-                    <span className="text-xs text-gray-500">{t.provider}</span>
-                    {t.agent_profile && <span className="text-xs text-emerald-400">{t.agent_profile}</span>}
-                  </div>
-                  <div className="flex items-center gap-2">
+            {activeSessionDetail.terminals.map(t => {
+              const currentStatus = terminalStatuses[t.id] ?? t.status
+              return (
+                <div key={t.id} className="bg-gray-900/50 border border-gray-700/30 rounded-lg p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <TermIcon size={14} className="text-gray-400" />
+                      <span className="text-sm font-mono text-gray-300">{t.id}</span>
+                      <StatusBadge status={currentStatus} terminal={t} />
+                      <span className="text-xs text-gray-500">{t.provider}</span>
+                      {t.agent_profile && <span className="text-xs text-emerald-400">{t.agent_profile}</span>}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <WorkStateInfoButton terminal={t} status={currentStatus} annotations={undefined} />
                     <button
                       onClick={() => setInboxTerminalId(t.id)}
                       className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors"
@@ -442,10 +446,11 @@ export function AgentPanel() {
                       <Send size={12} />
                       {sendingInput === t.id ? 'Sending...' : 'Send'}
                     </button>
-                  </div>
-                )}
-              </div>
-            ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
           </div>
         </div>
       )}

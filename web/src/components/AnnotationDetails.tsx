@@ -11,9 +11,10 @@
 //   hover card  — anchored to one chip, POINTER-ONLY, shows what that chip is
 //                 asserting about state. It is an enhancement, not a path: a
 //                 pointer user gets it, and nobody depends on it.
-//   info popover — opened from a real <button> in the row's action cluster,
-//                 shows EVERY annotation on the row plus the envelope metadata
-//                 the chip has no room for, and is copyable.
+//   info popover — opened from a real <button> in every row's action cluster,
+//                 shows the terminal status derivation and provenance plus
+//                 EVERY annotation and its envelope, and is copyable. It still
+//                 exists when no conductor annotation was published.
 //
 // THE CHIPS STAY NON-INTERACTIVE (AnnotationChips.tsx's founding decision).
 // Making 41 spans focusable to give the keyboard a route to the hover card
@@ -30,16 +31,18 @@
 // already published to the same origin by `GET /annotations` and already
 // rendered by the chip's own `aria-label` and by the mobile facet line; the
 // row itself already actuates (Terminal, Graceful Exit, Close). Copying text
-// the page is already showing adds no disclosure. The rule still binds where
-// it bites: NO worker-authored free text (§7) — every string here is the
-// conductor's derived label, a key the conductor chose, or a timestamp this
-// file formatted.
+// the page is already showing adds no disclosure. The terminal section likewise
+// uses the projected row already returned to this page, but deliberately omits
+// pane/socket/native-session control identities. The rule still binds where it
+// bites: NO worker-authored free text (§7) — every string here is a server
+// derivation, a conductor-derived label, or a timestamp this file formatted.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Info, Copy, Check, X } from 'lucide-react'
 
-import { Annotation } from '../api'
+import { Annotation, TerminalMeta } from '../api'
 import { FloatingCard } from './FloatingCard'
+import { MetadataRows, terminalMetadataSections, terminalMetadataToText } from './TerminalMetadata'
 import {
   ageSource,
   freshness,
@@ -403,12 +406,13 @@ function CopyButton({ text }: { text: string }) {
  */
 export function WorkStateInfoButton({
   annotations,
-  terminalId,
-  agentProfile,
+  terminal,
+  status,
 }: {
   annotations: Annotation[] | undefined
-  terminalId: string
-  agentProfile?: string | null
+  terminal: TerminalMeta
+  /** Latest lightweight status poll, when newer than the projected row. */
+  status?: string | null
 }) {
   const [anchor, setAnchor] = useState<HTMLButtonElement | null>(null)
   const [open, setOpen] = useState(false)
@@ -433,11 +437,13 @@ export function WorkStateInfoButton({
     }
   }, [open, anchor])
 
-  // A control that opens an empty card is worse than no control.
-  if (!annotations || annotations.length === 0) return null
-
-  const heading = `${agentProfile || 'default'} · ${terminalId}`
-  const text = detailsToText(annotations, `Work state — ${heading}`)
+  const items = annotations || []
+  const heading = `${terminal.agent_profile || 'default'} · ${terminal.id}`
+  const metadata = terminalMetadataSections(terminal, status)
+  const title = `Work state — ${heading}`
+  const terminalText = terminalMetadataToText(terminal, status)
+  const annotationText = items.length > 0 ? detailsToText(items, 'Annotations') : 'Annotations\n  None published'
+  const text = [title, '='.repeat(title.length), '', ...terminalText, annotationText].join('\n')
 
   return (
     <>
@@ -484,46 +490,79 @@ export function WorkStateInfoButton({
           </button>
         </div>
 
-        <div className="max-h-[60vh] overflow-y-auto px-3 py-2 space-y-3 select-text bg-gray-900">
-          {/* Above the annotations, and complete regardless of which chip the
-              operator arrived from: the dossier is a property of the ROW. */}
-          <WorkerSection annotations={annotations} />
-          {annotations.map((a, i) => {
-            const age = fmtAge(ageSource(a))
-            const note = freshnessNote(a)
-            return (
-              <section
-                key={`${a.namespace}:${a.kind}:${a.label}:${i}`}
-                data-testid="workstate-annotation"
-                className="space-y-1.5"
-              >
-                <div className="flex items-baseline gap-2 flex-wrap">
-                  <span className="text-[11px] font-semibold text-white">{a.label}</span>
-                  {age && <span className="text-[10px] text-gray-400">{age}</span>}
-                </div>
-                {/* Only the UNCLASSED facets. A classed facet is drawn once,
-                    in the Worker block, where it is labelled with the class
-                    that gives it its meaning; drawing it here as well would
-                    make the card say everything twice and say it worse. */}
-                <FacetRows entries={plainFacets(a)} dense />
-                <details className="group">
-                  <summary className="text-[10px] text-gray-400 cursor-pointer hover:text-white select-none">
-                    subject &amp; envelope
-                  </summary>
-                  <div className="mt-1 pl-2 border-l border-gray-700/60 space-y-1">
-                    <FacetRows entries={subjectEntries(a)} dense />
-                    <FacetRows entries={envelopeEntries(a)} dense />
-                  </div>
-                </details>
-                {note && <p className="text-[10px] text-amber-300/90">{note}</p>}
-              </section>
-            )
-          })}
+        <div className="max-h-[60vh] overflow-y-auto px-3 py-2 space-y-2 select-text bg-gray-900">
+          {metadata.map((section, index) => (
+            <details
+              key={section.id}
+              open={index === 0}
+              data-testid={`workstate-${section.id}`}
+              className="group rounded border border-gray-800 bg-gray-900"
+            >
+              <summary className="px-2 py-1.5 text-[11px] font-semibold text-gray-200 cursor-pointer hover:text-white select-none">
+                {section.label}
+              </summary>
+              <div className="px-2 pb-2 pt-1 border-t border-gray-800">
+                <MetadataRows entries={section.entries} dense />
+              </div>
+            </details>
+          ))}
+
+          <details
+            open={items.length > 0}
+            data-testid="workstate-annotations-region"
+            className="group rounded border border-gray-800 bg-gray-900"
+          >
+            <summary className="px-2 py-1.5 text-[11px] font-semibold text-gray-200 cursor-pointer hover:text-white select-none">
+              Work annotations ({items.length})
+            </summary>
+            <div className="px-2 pb-2 pt-1 border-t border-gray-800 space-y-3">
+              {items.length === 0 ? (
+                <p className="text-[11px] text-gray-400">No conductor work annotations are published for this agent.</p>
+              ) : (
+                <>
+                  {/* Above the individual claims: this dossier is a property
+                      of the row and is complete regardless of which chip led
+                      the operator here. */}
+                  <WorkerSection annotations={items} />
+                  {items.map((a, i) => {
+                    const age = fmtAge(ageSource(a))
+                    const note = freshnessNote(a)
+                    return (
+                      <section
+                        key={`${a.namespace}:${a.kind}:${a.label}:${i}`}
+                        data-testid="workstate-annotation"
+                        className="space-y-1.5"
+                      >
+                        <div className="flex items-baseline gap-2 flex-wrap">
+                          <span className="text-[11px] font-semibold text-white">{a.label}</span>
+                          {age && <span className="text-[10px] text-gray-400">{age}</span>}
+                        </div>
+                        {/* Only the UNCLASSED facets. A classed facet is drawn
+                            once, in the Worker block, where its class gives it
+                            meaning. */}
+                        <FacetRows entries={plainFacets(a)} dense />
+                        <details className="group">
+                          <summary className="text-[10px] text-gray-400 cursor-pointer hover:text-white select-none">
+                            subject &amp; envelope
+                          </summary>
+                          <div className="mt-1 pl-2 border-l border-gray-700/60 space-y-1">
+                            <FacetRows entries={subjectEntries(a)} dense />
+                            <FacetRows entries={envelopeEntries(a)} dense />
+                          </div>
+                        </details>
+                        {note && <p className="text-[10px] text-amber-300/90">{note}</p>}
+                      </section>
+                    )
+                  })}
+                </>
+              )}
+            </div>
+          </details>
         </div>
 
         <div className="flex items-center justify-between gap-2 px-3 py-2 bg-gray-900 border-t border-gray-700">
           <span className="text-[10px] text-gray-400">
-            {annotations.length} annotation{annotations.length === 1 ? '' : 's'}
+            Terminal evidence · {items.length} annotation{items.length === 1 ? '' : 's'}
           </span>
           <CopyButton text={text} />
         </div>
