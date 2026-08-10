@@ -5,6 +5,8 @@ import uuid
 
 from cli_agent_orchestrator.models.managed_launch import PROTOCOL_VERSION
 from cli_agent_orchestrator.services import managed_launch
+from cli_agent_orchestrator.services import managed_launch_v2 as v2
+from cli_agent_orchestrator.services import muse_native_launch
 
 
 def _reservation(tmp_path):
@@ -47,7 +49,20 @@ def _evidence(record, kind):
     }
 
 
-def test_capability_handshake_is_exact_and_versioned(client):
+def test_capability_handshake_is_exact_and_versioned(client, monkeypatch):
+    accepted_carrier = muse_native_launch.MuseProfileCarrierCapability(
+        True,
+        "",
+        cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+        full_banner="Muse Code 0.1.0 (0.1.0-R708.1)",
+        inner_executable="/fixture/muse-bin-0.1.0-R708.1",
+        inner_executable_sha256="4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c",
+    )
+    monkeypatch.setattr(
+        v2.muse_native_launch,
+        "installed_profile_carrier_capability",
+        lambda: accepted_carrier,
+    )
     response = client.get("/managed-launch/capabilities")
     assert response.status_code == 200
     assert response.json() == {
@@ -143,6 +158,12 @@ def test_capability_handshake_is_exact_and_versioned(client):
                     "pinned_version": "0.1.0",
                     "supported_versions": ["0.1.0"],
                     "version_enforcement": "open",
+                    "profile_carrier_capability": (
+                        muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL
+                    ),
+                    "profile_carrier_inner_sha256": (
+                        "4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c"
+                    ),
                 },
             },
         },

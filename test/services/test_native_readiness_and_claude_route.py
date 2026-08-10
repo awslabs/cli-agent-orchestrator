@@ -561,7 +561,11 @@ class TestTheObservedModelSurvivesTheRealPath:
         published = {}
         launched = {}
 
-        monkeypatch.setattr(bridge, "provider_version_banner", lambda _request: "2.1.220")
+        monkeypatch.setattr(
+            bridge,
+            "provider_version_banner",
+            lambda _request, *, environment=None: "2.1.220",
+        )
         monkeypatch.setattr(bridge, "native_child_environment", lambda _request: {})
         monkeypatch.setattr(
             v2,

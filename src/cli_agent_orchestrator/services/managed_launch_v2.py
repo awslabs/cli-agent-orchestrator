@@ -1115,11 +1115,13 @@ def native_tui_capabilities() -> dict[str, Any]:
     """
     from cli_agent_orchestrator.services import provider_contracts as contracts
 
+    muse_carrier = muse_native_launch.installed_profile_carrier_capability()
     providers = {}
     for provider in sorted(NATIVE_TUI_PROVIDERS):
         executable = _PINNED_PROVIDER[provider]
-        providers[provider] = {
-            "supported": True,
+        supported = provider != "muse_cli" or muse_carrier.supported
+        provider_capability = {
+            "supported": supported,
             "id_source": _ISSUANCE_SOURCES[provider],
             "readiness_receipt_kind": _NATIVE_TUI_READINESS_RECEIPT_KINDS[provider],
             "executable": executable,
@@ -1131,6 +1133,17 @@ def native_tui_capabilities() -> dict[str, Any]:
             "supported_versions": list(contracts.SUPPORTED_VERSIONS[executable]),
             "version_enforcement": contracts.version_enforcement_mode(executable),
         }
+        if provider == "muse_cli":
+            # This is deliberately narrower than ``supported_versions``:
+            # the internal profile carrier was proven for one full launcher
+            # revision + inner executable digest, not for every 0.1.0 build.
+            provider_capability["profile_carrier_capability"] = muse_carrier.cell
+            provider_capability["profile_carrier_inner_sha256"] = (
+                muse_carrier.inner_executable_sha256
+            )
+            if not supported:
+                provider_capability["reason"] = muse_carrier.reason
+        providers[provider] = provider_capability
     return {"schema_version": NATIVE_TUI_CAPABILITY_SCHEMA_VERSION, "providers": providers}
 
 
@@ -3836,7 +3849,18 @@ async def _launch_native_tui(
             )
         else:
             environment = native_child_environment(bridge_request)
-            version_output = await asyncio.to_thread(provider_version_banner, bridge_request)
+            if provider == "muse_cli":
+                # The carrier gate resolves the current inner binary before
+                # profile material is written. Disable the wrapper's updater
+                # so it cannot switch binaries after that decision.
+                environment["MUSE_NO_AUTO_UPDATE"] = "1"
+            # Use precisely the environment that will reach the pane.  In
+            # particular, Muse's update-capable wrapper must see its update
+            # suppression before this first wrapper execution, not merely at
+            # pane creation after the carrier decision.
+            version_output = await asyncio.to_thread(
+                provider_version_banner, bridge_request, environment=environment
+            )
         if provider == "kimi_cli":
             environment = _kimi_profile_environment(
                 record=record,
@@ -3929,6 +3953,7 @@ async def _launch_native_tui(
                 _prepare_muse_fresh_launch,
                 record=record,
                 request=request,
+                executable=executable,
                 version_output=version_output,
                 digest=digest,
                 profile_material=profile_material,
@@ -3978,6 +4003,11 @@ async def _launch_native_tui(
             launch_digest = route_envelope["wrapper_executable_sha256"]
             expected_inner_executable = route_envelope["inner_executable"]
         if provider == "muse_cli":
+            expected_inner_executable = bootstrap["profile_carrier_inner_executable"]
+            # Keep the canaried wrapper launch path: it supplies release
+            # metadata and any other launcher semantics.  Its updater is
+            # disabled before the version probe, and the observed primary
+            # process below must still be this prevalidated inner image.
             fresh_argv = muse_native_launch.build_fresh_launch_argv(
                 muse_binary=launch_executable,
                 extra_args=launch_extra_args,
@@ -4015,6 +4045,7 @@ async def _launch_native_tui(
                 ),
                 is_fresh_launch_argv=muse_native_launch.fresh_launch_has_no_identity,
                 expected_inner_executable=expected_inner_executable,
+                expected_inner_executable_sha256=bootstrap["profile_carrier_inner_sha256"],
                 provider_version=bootstrap["provider_version"],
             )
             bootstrap["native_session_id"] = outcome["native_session_id"]
@@ -4351,6 +4382,7 @@ def _prepare_muse_fresh_launch(
     *,
     record: dict[str, Any],
     request: dict[str, Any],
+    executable: str,
     version_output: str,
     digest: str,
     profile_material: dict[str, Any],
@@ -4364,6 +4396,17 @@ def _prepare_muse_fresh_launch(
     unpinnable model, or a profile with no material to compose is a refusal
     with nothing launched.
     """
+    # Check the private carrier before writing its generation-private file.
+    # Semver-level proof is not enough: R builds may change the undocumented
+    # env surface without changing 0.1.0.
+    carrier = muse_native_launch.profile_carrier_capability(
+        wrapper_executable=executable, full_banner=version_output
+    )
+    if not carrier.supported:
+        raise ManagedLaunchConflict(
+            "Muse profile carrier is unavailable for this installed wrapper/binary pair "
+            f"({carrier.reason}); stage-verify it before enabling profile launch"
+        )
     if not provider_contracts.is_proven_version(_PINNED_PROVIDER["muse_cli"], version_output):
         raise ManagedLaunchConflict(
             "Muse native status observation is unavailable for this provider build; "
@@ -4392,7 +4435,13 @@ def _prepare_muse_fresh_launch(
         "native_session_id": None,
         "id_source": _ISSUANCE_SOURCES["muse_cli"],
         "provider_version": normalized_version(version_output),
-        "binary_sha256": digest,
+        # This is the executable that interprets the internal profile
+        # carrier, never the update-capable launcher wrapper.
+        "binary_sha256": carrier.inner_executable_sha256,
+        "profile_carrier_capability": carrier.cell,
+        "profile_carrier_full_banner": carrier.full_banner,
+        "profile_carrier_inner_executable": carrier.inner_executable,
+        "profile_carrier_inner_sha256": carrier.inner_executable_sha256,
         "working_directory": record["working_directory"],
         # Requested, never observed: nothing has read the /status panel at
         # this point, so ``observed_model``/``observed_effort`` stay null
@@ -4552,6 +4601,8 @@ def _muse_bootstrap_intent(
             "native_session_id": native_session_id,
             "id_source": bootstrap["id_source"],
             "provider_version": bootstrap["provider_version"],
+            "profile_carrier_capability": bootstrap["profile_carrier_capability"],
+            "profile_carrier_inner_sha256": bootstrap["profile_carrier_inner_sha256"],
             "working_directory": bootstrap["working_directory"],
             "requested_model": bootstrap["requested_model"],
             "requested_effort": bootstrap["requested_effort"],
