@@ -47,8 +47,8 @@ one exception: :func:`start_discovered` starts the fresh no-prompt TUI,
 reads the provider-generated id from its own status panel, and only then
 claims ownership for that exact id — the pre-claim window is fenced so
 nothing but the internal status observation reaches the pane, and a
-failure there tears the pane down rather than leaving an untracked
-session.
+failure there attempts the exact pane teardown and surfaces any cleanup
+failure rather than silently claiming the session is gone.
 
 **The pane is proven to be running the session we claimed.**  The
 installed Kimi resume option takes an *optional* argument: given no id it

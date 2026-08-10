@@ -1121,7 +1121,7 @@ async def test_muse_launch_exposes_a_cleanup_failure_in_the_preflight_detail(
     )
     record, result = await _launch(worktree, tmp_path, muse_harness)
     assert result["state"] == "preflight_blocked"
-    detail = str(result.get("preflight_failure") or {})
+    detail = result["preflight_failure"]["detail"]
     assert "terminal deletion failed" in detail
     assert record["terminal_id"] in muse_harness.teardowns
     assert bridge.read_state(record["reservation_id"]) is None
@@ -1222,7 +1222,7 @@ async def test_muse_launch_exposes_a_teardown_failure_when_pane_creation_raises(
     )
     record, result = await _launch(worktree, tmp_path, muse_harness)
     assert result["state"] == "preflight_blocked"
-    detail = str(result.get("preflight_failure") or {})
+    detail = result["preflight_failure"]["detail"]
     assert "pane creation failed" in detail
     assert "cleanup: " in detail
     assert "cleanup also failed" in detail
@@ -1251,7 +1251,7 @@ async def test_muse_launch_exposes_a_teardown_failure_when_the_pane_handle_is_in
     )
     record, result = await _launch(worktree, tmp_path, muse_harness)
     assert result["state"] == "preflight_blocked"
-    detail = str(result.get("preflight_failure") or {})
+    detail = result["preflight_failure"]["detail"]
     assert "no usable handle" in detail
     assert "cleanup: " in detail
     assert "cleanup also failed" in detail
