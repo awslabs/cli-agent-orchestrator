@@ -2,11 +2,9 @@
 //
 // The suite is organised around the four things that must never regress:
 // annotations render ALONGSIDE the status badge; a stale-generation annotation
-// is dropped rather than re-parented; a stale annotation looks stale; and a
-// fleet with no annotations renders byte-identically to the dashboard before
-// this existed. The last one is asserted by DOM comparison rather than by
-// inspection, because "looks the same" is exactly the claim a human review
-// cannot make reliably.
+// is dropped rather than re-parented; a stale annotation looks stale; and an
+// absent annotations route degrades exactly like an empty one. Status evidence
+// remains available on every row whether or not annotations were published.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import annotationsLibSource from '../lib/annotations.ts?raw'
@@ -903,7 +901,7 @@ describe('one failed poll does not blank the surface', () => {
   }, 15000)
 })
 
-describe('the no-annotations control is byte-identical to today', () => {
+describe('rows without conductor annotations', () => {
   it('produces the same DOM with an empty payload as with no route at all', async () => {
     stubFetch(payload([]))
     const withEmpty = await renderDashboard()
@@ -931,6 +929,42 @@ describe('the no-annotations control is byte-identical to today', () => {
     // a flex item, so it consumes a `gap` on every row of a fleet with no
     // conductor — the one case that must stay byte-identical.
     expect(within(region).queryAllByTestId('annotation-group')).toHaveLength(0)
+  })
+
+  it('still gives an unannotated agent its status evidence and identity panel', async () => {
+    const unannotated = projectedTerminal({
+      id: 'unannotated-1',
+      status: 'unknown',
+      status_confidence: 'high',
+      status_reason: 'screen claims processing but two independent clocks contradict the claim',
+      status_signals: [
+        { name: 'screen', state: 'available', value: 'processing' },
+        { name: 'liveness', state: 'available', value: 1800 },
+        { name: 'activity', state: 'available', value: 7200 },
+      ],
+      wedged: true,
+    })
+    stubFetch(payload([]), [unannotated])
+    await renderDashboard([unannotated])
+
+    fireEvent.click(screen.getByTestId('workstate-info-button'))
+    const card = await screen.findByTestId('workstate-details')
+    const reachability = within(card).getByTestId('workstate-reachability')
+    const identity = within(card).getByTestId('workstate-identity')
+    const annotations = within(card).getByTestId('workstate-annotations-region')
+
+    expect(reachability).toHaveAttribute('open')
+    expect(identity).not.toHaveAttribute('open')
+    expect(annotations).not.toHaveAttribute('open')
+    expect(reachability.textContent).toContain('two independent clocks contradict the claim')
+    expect(reachability.textContent).toContain('Yes — independent quiet clocks contradict a working claim')
+    expect(reachability.textContent).toContain('30m')
+    expect(identity.textContent).toContain('unannotated-1-gen-1')
+    expect(identity.textContent).toContain('kimi_cli')
+    expect(annotations.textContent).toContain('No conductor work annotations')
+    // Control-plane identities remain out of this unauthenticated surface.
+    expect(card.textContent).not.toContain(unannotated.pane_id)
+    expect(card.textContent).not.toContain(unannotated.native_session_id)
   })
 })
 

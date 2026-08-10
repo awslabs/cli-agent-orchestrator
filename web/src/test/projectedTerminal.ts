@@ -57,6 +57,15 @@ export function projectedTerminal(overrides: ProjectedTerminalOverrides = {}): T
     superseded_by_generation: null,
     fifo_monitored: false,
     status: 'not_fifo_monitored',
+    status_confidence: 'none',
+    status_reason: 'no FIFO stream and no screen detector for this provider: nothing available can classify it',
+    status_signals: [
+      { name: 'fifo', state: 'absent', detail: 'native TUI: no FIFO stream exists' },
+      { name: 'screen', state: 'absent', detail: 'no provider instance' },
+      { name: 'liveness', state: 'available', value: 10 },
+      { name: 'activity', state: 'available', value: 60 },
+    ],
+    wedged: false,
     last_active: '2026-07-28T12:00:00Z',
     ...overrides,
   }
