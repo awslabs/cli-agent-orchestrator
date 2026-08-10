@@ -171,6 +171,8 @@ class AntigravityCliProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         model: Optional[str] = None,
         skill_prompt: Optional[str] = None,
+        native_session_id: Optional[str] = None,
+        effort: Optional[str] = None,
     ):
         """Initialize the Antigravity CLI provider.
 
@@ -182,15 +184,19 @@ class AntigravityCliProvider(BaseProvider):
             allowed_tools: Optional list of CAO tool names the agent may use.
                 When restricted (not wildcard), the security prompt is appended
                 to the injected system prompt for soft enforcement.
-            model: Optional model override (e.g. ``"Gemini 3.1 Pro (High)"``).
+            model: Optional model override (e.g. ``"gemini-3.6-flash"``).
                 The profile's ``model`` field takes precedence when set.
             skill_prompt: Optional skill catalog text built by the service
                 layer. Appended to the system prompt at launch.
+            native_session_id: Optional existing conversation ID to resume via ``--conversation``.
+            effort: Optional reasoning effort (e.g. ``"high"``, ``"medium"``, ``"low"``).
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
         self._model = model
+        self._effort = effort
+        self._native_session_id = native_session_id
         # MCP server names registered into ~/.gemini/config/mcp_config.json,
         # removed on cleanup().
         self._mcp_server_names: list[str] = []
@@ -247,13 +253,12 @@ class AntigravityCliProvider(BaseProvider):
 
         Structure::
 
-            agy --dangerously-skip-permissions [--model "<model>"] [-i "<system prompt>"]
+            agy --dangerously-skip-permissions [--conversation "<id>"] [--model "<model>"] [--effort "<effort>"] [-i "<system prompt>"]
 
         ``--dangerously-skip-permissions`` auto-approves tool calls (required
-        for unattended orchestration). ``--model`` selects the model. The agent
-        profile's system prompt (+ skill catalog + security prompt when tool-
-        restricted) is injected via ``-i`` with an explicit "acknowledge and
-        wait" guard so the agent adopts its role without exploring on launch.
+        for unattended orchestration). ``--conversation`` resumes an exact
+        existing session. System prompt injection via ``-i`` is used ONLY for new
+        un-resumed sessions.
 
         Returns a shell-escaped command string for ``send_keys``.
         """
@@ -265,6 +270,9 @@ class AntigravityCliProvider(BaseProvider):
             )
 
         command_parts = ["agy", "--dangerously-skip-permissions"]
+
+        if self._native_session_id:
+            command_parts.extend(["--conversation", self._native_session_id])
 
         profile = None
         if self._agent_profile is not None:
@@ -279,27 +287,30 @@ class AntigravityCliProvider(BaseProvider):
             model = profile.model
         if model:
             command_parts.extend(["--model", model])
+        if self._effort:
+            command_parts.extend(["--effort", self._effort])
 
-        # System prompt injection via -i.
+        # System prompt injection via -i (only when NOT resuming an existing conversation).
         if profile is not None:
-            system_prompt = profile.system_prompt or ""
-            system_prompt = self._apply_skill_prompt(system_prompt)
-            # Soft tool restriction: when the profile is not allowed every tool
-            # (e.g. the read-only reviewer), append the security prompt. agy
-            # honors a clear instruction not to use disallowed tools.
-            if self._allowed_tools and "*" not in self._allowed_tools:
-                system_prompt = (
-                    f"{system_prompt}\n\n{SECURITY_PROMPT}" if system_prompt else SECURITY_PROMPT
-                )
-            if system_prompt:
-                role_name = profile.name or "agent"
-                guarded = (
-                    f"{system_prompt}\n\n---\n"
-                    f"You are the {role_name}. Acknowledge your role in one sentence, "
-                    f"then wait for tasks. Do not take any action or use any tools "
-                    f"until you receive a specific task."
-                )
-                command_parts.extend(["-i", guarded])
+            if not self._native_session_id:
+                system_prompt = profile.system_prompt or ""
+                system_prompt = self._apply_skill_prompt(system_prompt)
+                # Soft tool restriction: when the profile is not allowed every tool
+                # (e.g. the read-only reviewer), append the security prompt. agy
+                # honors a clear instruction not to use disallowed tools.
+                if self._allowed_tools and "*" not in self._allowed_tools:
+                    system_prompt = (
+                        f"{system_prompt}\n\n{SECURITY_PROMPT}" if system_prompt else SECURITY_PROMPT
+                    )
+                if system_prompt:
+                    role_name = profile.name or "agent"
+                    guarded = (
+                        f"{system_prompt}\n\n---\n"
+                        f"You are the {role_name}. Acknowledge your role in one sentence, "
+                        f"then wait for tasks. Do not take any action or use any tools "
+                        f"until you receive a specific task."
+                    )
+                    command_parts.extend(["-i", guarded])
 
             # MCP servers (cao-mcp-server etc.) → agy's shared mcp_config.json.
             if profile.mcpServers:

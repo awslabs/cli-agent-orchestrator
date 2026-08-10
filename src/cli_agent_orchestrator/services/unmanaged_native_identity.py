@@ -45,8 +45,10 @@ under cond-0377 pending the product decision.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
+import subprocess
 from typing import Any, Mapping, Optional
 
 from cli_agent_orchestrator.providers.codex import (
@@ -64,7 +66,7 @@ from cli_agent_orchestrator.services import (
 #: The provider wire names whose ordinary/new-terminal launches consume a
 #: pre-task bound identity contract.  Kimi is deliberately absent: its
 #: zero-turn ACP bootstrap cannot bind a CAO profile (verified blocker).
-UNMANAGED_PRE_TASK_PROVIDERS = frozenset({"claude_code", "codex"})
+UNMANAGED_PRE_TASK_PROVIDERS = frozenset({"claude_code", "codex", "antigravity_cli"})
 
 # A bounded roster marker, not a lock or claim: it distinguishes an activated
 # launch that is currently between terminal-row creation and native-ID binding
@@ -77,12 +79,14 @@ PRE_TASK_IDENTITY_CAPTURED = "pre-task native identity captured"
 _PROVIDER_EXECUTABLE = {
     "claude_code": provider_contracts.PROVIDER_CLAUDE,
     "codex": provider_contracts.PROVIDER_CODEX,
+    "antigravity_cli": "agy",
 }
 
 #: Acquisition method per provider, matching the managed-v2 issuance sources.
 _ACQUISITION_BY_PROVIDER = {
     "claude_code": native_attachment.ACQUISITION_CHOSEN_SESSION_ID,
     "codex": native_attachment.ACQUISITION_ZERO_TURN_BOOTSTRAP,
+    "antigravity_cli": native_attachment.ACQUISITION_ZERO_TURN_BOOTSTRAP,
 }
 
 
@@ -226,6 +230,98 @@ def _effective_codex_route(
     return CodexRoute(model=model, effort=effort)
 
 
+def _mint_antigravity_session(
+    *,
+    working_directory: str,
+    expected_model: Optional[str],
+    expected_effort: Optional[str],
+    agent_profile: Optional[str],
+    environment: Optional[Mapping[str, str]] = None,
+) -> dict[str, Any]:
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+    executable = _resolve_executable("antigravity_cli")
+
+    profile = None
+    if agent_profile:
+        try:
+            profile = load_agent_profile(agent_profile)
+        except Exception as exc:
+            raise UnmanagedIdentityUnavailable(
+                f"failed to load agent profile {agent_profile!r} for antigravity_cli: {exc}"
+            ) from exc
+
+    model = expected_model or (getattr(profile, "model", None) or "")
+    effort = expected_effort or ""
+
+    system_prompt = (getattr(profile, "system_prompt", None) or "") if profile else ""
+    role_name = (getattr(profile, "name", None) or "agent") if profile else "agent"
+    guarded_prompt = (
+        f"{system_prompt}\n\n---\n"
+        f"You are the {role_name}. Acknowledge your role in one sentence, "
+        f"then wait for tasks. Do not take any action or use any tools "
+        f"until you receive a specific task."
+    ) if system_prompt else "Acknowledge initialization in one sentence and wait."
+
+    cmd = [
+        executable,
+        "-p", guarded_prompt,
+        "--output-format", "json",
+        "--dangerously-skip-permissions",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["--effort", effort])
+
+    env = dict(environment or os.environ)
+    try:
+        res = subprocess.run(
+            cmd,
+            cwd=working_directory,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise UnmanagedIdentityUnavailable(
+            f"antigravity_cli pre-task bootstrap failed to execute: {exc}"
+        ) from exc
+
+    if res.returncode != 0:
+        raise UnmanagedIdentityUnavailable(
+            f"antigravity_cli pre-task bootstrap failed with exit code {res.returncode}: {res.stderr.strip() or res.stdout.strip()}"
+        )
+
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise UnmanagedIdentityUnavailable(
+            f"antigravity_cli pre-task bootstrap returned invalid JSON: {res.stdout.strip()}"
+        ) from exc
+
+    cid = data.get("conversation_id")
+    if not isinstance(cid, str) or not cid:
+        raise UnmanagedIdentityUnavailable(
+            "antigravity_cli pre-task bootstrap returned no conversation_id"
+        )
+
+    return {
+        "native_session_id": cid,
+        "acquisition_method": _ACQUISITION_BY_PROVIDER["antigravity_cli"],
+        "working_directory": working_directory,
+        "model": model,
+        "effort": effort,
+        "bootstrap": {
+            "provider": "antigravity_cli",
+            "conversation_id": cid,
+            "working_directory": working_directory,
+            "duration_seconds": data.get("duration_seconds", 0),
+        },
+    }
+
+
 def resolve_pre_task_identity(
     *,
     provider: str,
@@ -236,6 +332,7 @@ def resolve_pre_task_identity(
     forwarded_environment: Optional[Mapping[str, str]],
     terminal_id: str,
     session_name: str,
+    agent_profile: Optional[str] = None,
 ) -> dict[str, Any]:
     """Resolve the deterministic harness-native session id for an unmanaged
     new launch, BEFORE the provider starts.
@@ -286,6 +383,15 @@ def resolve_pre_task_identity(
                 "working_directory": canonical_cwd,
             },
         }
+
+    if provider == "antigravity_cli":
+        return _mint_antigravity_session(
+            working_directory=canonical_cwd,
+            expected_model=expected_model,
+            expected_effort=expected_effort,
+            agent_profile=agent_profile,
+            environment=forwarded_environment,
+        )
 
     # Codex: the zero-turn app-server bootstrap materializes a resumable
     # rollout for the exact profile route; the TUI then resumes that id.

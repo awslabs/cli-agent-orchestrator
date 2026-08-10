@@ -1514,6 +1514,7 @@ def _pre_task_bind_and_resolve(
         forwarded_environment=forwarded_environment,
         terminal_id=terminal_id,
         session_name=session_name,
+        agent_profile=agent_profile,
     )
     if not isinstance(identity, dict) or not identity.get("native_session_id"):
         raise unmanaged_native_identity.UnmanagedIdentityUnavailable(

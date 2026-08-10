@@ -805,3 +805,47 @@ def test_codex_launch_argv_resumes_minted_id():
     provider = CodexProvider("t1", "cao-s", "w1", native_session_id=sid)
     command = provider._build_codex_command()
     assert command.strip().endswith(f"resume {sid}")
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_antigravity_new_launch_binds_pre_task_identity(
+    isolated_memory_db, launch_mocks, monkeypatch
+):
+    """Antigravity: pre-task 1-turn bootstrap mints a conversation id, durable in roster and metadata."""
+    native_id = str(uuid.uuid4())
+    def _mock_mint(*args, **kwargs):
+        return {
+            "native_session_id": native_id,
+            "acquisition_method": roster.ACQUISITION_ZERO_TURN_BOOTSTRAP,
+            "working_directory": kwargs.get("working_directory", "/tmp"),
+            "model": kwargs.get("expected_model") or "",
+            "effort": kwargs.get("expected_effort") or "",
+            "bootstrap": {"conversation_id": native_id},
+        }
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.unmanaged_native_identity._mint_antigravity_session",
+        _mock_mint,
+    )
+    result = await create_terminal("antigravity_cli", "implementer-gemini", new_session=True)
+    assert result.id == "test1234"
+    agent = roster.get_agent(roster.derive_initial_agent_id("test1234"))
+    lineage = agent["current_lineage"]
+    assert lineage["native_session_id"] == native_id
+    assert lineage["harness"] == "antigravity_cli"
+    from cli_agent_orchestrator.clients import database
+
+    assert database.get_terminal_metadata("test1234")["native_session_id"] == native_id
+
+
+def test_antigravity_launch_argv_resumes_minted_id():
+    from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
+
+    sid = str(uuid.uuid4())
+    provider = AntigravityCliProvider("t1", "cao-s", "w1", native_session_id=sid, model="gemini-3.6-flash", effort="high")
+    command = provider._build_agy_command()
+    assert f"--conversation {sid}" in command
+    assert "--model gemini-3.6-flash" in command
+    assert "--effort high" in command
+    assert "-i" not in command
+
