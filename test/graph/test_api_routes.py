@@ -317,7 +317,7 @@ def test_health_responds_while_slow_graph_projection_in_flight(client, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_full_build_queue_keeps_kind_and_rejects_without_task():
+async def test_full_build_queue_keeps_kind_and_rejects_without_task(caplog):
     cache = GraphViewCache(max_concurrent_builds=1, max_pending_builds=1)
     release = asyncio.Event()
     active_key = ("memory", "project", "active", True)
@@ -355,6 +355,9 @@ async def test_full_build_queue_keeps_kind_and_rejects_without_task():
         assert "build_started_at" not in detail
         assert cache.inflight_task(rejected_key) is None
         assert rejected_key not in cache._statuses
+        assert "graph projection rejected because build queue is full" in caplog.text
+        assert "memory" in caplog.text
+        assert "{}" in caplog.text
     finally:
         release.set()
         await asyncio.gather(active, pending)

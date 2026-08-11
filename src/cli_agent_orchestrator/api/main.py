@@ -4056,6 +4056,12 @@ async def _project_graph_with_timeout(
         # admission require the same retry-after-5 behavior. The additive
         # build_state distinguishes them without minting a new kind or 503
         # that existing clients do not handle.
+        logger.warning(
+            "graph projection rejected because build queue is full for "
+            "provider=%r key=%r",
+            provider,
+            filters,
+        )
         raise _timeout(exc.build_status)
 
     task_registry = getattr(app.state, "graph_build_tasks", None)

@@ -40,6 +40,18 @@ _SCOPES_IGNORING_SCOPE_ID = frozenset(
         MemoryScope.FEDERATED.value,
     }
 )
+_DISABLED_ENRICHMENTS = [
+    "orphan_page",
+    "contradiction",
+    "stale_claim",
+    "poison_frequency",
+    "graph_density",
+]
+
+
+def _mark_enrichment_failed(meta: dict[str, Any]) -> None:
+    meta["lint_enrichment"] = "failed"
+    meta["disabled_enrichments"] = list(_DISABLED_ENRICHMENTS)
 
 
 @register_provider("memory")
@@ -125,17 +137,7 @@ class MemoryGraphProvider(GraphProvider):
             "lint_enrichment": "enabled" if lint_enabled else "disabled",
         }
         if not lint_enabled:
-            meta.update(
-                {
-                    "disabled_enrichments": [
-                        "orphan_page",
-                        "contradiction",
-                        "stale_claim",
-                        "poison_frequency",
-                        "graph_density",
-                    ],
-                }
-            )
+            meta["disabled_enrichments"] = list(_DISABLED_ENRICHMENTS)
 
         # Resolve + parse the scope's index. A scope with no wiki on disk
         # (or an unresolvable scope/scope_id) is an empty graph, not an error.
@@ -193,8 +195,15 @@ class MemoryGraphProvider(GraphProvider):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
+                logger.warning(
+                    "memory graph provider: run_lint failed for scope=%r scope_id=%r: %r",
+                    scope,
+                    scope_id,
+                    e,
+                    exc_info=True,
+                )
                 meta["lint_error"] = type(e).__name__
+                _mark_enrichment_failed(meta)
 
         # ORDERING (human review, PR #524): the relationship read MUST come after
         # run_lint. run_lint persists its contradiction findings into this same
@@ -223,8 +232,15 @@ class MemoryGraphProvider(GraphProvider):
                 scope, scope_id, status="active", source_keys=keys
             )
         except Exception as e:  # degrade to a relationship-free graph, never 500
-            logger.warning("memory graph provider: relationship read failed: %r", e)
+            logger.warning(
+                "memory graph provider: relationship read failed for scope=%r scope_id=%r: %r",
+                scope,
+                scope_id,
+                e,
+                exc_info=True,
+            )
             meta["relationship_error"] = type(e).__name__
+            _mark_enrichment_failed(meta)
             active = []
         for rel in active:
             edge_type = _TYPE_MAP.get(rel.type)

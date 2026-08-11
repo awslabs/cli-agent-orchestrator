@@ -472,7 +472,9 @@ class TestMemoryProviderEdgeCases:
         assert elapsed < 2.0, f"project() took {elapsed:.2f}s (soft NFR-1 bound)"
 
     @pytest.mark.asyncio
-    async def test_run_lint_failure_degrades_to_lint_free_graph(self, populated_scope, monkeypatch):
+    async def test_run_lint_failure_degrades_to_lint_free_graph(
+        self, populated_scope, monkeypatch, caplog
+    ):
         """A run_lint failure must degrade to a lint-free graph (topic nodes
         still returned) with meta["lint_error"] set, rather than raising.
         """
@@ -487,6 +489,56 @@ class TestMemoryProviderEdgeCases:
 
         assert {n.id for n in view.nodes} >= {"a", "b", "c"}
         assert view.meta["lint_error"] == "RuntimeError"
+        assert view.meta["lint_enrichment"] == "failed"
+        assert view.meta["disabled_enrichments"] == [
+            "orphan_page",
+            "contradiction",
+            "stale_claim",
+            "poison_frequency",
+            "graph_density",
+        ]
+        record = next(record for record in caplog.records if "run_lint failed" in record.message)
+        assert "scope='global' scope_id=None" in record.message
+        assert record.exc_info is not None
+
+    @pytest.mark.asyncio
+    async def test_relationship_failure_reports_degraded_enrichment(
+        self, populated_scope, monkeypatch, caplog
+    ):
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            MemoryRelationshipService,
+        )
+
+        monkeypatch.setattr(wiki_lint, "run_lint", AsyncMock(return_value=[]))
+
+        def _raise_runtime_error(*args, **kwargs):
+            raise RuntimeError("relationship store unavailable")
+
+        monkeypatch.setattr(
+            MemoryRelationshipService,
+            "list_relationships",
+            _raise_runtime_error,
+        )
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        view = await provider.project(scope="global")
+
+        assert {n.id for n in view.nodes} >= {"a", "b", "c"}
+        assert view.edges == []
+        assert view.meta["relationship_error"] == "RuntimeError"
+        assert view.meta["lint_enrichment"] == "failed"
+        assert view.meta["disabled_enrichments"] == [
+            "orphan_page",
+            "contradiction",
+            "stale_claim",
+            "poison_frequency",
+            "graph_density",
+        ]
+        record = next(
+            record for record in caplog.records if "relationship read failed" in record.message
+        )
+        assert "scope='global' scope_id=None" in record.message
+        assert record.exc_info is not None
 
     @pytest.mark.asyncio
     async def test_run_lint_cancelled_error_propagates(self, populated_scope, monkeypatch):
