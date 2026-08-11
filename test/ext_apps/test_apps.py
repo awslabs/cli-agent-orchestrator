@@ -7,6 +7,8 @@ default-off registration.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from cli_agent_orchestrator.ext_apps import (
@@ -139,7 +141,34 @@ class TestRegisterApps:
 
         assert register_apps(NoResourceMCP()) is False
 
-    def test_registers_when_enabled_and_built(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
+    def test_missing_bundles_warn_at_visible_startup_level(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+        monkeypatch.setattr("cli_agent_orchestrator.ext_apps.apps.apps_static_dir", lambda: None)
+
+        class StubMCP:
+            def resource(self, uri, **kw):  # type: ignore[no-untyped-def]
+                def decorator(fn):  # type: ignore[no-untyped-def]
+                    return fn
+
+                return decorator
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
+            assert register_apps(StubMCP()) is False
+
+        records = [
+            record for record in caplog.records if "apps_static/ not found" in record.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].levelno >= logging.WARNING
+
+    def test_registers_when_enabled_and_built(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         for name in ("dashboard.html", "agent.html", "event-stream.html", "graph.html"):
             (tmp_path / name).write_text(f"<title>{name}</title>", encoding="utf-8")
         monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
@@ -155,13 +184,21 @@ class TestRegisterApps:
 
                 return decorator
 
-        assert register_apps(StubMCP()) is True
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
+            assert register_apps(StubMCP()) is True
         assert set(registered) == {
             DASHBOARD_RESOURCE_URI,
             AGENT_RESOURCE_URI,
             EVENT_STREAM_RESOURCE_URI,
             GRAPH_RESOURCE_URI,
         }
+        posture_records = [
+            record
+            for record in caplog.records
+            if "MCP App resource posture active" in record.getMessage()
+        ]
+        assert len(posture_records) == 1
+        assert posture_records[0].levelno >= logging.WARNING
 
     def test_graph_resource_gated_by_apps_enabled(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch

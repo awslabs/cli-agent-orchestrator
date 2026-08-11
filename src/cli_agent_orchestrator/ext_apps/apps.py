@@ -198,13 +198,14 @@ def get_resource_body(uri: str) -> str:
 
 
 def register_apps(mcp: Any) -> bool:
-    """Register the three ``ui://cao/*`` resources on the FastMCP server.
+    """Register the four ``ui://cao/*`` resources on the FastMCP server.
 
     Best-effort and side-effect free when disabled:
 
-    * returns ``False`` (logging at info level) when ``CAO_MCP_APPS_ENABLED`` is
-      unset, when the running FastMCP has no ``resource`` decorator, or when the
-      ``apps_static/`` build output is missing;
+    * returns ``False`` when ``CAO_MCP_APPS_ENABLED`` is unset, when the running
+      FastMCP has no ``resource`` decorator, or when the ``apps_static/`` build
+      output is missing; the first two are logged at info, while missing build
+      output is a degraded posture logged at warning;
     * otherwise registers one resource per built artifact and returns ``True``.
     """
 
@@ -223,7 +224,7 @@ def register_apps(mcp: Any) -> bool:
 
     static_dir = apps_static_dir()
     if static_dir is None:
-        logger.info(
+        logger.warning(
             "apps_static/ not found (frontend not built); skipping MCP App resource registration"
         )
         return False
@@ -252,7 +253,12 @@ def register_apps(mcp: Any) -> bool:
         except Exception:  # pragma: no cover - defensive: never crash startup
             logger.exception("Failed to register MCP App resource %s", uri)
 
-    logger.info(
-        "Registered %d/%d MCP App resources from %s", registered, len(_RESOURCE_FILES), static_dir
+    # Registration happens before logging is configured on the stdio path, so a
+    # posture summary must be WARNING to remain operator-visible.
+    logger.warning(
+        "MCP App resource posture active; registered %d/%d built HTML resources from %s",
+        registered,
+        len(_RESOURCE_FILES),
+        static_dir,
     )
     return registered > 0

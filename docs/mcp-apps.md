@@ -86,7 +86,8 @@ The surface is packaged as the built-in **`mcp_apps` plugin** (discovered via th
 `cao.plugins` entry-point group). On MCP server startup the plugin's
 `on_mcp_server` hook registers the tools, the `ui://cao/*` resources, the topology
 widget, and the capability advertisement — all best-effort, so an older FastMCP
-build or a missing frontend build degrades gracefully (logged, never fatal).
+build degrades without aborting startup. A missing frontend build emits a visible
+startup warning and skips the `ui://cao/*` resources.
 
 ## Surfaces
 
@@ -245,7 +246,7 @@ auth disabled (the default) no header is attached and behavior is unchanged.
 
 ## Building the frontend
 
-The three views are single-file HTML built from `cao_mcp_apps/`:
+The four views are single-file HTML built from `cao_mcp_apps/`:
 
 ```bash
 cd cao_mcp_apps && npm ci && npm run build:all   # emits src/.../ext_apps/apps_static/*.html
@@ -253,8 +254,9 @@ cd cao_mcp_apps && npm ci && npm run build:all   # emits src/.../ext_apps/apps_s
 
 The built bundles (and the committed `ext_apps/static/` topology widget) ship in
 the wheel via the `[tool.hatch.build].artifacts` force-include. If the bundles are
-absent (dev tree without a build), resource registration degrades gracefully and
-the topology widget still works (it needs no build step).
+absent (dev tree without a build), resource registration emits a warning and
+skips the four `ui://cao/*` resources without aborting startup; the topology
+widget still works because it needs no build step.
 
 ## Key decisions & deferred hardening
 
