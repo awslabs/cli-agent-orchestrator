@@ -135,11 +135,14 @@ def test_real_server_tool_names_are_unchanged_when_mode_is_off() -> None:
 
 
 def test_real_server_tool_names_do_not_use_app_namespace_separator() -> None:
-    """Document that namespaced app addressing is not registered today.
+    """Pin the bare-name precondition for the exact app-surface allowlist.
 
-    No real tool currently uses FastMCP's ``___`` delimiter. A future
-    namespaced tool is therefore a deliberate registration and allowlist change,
-    not a name that can appear accidentally and be silently admitted.
+    Native FastMCP app registration prefixes tool names as
+    ``{App}___{tool}``. Under exact matching, such tools silently disappear from
+    apps-only ``tools/list``; calls are rejected before FastMCP's bypass lookup
+    with a misleading app-surface-only error. If this fails, explicitly extend
+    ``APP_SURFACE_TOOL_NAMES`` with the namespaced names. Do not restore suffix
+    matching or assume the surface works merely because listing emitted no error.
     """
 
     tool_names = set(_probe_real_server(apps_only="false")["listed"])

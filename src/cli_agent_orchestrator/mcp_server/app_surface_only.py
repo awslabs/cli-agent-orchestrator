@@ -25,7 +25,11 @@ APP_SURFACE_TOOL_NAMES = frozenset(
 
 
 def _is_app_surface_tool_name(tool_name: str) -> bool:
-    """Return whether a tool name is explicitly part of the app surface."""
+    """Return whether a tool name is explicitly part of the app surface.
+
+    Exact matching makes denial uniform and non-enumerable: unknown and existing
+    non-allowlisted names receive the same rejection before provider lookup.
+    """
 
     return tool_name in APP_SURFACE_TOOL_NAMES
 

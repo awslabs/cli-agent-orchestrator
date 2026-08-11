@@ -100,7 +100,8 @@ class McpAppsPlugin(CaoPlugin):
 
                 mcp.add_middleware(AppSurfaceOnlyMiddleware())
                 # Registration runs before logging is configured; WARNING is the
-                # visibility floor for this security-posture assertion.
+                # visibility floor for this security-posture assertion. Keep the
+                # canary visible if future namespacing silently empties tools/list.
                 logger.warning(
                     "App-surface-only mode active; %d tool names allowlisted; "
                     "every other tool is hidden and rejected",
