@@ -13,8 +13,11 @@ Resolution of ``apps_static/`` tries, in order:
 
 1. the ``apps.static_dir`` override (``CAO_MCP_APPS_STATIC_DIR`` env var, or
    ``settings.json``), read via ``ConfigService``,
-2. the packaged location ``<package>/apps_static`` (wheel installs), then
-3. the source-tree location ``<repo-root>/apps_static`` (editable/dev installs).
+2. the primary packaged location ``<package>/ext_apps/apps_static`` emitted by
+   ``npm run build:all``,
+3. the alternate packaged location ``<package>/apps_static`` (wheel installs),
+   then
+4. the source-tree location ``<repo-root>/apps_static`` (editable/dev installs).
 
 This module imports nothing from ``clients.*`` — it stays on the HTTP-only side of
 the boundary and only reads static files from disk.
@@ -83,7 +86,8 @@ def apps_static_dir() -> Optional[Path]:
     """Return the first existing ``apps_static`` directory, or ``None``.
 
     Tries the ``apps.static_dir`` override (``CAO_MCP_APPS_STATIC_DIR`` env var
-    or ``settings.json``), the packaged location, then the source-tree location.
+    or ``settings.json``), ``<package>/ext_apps/apps_static``,
+    ``<package>/apps_static``, then ``<repo-root>/apps_static``.
     """
 
     override = ConfigService.get("apps.static_dir", default=None)
@@ -183,7 +187,10 @@ def _read_resource_html(filename: str, base_dir: Optional[Path] = None) -> Optio
     path = static_dir / filename
     if not _artifact_has_content(path):
         return None
-    html = path.read_text(encoding="utf-8")
+    try:
+        html = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
     return html or None
 
 
@@ -256,6 +263,8 @@ def register_apps(mcp: Any) -> bool:
             def _handler() -> str:
                 try:
                     return get_resource_body(resource_uri, base_dir)
+                # FileNotFoundError is the load-bearing contract that maps direct
+                # resource lookup failure to the request-time placeholder.
                 except FileNotFoundError:
                     logger.warning("MCP App artifact missing at request time: %s", fname)
                     return f"<!doctype html><title>{resource_uri}</title><p>view not built</p>"

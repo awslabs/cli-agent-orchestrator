@@ -125,6 +125,12 @@ class TestGetResourceBody:
         with pytest.raises(FileNotFoundError):
             get_resource_body(GRAPH_RESOURCE_URI)
 
+    def test_invalid_utf8_artifact_raises(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / "graph.html").write_bytes(b"\xff")
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
+        with pytest.raises(FileNotFoundError):
+            get_resource_body(GRAPH_RESOURCE_URI)
+
 
 class TestRegisterApps:
     def test_returns_false_when_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -270,7 +276,7 @@ class TestRegisterApps:
         assert "0/4 artifacts present" in records[0].getMessage()
         assert str(tmp_path) in records[0].getMessage()
 
-    def test_truncated_artifact_warns_and_serves_placeholder(
+    def test_empty_artifact_warns_and_serves_placeholder(
         self,
         tmp_path,
         monkeypatch: pytest.MonkeyPatch,
@@ -343,6 +349,7 @@ class TestRegisterApps:
 
         assert register_apps(StubMCP()) is True
         shutil.rmtree(override_dir)
+        assert apps_module.apps_static_dir() == fallback_dir
 
         with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
             html = handlers[DASHBOARD_RESOURCE_URI]()

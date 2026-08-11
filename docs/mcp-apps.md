@@ -95,7 +95,9 @@ startup warning and skips the `ui://cao/*` resources. Specifically, a missing
 `apps_static/` directory means no `ui://` resources are listed, while a failed or
 partial build that leaves the directory present keeps all four resources listed
 and returns the `"view not built"` placeholder for each missing artifact; the
-artifact-presence WARNING is the only startup signal distinguishing those states.
+artifact-presence WARNING distinguishes those states at startup. A nonempty but
+truncated artifact still counts as present, emits no such warning, and may serve a
+broken view.
 
 ## Surfaces
 
