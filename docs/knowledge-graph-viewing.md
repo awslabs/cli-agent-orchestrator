@@ -139,16 +139,23 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
 > call, but nothing calls it yet — this is a tracked follow-up to wire Refresh
 > to bypass the cache.)
 
-> **First cold load may still time out on a large scope.** The worst observed
-> cold build is **~148s**, while the API projection deadline is **90s**. A
-> measurement on 2026-08-11 completed in **0.028615s** with `meta.cached:
-> false`, explicitly under the 90s deadline; lint enrichment was disabled in
-> that environment, so it does not supersede the lint-enabled worst case. A
-> **504** response with `detail.kind: "graph_projection_timeout"` is
-> **retryable**: clients should honor `Retry-After` / `detail.retry_after_s`,
-> retry with backoff, and show a **"building…"** state while waiting.
-> Single-flight collapses concurrent cold requests onto one build, so this is a
-> deadline problem rather than a thundering herd.
+> **First cold load may still time out on a large scope.** The **~148s**
+> cold-build figure recorded in `graph/cache.py` was measured **under load**,
+> while the API projection deadline is **90s**; a single local measurement
+> does not retire that observation or establish a new worst case. On
+> 2026-08-11, a lint-enabled cold request over 48 global index rows (47
+> existing wiki pages) returned **504 after 90.012228s**. Running the same
+> projection without the API deadline completed in **164.036425s**, returned
+> 48 nodes and 7 edges, and reported `meta.cached: false`. The effective lint
+> setting was `true`; successful lint-enabled responses omit
+> `meta.lint_enabled` and `meta.lint_enrichment`, which are emitted only to
+> describe the disabled branch. This one corpus on one unloaded machine is not
+> a worst-case benchmark. Therefore a **504** with `detail.kind:
+> "graph_projection_timeout"` remains **retryable** regardless of one local
+> result: clients should honor `Retry-After` / `detail.retry_after_s`, retry
+> with backoff, and show a **"building…"** state while waiting. Single-flight
+> collapses concurrent cold requests onto one build, so this is a deadline
+> problem rather than a thundering herd.
 
 ## The API
 
