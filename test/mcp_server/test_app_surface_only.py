@@ -127,19 +127,24 @@ async def test_tools_list_contains_only_app_surface_tools_when_enabled(monkeypat
 
 
 def test_real_server_tool_names_are_unchanged_when_mode_is_off() -> None:
-    """Pin the delimiter assumption that makes suffix-only matching safe.
-
-    An in-session tool named ``anything___render_dashboard`` would pass the
-    suffix allowlist. The real unrestricted tool surface currently reserves
-    ``___`` for FastMCP app addressing, so fail if an ordinary tool starts
-    using it.
-    """
-
     baseline_names = set(_probe_real_server(apps_only=None)["listed"])
     explicit_off_names = set(_probe_real_server(apps_only="false")["listed"])
 
     assert explicit_off_names == baseline_names
-    assert not any("___" in name for name in baseline_names)
+
+
+def test_real_server_tool_names_do_not_use_app_namespace_separator() -> None:
+    """Pin the precondition for suffix matching in AppSurfaceOnlyMiddleware.
+
+    An in-session tool named ``foo___submit_command`` would pass the suffix
+    allowlist. If the real assembled surface ever registers a name containing
+    ``___``, switch the middleware to exact-name matching; do not relax this
+    assertion.
+    """
+
+    tool_names = set(_probe_real_server(apps_only="false")["listed"])
+
+    assert not any("___" in name for name in tool_names)
 
 
 def test_real_server_fastmcp_32_app_tool_reachability() -> None:
