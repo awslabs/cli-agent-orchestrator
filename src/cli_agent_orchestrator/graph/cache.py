@@ -5,13 +5,11 @@ Issue #348, perf follow-up.
 DELIBERATE ADR REVERSAL. The original graph-layer design record specified
 "lint-on-demand, no caching machinery" (ADR-7): every ``/graph/{provider}``
 request re-ran ``wiki_lint.run_lint`` in-request. Profiling the shipped
-``memory`` provider on ``scope=global`` measured that projection at ~30s
-typical and up to ~148s under load — worse than the frontend's 120s timeout,
-so the UI aborted before the server answered. The dominant cost is NOT the LLM
-contradiction detector (only ~8.5s / 3 pairs / 0 findings on global) but the
-ripgrep-based ``stale_claim`` detector (~20s: ~95 ``rg`` subprocess spawns over
-the whole repo). Caching the *projected* GraphView sidesteps the entire run_lint
-cost on repeat views regardless of which detector dominates.
+``memory`` provider on ``scope=global`` measured that projection at 146-166s,
+worse than the frontend's 120s timeout, so the UI aborted before the server
+answered. The dominant cost is the ripgrep-based ``stale_claim`` detector, not
+the LLM contradiction detector. Caching the *projected* GraphView sidesteps the
+entire run_lint cost on repeat views regardless of which detector dominates.
 
 This module lives in the graph layer ONLY — it does not touch the shipped
 ``wiki_lint`` / ``memory_service`` modules. A ``memory`` GraphProvider opts in
@@ -31,6 +29,7 @@ hook can wire proactive invalidation without changing this module's shape.
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -46,14 +45,14 @@ logger = logging.getLogger(__name__)
 # write-invalidation (see module docstring).
 DEFAULT_TTL_S = 300.0
 
-# Bounds how long a detached build may hold its per-key lock. Cancellation
-# cannot stop work already running in ``asyncio.to_thread``; it only releases
-# the asyncio lock and makes the key recoverable.
+# Bounds how long the cache awaits one detached build. Cancellation cannot stop
+# work already running in ``asyncio.to_thread``; it only makes the key
+# recoverable for another request.
 GRAPH_BUILD_MAX_S = 600.0
 
-# Detached graph builds use the process-wide default thread pool indirectly.
-# Keep their concurrency bounded so caller-supplied scope_ids cannot starve
-# unrelated executor users.
+# Bounds graph build coroutines admitted to the active section. A timed-out
+# ``asyncio.to_thread`` worker can outlive both its coroutine and this slot, so
+# this is not a bound on live executor threads.
 GRAPH_BUILD_CONCURRENCY = 2
 
 # At most two additional keys may wait behind the running builds. Once this
@@ -61,6 +60,11 @@ GRAPH_BUILD_CONCURRENCY = 2
 # a detached task, so caller-controlled scope_ids cannot grow the task registry
 # without bound.
 GRAPH_BUILD_QUEUE_MAX = 2
+
+# Bound completed projections by entry count. Memory use is therefore at most
+# 64 times the largest expected GraphView, plus at most the four hard-capped
+# in-flight entries that eviction must not remove.
+GRAPH_CACHE_MAX_ENTRIES = 64
 
 # Cache key: (provider name, scope, scope_id, lint_enabled). scope_id is
 # normalized to a string-or-None so ``("memory","global",None,True)`` and a
@@ -95,7 +99,7 @@ class BuildStatus:
 
 
 class GraphBuildDeadlineError(asyncio.TimeoutError):
-    """A graph build exceeded ``GRAPH_BUILD_MAX_S`` and released its key lock."""
+    """A graph build exceeded ``GRAPH_BUILD_MAX_S`` and made its key retryable."""
 
 
 class GraphBuildQueueFullError(Exception):
@@ -111,8 +115,8 @@ class GraphViewCache:
 
     Each cold key has exactly one strongly-referenced task. Request deadlines
     may stop waiting for that task without cancelling it; retries join it. A
-    hard build deadline bounds how long the per-key lock can remain held, but
-    cannot stop blocking worker threads already launched by ``to_thread``.
+    hard build deadline bounds how long the cache awaits the build, but cannot
+    stop blocking worker threads already launched by ``to_thread``.
     """
 
     def __init__(
@@ -123,49 +127,56 @@ class GraphViewCache:
         build_max_s: float = GRAPH_BUILD_MAX_S,
         max_concurrent_builds: int = GRAPH_BUILD_CONCURRENCY,
         max_pending_builds: int = GRAPH_BUILD_QUEUE_MAX,
+        max_entries: int = GRAPH_CACHE_MAX_ENTRIES,
     ) -> None:
         if max_concurrent_builds < 1:
             raise ValueError("max_concurrent_builds must be at least 1")
         if max_pending_builds < 0:
             raise ValueError("max_pending_builds must not be negative")
+        if max_entries < 1:
+            raise ValueError("max_entries must be at least 1")
         self._ttl = ttl_s
         self._clock = clock
         self._build_max_s = build_max_s
-        self._entries: dict[CacheKey, _Entry] = {}
-        self._locks: dict[CacheKey, asyncio.Lock] = {}
+        self._max_entries = max_entries
+        self._entries: OrderedDict[CacheKey, _Entry] = OrderedDict()
         self._inflight: dict[CacheKey, asyncio.Task[GraphView]] = {}
         self._statuses: dict[CacheKey, BuildStatus] = {}
-        self._failed_deadlines: dict[CacheKey, BuildStatus] = {}
+        self._failed_deadlines: OrderedDict[CacheKey, BuildStatus] = OrderedDict()
         self._build_slots = asyncio.Semaphore(max_concurrent_builds)
         self._active_builds = 0
         self._max_concurrent_builds = max_concurrent_builds
         self._max_pending_builds = max_pending_builds
-        # Guards mutation of the ``_locks`` map itself so two coroutines racing
-        # to create the per-key lock can't each make a different one.
-        self._locks_guard = asyncio.Lock()
-
-    async def _lock_for(self, key: CacheKey) -> asyncio.Lock:
-        async with self._locks_guard:
-            lock = self._locks.get(key)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._locks[key] = lock
-            return lock
 
     def _fresh(self, key: CacheKey) -> Optional[_Entry]:
         entry = self._entries.get(key)
         if entry is None:
             return None
         if self._clock() - entry.created_monotonic >= self._ttl:
-            # Evict the expired entry so ``_entries`` doesn't retain a stale
-            # GraphView for every key ever queried. ``_locks`` is intentionally
-            # NOT pruned here: it holds one tiny ``asyncio.Lock`` per key
-            # (bounded by the number of distinct keys, a small finite set), and
-            # a concurrent coroutine may be awaiting that very lock — dropping
-            # it mid-flight would let a second builder run for the same key.
             del self._entries[key]
             return None
+        self._entries.move_to_end(key)
         return entry
+
+    def _evict_lru_entries(self) -> None:
+        """Enforce the completed-entry cap without evicting active keys."""
+        while len(self._entries) > self._max_entries:
+            candidate = next(
+                (entry_key for entry_key in self._entries if entry_key not in self._inflight),
+                None,
+            )
+            if candidate is None:
+                # Correctness wins over the memory target. Admission hard-caps
+                # this temporary overshoot at the number of in-flight builds.
+                return
+            self._entries.pop(candidate)
+
+    def _record_failed_deadline(self, key: CacheKey, status: BuildStatus) -> None:
+        """Keep recent deadline diagnostics bounded independently of views."""
+        self._failed_deadlines[key] = status
+        self._failed_deadlines.move_to_end(key)
+        while len(self._failed_deadlines) > self._max_entries:
+            self._failed_deadlines.popitem(last=False)
 
     def get_or_build_task(
         self, key: CacheKey, builder: Callable[[], Awaitable[GraphView]]
@@ -216,34 +227,30 @@ class GraphViewCache:
     async def _run_build(
         self, key: CacheKey, builder: Callable[[], Awaitable[GraphView]]
     ) -> GraphView:
-        lock = await self._lock_for(key)
-        async with lock:
-            entry = self._fresh(key)
-            if entry is not None:
-                return self._with_provenance(entry.view, cached=True, as_of=entry.as_of)
+        async with self._build_slots:
+            self._active_builds += 1
+            status = self._statuses[key]
+            status.state = "in_progress"
+            try:
+                view = await asyncio.wait_for(builder(), timeout=self._build_max_s)
+            except asyncio.TimeoutError as exc:
+                status.state = "failed_deadline"
+                self._record_failed_deadline(key, status)
+                raise GraphBuildDeadlineError(
+                    f"graph build exceeded {self._build_max_s:g} seconds"
+                ) from exc
+            finally:
+                self._active_builds -= 1
 
-            async with self._build_slots:
-                self._active_builds += 1
-                status = self._statuses[key]
-                status.state = "in_progress"
-                try:
-                    view = await asyncio.wait_for(builder(), timeout=self._build_max_s)
-                except asyncio.TimeoutError as exc:
-                    status.state = "failed_deadline"
-                    self._failed_deadlines[key] = status
-                    raise GraphBuildDeadlineError(
-                        f"graph build exceeded {self._build_max_s:g} seconds"
-                    ) from exc
-                finally:
-                    self._active_builds -= 1
-
-            as_of = datetime.now(timezone.utc).isoformat()
-            self._entries[key] = _Entry(
-                view=view,
-                created_monotonic=self._clock(),
-                as_of=as_of,
-            )
-            return self._with_provenance(view, cached=False, as_of=as_of)
+        as_of = datetime.now(timezone.utc).isoformat()
+        self._entries[key] = _Entry(
+            view=view,
+            created_monotonic=self._clock(),
+            as_of=as_of,
+        )
+        self._entries.move_to_end(key)
+        self._evict_lru_entries()
+        return self._with_provenance(view, cached=False, as_of=as_of)
 
     def _build_done(self, key: CacheKey, task: asyncio.Task[GraphView]) -> None:
         """Retrieve failures and release the cache's strong task reference."""
@@ -261,6 +268,7 @@ class GraphViewCache:
         if self._inflight.get(key) is task:
             self._inflight.pop(key, None)
             self._statuses.pop(key, None)
+            self._evict_lru_entries()
 
     def build_status(self, key: CacheKey) -> Optional[dict[str, Any]]:
         """Return additive timeout metadata for an active or deadline-failed key."""

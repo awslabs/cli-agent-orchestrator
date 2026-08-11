@@ -129,7 +129,13 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
 - The **projected `GraphView` is cached per
   `(provider, scope, scope_id, lint_enabled)`** with a **300-second TTL**
   (`DEFAULT_TTL_S = 300.0`). Lint-enabled and lint-disabled projections of the
-  same scope therefore use separate entries.
+  same scope therefore use separate entries. For the memory provider, unknown
+  scopes canonicalize to `global`; `global` and `federated` ignore
+  caller-supplied `scope_id` values, while `project`, `session`, and `agent`
+  retain them.
+- Completed views use a **64-entry LRU bound**. Eviction never removes an
+  in-flight key; if every candidate is in flight the cache temporarily admits
+  over the target, bounded by the four-task admission limit.
 - The cache, rather than the request, owns each cold projection task. A request
   waits up to 90 seconds, but timing out does not cancel the build. A retry for
   the same key joins that exact task, so one completed build populates the cache
@@ -139,8 +145,10 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
   that bounded pending queue, the API returns
   `build_state: "rejected_queue_full"` without creating a build for that key;
   the caller can retry after capacity clears. `build_state: "queued"` means a
-  real build task does exist and is waiting for a run slot. A build may hold its
-  per-key lock for at most 600 seconds, after which the key reports
+  real build task does exist and is waiting for a run slot. The two active
+  slots bound graph build coroutines, not live executor threads: a timed-out
+  `asyncio.to_thread` worker may continue after its coroutine releases a slot.
+  The cache awaits a build for at most 600 seconds, after which the key reports
   `failed_deadline` and can be retried.
 - `meta.cached` (bool) and `meta.as_of` (ISO-8601 UTC timestamp of the build)
   tell you whether a response was served from cache and when the underlying data
@@ -166,26 +174,41 @@ the difference is that they may now complete after the HTTP request has ended.
 > retry joins the in-progress task instead of restarting it. Across the measured
 > 146-166s lint-enabled range above, the HTTP route cannot return 200 on its
 > first attempt: CAO's own 90-second request deadline fires first. A client
-> honoring the five-second retry hint should converge at roughly 150-170 seconds
-> from the initial request. The existing 504 contract remains stable:
-> `detail.kind` is `"graph_projection_timeout"` and `retryable` is true.
-> The additive `build_state` field is always present (`started`, `in_progress`,
-> `queued`, `rejected_queue_full`, or `failed_deadline`). States describing an
-> actual build also carry `build_elapsed_s` and `build_started_at`.
-> `rejected_queue_full` intentionally carries `build_state` alone because no
-> build was started for that key. `retry_after_s` and the `Retry-After` header
-> remain five seconds. That short cadence is safe because retries join rather
-> than restart work, and it is deliberately below the 300-second TTL so a
-> conformant client retries before a completed entry can expire. Successful
+> retrying promptly after the five-second minimum should converge at roughly
+> 150-170 seconds from the initial request. This is conditional on client
+> cadence, not enforced by CAO: `Retry-After: 5` means wait **at least** five
+> seconds, and exponential backoff can return after the completed entry's
+> 300-second TTL, causing another cold build.
+>
+> The existing 504 contract remains stable: `detail.kind` is
+> `"graph_projection_timeout"` and `retryable` is true. For providers such as
+> `memory` that implement `projection_status`, the additive `build_state` field
+> is present (`started`, `in_progress`, `queued`, `rejected_queue_full`, or
+> `failed_deadline`). States describing an actual build also carry
+> `build_elapsed_s` and `build_started_at`. `rejected_queue_full` intentionally
+> carries `build_state` alone because no build was started for that key.
+> Providers without `projection_status` omit these build fields.
+> `retry_after_s` and the `Retry-After` header remain five seconds. Successful
 > memory responses always report `meta.lint_enabled` and
 > `meta.lint_enrichment`, so callers can verify which path ran.
+>
+> **600-second convergence cliff.** If a build reaches
+> `GRAPH_BUILD_MAX_S = 600`, CAO abandons it and caches nothing. Each retry then
+> starts another cold build that can also be abandoned, so the client never
+> converges. This is reachable through normal configuration, not only hostile
+> input: `wiki_lint` scans the server's current working directory, and the
+> measured 166-second run made 756 ripgrep spawns with zero per-spawn timeouts.
+> A larger repository can therefore consume the substantial headroom between
+> the observed range and the 600-second cache deadline; the 2,268-second
+> subprocess arithmetic above is not an end-to-end upper bound.
 
 On shutdown, CAO cancels and retrieves all tracked graph tasks. Cancellation
 cannot stop a blocking `asyncio.to_thread` worker already running a ripgrep
-subprocess. Python 3.10 and 3.11 do not provide the timeout argument added to
-`loop.shutdown_default_executor()` in 3.12, so Ctrl-C on a development server
-may wait for the remaining detector duration and the worker thread may outlive
-the event loop.
+subprocess. Python 3.10 and 3.11 provide no executor-shutdown timeout and may
+wait indefinitely. Python 3.12's `Runner.close()` supplies the 300-second
+`THREAD_JOIN_TIMEOUT`, which exceeds the measured 146-166-second builds and can
+therefore wait for their full remaining duration. A worker exceeding that join
+window may outlive the event loop.
 
 ## The API
 

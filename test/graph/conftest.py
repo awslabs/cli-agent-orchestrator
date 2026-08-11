@@ -30,10 +30,11 @@ def _isolate_graph_registries():
 def _clear_graph_cache():
     """Drop the module-level MemoryGraphProvider cache around every test.
 
-    The cache is keyed by (provider, scope, scope_id); most tests project
-    ("memory","global",None), so without a reset one test's projection would
-    be served to the next (and the stubbed run_lint of the previous test would
-    win). Clear before AND after so ordering can't leak either direction.
+    The cache is keyed by (provider, scope, scope_id, lint_enabled); most tests
+    project ("memory","global",None,True), so without a reset one test's
+    projection would be served to the next (and the stubbed run_lint of the
+    previous test would win). Clear before AND after so ordering can't leak
+    either direction.
     """
     memory_provider._CACHE.clear()
     yield

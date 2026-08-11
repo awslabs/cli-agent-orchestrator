@@ -4045,8 +4045,9 @@ async def _project_graph_with_timeout(
         )
 
     project_inflight = getattr(inst, "project_inflight", None)
+    cache_owned = callable(project_inflight)
     try:
-        if callable(project_inflight):
+        if cache_owned:
             inflight = project_inflight(**filters)
         else:
             inflight = asyncio.ensure_future(inst.project(**filters))
@@ -4062,10 +4063,27 @@ async def _project_graph_with_timeout(
         task_registry = app.state.graph_build_tasks = set()
     if not inflight.done():
         task_registry.add(inflight)
-        inflight.add_done_callback(task_registry.discard)
+
+        def _projection_done(future: asyncio.Future[GraphView]) -> None:
+            task_registry.discard(future)
+            try:
+                exc = future.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                logger.error(
+                    "detached graph projection failed for provider=%r key=%r: %r",
+                    provider,
+                    filters,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        inflight.add_done_callback(_projection_done)
 
     try:
-        return await asyncio.wait_for(asyncio.shield(inflight), timeout=timeout_s)
+        awaitable = asyncio.shield(inflight) if cache_owned else inflight
+        return await asyncio.wait_for(awaitable, timeout=timeout_s)
     except GraphBuildDeadlineError:
         build_status = _status()
         build_status["build_state"] = "failed_deadline"

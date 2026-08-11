@@ -232,6 +232,58 @@ def test_graph_projection_timeout_returns_structured_504(client, monkeypatch):
     assert resp.headers["Retry-After"] == str(api_main.GRAPH_PROJECTION_RETRY_AFTER_S)
 
 
+@pytest.mark.asyncio
+async def test_non_cache_projection_timeout_cancels_fallback_task():
+    cancelled = asyncio.Event()
+
+    class _FallbackProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await api_main._project_graph_with_timeout(
+            _FallbackProvider(),
+            {},
+            provider="fallback",
+            timeout_s=0.01,
+        )
+
+    assert exc_info.value.status_code == 504
+    await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_cache_owned_post_timeout_failure_is_retrieved_with_context(caplog):
+    release = asyncio.Event()
+
+    class _CacheOwnedProvider:
+        def project_inflight(self, **filters):
+            async def _fail():
+                await release.wait()
+                raise RuntimeError("late projection failure")
+
+            return asyncio.create_task(_fail())
+
+    with pytest.raises(HTTPException):
+        await api_main._project_graph_with_timeout(
+            _CacheOwnedProvider(),
+            {"scope": "global"},
+            provider="cache-owned",
+            timeout_s=0.01,
+        )
+
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert "detached graph projection failed" in caplog.text
+    assert "cache-owned" in caplog.text
+    assert "global" in caplog.text
+
+
 def test_health_responds_while_slow_graph_projection_in_flight(client, monkeypatch):
     @providers_base.register_provider("slow-health-provider")
     class _SlowHealthProvider(GraphProvider):

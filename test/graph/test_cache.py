@@ -15,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
 from cli_agent_orchestrator.graph.cache import (
     DEFAULT_TTL_S,
+    GRAPH_CACHE_MAX_ENTRIES,
     GraphBuildDeadlineError,
     GraphBuildQueueFullError,
     GraphViewCache,
@@ -162,27 +163,70 @@ class TestGraphViewCache:
         assert key not in cache._entries  # ...AND evicted, not merely skipped
 
     @pytest.mark.asyncio
-    async def test_repeated_expired_lookups_do_not_grow_entries(self):
-        """Across many distinct keys whose entries have all expired, a second
-        round of lookups must not leave ``_entries`` growing without bound —
-        each expired access evicts the entry it read.
-        """
-        clock = _FakeClock()
-        cache = GraphViewCache(ttl_s=300.0, clock=clock)
+    async def test_distinct_keys_do_not_grow_entries_beyond_lru_bound(self):
+        """Request-controlled distinct keys must not create permanent rows."""
+        cache = GraphViewCache(ttl_s=300.0)
 
         async def builder():
             return _view("a")
 
-        keys = [("memory", "global", f"k{i}", True) for i in range(50)]
+        keys = [("memory", "project", f"k{i}", True) for i in range(80)]
         for key in keys:
             await cache.get_or_build(key, builder)
-        assert len(cache._entries) == 50
 
-        clock.advance(300.1)  # expire every entry
-        # Read each key once (a miss): eviction should drain _entries.
-        for key in keys:
-            assert cache._fresh(key) is None
-        assert len(cache._entries) == 0
+        assert len(cache._entries) <= GRAPH_CACHE_MAX_ENTRIES
+
+    @pytest.mark.asyncio
+    async def test_entry_cap_uses_lru_order(self):
+        cache = GraphViewCache(max_entries=2)
+
+        async def builder():
+            return _view("a")
+
+        key1 = ("memory", "project", "one", True)
+        key2 = ("memory", "project", "two", True)
+        key3 = ("memory", "project", "three", True)
+        await cache.get_or_build(key1, builder)
+        await cache.get_or_build(key2, builder)
+        await cache.get_or_build(key1, builder)  # refresh key1's recency
+        await cache.get_or_build(key3, builder)
+
+        assert list(cache._entries) == [key1, key3]
+
+    @pytest.mark.asyncio
+    async def test_entry_cap_rechecks_after_inflight_keys_complete(self):
+        cache = GraphViewCache(max_concurrent_builds=2, max_entries=1)
+        release = asyncio.Event()
+
+        async def builder():
+            await release.wait()
+            return _view("a")
+
+        tasks = [
+            cache.get_or_build_task(("memory", "project", f"k{i}", True), builder)
+            for i in range(2)
+        ]
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(0)
+
+        assert len(cache._entries) == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_deadline_diagnostics_are_bounded(self):
+        cache = GraphViewCache(build_max_s=0, max_entries=3)
+
+        async def builder():
+            await asyncio.sleep(0)
+            return _view("never")
+
+        for i in range(5):
+            key = ("memory", "project", f"deadline-{i}", True)
+            with pytest.raises(GraphBuildDeadlineError):
+                await cache.get_or_build(key, builder)
+
+        assert len(cache._failed_deadlines) == 3
 
     def test_make_meta_does_not_mutate_base(self):
         base = {"provider": "memory", "scope": "global"}
@@ -297,7 +341,7 @@ class TestGraphViewCache:
         assert view.meta["cached"] is True
 
     @pytest.mark.asyncio
-    async def test_build_deadline_releases_lock_and_key_recovers(self):
+    async def test_build_deadline_makes_key_recoverable_without_per_key_locks(self):
         cache = GraphViewCache(build_max_s=0.01)
         key = ("memory", "global", None, True)
 
@@ -308,7 +352,9 @@ class TestGraphViewCache:
         with pytest.raises(GraphBuildDeadlineError):
             await cache.get_or_build(key, hangs)
         assert cache.build_status(key)["build_state"] == "failed_deadline"
-        assert not cache._locks[key].locked()
+        assert not hasattr(cache, "_locks")
+        assert not hasattr(cache, "_locks_guard")
+        assert not hasattr(cache, "_lock_for")
 
         recovered = await cache.get_or_build(key, lambda: asyncio.sleep(0, result=_view("ok")))
         assert {node.id for node in recovered.nodes} == {"ok"}
@@ -446,6 +492,53 @@ def _patch_lint_env(monkeypatch, db_engine, svc) -> None:
 
 
 class TestProviderCacheIntegration:
+    @pytest.mark.asyncio
+    async def test_request_scope_ids_do_not_create_unbounded_entries(self, monkeypatch):
+        cache = GraphViewCache()
+        monkeypatch.setattr(memory_provider, "_CACHE", cache)
+        provider = MemoryGraphProvider(lint_enabled=lambda: False)
+
+        async def _build(scope, scope_id, lint_enabled):
+            return GraphView(nodes=[], edges=[], meta={})
+
+        monkeypatch.setattr(provider, "_build", _build)
+        for i in range(80):
+            await provider.project(scope="project", scope_id=f"project-{i}")
+
+        assert len(cache._entries) == GRAPH_CACHE_MAX_ENTRIES
+
+    @pytest.mark.asyncio
+    async def test_global_scope_ids_collapse_to_one_build(self, monkeypatch):
+        """Ignored global scope_ids must not consume every admission slot."""
+        cache = GraphViewCache()
+        monkeypatch.setattr(memory_provider, "_CACHE", cache)
+        provider = MemoryGraphProvider(lint_enabled=lambda: False)
+        release = asyncio.Event()
+        calls = 0
+
+        async def _blocked_build(scope, scope_id, lint_enabled):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return GraphView(
+                nodes=[],
+                edges=[],
+                meta={"scope": scope, "scope_id": scope_id},
+            )
+
+        monkeypatch.setattr(provider, "_build", _blocked_build)
+        tasks = [
+            provider.project_inflight(scope="global", scope_id=f"ignored-{i}")
+            for i in range(4)
+        ]
+        await asyncio.sleep(0)
+        release.set()
+        views = await asyncio.gather(*tasks)
+
+        assert calls == 1
+        assert len(cache._entries) == 1
+        assert all(view.meta["scope_id"] is None for view in views)
+
     @pytest.mark.asyncio
     async def test_second_project_call_does_not_rerun_lint(self, svc, db_engine, monkeypatch):
         """The money shot: run_lint is called ONCE across two project() calls

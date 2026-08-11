@@ -2,8 +2,8 @@
 
 Projects one memory scope's wiki into a GraphView by calling the
 memory-service internals directly (ADR-1: no facade, no MemoryBackend
-ABC, no edits to memory_service/wiki_lint) and awaiting
-``wiki_lint.run_lint`` in-request (ADR-7).
+ABC, no edits to memory_service/wiki_lint). Expensive builds run in
+cache-owned tasks so request deadlines do not cancel them.
 """
 
 import asyncio
@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 from cli_agent_orchestrator.graph.cache import CacheKey, GraphViewCache
 from cli_agent_orchestrator.graph.models import Edge, EdgeType, GraphView, Node
 from cli_agent_orchestrator.graph.providers.base import GraphProvider, register_provider
+from cli_agent_orchestrator.models.memory import MemoryScope
 from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
@@ -22,10 +23,23 @@ logger = logging.getLogger(__name__)
 # route instantiates a fresh provider per request via get_provider, so a
 # per-instance cache would never hit). DELIBERATE reversal of the original
 # "lint-on-demand, no caching" ADR — see graph/cache.py for the perf finding
-# (ripgrep stale_claim ~20s + LLM ~8.5s ⇒ ~30s typical, up to ~148s under
-# load, past the frontend's 120s timeout). Keyed by
-# (provider, scope, scope_id, lint_enabled).
+# (ripgrep stale_claim dominated two 146-166s local runs). Keyed by (provider,
+# scope, scope_id, lint_enabled).
 _CACHE = GraphViewCache()
+
+_SCOPES_CONSUMING_SCOPE_ID = frozenset(
+    {
+        MemoryScope.PROJECT.value,
+        MemoryScope.SESSION.value,
+        MemoryScope.AGENT.value,
+    }
+)
+_SCOPES_IGNORING_SCOPE_ID = frozenset(
+    {
+        MemoryScope.GLOBAL.value,
+        MemoryScope.FEDERATED.value,
+    }
+)
 
 
 @register_provider("memory")
@@ -54,10 +68,11 @@ class MemoryGraphProvider(GraphProvider):
         """Return this scope's GraphView, served from cache when fresh.
 
         The expensive build (``_build`` — which awaits ``wiki_lint.run_lint``)
-        runs at most once per (scope, scope_id) per TTL window; concurrent cold
-        requests for the same key collapse onto a single build (single-flight,
-        see GraphViewCache). ``meta.cached`` / ``meta.as_of`` tell the frontend
-        whether it got a hit and when the underlying data was projected.
+        runs at most once per canonical (scope, scope_id, lint_enabled) per TTL
+        window; concurrent cold requests for the same key collapse onto a
+        single build (single-flight, see GraphViewCache). ``meta.cached`` /
+        ``meta.as_of`` tell the frontend whether it got a hit and when the
+        underlying data was projected.
         """
         return await self.project_inflight(**filters)
 
@@ -78,9 +93,24 @@ class MemoryGraphProvider(GraphProvider):
         self,
         filters: dict[str, Any],
     ) -> tuple[CacheKey, str, Optional[str], bool]:
-        scope = str(filters.get("scope", "global"))
+        raw_scope = filters.get("scope", MemoryScope.GLOBAL.value)
+        try:
+            scope = MemoryScope(raw_scope).value
+        except (TypeError, ValueError):
+            scope = MemoryScope.GLOBAL.value
+
         raw_scope_id = filters.get("scope_id")
-        scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
+        supplied_scope_id: Optional[str] = (
+            None if raw_scope_id is None else str(raw_scope_id)
+        )
+        if scope in _SCOPES_CONSUMING_SCOPE_ID:
+            scope_id = supplied_scope_id
+        elif scope in _SCOPES_IGNORING_SCOPE_ID:
+            scope_id = None
+        else:
+            # Fail closed for a newly-added, not-yet-classified scope: retain
+            # tenant identity until the completeness test forces classification.
+            scope_id = supplied_scope_id
         lint_enabled = self._lint_enabled()
         key: CacheKey = ("memory", scope, scope_id, lint_enabled)
         return key, scope, scope_id, lint_enabled

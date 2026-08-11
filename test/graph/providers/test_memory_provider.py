@@ -18,7 +18,9 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
 from cli_agent_orchestrator.graph.models import EdgeType, GraphView
 from cli_agent_orchestrator.graph.providers import get_provider
+from cli_agent_orchestrator.graph.providers import memory as memory_provider
 from cli_agent_orchestrator.graph.providers.memory import MemoryGraphProvider
+from cli_agent_orchestrator.models.memory import MemoryScope
 from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.wiki_lint import LintIssue
@@ -202,6 +204,38 @@ class TestMemoryProviderHappyPath:
 
 
 class TestMemoryProviderEdgeCases:
+    def test_scope_id_classification_covers_every_memory_scope(self):
+        consuming = memory_provider._SCOPES_CONSUMING_SCOPE_ID
+        ignoring = memory_provider._SCOPES_IGNORING_SCOPE_ID
+
+        assert consuming.isdisjoint(ignoring)
+        assert consuming | ignoring == {scope.value for scope in MemoryScope}
+
+    @pytest.mark.asyncio
+    async def test_scope_and_scope_id_are_canonical_in_meta(self, monkeypatch):
+        provider = MemoryGraphProvider(lint_enabled=lambda: False)
+
+        async def _echo_build(scope, scope_id, lint_enabled):
+            return GraphView(
+                nodes=[],
+                edges=[],
+                meta={"scope": scope, "scope_id": scope_id},
+            )
+
+        monkeypatch.setattr(provider, "_build", _echo_build)
+
+        global_view = await provider.project(scope="global", scope_id="ignored")
+        project_view = await provider.project(scope="project", scope_id="project-1")
+        enum_view = await provider.project(scope=MemoryScope.PROJECT, scope_id="project-2")
+        unknown_view = await provider.project(scope="not-a-memory-scope", scope_id="ignored")
+
+        assert global_view.meta["scope_id"] is None
+        assert project_view.meta["scope_id"] == "project-1"
+        assert enum_view.meta["scope"] == "project"
+        assert enum_view.meta["scope_id"] == "project-2"
+        assert unknown_view.meta["scope"] == "global"
+        assert unknown_view.meta["scope_id"] is None
+
     @pytest.mark.asyncio
     async def test_empty_scope_returns_empty_view(self, svc):
         """AC 5: a scope with no wiki on disk → empty GraphView, not an error."""
