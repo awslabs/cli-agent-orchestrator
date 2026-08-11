@@ -136,9 +136,16 @@ def test_real_server_tool_names_are_unchanged_when_mode_is_off() -> None:
 def test_real_server_fastmcp_32_app_tool_reachability() -> None:
     """Characterize FastMCP 3.2's known app-only tool visibility limitation.
 
-    This drives the real assembled server through ``fastmcp.Client``. When
-    native app-tool registration lands, this test is expected to fail and must
-    be updated to assert that all six app tools are listed and callable.
+    This drives the real assembled server through ``fastmcp.Client``. The
+    shipped iframe currently sends bare names from ``mcpApp.ts:callServerTool``.
+    Its ``fetchHistory()`` awaits that call before evaluating
+    ``result?.events ?? []``, so an unknown ``cao_fetch_history`` rejects the
+    promise rather than degrading to an empty timeline.
+
+    When native app-tool registration lands, calls will likely use
+    ``{app}___{tool}`` names. This test is expected to fail then: update its
+    expectations together with ``mcpApp.ts:callServerTool`` and rebuild the
+    bundles so the server and shipped frontend change in lockstep.
     """
 
     result = _probe_real_server(apps_only="true")
@@ -231,4 +238,6 @@ async def test_app_surface_tool_names_match_registration(monkeypatch) -> None:
     assert register_app_tools(mcp) is True
 
     registered_names = {tool.name for tool in await mcp.local_provider.list_tools()}
+    # register_widget() adds a resource, not a tool, so this is the complete
+    # drift guard for the app-surface tool allowlist.
     assert registered_names == APP_SURFACE_TOOL_NAMES
