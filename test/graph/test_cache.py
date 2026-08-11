@@ -493,6 +493,37 @@ def _patch_lint_env(monkeypatch, db_engine, svc) -> None:
 
 class TestProviderCacheIntegration:
     @pytest.mark.asyncio
+    async def test_lint_mode_isolates_cache_entries(self, monkeypatch):
+        """The returned artifact must match its lint mode, not a cached view
+        built for the other mode.
+        """
+        cache = GraphViewCache()
+        monkeypatch.setattr(memory_provider, "_CACHE", cache)
+        lint_state = {"enabled": False}
+        provider = MemoryGraphProvider(lint_enabled=lambda: lint_state["enabled"])
+        calls = 0
+
+        async def _build(scope, scope_id, lint_enabled):
+            nonlocal calls
+            calls += 1
+            return GraphView(
+                nodes=[],
+                edges=[],
+                meta={"lint_enabled": lint_enabled},
+            )
+
+        monkeypatch.setattr(provider, "_build", _build)
+
+        lint_disabled_view = await provider.project(scope="global")
+        lint_state["enabled"] = True
+        lint_enabled_view = await provider.project(scope="global")
+
+        assert calls == 2
+        assert len(cache._entries) == 2
+        assert lint_disabled_view.meta["lint_enabled"] is False
+        assert lint_enabled_view.meta["lint_enabled"] is True
+
+    @pytest.mark.asyncio
     async def test_request_scope_ids_do_not_create_unbounded_entries(self, monkeypatch):
         cache = GraphViewCache()
         monkeypatch.setattr(memory_provider, "_CACHE", cache)

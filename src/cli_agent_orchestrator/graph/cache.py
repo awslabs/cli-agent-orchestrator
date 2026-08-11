@@ -51,8 +51,11 @@ DEFAULT_TTL_S = 300.0
 GRAPH_BUILD_MAX_S = 600.0
 
 # Bounds graph build coroutines admitted to the active section. A timed-out
-# ``asyncio.to_thread`` worker can outlive both its coroutine and this slot, so
-# this is not a bound on live executor threads.
+# ``asyncio.to_thread`` body can retain a shared default-executor worker after
+# its coroutine releases this slot. Unstarted executor jobs remain cancellable,
+# so thread growth stops at the pool size (14 here: min(32, cpu_count + 4)), but
+# abandoned sweeps can occupy every worker. That starves later graph builds into
+# ``failed_deadline`` and blocks every other ``asyncio.to_thread`` user.
 GRAPH_BUILD_CONCURRENCY = 2
 
 # At most two additional keys may wait behind the running builds. Once this

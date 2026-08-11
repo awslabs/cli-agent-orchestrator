@@ -133,6 +133,15 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
   scopes canonicalize to `global`; `global` and `federated` ignore
   caller-supplied `scope_id` values, while `project`, `session`, and `agent`
   retain them.
+  Before this canonicalization, distinct `scope_id` values on `global` minted
+  distinct keys for the same index path. With lint explicitly disabled, a
+  review measured 331 new permanent keys per second against the old unbounded
+  cache. That is not the shipped default: with lint enabled, the measured
+  146-166-second cost and two-build concurrency yielded roughly two completed
+  keys per 150 seconds, while four distinct aliases could occupy both active
+  and both pending slots and reject the legitimate `scope=global` request.
+  Canonicalization removes both the memory-growth alias and this availability
+  failure; the LRU is a separate memory backstop for genuinely distinct keys.
 - Completed views use a **64-entry LRU bound**. Eviction never removes an
   in-flight key; if every candidate is in flight the cache temporarily admits
   over the target, bounded by the four-task admission limit.
@@ -175,10 +184,27 @@ the difference is that they may now complete after the HTTP request has ended.
 > 146-166s lint-enabled range above, the HTTP route cannot return 200 on its
 > first attempt: CAO's own 90-second request deadline fires first. A client
 > retrying promptly after the five-second minimum should converge at roughly
-> 150-170 seconds from the initial request. This is conditional on client
-> cadence, not enforced by CAO: `Retry-After: 5` means wait **at least** five
-> seconds, and exponential backoff can return after the completed entry's
-> 300-second TTL, causing another cold build.
+> 150-170 seconds from the initial request. The estimate remains valid if the
+> build finishes in the five-second gap after the first 90-second request:
+> the completed view is cached and the retry is an immediate hit.
+>
+> That convergence depends on three distinct regimes:
+>
+> 1. **Hard build deadline.** Convergence degrades gracefully as build duration
+>    grows below `GRAPH_BUILD_MAX_S = 600`, because retries keep joining the
+>    admitted task. At 600 seconds or longer, CAO abandons the build and caches
+>    nothing. Every retry starts another build that is also abandoned, so the
+>    client never converges. The 2,268-second detector ceiling above is
+>    therefore a non-converging case, not merely a response slower than 170s.
+> 2. **Client cadence.** CAO assumes prompt retries but does not enforce them.
+>    `Retry-After: 5` means wait **at least** five seconds. A conformant client
+>    using exponential backoff can return after the completed entry's
+>    300-second TTL, find it expired, and start another cold build.
+> 3. **Initial admission.** If all four active and pending slots are occupied
+>    when a key first arrives, CAO returns `rejected_queue_full`; retries cannot
+>    create that key's build until capacity clears. Once the key is admitted,
+>    retries find and join its in-flight task before the queue-capacity check,
+>    so that admitted build cannot subsequently be rejected.
 >
 > The existing 504 contract remains stable: `detail.kind` is
 > `"graph_projection_timeout"` and `retryable` is true. For providers such as
@@ -192,10 +218,7 @@ the difference is that they may now complete after the HTTP request has ended.
 > memory responses always report `meta.lint_enabled` and
 > `meta.lint_enrichment`, so callers can verify which path ran.
 >
-> **600-second convergence cliff.** If a build reaches
-> `GRAPH_BUILD_MAX_S = 600`, CAO abandons it and caches nothing. Each retry then
-> starts another cold build that can also be abandoned, so the client never
-> converges. This is reachable through normal configuration, not only hostile
+> The hard cliff is reachable through normal configuration, not only hostile
 > input: `wiki_lint` scans the server's current working directory, and the
 > measured 166-second run made 756 ripgrep spawns with zero per-spawn timeouts.
 > A larger repository can therefore consume the substantial headroom between
@@ -205,10 +228,12 @@ the difference is that they may now complete after the HTTP request has ended.
 On shutdown, CAO cancels and retrieves all tracked graph tasks. Cancellation
 cannot stop a blocking `asyncio.to_thread` worker already running a ripgrep
 subprocess. Python 3.10 and 3.11 provide no executor-shutdown timeout and may
-wait indefinitely. Python 3.12's `Runner.close()` supplies the 300-second
-`THREAD_JOIN_TIMEOUT`, which exceeds the measured 146-166-second builds and can
-therefore wait for their full remaining duration. A worker exceeding that join
-window may outlive the event loop.
+wait indefinitely. In Python 3.12, `asyncio/runners.py:73` passes
+`constants.THREAD_JOIN_TIMEOUT = 300` to executor shutdown. Uvicorn reaches
+that live path through `asyncio_run` at `uvicorn/server.py:67`. Because 300
+seconds exceeds the measured 146-166-second builds, shutdown can wait for their
+full remaining duration even after lifespan cancellation has tidied the
+asyncio task. A worker exceeding the join window may outlive the event loop.
 
 ## The API
 
