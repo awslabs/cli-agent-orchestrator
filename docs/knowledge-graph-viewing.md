@@ -126,9 +126,11 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
   the same key joins that exact task, so one completed build populates the cache
   even when its initiating request has already returned 504.
 - Concurrent cold requests for the same key collapse onto one task. At most two
-  detached graph builds run globally; additional keys wait with
-  `build_state: "queued"`. A build may hold its per-key lock for at most 600
-  seconds, after which the key reports `failed_deadline` and can be retried.
+  detached graph builds run globally and at most two more keys wait. Beyond
+  that bounded pending queue, the API returns `build_state: "queued"` without
+  creating a task; the caller can retry after capacity clears. A build may hold
+  its per-key lock for at most 600 seconds, after which the key reports
+  `failed_deadline` and can be retried.
 - `meta.cached` (bool) and `meta.as_of` (ISO-8601 UTC timestamp of the build)
   tell you whether a response was served from cache and when the underlying data
   was projected.
@@ -155,8 +157,10 @@ the difference is that they may now complete after the HTTP request has ended.
 > `retryable` is true. Additive fields report `build_state`
 > (`started`, `in_progress`, `queued`, or `failed_deadline`),
 > `build_elapsed_s`, and `build_started_at`; `retry_after_s` and the
-> `Retry-After` header carry a dynamic remaining-time estimate floored at five
-> seconds. Successful memory responses always report `meta.lint_enabled` and
+> `Retry-After` header remain five seconds. That short cadence is safe because
+> retries join rather than restart work, and it is deliberately below the
+> 300-second TTL so a conformant client retries before a completed entry can
+> expire. Successful memory responses always report `meta.lint_enabled` and
 > `meta.lint_enrichment`, so callers can verify which path ran.
 
 On shutdown, CAO cancels and retrieves all tracked graph tasks. Cancellation

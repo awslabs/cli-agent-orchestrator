@@ -16,6 +16,7 @@ from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
 from cli_agent_orchestrator.graph.cache import (
     DEFAULT_TTL_S,
     GraphBuildDeadlineError,
+    GraphBuildQueueFullError,
     GraphViewCache,
     make_meta,
 )
@@ -238,6 +239,64 @@ class TestGraphViewCache:
         assert key in cache._entries
 
     @pytest.mark.asyncio
+    async def test_client_honoring_retry_after_returns_before_cache_ttl_expires(self):
+        """Retry-After must be shorter than the cache TTL.
+
+        A hint at or beyond the TTL lets the completed entry expire before a
+        conformant client returns, restoring the permanent cold-start
+        non-convergence this design exists to fix.
+        """
+        from cli_agent_orchestrator.api import main as api_main
+
+        clock = _FakeClock()
+        cache = GraphViewCache(ttl_s=DEFAULT_TTL_S, clock=clock)
+        key = ("memory", "global", None, True)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def builder():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return _view("completed")
+
+        class Provider:
+            def project_inflight(self, **filters):
+                return cache.get_or_build_task(key, builder)
+
+            def projection_status(self, **filters):
+                return cache.build_status(key)
+
+        build = cache.get_or_build_task(key, builder)
+        await started.wait()
+        with pytest.raises(HTTPException) as exc_info:
+            await api_main._project_graph_with_timeout(
+                Provider(),
+                {},
+                provider="memory",
+                timeout_s=0,
+            )
+
+        retry_after_s = exc_info.value.detail["retry_after_s"]
+        assert retry_after_s == int(exc_info.value.headers["Retry-After"])
+        assert retry_after_s < DEFAULT_TTL_S
+
+        release.set()
+        await build
+        clock.advance(retry_after_s)
+        view = await api_main._project_graph_with_timeout(
+            Provider(),
+            {},
+            provider="memory",
+            timeout_s=0.1,
+        )
+
+        assert calls == 1
+        assert view.meta["cached"] is True
+
+    @pytest.mark.asyncio
     async def test_build_deadline_releases_lock_and_key_recovers(self):
         cache = GraphViewCache(build_max_s=0.01)
         key = ("memory", "global", None, True)
@@ -273,6 +332,33 @@ class TestGraphViewCache:
         assert cache.build_status(key2)["build_state"] == "queued"
         release.set()
         await asyncio.gather(task1, task2)
+
+    @pytest.mark.asyncio
+    async def test_full_pending_queue_rejects_key_without_creating_task(self):
+        cache = GraphViewCache(max_concurrent_builds=1, max_pending_builds=1)
+        release = asyncio.Event()
+        active_key = ("memory", "project", "active", True)
+        pending_key = ("memory", "project", "pending", True)
+        rejected_key = ("memory", "project", "rejected", True)
+
+        async def blocked():
+            await release.wait()
+            return _view("done")
+
+        active = cache.get_or_build_task(active_key, blocked)
+        await asyncio.sleep(0)
+        pending = cache.get_or_build_task(pending_key, blocked)
+
+        with pytest.raises(GraphBuildQueueFullError) as exc_info:
+            cache.get_or_build_task(rejected_key, blocked)
+
+        assert exc_info.value.build_status["build_state"] == "queued"
+        assert cache.inflight_task(rejected_key) is None
+        assert rejected_key not in cache._statuses
+        assert len(cache._inflight) == 2
+
+        release.set()
+        await asyncio.gather(active, pending)
 
     @pytest.mark.asyncio
     async def test_inflight_registry_drops_strong_reference_after_completion(self):

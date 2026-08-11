@@ -4,7 +4,6 @@ import asyncio
 import fcntl
 import json
 import logging
-import math
 import os
 import pty
 import re
@@ -73,7 +72,7 @@ from cli_agent_orchestrator.constants import (
     is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
-from cli_agent_orchestrator.graph.cache import GRAPH_BUILD_MAX_S, GraphBuildDeadlineError
+from cli_agent_orchestrator.graph.cache import GraphBuildDeadlineError, GraphBuildQueueFullError
 from cli_agent_orchestrator.graph.models import GraphView
 from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider, list_providers
 
@@ -150,6 +149,10 @@ TMUX_KEY_PATTERN = re.compile(
     r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
 )
 GRAPH_PROJECTION_TIMEOUT_S = 90.0
+# Keep this below the graph cache TTL. Retries are cheap single-flight joins,
+# so a short cadence cannot restart or duplicate the build; a hint beyond the
+# TTL can instead make a conformant client return only after the completed
+# entry has expired, restoring permanent cold-start non-convergence.
 GRAPH_PROJECTION_RETRY_AFTER_S = 5
 
 
@@ -4019,19 +4022,6 @@ async def _project_graph_with_timeout(
     provider: str,
     timeout_s: float = GRAPH_PROJECTION_TIMEOUT_S,
 ) -> GraphView:
-    project_inflight = getattr(inst, "project_inflight", None)
-    if callable(project_inflight):
-        inflight = project_inflight(**filters)
-    else:
-        inflight = asyncio.ensure_future(inst.project(**filters))
-
-    task_registry = getattr(app.state, "graph_build_tasks", None)
-    if task_registry is None:
-        task_registry = app.state.graph_build_tasks = set()
-    if not inflight.done():
-        task_registry.add(inflight)
-        inflight.add_done_callback(task_registry.discard)
-
     def _status() -> Dict[str, Any]:
         projection_status = getattr(inst, "projection_status", None)
         if not callable(projection_status):
@@ -4039,12 +4029,6 @@ async def _project_graph_with_timeout(
         return cast(Dict[str, Any], projection_status(**filters) or {})
 
     def _timeout(build_status: Dict[str, Any]) -> HTTPException:
-        elapsed = float(build_status.get("build_elapsed_s", 0.0))
-        retry_after_s = (
-            max(GRAPH_PROJECTION_RETRY_AFTER_S, math.ceil(GRAPH_BUILD_MAX_S - elapsed))
-            if build_status
-            else GRAPH_PROJECTION_RETRY_AFTER_S
-        )
         return HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={
@@ -4054,11 +4038,27 @@ async def _project_graph_with_timeout(
                 "provider": provider,
                 "metadata": {"graph_projection_timeout": True},
                 "retryable": True,
-                "retry_after_s": retry_after_s,
+                "retry_after_s": GRAPH_PROJECTION_RETRY_AFTER_S,
                 **build_status,
             },
-            headers={"Retry-After": str(retry_after_s)},
+            headers={"Retry-After": str(GRAPH_PROJECTION_RETRY_AFTER_S)},
         )
+
+    project_inflight = getattr(inst, "project_inflight", None)
+    try:
+        if callable(project_inflight):
+            inflight = project_inflight(**filters)
+        else:
+            inflight = asyncio.ensure_future(inst.project(**filters))
+    except GraphBuildQueueFullError as exc:
+        raise _timeout(exc.build_status)
+
+    task_registry = getattr(app.state, "graph_build_tasks", None)
+    if task_registry is None:
+        task_registry = app.state.graph_build_tasks = set()
+    if not inflight.done():
+        task_registry.add(inflight)
+        inflight.add_done_callback(task_registry.discard)
 
     try:
         return await asyncio.wait_for(asyncio.shield(inflight), timeout=timeout_s)

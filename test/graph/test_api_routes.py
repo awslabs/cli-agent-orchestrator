@@ -265,11 +265,12 @@ def test_health_responds_while_slow_graph_projection_in_flight(client, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_global_build_cap_timeout_keeps_kind_and_reports_queued():
-    cache = GraphViewCache(max_concurrent_builds=1)
+async def test_full_build_queue_keeps_kind_and_rejects_without_task():
+    cache = GraphViewCache(max_concurrent_builds=1, max_pending_builds=1)
     release = asyncio.Event()
     active_key = ("memory", "project", "active", True)
-    queued_key = ("memory", "project", "queued", True)
+    pending_key = ("memory", "project", "pending", True)
+    rejected_key = ("memory", "project", "rejected", True)
 
     async def blocked():
         await release.wait()
@@ -277,13 +278,14 @@ async def test_global_build_cap_timeout_keeps_kind_and_reports_queued():
 
     active = cache.get_or_build_task(active_key, blocked)
     await asyncio.sleep(0)
+    pending = cache.get_or_build_task(pending_key, blocked)
 
     class _QueuedProvider:
         def project_inflight(self, **filters):
-            return cache.get_or_build_task(queued_key, blocked)
+            return cache.get_or_build_task(rejected_key, blocked)
 
         def projection_status(self, **filters):
-            return cache.build_status(queued_key)
+            return cache.build_status(rejected_key)
 
     try:
         with pytest.raises(HTTPException) as exc_info:
@@ -299,12 +301,11 @@ async def test_global_build_cap_timeout_keeps_kind_and_reports_queued():
         assert detail["build_state"] == "queued"
         assert detail["build_elapsed_s"] >= 0
         assert detail["build_started_at"]
+        assert cache.inflight_task(rejected_key) is None
+        assert rejected_key not in cache._statuses
     finally:
         release.set()
-        await active
-        queued = cache.inflight_task(queued_key)
-        if queued is not None:
-            await queued
+        await asyncio.gather(active, pending)
 
 
 @pytest.mark.asyncio

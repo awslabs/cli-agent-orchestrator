@@ -56,6 +56,12 @@ GRAPH_BUILD_MAX_S = 600.0
 # unrelated executor users.
 GRAPH_BUILD_CONCURRENCY = 2
 
+# At most two additional keys may wait behind the running builds. Once this
+# queue is full, callers receive queued status without allocating a detached
+# task, so caller-controlled scope_ids cannot grow the task registry without
+# bound.
+GRAPH_BUILD_QUEUE_MAX = 2
+
 # Cache key: (provider name, scope, scope_id, lint_enabled). scope_id is
 # normalized to a string-or-None so ``("memory","global",None,True)`` and a
 # project projection never collide, a global request never serves a
@@ -86,6 +92,14 @@ class GraphBuildDeadlineError(asyncio.TimeoutError):
     """A graph build exceeded ``GRAPH_BUILD_MAX_S`` and released its key lock."""
 
 
+class GraphBuildQueueFullError(Exception):
+    """No detached task was created because the bounded build queue is full."""
+
+    def __init__(self, build_status: dict[str, Any]) -> None:
+        super().__init__("graph build queue is full")
+        self.build_status = build_status
+
+
 class GraphViewCache:
     """Async-safe TTL cache whose tasks own single-flight projection work.
 
@@ -102,9 +116,12 @@ class GraphViewCache:
         clock: Callable[[], float] = time.monotonic,
         build_max_s: float = GRAPH_BUILD_MAX_S,
         max_concurrent_builds: int = GRAPH_BUILD_CONCURRENCY,
+        max_pending_builds: int = GRAPH_BUILD_QUEUE_MAX,
     ) -> None:
         if max_concurrent_builds < 1:
             raise ValueError("max_concurrent_builds must be at least 1")
+        if max_pending_builds < 0:
+            raise ValueError("max_pending_builds must not be negative")
         self._ttl = ttl_s
         self._clock = clock
         self._build_max_s = build_max_s
@@ -116,6 +133,7 @@ class GraphViewCache:
         self._build_slots = asyncio.Semaphore(max_concurrent_builds)
         self._active_builds = 0
         self._max_concurrent_builds = max_concurrent_builds
+        self._max_pending_builds = max_pending_builds
         # Guards mutation of the ``_locks`` map itself so two coroutines racing
         # to create the per-key lock can't each make a different one.
         self._locks_guard = asyncio.Lock()
@@ -165,12 +183,24 @@ class GraphViewCache:
             return task
 
         started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = self._clock()
+        if len(self._inflight) >= self._max_concurrent_builds + self._max_pending_builds:
+            raise GraphBuildQueueFullError(
+                self._status_dict(
+                    BuildStatus(
+                        state="queued",
+                        started_monotonic=started_monotonic,
+                        started_at=started_at,
+                    )
+                )
+            )
+
         initial_state: BuildState = (
             "started" if len(self._statuses) < self._max_concurrent_builds else "queued"
         )
         self._statuses[key] = BuildStatus(
             state=initial_state,
-            started_monotonic=self._clock(),
+            started_monotonic=started_monotonic,
             started_at=started_at,
         )
         self._failed_deadlines.pop(key, None)
@@ -239,6 +269,9 @@ class GraphViewCache:
         status = self._statuses.get(key) or self._failed_deadlines.get(key)
         if status is None:
             return None
+        return self._status_dict(status)
+
+    def _status_dict(self, status: BuildStatus) -> dict[str, Any]:
         return {
             "build_state": status.state,
             "build_elapsed_s": max(0.0, self._clock() - status.started_monotonic),
