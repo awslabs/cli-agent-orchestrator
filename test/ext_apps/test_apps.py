@@ -259,7 +259,8 @@ class TestRegisterApps:
         assert len(records) == 1
         assert records[0].levelno >= logging.WARNING
         assert "registered 4 handlers" in records[0].getMessage()
-        assert "4/4 artifacts present" not in records[0].getMessage()
+        assert "0/4 artifacts present" in records[0].getMessage()
+        assert str(tmp_path) in records[0].getMessage()
 
     def test_decorator_failure_logs_error_with_uri(
         self,

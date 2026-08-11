@@ -207,7 +207,9 @@ def register_apps(mcp: Any) -> bool:
       logged at warning and returns ``False``;
     * per-URI decorator failures are logged with ``logger.exception``;
     * the summary is logged at warning when any expected artifact is absent and
-      at info when all artifacts are present.
+      at info when all artifacts are present. It describes startup state in the
+      resolved directory, not steady state; artifacts removed later are reported
+      by the request-time warning, while content integrity is not checked here.
     """
 
     if not _is_enabled():
