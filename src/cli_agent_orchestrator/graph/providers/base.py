@@ -17,6 +17,23 @@ class GraphProvider(ABC):
     Uniformly async (ADR-7) so U4's route handler never needs to branch
     between a sync and an async provider. Never raises for an empty
     result — returns an empty GraphView(nodes=[], edges=[]).
+
+    Providers may expose two optional, non-abstract hooks:
+
+    * ``project_inflight(**filters)`` returns a cache-owned projection Future.
+      Without it, request timeout cancellation reaches ``project()`` directly,
+      and the provider forfeits the graph route's single-flight deduplication
+      and cache admission control.
+    * ``projection_status(**filters)`` returns additive build status for a
+      projection. Without it, timeout responses omit ``build_state``,
+      ``build_elapsed_s``, and ``build_started_at``.
+
+    These hooks are intentionally documentation-only seams. Adding concrete
+    defaults would make the route's ``callable()`` capability checks always
+    true, silently killing the heterogeneous fallback path; any future default
+    must remove both checks and that fallback in the same change.
+
+    Trivial providers need only implement ``project``.
     """
 
     @abstractmethod

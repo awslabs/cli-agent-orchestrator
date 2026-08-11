@@ -23,7 +23,10 @@ from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.graph.cache import GraphViewCache
 from cli_agent_orchestrator.graph.models import GraphView, Node
 from cli_agent_orchestrator.graph.providers import base as providers_base
+from cli_agent_orchestrator.graph.providers import memory as memory_provider
 from cli_agent_orchestrator.graph.providers.base import GraphProvider
+from cli_agent_orchestrator.graph.providers.memory import MemoryGraphProvider
+from cli_agent_orchestrator.graph.providers.stub import StubGraphProvider
 from cli_agent_orchestrator.graph.sinks import base as sinks_base
 from cli_agent_orchestrator.graph.sinks.base import GraphSink
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -256,6 +259,56 @@ async def test_non_cache_projection_timeout_cancels_fallback_task():
 
 
 @pytest.mark.asyncio
+async def test_optional_provider_hooks_control_timeout_build_fields(monkeypatch):
+    stub = StubGraphProvider()
+
+    async def _slow_stub(**filters):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stub, "project", _slow_stub)
+    with pytest.raises(HTTPException) as stub_exc:
+        await api_main._project_graph_with_timeout(
+            stub,
+            {},
+            provider="stub",
+            timeout_s=0.01,
+        )
+
+    assert not callable(getattr(stub, "project_inflight", None))
+    assert not callable(getattr(stub, "projection_status", None))
+    assert "build_state" not in stub_exc.value.detail
+    assert "build_elapsed_s" not in stub_exc.value.detail
+    assert "build_started_at" not in stub_exc.value.detail
+
+    release = asyncio.Event()
+    memory = MemoryGraphProvider(lint_enabled=lambda: False)
+
+    async def _slow_memory(scope, scope_id, lint_enabled):
+        await release.wait()
+        return GraphView(nodes=[], edges=[])
+
+    monkeypatch.setattr(memory, "_build", _slow_memory)
+    with pytest.raises(HTTPException) as memory_exc:
+        await api_main._project_graph_with_timeout(
+            memory,
+            {"scope": "global"},
+            provider="memory",
+            timeout_s=0.01,
+        )
+
+    assert callable(getattr(memory, "project_inflight", None))
+    assert callable(getattr(memory, "projection_status", None))
+    assert memory_exc.value.detail["build_state"] in {"started", "in_progress"}
+    assert "build_elapsed_s" in memory_exc.value.detail
+    assert "build_started_at" in memory_exc.value.detail
+
+    task = memory_provider._CACHE.inflight_task(("memory", "global", None, False))
+    assert task is not None
+    release.set()
+    await task
+
+
+@pytest.mark.asyncio
 async def test_cache_owned_post_timeout_failure_is_retrieved_with_context(caplog):
     release = asyncio.Event()
 
@@ -353,6 +406,10 @@ async def test_full_build_queue_keeps_kind_and_rejects_without_task(caplog):
         assert detail["build_state"] == "rejected_queue_full"
         assert "build_elapsed_s" not in detail
         assert "build_started_at" not in detail
+        assert detail["retry_after_s"] == api_main.GRAPH_PROJECTION_RETRY_AFTER_S
+        assert exc_info.value.headers["Retry-After"] == str(
+            api_main.GRAPH_PROJECTION_RETRY_AFTER_S
+        )
         assert cache.inflight_task(rejected_key) is None
         assert rejected_key not in cache._statuses
         assert "graph projection rejected because build queue is full" in caplog.text
@@ -390,6 +447,9 @@ async def test_build_deadline_timeout_keeps_kind_and_reports_failed_deadline():
     assert exc_info.value.status_code == 504
     assert exc_info.value.detail["kind"] == "graph_projection_timeout"
     assert exc_info.value.detail["build_state"] == "failed_deadline"
+    assert exc_info.value.detail["retryable"] is True
+    assert exc_info.value.detail["retry_after_s"] == int(api_main.GRAPH_BUILD_MAX_S)
+    assert exc_info.value.headers["Retry-After"] == str(int(api_main.GRAPH_BUILD_MAX_S))
 
 
 # ── POST /graph/{provider}/export ────────────────────────────────────────
@@ -594,6 +654,13 @@ def test_get_graph_provider_value_error_400(client, value_error_provider):
     resp = client.get(f"/graph/{value_error_provider}?scope=bogus")
     assert resp.status_code == 400
     assert "bad filter value" in resp.json()["detail"]
+
+
+def test_memory_provider_rejects_unrecognized_scope(client):
+    resp = client.get("/graph/memory?scope=not-a-memory-scope")
+
+    assert resp.status_code == 400
+    assert "unrecognized memory scope" in resp.json()["detail"]
 
 
 def test_post_export_provider_value_error_400(client, value_error_provider, stub_test_sink):

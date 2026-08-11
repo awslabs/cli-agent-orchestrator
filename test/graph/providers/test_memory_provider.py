@@ -227,14 +227,37 @@ class TestMemoryProviderEdgeCases:
         global_view = await provider.project(scope="global", scope_id="ignored")
         project_view = await provider.project(scope="project", scope_id="project-1")
         enum_view = await provider.project(scope=MemoryScope.PROJECT, scope_id="project-2")
-        unknown_view = await provider.project(scope="not-a-memory-scope", scope_id="ignored")
 
         assert global_view.meta["scope_id"] is None
         assert project_view.meta["scope_id"] == "project-1"
         assert enum_view.meta["scope"] == "project"
         assert enum_view.meta["scope_id"] == "project-2"
-        assert unknown_view.meta["scope"] == "global"
-        assert unknown_view.meta["scope_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_scope_fails_before_cache_admission(self):
+        provider = MemoryGraphProvider(lint_enabled=lambda: False)
+
+        with pytest.raises(ValueError, match="unrecognized memory scope"):
+            provider.project_inflight(scope="not-a-memory-scope", scope_id="ignored")
+
+        assert memory_provider._CACHE._entries == {}
+        assert memory_provider._CACHE._inflight == {}
+        assert memory_provider._CACHE._statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_ignored_scope_id_is_reported_in_meta(self, svc):
+        provider = MemoryGraphProvider(memory_service=svc, lint_enabled=lambda: False)
+
+        global_view = await provider.project(scope="global", scope_id="redundant")
+        federated_view = await provider.project(scope="federated", scope_id="redundant")
+        project_view = await provider.project(scope="project", scope_id="retained")
+
+        assert global_view.meta["scope_id"] is None
+        assert global_view.meta["ignored_filters"] == ["scope_id"]
+        assert federated_view.meta["scope_id"] is None
+        assert federated_view.meta["ignored_filters"] == ["scope_id"]
+        assert project_view.meta["scope_id"] == "retained"
+        assert "ignored_filters" not in project_view.meta
 
     @pytest.mark.asyncio
     async def test_empty_scope_returns_empty_view(self, svc):

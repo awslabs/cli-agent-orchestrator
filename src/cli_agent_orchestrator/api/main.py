@@ -72,7 +72,11 @@ from cli_agent_orchestrator.constants import (
     is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
-from cli_agent_orchestrator.graph.cache import GraphBuildDeadlineError, GraphBuildQueueFullError
+from cli_agent_orchestrator.graph.cache import (
+    GRAPH_BUILD_MAX_S,
+    GraphBuildDeadlineError,
+    GraphBuildQueueFullError,
+)
 from cli_agent_orchestrator.graph.models import GraphView
 from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider, list_providers
 
@@ -4029,6 +4033,11 @@ async def _project_graph_with_timeout(
         return cast(Dict[str, Any], projection_status(**filters) or {})
 
     def _timeout(build_status: Dict[str, Any]) -> HTTPException:
+        retry_after_s = (
+            int(GRAPH_BUILD_MAX_S)
+            if build_status.get("build_state") == "failed_deadline"
+            else GRAPH_PROJECTION_RETRY_AFTER_S
+        )
         return HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={
@@ -4038,10 +4047,10 @@ async def _project_graph_with_timeout(
                 "provider": provider,
                 "metadata": {"graph_projection_timeout": True},
                 "retryable": True,
-                "retry_after_s": GRAPH_PROJECTION_RETRY_AFTER_S,
+                "retry_after_s": retry_after_s,
                 **build_status,
             },
-            headers={"Retry-After": str(GRAPH_PROJECTION_RETRY_AFTER_S)},
+            headers={"Retry-After": str(retry_after_s)},
         )
 
     project_inflight = getattr(inst, "project_inflight", None)

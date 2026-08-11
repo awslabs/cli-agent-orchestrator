@@ -283,12 +283,9 @@ class TestGraphViewCache:
         assert key in cache._entries
 
     @pytest.mark.asyncio
-    async def test_client_honoring_retry_after_returns_before_cache_ttl_expires(self):
-        """Retry-After must be shorter than the cache TTL.
-
-        A hint at or beyond the TTL lets the completed entry expire before a
-        conformant client returns, restoring the permanent cold-start
-        non-convergence this design exists to fix.
+    async def test_fixed_retry_cadence_joins_completed_build_before_ttl(self):
+        """The ordinary timeout hint and header agree, and a retry at that
+        fixed cadence hits the completed single-flight build before its TTL.
         """
         from cli_agent_orchestrator.api import main as api_main
 
@@ -536,7 +533,22 @@ class TestProviderCacheIntegration:
         for i in range(80):
             await provider.project(scope="project", scope_id=f"project-{i}")
 
-        assert len(cache._entries) == GRAPH_CACHE_MAX_ENTRIES
+        map_bounds = {
+            "_entries": cache._max_entries,
+            "_inflight": cache._max_concurrent_builds + cache._max_pending_builds,
+            "_statuses": cache._max_concurrent_builds + cache._max_pending_builds,
+            "_failed_deadlines": cache._max_entries,
+        }
+        cache_maps = {
+            name: value
+            for name, value in vars(cache).items()
+            if isinstance(value, dict)
+        }
+
+        # A newly-added retention map must declare and test its own bound.
+        assert set(cache_maps) == set(map_bounds)
+        for name, cache_map in cache_maps.items():
+            assert len(cache_map) <= map_bounds[name], name
 
     @pytest.mark.asyncio
     async def test_global_scope_ids_collapse_to_one_build(self, monkeypatch):
@@ -562,9 +574,11 @@ class TestProviderCacheIntegration:
             provider.project_inflight(scope="global", scope_id=f"ignored-{i}")
             for i in range(4)
         ]
+        legitimate = provider.project_inflight(scope="global")
+        assert legitimate is tasks[0]
         await asyncio.sleep(0)
         release.set()
-        views = await asyncio.gather(*tasks)
+        views = await asyncio.gather(*tasks, legitimate)
 
         assert calls == 1
         assert len(cache._entries) == 1

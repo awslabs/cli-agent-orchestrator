@@ -108,8 +108,8 @@ class MemoryGraphProvider(GraphProvider):
         raw_scope = filters.get("scope", MemoryScope.GLOBAL.value)
         try:
             scope = MemoryScope(raw_scope).value
-        except (TypeError, ValueError):
-            scope = MemoryScope.GLOBAL.value
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"unrecognized memory scope: {raw_scope!r}") from exc
 
         raw_scope_id = filters.get("scope_id")
         supplied_scope_id: Optional[str] = (
@@ -136,6 +136,10 @@ class MemoryGraphProvider(GraphProvider):
             "lint_enabled": lint_enabled,
             "lint_enrichment": "enabled" if lint_enabled else "disabled",
         }
+        if scope in _SCOPES_IGNORING_SCOPE_ID:
+            # This is a property of the canonical scope, not the request, so
+            # every caller sharing this cached view receives truthful metadata.
+            meta["ignored_filters"] = ["scope_id"]
         if not lint_enabled:
             meta["disabled_enrichments"] = list(_DISABLED_ENRICHMENTS)
 

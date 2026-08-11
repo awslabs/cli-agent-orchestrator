@@ -129,18 +129,20 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
 - The **projected `GraphView` is cached per
   `(provider, scope, scope_id, lint_enabled)`** with a **300-second TTL**
   (`DEFAULT_TTL_S = 300.0`). Lint-enabled and lint-disabled projections of the
-  same scope therefore use separate entries. For the memory provider, unknown
-  scopes canonicalize to `global`; `global` and `federated` ignore
+  same scope therefore use separate entries. The memory provider rejects an
+  unrecognized scope with HTTP 400. `global` and `federated` ignore
   caller-supplied `scope_id` values, while `project`, `session`, and `agent`
-  retain them.
-  Before this canonicalization, distinct `scope_id` values on `global` minted
+  retain them. Views for the ignoring scopes report
+  `meta.ignored_filters: ["scope_id"]`; their canonical `meta.scope_id` is
+  `null`.
+  Before this `scope_id` normalization, distinct values on `global` minted
   distinct keys for the same index path. With lint explicitly disabled, a
   review measured 331 new permanent keys per second against the old unbounded
   cache. That is not the shipped default: with lint enabled, the measured
   146-166-second cost and two-build concurrency yielded roughly two completed
   keys per 150 seconds, while four distinct aliases could occupy both active
   and both pending slots and reject the legitimate `scope=global` request.
-  Canonicalization removes both the memory-growth alias and this availability
+  Normalization removes both the memory-growth alias and this availability
   failure; the LRU is a separate memory backstop for genuinely distinct keys.
 - Completed views use a **64-entry LRU bound**. Eviction never removes an
   in-flight key; if every candidate is in flight the cache temporarily admits
@@ -197,9 +199,11 @@ the difference is that they may now complete after the HTTP request has ended.
 >    client never converges. The 2,268-second detector ceiling above is
 >    therefore a non-converging case, not merely a response slower than 170s.
 > 2. **Client cadence.** CAO assumes prompt retries but does not enforce them.
->    `Retry-After: 5` means wait **at least** five seconds. A conformant client
->    using exponential backoff can return after the completed entry's
->    300-second TTL, find it expired, and start another cold build.
+>    `Retry-After: 5` means wait **at least** five seconds. Before completion at
+>    time B, a retry joins the in-flight build. After completion, a retry must
+>    arrive before B + 300 seconds to hit the cached entry. A conformant client
+>    using exponential backoff can arrive later, find it expired, and start
+>    another cold build.
 > 3. **Initial admission.** If all four active and pending slots are occupied
 >    when a key first arrives, CAO returns `rejected_queue_full`; retries cannot
 >    create that key's build until capacity clears. Once the key is admitted,
@@ -214,8 +218,12 @@ the difference is that they may now complete after the HTTP request has ended.
 > `build_elapsed_s` and `build_started_at`. `rejected_queue_full` intentionally
 > carries `build_state` alone because no build was started for that key.
 > Providers without `projection_status` omit these build fields.
-> `retry_after_s` and the `Retry-After` header remain five seconds. Successful
-> memory responses always report `meta.lint_enabled` and
+> For ordinary projection timeouts and queue rejection, `retry_after_s` and
+> the `Retry-After` header remain five seconds. `failed_deadline` advertises
+> 600 seconds instead: retry cannot succeed while the build continues to exceed
+> `GRAPH_BUILD_MAX_S`, but the frozen `retryable: true` value remains pending a
+> joint KiroCrew control-flow decision. Successful memory responses always
+> report `meta.lint_enabled` and
 > `meta.lint_enrichment`, so callers can verify which path ran.
 >
 > The hard cliff is reachable through normal configuration, not only hostile
