@@ -880,6 +880,57 @@ class StableAgentIncarnationModel(Base):
     )
 
 
+class RestoreContractModel(Base):
+    """One immutable, append-only restore contract (cond-0378 B1).
+
+    A versioned record of the no-secret relaunch facts of one exact source
+    incarnation (``(terminal_id, generation)``) of one native lineage of one
+    stable agent.  ``contract_json`` is the canonical serialization and
+    ``contract_digest`` its sha256; the row is immutable after first
+    publication — a repeat of the identical contract adopts the row, changed
+    content for the same source incarnation conflicts, and a new source
+    incarnation appends a new row.  Only references/digests travel in the
+    record, never secret values.
+
+    Uniqueness is scoped to the exact source incarnation, mirroring the
+    roster incarnation identity: one restore contract per (terminal_id,
+    generation) pair, with generation-less legacy rows keyed on the terminal
+    id alone via the NULL-generation partial index.
+    """
+
+    __tablename__ = "restore_contracts"
+
+    contract_id = Column(Text, primary_key=True)
+    contract_digest = Column(Text, nullable=False)
+    schema_version = Column(Text, nullable=False)
+    agent_id = Column(Text, nullable=False)
+    lineage_id = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    generation = Column(Text, nullable=True)
+    #: NULL is the truthful ``identity_missing`` lineage state.
+    native_session_id = Column(Text, nullable=True)
+    contract_json = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_restore_contracts_terminal_generation",
+            "terminal_id",
+            "generation",
+            unique=True,
+            sqlite_where=text("generation IS NOT NULL"),
+        ),
+        Index(
+            "ix_restore_contracts_terminal_legacy",
+            "terminal_id",
+            unique=True,
+            sqlite_where=text("generation IS NULL"),
+        ),
+        Index("ix_restore_contracts_agent_id", "agent_id"),
+        Index("ix_restore_contracts_lineage_id", "lineage_id"),
+    )
+
+
 class NativeStatusRepairEvidenceModel(Base):
     """One immutable bounded record of a native /status identity repair.
 
@@ -1412,6 +1463,7 @@ def init_db() -> None:
     _migrate_managed_launch_reservations()
     _migrate_managed_launch_v2()
     _migrate_stable_agent_roster()
+    _migrate_restore_contracts()
     _migrate_native_status_repair()
     _migrate_native_status_observation_attempt()
     _migrate_legacy_identity_migration()
@@ -1943,6 +1995,56 @@ def _migrate_stable_agent_roster() -> None:
                 )
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"stable-agent roster migration failed: {e}")
+
+
+def _migrate_restore_contracts() -> None:
+    """Create the immutable restore-contract store on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via
+    ``RestoreContractModel``; this idempotent migration covers databases
+    created before cond-0378 B1.  The DDL is byte-compatible with the ORM
+    model so both paths yield one schema.  Additive and dark: an old binary
+    never reads this table, and existing M3-A roster rows are untouched.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS restore_contracts ("
+                "contract_id TEXT NOT NULL PRIMARY KEY, "
+                "contract_digest TEXT NOT NULL, "
+                "schema_version TEXT NOT NULL, "
+                "agent_id TEXT NOT NULL, "
+                "lineage_id TEXT NOT NULL, "
+                "terminal_id TEXT NOT NULL, "
+                "generation TEXT, "
+                "native_session_id TEXT, "
+                "contract_json TEXT NOT NULL, "
+                "created_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_restore_contracts_terminal_generation ON restore_contracts"
+                "(terminal_id, generation) WHERE generation IS NOT NULL"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_restore_contracts_terminal_legacy "
+                "ON restore_contracts(terminal_id) WHERE generation IS NULL"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_restore_contracts_agent_id "
+                "ON restore_contracts(agent_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_restore_contracts_lineage_id "
+                "ON restore_contracts(lineage_id)"
+            )
+    except Exception as e:  # noqa: BLE001 - the transition path fails closed
+        logger.warning(f"restore-contract migration failed: {e}")
 
 
 def _migrate_native_status_repair() -> None:

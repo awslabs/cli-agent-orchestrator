@@ -61,15 +61,17 @@ across provider, tmux, or network I/O.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from cli_agent_orchestrator.clients import database
-from cli_agent_orchestrator.services import native_attachment
+from cli_agent_orchestrator.services import native_attachment, restore_contract
 
 #: Versioned identity contract of the roster itself.  A reader that sees an
 #: unknown ``resume_contract_version`` must degrade truthfully (flag it in
@@ -1032,6 +1034,250 @@ def retire_incarnation(
         result = _retire(session)
         session.commit()
         return result
+
+
+class _TransitionLostUpdate(StableAgentError):
+    """Internal sentinel: a concurrent writer won the live->retired CAS.
+
+    Never surfaced to callers — the wrapper converts it into a retry (standalone
+    path) or a typed ``StableAgentUnavailable`` for the caller to retry (caller-
+    owned ``db`` path), so the loser adopts the committed exact state instead of
+    racing a second write.
+    """
+
+    code = "stable-agent-transition-lost"
+
+
+def transition_dormant(
+    *,
+    terminal_id: str,
+    generation: Optional[str],
+    agent_id: str,
+    lineage_id: str,
+    contract_digest: str,
+    reason: str = "dormant-transition",
+    db: Any = None,
+) -> dict[str, Any]:
+    """Atomically retire the exact live source incarnation and mark its stable
+    agent dormant, preserving/linking the immutable restore contract.
+
+    The B1 narrow roster transition a later exact same-native-session
+    reincarnation needs: the source incarnation is the exact physical
+    identity ``(terminal_id, generation)``, and the transition is refused —
+    with zero mutation — when the generation/incarnation is stale, the agent
+    or lineage is wrong, a successor incarnation is already live, or the
+    immutable restore contract is missing or mismatched (including a
+    legacy/corrupt stored contract that no longer matches the authoritative
+    roster rows).
+
+    Concurrency: the live->retired mutation is a conditional write (CAS on the
+    incarnation disposition), so exactly one call performs it and every other
+    concurrent caller observes/adopts the already-committed exact state; the
+    durable first retirement reason is never overwritten.  No lock is held
+    across provider, tmux, or network I/O.
+
+    Replaying the identical transition converges (adopts) ONLY while the
+    source incarnation is still the agent's current incarnation — replaying a
+    prior incarnation after a successor took over is historical/stale and
+    refused even if the whole agent is dormant again.
+
+    The restore contract must be published first (``restore_contract
+    .publish_contract``); it is the durable basis of a later exact resume and
+    this transition never mutates it — the source incarnation's row stays
+    immutable and linked.  The native lineage row is never touched: the
+    provider-native conversation identity survives the retirement of the
+    disposable pane.
+
+    Ordinary teardown (``retire_incarnation``) is unchanged; later slices
+    deliberately adopt this transition when they retire an incarnation that
+    must be resurrectable.
+    """
+    contract_digest = _require_text(contract_digest, field="contract_digest", max_len=64)
+    reason = _require_text(reason, field="reason", max_len=512)
+
+    def _transition(session: Any) -> dict[str, Any]:
+        incarnation = _incarnation_by_exact(session, terminal_id, generation)
+        if incarnation is None:
+            raise StableAgentConflict(
+                f"no stable-agent incarnation is recorded for terminal {terminal_id} "
+                f"generation {generation}; a stale generation/incarnation cannot "
+                "transition dormant"
+            )
+        if incarnation.agent_id != agent_id:
+            raise StableAgentConflict(
+                f"incarnation {incarnation.incarnation_id} belongs to stable agent "
+                f"{incarnation.agent_id!r}, not {agent_id!r}; a dormant transition "
+                "never crosses agents"
+            )
+        if incarnation.lineage_id is None or incarnation.lineage_id != lineage_id:
+            raise StableAgentConflict(
+                f"incarnation {incarnation.incarnation_id} is bound to lineage "
+                f"{incarnation.lineage_id!r}, not {lineage_id!r}; a dormant transition "
+                "never crosses native lineages"
+            )
+        agent = _agent_by_id(session, agent_id)
+        if agent is None:  # pragma: no cover - FK-less store, defensive
+            raise StableAgentUnavailable(
+                f"incarnation {incarnation.incarnation_id} has no stable agent row"
+            )
+
+        # The immutable restore contract for this exact source incarnation
+        # must exist and match before any state change.
+        contract = restore_contract.get_contract_by_incarnation(
+            terminal_id=terminal_id, generation=generation, db=session
+        )
+        if contract is None:
+            raise StableAgentConflict(
+                f"no immutable restore contract is recorded for source incarnation "
+                f"{terminal_id}/{generation}; publish one before the dormant transition"
+            )
+        if contract["contract_digest"] != contract_digest:
+            raise StableAgentConflict(
+                f"restore contract digest mismatch for source incarnation "
+                f"{terminal_id}/{generation}: recorded {contract['contract_digest']}, "
+                f"expected {contract_digest}; changed content conflicts"
+            )
+        # Total revalidation of the STORED contract against the authoritative
+        # rows before any mutation: a legacy/corrupt/mismatched stored row never
+        # retires the source.  `stored_payload_mismatch` refuses every
+        # malformed/unknown shape (invalid JSON, non-mapping, missing identity
+        # keys, unknown schema version) with a typed refusal, and compares a
+        # well-shaped payload exactly (agent, lineage, harness, native id, route
+        # provenance, mode) — never a raw KeyError/TypeError.
+        lineage = _lineage_by_id(session, lineage_id)
+        if lineage is None:  # pragma: no cover - FK-less store, defensive
+            raise StableAgentUnavailable(f"lineage {lineage_id} has no row")
+        stored_payload = contract.get("contract")
+        mismatch = restore_contract.stored_payload_mismatch(stored_payload, incarnation, lineage)
+        if mismatch is not None:
+            raise StableAgentConflict(
+                f"stored restore contract cannot authorize the dormant transition: {mismatch}"
+            )
+
+        stamp = _now()
+        if incarnation.disposition == INCARNATION_RETIRED:
+            # Exact replay convergence: the source incarnation is already
+            # retired.  It adopts ONLY while the agent is dormant AND the source
+            # is still the agent's current incarnation; a successor (live or
+            # retired) makes the replay historical/stale and is refused.
+            if agent.disposition != DISPOSITION_DORMANT:
+                raise StableAgentConflict(
+                    f"stable agent {agent_id} is {agent.disposition!r} with a live "
+                    f"successor; retiring the already-retired source incarnation "
+                    f"{incarnation.incarnation_id} again is refused"
+                )
+            if agent.current_incarnation_id != incarnation.incarnation_id:
+                raise StableAgentConflict(
+                    f"stable agent {agent_id} is dormant but its current incarnation is "
+                    f"{agent.current_incarnation_id!r}, not the retired source "
+                    f"{incarnation.incarnation_id!r}; replaying this source's transition "
+                    "is historical/stale and refused"
+                )
+            return {
+                "agent": _agent_dict(agent),
+                "incarnation": _incarnation_dict(incarnation),
+                "contract": contract,
+                "adopted": True,
+            }
+
+        if incarnation.disposition not in LIVE_INCARNATION_DISPOSITIONS:
+            raise StableAgentConflict(
+                f"incarnation {incarnation.incarnation_id} is {incarnation.disposition!r}; "
+                "only a bound/admitted source incarnation can transition dormant"
+            )
+        if agent.current_incarnation_id != incarnation.incarnation_id:
+            raise StableAgentConflict(
+                f"incarnation {incarnation.incarnation_id} is not the current incarnation "
+                f"of stable agent {agent_id} (current={agent.current_incarnation_id!r}); "
+                "a stale incarnation cannot be retired as dormant"
+            )
+        if _agent_has_live_incarnation(
+            session, agent_id, except_incarnation_id=incarnation.incarnation_id
+        ):
+            raise StableAgentConflict(
+                f"stable agent {agent_id} already has a live successor incarnation; "
+                f"retiring {incarnation.incarnation_id} as dormant is refused "
+                "(one live incarnation per stable agent)"
+            )
+
+        # The live->retired mutation is a compare-and-swap on the incarnation
+        # disposition: exactly one concurrent caller wins it, every other caller
+        # observes rowcount 0 (or a busy retry) and adopts the committed state.
+        # The agent's dormant mark and single revision increment commit in the
+        # same SQLite transaction as the CAS.
+        result = session.execute(
+            sa_update(database.StableAgentIncarnationModel)
+            .where(
+                database.StableAgentIncarnationModel.incarnation_id == incarnation.incarnation_id,
+                database.StableAgentIncarnationModel.disposition.in_(
+                    sorted(LIVE_INCARNATION_DISPOSITIONS)
+                ),
+            )
+            .values(
+                disposition=INCARNATION_RETIRED,
+                retired_at=stamp,
+                retirement_reason=reason,
+                updated_at=stamp,
+            )
+        )
+        if result.rowcount == 0:
+            # A concurrent writer won the transition (or it was already retired
+            # between our read and the CAS).  Adopt the committed exact state.
+            raise _TransitionLostUpdate(
+                f"concurrent writer transitioned source incarnation "
+                f"{incarnation.incarnation_id}; adopting the committed state"
+            )
+        session.execute(
+            sa_update(database.StableAgentModel)
+            .where(database.StableAgentModel.agent_id == agent_id)
+            .values(
+                disposition=DISPOSITION_DORMANT,
+                revision=database.StableAgentModel.revision + 1,
+                updated_at=stamp,
+            )
+        )
+        session.refresh(incarnation)
+        session.refresh(agent)
+        return {
+            "agent": _agent_dict(agent),
+            "incarnation": _incarnation_dict(incarnation),
+            "contract": contract,
+            "adopted": False,
+        }
+
+    if db is not None:
+        # The caller owns this session's transaction: the transition's writes
+        # run directly in it (NO savepoint), so the caller's commit/rollback is
+        # the atomic boundary and a rollback truthfully leaves the roster
+        # unchanged.  A lost CAS or a busy store is a typed refusal the caller
+        # retries; the winner's committed state is adopted on that retry.
+        try:
+            return _transition(db)
+        except (_TransitionLostUpdate, IntegrityError, OperationalError) as exc:
+            raise StableAgentUnavailable(
+                f"concurrent dormant transition refused; retry the transition to adopt: {exc}"
+            ) from exc
+
+    last_error: Optional[BaseException] = None
+    for _attempt in range(5):
+        try:
+            with database.SessionLocal() as session:
+                result = _transition(session)
+                session.commit()
+                return result
+        except (_TransitionLostUpdate, OperationalError) as exc:
+            # A concurrent writer won the CAS or SQLite reported a busy/locked
+            # snapshot.  The session is rolled back; retry in a fresh session
+            # so the next pass reads the winner's committed retired/dormant
+            # state and adopts it.
+            last_error = exc
+            time.sleep(0.05)
+        except IntegrityError as exc:  # pragma: no cover - defensive
+            last_error = exc
+            time.sleep(0.05)
+    raise StableAgentUnavailable(
+        f"concurrent dormant transitions kept racing; refusing after retry: {last_error}"
+    )
 
 
 def record_native_identity(
