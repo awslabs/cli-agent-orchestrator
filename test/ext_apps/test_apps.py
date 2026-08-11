@@ -357,6 +357,43 @@ class TestRegisterApps:
         assert len(request_records) == 1
         assert request_records[0].levelno >= logging.WARNING
 
+    def test_handlers_and_bound_body_resolver_agree_for_all_resources(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        startup_dir = tmp_path / "startup"
+        current_dir = tmp_path / "current"
+        startup_dir.mkdir()
+        current_dir.mkdir()
+        for uri, name in _RESOURCE_FILES.items():
+            (startup_dir / name).write_text(f"<title>STARTUP {uri}</title>", encoding="utf-8")
+            (current_dir / name).write_text(f"<title>CURRENT {uri}</title>", encoding="utf-8")
+
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(startup_dir))
+        handlers = {}
+
+        class StubMCP:
+            def resource(self, uri, **kw):  # type: ignore[no-untyped-def]
+                def decorator(fn):  # type: ignore[no-untyped-def]
+                    handlers[uri] = fn
+                    return fn
+
+                return decorator
+
+        assert register_apps(StubMCP()) is True
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(current_dir))
+
+        for uri in _RESOURCE_FILES:
+            handler_html = handlers[uri]()
+            bound_html = get_resource_body(uri, startup_dir)
+            current_html = get_resource_body(uri)
+            assert handler_html == bound_html
+            assert f"STARTUP {uri}" in handler_html
+            assert f"CURRENT {uri}" in current_html
+            assert current_html != handler_html
+
     def test_decorator_failure_logs_error_with_uri(
         self,
         tmp_path,

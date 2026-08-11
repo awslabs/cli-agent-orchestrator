@@ -187,20 +187,23 @@ def _read_resource_html(filename: str, base_dir: Optional[Path] = None) -> Optio
     return html or None
 
 
-def get_resource_body(uri: str) -> str:
+def get_resource_body(uri: str, base_dir: Optional[Path] = None) -> str:
     """Return the HTML body for a registered ``ui://cao/*`` resource.
 
-    Resolves the artifact via :func:`apps_static_dir` (env override → packaged
-    location → source tree). Raises ``KeyError`` for an unknown URI and
-    ``FileNotFoundError`` when the artifact is absent or empty (e.g. the frontend
-    has not been built completely in a dev tree). Production wheels always ship
-    the artifacts via the hatch ``artifacts`` rule in ``pyproject.toml``.
+    When ``base_dir`` is provided, resolves only from that directory so registered
+    handlers and direct reads can share the handler's startup snapshot. Without
+    it, intentionally resolves via :func:`apps_static_dir` on each call for
+    stateless callers that are not attached to a server registration. Raises
+    ``KeyError`` for an unknown URI and ``FileNotFoundError`` when the artifact is
+    absent or empty (e.g. the frontend has not been built completely in a dev
+    tree). Production wheels always ship the artifacts via the hatch ``artifacts``
+    rule in ``pyproject.toml``.
     """
 
     filename = _RESOURCE_FILES.get(uri)
     if filename is None:
         raise KeyError(f"Unknown MCP Apps resource: {uri}")
-    html = _read_resource_html(filename)
+    html = _read_resource_html(filename, base_dir)
     if html is None:
         raise FileNotFoundError(f"MCP App artifact not found or empty: {filename}")
     return html
@@ -219,7 +222,8 @@ def register_apps(mcp: Any) -> bool:
       at info when all artifacts are present. It describes startup state in the
       resolved directory, not steady state. Registered handlers retain that
       directory and read it per request, warning when an artifact is then missing
-      or empty; :func:`get_resource_body` still resolves the directory per call.
+      or empty; unbound :func:`get_resource_body` calls remain intentionally
+      stateless and resolve the current configured directory per call.
     """
 
     if not _is_enabled():
@@ -250,11 +254,11 @@ def register_apps(mcp: Any) -> bool:
 
         def _make_handler(fname: str, resource_uri: str, base_dir: Path):
             def _handler() -> str:
-                html = _read_resource_html(fname, base_dir)
-                if html is None:
+                try:
+                    return get_resource_body(resource_uri, base_dir)
+                except FileNotFoundError:
                     logger.warning("MCP App artifact missing at request time: %s", fname)
                     return f"<!doctype html><title>{resource_uri}</title><p>view not built</p>"
-                return html
 
             return _handler
 
