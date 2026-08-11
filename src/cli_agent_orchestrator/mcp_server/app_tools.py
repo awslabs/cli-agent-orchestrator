@@ -491,13 +491,13 @@ def _route_command(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def register_app_tools(mcp: Any) -> bool:
-    """Register the five MCP App tools on the FastMCP server.
+    """Register the six MCP App tools on the FastMCP server.
 
     Best-effort and side-effect free when disabled:
 
     * returns ``False`` (logging at info level) when ``CAO_MCP_APPS_ENABLED`` is
       unset or when registration cannot proceed for any reason;
-    * otherwise registers the five tools (with ``visibility`` + ``_meta.ui``
+    * otherwise registers the six tools (with ``visibility`` + ``_meta.ui``
       annotations), also mounts the ``ui://cao/*`` resources via
       :func:`ext_apps.register_apps`, and returns ``True``.
     """

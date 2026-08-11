@@ -49,17 +49,24 @@ uv run cao-server
 uv run cao-mcp-server
 ```
 
-`CAO_MCP_APPS_ONLY` exposes only `render_dashboard`, `render_agent_view`,
-`cao_fetch_history`, `subscribe_events`, `render_graph_view`, and
-`submit_command`. It hides in-session tools such as `handoff`, `assign`, and
-`send_message`, which require a CAO-managed terminal. This behavior is explicit;
-it is never inferred from a missing `CAO_TERMINAL_ID`, so a misconfigured CAO
-session does not silently lose tools. The flag requires
-`CAO_MCP_APPS_ENABLED=true`.
+`CAO_MCP_APPS_ONLY` limits the advertised surface to the six declared app tools
+and hides in-session tools such as `handoff`, `assign`, and `send_message`, which
+require a CAO-managed terminal. This behavior is explicit; it is never inferred
+from a missing `CAO_TERMINAL_ID`, so a misconfigured CAO session does not
+silently lose tools. The flag requires `CAO_MCP_APPS_ENABLED=true`.
 
-`CAO_AGUI_ENABLED` is not required for this integration. KiroCrew consumes the
-MCP Apps tools and `ui://cao/*` resources and has no AG-UI consumer, so enabling
-AG-UI would mount a surface that nothing reads.
+With FastMCP 3.2, only `render_dashboard`, `render_agent_view`, and
+`render_graph_view` are listed and callable. `cao_fetch_history`,
+`subscribe_events`, and `submit_command` are declared with app-only
+`_meta.ui.visibility`, but are currently unreachable: FastMCP's
+`_is_model_visible()` filters `["app"]`-only tools out of both `tools/list` and
+`get_tool()`. The six-name restriction is retained so it remains correct when
+native app-tool registration is added.
+
+`CAO_AGUI_ENABLED` is not required because `CAO_MCP_APPS_ENABLED` also enables
+the shared AG-UI/event surface. Both `/agui/v1/stream` and `/events` are mounted;
+`subscribe_events` directs the MCP App host to `/events`. A host may ignore the
+AG-UI stream, but the route is enabled by the MCP Apps flag.
 
 The surface is packaged as the built-in **`mcp_apps` plugin** (discovered via the
 `cao.plugins` entry-point group). On MCP server startup the plugin's
@@ -169,6 +176,13 @@ pull-model equivalent.
   surface (including `submit_command` mutations) inherits CAO's unauthenticated,
   localhost-only trust model — keep it on a trusted loopback host and configure an
   IdP before exposing it more widely; the server logs a startup warning in this state.
+- **App-only mutation risk.** In app-surface-only mode with auth disabled,
+  `get_scopes_for_local_token()` returns the full scope set. The
+  `submit_command` pre-check also permits an empty scope set because it only
+  rejects a missing required scope when the set is non-empty. `submit_command`
+  is currently unreachable under FastMCP 3.2, but making it reachable without
+  first configuring auth would expose unauthenticated fleet mutation. Startup
+  logs a warning for this posture; do not expose it beyond trusted loopback.
 - **External app credentials stay server-side.** The MCP server process holds the
   credential used for authenticated HTTP calls. It must never appear in a
   `ui://` payload, tool arguments, or tool result text. A `ui://` resource is

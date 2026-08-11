@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastmcp import Client, FastMCP
@@ -14,6 +20,76 @@ from cli_agent_orchestrator.mcp_server.app_surface_only import (
     AppSurfaceOnlyMiddleware,
 )
 from cli_agent_orchestrator.mcp_server.app_tools import register_app_tools
+
+_REAL_SERVER_PROBE = textwrap.dedent("""
+    import asyncio
+    import json
+    from unittest.mock import patch
+
+    from fastmcp import Client
+    from fastmcp.exceptions import ToolError
+
+    from cli_agent_orchestrator.mcp_server import app_tools
+    from cli_agent_orchestrator.mcp_server.server import mcp
+
+    TOOL_ARGS = {
+        "render_dashboard": {},
+        "render_agent_view": {"terminal_id": "test-terminal"},
+        "cao_fetch_history": {},
+        "subscribe_events": {},
+        "render_graph_view": {"provider": "test-provider"},
+        "submit_command": {"kind": "pause"},
+    }
+
+    async def probe():
+        calls = {}
+        with (
+            patch.object(app_tools, "_render_dashboard_impl", return_value={"ok": True}),
+            patch.object(app_tools, "_render_agent_view_impl", return_value={"ok": True}),
+            patch.object(app_tools, "_cao_fetch_history_impl", return_value={"ok": True}),
+            patch.object(app_tools, "_subscribe_events_impl", return_value={"ok": True}),
+            patch.object(app_tools, "_render_graph_view_impl", return_value={"ok": True}),
+            patch.object(app_tools, "_submit_command_impl", return_value={"ok": True}),
+        ):
+            async with Client(mcp) as client:
+                listed = {tool.name for tool in await client.list_tools()}
+                for name, arguments in TOOL_ARGS.items():
+                    try:
+                        await client.call_tool(name, arguments)
+                    except ToolError as exc:
+                        calls[name] = {"status": "error", "message": str(exc)}
+                    else:
+                        calls[name] = {"status": "ok"}
+        return {"listed": sorted(listed), "calls": calls}
+
+    print("PROBE_RESULT=" + json.dumps(asyncio.run(probe()), sort_keys=True))
+    """)
+
+
+def _probe_real_server(*, apps_only: str | None) -> dict[str, Any]:
+    env = os.environ.copy()
+    env["CAO_MCP_APPS_ENABLED"] = "true"
+    env.pop("AUTH0_DOMAIN", None)
+    env.pop("CAO_AUTH_JWKS_URI", None)
+    if apps_only is None:
+        env.pop("CAO_MCP_APPS_ONLY", None)
+    else:
+        env["CAO_MCP_APPS_ONLY"] = apps_only
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _REAL_SERVER_PROBE],
+        cwd=Path(__file__).parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result_line = next(
+        line for line in completed.stdout.splitlines() if line.startswith("PROBE_RESULT=")
+    )
+    return json.loads(result_line.removeprefix("PROBE_RESULT="))
 
 
 def _server_with_tools(*, app_surface_only: bool, app_tools_are_stubs: bool = True) -> FastMCP:
@@ -50,24 +126,33 @@ async def test_tools_list_contains_only_app_surface_tools_when_enabled(monkeypat
     assert {"handoff", "assign", "send_message"}.isdisjoint(names)
 
 
-@pytest.mark.asyncio
-async def test_tools_list_is_unchanged_when_mode_is_off(monkeypatch) -> None:
-    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
-    baseline = _server_with_tools(app_surface_only=False)
-    mode_off = _server_with_tools(app_surface_only=False)
+def test_real_server_tool_names_are_unchanged_when_mode_is_off() -> None:
+    baseline_names = set(_probe_real_server(apps_only=None)["listed"])
+    explicit_off_names = set(_probe_real_server(apps_only="false")["listed"])
 
-    async with Client(baseline) as client:
-        baseline_names = {tool.name for tool in await client.list_tools()}
-    async with Client(mode_off) as client:
-        mode_off_names = {tool.name for tool in await client.list_tools()}
+    assert explicit_off_names == baseline_names
 
-    assert mode_off_names == baseline_names
-    assert mode_off_names == APP_SURFACE_TOOL_NAMES | {
-        "handoff",
-        "assign",
-        "send_message",
-        "unrelated_tool",
-    }
+
+def test_real_server_fastmcp_32_app_tool_reachability() -> None:
+    """Characterize FastMCP 3.2's known app-only tool visibility limitation.
+
+    This drives the real assembled server through ``fastmcp.Client``. When
+    native app-tool registration lands, this test is expected to fail and must
+    be updated to assert that all six app tools are listed and callable.
+    """
+
+    result = _probe_real_server(apps_only="true")
+    listed = set(result["listed"])
+    reachable = {"render_dashboard", "render_agent_view", "render_graph_view"}
+    unreachable = APP_SURFACE_TOOL_NAMES - reachable
+
+    for name in reachable:
+        assert name in listed
+        assert result["calls"][name] == {"status": "ok"}
+    for name in unreachable:
+        assert name not in listed
+        assert result["calls"][name]["status"] == "error"
+        assert result["calls"][name]["message"] == f"Unknown tool: '{name}'"
 
 
 @pytest.mark.asyncio
@@ -103,6 +188,39 @@ async def test_calling_hidden_tool_returns_mode_specific_error(monkeypatch) -> N
     async with Client(mcp) as client:
         with pytest.raises(ToolError, match="app-surface-only mode"):
             await client.call_tool("handoff")
+
+
+@pytest.mark.asyncio
+async def test_namespaced_app_tool_suffix_is_allowed(monkeypatch) -> None:
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    mcp = FastMCP("namespaced-app-tool-test")
+
+    @mcp.tool(name="gateway___cao___render_dashboard")
+    async def namespaced_render_dashboard() -> str:
+        return "ok"
+
+    mcp.add_middleware(AppSurfaceOnlyMiddleware())
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("gateway___cao___render_dashboard")
+
+    assert result.data == "ok"
+
+
+@pytest.mark.asyncio
+async def test_namespaced_non_app_tool_suffix_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    mcp = FastMCP("namespaced-hidden-tool-test")
+
+    @mcp.tool(name="gateway___render_dashboard___handoff")
+    async def namespaced_handoff() -> str:
+        return "not allowed"
+
+    mcp.add_middleware(AppSurfaceOnlyMiddleware())
+
+    async with Client(mcp) as client:
+        with pytest.raises(ToolError, match="app-surface-only mode"):
+            await client.call_tool("gateway___render_dashboard___handoff")
 
 
 @pytest.mark.asyncio

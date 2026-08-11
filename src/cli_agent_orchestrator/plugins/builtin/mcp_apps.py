@@ -2,15 +2,17 @@
 
 On MCP server startup (via the ``on_mcp_server`` hook) this plugin registers the
 MCP App tools (``render_dashboard`` / ``render_agent_view`` / ``cao_fetch_history``
-/ ``subscribe_events`` / ``submit_command``), the ``ui://cao/*`` resources, the
-topology widget (``cao://widget/topology``), and advertises the SEP-2133 UI
-capability on the ``initialize`` handshake.
+/ ``subscribe_events`` / ``render_graph_view`` / ``submit_command``), the
+``ui://cao/*`` resources, the topology widget (``cao://widget/topology``), and
+advertises the SEP-2133 UI capability on the ``initialize`` handshake.
 
-Everything is **default-off** via ``CAO_MCP_APPS_ENABLED`` and best-effort, so
-the default posture is byte-for-byte unchanged when the flag is unset. Durable
-event observation (the ring buffer that backs ``cao_fetch_history``) is handled
-by the companion ``event_log_publisher`` plugin; this plugin owns the
-MCP-server-facing registration.
+Everything is **default-off** via ``CAO_MCP_APPS_ENABLED``, so the default
+posture is byte-for-byte unchanged when the flag is unset. Additive surface
+registration is best-effort; an explicitly requested app-surface-only
+restriction is fail-closed. Durable event observation (the ring buffer that
+backs ``cao_fetch_history``) is handled by the companion
+``event_log_publisher`` plugin; this plugin owns the MCP-server-facing
+registration.
 
 Authoritative spec (source of truth for the surface this plugin registers):
 MCP Apps (SEP-1865, Status: Stable 2026-01-26).
@@ -25,7 +27,7 @@ MCP Apps (SEP-1865, Status: Stable 2026-01-26).
 import logging
 from typing import Any
 
-from cli_agent_orchestrator.plugins.base import CaoPlugin
+from cli_agent_orchestrator.plugins.base import CaoPlugin, McpServerStartupError
 from cli_agent_orchestrator.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
@@ -64,14 +66,20 @@ class McpAppsPlugin(CaoPlugin):
         # ``CAO_AUTH_JWKS_URI`` to enforce ``cao:read`` / ``cao:write`` /
         # ``cao:admin`` scopes on mutations.
         if _surface_enabled() and not is_auth_enabled():
+            mode = (
+                "CAO_MCP_APPS_ENABLED and CAO_MCP_APPS_ONLY are set"
+                if _app_surface_only()
+                else "CAO_MCP_APPS_ENABLED is set"
+            )
             logger.warning(
-                "CAO_MCP_APPS_ENABLED is set but no IdP is configured "
-                "(AUTH0_DOMAIN / CAO_AUTH_JWKS_URI unset): the MCP Apps surface is "
-                "mounted with authorization off, so submit_command mutations "
-                "(assign, interrupt, shutdown_session, ...) inherit CAO's "
-                "unauthenticated localhost-trust model. Set AUTH0_DOMAIN or "
-                "CAO_AUTH_JWKS_URI to enforce cao:read/cao:write/cao:admin scopes "
-                "before exposing the surface beyond a trusted loopback host."
+                "%s but no IdP is configured (AUTH0_DOMAIN / "
+                "CAO_AUTH_JWKS_URI unset): the MCP Apps surface is mounted with "
+                "authorization off, so submit_command mutations (assign, "
+                "interrupt, shutdown_session, ...) inherit CAO's unauthenticated "
+                "localhost-trust model. Set AUTH0_DOMAIN or CAO_AUTH_JWKS_URI to "
+                "enforce cao:read/cao:write/cao:admin scopes before exposing the "
+                "surface beyond a trusted loopback host.",
+                mode,
             )
 
         # register_app_tools also registers the ui://cao/* resources. Each call
@@ -96,8 +104,12 @@ class McpAppsPlugin(CaoPlugin):
                 )
 
                 mcp.add_middleware(AppSurfaceOnlyMiddleware())
-            except Exception:
-                logger.exception(
-                    "Failed to install app-surface-only middleware; "
-                    "continuing with the full MCP tool surface"
+            except Exception as exc:
+                logger.critical(
+                    "The app-surface-only restriction could not be applied; "
+                    "the MCP server must not start with an unrestricted tool surface",
+                    exc_info=True,
                 )
+                raise McpServerStartupError(
+                    "app-surface-only restriction could not be applied"
+                ) from exc

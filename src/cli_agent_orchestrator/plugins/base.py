@@ -13,6 +13,10 @@ AsyncMethodT = Callable[P, Awaitable[R]]
 _HOOK_EVENT_ATTR = "_cao_hook_event"
 
 
+class McpServerStartupError(RuntimeError):
+    """Fatal MCP surface registration error that must abort server startup."""
+
+
 class CaoPlugin:
     """Base class for CAO plugins.
 
@@ -37,8 +41,9 @@ class CaoPlugin:
 
         Override to register MCP tools, resources, or capabilities on ``mcp``.
         Runs synchronously while the server module initializes (before
-        ``mcp.run()``). Default: no-op. Best-effort — the registry isolates
-        failures so a broken plugin never blocks server startup.
+        ``mcp.run()``). Default: no-op. Additive failures are isolated by the
+        registry; security restrictions may raise :class:`McpServerStartupError`
+        to abort startup.
         """
 
 

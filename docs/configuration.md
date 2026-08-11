@@ -232,6 +232,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_TERMINAL_BACKEND` | `terminal.backend` | str |
 | `CAO_HERDR_SESSION` | `terminal.herdr_session` | str |
 | `CAO_MCP_APPS_ENABLED` | `apps.enabled` | bool |
+| `CAO_MCP_APPS_ONLY` | `apps.only` | bool |
 | `CAO_MCP_APPS_STATIC_DIR` | `apps.static_dir` | str |
 | `CAO_LOG_LEVEL` | `logging.level` | str |
 | `CAO_MEMORY_ENABLED` | `memory.enabled` | bool |

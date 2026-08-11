@@ -7,6 +7,11 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import Tool, ToolResult
 from mcp import types as mt
 
+# FastMCP 3.2's _is_model_visible() filters tools whose _meta.ui.visibility is
+# only ["app"] out of both tools/list and get_tool(). Consequently
+# cao_fetch_history, subscribe_events, and submit_command are currently
+# unreachable through FastMCP. Keep all six names here so the restriction remains
+# correct when native app-tool registration makes those tools addressable.
 APP_SURFACE_TOOL_NAMES = frozenset(
     {
         "render_dashboard",
@@ -36,7 +41,8 @@ class AppSurfaceOnlyMiddleware(Middleware):
         call_next: CallNext[mt.CallToolRequestParams, ToolResult],
     ) -> ToolResult:
         tool_name = context.message.name
-        if tool_name not in APP_SURFACE_TOOL_NAMES:
+        allowlist_name = tool_name.rsplit("___", 1)[-1]
+        if allowlist_name not in APP_SURFACE_TOOL_NAMES:
             raise ToolError(
                 f"Tool '{tool_name}' is unavailable because the server is in "
                 "app-surface-only mode (CAO_MCP_APPS_ONLY=true)."

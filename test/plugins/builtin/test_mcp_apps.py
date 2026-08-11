@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any, List
 
-from cli_agent_orchestrator.plugins.base import CaoPlugin
+import pytest
+
+from cli_agent_orchestrator.plugins.base import CaoPlugin, McpServerStartupError
 from cli_agent_orchestrator.plugins.builtin.mcp_apps import McpAppsPlugin
 from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces
 
@@ -109,6 +111,21 @@ def test_no_warning_when_surface_disabled(monkeypatch, caplog) -> None:
     assert not any("no IdP" in r.getMessage() for r in caplog.records)
 
 
+def test_warns_when_app_surface_only_is_unauthenticated(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
+    _no_idp(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
+        McpAppsPlugin().on_mcp_server(_FakeMcp())
+
+    assert any(
+        "CAO_MCP_APPS_ONLY" in record.getMessage()
+        and "submit_command mutations" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_app_surface_only_installs_middleware_when_apps_enabled(monkeypatch) -> None:
     monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
     monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
@@ -147,7 +164,7 @@ def test_app_surface_only_warns_and_does_not_install_when_apps_disabled(
     )
 
 
-def test_app_surface_only_middleware_failure_is_best_effort(monkeypatch, caplog) -> None:
+def test_app_surface_only_middleware_failure_aborts_startup(monkeypatch, caplog) -> None:
     monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
     monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
     fake = _FakeMcp()
@@ -156,10 +173,38 @@ def test_app_surface_only_middleware_failure_is_best_effort(monkeypatch, caplog)
         raise RuntimeError("unsupported")
 
     monkeypatch.setattr(fake, "add_middleware", fail_to_install)
-    with caplog.at_level(logging.ERROR, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
-        McpAppsPlugin().on_mcp_server(fake)
+    with caplog.at_level(
+        logging.CRITICAL, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"
+    ):
+        with pytest.raises(McpServerStartupError, match="restriction could not be applied"):
+            McpAppsPlugin().on_mcp_server(fake)
 
     assert any(
-        "Failed to install app-surface-only middleware" in record.getMessage()
+        record.levelno == logging.CRITICAL and "server must not start" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_app_surface_only_failure_propagates_through_surface_dispatcher(monkeypatch) -> None:
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
+    fake = _FakeMcp()
+
+    def fail_to_install(middleware: Any) -> None:
+        raise RuntimeError("unsupported")
+
+    class McpAppsEntryPoint:
+        name = "mcp_apps"
+
+        @staticmethod
+        def load() -> type[McpAppsPlugin]:
+            return McpAppsPlugin
+
+    monkeypatch.setattr(fake, "add_middleware", fail_to_install)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.registry.importlib.metadata.entry_points",
+        lambda **_kwargs: [McpAppsEntryPoint()],
+    )
+
+    with pytest.raises(McpServerStartupError, match="restriction could not be applied"):
+        register_mcp_server_surfaces(fake)

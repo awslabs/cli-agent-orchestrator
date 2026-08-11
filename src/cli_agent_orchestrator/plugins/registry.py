@@ -5,7 +5,11 @@ import inspect
 import logging
 from typing import Any
 
-from cli_agent_orchestrator.plugins.base import _HOOK_EVENT_ATTR, CaoPlugin
+from cli_agent_orchestrator.plugins.base import (
+    _HOOK_EVENT_ATTR,
+    CaoPlugin,
+    McpServerStartupError,
+)
 from cli_agent_orchestrator.plugins.events import CaoEvent
 
 logger = logging.getLogger(__name__)
@@ -93,8 +97,9 @@ def register_mcp_server_surfaces(mcp: Any) -> None:
     Discovers the entry-point group and calls ``on_mcp_server(mcp)`` on each
     plugin **synchronously** — independent of the async event-dispatch lifecycle
     (``setup``/``teardown``), which belongs to the HTTP API. Best-effort: a
-    failing or non-conforming entry point is logged and skipped, so one broken
-    plugin never blocks MCP server startup.
+    failing or non-conforming additive entry point is logged and skipped. A
+    :class:`McpServerStartupError` is propagated because continuing would violate
+    a security restriction requested by the operator.
 
     Called once from the MCP server module at import/startup. The built-in
     ``mcp_apps`` plugin uses this hook to register the MCP Apps tools, the
@@ -109,6 +114,8 @@ def register_mcp_server_surfaces(mcp: Any) -> None:
             if not (isinstance(plugin_class, type) and issubclass(plugin_class, CaoPlugin)):
                 continue
             plugin_class().on_mcp_server(mcp)
+        except McpServerStartupError:
+            raise
         except Exception:
             logger.warning(
                 "Plugin '%s' on_mcp_server registration failed",
