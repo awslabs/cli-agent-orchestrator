@@ -4010,9 +4010,9 @@ async def resume_workflow_run_endpoint(
 # ── graph layer (U4, Issue #348) ────────────────────────────────────────
 #
 # Three routes over the provider/sink seams. There is ZERO branching over the
-# provider or sink NAME (NFR-5): the only conditionals are try/except on
-# registry-resolution outcome. Names resolve through get_provider/get_sink,
-# which raise KeyError for an unregistered name (mapped to 404 here).
+# provider or sink NAME (NFR-5). Capability checks on the resolved instance are
+# permitted; names resolve through get_provider/get_sink, which raise KeyError
+# for an unregistered name (mapped to 404 here).
 
 
 async def _project_graph_with_timeout(

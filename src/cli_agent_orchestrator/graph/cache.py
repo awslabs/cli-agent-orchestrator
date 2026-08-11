@@ -57,9 +57,9 @@ GRAPH_BUILD_MAX_S = 600.0
 GRAPH_BUILD_CONCURRENCY = 2
 
 # At most two additional keys may wait behind the running builds. Once this
-# queue is full, callers receive queued status without allocating a detached
-# task, so caller-controlled scope_ids cannot grow the task registry without
-# bound.
+# queue is full, callers receive rejected_queue_full status without allocating
+# a detached task, so caller-controlled scope_ids cannot grow the task registry
+# without bound.
 GRAPH_BUILD_QUEUE_MAX = 2
 
 # Cache key: (provider name, scope, scope_id, lint_enabled). scope_id is

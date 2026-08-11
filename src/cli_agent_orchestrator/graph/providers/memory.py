@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 # per-instance cache would never hit). DELIBERATE reversal of the original
 # "lint-on-demand, no caching" ADR — see graph/cache.py for the perf finding
 # (ripgrep stale_claim ~20s + LLM ~8.5s ⇒ ~30s typical, up to ~148s under
-# load, past the frontend's 120s timeout). Keyed by (provider, scope, scope_id).
+# load, past the frontend's 120s timeout). Keyed by
+# (provider, scope, scope_id, lint_enabled).
 _CACHE = GraphViewCache()
 
 

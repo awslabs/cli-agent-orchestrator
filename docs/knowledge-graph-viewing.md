@@ -126,8 +126,10 @@ directory, so launching CAO from a different repository materially changes the
 corpus and cost. Because that can exceed request and client budgets, the
 projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
 
-- The **projected `GraphView` is cached per `(provider, scope, scope_id)`** with
-  a **300-second TTL** (`DEFAULT_TTL_S = 300.0`).
+- The **projected `GraphView` is cached per
+  `(provider, scope, scope_id, lint_enabled)`** with a **300-second TTL**
+  (`DEFAULT_TTL_S = 300.0`). Lint-enabled and lint-disabled projections of the
+  same scope therefore use separate entries.
 - The cache, rather than the request, owns each cold projection task. A request
   waits up to 90 seconds, but timing out does not cancel the build. A retry for
   the same key joins that exact task, so one completed build populates the cache
