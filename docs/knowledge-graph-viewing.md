@@ -167,14 +167,15 @@ the difference is that they may now complete after the HTTP request has ended.
 > honoring the five-second retry hint should converge at roughly 150-170 seconds
 > from the initial request. The existing 504 contract remains stable:
 > `detail.kind` is `"graph_projection_timeout"` and `retryable` is true.
-> Additive fields report `build_state`
-> (`started`, `in_progress`, `queued`, `rejected_queue_full`, or
-> `failed_deadline`),
-> `build_elapsed_s`, and `build_started_at`; `retry_after_s` and the
-> `Retry-After` header remain five seconds. That short cadence is safe because
-> retries join rather than restart work, and it is deliberately below the
-> 300-second TTL so a conformant client retries before a completed entry can
-> expire. Successful memory responses always report `meta.lint_enabled` and
+> The additive `build_state` field is always present (`started`, `in_progress`,
+> `queued`, `rejected_queue_full`, or `failed_deadline`). States describing an
+> actual build also carry `build_elapsed_s` and `build_started_at`.
+> `rejected_queue_full` intentionally carries `build_state` alone because no
+> build was started for that key. `retry_after_s` and the `Retry-After` header
+> remain five seconds. That short cadence is safe because retries join rather
+> than restart work, and it is deliberately below the 300-second TTL so a
+> conformant client retries before a completed entry can expire. Successful
+> memory responses always report `meta.lint_enabled` and
 > `meta.lint_enrichment`, so callers can verify which path ran.
 
 On shutdown, CAO cancels and retrieves all tracked graph tasks. Cancellation
