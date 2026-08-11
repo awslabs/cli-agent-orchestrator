@@ -61,6 +61,14 @@ IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|codex>)\s*$"
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
 ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)"
+# The managed bridge prefixes provider stderr so it cannot be confused with
+# model-authored text. Authentication failures on that channel are terminal
+# for the running provider process and must outrank old assistant history;
+# otherwise periodic retries repaint the pane and look like useful activity.
+FATAL_PROVIDER_DIAGNOSTIC_PATTERN = (
+    r"^\[provider diagnostic\].*(?:\b401 Unauthorized\b|"
+    r"\bauthentication token is expired\b|\bauth error code:\s*token_expired\b)"
+)
 
 # Codex TUI footer indicators (status bar below the idle prompt).
 # Used to detect when the bottom lines contain TUI chrome rather than user input.
@@ -833,6 +841,17 @@ class CodexProvider(BaseProvider):
         # idle ``›`` prompt / structural checks below misfire on the raw stream.
         clean_output = strip_terminal_escapes(output)
         tail_output = "\n".join(clean_output.splitlines()[-25:])
+
+        last_nonempty_line = next(
+            (line for line in reversed(clean_output.splitlines()) if line.strip()),
+            "",
+        )
+        if re.search(
+            FATAL_PROVIDER_DIAGNOSTIC_PATTERN,
+            last_nonempty_line,
+            re.IGNORECASE,
+        ):
+            return TerminalStatus.ERROR
 
         # Search for user messages, excluding the Codex TUI footer when present.
         # The TUI footer (idle prompt hint like "› Summarize recent commits" +
