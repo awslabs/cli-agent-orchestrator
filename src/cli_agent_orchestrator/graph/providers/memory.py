@@ -42,9 +42,6 @@ _SCOPES_IGNORING_SCOPE_ID = frozenset(
 )
 _DISABLED_ENRICHMENTS = [
     "orphan_page",
-    "contradiction",
-    "stale_claim",
-    "poison_frequency",
     "graph_density",
 ]
 
@@ -242,7 +239,6 @@ class MemoryGraphProvider(GraphProvider):
                 exc_info=True,
             )
             meta["relationship_error"] = type(e).__name__
-            _mark_enrichment_failed(meta)
             active = []
         for rel in active:
             edge_type = _TYPE_MAP.get(rel.type)

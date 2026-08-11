@@ -396,7 +396,7 @@ async def test_full_build_queue_keeps_kind_and_rejects_without_task(caplog):
         with pytest.raises(HTTPException) as exc_info:
             await api_main._project_graph_with_timeout(
                 _QueuedProvider(),
-                {},
+                {"scope": "project", "scope_id": "project-a"},
                 provider="memory",
                 timeout_s=0.01,
             )
@@ -412,7 +412,7 @@ async def test_full_build_queue_keeps_kind_and_rejects_without_task(caplog):
         assert rejected_key not in cache._statuses
         assert "graph projection rejected because build queue is full" in caplog.text
         assert "memory" in caplog.text
-        assert "{}" in caplog.text
+        assert "filters={'scope': 'project', 'scope_id': 'project-a'}" in caplog.text
     finally:
         release.set()
         await asyncio.gather(active, pending)

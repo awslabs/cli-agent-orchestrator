@@ -515,9 +515,6 @@ class TestMemoryProviderEdgeCases:
         assert view.meta["lint_enrichment"] == "failed"
         assert view.meta["disabled_enrichments"] == [
             "orphan_page",
-            "contradiction",
-            "stale_claim",
-            "poison_frequency",
             "graph_density",
         ]
         record = next(record for record in caplog.records if "run_lint failed" in record.message)
@@ -525,14 +522,21 @@ class TestMemoryProviderEdgeCases:
         assert record.exc_info is not None
 
     @pytest.mark.asyncio
-    async def test_relationship_failure_reports_degraded_enrichment(
+    async def test_relationship_failure_preserves_successful_lint_enrichment(
         self, populated_scope, monkeypatch, caplog
     ):
+        """A relationship failure must not contradict applied lint findings."""
         from cli_agent_orchestrator.services.memory_relationship_service import (
             MemoryRelationshipService,
         )
 
-        monkeypatch.setattr(wiki_lint, "run_lint", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            wiki_lint,
+            "run_lint",
+            AsyncMock(
+                return_value=[LintIssue(issue_type="orphan_page", key="lonely", scope_id=None)]
+            ),
+        )
 
         def _raise_runtime_error(*args, **kwargs):
             raise RuntimeError("relationship store unavailable")
@@ -549,19 +553,51 @@ class TestMemoryProviderEdgeCases:
         assert {n.id for n in view.nodes} >= {"a", "b", "c"}
         assert view.edges == []
         assert view.meta["relationship_error"] == "RuntimeError"
-        assert view.meta["lint_enrichment"] == "failed"
-        assert view.meta["disabled_enrichments"] == [
-            "orphan_page",
-            "contradiction",
-            "stale_claim",
-            "poison_frequency",
-            "graph_density",
-        ]
+        assert view.meta["lint_enrichment"] == "enabled"
+        assert "disabled_enrichments" not in view.meta
+        by_id = {node.id: node for node in view.nodes}
+        assert by_id["lonely"].attrs["is_orphan"] is True
         record = next(
             record for record in caplog.records if "relationship read failed" in record.message
         )
         assert "scope='global' scope_id=None" in record.message
         assert record.exc_info is not None
+
+    @pytest.mark.asyncio
+    async def test_relationship_failure_preserves_disabled_lint_enrichment(
+        self, populated_scope, monkeypatch
+    ):
+        """A relationship failure must not relabel unrequested lint as failed."""
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            MemoryRelationshipService,
+        )
+
+        run_lint = AsyncMock(return_value=[])
+        monkeypatch.setattr(wiki_lint, "run_lint", run_lint)
+
+        def _raise_runtime_error(*args, **kwargs):
+            raise RuntimeError("relationship store unavailable")
+
+        monkeypatch.setattr(
+            MemoryRelationshipService,
+            "list_relationships",
+            _raise_runtime_error,
+        )
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: False,
+        )
+
+        view = await provider.project(scope="global")
+
+        run_lint.assert_not_called()
+        assert view.meta["relationship_error"] == "RuntimeError"
+        assert view.meta["lint_enabled"] is False
+        assert view.meta["lint_enrichment"] == "disabled"
+        assert view.meta["disabled_enrichments"] == [
+            "orphan_page",
+            "graph_density",
+        ]
 
     @pytest.mark.asyncio
     async def test_run_lint_cancelled_error_propagates(self, populated_scope, monkeypatch):
@@ -600,9 +636,6 @@ class TestMemoryProviderEdgeCases:
         assert view.meta["lint_enrichment"] == "disabled"
         assert set(view.meta["disabled_enrichments"]) == {
             "orphan_page",
-            "contradiction",
-            "stale_claim",
-            "poison_frequency",
             "graph_density",
         }
         by_id = {n.id: n for n in view.nodes}
