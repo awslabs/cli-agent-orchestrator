@@ -334,7 +334,7 @@ async def test_cache_owned_post_timeout_failure_is_retrieved_with_context(caplog
 
     assert "detached graph projection failed" in caplog.text
     assert "cache-owned" in caplog.text
-    assert "global" in caplog.text
+    assert "filters={'scope': 'global'}" in caplog.text
 
 
 def test_health_responds_while_slow_graph_projection_in_flight(client, monkeypatch):

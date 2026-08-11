@@ -4086,7 +4086,7 @@ async def _project_graph_with_timeout(
                 return
             if exc is not None:
                 logger.error(
-                    "detached graph projection failed for provider=%r key=%r: %r",
+                    "detached graph projection failed for provider=%r filters=%r: %r",
                     provider,
                     filters,
                     exc,
