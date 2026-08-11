@@ -55,12 +55,15 @@ require a CAO-managed terminal. This behavior is explicit; it is never inferred
 from a missing `CAO_TERMINAL_ID`, so a misconfigured CAO session does not
 silently lose tools. The flag requires `CAO_MCP_APPS_ENABLED=true`.
 
-**Known product defect in FastMCP 3.2:** the shipped MCP Apps dashboard's
-event-history hydration and every command/mutation gesture are non-functional.
-The iframe calls `cao_fetch_history` and `submit_command` by bare name, but
-FastMCP cannot resolve either tool. The history call rejects before
-`fetchHistory()` can apply its empty-list fallback, so this does not degrade to
-an empty timeline.
+**Known product defect in FastMCP 3.2:** the shipped event-stream view renders
+permanently empty (no history backfill and no live SSE subscription), and every
+command/mutation gesture in the dashboard and agent views is non-functional.
+The views call `cao_fetch_history`, `subscribe_events`, and `submit_command` by
+bare name, but FastMCP cannot resolve them. Event-stream initialization awaits
+the history call before entering its SSE setup; that rejection occurs before
+`fetchHistory()` can apply its empty-list fallback and before
+`subscribe_events` is called. Neither the default SSE URL nor the optional-SSE
+catch can run, so this does not degrade gracefully.
 
 Only `render_dashboard`, `render_agent_view`, and `render_graph_view` are listed
 and callable. `cao_fetch_history`, `subscribe_events`, and `submit_command` are
