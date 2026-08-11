@@ -91,7 +91,11 @@ The surface is packaged as the built-in **`mcp_apps` plugin** (discovered via th
 `on_mcp_server` hook registers the tools, the `ui://cao/*` resources, the topology
 widget, and the capability advertisement — all best-effort, so an older FastMCP
 build degrades without aborting startup. A missing frontend build emits a visible
-startup warning and skips the `ui://cao/*` resources.
+startup warning and skips the `ui://cao/*` resources. Specifically, a missing
+`apps_static/` directory means no `ui://` resources are listed, while a failed or
+partial build that leaves the directory present keeps all four resources listed
+and returns the `"view not built"` placeholder for each missing artifact; the
+artifact-presence WARNING is the only startup signal distinguishing those states.
 
 ## Surfaces
 

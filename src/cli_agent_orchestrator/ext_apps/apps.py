@@ -202,13 +202,12 @@ def register_apps(mcp: Any) -> bool:
 
     Best-effort and side-effect free when disabled:
 
-    * returns ``False`` when ``CAO_MCP_APPS_ENABLED`` is unset, when the running
-      FastMCP has no ``resource`` decorator, or when the ``apps_static/`` build
-      output is missing; disabled registration is logged at info, while
-      unavailable resource support or build output is logged at warning;
-    * otherwise registers one resource per built artifact and returns ``True``;
-      incomplete registration is logged at warning and complete registration at
-      info.
+    * disabled registration is logged at info and returns ``False``;
+    * a missing FastMCP ``resource`` decorator or ``apps_static/`` directory is
+      logged at warning and returns ``False``;
+    * per-URI decorator failures are logged with ``logger.exception``;
+    * the summary is logged at warning when any expected artifact is absent and
+      at info when all artifacts are present.
     """
 
     if not _is_enabled():
@@ -231,6 +230,9 @@ def register_apps(mcp: Any) -> bool:
         )
         return False
 
+    artifacts_present = sum(
+        1 for filename in _RESOURCE_FILES.values() if (static_dir / filename).is_file()
+    )
     registered = 0
     for uri, filename in _RESOURCE_FILES.items():
 
@@ -255,10 +257,11 @@ def register_apps(mcp: Any) -> bool:
         except Exception:  # pragma: no cover - defensive: never crash startup
             logger.exception("Failed to register MCP App resource %s", uri)
 
-    log_registration = logger.warning if registered < len(_RESOURCE_FILES) else logger.info
+    log_registration = logger.warning if artifacts_present < len(_RESOURCE_FILES) else logger.info
     log_registration(
-        "MCP App resources registered %d/%d built HTML resources from %s",
+        "MCP App resources: registered %d handlers; %d/%d artifacts present under %s",
         registered,
+        artifacts_present,
         len(_RESOURCE_FILES),
         static_dir,
     )
