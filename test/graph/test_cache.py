@@ -203,8 +203,7 @@ class TestGraphViewCache:
             return _view("a")
 
         tasks = [
-            cache.get_or_build_task(("memory", "project", f"k{i}", True), builder)
-            for i in range(2)
+            cache.get_or_build_task(("memory", "project", f"k{i}", True), builder) for i in range(2)
         ]
         await asyncio.sleep(0)
         release.set()
@@ -539,11 +538,7 @@ class TestProviderCacheIntegration:
             "_statuses": cache._max_concurrent_builds + cache._max_pending_builds,
             "_failed_deadlines": cache._max_entries,
         }
-        cache_maps = {
-            name: value
-            for name, value in vars(cache).items()
-            if isinstance(value, dict)
-        }
+        cache_maps = {name: value for name, value in vars(cache).items() if isinstance(value, dict)}
 
         # A newly-added retention map must declare and test its own bound.
         assert set(cache_maps) == set(map_bounds)
@@ -571,8 +566,7 @@ class TestProviderCacheIntegration:
 
         monkeypatch.setattr(provider, "_build", _blocked_build)
         tasks = [
-            provider.project_inflight(scope="global", scope_id=f"ignored-{i}")
-            for i in range(4)
+            provider.project_inflight(scope="global", scope_id=f"ignored-{i}") for i in range(4)
         ]
         legitimate = provider.project_inflight(scope="global")
         assert legitimate is tasks[0]

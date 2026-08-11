@@ -407,9 +407,7 @@ async def test_full_build_queue_keeps_kind_and_rejects_without_task(caplog):
         assert "build_elapsed_s" not in detail
         assert "build_started_at" not in detail
         assert detail["retry_after_s"] == api_main.GRAPH_PROJECTION_RETRY_AFTER_S
-        assert exc_info.value.headers["Retry-After"] == str(
-            api_main.GRAPH_PROJECTION_RETRY_AFTER_S
-        )
+        assert exc_info.value.headers["Retry-After"] == str(api_main.GRAPH_PROJECTION_RETRY_AFTER_S)
         assert cache.inflight_task(rejected_key) is None
         assert rejected_key not in cache._statuses
         assert "graph projection rejected because build queue is full" in caplog.text

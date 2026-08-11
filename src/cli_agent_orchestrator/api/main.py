@@ -4066,8 +4066,7 @@ async def _project_graph_with_timeout(
         # build_state distinguishes them without minting a new kind or 503
         # that existing clients do not handle.
         logger.warning(
-            "graph projection rejected because build queue is full for "
-            "provider=%r key=%r",
+            "graph projection rejected because build queue is full for " "provider=%r key=%r",
             provider,
             filters,
         )

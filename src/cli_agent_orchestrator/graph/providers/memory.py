@@ -112,9 +112,7 @@ class MemoryGraphProvider(GraphProvider):
             raise ValueError(f"unrecognized memory scope: {raw_scope!r}") from exc
 
         raw_scope_id = filters.get("scope_id")
-        supplied_scope_id: Optional[str] = (
-            None if raw_scope_id is None else str(raw_scope_id)
-        )
+        supplied_scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
         if scope in _SCOPES_CONSUMING_SCOPE_ID:
             scope_id = supplied_scope_id
         elif scope in _SCOPES_IGNORING_SCOPE_ID:
