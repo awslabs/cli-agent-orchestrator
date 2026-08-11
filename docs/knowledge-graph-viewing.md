@@ -236,7 +236,7 @@ the difference is that they may now complete after the HTTP request has ended.
 On shutdown, CAO cancels and retrieves all tracked graph tasks. Cancellation
 cannot stop a blocking `asyncio.to_thread` worker already running a ripgrep
 subprocess. Python 3.10 and 3.11 provide no executor-shutdown timeout and may
-wait indefinitely. In Python 3.12, `asyncio/runners.py:73` passes
+wait indefinitely. From Python 3.12 onward, `asyncio/runners.py:73` passes
 `constants.THREAD_JOIN_TIMEOUT = 300` to executor shutdown. Uvicorn reaches
 that live path through `asyncio_run` at `uvicorn/server.py:67`. Because 300
 seconds exceeds the measured 146-166-second builds, shutdown can wait for their

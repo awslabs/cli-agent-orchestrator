@@ -15,6 +15,18 @@ from cli_agent_orchestrator.graph.sinks.base import GraphSink, get_sink, list_si
 class TestProviderRegistry:
     """Tests for register_provider/get_provider/list_providers."""
 
+    def test_only_stub_lacks_the_optional_projection_hooks(self):
+        """A new hookless provider reopens the deferred admission gate (#26)."""
+        providers = list_providers()
+        assert providers
+
+        # A third hookless provider reopens the deferred admission gate (#26).
+        for hook in ("project_inflight", "projection_status"):
+            missing = {
+                name for name in providers if not callable(getattr(get_provider(name), hook, None))
+            }
+            assert missing == {"stub"}, hook
+
     def test_register_and_resolve_round_trip(self):
         @register_provider("test-provider-happy")
         class HappyProvider(GraphProvider):
