@@ -18,7 +18,7 @@ class TestProviderRegistry:
     def test_only_stub_lacks_the_optional_projection_hooks(self):
         """A new hookless provider reopens the deferred admission gate (#26)."""
         providers = list_providers()
-        assert providers
+        assert {"memory", "stub"} <= set(providers)
 
         # A third hookless provider reopens the deferred admission gate (#26).
         for hook in ("project_inflight", "projection_status"):
