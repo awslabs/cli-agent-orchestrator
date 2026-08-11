@@ -236,6 +236,39 @@ def test_graph_projection_timeout_returns_structured_504(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_projection_status_cannot_override_timeout_contract(caplog):
+    class _CollidingStatusProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        def projection_status(self, **filters: Any):
+            return {
+                "build_state": "failed_deadline",
+                "retryable": False,
+                "retry_after_s": 1,
+                "kind": "attacker_kind",
+            }
+
+    with pytest.raises(HTTPException) as exc_info:
+        await api_main._project_graph_with_timeout(
+            _CollidingStatusProvider(),
+            {"scope": "global"},
+            provider="colliding-status-provider",
+            timeout_s=0.01,
+        )
+
+    detail = exc_info.value.detail
+    assert detail["retryable"] is True
+    assert detail["retry_after_s"] == int(api_main.GRAPH_BUILD_MAX_S)
+    assert detail["kind"] == "graph_projection_timeout"
+    assert detail["build_state"] == "failed_deadline"
+    assert exc_info.value.headers["Retry-After"] == str(int(api_main.GRAPH_BUILD_MAX_S))
+    assert "provider='colliding-status-provider'" in caplog.text
+    assert "keys=['kind', 'retry_after_s', 'retryable']" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_non_cache_projection_timeout_cancels_fallback_task():
     cancelled = asyncio.Event()
 

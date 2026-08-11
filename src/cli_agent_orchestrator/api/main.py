@@ -4017,6 +4017,7 @@ async def resume_workflow_run_endpoint(
 # provider or sink NAME (NFR-5). Capability checks on the resolved instance are
 # permitted; names resolve through get_provider/get_sink, which raise KeyError
 # for an unregistered name (mapped to 404 here).
+_GRAPH_BUILD_STATUS_KEYS = frozenset({"build_state", "build_elapsed_s", "build_started_at"})
 
 
 async def _project_graph_with_timeout(
@@ -4030,7 +4031,15 @@ async def _project_graph_with_timeout(
         projection_status = getattr(inst, "projection_status", None)
         if not callable(projection_status):
             return {}
-        return cast(Dict[str, Any], projection_status(**filters) or {})
+        raw_status = cast(Dict[str, Any], projection_status(**filters) or {})
+        dropped_keys = sorted(str(key) for key in raw_status if key not in _GRAPH_BUILD_STATUS_KEYS)
+        if dropped_keys:
+            logger.warning(
+                "graph projection status dropped unsupported keys for provider=%r keys=%r",
+                provider,
+                dropped_keys,
+            )
+        return {key: value for key, value in raw_status.items() if key in _GRAPH_BUILD_STATUS_KEYS}
 
     def _timeout(build_status: Dict[str, Any]) -> HTTPException:
         retry_after_s = (
