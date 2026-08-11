@@ -352,7 +352,12 @@ class TestGraphViewCache:
         with pytest.raises(GraphBuildQueueFullError) as exc_info:
             cache.get_or_build_task(rejected_key, blocked)
 
-        assert exc_info.value.build_status["build_state"] == "queued"
+        assert cache.build_status(pending_key)["build_state"] == "queued"
+        assert exc_info.value.build_status == {"build_state": "rejected_queue_full"}
+        assert (
+            exc_info.value.build_status["build_state"]
+            != cache.build_status(pending_key)["build_state"]
+        )
         assert cache.inflight_task(rejected_key) is None
         assert rejected_key not in cache._statuses
         assert len(cache._inflight) == 2

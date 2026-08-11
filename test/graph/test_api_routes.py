@@ -298,9 +298,9 @@ async def test_full_build_queue_keeps_kind_and_rejects_without_task():
         detail = exc_info.value.detail
         assert exc_info.value.status_code == 504
         assert detail["kind"] == "graph_projection_timeout"
-        assert detail["build_state"] == "queued"
-        assert detail["build_elapsed_s"] >= 0
-        assert detail["build_started_at"]
+        assert detail["build_state"] == "rejected_queue_full"
+        assert "build_elapsed_s" not in detail
+        assert "build_started_at" not in detail
         assert cache.inflight_task(rejected_key) is None
         assert rejected_key not in cache._statuses
     finally:

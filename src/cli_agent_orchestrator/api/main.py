@@ -4051,6 +4051,10 @@ async def _project_graph_with_timeout(
         else:
             inflight = asyncio.ensure_future(inst.project(**filters))
     except GraphBuildQueueFullError as exc:
+        # Keep the frozen KiroCrew seam: both a timed-out build and rejected
+        # admission require the same retry-after-5 behavior. The additive
+        # build_state distinguishes them without minting a new kind or 503
+        # that existing clients do not handle.
         raise _timeout(exc.build_status)
 
     task_registry = getattr(app.state, "graph_build_tasks", None)

@@ -127,9 +127,11 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
   even when its initiating request has already returned 504.
 - Concurrent cold requests for the same key collapse onto one task. At most two
   detached graph builds run globally and at most two more keys wait. Beyond
-  that bounded pending queue, the API returns `build_state: "queued"` without
-  creating a task; the caller can retry after capacity clears. A build may hold
-  its per-key lock for at most 600 seconds, after which the key reports
+  that bounded pending queue, the API returns
+  `build_state: "rejected_queue_full"` without creating a build for that key;
+  the caller can retry after capacity clears. `build_state: "queued"` means a
+  real build task does exist and is waiting for a run slot. A build may hold its
+  per-key lock for at most 600 seconds, after which the key reports
   `failed_deadline` and can be retried.
 - `meta.cached` (bool) and `meta.as_of` (ISO-8601 UTC timestamp of the build)
   tell you whether a response was served from cache and when the underlying data
@@ -155,7 +157,8 @@ the difference is that they may now complete after the HTTP request has ended.
 > retry joins the in-progress task instead of restarting it. The existing 504
 > contract remains stable: `detail.kind` is `"graph_projection_timeout"` and
 > `retryable` is true. Additive fields report `build_state`
-> (`started`, `in_progress`, `queued`, or `failed_deadline`),
+> (`started`, `in_progress`, `queued`, `rejected_queue_full`, or
+> `failed_deadline`),
 > `build_elapsed_s`, and `build_started_at`; `retry_after_s` and the
 > `Retry-After` header remain five seconds. That short cadence is safe because
 > retries join rather than restart work, and it is deliberately below the

@@ -76,7 +76,13 @@ class _Entry:
     as_of: str  # ISO-8601 UTC wall-clock of the build, surfaced as meta.as_of
 
 
-BuildState = Literal["in_progress", "started", "queued", "failed_deadline"]
+BuildState = Literal[
+    "in_progress",
+    "started",
+    "queued",
+    "rejected_queue_full",
+    "failed_deadline",
+]
 
 
 @dataclass
@@ -185,18 +191,10 @@ class GraphViewCache:
         started_at = datetime.now(timezone.utc).isoformat()
         started_monotonic = self._clock()
         if len(self._inflight) >= self._max_concurrent_builds + self._max_pending_builds:
-            raise GraphBuildQueueFullError(
-                self._status_dict(
-                    BuildStatus(
-                        state="queued",
-                        started_monotonic=started_monotonic,
-                        started_at=started_at,
-                    )
-                )
-            )
+            raise GraphBuildQueueFullError({"build_state": "rejected_queue_full"})
 
         initial_state: BuildState = (
-            "started" if len(self._statuses) < self._max_concurrent_builds else "queued"
+            "started" if len(self._inflight) < self._max_concurrent_builds else "queued"
         )
         self._statuses[key] = BuildStatus(
             state=initial_state,
