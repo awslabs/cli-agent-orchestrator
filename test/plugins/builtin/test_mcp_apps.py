@@ -111,21 +111,6 @@ def test_no_warning_when_surface_disabled(monkeypatch, caplog) -> None:
     assert not any("no IdP" in r.getMessage() for r in caplog.records)
 
 
-def test_warns_when_app_surface_only_is_unauthenticated(monkeypatch, caplog) -> None:
-    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
-    monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
-    _no_idp(monkeypatch)
-
-    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
-        McpAppsPlugin().on_mcp_server(_FakeMcp())
-
-    assert any(
-        "CAO_MCP_APPS_ONLY" in record.getMessage()
-        and "submit_command mutations" in record.getMessage()
-        for record in caplog.records
-    )
-
-
 def test_app_surface_only_installs_middleware_when_apps_enabled(monkeypatch) -> None:
     monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
     monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")

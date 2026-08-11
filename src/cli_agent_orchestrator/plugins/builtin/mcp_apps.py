@@ -66,20 +66,14 @@ class McpAppsPlugin(CaoPlugin):
         # ``CAO_AUTH_JWKS_URI`` to enforce ``cao:read`` / ``cao:write`` /
         # ``cao:admin`` scopes on mutations.
         if _surface_enabled() and not is_auth_enabled():
-            mode = (
-                "CAO_MCP_APPS_ENABLED and CAO_MCP_APPS_ONLY are set"
-                if _app_surface_only()
-                else "CAO_MCP_APPS_ENABLED is set"
-            )
             logger.warning(
-                "%s but no IdP is configured (AUTH0_DOMAIN / "
-                "CAO_AUTH_JWKS_URI unset): the MCP Apps surface is mounted with "
-                "authorization off, so submit_command mutations (assign, "
-                "interrupt, shutdown_session, ...) inherit CAO's unauthenticated "
-                "localhost-trust model. Set AUTH0_DOMAIN or CAO_AUTH_JWKS_URI to "
-                "enforce cao:read/cao:write/cao:admin scopes before exposing the "
-                "surface beyond a trusted loopback host.",
-                mode,
+                "CAO_MCP_APPS_ENABLED is set but no IdP is configured "
+                "(AUTH0_DOMAIN / CAO_AUTH_JWKS_URI unset): the MCP Apps surface is "
+                "mounted with authorization off, so submit_command mutations "
+                "(assign, interrupt, shutdown_session, ...) inherit CAO's "
+                "unauthenticated localhost-trust model. Set AUTH0_DOMAIN or "
+                "CAO_AUTH_JWKS_URI to enforce cao:read/cao:write/cao:admin scopes "
+                "before exposing the surface beyond a trusted loopback host."
             )
 
         # register_app_tools also registers the ui://cao/* resources. Each call

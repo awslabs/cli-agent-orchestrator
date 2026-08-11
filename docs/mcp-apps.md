@@ -191,7 +191,10 @@ pull-model equivalent.
   rejects a missing required scope when the set is non-empty. `submit_command`
   is currently unreachable under FastMCP 3.2, but making it reachable without
   first configuring auth would expose unauthenticated fleet mutation. Startup
-  logs a warning for this posture; do not expose it beyond trusted loopback.
+  logs the existing warning beginning **"CAO_MCP_APPS_ENABLED is set but no IdP
+  is configured"**, which names the affected mutation kinds and the IdP
+  remediation. App-surface-only mode requires MCP Apps enablement, so the same
+  warning always covers this posture; do not expose it beyond trusted loopback.
 - **External app credentials stay server-side.** The MCP server process holds the
   credential used for authenticated HTTP calls. It must never appear in a
   `ui://` payload, tool arguments, or tool result text. A `ui://` resource is
