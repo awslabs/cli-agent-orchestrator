@@ -124,7 +124,8 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
 - The first (cold) request in a window pays the full projection cost; every
   request within the TTL returns the cached view **near-instantly**. Concurrent
   cold requests for the same key collapse onto a single build (single-flight —
-  no thundering herd).
+  no thundering herd), so a slow cold response is a request-deadline problem,
+  not duplicated projection work.
 - `meta.cached` (bool) and `meta.as_of` (ISO-8601 UTC timestamp of the build)
   tell you whether a response was served from cache and when the underlying data
   was projected.
@@ -138,26 +139,46 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
 > call, but nothing calls it yet — this is a tracked follow-up to wire Refresh
 > to bypass the cache.)
 
-> **First cold load may still time out on a large scope.** If the cold
-> projection runs past the UI's 120s budget, the fetch aborts — but thanks to
-> single-flight the server keeps building and caches the result, so a **Refresh
-> a moment later** returns it near-instantly.
+> **First cold load may still time out on a large scope.** The worst observed
+> cold build is **~148s**, while the API projection deadline is **90s**. A
+> measurement on 2026-08-11 completed in **0.028615s** with `meta.cached:
+> false`, explicitly under the 90s deadline; lint enrichment was disabled in
+> that environment, so it does not supersede the lint-enabled worst case. A
+> **504** response with `detail.kind: "graph_projection_timeout"` is
+> **retryable**: clients should honor `Retry-After` / `detail.retry_after_s`,
+> retry with backoff, and show a **"building…"** state while waiting.
+> Single-flight collapses concurrent cold requests onto one build, so this is a
+> deadline problem rather than a thundering herd.
 
 ## The API
 
-Two routes, in `src/cli_agent_orchestrator/api/main.py`. Both take the provider
-name as a path segment and forward all query params to the provider as filters.
-These are still the right tool for **scripting / no-UI** use.
+Three routes live in `src/cli_agent_orchestrator/api/main.py`: provider
+discovery plus projection and export. They are still the right tool for
+**scripting / no-UI** use.
+
+### `GET /graph/providers` — discover providers
+
+Returns only the names in the live provider registry:
+
+```json
+{"providers": ["memory", "stub"]}
+```
+
+This route has the same `cao:read` / `cao:write` / `cao:admin` scope gate as
+`GET /graph/{provider}`, so clients can discover providers without hardcoding
+CAO internals.
 
 ### `GET /graph/{provider}` — project and return the wire shape
 
 | Param | In | Notes |
 |---|---|---|
 | `provider` | path | `memory` or `stub`. Unregistered → **404**. |
-| `scope` | query | `global` (default) or `project`. `session` / `agent` → **400** (private, refused). |
+| `scope` | query | `global` (default) or `project`. `session` / `agent` are refused case-insensitively with **400**. |
 | `scope_id` | query | Required for `project` (the canonical project id). Omit for `global`. |
 
 Returns the `GraphView` wire shape: `{"nodes": [...], "edges": [...], "meta": {...}}`.
+Under policy **D5**, private `MemoryScope.SESSION` and `MemoryScope.AGENT`
+requests are never exposed by this API, regardless of letter case.
 
 ```bash
 # Global scope (no scope_id)

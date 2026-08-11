@@ -73,7 +73,7 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
 from cli_agent_orchestrator.graph.models import GraphView
-from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
+from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider, list_providers
 
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
@@ -148,6 +148,7 @@ TMUX_KEY_PATTERN = re.compile(
     r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
 )
 GRAPH_PROJECTION_TIMEOUT_S = 90.0
+GRAPH_PROJECTION_RETRY_AFTER_S = 5
 
 
 async def flow_daemon():
@@ -3993,7 +3994,7 @@ async def resume_workflow_run_endpoint(
 
 # ── graph layer (U4, Issue #348) ────────────────────────────────────────
 #
-# Two routes over the provider/sink seams. There is ZERO branching over the
+# Three routes over the provider/sink seams. There is ZERO branching over the
 # provider or sink NAME (NFR-5): the only conditionals are try/except on
 # registry-resolution outcome. Names resolve through get_provider/get_sink,
 # which raise KeyError for an unregistered name (mapped to 404 here).
@@ -4017,8 +4018,19 @@ async def _project_graph_with_timeout(
                 "timeout_s": timeout_s,
                 "provider": provider,
                 "metadata": {"graph_projection_timeout": True},
+                "retryable": True,
+                "retry_after_s": GRAPH_PROJECTION_RETRY_AFTER_S,
             },
+            headers={"Retry-After": str(GRAPH_PROJECTION_RETRY_AFTER_S)},
         )
+
+
+@app.get("/graph/providers")
+async def list_graph_providers_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, List[str]]:
+    """Return the names currently registered in the graph provider registry."""
+    return {"providers": list_providers()}
 
 
 @app.get("/graph/{provider}")

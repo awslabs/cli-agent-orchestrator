@@ -87,6 +87,51 @@ def _override_scopes(scopes):
     return _dep
 
 
+# ── GET /graph/providers ─────────────────────────────────────────────────
+
+
+def test_list_graph_providers_returns_registered_providers(client):
+    resp = client.get("/graph/providers")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"providers": providers_base.list_providers()}
+
+
+def test_list_graph_providers_includes_fresh_registration(client):
+    @providers_base.register_provider("fresh-provider")
+    class _FreshProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            return GraphView(nodes=[], edges=[])
+
+    resp = client.get("/graph/providers")
+
+    assert resp.status_code == 200
+    assert "fresh-provider" in resp.json()["providers"]
+
+
+def test_list_graph_providers_static_route_wins_over_provider_route(client):
+    project_spy = MagicMock()
+
+    @providers_base.register_provider("providers")
+    class _ProvidersProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            project_spy()
+            return GraphView(nodes=[], edges=[])
+
+    resp = client.get("/graph/providers")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"providers": providers_base.list_providers()}
+    project_spy.assert_not_called()
+
+
+def test_list_graph_providers_no_token_matches_graph_route(client, auth_on):
+    providers_resp = client.get("/graph/providers")
+    graph_resp = client.get("/graph/stub")
+
+    assert providers_resp.status_code == graph_resp.status_code == 401
+
+
 # ── GET /graph/{provider} ────────────────────────────────────────────────
 
 
@@ -180,6 +225,9 @@ def test_graph_projection_timeout_returns_structured_504(client, monkeypatch):
     assert detail["provider"] == "slow-provider"
     assert detail["timeout_s"] == 0.01
     assert detail["metadata"]["graph_projection_timeout"] is True
+    assert detail["retryable"] is True
+    assert detail["retry_after_s"] == api_main.GRAPH_PROJECTION_RETRY_AFTER_S
+    assert resp.headers["Retry-After"] == str(api_main.GRAPH_PROJECTION_RETRY_AFTER_S)
 
 
 def test_health_responds_while_slow_graph_projection_in_flight(client, monkeypatch):
