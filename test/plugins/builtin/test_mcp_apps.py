@@ -116,12 +116,18 @@ def test_app_surface_only_installs_middleware_when_apps_enabled(monkeypatch, cap
     monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
     fake = _FakeMcp()
 
-    with caplog.at_level(logging.INFO, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
         McpAppsPlugin().on_mcp_server(fake)
 
     assert len(fake.middleware) == 1
     assert fake.middleware[0].__class__.__name__ == "AppSurfaceOnlyMiddleware"
-    assert "App-surface-only mode active; 6 tool names allowlisted" in caplog.text
+    activation_records = [
+        record
+        for record in caplog.records
+        if "App-surface-only mode active; 6 tool names allowlisted" in record.getMessage()
+    ]
+    assert len(activation_records) == 1
+    assert activation_records[0].levelno >= logging.WARNING
 
 
 def test_apps_only_off_leaves_middleware_unmodified(monkeypatch) -> None:
