@@ -135,12 +135,11 @@ def test_real_server_tool_names_are_unchanged_when_mode_is_off() -> None:
 
 
 def test_real_server_tool_names_do_not_use_app_namespace_separator() -> None:
-    """Pin the precondition for suffix matching in AppSurfaceOnlyMiddleware.
+    """Document that namespaced app addressing is not registered today.
 
-    An in-session tool named ``foo___submit_command`` would pass the suffix
-    allowlist. If the real assembled surface ever registers a name containing
-    ``___``, switch the middleware to exact-name matching; do not relax this
-    assertion.
+    No real tool currently uses FastMCP's ``___`` delimiter. A future
+    namespaced tool is therefore a deliberate registration and allowlist change,
+    not a name that can appear accidentally and be silently admitted.
     """
 
     tool_names = set(_probe_real_server(apps_only="false")["listed"])
@@ -214,7 +213,13 @@ async def test_calling_hidden_tool_returns_mode_specific_error(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_namespaced_app_tool_suffix_is_allowed(monkeypatch) -> None:
+async def test_namespaced_app_tool_is_rejected_until_native_registration(monkeypatch) -> None:
+    """Reject namespaced addressing until native app-tool registration lands.
+
+    Supporting ``{app}___{tool}`` requires explicitly extending the allowlist
+    as part of that registration change, not loose suffix matching.
+    """
+
     monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
     mcp = FastMCP("namespaced-app-tool-test")
 
@@ -226,10 +231,9 @@ async def test_namespaced_app_tool_suffix_is_allowed(monkeypatch) -> None:
 
     async with Client(mcp) as client:
         listed_names = {tool.name for tool in await client.list_tools()}
-        result = await client.call_tool("gateway___cao___render_dashboard")
-
-    assert "gateway___cao___render_dashboard" in listed_names
-    assert result.data == "ok"
+        assert "gateway___cao___render_dashboard" not in listed_names
+        with pytest.raises(ToolError, match="app-surface-only mode"):
+            await client.call_tool("gateway___cao___render_dashboard")
 
 
 @pytest.mark.asyncio
@@ -248,6 +252,52 @@ async def test_namespaced_non_app_tool_suffix_is_rejected(monkeypatch) -> None:
         assert "gateway___render_dashboard___handoff" not in listed_names
         with pytest.raises(ToolError, match="app-surface-only mode"):
             await client.call_tool("gateway___render_dashboard___handoff")
+
+
+@pytest.mark.asyncio
+async def test_namespaced_allowlisted_suffix_is_unlisted_and_uncallable(monkeypatch) -> None:
+    """Prevent registered tools from bypassing exact matching via an allowed suffix."""
+
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    mcp = FastMCP("namespaced-mutation-test")
+
+    @mcp.tool(name="evil___submit_command")
+    async def namespaced_submit_command() -> str:
+        return "mutation executed"
+
+    mcp.add_middleware(AppSurfaceOnlyMiddleware())
+
+    async with Client(mcp) as client:
+        listed_names = {tool.name for tool in await client.list_tools()}
+        assert "evil___submit_command" not in listed_names
+        with pytest.raises(ToolError, match="app-surface-only mode"):
+            await client.call_tool("evil___submit_command")
+
+
+@pytest.mark.asyncio
+async def test_listing_and_calling_use_the_same_app_surface_predicate(monkeypatch) -> None:
+    """Require listing and invocation to agree for allowed and rejected names."""
+
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    mcp = FastMCP("app-surface-predicate-agreement-test")
+
+    @mcp.tool(name="render_dashboard")
+    async def allowed_tool() -> str:
+        return "allowed"
+
+    @mcp.tool(name="handoff")
+    async def rejected_tool() -> str:
+        return "rejected"
+
+    mcp.add_middleware(AppSurfaceOnlyMiddleware())
+
+    async with Client(mcp) as client:
+        listed_names = {tool.name for tool in await client.list_tools()}
+        assert "render_dashboard" in listed_names
+        assert "handoff" not in listed_names
+        assert (await client.call_tool("render_dashboard")).data == "allowed"
+        with pytest.raises(ToolError, match="app-surface-only mode"):
+            await client.call_tool("handoff")
 
 
 @pytest.mark.asyncio

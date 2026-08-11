@@ -69,8 +69,10 @@ declared with app-only `_meta.ui.visibility`, but FastMCP's
 `get_tool()`. Its remaining app-tool path requires `{app}___{tool}` addressing
 through `get_app_tool()` and matching `meta.fastmcp.app` metadata; CAO currently
 provides neither because the iframe sends bare names and `ui_meta()` does not
-set that metadata. The six-name restriction is retained so it remains correct
-when native app-tool registration is added in a separately reviewed change.
+set that metadata. App-surface-only mode deliberately rejects namespaced tool
+names until native app-tool registration lands. That future change must extend
+the exact allowlist explicitly. The six-name restriction is retained so it
+remains correct for today's bare-name surface.
 
 `CAO_AGUI_ENABLED` is not required because `CAO_MCP_APPS_ENABLED` also enables
 the shared AG-UI/event surface. Both `/agui/v1/stream` and `/events` are mounted;

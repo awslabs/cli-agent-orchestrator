@@ -25,9 +25,9 @@ APP_SURFACE_TOOL_NAMES = frozenset(
 
 
 def _is_app_surface_tool_name(tool_name: str) -> bool:
-    """Return whether a bare or namespaced tool name belongs to the app surface."""
+    """Return whether a tool name is explicitly part of the app surface."""
 
-    return tool_name.rsplit("___", 1)[-1] in APP_SURFACE_TOOL_NAMES
+    return tool_name in APP_SURFACE_TOOL_NAMES
 
 
 class AppSurfaceOnlyMiddleware(Middleware):
