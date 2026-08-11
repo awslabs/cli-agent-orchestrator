@@ -308,11 +308,18 @@ def test_replace_profile_can_replace_a_corrupt_store_file(store: Path) -> None:
     assert target.read_text(encoding="utf-8") == "clean\n"
 
 
-def test_replace_profile_lets_exactly_one_concurrent_deleter_or_writer_win(store: Path) -> None:
+def test_replace_profile_refuses_every_concurrent_writer_when_the_target_is_absent(
+    store: Path,
+) -> None:
     """The existence requirement holds under contention, not just serially.
 
     Two threads race to replace the same profile after it is deleted. Neither may
     succeed by creating the file, because the check lives inside the lock.
+
+    Note what this does NOT cover: the file is removed *before* the barrier, so
+    both racers are writers and no delete overlaps a write. The interleaving that
+    actually threatened the update-only guarantee is covered by
+    ``test_delete_profile_cannot_unlink_while_a_replace_holds_the_lock`` below.
     """
     import threading
 
@@ -341,3 +348,69 @@ def test_replace_profile_lets_exactly_one_concurrent_deleter_or_writer_win(store
 
     assert sorted(outcomes) == ["rejected:FIRST", "rejected:SECOND"]
     assert not (store / "agent.md").exists()
+
+
+def test_delete_profile_cannot_unlink_while_a_replace_holds_the_lock(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent delete cannot resurrect a profile through an in-flight update.
+
+    Reported on PR #585. ``delete_profile`` used to do an unlocked ``exists()``
+    then ``unlink()``, so this interleaving was reachable:
+
+      1. ``replace_profile`` takes the lock and passes its ``must_exist`` check
+      2. ``delete_profile`` unlinks the file and reports success
+      3. ``replace_profile`` publishes, recreating what was just deleted
+
+    Both callers were told they succeeded and the "deleted" profile was back on
+    disk holding the replacement text. Pausing inside the publish makes the
+    window deterministic rather than hoping the scheduler lands in it: the
+    deleter must still be blocked on the lock while the replace holds it.
+    """
+    from cli_agent_orchestrator.utils import atomic_file
+
+    profile_store.write_profile("agent", "original\n")
+    target = store / "agent.md"
+
+    publish_entered = threading.Event()
+    release = threading.Event()
+    real_publish = atomic_file._atomic_publish
+
+    def paused_publish(t: Path, content: str, encoding: str) -> None:
+        publish_entered.set()
+        release.wait(timeout=10)
+        return real_publish(t, content, encoding)
+
+    monkeypatch.setattr(atomic_file, "_atomic_publish", paused_publish)
+
+    delete_outcome: list[str] = []
+
+    def deleter() -> None:
+        try:
+            profile_store.delete_profile("agent")
+            delete_outcome.append("deleted")
+        except Exception as exc:  # noqa: BLE001 - recording the class is the point
+            delete_outcome.append(type(exc).__name__)
+
+    replacer = threading.Thread(target=lambda: profile_store.replace_profile("agent", "REPLACED\n"))
+    replacer.start()
+    assert publish_entered.wait(timeout=10), "replace never reached the publish step"
+
+    deleter_thread = threading.Thread(target=deleter)
+    deleter_thread.start()
+    deleter_thread.join(timeout=0.5)
+
+    # The assertion that fails on the unlocked implementation: the delete would
+    # have completed here, having unlinked a file the replace is about to
+    # republish.
+    assert deleter_thread.is_alive(), "delete_profile did not wait for the write lock"
+    assert target.exists()
+
+    release.set()
+    replacer.join(timeout=10)
+    deleter_thread.join(timeout=15)
+
+    # Serialised, so the delete lands after the update rather than inside it and
+    # the file is genuinely gone.
+    assert delete_outcome == ["deleted"]
+    assert not target.exists()

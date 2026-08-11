@@ -312,6 +312,61 @@ def locked_atomic_write(
         _atomic_publish(target, content, encoding)
 
 
+def locked_atomic_delete(
+    target: Path,
+    *,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    must_exist: bool = True,
+) -> None:
+    """Remove ``target`` while holding the same lock the writers use.
+
+    The deleting sibling of :func:`locked_atomic_write`. It exists because
+    ``locked_atomic_write``'s ``must_exist`` guarantee is only real if deletion
+    participates in the same critical section. An unlocked
+    ``exists()``-then-``unlink()`` can land *between* an update's existence check
+    and its ``os.replace``: the delete succeeds, the update then republishes the
+    file, and both callers are told they succeeded while a supposedly-deleted
+    file is back on disk holding the new content. Serialising here makes one of
+    the two lose, which is the whole point of ``must_exist``.
+
+    Deletion needs no temp file or ``os.replace`` because ``unlink`` is already
+    atomic. The lock is what this adds, not atomicity.
+
+    Note:
+        Safe against the ``fcntl.flock``-is-per-inode hazard because the lock
+        file is not the target. ``_lock_path_for`` keys a file under
+        ``LOCK_DIR`` by a hash of the target's *resolved* path, and those lock
+        files are never unlinked, so removing the target leaves the lock inode
+        untouched and a concurrent writer keeps contending on the same one.
+
+    Args:
+        target: The file to remove.
+        lock_timeout: Seconds to wait for the lock before raising
+            ``LockTimeoutError``.
+        must_exist: When True (default), a missing target raises
+            ``FileNotFoundError``. The check runs inside the lock, so two
+            concurrent deleters cannot both observe the file as present.
+            Pass False to make removal idempotent.
+
+    Raises:
+        FileNotFoundError: If ``target`` is absent and ``must_exist`` is True.
+        LockTimeoutError: If the lock is not acquired within ``lock_timeout``
+            seconds.
+        OSError: Propagated from the unlink.
+    """
+    lock_path = _lock_path_for(target)
+
+    with _file_lock(lock_path, lock_timeout):
+        # Inside the lock for the same reason as locked_atomic_write's checks:
+        # a caller testing existence beforehand would race both a concurrent
+        # deleter (double unlink) and a concurrent update (resurrected file).
+        if not target.exists():
+            if must_exist:
+                raise FileNotFoundError(f"{target} does not exist")
+            return
+        target.unlink()
+
+
 def _atomic_publish(target: Path, content: str, encoding: str) -> None:
     """Write ``content`` to ``target`` via a unique temp file + ``os.replace``.
 

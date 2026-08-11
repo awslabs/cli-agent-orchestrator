@@ -31,6 +31,7 @@ from cli_agent_orchestrator.utils.atomic_file import (
     LockTimeoutError,
     _file_lock,
     _lock_path_for,
+    locked_atomic_delete,
     locked_atomic_rewrite,
     locked_atomic_write,
 )
@@ -771,3 +772,76 @@ def test_locked_atomic_write_must_exist_is_enforced_under_the_lock(tmp_path: Pat
 
     assert sorted(outcomes) == ["refused:A", "refused:B"]
     assert not target.exists()
+
+
+# --------------------------------------------------------------------------
+# locked_atomic_delete
+#
+# Added for the PR #585 review: locked_atomic_write's ``must_exist`` guarantee
+# is only real if deletion takes the SAME lock. An unlocked
+# exists()-then-unlink() can land between an update's existence check and its
+# os.replace, so the delete succeeds, the update republishes, and a deleted
+# file is back on disk holding the new content.
+# --------------------------------------------------------------------------
+
+
+def test_delete_removes_an_existing_file(tmp_path: Path) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text("bye\n", encoding="utf-8")
+
+    locked_atomic_delete(target)
+
+    assert not target.exists()
+
+
+def test_delete_raises_when_the_target_is_absent(tmp_path: Path) -> None:
+    """``must_exist`` defaults to True so a caller can map absence to its own error."""
+    with pytest.raises(FileNotFoundError):
+        locked_atomic_delete(tmp_path / "never-existed.md")
+
+
+def test_delete_is_idempotent_when_must_exist_is_false(tmp_path: Path) -> None:
+    target = tmp_path / "AGENTS.md"
+
+    locked_atomic_delete(target, must_exist=False)  # no raise
+
+    assert not target.exists()
+
+
+def test_delete_contends_on_the_same_lock_as_a_write(tmp_path: Path) -> None:
+    """The guarantee this helper exists for: one lock covers writes AND deletes.
+
+    Holding the target's lock directly, then asserting the delete times out,
+    proves ``locked_atomic_delete`` computes the same key via ``_lock_path_for``
+    that ``locked_atomic_write`` uses. A delete that keyed a different lock (or
+    took none) would return immediately and the file would be gone.
+    """
+    target = tmp_path / "AGENTS.md"
+    target.write_text("live\n", encoding="utf-8")
+
+    with _file_lock(_lock_path_for(target), 5.0):
+        with pytest.raises(LockTimeoutError):
+            locked_atomic_delete(target, lock_timeout=0.2)
+
+    assert target.exists(), "the delete must not have unlinked while the lock was held"
+
+
+def test_delete_does_not_disturb_the_lock_file_itself(tmp_path: Path) -> None:
+    """Removing the target must leave the lock inode intact.
+
+    ``fcntl.flock`` is per-inode, so if deleting a target also removed its lock
+    file, the next writer and the next deleter would lock different inodes and
+    stop conflicting. Lock files live under ``LOCK_DIR``, keyed by a hash of the
+    resolved target path, and are never unlinked.
+    """
+    target = tmp_path / "AGENTS.md"
+    target.write_text("live\n", encoding="utf-8")
+    locked_atomic_write(target, "live\n")
+    lock_path = _lock_path_for(target)
+    assert lock_path.exists()
+
+    locked_atomic_delete(target)
+
+    assert not target.exists()
+    assert lock_path.exists()
+    assert LOCK_DIR in lock_path.parents

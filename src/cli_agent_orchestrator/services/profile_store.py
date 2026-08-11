@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_delete, locked_atomic_write
 
 # A profile name becomes a single filesystem segment under
 # LOCAL_AGENT_STORE_DIR. Restricting to [A-Za-z0-9_-] with a 64-char cap
@@ -38,6 +38,7 @@ __all__ = [
     "ProfileExistsError",
     "ProfileNotFoundError",
     "delete_profile",
+    "replace_profile",
     "store_path",
     "write_profile",
 ]
@@ -192,6 +193,14 @@ def replace_profile(name: str, content: str) -> Path:
 def delete_profile(name: str) -> None:
     """Delete the profile ``name`` from the local store.
 
+    The existence check and the unlink both happen inside the target's write
+    lock, via :func:`locked_atomic_delete`. That lock is shared with
+    :func:`replace_profile`, and it has to be: an unlocked delete can slip
+    between an update's ``must_exist`` check and its publish, so the update
+    recreates the file and both operations report success. Deletion being the
+    unlocked side of that pair would silently void the update-only guarantee
+    ``replace_profile`` advertises.
+
     Args:
         name: Profile name, used as the filename stem.
 
@@ -207,6 +216,7 @@ def delete_profile(name: str) -> None:
     if not target.is_relative_to(root):
         raise InvalidProfileNameError(f"Profile name '{name}' escapes the local store.")
 
-    if not target.exists():
-        raise ProfileNotFoundError(f"Profile '{name}' not found in the local store.")
-    target.unlink()
+    try:
+        locked_atomic_delete(target)
+    except FileNotFoundError as exc:
+        raise ProfileNotFoundError(f"Profile '{name}' not found in the local store.") from exc

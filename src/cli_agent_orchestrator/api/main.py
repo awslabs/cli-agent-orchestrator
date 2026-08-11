@@ -2129,15 +2129,22 @@ async def replace_agent_profile_endpoint(
 @app.delete("/agents/profiles/{name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_agent_profile_endpoint(
     name: str,
-    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> None:
     """Delete a profile from the local store.
 
-    ``SCOPE_ADMIN`` alone rather than write-or-admin, matching every other
-    destructive route on this service (``/sessions``, ``/workflows``,
-    ``/terminals``, ``/flows``, ``/memory``). Deletion is the only irreversible
-    operation in this group, and the asymmetry with POST and PUT is the existing
-    convention rather than a new one.
+    Write-or-admin, the same guard as POST and PUT, so one credential completes
+    the whole create/edit/delete cycle that issue #510 specifies. Scopes are a
+    flat set here, not a hierarchy: ``require_any_scope`` tests membership, so
+    admin-only would 403 a caller holding exactly ``cao:write`` and leave a
+    client that can create and edit a profile unable to remove it.
+
+    Most other ``DELETE`` routes on this service do require admin alone, but they
+    remove *running or generated* state: sessions, terminals, workflows, flows,
+    and bulk memory. A profile is an authored document, closer to
+    ``DELETE /memory/relationships/{id}``, which is also write-or-admin. Removing
+    one stops no in-flight work and destroys nothing that cannot be re-authored,
+    and the deletion is already gated behind a confirmation in the UI.
 
     Built-in and provider-managed profiles are not deletable for the same reason
     they are not replaceable: ``delete_profile`` resolves only inside the local
@@ -2158,7 +2165,10 @@ async def delete_agent_profile_endpoint(
 
 
 @app.get("/agents/profiles/{name}/source")
-async def get_agent_profile_source_endpoint(name: str) -> ProfileSourceResponse:
+async def get_agent_profile_source_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileSourceResponse:
     """Return a profile's document exactly as stored, unresolved.
 
     The authoring counterpart to ``GET /agents/profiles/{name}``. That route calls
@@ -2172,6 +2182,14 @@ async def get_agent_profile_source_endpoint(name: str) -> ProfileSourceResponse:
     Reads across all configured stores, not only the local one, so a built-in can
     be fetched as the starting point for a clone. Writing it back still requires
     the local store, which is enforced by the write routes.
+
+    Scope-gated, unlike the pre-existing profile reads beside it, following the
+    precedent set on #505: a newly added read route carries the gate, while
+    already-shipped ungated siblings are left alone because tightening them could
+    break an existing unauthenticated reader. Gating matters more here than on
+    those siblings because this route returns the stored bytes verbatim from the
+    local, provider, extra and built-in stores, including documents that fail to
+    parse, whereas the parsed route can only return what the model accepts.
     """
     from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
 

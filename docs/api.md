@@ -71,9 +71,11 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   returns 404 rather than writing a local file that would shadow the original.
   Requires `cao:write` or `cao:admin`.
 - `DELETE /agents/profiles/{name}` removes a profile from the local store.
-  Requires `cao:admin`, matching the other destructive routes on this service;
-  a `cao:write` token that may create and edit profiles cannot delete them.
-  Built-ins are not deletable, for the same reason they are not replaceable.
+  Requires `cao:write` or `cao:admin`, the same guard as create and replace, so
+  one credential covers the whole create/edit/delete cycle. Scopes are a flat
+  set rather than a hierarchy, so requiring admin here would 403 a caller
+  holding exactly `cao:write`. Built-ins are not deletable, for the same reason
+  they are not replaceable.
 - Both write routes run the profile validator on the exact submitted document
   before persisting anything, so an invalid profile never reaches disk. Errors
   reject the request with 400 and the findings attached; warnings do not block
@@ -85,6 +87,11 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   profile, having applied `${VAR}` substitution from the managed environment
   file to the raw text before parsing. Round-tripping a resolved document
   through a write would persist substituted values into a plaintext profile.
+  Requires `cao:read`, `cao:write`, or `cao:admin`. The pre-existing profile
+  reads beside it are ungated and stay that way, since tightening a shipped
+  route could break an existing unauthenticated reader; this one is gated
+  because it returns the stored bytes verbatim from every configured store,
+  including documents that fail to parse.
 - Template validation and preview require the selected template to include a
   `schema.json` file.
 - `/agents/providers` reports provider availability.
