@@ -120,11 +120,18 @@ write-neutralized scope comparison (contradiction detection and persistence
 disabled) measured **178.73s for
 `global`** (756 ripgrep spawns, 72 issues) and **258.97s for `project`** (755
 spawns, 151 issues). These are write-neutralized comparisons, not shipped-path
-costs. Under shipped defaults (lint enabled with the real contradiction
-detector), a full `global` build measured **432.0s**, while the legitimate
-`project` scope **exceeded the 600-second deadline** and produced no cached
-view. The project overshoot was not instrumented, so no duration beyond that
-deadline is claimed.
+costs. Under shipped defaults a full `global` build measured **432.0s**, while
+the legitimate `project` scope **exceeded the 600-second deadline** and produced
+no cached view. The dominant cost is the ripgrep-based `stale_claim` detector,
+**not** the LLM contradiction detector: `run_lint`'s `timeout_s` defaults to
+60.0s (`wiki_lint.py:74`) and the memory provider does not override it
+(`providers/memory.py:201`), so by the time the contradiction detector runs last
+(`wiki_lint.py:1136-1156`) the shared budget is long exhausted and it is skipped
+outright. `_detect_stale_claims` (`wiki_lint.py:1093`) is the only region of the
+lint with no timeout at all. The 432.0s result is one uninstrumented sample; the
+spread from the 178.73s run was not measured, its cause is unknown, and reruns
+are pending under #41. The project overshoot was also not instrumented, so no
+duration beyond its deadline is claimed.
 
 The global sample contained 48 index rows / 48 keys, 47 existing wiki pages,
 182 global metadata rows, and 1,118 repository files visible to ripgrep. The
@@ -205,9 +212,10 @@ the difference is that they may now complete after the HTTP request has ended.
 > write-neutralized comparison measured roughly **179s for `global`** and
 > **259s for `project`**; both exceed CAO's 90-second request deadline and
 > therefore cannot return 200 on their first attempt. Under shipped defaults,
-> the real contradiction detector raised `global` to a measured **432.0s**;
-> prompt retries can still join that admitted build and converge when it
-> completes. The legitimate `project` scope instead exceeded the 600-second
+> `global` measured **432.0s**, dominated by the `stale_claim` ripgrep sweep and
+> not by the contradiction detector (see above); prompt retries can still join
+> that admitted build and converge when it completes. The legitimate `project`
+> scope instead exceeded the 600-second
 > deadline, cached nothing, and never converges while that duration persists.
 > If a build finishes in the five-second gap after a request, the completed view
 > remains cached and the next retry is an immediate hit.

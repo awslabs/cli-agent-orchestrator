@@ -19,14 +19,14 @@ from cli_agent_orchestrator.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
-# Module-level cache shared across every MemoryGraphProvider instance (the U4
-# route instantiates a fresh provider per request via get_provider, so a
-# per-instance cache would never hit). DELIBERATE reversal of the original
-# "lint-on-demand, no caching" ADR — see graph/cache.py for the perf finding.
-# Under shipped defaults (lint enabled with the real contradiction detector), a
-# full global build measured 432.0s, while the legitimate project scope exceeded
-# the 600-second deadline and produced no cached view. Keyed by (provider, scope,
-# scope_id, lint_enabled).
+# Module-level cache shared across every MemoryGraphProvider instance; the route
+# instantiates a fresh provider per request, so a per-instance cache never hits.
+# DELIBERATE reversal of the "lint-on-demand, no caching" ADR; see graph/cache.py.
+# Under shipped defaults, global measured 432.0s; legitimate project exceeded the
+# 600-second deadline and cached nothing. The dominant cost is ripgrep-based
+# stale_claim, not the LLM contradiction detector: run_lint's 60.0s budget expires
+# before that last detector runs, while _detect_stale_claims has no timeout.
+# Keyed by (provider, scope, scope_id, lint_enabled).
 _CACHE = GraphViewCache()
 
 _SCOPES_CONSUMING_SCOPE_ID = frozenset(
@@ -127,10 +127,10 @@ class MemoryGraphProvider(GraphProvider):
     async def _build(self, scope: str, scope_id: Optional[str], lint_enabled: bool) -> GraphView:
         """Project the scope's wiki into a GraphView.
 
-        Under shipped defaults (lint enabled with the real contradiction
-        detector), a full global build measured 432.0s, while the legitimate
-        project scope exceeded the 600-second deadline and produced no cached
-        view.
+        Under shipped defaults, global measured 432.0s; legitimate project exceeded
+        the 600-second deadline and cached nothing. The dominant cost is ripgrep-based
+        stale_claim, not the LLM contradiction detector: run_lint's 60.0s budget
+        expires before that last detector runs; _detect_stale_claims has no timeout.
         """
         meta: dict[str, Any] = {
             "provider": "memory",
