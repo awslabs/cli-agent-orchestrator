@@ -55,27 +55,31 @@ require a CAO-managed terminal. This behavior is explicit; it is never inferred
 from a missing `CAO_TERMINAL_ID`, so a misconfigured CAO session does not
 silently lose tools. The flag requires `CAO_MCP_APPS_ENABLED=true`.
 
-**Known product defect in FastMCP 3.2:** the shipped event-stream view renders
-permanently empty (no history backfill and no live SSE subscription), and every
-command/mutation gesture in the dashboard and agent views is non-functional.
-The views call `cao_fetch_history`, `subscribe_events`, and `submit_command` by
-bare name, but FastMCP cannot resolve them. Event-stream initialization awaits
-the history call before entering its SSE setup; that rejection occurs before
-`fetchHistory()` can apply its empty-list fallback and before
-`subscribe_events` is called. Neither the default SSE URL nor the optional-SSE
-catch can run, so this does not degrade gracefully.
+**Known CAO integration gap with FastMCP 3.2's app-tool addressing:** the shipped
+event-stream view renders permanently empty (no history backfill and no live SSE
+subscription), and every command/mutation gesture in the dashboard and agent
+views is non-functional. The views call `cao_fetch_history`, `subscribe_events`,
+and `submit_command` by bare name, but FastMCP cannot resolve them. Event-stream
+initialization awaits the history call before entering its SSE setup; that
+rejection occurs before `fetchHistory()` can apply its empty-list fallback and
+before `subscribe_events` is called. Neither the default SSE URL nor the
+optional-SSE catch can run, and no error is surfaced in the view; it renders its
+ordinary empty state while the rejection appears only in the host iframe
+console.
 
-Only `render_dashboard`, `render_agent_view`, and `render_graph_view` are listed
-and callable. `cao_fetch_history`, `subscribe_events`, and `submit_command` are
-declared with app-only `_meta.ui.visibility`, but FastMCP's
-`_is_model_visible()` filters `["app"]`-only tools out of both `tools/list` and
-`get_tool()`. Its remaining app-tool path requires `{app}___{tool}` addressing
-through `get_app_tool()` and matching `meta.fastmcp.app` metadata; CAO currently
-provides neither because the iframe sends bare names and `ui_meta()` does not
-set that metadata. App-surface-only mode deliberately rejects namespaced tool
-names until native app-tool registration lands. That future change must extend
-the exact allowlist explicitly. The six-name restriction is retained so it
-remains correct for today's bare-name surface.
+In app-surface-only mode, only `render_dashboard`, `render_agent_view`, and
+`render_graph_view` are listed and callable. The outage for `cao_fetch_history`,
+`subscribe_events`, and `submit_command` is independent of `CAO_MCP_APPS_ONLY`;
+disabling the flag does not restore these three tools. They are declared with
+app-only `_meta.ui.visibility`, but FastMCP's `_is_model_visible()` filters
+`["app"]`-only tools out of both `tools/list` and `get_tool()`. Its remaining
+app-tool path requires `{app}___{tool}` addressing through `get_app_tool()` and
+matching `meta.fastmcp.app` metadata; CAO currently provides neither because the
+iframe sends bare names and `ui_meta()` does not set that metadata.
+App-surface-only mode deliberately rejects namespaced tool names until native
+app-tool registration lands. That future change must extend the exact allowlist
+explicitly. The six-name restriction is retained so it remains correct for
+today's bare-name surface.
 
 `CAO_AGUI_ENABLED` is not required because `CAO_MCP_APPS_ENABLED` also enables
 the shared AG-UI/event surface. Both `/agui/v1/stream` and `/events` are mounted;

@@ -204,9 +204,11 @@ def register_apps(mcp: Any) -> bool:
 
     * returns ``False`` when ``CAO_MCP_APPS_ENABLED`` is unset, when the running
       FastMCP has no ``resource`` decorator, or when the ``apps_static/`` build
-      output is missing; the first two are logged at info, while missing build
-      output is a degraded posture logged at warning;
-    * otherwise registers one resource per built artifact and returns ``True``.
+      output is missing; disabled registration is logged at info, while
+      unavailable resource support or build output is logged at warning;
+    * otherwise registers one resource per built artifact and returns ``True``;
+      incomplete registration is logged at warning and complete registration at
+      info.
     """
 
     if not _is_enabled():
@@ -217,7 +219,7 @@ def register_apps(mcp: Any) -> bool:
 
     resource_decorator = getattr(mcp, "resource", None)
     if not callable(resource_decorator):
-        logger.info(
+        logger.warning(
             "FastMCP build has no @mcp.resource decorator; skipping MCP App resource registration"
         )
         return False
@@ -253,10 +255,9 @@ def register_apps(mcp: Any) -> bool:
         except Exception:  # pragma: no cover - defensive: never crash startup
             logger.exception("Failed to register MCP App resource %s", uri)
 
-    # Registration happens before logging is configured on the stdio path, so a
-    # posture summary must be WARNING to remain operator-visible.
-    logger.warning(
-        "MCP App resource posture active; registered %d/%d built HTML resources from %s",
+    log_registration = logger.warning if registered < len(_RESOURCE_FILES) else logger.info
+    log_registration(
+        "MCP App resources registered %d/%d built HTML resources from %s",
         registered,
         len(_RESOURCE_FILES),
         static_dir,

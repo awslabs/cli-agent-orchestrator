@@ -132,14 +132,23 @@ class TestRegisterApps:
         assert register_apps(StubMCP()) is False
 
     def test_returns_false_without_resource_decorator(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
 
         class NoResourceMCP:
             pass
 
-        assert register_apps(NoResourceMCP()) is False
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
+            assert register_apps(NoResourceMCP()) is False
+
+        records = [
+            record
+            for record in caplog.records
+            if "no @mcp.resource decorator" in record.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].levelno >= logging.WARNING
 
     def test_missing_bundles_warn_at_visible_startup_level(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -163,7 +172,7 @@ class TestRegisterApps:
         assert len(records) == 1
         assert records[0].levelno >= logging.WARNING
 
-    def test_registers_when_enabled_and_built(
+    def test_complete_registration_has_no_warning(
         self,
         tmp_path,
         monkeypatch: pytest.MonkeyPatch,
@@ -192,13 +201,39 @@ class TestRegisterApps:
             EVENT_STREAM_RESOURCE_URI,
             GRAPH_RESOURCE_URI,
         }
-        posture_records = [
+        posture_records = [record for record in caplog.records if record.levelno >= logging.WARNING]
+        assert posture_records == []
+
+    def test_partial_registration_warns(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        for name in _RESOURCE_FILES.values():
+            (tmp_path / name).write_text(f"<title>{name}</title>", encoding="utf-8")
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
+
+        class StubMCP:
+            def resource(self, uri, **kw):  # type: ignore[no-untyped-def]
+                def decorator(fn):  # type: ignore[no-untyped-def]
+                    if uri == EVENT_STREAM_RESOURCE_URI:
+                        raise RuntimeError("registration failed")
+                    return fn
+
+                return decorator
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
+            assert register_apps(StubMCP()) is True
+
+        records = [
             record
             for record in caplog.records
-            if "MCP App resource posture active" in record.getMessage()
+            if "MCP App resources registered 3/4" in record.getMessage()
         ]
-        assert len(posture_records) == 1
-        assert posture_records[0].levelno >= logging.WARNING
+        assert len(records) == 1
+        assert records[0].levelno >= logging.WARNING
 
     def test_graph_resource_gated_by_apps_enabled(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
