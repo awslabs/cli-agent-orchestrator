@@ -8,11 +8,17 @@ isolation, invalidate) and its integration through MemoryGraphProvider
 import asyncio
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
-from cli_agent_orchestrator.graph.cache import DEFAULT_TTL_S, GraphViewCache, make_meta
+from cli_agent_orchestrator.graph.cache import (
+    DEFAULT_TTL_S,
+    GraphBuildDeadlineError,
+    GraphViewCache,
+    make_meta,
+)
 from cli_agent_orchestrator.graph.models import GraphView, Node
 from cli_agent_orchestrator.graph.providers import memory as memory_provider
 from cli_agent_orchestrator.graph.providers.memory import MemoryGraphProvider
@@ -52,13 +58,13 @@ class TestGraphViewCache:
             calls["n"] += 1
             return _view("a")
 
-        key = ("memory", "global", None)
-        view1, cached1, _ = await cache.get_or_build(key, builder)
-        view2, cached2, _ = await cache.get_or_build(key, builder)
+        key = ("memory", "global", None, True)
+        view1 = await cache.get_or_build(key, builder)
+        view2 = await cache.get_or_build(key, builder)
 
         assert calls["n"] == 1  # builder ran ONCE across two calls
-        assert cached1 is False and cached2 is True
-        assert view1 is view2  # same cached instance served
+        assert view1.meta["cached"] is False
+        assert view2.meta["cached"] is True
 
     @pytest.mark.asyncio
     async def test_ttl_expiry_reruns_builder(self):
@@ -70,13 +76,13 @@ class TestGraphViewCache:
             calls["n"] += 1
             return _view("a")
 
-        key = ("memory", "global", None)
-        _, cached1, _ = await cache.get_or_build(key, builder)
+        key = ("memory", "global", None, True)
+        view1 = await cache.get_or_build(key, builder)
         clock.advance(300.1)  # past TTL
-        _, cached2, _ = await cache.get_or_build(key, builder)
+        view2 = await cache.get_or_build(key, builder)
 
         assert calls["n"] == 2
-        assert cached1 is False and cached2 is False
+        assert view1.meta["cached"] is False and view2.meta["cached"] is False
 
     @pytest.mark.asyncio
     async def test_per_key_isolation(self):
@@ -89,10 +95,10 @@ class TestGraphViewCache:
         async def build_project():
             return _view("p")
 
-        vg, _, _ = await cache.get_or_build(("memory", "global", None), build_global)
-        vp, cached, _ = await cache.get_or_build(("memory", "project", "proj1"), build_project)
+        vg = await cache.get_or_build(("memory", "global", None, True), build_global)
+        vp = await cache.get_or_build(("memory", "project", "proj1", True), build_project)
 
-        assert cached is False  # different key ⇒ built fresh, not a global hit
+        assert vp.meta["cached"] is False  # different key ⇒ built fresh, not a global hit
         assert {n.id for n in vg.nodes} == {"g"}
         assert {n.id for n in vp.nodes} == {"p"}
 
@@ -110,15 +116,14 @@ class TestGraphViewCache:
             await release.wait()  # hold all concurrent callers on the lock
             return _view("a")
 
-        key = ("memory", "global", None)
+        key = ("memory", "global", None, True)
         tasks = [asyncio.create_task(cache.get_or_build(key, slow_builder)) for _ in range(5)]
         await started.wait()
         release.set()
         results = await asyncio.gather(*tasks)
 
         assert calls["n"] == 1
-        # Exactly one caller saw cached=False (the builder), the rest hit cache.
-        assert sum(1 for _, cached, _ in results if cached is False) == 1
+        assert all(view.meta["cached"] is False for view in results)
 
     @pytest.mark.asyncio
     async def test_invalidate_forces_rebuild(self):
@@ -129,12 +134,12 @@ class TestGraphViewCache:
             calls["n"] += 1
             return _view("a")
 
-        key = ("memory", "global", None)
+        key = ("memory", "global", None, True)
         await cache.get_or_build(key, builder)
         cache.invalidate(key)
-        _, cached, _ = await cache.get_or_build(key, builder)
+        view = await cache.get_or_build(key, builder)
 
-        assert calls["n"] == 2 and cached is False
+        assert calls["n"] == 2 and view.meta["cached"] is False
 
     @pytest.mark.asyncio
     async def test_expired_entry_is_evicted_not_just_missed(self):
@@ -147,7 +152,7 @@ class TestGraphViewCache:
         async def builder():
             return _view("a")
 
-        key = ("memory", "global", None)
+        key = ("memory", "global", None, True)
         await cache.get_or_build(key, builder)
         assert key in cache._entries  # cached while fresh
 
@@ -167,7 +172,7 @@ class TestGraphViewCache:
         async def builder():
             return _view("a")
 
-        keys = [("memory", "global", f"k{i}") for i in range(50)]
+        keys = [("memory", "global", f"k{i}", True) for i in range(50)]
         for key in keys:
             await cache.get_or_build(key, builder)
         assert len(cache._entries) == 50
@@ -186,6 +191,101 @@ class TestGraphViewCache:
 
     def test_default_ttl_is_five_minutes(self):
         assert DEFAULT_TTL_S == 300.0
+
+    @pytest.mark.asyncio
+    async def test_request_timeout_does_not_cancel_build_and_retry_converges(self):
+        from cli_agent_orchestrator.api.main import _project_graph_with_timeout
+
+        cache = GraphViewCache()
+        key = ("memory", "global", None, True)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def builder():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return _view("completed")
+
+        class Provider:
+            def project_inflight(self, **filters):
+                return cache.get_or_build_task(key, builder)
+
+            def projection_status(self, **filters):
+                return cache.build_status(key)
+
+        first = asyncio.create_task(
+            _project_graph_with_timeout(Provider(), {}, provider="memory", timeout_s=0.01)
+        )
+        await started.wait()
+        with pytest.raises(HTTPException) as exc_info:
+            await first
+        assert exc_info.value.status_code == 504
+        assert exc_info.value.detail["kind"] == "graph_projection_timeout"
+        assert key in cache._inflight
+
+        retry = asyncio.create_task(
+            _project_graph_with_timeout(Provider(), {}, provider="memory", timeout_s=0.2)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        view = await retry
+
+        assert calls == 1
+        assert {node.id for node in view.nodes} == {"completed"}
+        assert key in cache._entries
+
+    @pytest.mark.asyncio
+    async def test_build_deadline_releases_lock_and_key_recovers(self):
+        cache = GraphViewCache(build_max_s=0.01)
+        key = ("memory", "global", None, True)
+
+        async def hangs():
+            await asyncio.Event().wait()
+            return _view("never")
+
+        with pytest.raises(GraphBuildDeadlineError):
+            await cache.get_or_build(key, hangs)
+        assert cache.build_status(key)["build_state"] == "failed_deadline"
+        assert not cache._locks[key].locked()
+
+        recovered = await cache.get_or_build(key, lambda: asyncio.sleep(0, result=_view("ok")))
+        assert {node.id for node in recovered.nodes} == {"ok"}
+
+    @pytest.mark.asyncio
+    async def test_global_cap_marks_additional_key_queued(self):
+        cache = GraphViewCache(max_concurrent_builds=1)
+        release = asyncio.Event()
+        key1 = ("memory", "project", "one", True)
+        key2 = ("memory", "project", "two", True)
+
+        async def blocked():
+            await release.wait()
+            return _view("done")
+
+        task1 = cache.get_or_build_task(key1, blocked)
+        await asyncio.sleep(0)
+        task2 = cache.get_or_build_task(key2, blocked)
+
+        assert cache.build_status(key1)["build_state"] == "in_progress"
+        assert cache.build_status(key2)["build_state"] == "queued"
+        release.set()
+        await asyncio.gather(task1, task2)
+
+    @pytest.mark.asyncio
+    async def test_inflight_registry_drops_strong_reference_after_completion(self):
+        cache = GraphViewCache()
+        key = ("memory", "global", None, True)
+
+        task = cache.get_or_build_task(key, lambda: asyncio.sleep(0, result=_view("done")))
+        assert cache.inflight_task(key) is task
+        await task
+        await asyncio.sleep(0)
+
+        assert cache.inflight_task(key) is None
+        assert cache._inflight == {}
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import pytest
 from cli_agent_orchestrator.graph.providers import base as providers_base
 from cli_agent_orchestrator.graph.providers import memory as memory_provider
 from cli_agent_orchestrator.graph.sinks import base as sinks_base
+from cli_agent_orchestrator.services import settings_service
 
 
 @pytest.fixture(autouse=True)
@@ -37,3 +38,9 @@ def _clear_graph_cache():
     memory_provider._CACHE.clear()
     yield
     memory_provider._CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _enable_graph_lint_by_default(monkeypatch):
+    """Keep graph tests independent of the developer's persisted lint setting."""
+    monkeypatch.setattr(settings_service, "is_memory_lint_enabled", lambda: True)

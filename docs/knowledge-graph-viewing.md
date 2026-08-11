@@ -113,7 +113,7 @@ than returning a 500.
 ## Caching & staleness
 
 Building the memory graph runs `wiki_lint` (ripgrep-backed detectors + an LLM
-contradiction check) **in-request**. Profiling `scope=global` measured this at
+contradiction check). Profiling `scope=global` measured this at
 **~30s typical and up to ~148s under load** — the dominant cost is the
 ripgrep-based `stale_claim` detector (~95 `rg` subprocess spawns), not the LLM
 detector. Because that can exceed the frontend's 120s fetch budget, the
@@ -121,14 +121,22 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
 
 - The **projected `GraphView` is cached per `(provider, scope, scope_id)`** with
   a **300-second TTL** (`DEFAULT_TTL_S = 300.0`).
-- The first (cold) request in a window pays the full projection cost; every
-  request within the TTL returns the cached view **near-instantly**. Concurrent
-  cold requests for the same key collapse onto a single build (single-flight —
-  no thundering herd), so a slow cold response is a request-deadline problem,
-  not duplicated projection work.
+- The cache, rather than the request, owns each cold projection task. A request
+  waits up to 90 seconds, but timing out does not cancel the build. A retry for
+  the same key joins that exact task, so one completed build populates the cache
+  even when its initiating request has already returned 504.
+- Concurrent cold requests for the same key collapse onto one task. At most two
+  detached graph builds run globally; additional keys wait with
+  `build_state: "queued"`. A build may hold its per-key lock for at most 600
+  seconds, after which the key reports `failed_deadline` and can be retried.
 - `meta.cached` (bool) and `meta.as_of` (ISO-8601 UTC timestamp of the build)
   tell you whether a response was served from cache and when the underlying data
   was projected.
+
+The detached projection is **not read-only**. `wiki_lint` persists contradiction
+relationships through its producer-scoped `replace_set` path, including the
+normal write audit. These are the same writes the synchronous projection made;
+the difference is that they may now complete after the HTTP request has ended.
 
 > **Staleness caveat — read this.** Invalidation is **TTL-only**; there is no
 > write-invalidation hook wired up today. So after you **store or forget** a
@@ -139,23 +147,24 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
 > call, but nothing calls it yet — this is a tracked follow-up to wire Refresh
 > to bypass the cache.)
 
-> **First cold load may still time out on a large scope.** The **~148s**
-> cold-build figure recorded in `graph/cache.py` was measured **under load**,
-> while the API projection deadline is **90s**; a single local measurement
-> does not retire that observation or establish a new worst case. On
-> 2026-08-11, a lint-enabled cold request over 48 global index rows (47
-> existing wiki pages) returned **504 after 90.012228s**. Running the same
-> projection without the API deadline completed in **164.036425s**, returned
-> 48 nodes and 7 edges, and reported `meta.cached: false`. The effective lint
-> setting was `true`; successful lint-enabled responses omit
-> `meta.lint_enabled` and `meta.lint_enrichment`, which are emitted only to
-> describe the disabled branch. This one corpus on one unloaded machine is not
-> a worst-case benchmark. Therefore a **504** with `detail.kind:
-> "graph_projection_timeout"` remains **retryable** regardless of one local
-> result: clients should honor `Retry-After` / `detail.retry_after_s`, retry
-> with backoff, and show a **"building…"** state while waiting. Single-flight
-> collapses concurrent cold requests onto one build, so this is a deadline
-> problem rather than a thundering herd.
+> **First cold load may still time out on a large scope.** On 2026-08-11, a
+> lint-enabled cold request over 48 global index rows returned **504 after
+> 90.012228s**, while its cache-owned build completed in **164.036425s**. A
+> retry joins the in-progress task instead of restarting it. The existing 504
+> contract remains stable: `detail.kind` is `"graph_projection_timeout"` and
+> `retryable` is true. Additive fields report `build_state`
+> (`started`, `in_progress`, `queued`, or `failed_deadline`),
+> `build_elapsed_s`, and `build_started_at`; `retry_after_s` and the
+> `Retry-After` header carry a dynamic remaining-time estimate floored at five
+> seconds. Successful memory responses always report `meta.lint_enabled` and
+> `meta.lint_enrichment`, so callers can verify which path ran.
+
+On shutdown, CAO cancels and retrieves all tracked graph tasks. Cancellation
+cannot stop a blocking `asyncio.to_thread` worker already running a ripgrep
+subprocess. Python 3.10 and 3.11 do not provide the timeout argument added to
+`loop.shutdown_default_executor()` in 3.12, so Ctrl-C on a development server
+may wait for the remaining detector duration and the worker thread may outlive
+the event loop.
 
 ## The API
 

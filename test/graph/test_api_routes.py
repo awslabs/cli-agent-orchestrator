@@ -15,10 +15,12 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api import main as api_main
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.graph.cache import GraphViewCache
 from cli_agent_orchestrator.graph.models import GraphView, Node
 from cli_agent_orchestrator.graph.providers import base as providers_base
 from cli_agent_orchestrator.graph.providers.base import GraphProvider
@@ -260,6 +262,78 @@ def test_health_responds_while_slow_graph_projection_in_flight(client, monkeypat
     assert health.status_code == 200
     assert elapsed < 0.5
     assert graph_response["resp"].status_code == 504
+
+
+@pytest.mark.asyncio
+async def test_global_build_cap_timeout_keeps_kind_and_reports_queued():
+    cache = GraphViewCache(max_concurrent_builds=1)
+    release = asyncio.Event()
+    active_key = ("memory", "project", "active", True)
+    queued_key = ("memory", "project", "queued", True)
+
+    async def blocked():
+        await release.wait()
+        return GraphView(nodes=[], edges=[])
+
+    active = cache.get_or_build_task(active_key, blocked)
+    await asyncio.sleep(0)
+
+    class _QueuedProvider:
+        def project_inflight(self, **filters):
+            return cache.get_or_build_task(queued_key, blocked)
+
+        def projection_status(self, **filters):
+            return cache.build_status(queued_key)
+
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await api_main._project_graph_with_timeout(
+                _QueuedProvider(),
+                {},
+                provider="memory",
+                timeout_s=0.01,
+            )
+        detail = exc_info.value.detail
+        assert exc_info.value.status_code == 504
+        assert detail["kind"] == "graph_projection_timeout"
+        assert detail["build_state"] == "queued"
+        assert detail["build_elapsed_s"] >= 0
+        assert detail["build_started_at"]
+    finally:
+        release.set()
+        await active
+        queued = cache.inflight_task(queued_key)
+        if queued is not None:
+            await queued
+
+
+@pytest.mark.asyncio
+async def test_build_deadline_timeout_keeps_kind_and_reports_failed_deadline():
+    cache = GraphViewCache(build_max_s=0.01)
+    key = ("memory", "global", None, True)
+
+    async def blocked():
+        await asyncio.Event().wait()
+        return GraphView(nodes=[], edges=[])
+
+    class _DeadlineProvider:
+        def project_inflight(self, **filters):
+            return cache.get_or_build_task(key, blocked)
+
+        def projection_status(self, **filters):
+            return cache.build_status(key)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await api_main._project_graph_with_timeout(
+            _DeadlineProvider(),
+            {},
+            provider="memory",
+            timeout_s=0.2,
+        )
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.detail["kind"] == "graph_projection_timeout"
+    assert exc_info.value.detail["build_state"] == "failed_deadline"
 
 
 # ── POST /graph/{provider}/export ────────────────────────────────────────

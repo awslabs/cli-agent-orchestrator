@@ -4,6 +4,7 @@ import asyncio
 import fcntl
 import json
 import logging
+import math
 import os
 import pty
 import re
@@ -72,6 +73,7 @@ from cli_agent_orchestrator.constants import (
     is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
+from cli_agent_orchestrator.graph.cache import GRAPH_BUILD_MAX_S, GraphBuildDeadlineError
 from cli_agent_orchestrator.graph.models import GraphView
 from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider, list_providers
 
@@ -821,6 +823,7 @@ async def lifespan(app: FastAPI):
     # Start provider-agnostic reconciliation sweep for orphaned PENDING messages
     # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
+    app.state.graph_build_tasks = set()
 
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
@@ -842,6 +845,15 @@ async def lifespan(app: FastAPI):
         logger.info("Herdr inbox service started")
 
     yield
+
+    # Detached graph projections outlive request deadlines. Cancel and retrieve
+    # them explicitly so shutdown does not destroy pending asyncio tasks.
+    graph_build_tasks = list(app.state.graph_build_tasks)
+    for task in graph_build_tasks:
+        task.cancel()
+    if graph_build_tasks:
+        await asyncio.gather(*graph_build_tasks, return_exceptions=True)
+    app.state.graph_build_tasks.clear()
 
     # Stop herdr inbox service on shutdown
     if herdr_inbox_task is not None:
@@ -4007,10 +4019,33 @@ async def _project_graph_with_timeout(
     provider: str,
     timeout_s: float = GRAPH_PROJECTION_TIMEOUT_S,
 ) -> GraphView:
-    try:
-        return await asyncio.wait_for(inst.project(**filters), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        raise HTTPException(
+    project_inflight = getattr(inst, "project_inflight", None)
+    if callable(project_inflight):
+        inflight = project_inflight(**filters)
+    else:
+        inflight = asyncio.ensure_future(inst.project(**filters))
+
+    task_registry = getattr(app.state, "graph_build_tasks", None)
+    if task_registry is None:
+        task_registry = app.state.graph_build_tasks = set()
+    if not inflight.done():
+        task_registry.add(inflight)
+        inflight.add_done_callback(task_registry.discard)
+
+    def _status() -> Dict[str, Any]:
+        projection_status = getattr(inst, "projection_status", None)
+        if not callable(projection_status):
+            return {}
+        return cast(Dict[str, Any], projection_status(**filters) or {})
+
+    def _timeout(build_status: Dict[str, Any]) -> HTTPException:
+        elapsed = float(build_status.get("build_elapsed_s", 0.0))
+        retry_after_s = (
+            max(GRAPH_PROJECTION_RETRY_AFTER_S, math.ceil(GRAPH_BUILD_MAX_S - elapsed))
+            if build_status
+            else GRAPH_PROJECTION_RETRY_AFTER_S
+        )
+        return HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={
                 "message": f"graph projection timed out after {timeout_s:g} seconds",
@@ -4019,10 +4054,20 @@ async def _project_graph_with_timeout(
                 "provider": provider,
                 "metadata": {"graph_projection_timeout": True},
                 "retryable": True,
-                "retry_after_s": GRAPH_PROJECTION_RETRY_AFTER_S,
+                "retry_after_s": retry_after_s,
+                **build_status,
             },
-            headers={"Retry-After": str(GRAPH_PROJECTION_RETRY_AFTER_S)},
+            headers={"Retry-After": str(retry_after_s)},
         )
+
+    try:
+        return await asyncio.wait_for(asyncio.shield(inflight), timeout=timeout_s)
+    except GraphBuildDeadlineError:
+        build_status = _status()
+        build_status["build_state"] = "failed_deadline"
+        raise _timeout(build_status)
+    except asyncio.TimeoutError:
+        raise _timeout(_status())
 
 
 @app.get("/graph/providers")

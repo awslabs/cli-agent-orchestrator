@@ -10,7 +10,7 @@ import asyncio
 import logging
 from typing import Any, Callable, Optional
 
-from cli_agent_orchestrator.graph.cache import GraphViewCache, make_meta
+from cli_agent_orchestrator.graph.cache import CacheKey, GraphViewCache
 from cli_agent_orchestrator.graph.models import Edge, EdgeType, GraphView, Node
 from cli_agent_orchestrator.graph.providers.base import GraphProvider, register_provider
 from cli_agent_orchestrator.services import settings_service, wiki_lint
@@ -58,32 +58,44 @@ class MemoryGraphProvider(GraphProvider):
         see GraphViewCache). ``meta.cached`` / ``meta.as_of`` tell the frontend
         whether it got a hit and when the underlying data was projected.
         """
-        scope = str(filters.get("scope", "global"))
-        raw_scope_id = filters.get("scope_id")
-        scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
+        return await self.project_inflight(**filters)
 
-        lint_enabled = self._lint_enabled()
-        key = ("memory", scope, scope_id, lint_enabled)
-        view, cached, as_of = await _CACHE.get_or_build(
+    def project_inflight(self, **filters: Any) -> asyncio.Future[GraphView]:
+        """Return the cache-owned projection future for request shielding."""
+        key, scope, scope_id, lint_enabled = self._projection_key(filters)
+        return _CACHE.get_or_build_task(
             key,
             lambda: self._build(scope, scope_id, lint_enabled),
         )
-        # Re-wrap with fresh cache provenance without mutating the cached
-        # instance's own meta (the same GraphView object is served to every hit).
-        return GraphView(
-            nodes=view.nodes,
-            edges=view.edges,
-            meta=make_meta(view.meta, cached=cached, as_of=as_of),
-        )
+
+    def projection_status(self, **filters: Any) -> Optional[dict[str, Any]]:
+        """Return additive status for the projection identified by ``filters``."""
+        key, _, _, _ = self._projection_key(filters)
+        return _CACHE.build_status(key)
+
+    def _projection_key(
+        self,
+        filters: dict[str, Any],
+    ) -> tuple[CacheKey, str, Optional[str], bool]:
+        scope = str(filters.get("scope", "global"))
+        raw_scope_id = filters.get("scope_id")
+        scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
+        lint_enabled = self._lint_enabled()
+        key: CacheKey = ("memory", scope, scope_id, lint_enabled)
+        return key, scope, scope_id, lint_enabled
 
     async def _build(self, scope: str, scope_id: Optional[str], lint_enabled: bool) -> GraphView:
         """Project the scope's wiki into a GraphView (the uncached, ~148s path)."""
-        meta: dict[str, Any] = {"provider": "memory", "scope": scope, "scope_id": scope_id}
+        meta: dict[str, Any] = {
+            "provider": "memory",
+            "scope": scope,
+            "scope_id": scope_id,
+            "lint_enabled": lint_enabled,
+            "lint_enrichment": "enabled" if lint_enabled else "disabled",
+        }
         if not lint_enabled:
             meta.update(
                 {
-                    "lint_enabled": False,
-                    "lint_enrichment": "disabled",
                     "disabled_enrichments": [
                         "orphan_page",
                         "contradiction",

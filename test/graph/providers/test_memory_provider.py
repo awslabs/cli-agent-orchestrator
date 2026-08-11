@@ -499,3 +499,18 @@ class TestMemoryProviderEdgeCases:
         by_id = {n.id: n for n in view.nodes}
         assert "is_hub" not in by_id["a"].attrs
         assert all(e.type != EdgeType.CONTRADICTION for e in view.edges)
+
+    @pytest.mark.asyncio
+    async def test_lint_enabled_response_identifies_enrichment_path(
+        self, populated_scope, monkeypatch
+    ):
+        monkeypatch.setattr(wiki_lint, "run_lint", AsyncMock(return_value=[]))
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: True,
+        )
+
+        view = await provider.project(scope="global")
+
+        assert view.meta["lint_enabled"] is True
+        assert view.meta["lint_enrichment"] == "enabled"
