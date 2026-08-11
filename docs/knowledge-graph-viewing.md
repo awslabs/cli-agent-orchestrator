@@ -223,8 +223,17 @@ the difference is that they may now complete after the HTTP request has ended.
 > 600 seconds instead: retry cannot succeed while the build continues to exceed
 > `GRAPH_BUILD_MAX_S`, but the frozen `retryable: true` value remains pending a
 > joint KiroCrew control-flow decision. Successful memory responses always
-> report `meta.lint_enabled` and
-> `meta.lint_enrichment`, so callers can verify which path ran.
+> report `meta.lint_enabled` and `meta.lint_enrichment`. The latter reports only
+> the lint outcome (`enabled`, `disabled`, or `failed`). When lint is disabled or
+> fails, `meta.disabled_enrichments` lists the withheld lint-derived attributes:
+> `orphan_page` and `graph_density`.
+>
+> `meta.relationship_error` is present only when the relationship read fails
+> and contains only the exception class name (`type(e).__name__`), never the
+> exception message. That view is edge-free, but its nodes and any successful
+> lint attributes remain intact. The signals are independent: a relationship
+> failure does not imply degraded lint enrichment, and a lint failure does not
+> imply a relationship failure.
 >
 > The hard cliff is reachable through normal configuration, not only hostile
 > input: `wiki_lint` scans the server's current working directory, and the
