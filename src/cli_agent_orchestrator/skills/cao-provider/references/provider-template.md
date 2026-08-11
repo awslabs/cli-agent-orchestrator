@@ -92,7 +92,7 @@ class NewCliProvider(BaseProvider):
 
     def _build_command(self) -> str:
         """Build the CLI launch command with agent profile and MCP config.
-        
+
         Loads the agent profile to get system prompt and MCP server config,
         then constructs the full command string.
         """
@@ -155,7 +155,7 @@ class NewCliProvider(BaseProvider):
 
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Detect terminal state by analyzing tmux output.
-        
+
         IMPORTANT: Check COMPLETED before PROCESSING to avoid the stale
         buffer problem. See references/lessons-learnt.md #1.
         """
@@ -200,7 +200,7 @@ class NewCliProvider(BaseProvider):
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract the agent's last response from terminal output.
-        
+
         Strategy:
         1. Find all response markers in the output
         2. Take the last one (final answer)

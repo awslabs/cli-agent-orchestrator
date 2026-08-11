@@ -347,7 +347,7 @@ CAO injects relevant memories into a new session two ways:
 
 1. **First-message block** — when an agent receives its first message in a session,
    CAO prepends a `<cao-memory>` block containing relevant memories.
-2. **Provider config file** — built-in plugins for Claude Code, Codex, and Kiro CLI
+2. **Provider config file** — built-in event plugins for Claude Code, Codex, and Kiro CLI
    write the same block into each provider's per-project config file (e.g.
    `.claude/CLAUDE.md`) on terminal creation, delimited by `cao-memory` markers so
    repeated runs overwrite the same section.
@@ -373,7 +373,7 @@ the injection budget.
 ## Saving Memories
 
 Agents call `memory_store` explicitly via MCP when they want to persist a fact; agent
-profiles include guidance on when to store (see below). Hook- and plugin-driven injection
+profiles include guidance on when to store (see below). Hook- and event-plugin-driven injection
 surfaces stored memories back into later sessions automatically.
 
 ## Storage Layout
