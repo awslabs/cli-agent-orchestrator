@@ -112,12 +112,17 @@ than returning a 500.
 
 ## Caching & staleness
 
-Building the memory graph runs `wiki_lint` (ripgrep-backed detectors + an LLM
-contradiction check). Profiling `scope=global` measured this at
-**~30s typical and up to ~148s under load** — the dominant cost is the
-ripgrep-based `stale_claim` detector (~95 `rg` subprocess spawns), not the LLM
-detector. Because that can exceed the frontend's 120s fetch budget, the
-projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
+Building the memory graph can run `wiki_lint` (ripgrep-backed detectors + an
+LLM contradiction check). On 2026-08-11, one local `scope=global` sample took
+**0.21s cold with lint disabled** and **145.87s cold with lint enabled**. The
+sample contained 48 index rows / 48 keys, 47 existing wiki pages, 182 global
+metadata rows, and 1,118 repository files visible to ripgrep. These figures are
+from one machine, not worst-case bounds. `wiki_lint` scans the server's current
+working directory, so launching CAO from a different repository materially
+changes the corpus and cost. The dominant enabled-path cost was the
+ripgrep-based `stale_claim` detector, not the LLM detector. Because that can
+exceed request and client budgets, the projection is now **cached**
+(`src/cli_agent_orchestrator/graph/cache.py`).
 
 - The **projected `GraphView` is cached per `(provider, scope, scope_id)`** with
   a **300-second TTL** (`DEFAULT_TTL_S = 300.0`).
@@ -154,9 +159,13 @@ the difference is that they may now complete after the HTTP request has ended.
 > **First cold load may still time out on a large scope.** On 2026-08-11, a
 > lint-enabled cold request over 48 global index rows returned **504 after
 > 90.012228s**, while its cache-owned build completed in **164.036425s**. A
-> retry joins the in-progress task instead of restarting it. The existing 504
-> contract remains stable: `detail.kind` is `"graph_projection_timeout"` and
-> `retryable` is true. Additive fields report `build_state`
+> retry joins the in-progress task instead of restarting it. At the measured
+> 145.87s lint-enabled cost above, the HTTP route cannot return 200 on its first
+> attempt: CAO's own 90-second request deadline fires first. A client honoring
+> the five-second retry hint should converge at roughly 150 seconds from the
+> initial request. The existing 504 contract remains stable: `detail.kind` is
+> `"graph_projection_timeout"` and `retryable` is true. Additive fields report
+> `build_state`
 > (`started`, `in_progress`, `queued`, `rejected_queue_full`, or
 > `failed_deadline`),
 > `build_elapsed_s`, and `build_started_at`; `retry_after_s` and the
