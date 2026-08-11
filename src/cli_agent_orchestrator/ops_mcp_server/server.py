@@ -18,6 +18,11 @@ from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 JsonDict = Dict[str, Any]
 
+# (connect, read) seconds for every call to the CAO API server. The server is
+# localhost-only, so a slow connect means something is wrong rather than far
+# away; the read budget is generous because launching a session is not instant.
+_HTTP_TIMEOUT = (5, 300)
+
 mcp = FastMCP(
     "cao-ops-mcp",
     instructions="""
@@ -66,13 +71,26 @@ def _request_json(
     json: Optional[Any] = None,
     operation: str,
 ) -> tuple[Optional[Any], Optional[str]]:
-    """Execute an API request and return either JSON data or an error message."""
+    """Execute an API request and return either JSON data or an error message.
+
+    Errors are **returned, not raised**, so every tool surfaces a structured,
+    operation-named string to the calling agent rather than a traceback, a hang,
+    or a silently empty result. That contract is what the packaged ``cao-ops``
+    Agent Plugin depends on when the operator's ``cao-server`` is not running.
+    """
     try:
         response = requests.request(
             method,
             f"{API_BASE_URL}{path}",
             params=params,
             json=json,
+            # Bounded so "the server never answers" cannot become an
+            # indefinite hang. Connection-refused — the common case when
+            # cao-server simply is not running — already returns immediately;
+            # this covers the rest (a dropped packet, a wedged listener). A
+            # timeout is a `requests.RequestException`, so it flows through the
+            # same handler below and produces the identical structured error.
+            timeout=_HTTP_TIMEOUT,
         )
     except requests.RequestException as exc:
         return None, f"{operation} failed: {exc}"

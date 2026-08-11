@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.cli.commands.agent_plugin import UNTRUSTED_CONTENT_WARNING
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
@@ -2075,6 +2076,235 @@ async def get_skill_content(name: str) -> SkillContentResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to load skill: {str(e)}",
         )
+
+
+# =============================================================================
+# Agent Plugins (Agent Plugins 1.0.0) — NOT the event-plugin system
+# =============================================================================
+# Added inline next to the /skills and /settings/skill-dirs handlers because
+# api/main.py is flat (no routers package). Naming is unresolved maintainer
+# decision M1; per requirements.md 16.5 this surface must not ship to end users
+# before that is settled, so every route below is gated on
+# CAO_AGENT_PLUGINS_ENABLED (default off) and 404s without it — the routes are
+# constructed but not executable, mirroring the AG-UI gate above. The scope
+# dependencies are authorization, not the gate: they are a no-op when auth is
+# disabled.
+
+
+def _require_plugins_enabled() -> None:
+    """Raise 404 when the agent-plugin surface is disabled (default-off).
+
+    Requirement 16.5's ship-gate. Shares one predicate with the CLI group so the
+    two surfaces cannot disagree about whether the surface is live.
+
+    Applied as a **route dependency**, not as the handler's first statement, and
+    that distinction is the gate: FastAPI validates the request body and solves
+    the scope dependency *before* the handler body runs, so an in-body check still
+    answered a malformed payload with 422 and an unauthorized caller with 401/403 —
+    both of which disclose that the gated route exists. A route-level dependency is
+    solved first, so every request to a disabled surface gets the same 404 an
+    unregistered path would (verified for a malformed body and for a failing auth
+    dependency). "First in the handler" is not "first in the request".
+    """
+
+    from cli_agent_orchestrator.agent_plugins.gate import agent_plugins_surface_enabled
+
+    if not agent_plugins_surface_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent plugin surface disabled",
+        )
+
+
+class PluginInstallRequest(BaseModel):
+    """Body for ``POST /plugins`` and ``POST /plugins/validate``."""
+
+    source: str
+    kind: Optional[str] = None
+    """``"path"`` or ``"git"``. Inferred from the source string when omitted."""
+
+    ref: Optional[str] = None
+    subdir: Optional[str] = None
+    force: bool = False
+
+
+def _plugin_source(body: "PluginInstallRequest"):
+    """Build a PluginSource, reusing the CLI's source-kind detection.
+
+    Shared rather than reimplemented so a source string that installs from the
+    CLI installs identically from the panel.
+    """
+    from cli_agent_orchestrator.agent_plugins.models import PluginSource
+    from cli_agent_orchestrator.cli.commands.agent_plugin import _looks_like_git
+
+    if body.kind == "git" or (body.kind != "path" and _looks_like_git(body.source)):
+        kind: Literal["path", "git"] = "git"
+    else:
+        kind = "path"
+    return PluginSource(kind=kind, location=body.source, ref=body.ref, subdir=body.subdir)
+
+
+def _with_untrusted_warning(payload: Dict) -> Dict:
+    """Attach the untrusted-content warning to an agent-plugin response.
+
+    Every response describing a plugin carries it — list, install, validate, and
+    the 422 body for an unloadable install — so a client cannot render an install
+    affordance without having been handed the text to show beside it. Requirement
+    22.1 puts the obligation on CAO, and a warning present only on the *list*
+    response is satisfiable by a client that never calls list.
+
+    That the unloadable-install 422 carries it too is the case worth stating:
+    "this plugin is not loadable" is exactly the moment a user is deciding whether
+    to try a different source, which is a decision about trust.
+    """
+    return {**payload, "untrusted_content_warning": UNTRUSTED_CONTENT_WARNING}
+
+
+@app.get("/plugins", dependencies=[Depends(_require_plugins_enabled)])
+async def list_agent_plugins(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List installed agent plugins with findings and projected skill names.
+
+    Also reports, per plugin, which live sessions reference a skill it provides,
+    so a client can render the removal warning *before* the operator commits to
+    a DELETE.
+
+    Read-scope gated when auth is enabled, following ``GET /settings/agent-dirs``
+    and for a strictly larger version of its reason. That route is gated because it
+    discloses local filesystem layout; this one discloses that **plus** live
+    operational state: every plugin's original source path or repository URL, and
+    per plugin the terminal IDs, session names, profile names, and skill names of
+    running work. The read floor rather than write/admin, because read-only
+    callers — the web panel, a status script — are exactly who this is for.
+    """
+    from cli_agent_orchestrator.agent_plugins.installer import affected_sessions_by_plugin
+    from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
+
+    store = InstalledPluginStore()
+    # Deliberately does NOT sweep dangling projections. This is a GET a panel
+    # polls, and `sweep_dangling_projections` mutates the filesystem — a read
+    # route that deletes things is both surprising and, on the event loop, a
+    # per-poll directory walk. The sweep still runs where it belongs: on every
+    # projection rebuild, i.e. install and removal. Read paths already tolerate a
+    # dangling link on their own (`list_skills()` gates on `is_dir()` and
+    # `SKILL.md is_file()`, both False rather than raising for a broken link), so
+    # nothing here depends on having swept first.
+    # One live-state walk for the whole response. Calling `affected_sessions`
+    # per record re-enumerated sessions, terminals and profiles for every plugin —
+    # identical work each time, on a route a panel polls.
+    affected_by_plugin = affected_sessions_by_plugin(store=store)
+
+    plugins = []
+    for record in store.list_installed():
+        entry = record.to_dict()
+        entry["affected_sessions"] = [
+            session.to_dict() for session in affected_by_plugin.get(record.name, [])
+        ]
+        plugins.append(entry)
+
+    return _with_untrusted_warning({"plugins": plugins})
+
+
+@app.post(
+    "/plugins",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(_require_plugins_enabled)],
+)
+async def install_agent_plugin(
+    body: PluginInstallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Install an agent plugin from a local path or a git URL."""
+    from cli_agent_orchestrator.agent_plugins.installer import PluginInstallError, install
+
+    try:
+        # Offloaded: a git source can block in `subprocess.run` for up to 300s and a
+        # large local source blocks in `copytree`. Run on the event loop, that window
+        # is one where the server serves no health/session request and runs no status
+        # or inbox task. `asyncio.to_thread` is the convention already used throughout
+        # this module.
+        outcome = await asyncio.to_thread(install, _plugin_source(body), force=body.force)
+    except PluginInstallError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to install agent plugin: {exc}",
+        )
+
+    if not outcome.installed:
+        # A plugin that is not loadable is the caller's input being wrong, not a
+        # server fault: return the full report so the panel can render every
+        # finding rather than a bare error string.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_with_untrusted_warning(outcome.to_dict()),
+        )
+    return _with_untrusted_warning(outcome.to_dict())
+
+
+@app.post("/plugins/validate", dependencies=[Depends(_require_plugins_enabled)])
+async def validate_agent_plugin(
+    body: PluginInstallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Validate a plugin source without installing it.
+
+    Scope-gated despite installing nothing, unlike the other ``/validate``
+    endpoints, which are pure computation over a document the caller already
+    supplied. This one **resolves the source first**: a git source is cloned and
+    a path source is copied into staging. That is real outbound network and disk
+    work performed on the caller's behalf, so exempting it on the strength of the
+    shared ``/validate`` suffix would be reading the name rather than the
+    behaviour.
+    """
+    from cli_agent_orchestrator.agent_plugins.installer import PluginInstallError, validate_source
+
+    try:
+        # Offloaded for the same reason as the install path: validating a source
+        # resolves it first, which clones or copies before any parsing happens.
+        report = await asyncio.to_thread(validate_source, _plugin_source(body))
+    except PluginInstallError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to validate agent plugin: {exc}",
+        )
+    return _with_untrusted_warning(report.to_dict())
+
+
+@app.delete("/plugins/{name}", dependencies=[Depends(_require_plugins_enabled)])
+async def uninstall_agent_plugin(
+    name: str,
+    purge_data: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Uninstall an agent plugin.
+
+    The response reports which live sessions referenced a skill this plugin
+    provided. Note that reporting is all this endpoint can do — the
+    warn-and-confirm gate itself belongs to the client, which must render that
+    information and wait for the operator *before* issuing the DELETE.
+    """
+    from cli_agent_orchestrator.agent_plugins.installer import PluginInstallError, uninstall
+
+    try:
+        # Offloaded: removal walks the store and rebuilds the skill projection,
+        # both synchronous filesystem work.
+        outcome = await asyncio.to_thread(uninstall, name, purge_data=purge_data)
+    except PluginInstallError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to uninstall agent plugin: {exc}",
+        )
+    # Deliberately NOT warned: removal is the safe direction, and a warning about
+    # installing untrusted content beside a successful uninstall is noise that
+    # trains operators to ignore the text where it matters.
+    return outcome.to_dict()
 
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)

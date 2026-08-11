@@ -1,0 +1,5 @@
+{
+  "name": "cao",
+  "version": "2.4.1",
+  "description": "Drive CLI Agent Orchestrator multi-agent sessions from any Agent-Plugins-compatible client. Prerequisites: the `uv` toolchain must be on PATH (the MCP server is launched via `uvx`), and a CAO API server must be running locally at http://127.0.0.1:9889 (`cao-server`). All communication is localhost-only."
+}

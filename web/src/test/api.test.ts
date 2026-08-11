@@ -371,4 +371,65 @@ describe('API wrapper', () => {
       api.exportGraph('memory', { sink: 'obsidian', dest: 'x' }, 'global')
     ).rejects.toMatchObject({ status: 422, detail: "export rejected: secret pattern 'aws-key' detected" })
   })
+
+  // ── Agent Plugins ─────────────────────────────────────────────────────────
+
+  it('listPlugins fetches /plugins', async () => {
+    mockResponse({ plugins: [], untrusted_content_warning: 'w' })
+    const result = await api.listPlugins()
+    expect(result.plugins).toEqual([])
+    expect(mockFetch).toHaveBeenCalledWith('/plugins', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+  })
+
+  it('installPlugin POSTs the source body to /plugins', async () => {
+    mockResponse({ installed: true })
+    await api.installPlugin({ source: 'https://github.com/o/r', ref: 'main' })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ source: 'https://github.com/o/r', ref: 'main' }),
+      }),
+    )
+  })
+
+  it('validatePlugin POSTs to /plugins/validate', async () => {
+    mockResponse({ loadable: true })
+    await api.validatePlugin({ source: '/local/plugin' })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins/validate',
+      expect.objectContaining({ method: 'POST' }),
+    )
+  })
+
+  it('uninstallPlugin DELETEs the encoded name', async () => {
+    mockResponse({ removed: true })
+    await api.uninstallPlugin('my plugin')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins/my%20plugin',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+
+  it('uninstallPlugin forwards purge_data only when asked', async () => {
+    mockResponse({ removed: true })
+    await api.uninstallPlugin('demo', true)
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins/demo?purge_data=true',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+
+  it('installPlugin surfaces the 422 validation detail', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      statusText: 'Unprocessable Entity',
+      json: () => Promise.resolve({ detail: 'plugin is not loadable' }),
+    })
+    await expect(api.installPlugin({ source: '/bad' })).rejects.toMatchObject({
+      status: 422,
+      detail: 'plugin is not loadable',
+    })
+  })
 })

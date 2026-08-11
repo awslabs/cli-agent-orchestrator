@@ -1,6 +1,16 @@
-# Plugins
+# Event Plugins
 
-CAO supports plugins that react to server-side events — session and terminal lifecycle changes, and message delivery between agents. Plugins run inside the `cao-server` process and are notified whenever one of those events occurs.
+> **Not the same thing as [Agent Plugins](agent-plugins.md).** CAO has two
+> unrelated plugin systems. **Event plugins** — this page — are Python packages
+> that run inside the `cao-server` process and react to CAO lifecycle events.
+> **Agent plugins** are portable packages of skills and MCP servers conforming
+> to the open [Agent Plugins 1.0.0](https://agent-plugins.org/specification)
+> specification, installed with `cao plugin add`. Different formats, different
+> audiences, different code. Throughout CAO's documentation "event plugin" and
+> "agent plugin" are always written in full; bare "plugin" appears only inside a
+> document whose title already scopes it, as this one does.
+
+CAO supports event plugins that react to server-side events — session and terminal lifecycle changes, and message delivery between agents. Plugins run inside the `cao-server` process and are notified whenever one of those events occurs.
 
 Typical uses today:
 
@@ -176,8 +186,8 @@ The items below are **not available today** — they describe the direction the 
 - **`pre_*` events** — observe operations *before* they happen (e.g. `pre_send_message`, `pre_create_terminal`), giving plugins visibility into intent, not just outcome.
 - **Event denial / veto** — let a plugin reject an in-flight operation via `pre_*` return values.
 - **Event transformation** — let a plugin rewrite event payloads mid-flight (e.g. redact message content before it's delivered).
-- **Plugin management CLI** — `cao plugin list / info / enable / disable / reload` to manage installed plugins without touching `pip` or restarting the server manually.
+- **Event-plugin management CLI** — a command group to list, inspect, enable, disable, and reload installed event plugins without touching `pip` or restarting the server manually. **The verb is unsettled.** This item originally promised `cao plugin …`, but that noun is now taken by [agent plugins](agent-plugins.md), whose users arrive from other clients already calling the concept "plugin". Choosing between `cao plugin` for agent plugins (with this surface becoming `cao event-plugin …`) and the reverse is an open maintainer decision, recorded as **M1**; it is called out here rather than quietly rewritten.
 - **Hot reload** — pick up plugin install, upgrade, or config changes without restarting `cao-server`.
-- **Improved discovery and installation UX** — a curated plugin index, a `cao plugin install <name>` wrapper, or a dedicated plugins directory that doesn't require sharing the server's Python environment.
+- **Improved discovery and installation UX** — a curated event-plugin index, an install wrapper, or a dedicated directory that doesn't require sharing the server's Python environment. The same verb question (**M1**) applies to whatever this command ends up being called.
 - **First-class per-plugin configuration** — a CAO-delivered configuration channel so plugins no longer have to roll their own env-var / `.env` loading.
 - **Richer event catalog** — additional events such as provider status changes, flow step transitions, and inbox reads.

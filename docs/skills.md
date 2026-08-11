@@ -111,6 +111,68 @@ Each registered directory is scanned one level deep — every immediate subfolde
 
 **Configuration.** Extra skill directories are stored under `skills.extra_dirs` in `~/.aws/cli-agent-orchestrator/settings.json` and managed through the `/settings/skill-dirs` API. See [configuration.md](./configuration.md#skills-skills) for the request/response format.
 
+## Agent-Plugin-Provided Skills
+
+A third source of skills, alongside the global store and extra directories, is
+an installed **agent plugin** — a portable package conforming to the open
+[Agent Plugins 1.0.0](https://agent-plugins.org/specification) specification.
+See [agent-plugins.md](./agent-plugins.md) for installing and managing them.
+(Not to be confused with CAO's [event plugins](./plugins.md), which react to
+server-side events and provide no skills.)
+
+```bash
+cao plugin add https://github.com/owner/repo
+```
+
+**Agent-plugin skills are projected into the global store**, not scanned from a
+fourth location. Each valid skill in an installed agent plugin is materialized as
+a managed symlink inside `SKILLS_DIR`:
+
+```text
+~/.aws/cli-agent-orchestrator/skills/<skill-name>
+    -> ~/.aws/cli-agent-orchestrator/agent-plugins/<plugin>/skills/<skill-name>
+```
+
+That is deliberate rather than incidental. Registering agent-plugin roots as
+extra directories would cover the catalog-based providers and **miss Kiro CLI
+and OpenCode entirely**: Kiro receives only [`skill://` globs rooted at
+`SKILLS_DIR`](#kiro-cli) and OpenCode reads through one symlink to `SKILLS_DIR`,
+so a skill stored anywhere else is invisible to both — including CAO's own
+default provider. Projecting into the store means every mechanism described in
+[How Skills Work by Provider](#how-skills-work-by-provider) picks agent-plugin
+skills up with no per-provider change, and the launch path gains no new
+filesystem scan.
+
+**The link is named with the unprefixed skill name.** A skill folder's name must
+equal its frontmatter `name`, so no namespacing prefix is possible without
+rewriting the agent plugin's bytes — which CAO never does. Use
+`cao plugin list` to see which agent plugin contributed a given skill.
+
+**Collisions are resolved by a fixed rule, never silently:**
+
+1. **A built-in or user-added skill always wins.** If a name is already taken by
+   a seeded skill, a `cao skills add` install, or an `extra_skill_dirs` skill,
+   the agent plugin's skill is not projected and a `SKIPPED` finding names the
+   collision. The pre-existing skill keeps resolving exactly as before.
+2. **Between two agent plugins, the lexicographically smallest manifest name
+   wins**, and every loser gets a finding naming the winner. The rule reads only
+   the persisted manifest name — never install order, timestamps, or directory
+   scan order — so the outcome depends on *which* agent plugins are installed,
+   not *how* they got there. Installing a lexicographically earlier agent plugin
+   can therefore reassign an existing projection; when that happens CAO emits an
+   additional warning naming both the previous and the new provider.
+
+**Projection is derived state.** It is rebuilt from scratch on every install,
+update, and removal, and swept for dangling links on `cao plugin list`. A
+projected link whose target has gone is simply not enumerated — the same
+`is_dir()` / `SKILL.md is_file()` gates that skip any invalid skill folder — so
+it can never break a terminal launch.
+
+On a system where symlink creation is unavailable (Windows without Developer
+Mode or elevation), CAO falls back to copying the skill content and reports the
+fallback. Set `"skills": {"projection_mode": "copy"}` in `settings.json` to make
+that explicit.
+
 ## How Agents Discover Skills
 
 By default, every installed skill is available to every CAO agent. When an agent is launched, CAO appends a catalog block to the prompt listing each available skill's name and description, along with instructions to use the `load_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
@@ -179,11 +241,14 @@ No action is needed after `cao skills add` or `cao skills remove` — the next t
 
 ### Kiro CLI
 
-Kiro has native support for `skill://` resources with progressive loading. At terminal creation, CAO includes a `skill://` glob pattern in the agent's `resources` field that points to the skill store directory:
+Kiro has native support for `skill://` resources with progressive loading. At terminal creation, CAO includes two `skill://` glob patterns in the agent's `resources` field, both pointing at the skill store directory:
 
 ```
 skill://~/.aws/cli-agent-orchestrator/skills/**/SKILL.md
+skill://~/.aws/cli-agent-orchestrator/skills/*/SKILL.md
 ```
+
+The second pattern is not redundant. Kiro expands these globs itself, and `**` has no single agreed meaning for directory symlinks — Python's `glob.glob(recursive=True)` descends into them while `pathlib.Path.glob` does not. [Agent-plugin](agent-plugins.md) skills are projected into the store as symlinks, so under the stricter reading they would be invisible to Kiro alone. A single-level `*/SKILL.md` has no recursive descent to opt out of, so it matches them either way, and it covers exactly the one-level-deep layout CAO guarantees. `**/SKILL.md` is kept because Kiro supports nested skill directories natively even though CAO's own catalog does not.
 
 Kiro loads only skill metadata (name and description) at startup, then retrieves full content on demand through its own progressive loading mechanism — no MCP tool call needed.
 
@@ -249,4 +314,5 @@ Running `cao skills add --force` refreshes Copilot CLI agent files immediately. 
 ## Known Limitations
 
 - **No nested skill directories.** Skills must be immediate subdirectories of the skill store. Nested paths (e.g., `skills/team/python-testing/`) are not discovered by CAO's skill catalog. Kiro's `skill://` glob handles nested paths natively, but other providers do not.
+- **Extra-directory skills do not reach Kiro CLI or OpenCode CLI.** These two providers discover skills by traversing the skill store path directly — Kiro through the `skill://` resource globs baked into its agent JSON, OpenCode through the `OPENCODE_CONFIG_DIR/skills` symlink that points at the skill store. Both are rooted at the store, so skills registered via [extra skill directories](#extra-skill-directories), which live outside it, are invisible to them. The catalog-based providers (Claude Code, Codex, Antigravity CLI, Kimi CLI, Copilot CLI) are unaffected, because they receive a catalog built by CAO's own scan, which searches the store *and* every registered extra directory. To make a skill reachable by every provider, install it into the global store (`cao skills add <folder>`) rather than registering its parent directory. The provider table above describes the injection mechanism, not extra-directory coverage.
 - **Catalog scoping is advertise-only.** The per-agent [`skills`](#scoping-the-catalog-per-agent-skills) field filters which skills appear in an agent's injected catalog, but it does not restrict resolution — `load_skill` still resolves any installed skill by name. It is a prompt-relevance control, not an access boundary; a hard per-agent allowlist would need enforcement in the `load_skill` path.

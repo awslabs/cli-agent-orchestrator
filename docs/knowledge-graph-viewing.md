@@ -489,7 +489,7 @@ whole-knowledge-base view currently fragments per scope. A query-capable store
 is only *useful* once cross-scope edges exist — and that design isn't settled.
 So this tier is explicitly a **future / optional adapter, not core**: it is the
 heaviest tier (infrastructure, IAM, bulk-load), gated behind an open question,
-and would ship — if ever — as an optional plugin, never as part of the base
+and would ship — if ever — as an optional event plugin, never as part of the base
 engine.
 
 > **Tracking rule:** this section preserves possible extension directions. It is

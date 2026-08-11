@@ -28,6 +28,15 @@ _EXCLUDED_FILES = (
     # non-repository paths such as docs/guide.md.
     Path("examples/codex-basic/codex_documenter.md"),
 )
+# Generated agent-plugin package trees. Their ``skills/`` directories are byte
+# copies of the top-level ``skills/`` source (same reason
+# ``src/cli_agent_orchestrator/skills`` is excluded above): the copies sit one
+# level deeper, so the source's repo-relative links do not resolve from there,
+# and rewriting them would break the byte-identical drift guard. Each package's
+# own generated ``README.md`` and ``CHANGELOG.md`` are still checked — they are
+# written by the build with links correct for their location.
+_GENERATED_PACKAGE_ROOT = Path("agent-plugin")
+_GENERATED_PACKAGE_SKILLS = "skills"
 _PUNCTUATION_RE = re.compile(r"[^\w\-\s]", flags=re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s")
 
@@ -63,6 +72,11 @@ def discover_markdown_files(repo_root: Path) -> list[Path]:
         relative = Path(name)
         if relative in _EXCLUDED_FILES or any(
             relative.is_relative_to(prefix) for prefix in _EXCLUDED_PREFIXES
+        ):
+            continue
+        if (
+            relative.is_relative_to(_GENERATED_PACKAGE_ROOT)
+            and _GENERATED_PACKAGE_SKILLS in relative.parts
         ):
             continue
         files.append(repo_root / relative)

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "cao-contributor",
+  "version": "2.4.1",
+  "description": "Skills for extending CLI Agent Orchestrator: authoring providers and event plugins. Development-facing; install the `cao` plugin instead to drive sessions.",
+  "repository": "https://github.com/awslabs/cli-agent-orchestrator",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cao",
+    "development",
+    "provider",
+    "extension"
+  ]
+}

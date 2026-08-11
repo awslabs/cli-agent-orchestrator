@@ -7,17 +7,23 @@ import { AgentPanel } from './components/AgentPanel'
 import { FlowsPanel } from './components/FlowsPanel'
 import { MemoryPanel } from './components/MemoryPanel'
 import { SettingsPanel } from './components/SettingsPanel'
-import { Bot, Home, Clock, Settings, Brain, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
+import { PluginsPanel } from './components/PluginsPanel'
+import { PLUGINS_TAB_ENABLED } from './featureFlags'
+import { Bot, Home, Clock, Settings, Brain, Puzzle, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
 
-type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory'
+type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory' | 'plugins'
 
-// Memory appended last so Alt+N numbering of existing tabs never shifts
+// Appended last, always. Alt+N numbers the VISIBLE tabs in array order, so
+// inserting anywhere but the end renumbers every shortcut after the insertion
+// point. Memory was appended for that reason; Plugins follows it for the same
+// one. (Agent Plugins, not the event-plugin system — see docs/agent-plugins.md.)
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'home', label: 'Home', icon: <Home size={16} /> },
   { key: 'agents', label: 'Agents', icon: <Bot size={16} /> },
   { key: 'flows', label: 'Flows', icon: <Clock size={16} /> },
   { key: 'settings', label: 'Settings', icon: <Settings size={16} /> },
   { key: 'memory', label: 'Memory', icon: <Brain size={16} /> },
+  { key: 'plugins', label: 'Plugins', icon: <Puzzle size={16} /> },
 ]
 
 function Snackbar() {
@@ -57,7 +63,12 @@ export default function App() {
   const [memoryEnabled, setMemoryEnabled] = useState(false)
   const { sessions, connected, fetchSessions } = useStore()
 
-  const visibleTabs = TABS.filter(t => t.key !== 'memory' || memoryEnabled)
+  // Two independent gates, both fail-closed. Memory is a runtime capability
+  // check; Plugins is the build-time M1 gate (Requirement 16.5) and mirrors
+  // `hidden=True` on the Click group and `Policy::Hidden` on the TUI rows.
+  const visibleTabs = TABS.filter(
+    t => (t.key !== 'memory' || memoryEnabled) && (t.key !== 'plugins' || PLUGINS_TAB_ENABLED)
+  )
 
   useEffect(() => {
     fetchSessions()
@@ -146,6 +157,7 @@ export default function App() {
             {tab === 'flows' && <FlowsPanel />}
             {tab === 'settings' && <SettingsPanel />}
             {tab === 'memory' && <MemoryPanel />}
+            {tab === 'plugins' && PLUGINS_TAB_ENABLED && <PluginsPanel />}
           </Suspense>
         </ErrorBoundary>
       </main>

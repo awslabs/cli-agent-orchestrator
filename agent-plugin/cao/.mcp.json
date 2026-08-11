@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "cao-ops": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "cli-agent-orchestrator==2.4.1",
+        "cao-ops-mcp-server"
+      ]
+    }
+  }
+}

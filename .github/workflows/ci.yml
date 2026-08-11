@@ -48,6 +48,18 @@ jobs:
       - name: Validate Markdown links
         run: uv run python scripts/validate_markdown_links.py
 
+      # Agent Plugins 1.0.0 conformance guards. #573 requires the schemas
+      # validate on every PR; both steps are the same `make` targets a
+      # developer runs locally, so CI and pre-push execute identical code.
+      - name: Check Agent Plugins schema pin
+        run: make check-agent-plugins-schemas
+
+      # Also the on-every-PR validation of CAO's own manifests against the
+      # pinned schemas: the drift check runs the real validator over both
+      # committed packages.
+      - name: Check CAO agent plugin packages
+        run: make check-agent-plugin
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
@@ -353,6 +365,60 @@ jobs:
         with:
           name: ag-ui-construct-demos
           path: docs/media/ag-ui-*-demo.gif
+          if-no-files-found: warn
+        continue-on-error: true
+
+  agent-plugins-dogfood:
+    name: Agent Plugins dog-food (shift-left recording)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (cao runs the dog-food pipeline under uv)
+        run: uv sync --all-extras --dev
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install recorder deps
+        # ffmpeg is provided by the ffmpeg-static npm package (gif-capable), so
+        # no apt install is needed here.
+        run: npm install
+        working-directory: examples/agent-plugins/agent-plugins-dogfood/tools
+
+      - name: Install Playwright browser (chromium)
+        run: npm run playwright:install
+        working-directory: examples/agent-plugins/agent-plugins-dogfood/tools
+
+      - name: Record dog-food demo (asserts the plugin pipeline; gates on drift)
+        # Runs run.sh OFFLINE (no provider binary, network, or secrets) — CAO
+        # installing its own `cao` plugin through its own pipeline — and asserts
+        # validate/add/install(Kiro+OpenCode)/remove, exporting
+        # docs/media/agent-plugins-dogfood-demo.gif. A non-zero exit or a missing
+        # PASS marker (the pipeline regressed) fails this job — the shift-left
+        # gate. The live OpenCode observational step (CAO_DOGFOOD_LIVE=1, needs
+        # the opencode binary) is deliberately NOT set here.
+        run: npm run record
+        working-directory: examples/agent-plugins/agent-plugins-dogfood/tools
+
+      - name: Upload dog-food demo GIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-plugins-dogfood
+          path: docs/media/agent-plugins-dogfood-demo.gif
           if-no-files-found: warn
         continue-on-error: true
 

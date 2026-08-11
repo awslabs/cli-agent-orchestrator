@@ -5,6 +5,10 @@ from pathlib import Path
 
 import click
 
+from cli_agent_orchestrator.agent_plugins.projection import (
+    ProjectionClaimError,
+    release_projection_claim,
+)
 from cli_agent_orchestrator.constants import SKILLS_DIR
 from cli_agent_orchestrator.utils.skill_injection import refresh_all_cao_managed_agents
 from cli_agent_orchestrator.utils.skills import (
@@ -22,12 +26,46 @@ def _install_skill_folder(source_dir: Path, force: bool = False) -> Path:
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     destination_dir = SKILLS_DIR / skill_name
 
-    if destination_dir.exists():
+    if destination_dir.exists() or destination_dir.is_symlink():
         if not force:
             raise FileExistsError(
                 f"Skill '{skill_name}' already exists. Use --force to overwrite it."
             )
-        shutil.rmtree(destination_dir)
+
+        # A user install that replaces a plugin's projected skill takes ownership
+        # of the name. Without this the install record kept claiming it, so a
+        # later `cao plugin remove` deleted the user's directory and any
+        # projection rebuild overwrote it with the plugin's copy.
+        #
+        # Ordering is load-bearing: the transfer must be *committed* before
+        # anything on disk is touched. A release that failed used to be
+        # indistinguishable from "no plugin held this name", so the install went
+        # ahead, unlinked the projection and copied the user's folder into place
+        # while the record still claimed the name — and the next rebuild's sweep
+        # deleted that folder. `ProjectionClaimError` is the third state; on it
+        # the install aborts with nothing changed.
+        try:
+            released = release_projection_claim(skill_name)
+        except ProjectionClaimError as exc:
+            raise RuntimeError(
+                f"Refusing to install skill '{skill_name}': it is currently provided by "
+                f"an agent plugin, and that plugin's install record could not be updated "
+                f"to give up its claim ({exc}). Nothing was changed. Fix the underlying "
+                f"problem — most often an unwritable or full agent-plugin state directory "
+                f"— and retry."
+            ) from exc
+        if released:
+            click.echo(
+                f"Skill '{skill_name}' was provided by agent plugin '{released}'; "
+                f"it is now user-owned and will win future collisions."
+            )
+
+        # `shutil.rmtree` refuses a symbolic link, which is exactly what a
+        # symlink-mode projection is — so the two cases are removed differently.
+        if destination_dir.is_symlink():
+            destination_dir.unlink()
+        else:
+            shutil.rmtree(destination_dir)
 
     shutil.copytree(source_dir, destination_dir)
     return destination_dir

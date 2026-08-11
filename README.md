@@ -124,7 +124,11 @@ provider override while keeping the same sequence.
   selection, and overrides.
 - [HTTP API and PTY WebSocket](docs/api.md): route-family overview and terminal
   streaming contract.
-- [Plugins](docs/plugins.md): outbound events, installation, and authoring.
+- [Agent plugins](docs/agent-plugins.md): installing portable Agent Plugins
+  1.0.0 packages, and CAO's own operator and contributor packages. The CLI, TUI
+  and web surfaces are built but gated off pending a naming decision; the HTTP
+  API is available.
+- [Event plugins](docs/plugins.md): outbound events, installation, and authoring.
 - Provider behavior:
   [Kiro CLI](docs/kiro-cli.md), [Claude Code](docs/claude-code.md),
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),

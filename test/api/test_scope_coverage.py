@@ -73,6 +73,140 @@ def test_every_mutating_route_is_scope_gated():
     )
 
 
+# --------------------------------------------------------------------------- #
+# Disclosure-bearing GET routes.
+#
+# The mutating-route guard above cannot see the failure mode the agent-plugins
+# adoption audit found (R2): `GET /plugins` shipped with no scope dependency while
+# disclosing every plugin's source path plus the terminal IDs, session names,
+# profile names and skill names of running work. Nothing enumerated GETs, so
+# nothing caught it.
+#
+# Gating all 28 pre-existing ungated reads is NOT the fix — it would change the
+# auth posture of shipped routes and could break existing unauthenticated readers,
+# the same trade-off recorded for the `/workflows` reads below. So the guard
+# inverts the default for GETs and pins today's state as data: a GET route must
+# either carry a scope dependency or appear in `_OPEN_READS`. A new route is
+# gated by default, and opening one becomes a visible, reviewable diff to this
+# list rather than an omission nobody sees.
+#
+# `/plugins` is deliberately ABSENT from this list: it is gated.
+# --------------------------------------------------------------------------- #
+_OPEN_READS = {
+    # Protocol/discovery surfaces that must answer before a caller can hold a
+    # token at all, and CAO's liveness probe.
+    "/.well-known/oauth-protected-resource",
+    "/health",
+    # Agent profile and provider catalogs. Names and descriptions of installable
+    # profiles, plus which provider binaries are present.
+    "/agents/profiles",
+    "/agents/profiles/schema",
+    "/agents/profiles/search",
+    "/agents/profiles/templates",
+    "/agents/profiles/templates/{category}/{name}/schema",
+    "/agents/profiles/{name}",
+    "/agents/providers",
+    # AG-UI event stream; carries its own auth story.
+    "/agui/v1/stream",
+    # Flow definitions.
+    "/flows",
+    "/flows/{name}",
+    # Memory reads. Gated writes, open reads — pre-existing asymmetry.
+    "/memory",
+    "/memory/{key}",
+    "/settings/memory",
+    "/settings/skill-dirs",
+    # Skill content.
+    "/skills/{name}",
+    # Live session and terminal state. The closest siblings to `/plugins`, and the
+    # strongest candidates for a future gate: they disclose exactly the live
+    # operational detail that motivated gating `/plugins`. Left open here only
+    # because they are shipped routes with existing readers.
+    "/sessions",
+    "/sessions/{session_name}",
+    "/sessions/{session_name}/terminals",
+    "/terminals/{terminal_id}",
+    "/terminals/{terminal_id}/inbox/messages",
+    "/terminals/{terminal_id}/memory-context",
+    "/terminals/{terminal_id}/output",
+    "/terminals/{terminal_id}/working-directory",
+    # Workflow reads. `/workflows/runs` and `/workflows/runs/{run_id}/result` are
+    # gated (see the #505 block below); these three siblings are not, deliberately.
+    "/workflows",
+    "/workflows/runs/{run_id}",
+    "/workflows/{name}",
+}
+
+
+def _api_get_routes():
+    """Every GET route that FastAPI resolved a dependency tree for.
+
+    Skips the routes Starlette mounts itself — ``/docs``, ``/redoc``,
+    ``/openapi.json``, ``/docs/oauth2-redirect`` — which have no ``dependant`` and
+    are not application endpoints.
+    """
+    for route in app.routes:
+        methods = getattr(route, "methods", None) or set()
+        if "GET" not in methods:
+            continue
+        if getattr(route, "dependant", None) is None:
+            continue
+        yield route
+
+
+def test_every_disclosure_bearing_get_route_is_gated_or_explicitly_open():
+    """A GET route is scope-gated unless it is listed as deliberately open.
+
+    The assertion is one-directional on purpose: it fails for a *new* ungated GET,
+    not for one that becomes gated. Tightening a route should never require
+    editing a test to permit it.
+    """
+    unlisted = [
+        route.path
+        for route in _api_get_routes()
+        if not _has_scope_dependency(route) and route.path not in _OPEN_READS
+    ]
+    assert not unlisted, (
+        "ungated GET route(s) not listed in _OPEN_READS: "
+        + ", ".join(sorted(unlisted))
+        + ". Add a scope dependency, or add the path to _OPEN_READS with a comment "
+        "saying what it discloses and why that is acceptable."
+    )
+
+
+def test_the_open_reads_list_has_no_stale_entries():
+    """Keeps `_OPEN_READS` honest in the other direction.
+
+    Without this, a path that was gated (or deleted) would linger in the list and
+    silently pre-authorize a *future* route that happened to reuse the path. This
+    test is why gating a route requires removing it from the list — which is the
+    reviewable diff the list exists to produce.
+    """
+    registered_ungated = {
+        route.path for route in _api_get_routes() if not _has_scope_dependency(route)
+    }
+    stale = sorted(_OPEN_READS - registered_ungated)
+    assert not stale, (
+        "_OPEN_READS lists path(s) that are no longer ungated GET routes: "
+        + ", ".join(stale)
+        + ". Remove them — a stale entry would pre-authorize a future route reusing the path."
+    )
+
+
+def test_plugins_list_is_gated_and_not_exempted():
+    """`GET /plugins` specifically — the route the audit found ungated (R2).
+
+    Named rather than left to the generic guard because the generic guard would
+    also pass if someone added `/plugins` to `_OPEN_READS`, and that would be
+    exactly the regression. This asserts the route carries the dependency AND that
+    the exemption list does not mention it.
+    """
+    matches = [route for route in _api_get_routes() if route.path == "/plugins"]
+    assert matches, "GET /plugins is not registered"
+    assert _has_scope_dependency(matches[0]), "GET /plugins lost its scope dependency"
+    assert "/plugins" not in _OPEN_READS, "GET /plugins must not be exempted from the read floor"
+
+
 def _override_scopes(scopes):
     async def _dep():
         return list(scopes)
