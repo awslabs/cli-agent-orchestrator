@@ -130,6 +130,7 @@ def test_real_server_tool_names_are_unchanged_when_mode_is_off() -> None:
     baseline_names = set(_probe_real_server(apps_only=None)["listed"])
     explicit_off_names = set(_probe_real_server(apps_only="false")["listed"])
 
+    assert baseline_names
     assert explicit_off_names == baseline_names
 
 
@@ -144,6 +145,7 @@ def test_real_server_tool_names_do_not_use_app_namespace_separator() -> None:
 
     tool_names = set(_probe_real_server(apps_only="false")["listed"])
 
+    assert tool_names
     assert not any("___" in name for name in tool_names)
 
 
@@ -223,8 +225,10 @@ async def test_namespaced_app_tool_suffix_is_allowed(monkeypatch) -> None:
     mcp.add_middleware(AppSurfaceOnlyMiddleware())
 
     async with Client(mcp) as client:
+        listed_names = {tool.name for tool in await client.list_tools()}
         result = await client.call_tool("gateway___cao___render_dashboard")
 
+    assert "gateway___cao___render_dashboard" in listed_names
     assert result.data == "ok"
 
 
@@ -240,6 +244,8 @@ async def test_namespaced_non_app_tool_suffix_is_rejected(monkeypatch) -> None:
     mcp.add_middleware(AppSurfaceOnlyMiddleware())
 
     async with Client(mcp) as client:
+        listed_names = {tool.name for tool in await client.list_tools()}
+        assert "gateway___render_dashboard___handoff" not in listed_names
         with pytest.raises(ToolError, match="app-surface-only mode"):
             await client.call_tool("gateway___render_dashboard___handoff")
 

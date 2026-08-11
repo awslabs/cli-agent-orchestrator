@@ -24,6 +24,12 @@ APP_SURFACE_TOOL_NAMES = frozenset(
 )
 
 
+def _is_app_surface_tool_name(tool_name: str) -> bool:
+    """Return whether a bare or namespaced tool name belongs to the app surface."""
+
+    return tool_name.rsplit("___", 1)[-1] in APP_SURFACE_TOOL_NAMES
+
+
 class AppSurfaceOnlyMiddleware(Middleware):
     """Hide and reject tools that are not part of the MCP Apps surface."""
 
@@ -33,7 +39,7 @@ class AppSurfaceOnlyMiddleware(Middleware):
         call_next: CallNext[mt.ListToolsRequest, Sequence[Tool]],
     ) -> Sequence[Tool]:
         tools = await call_next(context)
-        return [tool for tool in tools if tool.name in APP_SURFACE_TOOL_NAMES]
+        return [tool for tool in tools if _is_app_surface_tool_name(tool.name)]
 
     async def on_call_tool(
         self,
@@ -41,8 +47,7 @@ class AppSurfaceOnlyMiddleware(Middleware):
         call_next: CallNext[mt.CallToolRequestParams, ToolResult],
     ) -> ToolResult:
         tool_name = context.message.name
-        allowlist_name = tool_name.rsplit("___", 1)[-1]
-        if allowlist_name not in APP_SURFACE_TOOL_NAMES:
+        if not _is_app_surface_tool_name(tool_name):
             raise ToolError(
                 f"Tool '{tool_name}' is unavailable because the server is in "
                 "app-surface-only mode (CAO_MCP_APPS_ONLY=true)."

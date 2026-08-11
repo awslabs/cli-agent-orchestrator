@@ -94,10 +94,15 @@ class McpAppsPlugin(CaoPlugin):
 
             try:
                 from cli_agent_orchestrator.mcp_server.app_surface_only import (
+                    APP_SURFACE_TOOL_NAMES,
                     AppSurfaceOnlyMiddleware,
                 )
 
                 mcp.add_middleware(AppSurfaceOnlyMiddleware())
+                logger.info(
+                    "App-surface-only mode active; %d tool names allowlisted",
+                    len(APP_SURFACE_TOOL_NAMES),
+                )
             except Exception as exc:
                 logger.critical(
                     "The app-surface-only restriction could not be applied; "

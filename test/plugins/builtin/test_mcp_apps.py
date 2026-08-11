@@ -111,15 +111,17 @@ def test_no_warning_when_surface_disabled(monkeypatch, caplog) -> None:
     assert not any("no IdP" in r.getMessage() for r in caplog.records)
 
 
-def test_app_surface_only_installs_middleware_when_apps_enabled(monkeypatch) -> None:
+def test_app_surface_only_installs_middleware_when_apps_enabled(monkeypatch, caplog) -> None:
     monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
     monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
     fake = _FakeMcp()
 
-    McpAppsPlugin().on_mcp_server(fake)
+    with caplog.at_level(logging.INFO, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
+        McpAppsPlugin().on_mcp_server(fake)
 
     assert len(fake.middleware) == 1
     assert fake.middleware[0].__class__.__name__ == "AppSurfaceOnlyMiddleware"
+    assert "App-surface-only mode active; 6 tool names allowlisted" in caplog.text
 
 
 def test_apps_only_off_leaves_middleware_unmodified(monkeypatch) -> None:
