@@ -349,7 +349,10 @@ class TestRegisterApps:
 
         assert register_apps(StubMCP()) is True
         shutil.rmtree(override_dir)
-        assert apps_module.apps_static_dir() == fallback_dir
+        reached = apps_module.apps_static_dir()
+        # tmp_path is pre-resolved by pytest, but an explicit --basetemp is not;
+        # compare by inode so /var vs /private/var cannot produce a false failure.
+        assert reached is not None and reached.samefile(fallback_dir)
 
         with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
             html = handlers[DASHBOARD_RESOURCE_URI]()
