@@ -22,9 +22,11 @@ logger = logging.getLogger(__name__)
 # Module-level cache shared across every MemoryGraphProvider instance (the U4
 # route instantiates a fresh provider per request via get_provider, so a
 # per-instance cache would never hit). DELIBERATE reversal of the original
-# "lint-on-demand, no caching" ADR — see graph/cache.py for the perf finding
-# (ripgrep stale_claim dominated two 146-166s local runs). Keyed by (provider,
-# scope, scope_id, lint_enabled).
+# "lint-on-demand, no caching" ADR — see graph/cache.py for the perf finding.
+# Under shipped defaults (lint enabled with the real contradiction detector), a
+# full global build measured 432.0s, while the legitimate project scope exceeded
+# the 600-second deadline and produced no cached view. Keyed by (provider, scope,
+# scope_id, lint_enabled).
 _CACHE = GraphViewCache()
 
 _SCOPES_CONSUMING_SCOPE_ID = frozenset(
@@ -123,7 +125,13 @@ class MemoryGraphProvider(GraphProvider):
         return key, scope, scope_id, lint_enabled
 
     async def _build(self, scope: str, scope_id: Optional[str], lint_enabled: bool) -> GraphView:
-        """Project the scope's wiki into a GraphView (the uncached, ~148s path)."""
+        """Project the scope's wiki into a GraphView.
+
+        Under shipped defaults (lint enabled with the real contradiction
+        detector), a full global build measured 432.0s, while the legitimate
+        project scope exceeded the 600-second deadline and produced no cached
+        view.
+        """
         meta: dict[str, Any] = {
             "provider": "memory",
             "scope": scope,

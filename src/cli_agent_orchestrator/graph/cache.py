@@ -4,11 +4,10 @@ Issue #348, perf follow-up.
 
 DELIBERATE ADR REVERSAL. The original graph-layer design record specified
 "lint-on-demand, no caching machinery" (ADR-7): every ``/graph/{provider}``
-request re-ran ``wiki_lint.run_lint`` in-request. Profiling the shipped
-``memory`` provider on ``scope=global`` measured that projection at 146-166s,
-worse than the frontend's 120s timeout, so the UI aborted before the server
-answered. The dominant cost is the ripgrep-based ``stale_claim`` detector, not
-the LLM contradiction detector. Caching the *projected* GraphView sidesteps the
+request re-ran ``wiki_lint.run_lint`` in-request. Under shipped defaults (lint
+enabled with the real contradiction detector), a full ``global`` build measured
+432.0s, while the legitimate ``project`` scope exceeded the 600-second deadline
+and produced no cached view. Caching the *projected* GraphView sidesteps the
 entire run_lint cost on repeat views regardless of which detector dominates.
 
 This module lives in the graph layer ONLY — it does not touch the shipped
