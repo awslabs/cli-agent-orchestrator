@@ -114,17 +114,29 @@ than returning a 500.
 
 Building the memory graph can run `wiki_lint` (ripgrep-backed detectors + an
 LLM contradiction check). On 2026-08-11, one local `scope=global` sample took
-**0.21s cold with lint disabled**; two lint-enabled runs took **145.87s and
-166.40s cold** (an observed range of roughly **146-166s**). The sample contained
-48 index rows / 48 keys, 47 existing wiki pages, 182 global metadata rows, and
-1,118 repository files visible to ripgrep. These figures are from one machine,
-not worst-case bounds. The dominant enabled-path cost was the ripgrep-based
-`stale_claim` detector, which has no aggregate deadline: at the measured 756
-sequential ripgrep spawns, its three-second per-spawn timeout alone permits
-2,268s of subprocess time. `wiki_lint` scans the server's current working
-directory, so launching CAO from a different repository materially changes the
-corpus and cost. Because that can exceed request and client budgets, the
-projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
+**0.21s cold with lint disabled**; two initial lint-enabled global runs took
+**145.87s and 166.40s cold**. A later write-neutralized scope comparison
+(contradiction detection and persistence disabled) measured **178.73s for
+`global`** (756 ripgrep spawns, 72 issues) and **258.97s for `project`** (755
+spawns, 151 issues). The project result, roughly **259s**, is the largest
+measured legitimate cold build. Adding the separately gated, 60-second LLM
+contradiction detector gives an **inferred** project cost of roughly **319s**;
+319s was not measured.
+
+The global sample contained 48 index rows / 48 keys, 47 existing wiki pages,
+182 global metadata rows, and 1,118 repository files visible to ripgrep. The
+project measurement covered 195 project metadata rows. The 48-entry global wiki
+index does **not** bound lint cost: the provider passes the requested `scope` to
+`run_lint`, which filters the metadata table by scope alone; its other argument
+is audit-log context, not a container filter. That is why the 182-row global
+and 195-row project scopes each made about 756 ripgrep spawns. These figures are
+from one machine and tree, not worst-case bounds. The dominant enabled-path cost
+was the ripgrep-based `stale_claim` detector, which has no aggregate deadline:
+756 sequential spawns at its three-second per-spawn timeout permit 2,268s of
+subprocess time. `wiki_lint` scans the server's current working directory, so
+launching CAO from a different repository materially changes the corpus and
+cost. Because that can exceed request and client budgets, the projection is now
+**cached** (`src/cli_agent_orchestrator/graph/cache.py`).
 
 - The **projected `GraphView` is cached per
   `(provider, scope, scope_id, lint_enabled)`** with a **300-second TTL**
@@ -138,10 +150,11 @@ projection is now **cached** (`src/cli_agent_orchestrator/graph/cache.py`).
   Before this `scope_id` normalization, distinct values on `global` minted
   distinct keys for the same index path. With lint explicitly disabled, a
   review measured 331 new permanent keys per second against the old unbounded
-  cache. That is not the shipped default: with lint enabled, the measured
-  146-166-second cost and two-build concurrency yielded roughly two completed
-  keys per 150 seconds, while four distinct aliases could occupy both active
-  and both pending slots and reject the legitimate `scope=global` request.
+  cache. That is not the shipped default: with lint enabled, even the
+  write-neutralized global comparison measured 178.73 seconds, so two-build
+  concurrency yielded roughly two completed keys per 179 seconds. Four distinct
+  aliases could occupy both active and both pending slots and reject the
+  legitimate `scope=global` request.
   Normalization removes both the memory-growth alias and this availability
   failure; the LRU is a separate memory backstop for genuinely distinct keys.
 - Completed views use a **64-entry LRU bound**. Eviction never removes an
@@ -180,15 +193,17 @@ the difference is that they may now complete after the HTTP request has ended.
 > to bypass the cache.)
 
 > **First cold load may still time out on a large scope.** On 2026-08-11, a
-> lint-enabled cold request over 48 global index rows returned **504 after
-> 90.012228s**, while its cache-owned build completed in **164.036425s**. A
-> retry joins the in-progress task instead of restarting it. Across the measured
-> 146-166s lint-enabled range above, the HTTP route cannot return 200 on its
-> first attempt: CAO's own 90-second request deadline fires first. A client
-> retrying promptly after the five-second minimum should converge at roughly
-> 150-170 seconds from the initial request. The estimate remains valid if the
-> build finishes in the five-second gap after the first 90-second request:
-> the completed view is cached and the retry is an immediate hit.
+> lint-enabled cold `global` request returned **504 after 90.012228s**, while
+> its cache-owned build completed in **164.036425s**. That historical sample
+> converged at roughly 150-170 seconds with prompt retries. The later
+> write-neutralized comparison measured roughly **179s for `global`** and
+> **259s for `project`**; both exceed CAO's 90-second request deadline and
+> therefore cannot return 200 on their first attempt. A client retrying promptly
+> after the five-second minimum should converge around the build completion
+> time. A full project path including the 60-second-gated contradiction detector
+> is **inferred** at roughly **319s**, not measured. If a build finishes in the
+> five-second gap after a request, the completed view remains cached and the
+> next retry is an immediate hit.
 >
 > That convergence depends on three distinct regimes:
 >
@@ -197,7 +212,7 @@ the difference is that they may now complete after the HTTP request has ended.
 >    admitted task. At 600 seconds or longer, CAO abandons the build and caches
 >    nothing. Every retry starts another build that is also abandoned, so the
 >    client never converges. The 2,268-second detector ceiling above is
->    therefore a non-converging case, not merely a response slower than 170s.
+>    therefore a non-converging case, not merely a slower response.
 > 2. **Client cadence.** CAO assumes prompt retries but does not enforce them.
 >    `Retry-After: 5` means wait **at least** five seconds. Before completion at
 >    time B, a retry joins the in-flight build. After completion, a retry must
@@ -236,10 +251,15 @@ the difference is that they may now complete after the HTTP request has ended.
 > imply a relationship failure.
 >
 > The hard cliff is reachable through normal configuration, not only hostile
-> input: `wiki_lint` scans the server's current working directory, and the
-> measured 166-second run made 756 ripgrep spawns with zero per-spawn timeouts.
-> A larger repository can therefore consume the substantial headroom between
-> the observed range and the 600-second cache deadline; the 2,268-second
+> input. The largest legitimate scope measured here already took **258.97s at
+> only 195 scope-filtered metadata rows** before the LLM contradiction detector;
+> including that 60-second-gated detector gives an **inferred** end-to-end cost
+> of roughly **319s**, past half of the 600-second deadline. One corpus doubling
+> at comparable end-to-end scaling crosses the abandonment boundary, making
+> never-converges a likely corpus-growth failure rather than a theoretical edge
+> case. `wiki_lint` also scans the server's current working directory, and both
+> measured scopes made about 756 ripgrep spawns with zero per-spawn timeouts.
+> A larger repository can therefore increase the cost directly; the 2,268-second
 > subprocess arithmetic above is not an end-to-end upper bound.
 
 On shutdown, CAO cancels and retrieves all tracked graph tasks. Cancellation
@@ -247,10 +267,12 @@ cannot stop a blocking `asyncio.to_thread` worker already running a ripgrep
 subprocess. Python 3.10 and 3.11 provide no executor-shutdown timeout and may
 wait indefinitely. From Python 3.12 onward, `asyncio/runners.py:73` passes
 `constants.THREAD_JOIN_TIMEOUT = 300` to executor shutdown. Uvicorn reaches
-that live path through `asyncio_run` at `uvicorn/server.py:67`. Because 300
-seconds exceeds the measured 146-166-second builds, shutdown can wait for their
-full remaining duration even after lifespan cancellation has tidied the
-asyncio task. A worker exceeding the join window may outlive the event loop.
+that live path through `asyncio_run` at `uvicorn/server.py:67`. The 300-second
+window exceeds both write-neutralized measurements (179s and 259s), while the
+inferred 319-second project path can consume the full window. Shutdown can
+therefore wait for most or all of a build's remaining duration even after
+lifespan cancellation has tidied the asyncio task. A worker exceeding the join
+window may outlive the event loop.
 
 ## The API
 
