@@ -8,9 +8,11 @@ default-off registration.
 from __future__ import annotations
 
 import logging
+import shutil
 
 import pytest
 
+import cli_agent_orchestrator.ext_apps.apps as apps_module
 from cli_agent_orchestrator.ext_apps import (
     AGENT_RESOURCE_URI,
     DASHBOARD_RESOURCE_URI,
@@ -116,6 +118,12 @@ class TestGetResourceBody:
         monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
         with pytest.raises(FileNotFoundError):
             get_resource_body(DASHBOARD_RESOURCE_URI)
+
+    def test_empty_artifact_raises(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
+        (tmp_path / "graph.html").write_text("", encoding="utf-8")
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
+        with pytest.raises(FileNotFoundError):
+            get_resource_body(GRAPH_RESOURCE_URI)
 
 
 class TestRegisterApps:
@@ -261,6 +269,93 @@ class TestRegisterApps:
         assert "registered 4 handlers" in records[0].getMessage()
         assert "0/4 artifacts present" in records[0].getMessage()
         assert str(tmp_path) in records[0].getMessage()
+
+    def test_truncated_artifact_warns_and_serves_placeholder(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        for name in _RESOURCE_FILES.values():
+            (tmp_path / name).write_text(f"<title>{name}</title>", encoding="utf-8")
+        (tmp_path / "graph.html").write_text("", encoding="utf-8")
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
+        handlers = {}
+
+        class StubMCP:
+            def resource(self, uri, **kw):  # type: ignore[no-untyped-def]
+                def decorator(fn):  # type: ignore[no-untyped-def]
+                    handlers[uri] = fn
+                    return fn
+
+                return decorator
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
+            assert register_apps(StubMCP()) is True
+            html = handlers[GRAPH_RESOURCE_URI]()
+
+        summary_records = [
+            record for record in caplog.records if "3/4 artifacts present" in record.getMessage()
+        ]
+        assert len(summary_records) == 1
+        assert summary_records[0].levelno >= logging.WARNING
+        request_records = [
+            record
+            for record in caplog.records
+            if "artifact missing at request time: graph.html" in record.getMessage()
+        ]
+        assert len(request_records) == 1
+        assert request_records[0].levelno >= logging.WARNING
+        assert "view not built" in html
+        assert html != ""
+
+    def test_registered_handler_does_not_switch_static_directories(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        override_dir = tmp_path / "override"
+        override_dir.mkdir()
+        for name in _RESOURCE_FILES.values():
+            (override_dir / name).write_text(f"<title>{name}</title>", encoding="utf-8")
+
+        fake_module = tmp_path / "fake-package" / "cli_agent_orchestrator" / "ext_apps" / "apps.py"
+        fallback_dir = fake_module.parents[1] / "ext_apps" / "apps_static"
+        fallback_dir.mkdir(parents=True)
+        (fallback_dir / "dashboard.html").write_text(
+            "<title>STALE FALLBACK dashboard.html</title>",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(apps_module, "__file__", str(fake_module))
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(override_dir))
+        handlers = {}
+
+        class StubMCP:
+            def resource(self, uri, **kw):  # type: ignore[no-untyped-def]
+                def decorator(fn):  # type: ignore[no-untyped-def]
+                    handlers[uri] = fn
+                    return fn
+
+                return decorator
+
+        assert register_apps(StubMCP()) is True
+        shutil.rmtree(override_dir)
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
+            html = handlers[DASHBOARD_RESOURCE_URI]()
+
+        assert "STALE FALLBACK" not in html
+        assert "view not built" in html
+        request_records = [
+            record
+            for record in caplog.records
+            if "artifact missing at request time: dashboard.html" in record.getMessage()
+        ]
+        assert len(request_records) == 1
+        assert request_records[0].levelno >= logging.WARNING
 
     def test_decorator_failure_logs_error_with_uri(
         self,

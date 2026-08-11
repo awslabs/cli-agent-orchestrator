@@ -165,16 +165,26 @@ def ui_meta(
     return {"ui": ui}
 
 
-def _read_resource_html(filename: str) -> Optional[str]:
-    """Read a single-file artifact from ``apps_static/`` if present."""
+def _artifact_has_content(path: Path) -> bool:
+    """Return whether *path* is a non-empty regular file."""
 
-    static_dir = apps_static_dir()
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _read_resource_html(filename: str, base_dir: Optional[Path] = None) -> Optional[str]:
+    """Read a non-empty single-file artifact from ``apps_static/`` if present."""
+
+    static_dir = base_dir if base_dir is not None else apps_static_dir()
     if static_dir is None:
         return None
     path = static_dir / filename
-    if not path.is_file():
+    if not _artifact_has_content(path):
         return None
-    return path.read_text(encoding="utf-8")
+    html = path.read_text(encoding="utf-8")
+    return html or None
 
 
 def get_resource_body(uri: str) -> str:
@@ -182,19 +192,18 @@ def get_resource_body(uri: str) -> str:
 
     Resolves the artifact via :func:`apps_static_dir` (env override → packaged
     location → source tree). Raises ``KeyError`` for an unknown URI and
-    ``FileNotFoundError`` when the artifact is absent (e.g. the frontend has not
-    been built in a dev tree). Production wheels always ship the artifacts via the
-    hatch ``artifacts`` rule in ``pyproject.toml``.
+    ``FileNotFoundError`` when the artifact is absent or empty (e.g. the frontend
+    has not been built completely in a dev tree). Production wheels always ship
+    the artifacts via the hatch ``artifacts`` rule in ``pyproject.toml``.
     """
 
     filename = _RESOURCE_FILES.get(uri)
     if filename is None:
         raise KeyError(f"Unknown MCP Apps resource: {uri}")
-    static_dir = apps_static_dir()
-    if static_dir is None:
-        raise FileNotFoundError("apps_static/ not found (frontend not built)")
-    path = static_dir / filename
-    return path.read_text(encoding="utf-8")
+    html = _read_resource_html(filename)
+    if html is None:
+        raise FileNotFoundError(f"MCP App artifact not found or empty: {filename}")
+    return html
 
 
 def register_apps(mcp: Any) -> bool:
@@ -208,8 +217,9 @@ def register_apps(mcp: Any) -> bool:
     * per-URI decorator failures are logged with ``logger.exception``;
     * the summary is logged at warning when any expected artifact is absent and
       at info when all artifacts are present. It describes startup state in the
-      resolved directory, not steady state; artifacts removed later are reported
-      by the request-time warning, while content integrity is not checked here.
+      resolved directory, not steady state. Registered handlers retain that
+      directory and read it per request, warning when an artifact is then missing
+      or empty; :func:`get_resource_body` still resolves the directory per call.
     """
 
     if not _is_enabled():
@@ -233,14 +243,14 @@ def register_apps(mcp: Any) -> bool:
         return False
 
     artifacts_present = sum(
-        1 for filename in _RESOURCE_FILES.values() if (static_dir / filename).is_file()
+        1 for filename in _RESOURCE_FILES.values() if _artifact_has_content(static_dir / filename)
     )
     registered = 0
     for uri, filename in _RESOURCE_FILES.items():
 
-        def _make_handler(fname: str, resource_uri: str):
+        def _make_handler(fname: str, resource_uri: str, base_dir: Path):
             def _handler() -> str:
-                html = _read_resource_html(fname)
+                html = _read_resource_html(fname, base_dir)
                 if html is None:
                     logger.warning("MCP App artifact missing at request time: %s", fname)
                     return f"<!doctype html><title>{resource_uri}</title><p>view not built</p>"
@@ -250,7 +260,7 @@ def register_apps(mcp: Any) -> bool:
 
         try:
             decorated = resource_decorator(uri, mime_type=RESOURCE_MIME_TYPE)(
-                _make_handler(filename, uri)
+                _make_handler(filename, uri, static_dir)
             )
             # Reference the decorated handler so linters do not flag it unused;
             # FastMCP retains its own registration regardless.
