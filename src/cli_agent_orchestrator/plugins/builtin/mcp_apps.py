@@ -38,6 +38,12 @@ def _surface_enabled() -> bool:
     return bool(ConfigService.get("apps.enabled", default=False))
 
 
+def _app_surface_only() -> bool:
+    """Return whether non-app MCP tools should be hidden."""
+
+    return bool(ConfigService.get("apps.only", default=False))
+
+
 class McpAppsPlugin(CaoPlugin):
     """Registers the CAO MCP Apps surface on the FastMCP server at startup."""
 
@@ -74,3 +80,24 @@ class McpAppsPlugin(CaoPlugin):
         register_app_tools(mcp)
         register_widget(mcp)
         advertise_capability(mcp)
+
+        if _app_surface_only():
+            if not _surface_enabled():
+                logger.warning(
+                    "CAO_MCP_APPS_ONLY is set but CAO_MCP_APPS_ENABLED is false; "
+                    "not installing app-surface-only middleware because it would "
+                    "hide every MCP tool."
+                )
+                return
+
+            try:
+                from cli_agent_orchestrator.mcp_server.app_surface_only import (
+                    AppSurfaceOnlyMiddleware,
+                )
+
+                mcp.add_middleware(AppSurfaceOnlyMiddleware())
+            except Exception:
+                logger.exception(
+                    "Failed to install app-surface-only middleware; "
+                    "continuing with the full MCP tool surface"
+                )

@@ -75,6 +75,7 @@ class TerminalConfig(BaseModel):
 
 class AppsConfig(BaseModel):
     enabled: bool = False
+    only: bool = False
     static_dir: Optional[str] = None
 
 
@@ -153,6 +154,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.backend": "tmux",
     "terminal.herdr_session": "cao",
     "apps.enabled": False,
+    "apps.only": False,
     "apps.static_dir": None,
     "auth.jwks_uri": "",
     "auth.audience": "",
@@ -172,6 +174,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_BACKEND": ("terminal.backend", "str", "tmux"),
     "CAO_HERDR_SESSION": ("terminal.herdr_session", "str", "cao"),
     "CAO_MCP_APPS_ENABLED": ("apps.enabled", "bool", False),
+    "CAO_MCP_APPS_ONLY": ("apps.only", "bool", False),
     "CAO_MCP_APPS_STATIC_DIR": ("apps.static_dir", "str", None),
     "CAO_AUTH_JWKS_URI": ("auth.jwks_uri", "str", ""),
     "CAO_AUTH_AUDIENCE": ("auth.audience", "str", ""),
@@ -530,6 +533,7 @@ class ConfigService:
             ),
             apps=AppsConfig(
                 enabled=_get_value("apps.enabled", default=False),
+                only=_get_value("apps.only", default=False),
                 static_dir=_get_value("apps.static_dir", default=None),
             ),
             network=NetworkConfig(

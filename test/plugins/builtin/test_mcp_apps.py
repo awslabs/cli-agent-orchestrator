@@ -26,6 +26,7 @@ class _FakeMcp:
     def __init__(self) -> None:
         self.tools: List[str] = []
         self.resources: List[str] = []
+        self.middleware: List[Any] = []
         self._mcp_server = _FakeLowLevel()
 
     def tool(self, *args: Any, **kwargs: Any) -> Any:
@@ -41,6 +42,9 @@ class _FakeMcp:
             return fn
 
         return _deco
+
+    def add_middleware(self, middleware: Any) -> None:
+        self.middleware.append(middleware)
 
 
 def test_mcp_apps_is_a_cao_plugin() -> None:
@@ -103,3 +107,59 @@ def test_no_warning_when_surface_disabled(monkeypatch, caplog) -> None:
     with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
         McpAppsPlugin().on_mcp_server(_FakeMcp())
     assert not any("no IdP" in r.getMessage() for r in caplog.records)
+
+
+def test_app_surface_only_installs_middleware_when_apps_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
+    fake = _FakeMcp()
+
+    McpAppsPlugin().on_mcp_server(fake)
+
+    assert len(fake.middleware) == 1
+    assert fake.middleware[0].__class__.__name__ == "AppSurfaceOnlyMiddleware"
+
+
+def test_apps_only_off_leaves_middleware_unmodified(monkeypatch) -> None:
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    monkeypatch.delenv("CAO_MCP_APPS_ONLY", raising=False)
+    fake = _FakeMcp()
+
+    McpAppsPlugin().on_mcp_server(fake)
+
+    assert fake.middleware == []
+
+
+def test_app_surface_only_warns_and_does_not_install_when_apps_disabled(
+    monkeypatch, caplog
+) -> None:
+    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
+    fake = _FakeMcp()
+
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
+        McpAppsPlugin().on_mcp_server(fake)
+
+    assert fake.middleware == []
+    assert any(
+        "CAO_MCP_APPS_ONLY" in record.getMessage() and "hide every MCP tool" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_app_surface_only_middleware_failure_is_best_effort(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    monkeypatch.setenv("CAO_MCP_APPS_ONLY", "true")
+    fake = _FakeMcp()
+
+    def fail_to_install(middleware: Any) -> None:
+        raise RuntimeError("unsupported")
+
+    monkeypatch.setattr(fake, "add_middleware", fail_to_install)
+    with caplog.at_level(logging.ERROR, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
+        McpAppsPlugin().on_mcp_server(fake)
+
+    assert any(
+        "Failed to install app-surface-only middleware" in record.getMessage()
+        for record in caplog.records
+    )

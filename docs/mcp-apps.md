@@ -40,6 +40,27 @@ uv run cao-server                  # FastAPI + /events on :9889
 uv run cao-mcp-server              # registers the MCP App tools/resources
 ```
 
+For a graph-only external host such as KiroCrew, the minimum environment is:
+
+```bash
+export CAO_MCP_APPS_ENABLED=true
+export CAO_MCP_APPS_ONLY=true
+uv run cao-server
+uv run cao-mcp-server
+```
+
+`CAO_MCP_APPS_ONLY` exposes only `render_dashboard`, `render_agent_view`,
+`cao_fetch_history`, `subscribe_events`, `render_graph_view`, and
+`submit_command`. It hides in-session tools such as `handoff`, `assign`, and
+`send_message`, which require a CAO-managed terminal. This behavior is explicit;
+it is never inferred from a missing `CAO_TERMINAL_ID`, so a misconfigured CAO
+session does not silently lose tools. The flag requires
+`CAO_MCP_APPS_ENABLED=true`.
+
+`CAO_AGUI_ENABLED` is not required for this integration. KiroCrew consumes the
+MCP Apps tools and `ui://cao/*` resources and has no AG-UI consumer, so enabling
+AG-UI would mount a surface that nothing reads.
+
 The surface is packaged as the built-in **`mcp_apps` plugin** (discovered via the
 `cao.plugins` entry-point group). On MCP server startup the plugin's
 `on_mcp_server` hook registers the tools, the `ui://cao/*` resources, the topology
@@ -148,12 +169,29 @@ pull-model equivalent.
   surface (including `submit_command` mutations) inherits CAO's unauthenticated,
   localhost-only trust model — keep it on a trusted loopback host and configure an
   IdP before exposing it more widely; the server logs a startup warning in this state.
+- **External app credentials stay server-side.** The MCP server process holds the
+  credential used for authenticated HTTP calls. It must never appear in a
+  `ui://` payload, tool arguments, or tool result text. A `ui://` resource is
+  server-supplied HTML rendered in a null-origin sandboxed iframe with no
+  storage, and the host gateway spools that payload to a file on disk; embedding
+  a token therefore exposes it in both the spool file and frame source. Tool
+  results are also persisted in the conversation transcript.
+- **Use the correct authentication transport.** `/agui/v1/stream` accepts
+  `?access_token=<JWT>` only because native `EventSource` cannot set request
+  headers. The graph route is ordinary HTTP and must receive the token in an
+  `Authorization` header; URL tokens are substantially more likely to enter
+  access logs and other telemetry.
+- **Fail visibly.** Insufficient graph scope must return a distinguishable error,
+  not a blank graph. For initial bring-up, the documented default is auth
+  disabled on localhost; configure an IdP and server-held credential before
+  exposing the service beyond trusted loopback.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `CAO_MCP_APPS_ENABLED` | `false` | Master switch for the entire surface. |
+| `CAO_MCP_APPS_ONLY` | `false` | Expose only the six MCP Apps tools; requires `CAO_MCP_APPS_ENABLED=true`. |
 | `CAO_MCP_APPS_STATIC_DIR` | — | Override the built `apps_static/` location. |
 | `AUTH0_DOMAIN` / `CAO_AUTH_JWKS_URI` | — | Enable the auth layer (IdP). |
 | `CAO_AUTH_AUDIENCE`, `CAO_AUTH_ISSUER` | — | Token audience / issuer for validation + PRM. |
