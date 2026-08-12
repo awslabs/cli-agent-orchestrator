@@ -7,7 +7,7 @@ MCP App-capable host** — ChatGPT, Claude / Claude Desktop, VS Code (GitHub
 Copilot), Microsoft 365 Copilot, Goose, Postman, MCPJam, Archestra.AI (see the
 [client support matrix](https://modelcontextprotocol.io/extensions/client-matrix)
 for the authoritative, up-to-date list). It
-ships three single-file HTML views plus a lightweight topology widget, driven by
+ships four single-file HTML views plus a lightweight topology widget, driven by
 a small set of MCP tools and backed by an in-process event ring buffer.
 
 The whole surface is **default-off and behavior-preserving**: with
@@ -92,12 +92,15 @@ The surface is packaged as the built-in **`mcp_apps` plugin** (discovered via th
 widget, and the capability advertisement — all best-effort, so an older FastMCP
 build degrades without aborting startup. A missing frontend build emits a visible
 startup warning and skips the `ui://cao/*` resources. Specifically, a missing
-`apps_static/` directory means no `ui://` resources are listed, while a failed or
-partial build that leaves the directory present keeps all four resources listed
-and returns the `"view not built"` placeholder for each missing artifact; the
-artifact-presence WARNING distinguishes those states at startup. A nonempty but
-truncated or otherwise unreadable artifact still counts as present, emits no such
-warning, and may serve a broken view.
+`apps_static/` directory means no `ui://` resources are listed and emits the
+missing-directory warning, while a failed or partial build that leaves the
+directory present keeps all four resources listed, emits the artifact-presence
+warning, and returns the `"view not built"` placeholder for each missing artifact.
+A nonempty but truncated artifact still counts as present, emits no startup
+warning, and may serve a broken view. A nonempty but unreadable artifact —
+non-UTF-8 bytes or denied permissions — also counts as present at startup, but is
+diagnosed at request time with its cause and serves the `"view not built"`
+placeholder.
 
 ## Surfaces
 
@@ -106,6 +109,7 @@ warning, and may serve a broken view.
 | Dashboard | `ui://cao/dashboard` | Sessions, terminals, provider status, fleet overview; the mutation entry point. |
 | Agent detail | `ui://cao/agent` | One terminal: status, recent output tail, inbox depth, sub-agents. |
 | Event stream | `ui://cao/event-stream` | Compact, app-only governance ticker of normalized fleet events. |
+| Graph | `ui://cao/graph` | Polled Sigma.js view of provider graph nodes and edges, highlighting hubs, orphans, and contradictions. |
 | Topology widget | `cao://widget/topology` | Vanilla-JS live event view; also served at `/widgets/topology/` as a build-free fallback for hosts/older clients that don't render the full React views. |
 
 ## MCP tools (`mcp_server/app_tools.py`)

@@ -21,6 +21,7 @@ host setup, see [`../docs/mcp-apps.md`](../docs/mcp-apps.md).
 | `ui://cao/dashboard`    | `src/dashboard/dashboard.html`     | `apps_static/dashboard.html` |
 | `ui://cao/agent`        | `src/agent/agent.html`             | `apps_static/agent.html` |
 | `ui://cao/event-stream` | `src/event-stream/event-stream.html` | `apps_static/event-stream.html` |
+| `ui://cao/graph`        | `src/graph/graph.html`             | `apps_static/graph.html` |
 
 Shared building blocks live in `src/shared/` (the `McpApp` postMessage/JSON-RPC
 bridge, status/event/task components, and the RFC-6902 patch helpers).
@@ -59,8 +60,8 @@ npm install
 | `npm test` | Run the Vitest unit/component/integration suites once. |
 | `npm run test:watch` | Vitest in watch mode. |
 | `npm run test:e2e` | Playwright E2E (builds bundles + starts the harness server first). |
-| `npm run build:all` | Build all three single-file views into `apps_static/`. |
-| `npm run build:dashboard` / `build:agent` / `build:events` | Build one view. |
+| `npm run build:all` | Build all four single-file views into `apps_static/`. |
+| `npm run build:dashboard` / `build:agent` / `build:events` / `build:graph` | Build one view. |
 | `npm run scan:jit` | Fail if any built bundle contains a JIT token (`eval`/`new Function`). |
 | `npm run check:size` | Enforce the per-bundle gzipped size budget. |
 | `npm run coverage:ratchet` | Fail if measured coverage drops below the recorded floors. |
