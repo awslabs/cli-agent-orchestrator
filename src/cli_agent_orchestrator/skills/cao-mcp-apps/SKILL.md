@@ -32,7 +32,7 @@ uv run cao-mcp-server    # registers tools/resources via the mcp_apps plugin
 ```
 
 It is packaged as the built-in `mcp_apps` plugin (`cao.plugins` entry-point). The
-plugin's `on_mcp_server` hook registers the `ui://cao/*` resources, the five app
+plugin's `on_mcp_server` hook registers the `ui://cao/*` resources, the six app
 tools, the topology widget, and advertises the `io.modelcontextprotocol/ui`
 capability — best-effort and default-off, so nothing changes when the flag is unset.
 
@@ -41,6 +41,8 @@ capability — best-effort and default-off, so nothing changes when the flag is 
 - `ui://cao/dashboard` — fleet overview + the mutation entry point.
 - `ui://cao/agent` — one terminal's status, output tail, inbox, sub-agents.
 - `ui://cao/event-stream` — live governance ticker (app-only).
+- `ui://cao/graph` — polled Sigma.js view of provider graph nodes and edges,
+  highlighting hubs, orphans, and contradictions.
 - `cao://widget/topology` + `/widgets/topology/` — build-free live event view.
 
 All mutations flow through `submit_command(kind, payload)` — kinds:
