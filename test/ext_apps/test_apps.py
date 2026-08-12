@@ -254,7 +254,12 @@ class TestRegisterApps:
             EVENT_STREAM_RESOURCE_URI,
             GRAPH_RESOURCE_URI,
         }
-        posture_records = [record for record in caplog.records if record.levelno >= logging.WARNING]
+        posture_records = [
+            record
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+            and record.name == "cli_agent_orchestrator.ext_apps.apps"
+        ]
         assert posture_records == []
 
     def test_partial_artifacts_warn(

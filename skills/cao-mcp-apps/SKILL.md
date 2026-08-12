@@ -122,9 +122,9 @@ cd cao_mcp_apps && npm run build:all && npm run demo
 
 This runs `scripts/record-demo.mjs` which:
 1. Boots the E2E harness server (serves built bundles in a real MCP-host iframe)
-2. Drives Chromium through: dashboard → agent detail → unified → event-stream
+2. Drives Chromium through: dashboard → agent detail → event-stream
 3. Records video (`docs/media/mcp-apps-demo.webm`)
-4. Captures screenshots (`docs/media/mcp-apps-{dashboard,agent,unified,event-stream}.png`)
+4. Captures screenshots (`docs/media/mcp-apps-{dashboard,agent,event-stream}.png`)
 5. Generates an optimized GIF (`docs/media/mcp-apps-demo.gif`) when ffmpeg is available
 
 The GIF is referenced in `README.md` and `docs/mcp-apps.md` — always regenerate after
