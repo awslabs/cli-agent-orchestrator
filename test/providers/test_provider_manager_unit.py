@@ -54,6 +54,37 @@ def test_create_provider_hermes_stores_mapping():
     assert manager.get_provider("t1") is provider
 
 
+def test_create_provider_grok_forwards_launch_configuration():
+    manager = ProviderManager()
+    provider = MagicMock()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.GrokCliProvider", return_value=provider
+    ) as provider_cls:
+        result = manager.create_provider(
+            ProviderType.GROK_CLI.value,
+            terminal_id="t1",
+            tmux_session="s1",
+            tmux_window="w1",
+            agent_profile="reviewer",
+            allowed_tools=["fs_read", "fs_list"],
+            skill_prompt="runtime skill catalog",
+            model="grok-4.5",
+        )
+
+    assert result is provider
+    assert manager.get_provider("t1") is provider
+    provider_cls.assert_called_once_with(
+        "t1",
+        "s1",
+        "w1",
+        "reviewer",
+        ["fs_read", "fs_list"],
+        skill_prompt="runtime skill catalog",
+        model="grok-4.5",
+    )
+
+
 def test_create_provider_unknown_type_raises():
     manager = ProviderManager()
     with pytest.raises(ValueError, match="Unknown provider type"):

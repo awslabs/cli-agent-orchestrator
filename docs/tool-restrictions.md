@@ -197,15 +197,15 @@ The confirmation prompt is a **review gate** — it shows the resolved role and 
 
 CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, `fs_list`). However, not all providers understand this vocabulary natively. There are two categories:
 
-**Providers that need translation** — Claude Code and Copilot CLI each have their own native tool names (e.g., Claude Code calls bash execution `Bash`, Copilot calls it `shell`). CAO uses an internal `TOOL_MAPPING` to translate the CAO vocabulary to provider-native names, then computes which native tools to block and passes them as CLI flags (e.g., `--disallowedTools Bash`, `--deny-tool shell`).
+**Providers that need translation** — Claude Code, Copilot CLI, and Grok Build CLI each have their own native tool names (e.g., Claude Code and Grok call bash execution `Bash`, while Copilot calls it `shell`). CAO uses an internal `TOOL_MAPPING` to translate the CAO vocabulary to provider-native names, then computes which native tools to block and passes them as CLI flags (e.g., `--disallowedTools Bash`, `--deny-tool shell`, or `--deny Bash`).
 
-| CAO Tool | Claude Code | Copilot CLI |
-|----------|-------------|-------------|
-| `execute_bash` | `Bash` | `shell` |
-| `fs_read` | `Read` | `read` |
-| `fs_write` | `Edit`, `Write` | `write` |
-| `fs_list` | `Glob`, `Grep` | `list`, `grep` |
-| `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) |
+| CAO Tool | Claude Code | Copilot CLI | Grok Build CLI |
+|----------|-------------|-------------|----------------|
+| `execute_bash` | `Bash` | `shell` | `Bash` |
+| `fs_read` | `Read` | `read` | `Read`, `NotebookRead` |
+| `fs_write` | `Edit`, `Write` | `write` | `Edit`, `Write`, `NotebookEdit` |
+| `fs_list` | `Glob`, `Grep` | `list`, `grep` | `Grep`, `Glob` |
+| `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) | `WebFetch`, `WebSearch` + disabled web search |
 
 **Providers that accept CAO vocabulary directly** — Kiro CLI accepts `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI and Codex use system prompt instructions to enforce restrictions. For all three, CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
 
@@ -251,6 +251,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **Kiro CLI** | Hard | `allowedTools` in agent JSON at install time |
 | **Copilot CLI** | Hard | `--deny-tool` flags override `--allow-all` |
 | **OpenCode CLI** | Hard | `permission:` YAML frontmatter enforced natively at install time |
+| **Grok Build CLI** | Hard | Native `--deny` rules override `--always-approve`; native subagents are disabled |
 | **Kimi CLI** | Soft | Security system prompt only |
 | **Codex** | Soft | Security system prompt only |
 | **Antigravity CLI** | Soft | Security system prompt only |
@@ -279,6 +280,16 @@ claude --dangerously-skip-permissions --disallowedTools Bash --disallowedTools E
 ```bash
 copilot --allow-all --deny-tool shell --deny-tool write
 ```
+
+**Grok Build CLI** — Adds native `--deny` rules alongside auto-approval and
+disables Grok-native subagents:
+
+```bash
+grok --always-approve --no-subagents --deny Bash --deny Edit --deny Write
+```
+
+See the [Grok Build CLI provider guide](grok-cli.md#tool-restrictions) for the
+complete mapping and isolation behavior.
 
 **Kimi CLI / Codex** — Prepends to the system prompt:
 ```

@@ -962,3 +962,11 @@ def test_launch_rejects_blocked_env_prefix_before_calling_api():
         assert result.exit_code != 0
         assert "blocked prefix" in result.output
         mock_post.assert_not_called()
+
+
+def test_grok_cli_requires_workspace_access_confirmation():
+    from cli_agent_orchestrator.cli.commands.launch import (
+        PROVIDERS_REQUIRING_WORKSPACE_ACCESS,
+    )
+
+    assert "grok_cli" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS

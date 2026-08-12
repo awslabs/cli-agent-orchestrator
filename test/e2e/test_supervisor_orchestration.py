@@ -543,6 +543,21 @@ def _run_supervisor_assign_three_analysts_test(provider: str):
             "Expected at least 5 terminals " "(supervisor + analyst A/B/C + report_generator)"
         )
 
+        if provider == "grok_cli":
+            worker_profiles = [
+                terminal.get("agent_profile")
+                for terminal in terminals
+                if terminal.get("id") != supervisor_id
+            ]
+            assert worker_profiles.count("data_analyst") == 3, (
+                "Expected exactly three delegated data_analyst terminals, got "
+                f"profiles={worker_profiles}"
+            )
+            assert worker_profiles.count("report_generator") == 1, (
+                "Expected exactly one report_generator created through handoff, got "
+                f"profiles={worker_profiles}"
+            )
+
         # Verify 3 analyst callbacks were delivered to supervisor inbox.
         delivered_messages = []
         for _ in range(36):  # up to 180s
@@ -556,6 +571,11 @@ def _run_supervisor_assign_three_analysts_test(provider: str):
         assert len(unique_senders) >= 3, (
             "Expected delivered callbacks from at least 3 distinct worker terminals. "
             f"Got {len(unique_senders)} senders: {sorted(unique_senders)}"
+        )
+        pending_messages = _get_inbox_messages(supervisor_id, status_filter="pending")
+        assert not pending_messages, (
+            "All analyst callbacks must be delivered before final synthesis; "
+            f"pending={pending_messages}"
         )
 
         # Ensure final output reflects combined multi-dataset report.
@@ -759,3 +779,25 @@ class TestAntigravityCliSupervisorOrchestration:
     def test_supervisor_assign_and_handoff(self, require_antigravity):
         """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
         _run_supervisor_assign_test(provider="antigravity_cli")
+
+
+# ---------------------------------------------------------------------------
+# Grok Build CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGrokCliSupervisorOrchestration:
+    """E2E MCP orchestration tests for the official xAI Grok Build CLI."""
+
+    def test_supervisor_handoff(self, require_grok):
+        """Grok supervisor delegates report creation through handoff."""
+        _run_supervisor_handoff_test(provider="grok_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_grok):
+        """Grok supervisor combines asynchronous assign with blocking handoff."""
+        _run_supervisor_assign_test(provider="grok_cli")
+
+    def test_supervisor_assign_three_analysts(self, require_grok):
+        """Grok runs the maintainer-required three-analyst workflow."""
+        _run_supervisor_assign_three_analysts_test(provider="grok_cli")

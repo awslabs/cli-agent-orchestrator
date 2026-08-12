@@ -11,6 +11,17 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_special_key,
 )
 
+
+def test_grok_uses_runtime_skills_with_native_tool_enforcement():
+    from cli_agent_orchestrator.services.terminal_service import (
+        RUNTIME_SKILL_PROMPT_PROVIDERS,
+        SOFT_ENFORCEMENT_PROVIDERS,
+    )
+
+    assert "grok_cli" in RUNTIME_SKILL_PROMPT_PROVIDERS
+    assert "grok_cli" not in SOFT_ENFORCEMENT_PROVIDERS
+
+
 _TS = "cli_agent_orchestrator.services.terminal_service"
 
 

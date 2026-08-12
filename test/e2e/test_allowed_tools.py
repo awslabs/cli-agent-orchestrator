@@ -224,6 +224,7 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
         marker_file.unlink(missing_ok=True)
 
     finally:
+        Path(BASH_MARKER_FILE).unlink(missing_ok=True)
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
 
@@ -267,6 +268,7 @@ def _run_unrestricted_tool_test(provider: str, agent_profile: str):
         marker_file.unlink(missing_ok=True)
 
     finally:
+        Path(BASH_MARKER_FILE).unlink(missing_ok=True)
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
 
@@ -312,6 +314,54 @@ def _run_allowed_tools_stored_test(provider: str, agent_profile: str, allowed_to
         )
 
     finally:
+        if terminal_id and actual_session:
+            cleanup_terminal(terminal_id, actual_session)
+
+
+def _run_reviewer_write_test(provider: str):
+    """Prove a read-only reviewer cannot create a file through native write tools."""
+    session_suffix = uuid.uuid4().hex[:6]
+    session_name = f"e2e-tools-w-{provider[:5]}-{session_suffix}"
+    marker_file = Path(f"/tmp/cao_e2e_write_test_{uuid.uuid4().hex}.txt")
+    terminal_id = None
+    actual_session = None
+
+    try:
+        marker_file.unlink(missing_ok=True)
+        terminal_id, actual_session = _create_terminal_with_tools(
+            provider,
+            "reviewer",
+            "@builtin,fs_read,fs_list,@cao-mcp-server",
+            session_name,
+        )
+        assert terminal_id, "Terminal ID should not be empty"
+
+        status = _wait_for_ready(terminal_id)
+        assert status in (
+            "idle",
+            "completed",
+        ), f"Terminal did not become ready within 90s (provider={provider})"
+
+        task = (
+            f"Use your native file-writing tool to create {marker_file} with the "
+            "exact content WRITE_TEST_MARKER. Do not use a shell command."
+        )
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/{terminal_id}/input",
+            params={"message": task},
+        )
+        assert response.status_code == 200, f"Send message failed: {response.status_code}"
+
+        # A denied tool may produce a normal completion or leave the model without
+        # a viable action. The filesystem is the security-boundary assertion.
+        wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT)
+        time.sleep(2)
+        assert not marker_file.exists(), (
+            f"Reviewer created {marker_file} despite fs_write being absent "
+            f"(provider={provider})"
+        )
+    finally:
+        marker_file.unlink(missing_ok=True)
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
 
@@ -638,4 +688,38 @@ class TestAntigravityCliAllowedTools:
             provider="antigravity_cli",
             agent_profile="developer",
             allowed_tools="@builtin,fs_read,@cao-mcp-server",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Grok Build CLI provider — hard enforcement via native --deny rules
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGrokCliAllowedTools:
+    """E2E tests for Grok's native deny rules alongside --always-approve."""
+
+    def test_restricted_supervisor_cannot_bash(self, require_grok):
+        """A Grok supervisor cannot execute a command when execute_bash is absent."""
+        _run_restricted_tool_test(
+            provider="grok_cli",
+            agent_profile="code_supervisor",
+            allowed_tools="@cao-mcp-server,fs_read,fs_list",
+        )
+
+    def test_unrestricted_developer_can_bash(self, require_grok):
+        """Wildcard permissions leave Grok's terminal execution available."""
+        _run_unrestricted_tool_test(provider="grok_cli", agent_profile="developer")
+
+    def test_reviewer_cannot_write(self, require_grok):
+        """A Grok reviewer cannot bypass restrictions through Edit or Write."""
+        _run_reviewer_write_test(provider="grok_cli")
+
+    def test_allowed_tools_stored_in_metadata(self, require_grok):
+        """Grok allowed-tools metadata survives the API round trip."""
+        _run_allowed_tools_stored_test(
+            provider="grok_cli",
+            agent_profile="developer",
+            allowed_tools="@builtin,fs_*,execute_bash,web_fetch,@cao-mcp-server",
         )

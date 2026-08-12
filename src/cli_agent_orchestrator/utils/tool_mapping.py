@@ -51,6 +51,25 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
     },
+    # Official xAI Grok Build CLI permission-rule prefixes. These rules work
+    # in the interactive TUI and remain enforced under --always-approve.
+    # Grok-native subagents are disabled separately with --no-subagents.
+    "grok_cli": {
+        "execute_bash": ["Bash"],
+        "fs_read": ["Read", "NotebookRead"],
+        "fs_write": ["Edit", "Write", "NotebookEdit"],
+        "fs_list": ["Grep", "Glob"],
+        "fs_*": [
+            "Read",
+            "NotebookRead",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Grep",
+            "Glob",
+        ],
+        "web_fetch": ["WebFetch", "WebSearch"],
+    },
     # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
     # (write_file/read_file/run_shell_command/...). Restrictions are enforced
     # softly via the injected security prompt (see SOFT_ENFORCEMENT_PROVIDERS).

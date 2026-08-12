@@ -158,6 +158,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.GROK_CLI.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native
@@ -411,7 +412,7 @@ async def create_terminal(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
                 f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
                 f"requests {allowed_tools}. Treat this worker as unrestricted; for "
-                f"enforced restrictions use claude_code, kiro_cli, or "
+                f"enforced restrictions use claude_code, grok_cli, kiro_cli, or "
                 f"copilot_cli."
             )
 
