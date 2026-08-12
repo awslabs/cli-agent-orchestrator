@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -125,11 +126,49 @@ class TestGetResourceBody:
         with pytest.raises(FileNotFoundError):
             get_resource_body(GRAPH_RESOURCE_URI)
 
-    def test_invalid_utf8_artifact_raises(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_invalid_utf8_artifact_raises(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         (tmp_path / "graph.html").write_bytes(b"\xff")
         monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
-        with pytest.raises(FileNotFoundError):
-            get_resource_body(GRAPH_RESOURCE_URI)
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
+            with pytest.raises(
+                FileNotFoundError,
+                match=r"unavailable \(missing, empty, or unreadable\): graph.html",
+            ):
+                get_resource_body(GRAPH_RESOURCE_URI)
+        assert any(
+            "graph.html" in record.getMessage() and "UnicodeDecodeError" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_unreadable_artifact_logs_cause(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        artifact = tmp_path / "graph.html"
+        artifact.write_text("<title>Graph</title>", encoding="utf-8")
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
+        original_read_text = Path.read_text
+
+        def deny_artifact_read(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if path == artifact:
+                raise PermissionError("test read denied")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", deny_artifact_read)
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.ext_apps.apps"):
+            with pytest.raises(FileNotFoundError):
+                get_resource_body(GRAPH_RESOURCE_URI)
+        assert any(
+            "graph.html" in record.getMessage() and "PermissionError" in record.getMessage()
+            for record in caplog.records
+        )
 
 
 class TestRegisterApps:
@@ -309,7 +348,7 @@ class TestRegisterApps:
         request_records = [
             record
             for record in caplog.records
-            if "artifact missing at request time: graph.html" in record.getMessage()
+            if "artifact unavailable at request time: graph.html" in record.getMessage()
         ]
         assert len(request_records) == 1
         assert request_records[0].levelno >= logging.WARNING
@@ -362,10 +401,38 @@ class TestRegisterApps:
         request_records = [
             record
             for record in caplog.records
-            if "artifact missing at request time: dashboard.html" in record.getMessage()
+            if "artifact unavailable at request time: dashboard.html" in record.getMessage()
         ]
         assert len(request_records) == 1
         assert request_records[0].levelno >= logging.WARNING
+
+    def test_handler_propagates_non_artifact_failure(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        for name in _RESOURCE_FILES.values():
+            (tmp_path / name).write_text(f"<title>{name}</title>", encoding="utf-8")
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
+        handlers = {}
+
+        class StubMCP:
+            def resource(self, uri, **kw):  # type: ignore[no-untyped-def]
+                def decorator(fn):  # type: ignore[no-untyped-def]
+                    handlers[uri] = fn
+                    return fn
+
+                return decorator
+
+        assert register_apps(StubMCP()) is True
+
+        def fail_resource_lookup(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("unexpected resolver failure")
+
+        monkeypatch.setattr(apps_module, "get_resource_body", fail_resource_lookup)
+        with pytest.raises(RuntimeError, match="unexpected resolver failure"):
+            handlers[DASHBOARD_RESOURCE_URI]()
 
     def test_handlers_and_bound_body_resolver_agree_for_all_resources(
         self,

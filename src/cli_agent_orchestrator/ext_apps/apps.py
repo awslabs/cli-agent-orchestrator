@@ -1,6 +1,6 @@
 """``ui://cao/*`` MCP App resources, ``_meta.ui`` annotations, and registration.
 
-The three views are shipped as **single-file HTML** artifacts built by the
+The four views are shipped as **single-file HTML** artifacts built by the
 ``cao_mcp_apps`` frontend (``vite-plugin-singlefile``) into ``apps_static/``.
 ``register_apps`` mounts each artifact as an MCP resource under its ``ui://cao/*``
 URI so an MCP App host can load it into a sandboxed iframe.
@@ -25,6 +25,7 @@ the boundary and only reads static files from disk.
 
 import logging
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.services.config_service import ConfigService
@@ -183,13 +184,27 @@ def _read_resource_html(filename: str, base_dir: Optional[Path] = None) -> Optio
 
     static_dir = base_dir if base_dir is not None else apps_static_dir()
     if static_dir is None:
+        logger.warning("MCP App static directory unavailable while reading artifact: %s", filename)
         return None
     path = static_dir / filename
-    if not _artifact_has_content(path):
+    try:
+        artifact_stat = path.stat()
+    except FileNotFoundError:
+        logger.warning("MCP App artifact absent: %s", path)
+        return None
+    except OSError as exc:
+        logger.warning("MCP App artifact stat failed: %s (%s)", path, type(exc).__name__)
+        return None
+    if not S_ISREG(artifact_stat.st_mode):
+        logger.warning("MCP App artifact is not a regular file: %s", path)
+        return None
+    if artifact_stat.st_size == 0:
+        logger.warning("MCP App artifact empty: %s", path)
         return None
     try:
         html = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning("MCP App artifact unreadable: %s (%s)", path, type(exc).__name__)
         return None
     return html or None
 
@@ -202,9 +217,9 @@ def get_resource_body(uri: str, base_dir: Optional[Path] = None) -> str:
     it, intentionally resolves via :func:`apps_static_dir` on each call for
     stateless callers that are not attached to a server registration. Raises
     ``KeyError`` for an unknown URI and ``FileNotFoundError`` when the artifact is
-    absent or empty (e.g. the frontend has not been built completely in a dev
-    tree). Production wheels always ship the artifacts via the hatch ``artifacts``
-    rule in ``pyproject.toml``.
+    absent, empty, or unreadable (permission errors and non-UTF-8 bytes included).
+    Production wheels always ship the artifacts via the hatch ``artifacts`` rule
+    in ``pyproject.toml``.
     """
 
     filename = _RESOURCE_FILES.get(uri)
@@ -212,7 +227,9 @@ def get_resource_body(uri: str, base_dir: Optional[Path] = None) -> str:
         raise KeyError(f"Unknown MCP Apps resource: {uri}")
     html = _read_resource_html(filename, base_dir)
     if html is None:
-        raise FileNotFoundError(f"MCP App artifact not found or empty: {filename}")
+        raise FileNotFoundError(
+            f"MCP App artifact unavailable (missing, empty, or unreadable): {filename}"
+        )
     return html
 
 
@@ -228,9 +245,10 @@ def register_apps(mcp: Any) -> bool:
     * the summary is logged at warning when any expected artifact is absent and
       at info when all artifacts are present. It describes startup state in the
       resolved directory, not steady state. Registered handlers retain that
-      directory and read it per request, warning when an artifact is then missing
-      or empty; unbound :func:`get_resource_body` calls remain intentionally
-      stateless and resolve the current configured directory per call.
+      directory and read it per request, warning when an artifact is then missing,
+      empty, or unreadable; unbound :func:`get_resource_body` calls remain
+      intentionally stateless and resolve the current configured directory per
+      call.
     """
 
     if not _is_enabled():
@@ -266,7 +284,11 @@ def register_apps(mcp: Any) -> bool:
                 # FileNotFoundError is the load-bearing contract that maps direct
                 # resource lookup failure to the request-time placeholder.
                 except FileNotFoundError:
-                    logger.warning("MCP App artifact missing at request time: %s", fname)
+                    logger.warning(
+                        "MCP App artifact unavailable at request time: %s "
+                        "(missing, empty, or unreadable)",
+                        fname,
+                    )
                     return f"<!doctype html><title>{resource_uri}</title><p>view not built</p>"
 
             return _handler

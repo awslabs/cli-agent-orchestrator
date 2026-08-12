@@ -96,8 +96,8 @@ startup warning and skips the `ui://cao/*` resources. Specifically, a missing
 partial build that leaves the directory present keeps all four resources listed
 and returns the `"view not built"` placeholder for each missing artifact; the
 artifact-presence WARNING distinguishes those states at startup. A nonempty but
-truncated artifact still counts as present, emits no such warning, and may serve a
-broken view.
+truncated or otherwise unreadable artifact still counts as present, emits no such
+warning, and may serve a broken view.
 
 ## Surfaces
 
