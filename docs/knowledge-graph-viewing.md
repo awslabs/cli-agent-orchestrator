@@ -186,9 +186,11 @@ cost. Because that can exceed request and client budgets, the projection is now
   `asyncio.to_thread` worker may continue after its coroutine releases a slot.
   The cache awaits a build for at most 600 seconds, after which the key reports
   `failed_deadline` and can be retried.
-- `meta.cached` (bool) and `meta.as_of` (ISO-8601 UTC timestamp of the build)
+- For providers that implement the cache-owned `project_inflight` hook,
+  `meta.cached` (bool) and `meta.as_of` (ISO-8601 UTC timestamp of the build)
   tell you whether a response was served from cache and when the underlying data
-  was projected.
+  was projected. Fallback providers without that hook, including the shipped
+  `stub` provider, return their own metadata without `cached` or `as_of`.
 
 The detached projection is **not read-only**. `wiki_lint` persists contradiction
 relationships through its producer-scoped `replace_set` path, including the
@@ -381,18 +383,25 @@ The built sinks:
 ## Secure access
 
 The graph carries **summaries of memory content** (notably contradiction-edge
-summaries), so access is gated. The behaviors below are enforced in code, not
-aspirational.
+summaries). The secret gate is unconditional, and the read handler directly
+refuses private tiers. The read and export scope dependencies enforce access
+only when authentication is enabled; under the default no-IdP configuration,
+they receive the full scope set.
 
-- **Reads are scope-gated (D5).** `GET /graph/{provider}` requires any of
+- **Reads are scope-gated when authentication is enabled (D5).**
+  `GET /graph/{provider}` requires any of
   `cao:read` / `cao:write` / `cao:admin` (read is the floor), identical to
   `/events`. This **supersedes** the earlier "ungated by design" (FR-12)
-  wording — an unauthenticated caller must not read the graph.
-- **Private tiers are refused outright.** `scope=session` or `scope=agent` is
-  rejected with **400** even for an authed `cao:read` caller (case-insensitive
-  check). The graph API never exposes private tiers — mirrors `/memory/export`.
-- **Exports are write-scoped.** `POST /graph/{provider}/export` requires
-  `cao:write` / `cao:admin`.
+  wording for authenticated deployments.
+- **Private tiers are refused outright on reads.** `scope=session` or
+  `scope=agent` is rejected with **400** by `GET /graph/{provider}`, even for
+  an authed `cao:read` caller (case-insensitive check). The read route never
+  exposes private tiers — mirrors `/memory/export`; the export route does not
+  share this check.
+- **Exports are write-scoped when authentication is enabled.**
+  `POST /graph/{provider}/export` requires `cao:write` / `cao:admin`. On the
+  export path, loopback is the only control. The scope gates the docs describe
+  are inactive by default.
 - **Secret gate runs before any write.** The serialized view is scanned by
   `secret_gate` **before** the sink is invoked. On a hit the export is rejected
   with **422**, the sink's `export()` is never called, and **nothing is
