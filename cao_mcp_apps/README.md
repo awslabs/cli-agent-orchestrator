@@ -34,6 +34,7 @@ cao_mcp_apps/
 │   ├── dashboard/      # ui://cao/dashboard view + entry
 │   ├── agent/          # ui://cao/agent view + entry
 │   ├── event-stream/   # ui://cao/event-stream view + entry
+│   ├── graph/          # ui://cao/graph view + entry
 │   ├── shared/         # McpApp bridge, components, patch helpers, types
 │   └── test/           # unit/component/integration tests + Mock Host harness
 ├── e2e/                # Playwright specs + standalone harness server
