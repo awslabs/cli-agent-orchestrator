@@ -396,12 +396,12 @@ they receive the full scope set.
 - **Private tiers are refused outright on reads.** `scope=session` or
   `scope=agent` is rejected with **400** by `GET /graph/{provider}`, even for
   an authed `cao:read` caller (case-insensitive check). The read route never
-  exposes private tiers — mirrors `/memory/export`; the export route does not
-  share this check.
+  exposes private tiers — mirrors `/memory/export`;
+  `POST /graph/{provider}/export` does not share this check.
 - **Exports are write-scoped when authentication is enabled.**
-  `POST /graph/{provider}/export` requires `cao:write` / `cao:admin`. On the
-  export path, loopback is the only control. The scope gates the docs describe
-  are inactive by default.
+  `POST /graph/{provider}/export` requires `cao:write` / `cao:admin`. With
+  authentication disabled, loopback is the only *access* control on this path.
+  The scope gates the docs describe are inactive by default.
 - **Secret gate runs before any write.** The serialized view is scanned by
   `secret_gate` **before** the sink is invoked. On a hit the export is rejected
   with **422**, the sink's `export()` is never called, and **nothing is
@@ -681,5 +681,3 @@ engine.
   - MCP renderer: `cao_mcp_apps/src/graph/GraphView.tsx`,
     `mcp_server/app_tools.py` (`render_graph_view`), `ext_apps/apps.py`
     (`ui://cao/graph`)
-</content>
-</invoke>
