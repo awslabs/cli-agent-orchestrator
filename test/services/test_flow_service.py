@@ -866,12 +866,16 @@ Prompt.
         mock_terminal = MagicMock()
         mock_terminal.id = "terminal-123"
         mock_create_terminal.return_value = mock_terminal
+        lifecycle: list[str] = []
+        mock_get_backend.return_value.kill_session.side_effect = lambda *_: lifecycle.append("kill")
+        mock_provider_manager.cleanup_provider.side_effect = lambda *_: lifecycle.append("cleanup")
 
         result = await execute_flow("idle-flow")
 
         assert result is True
         mock_get_backend.return_value.kill_session.assert_called_once()
         mock_provider_manager.cleanup_provider.assert_called_once_with("t1")
+        assert lifecycle == ["kill", "cleanup"]
         mock_create_terminal.assert_called_once()
 
     @pytest.mark.asyncio

@@ -284,7 +284,6 @@ async def execute_flow(name: str) -> bool:
                 logger.info(f"Flow {name}: session {session_name} is busy, skipping")
                 return False
             for t in terminals:
-                provider_manager.cleanup_provider(t["id"])
                 # Tear down the event-driven pipeline for each recycled terminal:
                 # stop the FIFO reader thread (and unlink its *.fifo file) and clear
                 # the StatusMonitor buffers. Without this, repeated flow runs leak
@@ -298,6 +297,11 @@ async def execute_flow(name: str) -> bool:
                 except Exception as e:
                     logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
             get_backend().kill_session(session_name)
+            # A provider's private state must outlive the process that owns
+            # it.  Grok cleanup confirms any escaped updater has stopped
+            # before recursively deleting its private GROK_HOME.
+            for t in terminals:
+                provider_manager.cleanup_provider(t["id"])
             delete_terminals_by_session(session_name)
         terminal = await create_terminal(
             session_name=session_name,

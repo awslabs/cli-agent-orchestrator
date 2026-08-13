@@ -55,6 +55,9 @@ class TestCreateTerminalCleanup:
         # initialize is awaited inside create_terminal, so it must be an AsyncMock
         mock_provider.initialize = AsyncMock(side_effect=Exception("Provider init failed"))
         mock_pm.create_provider.return_value = mock_provider
+        lifecycle: list[str] = []
+        mock_tmux.kill_session.side_effect = lambda *_: lifecycle.append("kill")
+        mock_pm.cleanup_provider.side_effect = lambda *_: lifecycle.append("cleanup")
 
         with pytest.raises(Exception, match="Provider init failed"):
             await create_terminal(
@@ -67,6 +70,7 @@ class TestCreateTerminalCleanup:
 
         mock_pm.cleanup_provider.assert_called_once_with("tid1")
         mock_tmux.kill_session.assert_called_once()
+        assert lifecycle == ["kill", "cleanup"]
         mock_db_delete.assert_called_once_with("tid1")
 
     @pytest.mark.asyncio

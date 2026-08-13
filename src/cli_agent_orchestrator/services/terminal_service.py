@@ -572,11 +572,6 @@ async def create_terminal(
                 status_monitor.clear_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        try:
-            if terminal_id is not None:
-                provider_manager.cleanup_provider(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
         # Roll back the DB terminal row so a failed create does not leave an
         # orphan record: the stale row would still be listed for the session
         # and report UNKNOWN status even though nothing is running. Idempotent
@@ -615,7 +610,16 @@ async def create_terminal(
                 get_backend().kill_window(session_name, window_name)
             except Exception:
                 pass  # Ignore cleanup errors
-        if worktree_repo_root is not None:
+        # The process-owning tmux session/window must be stopped before a
+        # provider releases private on-disk state.  In particular Grok can
+        # have an updater still writing $GROK_HOME while its initialization
+        # fails; its cleanup verifies that no such process remains.
+        try:
+            if terminal_id is not None:
+                provider_manager.cleanup_provider(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
+        if worktree_repo_root is not None and terminal_id is not None:
             # A worktree WAS created (Step 1b succeeded) before some later step
             # failed -- roll it back too, same best-effort posture as everything
             # else in this block. Without this, a provider-init timeout (or any
