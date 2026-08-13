@@ -209,6 +209,20 @@ PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRAC
 # After this many attempts, give up loudly and drop the terminal from the
 # watchdog, exactly like the rearm()-exception path already does.
 PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
+# Cap on consecutive liveness-PROBE failures per terminal (harness-control#845). The
+# probe (a tmux ``capture-pane``/``get_history``) raises — e.g. libtmux
+# ``ObjectDoesNotExist`` — when the session, window, or the whole tmux server is gone.
+# That exception path reaches NEITHER the rearm-failure NOR the cold-start counter above
+# (both sit downstream of a probe that RETURNED), so before this bound a terminal whose
+# session/server had died was re-probed every PIPE_LIVENESS_CHECK_INTERVAL_S forever, each
+# tick emitting a full-traceback ERROR — an unbounded, self-amplifying log/CPU storm across
+# every ghost terminal exactly when the box is already unhealthy (live incident: ~578k
+# error lines, a strong contributor to a near-simultaneous mass session teardown). After
+# this many consecutive probe failures, give up loudly ONCE and drop the terminal from the
+# watchdog, exactly like the rearm-exception and cold-start paths already do. The counter
+# resets on any successful probe, so a brief transient (a session momentarily unavailable
+# but not gone) never accumulates to a false drop.
+PIPE_LIVENESS_MAX_PROBE_FAILURES = _env_int("CAO_PIPE_LIVENESS_MAX_PROBE_FAILURES", 5)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
