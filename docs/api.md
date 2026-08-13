@@ -81,6 +81,18 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   reject the request with 400 and the findings attached; warnings do not block
   the write and are returned in the response so a client can surface them after
   a successful save.
+- The validator rejects non-string mapping keys. A profile is written as YAML,
+  which allows any scalar as a key, but the format is described by JSON Schema,
+  where object keys are strings. Without this rule `mcpServers: {1: {...}}`
+  validates clean and persists, then fails to load, since the model requires
+  string keys. Note YAML also auto-types an unquoted date, so `2026-01-01:` is a
+  date key rather than a string; quote such keys.
+- Every 400 from the profile write and source routes uses one `detail` shape,
+  `{"message", "errors"}`, so a client never has to switch on the type of
+  `detail`. `errors` is empty for a failure that is not attributable to a field,
+  but the key is always present. This covers rejected names as well as schema
+  findings. 404 and 409 keep FastAPI's conventional bare-string `detail`, since
+  the status code already discriminates and there are no findings to attach.
 - `GET /agents/profiles/{name}/source` returns a profile's document exactly as
   stored. Use this, not `GET /agents/profiles/{name}`, when the document is
   going to be edited and written back: that route returns the *resolved*

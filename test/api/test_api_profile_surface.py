@@ -754,31 +754,147 @@ class TestAgentProfileSourceEndpoint:
         assert client.get("/agents/profiles/absent/source").status_code == 404
 
 
+class TestNonStringMappingKeysAreRejected:
+    """A profile the runtime cannot load must not reach disk.
+
+    Reported as a P2 in round 1 of review on #585. The request body is YAML,
+    which allows any scalar as a mapping key, but the gate was JSON Schema, where
+    object keys are strings by definition. jsonschema saw nothing wrong with
+    ``mcpServers: {1: {command: echo}}``, so the write returned 201 and created
+    the file, and ``parse_agent_profile_text`` then refused to load it with a
+    Pydantic error at ``mcpServers.1.[key]``. The profile saved and could not be
+    read or launched, which contradicts the route's guarantee.
+
+    The check lives in the validator rather than only on this path, so
+    ``cao profile validate`` and ``POST /agents/profiles/validate`` agree with
+    the write routes. A UI that validates before saving would otherwise be told
+    the document is fine and then handed a 400.
+    """
+
+    CASES = {
+        "mcpServers integer key": "---\nname: probe\nmcpServers:\n  1:\n    command: echo\n---\n\nB.\n",
+        "toolAliases integer key": "---\nname: probe\ntoolAliases:\n  1: Read\n---\n\nB.\n",
+        # YAML auto-types an unquoted date, so this key is a datetime.date. The
+        # same mismatch, reached without anyone writing a number.
+        "unquoted date key": "---\nname: probe\ntoolAliases:\n  2026-01-01: Read\n---\n\nB.\n",
+    }
+
+    @pytest.mark.parametrize("label", list(CASES))
+    def test_create_rejects_and_writes_nothing(self, client, write_store, label) -> None:
+        response = client.post(
+            "/agents/profiles", json={"name": "probe", "content": self.CASES[label]}
+        )
+
+        assert response.status_code == 400, label
+        assert not (write_store / "probe.md").exists(), f"{label}: profile was persisted"
+
+    @pytest.mark.parametrize("label", list(CASES))
+    def test_replace_rejects_and_leaves_the_original(self, client, write_store, label) -> None:
+        """The existing document must survive a rejected update byte-for-byte."""
+        write_store.mkdir(parents=True, exist_ok=True)
+        original = VALID_PROFILE.format(name="probe")
+        (write_store / "probe.md").write_text(original, encoding="utf-8")
+
+        response = client.put("/agents/profiles/probe", json={"content": self.CASES[label]})
+
+        assert response.status_code == 400, label
+        assert (write_store / "probe.md").read_text(encoding="utf-8") == original, label
+
+    def test_the_rejected_document_is_indeed_unloadable(self, write_store) -> None:
+        """Anchors the reason for rejecting: the runtime cannot parse these.
+
+        Without this, the rule above reads as an arbitrary restriction. Asserting
+        the load failure keeps the justification in the suite rather than only in
+        a commit message.
+        """
+        import pytest as _pytest
+
+        from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
+
+        with _pytest.raises(Exception) as excinfo:
+            parse_agent_profile_text(self.CASES["mcpServers integer key"], "probe")
+
+        assert "mcpServers" in str(excinfo.value)
+
+
 class TestWriteRejectionShape:
-    """Every 400 from a write route uses one ``detail`` shape.
+    """Every 400 from the profile write and source routes uses one ``detail`` shape.
 
     A client should not have to switch on ``type(detail)``. Before this was
     unified, a schema failure returned a dict while a name mismatch and a parse
     failure returned bare strings, from the same endpoint.
+
+    Two kinds of 400 reach the client and both are covered below: validation
+    findings raised inside ``_validate_profile_for_write``, and the
+    service-raised ``InvalidProfileNameError``, which ``DELETE`` reaches because
+    it has no body to validate first. Round 1 of review on #585 caught that this
+    class asserted the suite-wide contract while exercising only ``POST``, and
+    that ``DELETE``'s name error was in fact still a bare string. The parameters
+    below exist so that gap fails a test rather than merely contradicting a
+    docstring.
+
+    404 and 409 deliberately keep FastAPI's conventional bare-string ``detail``
+    and are not covered here: the status code already discriminates and there are
+    no findings to attach.
     """
 
-    REJECTIONS = {
-        "schema error": {"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
-        "name mismatch": {"name": "x", "content": "---\nname: other\n---\n\nB.\n"},
-        "unparseable": {"name": "x", "content": "---\nname: [unclosed\n  b: : y\n---\n\nB.\n"},
-        "missing name": {"name": "x", "content": "---\ndescription: none\n---\n\nB.\n"},
-    }
+    # (label, client method, url, json body or None)
+    REJECTIONS = [
+        (
+            "post: schema error",
+            "post",
+            "/agents/profiles",
+            {"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
+        ),
+        (
+            "post: name mismatch",
+            "post",
+            "/agents/profiles",
+            {"name": "x", "content": "---\nname: other\n---\n\nB.\n"},
+        ),
+        (
+            "post: unparseable",
+            "post",
+            "/agents/profiles",
+            {"name": "x", "content": "---\nname: [unclosed\n  b: : y\n---\n\nB.\n"},
+        ),
+        (
+            "post: missing name",
+            "post",
+            "/agents/profiles",
+            {"name": "x", "content": "---\ndescription: none\n---\n\nB.\n"},
+        ),
+        (
+            "post: non-string mapping key",
+            "post",
+            "/agents/profiles",
+            {
+                "name": "x",
+                "content": "---\nname: x\nmcpServers:\n  1:\n    command: echo\n---\n\nB.\n",
+            },
+        ),
+        (
+            "put: name mismatch",
+            "put",
+            "/agents/profiles/x",
+            {"content": "---\nname: other\n---\n\nB.\n"},
+        ),
+        ("delete: unsafe name", "delete", "/agents/profiles/bad@name", None),
+    ]
 
-    def test_every_rejection_has_the_same_detail_shape(self, client, write_store) -> None:
-        for label, body in self.REJECTIONS.items():
-            response = client.post("/agents/profiles", json=body)
+    @pytest.mark.parametrize("label,method,url,body", REJECTIONS, ids=[r[0] for r in REJECTIONS])
+    def test_every_rejection_has_the_same_detail_shape(
+        self, client, write_store, label, method, url, body
+    ) -> None:
+        call = getattr(client, method)
+        response = call(url) if body is None else call(url, json=body)
 
-            assert response.status_code == 400, label
-            detail = response.json()["detail"]
-            assert isinstance(detail, dict), f"{label}: detail was {type(detail).__name__}"
-            assert set(detail) == {"message", "errors"}, label
-            assert isinstance(detail["message"], str), label
-            assert isinstance(detail["errors"], list), label
+        assert response.status_code == 400, label
+        detail = response.json()["detail"]
+        assert isinstance(detail, dict), f"{label}: detail was {type(detail).__name__}"
+        assert set(detail) == {"message", "errors"}, label
+        assert isinstance(detail["message"], str), label
+        assert isinstance(detail["errors"], list), label
 
     def test_field_level_failures_carry_a_path(self, client, write_store) -> None:
         """A schema failure must say which field, so a form can render it."""

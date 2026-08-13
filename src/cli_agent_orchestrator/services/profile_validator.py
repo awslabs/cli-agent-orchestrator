@@ -71,12 +71,71 @@ def load_profile_schema() -> dict:
     return json.loads(schema_path.read_text(encoding="utf-8"))
 
 
+def _non_string_key_findings(
+    value: object, path: str = "", _depth: int = 0
+) -> list["ValidationMessage"]:
+    """Report every mapping key in ``value`` that is not a string.
+
+    Closes a gap between the two formats in play. A profile arrives as **YAML**,
+    which allows any scalar as a mapping key, but the format is described by
+    **JSON Schema**, where object keys are strings by definition. jsonschema
+    therefore does not flag ``mcpServers: {1: {command: echo}}`` at all, while
+    ``AgentProfile`` refuses to load it later because ``Dict[str, ...]`` rejects
+    the integer key.
+
+    Reported here rather than only on the HTTP write path so that every consumer
+    agrees. Otherwise ``cao profile validate`` and
+    ``POST /agents/profiles/validate`` would call such a document valid and the
+    write routes would then reject it, and a UI that validates before saving
+    would show a contradiction.
+
+    The same mismatch reaches further than integer keys: YAML also auto-types
+    unquoted dates, so ``2026-01-01:`` becomes a ``datetime.date`` key. Checking
+    the key type generally covers those without enumerating them.
+
+    Args:
+        value: Any parsed YAML value. Only mappings and sequences are descended.
+        path: Dotted path of ``value`` within the document, for the finding.
+        _depth: Recursion guard. YAML aliases can build deeply nested or
+            self-referential structures, and a validator must not hang on input
+            whose whole problem is that it is malformed.
+
+    Returns:
+        One error finding per offending key, in document order.
+    """
+    if _depth > 32:
+        return []
+
+    findings: list[ValidationMessage] = []
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if not isinstance(key, str):
+                findings.append(
+                    ValidationMessage(
+                        "error",
+                        f"Mapping key {key!r} is a {type(key).__name__}, not a string. "
+                        f"Profile fields are string-keyed; quote it as '{key}'.",
+                        child_path,
+                    )
+                )
+            findings.extend(_non_string_key_findings(child, child_path, _depth + 1))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            child_path = f"{path}.{index}" if path else str(index)
+            findings.extend(_non_string_key_findings(child, child_path, _depth + 1))
+
+    return findings
+
+
 def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
     """Validate a frontmatter dict against the schema and CAO conventions.
 
-    Returns findings in a stable order: deprecated fields, then JSON-Schema
-    errors sorted by path, then ``allowedTools`` vocabulary warnings, then the
-    role check. An empty list means the profile is valid with no advisories.
+    Returns findings in a stable order: deprecated fields, then non-string
+    mapping keys, then JSON-Schema errors sorted by path, then ``allowedTools``
+    vocabulary warnings, then the role check. An empty list means the profile is
+    valid with no advisories.
     """
     messages: list[ValidationMessage] = []
 
@@ -92,7 +151,13 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
                 )
             )
 
-    # 2. JSON-Schema structural validation.
+    # 2. Non-string mapping keys, which JSON Schema cannot see. Reported before
+    #    the schema errors because a document with a non-string key is outside
+    #    the format entirely, and because the schema's own findings for such a
+    #    document tend to be confusing.
+    messages.extend(_non_string_key_findings(metadata))
+
+    # 3. JSON-Schema structural validation.
     #
     # The sort key stringifies each path component. Raw components are whatever
     # the document used as mapping keys, so a profile with mixed-type keys (for
@@ -105,7 +170,7 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
         path = ".".join(str(p) for p in error.absolute_path) or "(root)"
         messages.append(ValidationMessage("error", error.message, path))
 
-    # 3. allowedTools vocabulary check (advisory, not blocking).
+    # 4. allowedTools vocabulary check (advisory, not blocking).
     #
     # Each entry is type-checked before the membership test. ``_VALID_TOOL_VOCAB``
     # is a set, so ``tool not in`` hashes ``tool``, and an unhashable element
@@ -126,7 +191,7 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
                     )
                 )
 
-    # 4. Role check (advisory — custom roles are valid but worth flagging).
+    # 5. Role check (advisory — custom roles are valid but worth flagging).
     #
     # Same hashing hazard as above: ``role: [developer]`` is unhashable. The
     # schema reports the type error, so this advisory check simply stands aside.

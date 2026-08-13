@@ -1939,6 +1939,33 @@ async def get_agent_profile_schema_endpoint() -> Dict:
     return load_profile_schema()
 
 
+def _profile_write_rejection(message: str, findings: Sequence[Any] = ()) -> HTTPException:
+    """Build the one 400 a profile write route may return.
+
+    Every 400 from the profile write and source routes carries this shape,
+    ``{"message", "errors"}``, so a client parses one thing rather than switching
+    on ``type(detail)``. ``errors`` is empty for a failure that is not
+    attributable to a field, but the key is always present so a caller can
+    iterate it unconditionally.
+
+    Deliberately covers the service-raised ``InvalidProfileNameError`` paths too,
+    not only schema findings. An unsafe name is a rejected input just like a
+    schema violation, and returning a bare string for one and a dict for the
+    other reintroduces exactly the type-switching this removes. The 404 and 409
+    mappings keep FastAPI's conventional bare-string ``detail``: the status code
+    already tells a client what happened and there are no findings to attach.
+    """
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "message": message,
+            "errors": [
+                {"severity": f.severity, "message": f.message, "path": f.path} for f in findings
+            ],
+        },
+    )
+
+
 def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidationMessage]:
     """Validate a submitted profile document and enforce name identity.
 
@@ -1966,25 +1993,15 @@ def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidati
 
     Raises:
         HTTPException: 400 if the document is unparseable, carries an
-            error-severity finding, or declares a conflicting ``name``. Every
-            rejection uses the same ``detail`` shape, ``{"message", "errors"}``,
-            so a client parses one thing rather than switching on the type of
-            ``detail``. ``errors`` is empty for failures that are not per-field.
+            error-severity finding, or declares a conflicting ``name``. See
+            :func:`_profile_write_rejection` for the shared ``detail`` shape.
     """
     import frontmatter
 
     from cli_agent_orchestrator.services.profile_validator import validate_frontmatter
 
     def _reject(message: str, findings: Sequence[Any] = ()) -> None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "message": message,
-                "errors": [
-                    {"severity": f.severity, "message": f.message, "path": f.path} for f in findings
-                ],
-            },
-        )
+        raise _profile_write_rejection(message, findings)
 
     # Parsed once here, then handed to validate_frontmatter as metadata.
     # validate_profile_text would parse it again: its docstring exists precisely
@@ -2086,7 +2103,7 @@ async def create_agent_profile_endpoint(
     try:
         write_profile(request.name, request.content, overwrite=False)
     except InvalidProfileNameError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise _profile_write_rejection(str(exc))
     except ProfileExistsError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
@@ -2119,7 +2136,7 @@ async def replace_agent_profile_endpoint(
     try:
         replace_profile(name, request.content)
     except InvalidProfileNameError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise _profile_write_rejection(str(exc))
     except ProfileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
@@ -2159,7 +2176,7 @@ async def delete_agent_profile_endpoint(
     try:
         delete_profile(name)
     except InvalidProfileNameError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise _profile_write_rejection(str(exc))
     except ProfileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
@@ -2198,7 +2215,7 @@ async def get_agent_profile_source_endpoint(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise _profile_write_rejection(str(exc))
 
 
 @app.get("/agents/providers")
