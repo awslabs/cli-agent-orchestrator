@@ -307,6 +307,8 @@ def init_db() -> None:
     _migrate_workflow_run_indexes()
     _migrate_workflow_run_step()
     _migrate_workflow_outcome_indexes()
+    _migrate_workflow_run_event()
+    _migrate_workflow_run_seq()
     # Appended LAST (issue #511). Disjoint from the workflow_run* tables that
     # #504 also migrates, so registry order is immaterial — never reorder the
     # entries above.
@@ -780,6 +782,13 @@ def _migrate_workflow_run_step() -> None:
     indistinguishable from its pre-extension form (INV-1/INV-2); ``append_step``
     is the sole write path for the column (``update_step`` stays untouched — the
     fingerprint is set once, at the RUNNING insert).
+
+    U1 (issue #504, event-log substrate) additively appends three nullable
+    columns via the same PRAGMA-gated ``ALTER TABLE ADD COLUMN`` idiom:
+    ``terminal_id`` (associated terminal), ``reprompted`` (reprompt flag), and
+    ``error_kind`` (structured error kind). All default to ``NULL`` so a
+    pre-U1 row reads back observably identical to its pre-extension form
+    (additive-only, C-1/C-4). ``workflow_run`` itself is untouched.
     """
     import sqlite3
 
@@ -805,6 +814,21 @@ def _migrate_workflow_run_step() -> None:
                     "ALTER TABLE workflow_run_step ADD COLUMN call_fingerprint TEXT DEFAULT NULL"
                 )
                 logger.info("Migration: added call_fingerprint column to workflow_run_step")
+            if "terminal_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN terminal_id TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added terminal_id column to workflow_run_step")
+            if "reprompted" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN reprompted INTEGER DEFAULT NULL"
+                )
+                logger.info("Migration: added reprompted column to workflow_run_step")
+            if "error_kind" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN error_kind TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added error_kind column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
 
@@ -834,6 +858,90 @@ def _migrate_workflow_outcome_indexes() -> None:
             )
     except Exception as e:
         logger.debug(f"workflow_outcomes index migration skipped: {e}")
+
+
+def _migrate_workflow_run_event() -> None:
+    """Create the durable append-only ``workflow_run_event`` table if missing (issue #504, U1).
+
+    The event log root: one row per emitted workflow domain event, keyed by the
+    composite ``(run_id, seq)`` PRIMARY KEY (ADR-1, domain-entities). Per
+    NFR-DUR-1 this table is the authoritative, append-only, versioned record of
+    workflow execution — rows are inserted and never updated or reordered; ``seq``
+    (a per-run monotonically increasing sequence) is the SOLE ordering authority,
+    ``ts`` is display/duration only (BR-5). ``run_id``, ``seq``, ``event_type``,
+    ``event_schema_version`` (FR-1.1) and ``ts`` are NOT NULL; the remaining
+    columns are nullable and populated where applicable. ``iteration`` and
+    ``which_guard_fired`` are RESERVED for a later deterministic-loops feature
+    (FR-1.5) and stay NULL in the MVP.
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``), zero-arg and self-connecting —
+    mirrors ``_migrate_workflow_run`` (C-1/C-4, additive-only). Failure is logged
+    at debug and never propagated: a missing table is recoverable, the next
+    best-effort append retries the path.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_run_event ("
+                "run_id TEXT NOT NULL, "
+                "seq INTEGER NOT NULL, "
+                "event_type TEXT NOT NULL, "
+                "event_schema_version INTEGER NOT NULL, "
+                "ts TEXT NOT NULL, "
+                "step_id TEXT, "
+                "attempt INTEGER, "
+                "state TEXT, "
+                "elapsed_ms INTEGER, "
+                "provider TEXT, "
+                "agent_profile TEXT, "
+                "engine TEXT, "
+                "terminal_id TEXT, "
+                "terminal_offset_start INTEGER, "
+                "terminal_offset_len INTEGER, "
+                "error_kind TEXT, "
+                "reason TEXT, "
+                "validation_result TEXT, "
+                "output_ref TEXT, "
+                "iteration INTEGER, "
+                "which_guard_fired TEXT, "
+                "PRIMARY KEY (run_id, seq)"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        logger.debug(f"workflow_run_event migration skipped: {e}")
+
+
+def _migrate_workflow_run_seq() -> None:
+    """Create the durable ``workflow_run_seq`` high-water table if missing (issue #504, U1).
+
+    One row per run: ``high_water`` records the highest per-run ``seq`` ever
+    ALLOCATED (best-effort persisted before the matching event append), so a
+    rebuild can resume strictly above any allocated slot even when its append was
+    swallowed (BR-3). ``high_water`` advances monotonically (BR-11) and is NOT
+    NULL; ``run_id`` is the PRIMARY KEY.
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``), zero-arg and self-connecting —
+    same additive-only posture as ``_migrate_workflow_run_event``. Failure is
+    logged at debug and never propagated.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_run_seq ("
+                "run_id TEXT PRIMARY KEY, "
+                "high_water INTEGER NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        logger.debug(f"workflow_run_seq migration skipped: {e}")
 
 
 def _migrate_workflow_run_indexes() -> None:

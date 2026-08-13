@@ -361,18 +361,29 @@ def test_submit_202_shape_and_unconditional_links(client, async_yaml_env):
     assert links["status"] == "/workflows/runs/async-1"
 
 
-def test_submit_omits_events_link_when_route_absent(client, async_yaml_env):
-    """CD-1: with no events route registered (this branch's actual state), the 202
-    body carries NO ``events`` role — a ``links`` map is a capability advertisement,
-    and an advertised role that 404s is worse than an absent one.
+def test_submit_omits_events_link_when_route_absent(client, async_yaml_env, monkeypatch):
+    """CD-1: when the events route is NOT served, the 202 body carries NO ``events``
+    role — a ``links`` map is a capability advertisement, and an advertised role that
+    404s is worse than an absent one.
+
+    POST-#504-MERGE: this branch now DOES serve ``/workflows/runs/{run_id}/events``,
+    so the absent-route direction can no longer be observed by asserting on the real
+    route table (its precondition ``not _events_route_registered()`` was true only
+    pre-merge). The absent direction still has to be covered — it is the behaviour
+    that fires on any build where the route is missing — so the predicate is forced
+    False here.
+
+    This is the ONE place stubbing the predicate is correct: the paired test below
+    proves ``_EVENTS_ROUTE_PATH`` really matches a route #504 declares, which is the
+    thing a stub would otherwise hide. Here we exercise ``_run_links``' branch, not
+    the predicate.
 
     MUTATION PROOF: make ``_run_links`` add ``events`` unconditionally and this goes
     RED.
     """
     from cli_agent_orchestrator.api import main as api_main
 
-    # Precondition: this build really does not serve the route (guards against the
-    # test passing for the wrong reason once #504 merges — see the paired test).
+    monkeypatch.setattr(api_main, "_events_route_registered", lambda: False)
     assert not api_main._events_route_registered()
 
     resp = client.post(
@@ -383,51 +394,41 @@ def test_submit_omits_events_link_when_route_absent(client, async_yaml_env):
 
 
 def test_submit_includes_events_link_when_route_registered(client, async_yaml_env):
-    """CD-1, the other direction: once the route IS served (post-#504-merge), the
+    """CD-1, the other direction: now that the route IS served (post-#504-merge), the
     link reappears with NO code change — the check reads the live route table.
 
-    This is what makes the conditional self-healing rather than a hard-coded
-    omission needing a follow-up edit at the rebase.
+    That is what made the conditional self-healing rather than a hard-coded omission
+    needing a follow-up edit at the rebase, and this run is the proof: the ``events``
+    role below is produced by the SHIPPED predicate seeing #504's REAL route.
 
-    Registers a REAL route on the app and lets the SHIPPED predicate decide, rather
-    than monkeypatching ``_events_route_registered`` to True. Stubbing the predicate
-    would make this test pass even if ``_EVENTS_ROUTE_PATH`` did not match any route
-    #504 actually declares — the exact condition that must hold at the rebase, and
-    the one thing this test exists to prove. Proven necessary: corrupting
-    ``_EVENTS_ROUTE_PATH`` to an unmatchable string left the stubbed version GREEN.
+    Pre-merge this test had to register a stand-in route, because the real one did not
+    exist yet; the stand-in was declared with a hard-coded literal path (never via
+    ``_EVENTS_ROUTE_PATH``) so that corrupting the constant could not leave it GREEN.
+    The stand-in is now DELETED rather than kept: asserting against the genuine route
+    is strictly stronger, and re-registering a duplicate path would shadow #504's real
+    handler for anything reached through the shared app. The constant-correctness check
+    survives below as the explicit route-table assertion — corrupting
+    ``_EVENTS_ROUTE_PATH`` to an unmatchable string still turns this RED.
     """
     from cli_agent_orchestrator.api import main as api_main
 
-    async def _stand_in_events_route(run_id: str):  # pragma: no cover - never called
-        return []
+    # #504's real route must be present in the live table at exactly the path the
+    # constant names. This is the assertion the stand-in used to stand in for.
+    assert api_main._EVENTS_ROUTE_PATH == "/workflows/runs/{run_id}/events"
+    assert any(
+        getattr(r, "path", None) == "/workflows/runs/{run_id}/events" for r in api_main.app.routes
+    ), "#504's events route is missing from the live route table"
+    assert api_main._events_route_registered(), (
+        "the shipped predicate must SEE a route registered at _EVENTS_ROUTE_PATH "
+        "— if this fails, the path constant does not match a real route shape"
+    )
 
-    # The path is written as a LITERAL, deliberately NOT via _EVENTS_ROUTE_PATH: this
-    # is the contract with #504's route (its api/main.py declares exactly
-    # "/workflows/runs/{run_id}/events"). Registering via the constant would make the
-    # test move in lockstep with the constant, so corrupting the constant would leave
-    # this GREEN — which is exactly what happened on the first attempt. Hard-coding
-    # the real path is what makes the constant's correctness testable at all.
-    api_main.app.get("/workflows/runs/{run_id}/events")(_stand_in_events_route)
-    try:
-        assert api_main._events_route_registered(), (
-            "the shipped predicate must SEE a route registered at _EVENTS_ROUTE_PATH "
-            "— if this fails, the path constant does not match a real route shape"
-        )
-        resp = client.post(
-            "/workflows/runs:submit",
-            json={"name_or_path": "wf", "inputs": {}, "run_id": "async-ev"},
-        )
-        assert resp.status_code == 202
-        assert resp.json()["links"]["events"] == "/workflows/runs/async-ev/events"
-    finally:
-        api_main.app.routes[:] = [
-            r
-            for r in api_main.app.routes
-            if getattr(r, "endpoint", None) is not _stand_in_events_route
-        ]
-    # Post-cleanup: the app is back to having no events route, so this test cannot
-    # leak a registered route into any later test's view of the route table.
-    assert not api_main._events_route_registered()
+    resp = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "wf", "inputs": {}, "run_id": "async-ev"},
+    )
+    assert resp.status_code == 202
+    assert resp.json()["links"]["events"] == "/workflows/runs/async-ev/events"
 
 
 def test_submit_run_id_allocated_before_ack(client, async_yaml_env):
@@ -1592,25 +1593,44 @@ def test_resolve_error_kind_column_first_precedence_when_present():
     assert _resolve_error_kind(_FakeRow(RunState.FAILED.value), inferred_steps) == "error"
 
 
-def test_durable_error_kind_inert_on_real_steprow_today():
-    """U9 (#504-rebase guard): today's ``StepRow`` has NO ``error_kind`` attribute,
-    so ``_durable_error_kind`` is INERT (returns None) and the inference floor is in
-    force. This pins the pre-rebase behavior; it flips to column-first the moment
-    #504's column + ``StepRow`` field land, with no call-site change (RP-5)."""
+def test_durable_error_kind_is_column_first_after_504_merge():
+    """U9 (RP-1/RP-5), FLIPPED at the #504 merge as its own docstring predicted.
+
+    Pre-merge this test pinned the inert direction: ``StepRow`` had no
+    ``error_kind`` attribute, so ``_durable_error_kind`` returned None and the
+    inference floor was in force. Issue #504 landed the durable
+    ``workflow_run_step.error_kind`` column AND surfaced it on ``StepRow``, so the
+    ``getattr`` in ``_durable_error_kind`` now activates — exactly the "no call-site
+    change" swap RP-5 designed for. Both directions are asserted so the helper
+    cannot silently regress to inert:
+
+    - a row carrying a durable kind resolves to THAT kind (column-first), and
+    - a row whose durable column is NULL still yields None, leaving the inference
+      floor in force for pre-U1 rows (RP-2).
+    """
     from cli_agent_orchestrator.api.main import _durable_error_kind
     from cli_agent_orchestrator.services.workflow_journal import StepRow
 
-    row = StepRow(
-        run_id="r",
-        step_id="s1",
-        state="failed",
-        attempts=1,
-        output_json=None,
-        error="boom",
-        updated_at="t",
-    )
-    assert not hasattr(row, "error_kind")
-    assert _durable_error_kind([row]) is None
+    def _row(**kw):
+        return StepRow(
+            run_id="r",
+            step_id="s1",
+            state="failed",
+            attempts=1,
+            output_json=None,
+            error="boom",
+            updated_at="t",
+            **kw,
+        )
+
+    # The field now EXISTS — this is the post-#504 half of the flip.
+    assert hasattr(_row(), "error_kind")
+
+    # Column-first: a durable kind is authoritative.
+    assert _durable_error_kind([_row(error_kind="provider_error")]) == "provider_error"
+
+    # NULL column -> still None, so inference remains the floor (RP-2).
+    assert _durable_error_kind([_row(error_kind=None)]) is None
 
 
 def test_failure_envelope_assembled_for_failed_run_from_journal(client, read_surface_db):
@@ -1684,7 +1704,15 @@ def test_completed_run_result_has_no_failure_envelope(client, read_surface_db):
 def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
     """U9-T7 (EF-5): the envelope is a presentation projection — U9 introduces NO
     migration. The ``workflow_run_step`` column set is unchanged after a failed run's
-    result is assembled (the envelope never writes a column)."""
+    result is assembled (the envelope never writes a column).
+
+    The expected set below gained ``terminal_id``/``reprompted``/``error_kind`` at the
+    #504 merge: those three are #504's U1 additive columns, created by
+    ``_migrate_workflow_run_step`` at init_db time — NOT by envelope assembly. The
+    assertion still carries its full force, because what it guards is that assembling
+    an envelope adds no column: the set is captured AFTER the result call and must
+    equal the migrated schema exactly, so an envelope-driven write would still fail it.
+    """
     _seed_run(
         "nocol",
         RunState.FAILED.value,
@@ -1706,6 +1734,10 @@ def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
         "error",
         "updated_at",
         "call_fingerprint",
+        # #504 U1 additive columns (from the migration, not from the envelope).
+        "terminal_id",
+        "reprompted",
+        "error_kind",
     }
 
 

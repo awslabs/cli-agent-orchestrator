@@ -10,6 +10,7 @@ dist/
 # Testing
 .coverage
 coverage.json
+coverage.xml
 .pytest_cache/
 
 # MyPy

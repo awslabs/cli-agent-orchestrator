@@ -13,6 +13,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
     CodexProvider,
     ProviderError,
+    _find_response_marker,
     _has_startup_idle_composer,
     _toml_override,
     _toml_scalar,
@@ -1102,6 +1103,86 @@ class TestCodexProviderStatusDetection:
         assert status == TerminalStatus.COMPLETED
 
 
+class TestCodexRenderedScreenStatusDetection:
+    """Regression coverage for in-place Codex TUI redraws.
+
+    ``tmux pipe-pane`` is append-only: text erased from the visible terminal
+    remains in CAO's raw rolling buffer.  MCP startup uses the same spinner
+    shape as a live agent turn, so raw parsing can remain PROCESSING forever
+    after the visible screen has returned to the idle composer.
+    """
+
+    def test_provider_opts_into_rendered_screen_detection(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.supports_screen_detection is True
+
+    def test_blank_rendered_screen_is_unknown(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(["", "   "]) == TerminalStatus.UNKNOWN
+
+    def test_overwritten_mcp_startup_spinner_does_not_pin_processing(self):
+        import pyte
+
+        raw = (
+            "\x1b[1;1H• Starting MCP servers (0/3): cao-mcp-server"
+            " (0s • esc to interrupt)"
+            "\x1b[3;1H› Improve documentation in @filename"
+            "\x1b[5;1H  gpt-5.6-terra high · /tmp/project"
+            # Codex clears the transient activity row once MCP startup settles.
+            "\x1b[1;1H\x1b[2K"
+        )
+        screen = pyte.Screen(200, 20)
+        pyte.Stream(screen).feed(raw)
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        # Demonstrate the old failure mode: stripping cursor controls from the
+        # append-only stream leaves the erased spinner behind.
+        assert provider.get_status(raw) == TerminalStatus.PROCESSING
+        # The composited viewport contains only the live idle composer.
+        assert provider.get_status_from_screen(list(screen.display)) == TerminalStatus.IDLE
+
+    def test_live_mcp_startup_spinner_is_processing(self):
+        screen_lines = [
+            "• Starting MCP servers (1/3): cao-mcp-server (0s • esc to interrupt)",
+            "",
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("elapsed", ["1m 00s", "1h 00m 00s"])
+    def test_minute_plus_live_progress_is_processing(self, elapsed):
+        screen_lines = [
+            "› Implement the requested feature",
+            f"• Working ({elapsed} • esc to interrupt)",
+            "",
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+
+    def test_completed_turn_on_rendered_screen_is_completed(self):
+        screen_lines = [
+            "› Reply with the readiness token",
+            "• CAO_CODEX_READY",
+            "",
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.COMPLETED
+
+
 class TestCodexBulletFormatStatusDetection:
     """Tests for Codex's real interactive output format using › prompt and • bullets."""
 
@@ -1694,6 +1775,261 @@ class TestCodexBulletFormatExtraction:
         message = provider.extract_last_message_from_script(output)
 
         assert "Called attention to the import bug" in message
+
+    def test_extract_preserves_ambiguous_compact_bullet_group(self):
+        """Compact bullet groups are indistinguishable from a legitimate answer."""
+        output = (
+            "› fix the failing test\n"
+            "\n"
+            "• Explored src/providers\n"
+            "• Ran pytest -q\n"
+            "\n"
+            "• The bug is in the poll loop.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Explored src/providers" in message
+        assert "Ran pytest -q" in message
+        assert "The bug is in the poll loop" in message
+
+    def test_response_marker_returns_none_without_assistant_output(self):
+        """A user prompt without a response has no response marker."""
+        assert _find_response_marker("› still waiting") is None
+
+    def test_response_marker_handles_final_line_without_newline(self):
+        """A marker on the final line is detected without a trailing newline."""
+        marker = _find_response_marker("• Complete")
+
+        assert marker is not None
+        assert marker.group() == "•"
+
+    def test_extract_preserves_single_tree_formatted_bullet(self):
+        """One tree-formatted bullet can be a legitimate answer, so retain it."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored src/providers\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• The extraction starts at the wrong marker.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Explored src/providers" in message
+        assert "Read codex.py" in message
+        assert "The extraction starts at the wrong marker" in message
+
+    def test_extract_skips_multiple_blank_separated_activity_cells(self):
+        """The response starts after the last complete native activity cell."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ 170 passed\n"
+            "\n"
+            "• The bug is fixed.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "• The bug is fixed."
+
+    def test_extract_skips_activity_cells_before_prose_reply(self):
+        """A prose reply starts after the last complete native activity cell."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ 170 passed\n"
+            "\n"
+            "The bug is fixed.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "The bug is fixed."
+
+    def test_extract_skips_multiple_tree_rows_before_prose_reply(self):
+        """All tree rows in the final activity cell stay before the reply."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ pytest -q\n"
+            "  └ 170 passed\n"
+            "\n"
+            "All green.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "All green."
+
+    def test_extract_skips_indented_tree_output_before_prose_reply(self):
+        """Indented output belonging to the final tree row is not returned."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ 170 passed\n"
+            "    3 skipped\n"
+            "\n"
+            "All green.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "All green."
+
+    def test_extract_skips_three_activity_cells_before_prose_reply(self):
+        """All complete activity cells are removed before a prose reply."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Edited\n"
+            "  └ Updated codex.py\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ 170 passed\n"
+            "\n"
+            "The bug is fixed.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "The bug is fixed."
+
+    def test_extract_skips_interleaved_commentary_and_activity(self):
+        """Commentary between complete activity cells stays before the reply boundary."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "I will verify the focused behavior next.\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ 170 passed\n"
+            "\n"
+            "• The bug is fixed.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "• The bug is fixed."
+
+    def test_extract_preserves_two_consecutive_legitimate_answer_bullets(self):
+        """An ambiguous compact answer is preserved rather than truncated."""
+        output = (
+            "› summarize the fix\n"
+            "• Fixed parser\n"
+            "• Added regression tests\n"
+            "\n"
+            "• Verification: all tests pass\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Fixed parser" in message
+        assert "Added regression tests" in message
+        assert "Verification: all tests pass" in message
+
+    def test_extract_preserves_tree_formatted_legitimate_answer(self):
+        """One tree-formatted answer followed by another bullet is not activity."""
+        output = (
+            "› summarize the fix\n"
+            "• Files changed\n"
+            "  └ src/provider.py\n"
+            "\n"
+            "• Tests pass\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Files changed" in message
+        assert "src/provider.py" in message
+        assert "Tests pass" in message
+
+    def test_extract_does_not_count_mcp_tree_output_as_activity_cells(self):
+        """MCP output must not complete neighboring model-reply bullets."""
+        output = (
+            "› summarize the work\n"
+            "• First finding\n"
+            '• Called tools.inspect({"path":"src"})\n'
+            "  └ inspection result\n"
+            "\n"
+            "• Second finding\n"
+            '• Called tools.verify({"path":"test"})\n'
+            "  └ verification result\n"
+            "\n"
+            "• Conclusion\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "First finding" in message
+        assert "Second finding" in message
+        assert "Conclusion" in message
+
+    def test_extract_preserves_blank_separated_reply_bullets(self):
+        """A single reply bullet before a blank line is not an activity prelude."""
+        output = (
+            "› summarize the fix\n"
+            "• The parser now uses structural layout.\n"
+            "\n"
+            "• English verbs remain valid answer text.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "parser now uses structural layout" in message
+        assert "English verbs remain valid" in message
 
 
 class TestCodexV0111Extraction:
