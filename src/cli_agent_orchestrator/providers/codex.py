@@ -325,6 +325,63 @@ def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     return None
 
 
+def _find_response_marker(text: str) -> Optional[re.Match[str]]:
+    """Find the first model-reply marker after a structural activity prelude.
+
+    Native Codex activity cells have a ``•`` summary followed by a ``└`` tree
+    continuation.  Require at least two complete cells before advancing the
+    response boundary: a single tree-formatted group may be a legitimate
+    answer, while two consecutive cells are strong evidence of TUI activity.
+    Compact bullet groups remain ambiguous and are preserved.  This trades a
+    rare false positive for avoiding silent truncation of ordinary replies and
+    deliberately avoids matching English verbs such as ``Read`` or ``Called``.
+    """
+
+    def line_end(start: int) -> int:
+        newline = text.find("\n", start)
+        return len(text) if newline == -1 else newline
+
+    matches = []
+    for match in re.finditer(ASSISTANT_PREFIX_PATTERN, text, re.IGNORECASE | re.MULTILINE):
+        if not re.match(MCP_TOOL_CALL_PATTERN, text[match.start() : line_end(match.start())]):
+            matches.append(match)
+
+    if not matches:
+        return None
+
+    complete_cells = []
+    prose_start = None
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        cell_tail = text[line_end(match.start()) : next_start]
+        continuation = re.search(r"^[^\S\n]*└[^\n]*(?:\n|$)", cell_tail, re.MULTILINE)
+        contains_mcp_call = re.search(MCP_TOOL_CALL_PATTERN, cell_tail, re.MULTILINE)
+        if continuation and not contains_mcp_call:
+            complete_cells.append(index)
+            if index == len(matches) - 1:
+                remaining = cell_tail[continuation.end() :]
+                separator = re.search(r"^[^\S\n]*\n", remaining, re.MULTILINE)
+                following = re.search(r"\S", remaining[separator.end() :]) if separator else None
+                if separator and following:
+                    candidate = (
+                        line_end(match.start())
+                        + continuation.end()
+                        + separator.end()
+                        + following.start()
+                    )
+                    if text[candidate] != "›":
+                        prose_start = candidate
+
+    if len(complete_cells) >= 2:
+        last_cell = complete_cells[-1]
+        if last_cell + 1 < len(matches):
+            return matches[last_cell + 1]
+        if prose_start is not None:
+            return re.compile("").match(text, prose_start)
+
+    return matches[0]
+
+
 class ProviderError(Exception):
     """Exception raised for provider-specific errors."""
 
@@ -956,12 +1013,10 @@ class CodexProvider(BaseProvider):
         if user_matches:
             last_user = user_matches[-1]
 
-            # Find the first assistant response marker (• or assistant:) after
-            # the user message, skipping "• Called <server>.<tool>(...)" MCP
-            # tool call markers — those are followed by tool output, not the
-            # model's reply. Anchoring on a tool call marker would pull tool
-            # output (e.g. skill body text) into the extracted response.
-            asst_after_user = _find_assistant_marker(clean_output[last_user.start() :])
+            # Extraction uses a stricter anchor than status detection: skip MCP
+            # calls and at least two complete native activity cells before the
+            # model's actual reply, while preserving ambiguous compact groups.
+            asst_after_user = _find_response_marker(clean_output[last_user.start() :])
 
             if asst_after_user:
                 response_start = last_user.start() + asst_after_user.start()
