@@ -18,6 +18,7 @@ describe('API wrapper', () => {
       status,
       statusText: status === 200 ? 'OK' : 'Error',
       json: () => Promise.resolve(data),
+      text: () => Promise.resolve(JSON.stringify(data)),
     })
   }
 

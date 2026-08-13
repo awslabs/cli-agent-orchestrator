@@ -11,6 +11,14 @@ U3 (issue #312, script-tier journal extension, C3) additively appends
 are updated to include them; the defaults (``tier='yaml'``, ``generation='1'``,
 ``call_fingerprint=NULL``) preserve a pre-U3/YAML row's observable shape
 (INV-1/INV-2).
+
+U1 (issue #504, event-log substrate) additively adds the append-only
+``workflow_run_event`` table (21 columns, PK ``(run_id, seq)``), the
+``workflow_run_seq`` high-water table, and three nullable
+``workflow_run_step`` columns (``terminal_id``/``reprompted``/``error_kind``).
+The tests below are EXTENDED (never deleted, C-1): the new tables get their own
+column-set assertions, the step-columns test gains the three additive columns,
+and the idempotency test exercises the two new migrators.
 """
 
 import sqlite3
@@ -20,7 +28,9 @@ import pytest
 
 from cli_agent_orchestrator.clients.database import (
     _migrate_workflow_run,
+    _migrate_workflow_run_event,
     _migrate_workflow_run_indexes,
+    _migrate_workflow_run_seq,
     _migrate_workflow_run_step,
 )
 
@@ -83,6 +93,8 @@ def test_workflow_run_no_loop_columns(patched_db):
 def test_workflow_run_step_columns(patched_db):
     _migrate_workflow_run_step()
     cols = _columns(patched_db, "workflow_run_step")
+    # U1 (issue #504) additively adds terminal_id / reprompted / error_kind, so
+    # they now belong in the column set alongside the U3 call_fingerprint.
     assert set(cols) == {
         "run_id",
         "step_id",
@@ -92,40 +104,116 @@ def test_workflow_run_step_columns(patched_db):
         "error",
         "updated_at",
         "call_fingerprint",
+        "terminal_id",
+        "reprompted",
+        "error_kind",
     }
     # Composite PRIMARY KEY (run_id, step_id): both carry pk>0.
     assert cols["run_id"][5] > 0
     assert cols["step_id"][5] > 0
-    # reprompted / terminal_id are deliberately NOT journaled (F3).
-    assert "reprompted" not in cols
-    assert "terminal_id" not in cols
     # U3 additive column (E2): defaults to NULL (INV-2). PRAGMA table_info reports
     # the literal default expression as the string "NULL", not Python None.
     assert cols["call_fingerprint"][4] == "NULL"
+    # U1 additive columns (issue #504): all three nullable, defaulting to NULL so
+    # a pre-U1 row reads back observably identical to its pre-extension shape.
+    assert cols["terminal_id"][3] == 0
+    assert cols["reprompted"][3] == 0
+    assert cols["error_kind"][3] == 0
+    assert cols["terminal_id"][4] == "NULL"
+    assert cols["reprompted"][4] == "NULL"
+    assert cols["error_kind"][4] == "NULL"
+
+
+def test_workflow_run_event_columns(patched_db):
+    # U1 (issue #504): the append-only event table carries the 21 ADR-1 columns,
+    # a composite PK (run_id, seq), and NOT NULL on the five required columns.
+    _migrate_workflow_run_event()
+    cols = _columns(patched_db, "workflow_run_event")
+    assert set(cols) == {
+        "run_id",
+        "seq",
+        "event_type",
+        "event_schema_version",
+        "ts",
+        "step_id",
+        "attempt",
+        "state",
+        "elapsed_ms",
+        "provider",
+        "agent_profile",
+        "engine",
+        "terminal_id",
+        "terminal_offset_start",
+        "terminal_offset_len",
+        "error_kind",
+        "reason",
+        "validation_result",
+        "output_ref",
+        "iteration",
+        "which_guard_fired",
+    }
+    # Composite PRIMARY KEY (run_id, seq): both carry pk>0.
+    assert cols["run_id"][5] > 0
+    assert cols["seq"][5] > 0
+    # The five required columns are NOT NULL; ts is display-only but still NN.
+    assert cols["run_id"][3] == 1
+    assert cols["seq"][3] == 1
+    assert cols["event_type"][3] == 1
+    assert cols["event_schema_version"][3] == 1
+    assert cols["ts"][3] == 1
+    # A representative optional column is nullable, and the RESERVED loop fields
+    # (FR-1.5) ship as columns but stay nullable (NULL in the MVP).
+    assert cols["step_id"][3] == 0
+    assert cols["iteration"][3] == 0
+    assert cols["which_guard_fired"][3] == 0
+
+
+def test_workflow_run_seq_columns(patched_db):
+    # U1 (issue #504): the high-water table keys on run_id with a NOT NULL
+    # high_water counter.
+    _migrate_workflow_run_seq()
+    cols = _columns(patched_db, "workflow_run_seq")
+    assert set(cols) == {"run_id", "high_water"}
+    assert cols["run_id"][5] == 1  # PRIMARY KEY
+    assert cols["high_water"][3] == 1  # NOT NULL
 
 
 def test_migrations_are_idempotent(patched_db):
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    _migrate_workflow_run_event()
+    _migrate_workflow_run_seq()
     with sqlite3.connect(str(patched_db)) as conn:
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, started_at) "
             "VALUES ('r1', 'wf', '{}', '{}', 'running', '2026-01-01T00:00:00Z')"
         )
+        conn.execute(
+            "INSERT INTO workflow_run_event "
+            "(run_id, seq, event_type, event_schema_version, ts) "
+            "VALUES ('r1', 1, 'run.started', 1, '2026-01-01T00:00:00Z')"
+        )
+        conn.execute("INSERT INTO workflow_run_seq (run_id, high_water) VALUES ('r1', 1)")
         conn.commit()
-    # Second run must NOT drop/recreate the table.
+    # Second run must NOT drop/recreate the tables (U1 event/seq migrators too).
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    _migrate_workflow_run_event()
+    _migrate_workflow_run_seq()
     with sqlite3.connect(str(patched_db)) as conn:
-        count = conn.execute("SELECT COUNT(*) FROM workflow_run").fetchone()[0]
-    assert count == 1
+        assert conn.execute("SELECT COUNT(*) FROM workflow_run").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM workflow_run_event").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM workflow_run_seq").fetchone()[0] == 1
 
 
 def test_zero_arg_callables(patched_db):
-    # NB-1: both migrators are zero-arg, self-connecting.
+    # NB-1: all migrators are zero-arg, self-connecting.
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    _migrate_workflow_run_event()
+    _migrate_workflow_run_seq()
+    _migrate_workflow_run_indexes()
 
 
 # ---------------------------------------------------------------------------

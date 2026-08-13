@@ -4,11 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
 ## [Unreleased]
 
 ### Fixed
 
 - tmux listing parse failures are retried once and reported as a distinct condition instead of surfacing as a bare `ValueError` that reads like "session not found" one layer up. libtmux 0.53.1+ zips `parse_output`'s fields with `strict=True`, so any short row (a pane or session vanishing mid-listing, or trailing fields tmux omits) raised `ValueError: zip() argument 2 is shorter than argument 1` — which propagated through `server.sessions`/`window.panes`, blocked launches outright, and left the pipe-liveness watchdog unable to tell a genuinely-gone session from a transient parse failure. Adds `TmuxLookupError` and routes the listing reads in `clients/tmux.py` through a single retry-and-classify wrapper; a failed `create_session` no longer leaves an orphaned tmux session that blocks relaunching the same name. Also caps `libtmux<0.53.1`, the last release that zips non-strict (caom-anv)
+- Codex handoff extraction now skips native TUI activity cells without relying on an English verb allowlist, including when the model's reply starts with prose (#545)
 
 ## [2.4.1] - 2026-08-04
 
@@ -39,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Validated by a 20-package controlled A/B experiment: +11 mean points on work items with headroom (6/6 wins, sign test p = 0.016), neutral at the ceiling — `docs/self-learning-validation.md`
 - `cao profile find <query>` CLI verb and `find_profiles` MCP tool for keyword/BM25 profile discovery over metadata (name, description, tags, capabilities); metadata-only, never exposes prompt bodies (#340)
 - Optional `capabilities` and `tags` arrays in the agent profile frontmatter schema (#340)
+- **Durable workflow run journal** — a workflow run's execution history now survives a server restart and is inspectable after the fact (#504):
+  - append-only `workflow_run_event` table with a per-run `seq` as the sole ordering authority; a swallowed append leaves a hole the read path DECLARES as a `GapMarker` (interior and trailing) rather than renumbering it away, so "nothing happened" is distinguishable from "an event was lost"
+  - read routes over the durable journal, all answered with no in-memory `run_registry` dependency: `GET /workflows/runs/{id}` (enriched inspect), `GET .../events` (ordered timeline), `GET .../compare?against=` (per-step comparison), `GET .../diagnostics` (troubleshooting bundle). All four require a `cao:read`/`cao:write`/`cao:admin` scope when auth is enabled
+  - SSE live-follow content-negotiated onto the same `.../events` path (`Accept: text/event-stream` or `?stream=true`): durable replay from a cursor, exact `Last-Event-ID` reconnect, and a terminal-state guard that closes an already-ended run instead of hanging the follower
+  - `GET /terminals/{id}/output/range` for byte-exact reads of a terminal's append-only log
+  - `DELETE /workflows/runs/{id}` (write/admin scope) removing a run and all its retained data, plus an age + run-count retention sweep at startup — `0` on either bound DISABLES that bound
+  - web: a run list / detail surface with event-timeline playback (transport + ARIA scrubber), declared-gap markers, and a terminal pane synced to the selected event
+  - output capture is OFF by default (metadata only); when enabled, retained text is size-capped and funnelled through the existing `audit_log` sanitizer. Four new `memory` settings — see [Configuration](docs/configuration.md#memory-memory)
 - **Asynchronous workflow-run lifecycle** — runs are now submittable without holding a connection open for their whole duration (#505):
   - `POST /workflows/runs:submit` acks `202 {run_id, state, links}` the instant the run is durably journaled, then drives it in a background task. The blocking `POST /workflows/runs` is retained and byte-compatible. `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`), and `GET /workflows/runs/{run_id}/result` returns the full retained result for a detached, in-flight, or post-restart run
   - four CLI verbs: `cao workflow runs` (list recorded runs), `wait` (follow an already-submitted run), `result` (full detail), `events` (live SSE progress); `run` now submits-and-follows by default, with `--detach` to submit and exit and `--wait` for the retained blocking path
@@ -121,7 +131,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - workflow: the background drive's FAILED backstop no longer overwrites an already-settled run (#505). It fired unconditionally on any exception, so a drive that raised *after* the engine journaled COMPLETED/CANCELLED — during post-settlement bookkeeping — rewrote that terminal state to FAILED, making the durable record misreport the run's outcome. The write is now a conditional `UPDATE ... WHERE state = 'running'` in the journal DAL (atomic, so no concurrent settle can interleave), covering both the `Exception` and `CancelledError` arms; a run that raises *before* settling still lands FAILED as before, so no run is left orphaned in `running`
 - workflow: `cao workflow events` closes its streamed SSE response on every exit path (#505). The follower breaks out of its loop on a terminal frame and abandons the generator on each reconnect, so without an explicit close the socket survived until garbage collection and a long follow with repeated reconnects accumulated live file descriptors. The equivalent MCP tool was already hardened
 - workflow: a caller-supplied `run_id` that loses a concurrent-submit race now returns `409` instead of `500` (#505). The uniqueness pre-check and the durable insert are not one atomic operation, so both submits can pass the pre-check; the loser's `IntegrityError` is now mapped to the same `409` the serialized case reports
-
 - profile store writes are now atomic and inter-process safe. Both store writes were previously bare `write_text` calls, so a concurrent `cao profile` write and a server-side write could interleave or leave a partial file. Adds `locked_atomic_write` to `utils/atomic_file.py` as the blind-write sibling of `locked_atomic_rewrite` (#492): it shares the same lock, temp file, fsync, mode preservation and `os.replace`, but skips the read, so a corrupt or non-UTF-8 file in the agent store can still be replaced by the install that would have repaired it instead of failing with `UnicodeDecodeError` (#543)
 - self-healing pipe-pane liveness watchdog for silently-stalled FIFO forwarding (fixes #388) (#397), including detection of a stall that settles into a new static frame before the next poll and of a pipe that never delivers a single byte from terminal creation (cold start, harness-control#93) — see `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` / `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` in `docs/configuration.md`
 - web: attach web terminals through the configured backend so herdr-backed terminals no longer fail to attach (#417)
