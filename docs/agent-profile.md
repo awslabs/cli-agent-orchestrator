@@ -65,6 +65,8 @@ portable and make profile listings useful.
 - `codexProfile` (string): named Codex configuration profile.
 - `codexConfig` (object): inline Codex configuration overrides.
 - `hermesProfile` (string): Hermes profile wrapper command.
+- `grokNativeWorkflows` (boolean): explicit Grok Build-native worker/workflow
+  opt-in; defaults to `false`.
 
 Provider support for pass-through fields differs. Use the focused guides for
 [Kiro CLI](kiro-cli.md), [Claude Code](claude-code.md),

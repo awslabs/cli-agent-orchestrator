@@ -209,6 +209,31 @@ def test_cleanup_provider_nonexistent_terminal():
     manager.cleanup_provider("nonexistent")
 
 
+def test_cleanup_provider_recovers_grok_home_after_restart():
+    """A restart leaves no provider map entry but terminal metadata survives."""
+    manager = ProviderManager()
+    cleanup_only_provider = MagicMock()
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.GROK_CLI.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "developer",
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.GrokCliProvider",
+            return_value=cleanup_only_provider,
+        ) as provider_cls,
+    ):
+        manager.cleanup_provider("restored-grok")
+
+    provider_cls.assert_called_once_with("restored-grok", "s1", "w1", "developer")
+    cleanup_only_provider.cleanup.assert_called_once()
+
+
 def test_list_providers():
     """Test list_providers returns correct mapping."""
     from cli_agent_orchestrator.providers.codex import CodexProvider

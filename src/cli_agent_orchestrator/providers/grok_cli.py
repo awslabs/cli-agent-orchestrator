@@ -23,8 +23,10 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -34,7 +36,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
-from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,14 @@ WAITING_USER_PATTERN = re.compile(
     r"Yes, proceed|No, reject \(type to add feedback\))",
     re.IGNORECASE,
 )
+# A fresh private GROK_HOME has no folder-trust decision.  This dialog would
+# grant project-local MCP, LSP, and hooks permission to run repository-defined
+# code, so it is not an ordinary picker CAO may auto-answer.
+DIRECTORY_TRUST_PATTERN = re.compile(
+    r"Do you trust the contents of this directory\?.*?"
+    r"Grok Build may run or modify contents in this directory",
+    re.IGNORECASE | re.DOTALL,
+)
 ERROR_PATTERN = re.compile(
     r"^(?:Error:|ERROR:|panic:|Traceback \(most recent call last\):|"
     r"Authentication failed|Failed to (?:start|connect|load)|"
@@ -88,6 +98,8 @@ ERROR_PATTERN = re.compile(
 
 _STATUS_TAIL_CHARS = 8192
 _COMPLETION_TO_READY_MAX_CHARS = 4096
+_HOME_PROCESS_TERM_GRACE_SECONDS = 1.0
+_HOME_PROCESS_KILL_GRACE_SECONDS = 1.0
 _TIMESTAMP_SUFFIX = re.compile(r"\s{2,}\d{1,2}:\d{2}\s+(?:AM|PM)\s*$", re.IGNORECASE)
 _THOUGHT_LINE = re.compile(r"^\s*◆\s+Thought\b", re.IGNORECASE)
 _TOOL_LINE = re.compile(r"^\s*┃")
@@ -127,8 +139,23 @@ class GrokCliProvider(BaseProvider):
         self._initialized = False
         self._turns = 0
         self._grok_home: Optional[Path] = None
+        # Keep the root used at prepare time so cleanup remains safe and
+        # testable if a caller relocates CAO_HOME_DIR between prepare/cleanup.
+        # A normal server process never changes that constant; restart recovery
+        # intentionally uses the current deterministic root instead.
+        self._grok_home_root: Optional[Path] = None
         self._awaiting_turn_activity = False
-        self._last_completion_fingerprint: Optional[str] = None
+        # The terminal screen can retain the previous completion after CAO has
+        # dispatched another prompt. Keep an identity for that completion and
+        # its position in a monotonic view of StatusMonitor's rolling stream.
+        # The raw buffer is bounded, so a buffer-relative offset must never be
+        # used as a completion identity: eviction shifts an old marker even
+        # when no new completion has happened.
+        self._last_completion_identity: Optional[str] = None
+        self._last_completion_stream_offset: Optional[int] = None
+        self._turn_activity_seen = False
+        self._last_status_buffer: Optional[str] = None
+        self._last_status_buffer_stream_start = 0
 
     @property
     def paste_enter_count(self) -> int:
@@ -177,7 +204,63 @@ class GrokCliProvider(BaseProvider):
     def _home_path(self) -> Path:
         digest = hashlib.sha256(self.terminal_id.encode("utf-8")).hexdigest()[:12]
         slug = re.sub(r"[^A-Za-z0-9_.-]", "_", self.terminal_id).strip("._") or "terminal"
-        return CAO_HOME_DIR / "grok" / "terminals" / f"{slug[:48]}-{digest}"
+        return self._managed_home_root() / f"{slug[:48]}-{digest}"
+
+    @staticmethod
+    def _managed_home_root() -> Path:
+        """Return the only directory containing CAO-owned Grok homes."""
+
+        return CAO_HOME_DIR / "grok" / "terminals"
+
+    def _is_managed_home(self, home: Path) -> bool:
+        """Return whether ``home`` is this terminal's deterministic home.
+
+        ``cleanup()`` is intentionally willing to run on a provider recreated
+        after a server restart, where ``_grok_home`` was never populated.  Do
+        not turn that recovery path into a general recursive-delete primitive:
+        the target must be exactly the deterministic child of CAO's managed
+        Grok terminal root, rather than merely somewhere below it.
+        """
+
+        expected = self._home_path()
+        current_root = self._managed_home_root()
+        if home == expected and home.parent == current_root:
+            root = current_root
+        # Tests and a deliberately relocated CAO home can prepare a terminal
+        # before the process-wide constant is changed.  Preserve that valid
+        # in-process lifecycle, but only for the exact private path prepared
+        # by this instance; restart recovery always takes the branch above.
+        elif (
+            home == self._grok_home
+            and self._grok_home_root is not None
+            and home.parent == self._grok_home_root
+            and home.name == expected.name
+        ):
+            root = self._grok_home_root
+        else:
+            return False
+
+        # ``Path`` equality is lexical.  An attacker-controlled symlink in the
+        # managed path (for example ``.../grok/terminals -> /tmp``) would still
+        # make the lexical check above pass, then cause ``rmtree(home)`` to
+        # delete outside CAO's state directory.  CAO_HOME_DIR is resolved at
+        # import in production, but inspect every managed ancestor as well so
+        # cleanup remains safe with a relocated/test home and if an ancestor is
+        # replaced between terminal creation and deletion.  The terminal home
+        # itself is intentionally excluded: it may be a symlink and is safe to
+        # unlink without following its target.
+        base = root.parent.parent
+        if root.name != "terminals" or root.parent.name != "grok":
+            return False
+        ancestors = (base, base / "grok", root)
+        try:
+            if any(ancestor.is_symlink() for ancestor in ancestors):
+                return False
+            # Defense in depth for platform-specific path normalization.  The
+            # parent must resolve to this exact non-symlink managed root.
+            return home.parent.resolve(strict=False) == root.resolve(strict=False)
+        except OSError:
+            return False
 
     @staticmethod
     def _server_dict(server: Any) -> dict[str, Any]:
@@ -200,6 +283,17 @@ class GrokCliProvider(BaseProvider):
             table = f"mcp_servers.{_toml_string(name)}"
             lines.extend(["", f"[{table}]"])
             if config.get("url"):
+                transport = config.get("type")
+                if transport is not None:
+                    if transport not in {"http", "sse"}:
+                        raise ProviderError(
+                            f"MCP server '{name}' has unsupported URL transport "
+                            f"{transport!r}; Grok supports 'http' and 'sse'"
+                        )
+                    # Grok defaults an untyped URL to HTTP.  SSE requires an
+                    # explicit type, so preserve the profile transport rather
+                    # than silently changing an SSE server into HTTP.
+                    lines.append(f"type = {_toml_string(transport)}")
                 lines.append(f"url = {_toml_string(config['url'])}")
             elif config.get("command"):
                 lines.append(f"command = {_toml_string(config['command'])}")
@@ -273,6 +367,7 @@ class GrokCliProvider(BaseProvider):
 
         self._atomic_write_private(home / "config.toml", self._render_mcp_config(mcp_servers))
         self._grok_home = home
+        self._grok_home_root = home.parent
         return home
 
     def _build_grok_command(self) -> str:
@@ -287,14 +382,25 @@ class GrokCliProvider(BaseProvider):
         mcp_servers = profile.mcpServers if profile is not None else None
         home = self._prepare_grok_home(mcp_servers)
 
+        # CAO owns child profiles, terminal accounting, callbacks, and tool
+        # boundaries. ``--no-subagents`` alone only blocks spawn_subagent;
+        # disable Grok's workflow and /goal engines too, because either can
+        # launch native workers outside CAO accounting. A profile must opt in
+        # explicitly; unrestricted allowedTools is a tool policy, not consent
+        # to bypass CAO orchestration.
+        native_workflows = bool(profile and profile.grokNativeWorkflows)
         command_parts = [
             "env",
             f"GROK_HOME={home}",
+            f"GROK_SUBAGENTS={int(native_workflows)}",
+            f"GROK_WORKFLOWS={int(native_workflows)}",
+            f"GROK_GOAL={int(native_workflows)}",
             binary,
             "--no-alt-screen",
             "--always-approve",
-            "--no-subagents",
         ]
+        if not native_workflows:
+            command_parts.append("--no-subagents")
 
         # Explicit launch/assign/handoff model wins, then profile model.
         model = self._model or (profile.model if profile is not None else None)
@@ -329,12 +435,7 @@ class GrokCliProvider(BaseProvider):
             await asyncio.to_thread(
                 get_backend().send_keys, self.session_name, self.window_name, command
             )
-            if not await wait_until_status(
-                self.terminal_id,
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=init_timeout,
-            ):
-                raise TimeoutError(f"Grok CLI initialization timed out after {init_timeout:g}s")
+            await self._wait_for_startup_ready(init_timeout)
 
             # Grok preserves an existing config mode. Repair defensively after
             # startup in case a future release rewrites it during migration.
@@ -348,6 +449,96 @@ class GrokCliProvider(BaseProvider):
             await asyncio.to_thread(self.cleanup)
             raise
 
+    async def _wait_for_startup_ready(self, timeout: float) -> None:
+        """Wait for the composer, failing explicitly rather than granting trust.
+
+        Selecting ``No`` at Grok's directory-trust dialog quits and selecting
+        ``Yes`` permits repository-controlled MCP/LSP/hooks under the terminal
+        user's privileges. CAO must do neither in an unattended launch.
+        """
+
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            output = status_monitor.get_buffer(self.terminal_id)
+            if DIRECTORY_TRUST_PATTERN.search(strip_terminal_escapes(output)):
+                raise ProviderError(
+                    "Grok Build is waiting for directory trust. CAO does not automatically "
+                    "trust repository-local MCP, LSP, or hooks. Review and remove the "
+                    "project-local configuration (for example .mcp.json or .grok/) before "
+                    "launching this CAO terminal."
+                )
+            if status_monitor.get_status(self.terminal_id) in {
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+            }:
+                return
+            await asyncio.sleep(1.0)
+
+        raise TimeoutError(f"Grok CLI initialization timed out after {timeout:g}s")
+
+    def _observe_status_buffer(self, output: str, *, at_rolling_capacity: bool) -> tuple[int, bool]:
+        """Return the monotonic stream start for a rolling normalized buffer.
+
+        StatusMonitor appends FIFO chunks and then retains only a suffix. Most
+        consecutive observations therefore either share a prefix (no eviction)
+        or a suffix/prefix overlap (eviction). Preserve that overlap to make a
+        completion position stable across buffer eviction. A short no-overlap
+        replacement is a rendered-test/snapshot discontinuity, not trustworthy
+        evidence of a new turn; a full rolling buffer with no overlap can only
+        happen after enough fresh output to evict the prior buffer and is safe
+        to advance as a new stream segment.
+        """
+
+        previous = self._last_status_buffer
+        if previous is None:
+            self._last_status_buffer = output
+            return self._last_status_buffer_stream_start, True
+        if output == previous:
+            return self._last_status_buffer_stream_start, True
+
+        if output.startswith(previous):
+            stream_start = self._last_status_buffer_stream_start
+            contiguous = True
+        else:
+            # Retaining an overlap is what lets a fixed-size StatusMonitor
+            # buffer slide without changing the absolute position of retained
+            # completion chrome. KMP finds the longest suffix/prefix overlap
+            # in linear time; a descending slice comparison becomes quadratic
+            # when a full 32 KiB buffer has no overlap.
+            sequence: list[object] = [*output, object(), *previous]
+            prefix = [0] * len(sequence)
+            for index in range(1, len(sequence)):
+                candidate = prefix[index - 1]
+                while candidate and sequence[index] != sequence[candidate]:
+                    candidate = prefix[candidate - 1]
+                if sequence[index] == sequence[candidate]:
+                    candidate += 1
+                prefix[index] = candidate
+            overlap = min(prefix[-1], len(previous), len(output))
+            if overlap:
+                stream_start = self._last_status_buffer_stream_start + len(previous) - overlap
+                contiguous = True
+            else:
+                if at_rolling_capacity:
+                    # A bounded FIFO buffer can lose every byte of its prior
+                    # view if one burst exceeds the cap. It is fresh output,
+                    # not a stale completion moved to a different offset.
+                    stream_start = self._last_status_buffer_stream_start + len(previous)
+                    contiguous = True
+                else:
+                    # Do not manufacture a new generation from a non-append
+                    # snapshot. This is especially important after a visible
+                    # processing frame, where an old completed screen may be
+                    # supplied again by a renderer.
+                    stream_start = self._last_status_buffer_stream_start
+                    contiguous = False
+
+        self._last_status_buffer = output
+        self._last_status_buffer_stream_start = stream_start
+        return stream_start, contiguous
+
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         native = self._resolve_native_status(output)
         if native is not None:
@@ -357,7 +548,18 @@ class GrokCliProvider(BaseProvider):
         if not output:
             return TerminalStatus.UNKNOWN
 
-        clean = strip_terminal_escapes(output)
+        # Completion positions below are measured in normalized terminal text,
+        # so observe the same representation.  The capacity check remains on
+        # raw bytes because StatusMonitor bounds the raw FIFO buffer before
+        # ``strip_terminal_escapes`` removes cursor-control sequences.
+        raw_output = output
+        clean = strip_terminal_escapes(raw_output)
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        stream_start, stream_contiguous = self._observe_status_buffer(
+            clean,
+            at_rolling_capacity=len(raw_output) >= get_server_settings()["state_buffer_max"],
+        )
         tail = clean[-_STATUS_TAIL_CHARS:]
 
         last_waiting = max(
@@ -425,6 +627,8 @@ class GrokCliProvider(BaseProvider):
             return TerminalStatus.WAITING_USER_ANSWER
 
         if last_processing > last_completion:
+            if self._awaiting_turn_activity:
+                self._turn_activity_seen = True
             return TerminalStatus.PROCESSING
 
         if last_error > max(last_completion, last_ready, last_processing):
@@ -433,20 +637,58 @@ class GrokCliProvider(BaseProvider):
         if last_ready >= 0:
             if last_completion >= 0 and self._turns > 0:
                 completion_match = completion_matches[-1]
-                query_matches = list(QUERY_PATTERN.finditer(tail[: completion_match.start()]))
-                turn_start = (
-                    query_matches[-1].start() if query_matches else completion_match.start()
-                )
+                completion_start = len(clean) - len(tail) + completion_match.start()
+                completion_end = len(clean) - len(tail) + completion_match.end()
+                completion_stream_offset = stream_start + completion_start
+                query_matches = list(QUERY_PATTERN.finditer(clean[:completion_start]))
+                turn_start = query_matches[-1].start() if query_matches else completion_start
                 fingerprint = hashlib.sha256(
-                    tail[turn_start : completion_match.end()].encode("utf-8")
+                    clean[turn_start:completion_end].encode("utf-8")
                 ).hexdigest()
+                same_completion = (
+                    self._last_completion_identity == fingerprint
+                    and self._last_completion_stream_offset == completion_stream_offset
+                )
+                if self._awaiting_turn_activity and same_completion:
+                    return TerminalStatus.PROCESSING
+
+                # A byte-identical completion can be legitimate on a new turn.
+                # Accept it only when its stable stream position has advanced.
+                # A short discontinuous snapshot has no such proof and must
+                # remain processing; otherwise a stale completion seen after a
+                # processing frame could complete the new task.
                 if (
                     self._awaiting_turn_activity
-                    and self._last_completion_fingerprint == fingerprint
+                    and self._last_completion_identity == fingerprint
+                    and (
+                        not stream_contiguous
+                        or self._last_completion_stream_offset is None
+                        or completion_stream_offset <= self._last_completion_stream_offset
+                    )
                 ):
                     return TerminalStatus.PROCESSING
+
+                # Before accepting a completion after dispatch, require a
+                # current-turn signal.  A live processing marker is the usual
+                # signal.  For very fast turns, the new query can be the first
+                # observable signal; use the full transcript rather than the
+                # 8 KiB status tail so long answers retain that evidence.
+                if (
+                    self._awaiting_turn_activity
+                    and self._last_completion_identity is not None
+                    and not self._turn_activity_seen
+                ):
+                    latest_query_start = query_matches[-1].start() if query_matches else None
+                    if (
+                        latest_query_start is None
+                        or self._last_completion_stream_offset is not None
+                        and stream_start + latest_query_start <= self._last_completion_stream_offset
+                    ):
+                        return TerminalStatus.PROCESSING
+                    self._turn_activity_seen = True
                 self._awaiting_turn_activity = False
-                self._last_completion_fingerprint = fingerprint
+                self._last_completion_identity = fingerprint
+                self._last_completion_stream_offset = completion_stream_offset
                 return TerminalStatus.COMPLETED
             # After dispatch, do not mistake the previous empty composer for
             # instant completion before Grok has rendered this turn.
@@ -504,21 +746,208 @@ class GrokCliProvider(BaseProvider):
     def exit_cli(self) -> str:
         return "/quit"
 
+    @staticmethod
+    def _pids_using_home(home: Path) -> Optional[set[int]]:
+        """Return same-user processes whose exact ``GROK_HOME`` is ``home``.
+
+        Grok 1.0.0 can leave its updater as an orphan after the tmux pane is
+        killed.  That process keeps writing into the private home, so deleting
+        the directory first merely lets it recreate a partial tree.  Inspect
+        the process environment rather than command lines: the exact,
+        deterministic home is the capability boundary and avoids touching a
+        user's ordinary Grok process.
+        """
+
+        current_pid = os.getpid()
+        pids: set[int] = set()
+        try:
+            entries = os.scandir("/proc")
+        except OSError as exc:
+            logger.warning("Cannot inspect /proc before cleaning Grok home %s: %s", home, exc)
+            # A failed inspection is not evidence of a CAO-owned process.  In
+            # particular, cleanup may run in the server process, so never
+            # synthesize and signal our own PID. Retain state for a later retry.
+            return None
+
+        with entries:
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                if pid == current_pid:
+                    continue
+                uses_home = GrokCliProvider._pid_uses_home(pid, home)
+                if uses_home is None:
+                    # We know this is a same-user candidate only after reading
+                    # its /proc metadata.  An unreadable environment is not
+                    # proof it is safe to delete beneath: retain the private
+                    # home until we can establish quiescence.
+                    return None
+                if uses_home:
+                    pids.add(pid)
+        return pids
+
+    @staticmethod
+    def _pid_uses_home(pid: int, home: Path) -> Optional[bool]:
+        """Check exact home ownership immediately before a signal.
+
+        A PID found by the initial scan can exit and be reused before cleanup
+        signals it. Re-reading same-user process metadata and its environment
+        prevents a signal from crossing that PID-reuse boundary. ``None`` is
+        uncertainty (for example a protected same-user environment), which is
+        deliberately fail-closed for private-home removal.
+        """
+
+        proc = Path("/proc") / str(pid)
+        try:
+            if proc.stat().st_uid != os.geteuid():
+                return False
+            executable = os.readlink(proc / "exe")
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        except (PermissionError, OSError):
+            # Cannot establish this process is a Grok candidate. Do not let an
+            # unrelated protected same-user service block cleanup; once an
+            # executable is known to be Grok, the environment read below is
+            # fail-closed instead.
+            return False
+
+        try:
+            # Avoid treating unrelated same-user services (which can protect
+            # their environment under Linux's ptrace policy) as Grok cleanup
+            # candidates. A Grok main process/updater always has ``grok`` in
+            # its executable basename. Its CAO MCP child is Python, so accept
+            # only its observed launcher shape: a native binary in argv[0],
+            # or a Python interpreter with the exact console-script path in
+            # argv[1]. Do not accept an arbitrary later argument/source string.
+            executable_name = Path(executable).name.lower()
+            is_grok = "grok" in executable_name
+            argv = [
+                argument for argument in (proc / "cmdline").read_bytes().split(b"\0") if argument
+            ]
+            argv0 = os.path.basename(argv[0]) if argv else b""
+            is_cao_mcp = (argv0 == b"cao-mcp-server" and executable_name == "cao-mcp-server") or (
+                len(argv) >= 2
+                and argv0.startswith(b"python")
+                and os.path.basename(argv[1]) == b"cao-mcp-server"
+            )
+            if not (is_grok or is_cao_mcp):
+                return False
+            environ = (proc / "environ").read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        except (PermissionError, OSError) as exc:
+            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
+            return None
+        expected = os.fsencode(f"GROK_HOME={home}")
+        return expected in environ.split(b"\0")
+
+    @classmethod
+    def _stop_home_processes(cls, home: Path) -> bool:
+        """Stop residual processes before removing a private Grok home.
+
+        The normal terminal path kills the tmux window first.  This additional
+        confirmation handles Grok's updater, which may have escaped that pane
+        process group.  On any uncertainty retain the private directory for a
+        later cleanup rather than racing a live process and leaking it again.
+        """
+
+        def stop(pids: set[int], sig: signal.Signals) -> bool:
+            delivered = True
+            for pid in pids:
+                uses_home = cls._pid_uses_home(pid, home)
+                if uses_home is None:
+                    delivered = False
+                    continue
+                if not uses_home:
+                    continue
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    continue
+                except OSError as exc:
+                    logger.warning("Cannot signal Grok-home process %s for %s: %s", pid, home, exc)
+                    delivered = False
+            return delivered
+
+        pids = cls._pids_using_home(home)
+        if pids is None:
+            return False
+        if not pids:
+            return True
+        logger.info("Stopping residual Grok processes %s before cleanup of %s", sorted(pids), home)
+        if not stop(pids, signal.SIGTERM):
+            return False
+
+        deadline = time.monotonic() + _HOME_PROCESS_TERM_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            remaining = cls._pids_using_home(home)
+            if remaining is None:
+                return False
+            if not remaining:
+                return True
+            time.sleep(0.05)
+
+        pids = cls._pids_using_home(home)
+        if pids is None:
+            return False
+        if not pids:
+            return True
+        logger.warning("Grok-home processes did not exit after SIGTERM: %s", sorted(pids))
+        if not stop(pids, signal.SIGKILL):
+            return False
+
+        deadline = time.monotonic() + _HOME_PROCESS_KILL_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            remaining = cls._pids_using_home(home)
+            if remaining is None:
+                return False
+            if not remaining:
+                return True
+            time.sleep(0.05)
+        remaining = cls._pids_using_home(home)
+        logger.warning(
+            "Retaining Grok home %s because processes remain alive or cannot be inspected: %s",
+            home,
+            sorted(remaining) if remaining is not None else "unknown",
+        )
+        return False
+
     def cleanup(self) -> None:
         self._initialized = False
-        home = self._grok_home
-        if home is None:
+        # The provider object is reconstructed after a cao-server restart, so
+        # `_grok_home` only describes the happy in-process lifecycle.  The
+        # terminal id deterministically identifies the CAO-owned directory and
+        # lets cleanup recover that state without persisting credentials.
+        home = self._grok_home or self._home_path()
+        if not self._is_managed_home(home):
+            logger.warning("Refusing to remove non-managed Grok home %s", home)
+            return
+        if not self._stop_home_processes(home):
+            # A later terminal deletion/retry can safely revisit the exact
+            # deterministic path.  Do not erase it while a process can still
+            # recreate private files after cleanup.
             return
         try:
-            shutil.rmtree(home)
+            # rmtree refuses a symlink root, which is safe but leaves the
+            # managed entry behind.  Removing the link itself never follows
+            # its target; this is also the same property that protects the
+            # auth.json symlink inside a normal managed home.
+            if home.is_symlink():
+                home.unlink()
+            else:
+                shutil.rmtree(home)
         except FileNotFoundError:
             self._grok_home = None
+            self._grok_home_root = None
         except OSError as exc:
             logger.warning("Failed to remove Grok home %s: %s", home, exc)
         else:
             self._grok_home = None
+            self._grok_home_root = None
 
     def mark_input_received(self) -> None:
         super().mark_input_received()
         self._turns += 1
         self._awaiting_turn_activity = True
+        self._turn_activity_seen = False

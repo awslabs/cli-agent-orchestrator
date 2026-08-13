@@ -101,3 +101,10 @@ class AgentProfile(BaseModel):
     # example one created by `hermes profile alias <profile>`). When omitted,
     # the Hermes provider launches the default `hermes` command.
     hermesProfile: Optional[str] = Field(default=None, min_length=1)
+
+    # Grok-only. Explicitly permits Grok's own subagents, workflows, and /goal
+    # engine in this CAO terminal. Omission remains ``None`` so existing profile
+    # API responses do not gain a new false-valued field; Grok resolves None as
+    # disabled because those workers are outside CAO's profile, callback, and
+    # terminal-accounting boundaries.
+    grokNativeWorkflows: Optional[bool] = None

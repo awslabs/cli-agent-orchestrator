@@ -233,6 +233,22 @@ class ProviderManager:
             if provider:
                 provider.cleanup()
                 logger.info(f"Cleaned up provider for terminal: {terminal_id}")
+                return
+
+            # Provider instances are in-memory only.  After cao-server
+            # restarts terminal deletion still has database metadata, but no
+            # provider map entry.  Grok has a deterministic, private on-disk
+            # home containing generated MCP config, so instantiate the small
+            # cleanup-only adapter rather than leaking that directory.
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata and metadata.get("provider") == ProviderType.GROK_CLI.value:
+                GrokCliProvider(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                ).cleanup()
+                logger.info("Cleaned up restored Grok provider for terminal: %s", terminal_id)
         except Exception as e:
             logger.error(f"Failed to cleanup provider for terminal {terminal_id}: {e}")
 

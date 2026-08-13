@@ -88,7 +88,8 @@ account.
 The command has this shape:
 
 ```text
-grok --no-alt-screen --always-approve --no-subagents \
+env GROK_SUBAGENTS=0 GROK_WORKFLOWS=0 GROK_GOAL=0 \
+  grok --no-alt-screen --always-approve --no-subagents \
   [--model MODEL] [--rules RULES] [--deny RULE ...]
 ```
 
@@ -97,9 +98,33 @@ grok --no-alt-screen --always-approve --no-subagents \
   unattended orchestration.
 - Native `--deny` rules still override auto-approval and provide hard tool
   restrictions.
-- `--no-subagents` prevents Grok-native workers from bypassing CAO roles,
-  permissions, callbacks, or terminal accounting.
+- `--no-subagents`, `GROK_SUBAGENTS=0`, `GROK_WORKFLOWS=0`, and
+  `GROK_GOAL=0` prevent Grok-native workers, workflows, and `/goal` from
+  bypassing CAO roles, permissions, callbacks, or terminal accounting. This
+  combination was verified against Grok Build 1.0.0; recheck it after a Grok
+  upgrade because these controls are not all shown by `grok --help`.
 - A single Enter submits bracketed-paste input. `/quit` exits the session.
+
+### Native workflow opt-in
+
+CAO-managed terminals disable Grok-native workers by default, including when
+`allowedTools: ["*"]` is used. Tool permission is not consent to bypass CAO's
+orchestration accounting. To intentionally let this specific Grok profile use
+native subagents, workflows, and `/goal`, set the typed profile field:
+
+```yaml
+---
+name: grok_experimental
+provider: grok_cli
+grokNativeWorkflows: true
+---
+```
+
+With this opt-in CAO launches Grok with `GROK_SUBAGENTS=1`,
+`GROK_WORKFLOWS=1`, and `GROK_GOAL=1`, and omits `--no-subagents`. CAO's MCP
+tools remain available to the top-level Grok session, but any Grok-native
+workers are outside CAO's profile selection, callback routing, and terminal
+accounting. Do not enable this setting where those CAO controls are required.
 
 The empty `❯` composer may remain visible while Grok is working. CAO therefore
 prioritizes current `Waiting for response…` and `Esc:cancel` markers over the
@@ -124,6 +149,13 @@ A newly isolated home can show Grok's `Help improve Grok` telemetry choice.
 The banner is non-blocking and is ignored by CAO's status and response
 extraction logic.
 
+CAO never automatically accepts Grok's directory-trust screen. Accepting it
+would enable project-local MCP, LSP, and hook configuration under the terminal
+user's privileges; selecting No quits Grok. If that screen is detected, CAO
+fails startup with an actionable error. Review and remove project-local
+configuration such as `.mcp.json` or `.grok/` before launching the CAO
+terminal, or use standalone Grok when you intentionally want to trust it.
+
 ## Tool Restrictions
 
 Grok is a hard-enforcement provider. CAO translates missing capabilities into
@@ -137,10 +169,12 @@ native Grok deny rules:
 | `fs_list` | `Grep`, `Glob` |
 | `web_fetch` | `WebFetch`, `WebSearch`, with web search disabled |
 
-`allowedTools: ["*"]` adds no restrictive deny rules. For a restricted role,
-deny rules are applied alongside `--always-approve`; auto-approval does not
-turn a denied tool back on. The provider also always passes `--no-subagents`
-to close the native-subagent escape path.
+`allowedTools: ["*"]` adds no restrictive deny rules. It does not enable
+Grok-native delegation: CAO keeps subagents, workflows, and `/goal` disabled
+unless a profile explicitly sets `grokNativeWorkflows: true`, so `assign` and
+`handoff` remain the accountable orchestration mechanisms by default. For a
+restricted role, deny rules are applied alongside `--always-approve`;
+auto-approval does not turn a denied tool back on.
 
 `@cao-mcp-server` follows CAO's current shared MCP limitation: it records the
 profile's orchestration intent, but individual MCP tools are not blocked at

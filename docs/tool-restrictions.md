@@ -282,11 +282,16 @@ copilot --allow-all --deny-tool shell --deny-tool write
 ```
 
 **Grok Build CLI** — Adds native `--deny` rules alongside auto-approval and
-disables Grok-native subagents:
+disables Grok-native worker routes by default:
 
 ```bash
-grok --always-approve --no-subagents --deny Bash --deny Edit --deny Write
+GROK_SUBAGENTS=0 GROK_WORKFLOWS=0 GROK_GOAL=0 \
+  grok --always-approve --no-subagents --deny Bash --deny Edit --deny Write
 ```
+
+Set `grokNativeWorkflows: true` in a Grok agent profile only when intentionally
+allowing Grok-native workers outside CAO's orchestration accounting. It is
+separate from `allowedTools`, including `allowedTools: ["*"]`.
 
 See the [Grok Build CLI provider guide](grok-cli.md#tool-restrictions) for the
 complete mapping and isolation behavior.

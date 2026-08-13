@@ -3,6 +3,7 @@
 import asyncio
 import os
 import shlex
+import signal
 import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,7 +12,12 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider, ProviderError
+from cli_agent_orchestrator.providers.grok_cli import (
+    DIRECTORY_TRUST_PATTERN,
+    GrokCliProvider,
+    ProviderError,
+)
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -36,6 +42,23 @@ def make_provider(
         allowed_tools,
         model,
         skill_prompt,
+    )
+
+
+def _completed_turn(query: str, response: str, *, raw: bool = False) -> str:
+    """Build a minimal Grok completion screen for status regressions."""
+
+    if raw:
+        return (
+            f"     ❯ {query}\n\n{response}\n\n"
+            "\x1b[38;6H\x1b[2mWorked for 2.0s\x1b[38;220H\x1b[22m"
+            "█                               █\x1b[49;22H"
+            "\x1b[1mCtrl+x\x1b[22m:shortcuts"
+        )
+    return (
+        f"     ❯ {query}\n\n{response}\n\n"
+        "     Worked for 2.0s\n\n"
+        "  Shift+Tab:mode  │  Ctrl+x:shortcuts"
     )
 
 
@@ -202,6 +225,87 @@ def test_stale_completion_guard_remains_armed_after_processing_frame():
     assert provider.get_status(first) == TerminalStatus.PROCESSING
 
 
+def test_previous_completion_before_new_turn_activity_stays_processing():
+    provider = make_provider()
+    completed = _completed_turn("first", "first response")
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.COMPLETED
+
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.PROCESSING
+
+
+def test_processing_then_stale_completion_then_new_completion():
+    provider = make_provider()
+    first = _completed_turn("first", "first response")
+    provider.mark_input_received()
+    assert provider.get_status(first) == TerminalStatus.COMPLETED
+
+    provider.mark_input_received()
+    assert provider.get_status("Waiting for response…\nEsc:cancel") == TerminalStatus.PROCESSING
+    assert provider.get_status(first) == TerminalStatus.PROCESSING
+    second = first + "\n" + _completed_turn("second", "second response")
+    assert provider.get_status(second) == TerminalStatus.COMPLETED
+
+
+def test_long_distinct_turns_with_identical_duration_complete():
+    provider = make_provider()
+    first = _completed_turn("first question", "a" * 9_100)
+    provider.mark_input_received()
+    assert provider.get_status(first) == TerminalStatus.COMPLETED
+
+    provider.mark_input_received()
+    second = first + "\n" + _completed_turn("second question", "b" * 9_100)
+    assert provider.get_status(second) == TerminalStatus.COMPLETED
+
+
+def test_identical_completion_marker_survives_rolling_buffer_eviction():
+    """A shifted stale marker must not pin a later long turn in PROCESSING."""
+
+    provider = make_provider()
+    buffer_limit = 1_024
+    first = _completed_turn("first question", "a" * (buffer_limit + 200))[-buffer_limit:]
+    second = _completed_turn("second question", "b" * (buffer_limit + 200))[-buffer_limit:]
+    # Both retained suffixes have lost their query/response identity; only the
+    # identical ``Worked for 2.0s`` completion chrome remains.
+    assert "first question" not in first
+    assert "second question" not in second
+
+    with patch(
+        "cli_agent_orchestrator.services.settings_service.get_server_settings",
+        return_value={"state_buffer_max": buffer_limit},
+    ):
+        provider.mark_input_received()
+        assert provider.get_status(first) == TerminalStatus.COMPLETED
+
+        provider.mark_input_received()
+        processing = (first + "\nWaiting for response…\nEsc:cancel")[-buffer_limit:]
+        assert provider.get_status(processing) == TerminalStatus.PROCESSING
+        assert provider.get_status(second) == TerminalStatus.COMPLETED
+
+
+def test_byte_identical_consecutive_turns_have_distinct_generations():
+    provider = make_provider()
+    completed = _completed_turn("repeat exactly", "same response")
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.COMPLETED
+
+    provider.mark_input_received()
+    assert provider.get_status(completed + "\n" + completed) == TerminalStatus.COMPLETED
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_long_turn_completion_uses_full_transcript_for_rendered_and_raw_output(raw):
+    provider = make_provider()
+    first = _completed_turn("first", "a" * 9_100, raw=raw)
+    provider.mark_input_received()
+    assert provider.get_status(first) == TerminalStatus.COMPLETED
+
+    provider.mark_input_received()
+    second = first + "\n" + _completed_turn("second", "b" * 9_100, raw=raw)
+    assert provider.get_status(second) == TerminalStatus.COMPLETED
+
+
 def test_extract_completed_response_preserves_markdown_and_code():
     response = make_provider().extract_last_message_from_script(
         load_fixture("grok_cli_completed.txt")
@@ -291,13 +395,59 @@ def test_build_command_required_flags_and_unrestricted_tools(tmp_path):
         ),
     ):
         parts = shlex.split(provider._build_grok_command())
-    assert parts[:3] == ["env", f"GROK_HOME={provider.grok_home}", "/opt/grok/bin/grok"]
+    assert parts[0] == "env"
+    assert f"GROK_HOME={provider.grok_home}" in parts
+    assert "/opt/grok/bin/grok" in parts
     assert "--no-alt-screen" in parts
     assert "--always-approve" in parts
     assert "--no-subagents" in parts
+    assert "GROK_SUBAGENTS=0" in parts
+    assert "GROK_WORKFLOWS=0" in parts
+    assert "GROK_GOAL=0" in parts
     assert "--deny" not in parts
     assert "--disable-web-search" not in parts
     provider.cleanup()
+
+
+def test_default_command_disables_every_native_worker_route(tmp_path):
+    provider = make_provider()
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+    ):
+        parts = shlex.split(provider._build_grok_command())
+    assert "--no-subagents" in parts
+    assert "GROK_SUBAGENTS=0" in parts
+    assert "GROK_WORKFLOWS=0" in parts
+    assert "GROK_GOAL=0" in parts
+    provider.cleanup()
+
+
+def test_profile_can_explicitly_enable_native_grok_workflows(tmp_path):
+    provider = make_provider(agent_profile="grok-native")
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+            return_value=_profile(grokNativeWorkflows=True),
+        ),
+    ):
+        parts = shlex.split(provider._build_grok_command())
+    assert "--no-subagents" not in parts
+    assert "GROK_SUBAGENTS=1" in parts
+    assert "GROK_WORKFLOWS=1" in parts
+    assert "GROK_GOAL=1" in parts
+    provider.cleanup()
+
+
+def test_directory_trust_fixture_is_recognized():
+    output = (
+        "Do you trust the contents of this directory?\n"
+        "Grok Build may run or modify contents in this directory, posing security risks.\n"
+        "Yes, proceed  y\nNo, quit  n"
+    )
+    assert DIRECTORY_TRUST_PATTERN.search(output)
 
 
 def test_build_command_model_precedence_rules_and_skill_prompt(tmp_path):
@@ -410,7 +560,12 @@ def test_private_home_and_atomic_mcp_config(tmp_path):
         },
         "remote": {
             "url": "https://mcp.example.invalid/mcp",
+            "type": "http",
             "headers": {"Authorization": "Bearer placeholder"},
+        },
+        "events": {
+            "url": "https://mcp.example.invalid/events",
+            "type": "sse",
         },
     }
     with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
@@ -426,6 +581,8 @@ def test_private_home_and_atomic_mcp_config(tmp_path):
     assert '"EXISTING" = "value"' in text
     assert "startup_timeout_sec = 321" in text
     assert "tool_timeout_sec = 321" in text
+    assert 'type = "http"\nurl = "https://mcp.example.invalid/mcp"' in text
+    assert 'type = "sse"\nurl = "https://mcp.example.invalid/events"' in text
     assert '[mcp_servers."remote".headers]' in text
     assert "grok mcp add" not in text
     provider.cleanup()
@@ -488,6 +645,89 @@ def test_cleanup_is_idempotent(tmp_path):
     assert provider.grok_home is None
 
 
+def test_cleanup_reconstructs_deterministic_home_after_restart(tmp_path):
+    original = make_provider(terminal_id="restored-terminal")
+    with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
+        home = original._prepare_grok_home(None)
+        restored = make_provider(terminal_id="restored-terminal")
+        assert restored.grok_home is None
+        restored.cleanup()
+    assert not home.exists()
+    assert restored.grok_home is None
+
+
+def test_cleanup_refuses_tampered_path_outside_managed_root(tmp_path):
+    provider = make_provider()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
+        provider._grok_home = outside
+        provider.cleanup()
+    assert outside.exists()
+
+
+def test_cleanup_unlinks_managed_home_symlink_without_following_target(tmp_path):
+    provider = make_provider()
+    target = tmp_path / "auth-source"
+    target.mkdir()
+    target_file = target / "keep.txt"
+    target_file.write_text("keep", encoding="utf-8")
+    with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
+        home = provider._home_path()
+        home.parent.mkdir(parents=True)
+        home.symlink_to(target, target_is_directory=True)
+        provider.cleanup()
+    assert not home.exists()
+    assert target_file.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("symlinked_ancestor", ["cao_home", "grok", "terminals"])
+def test_cleanup_refuses_symlinked_managed_ancestor(tmp_path, symlinked_ancestor):
+    """Never let a lexical CAO path escape through a symlinked ancestor."""
+
+    provider = make_provider(terminal_id=f"symlinked-{symlinked_ancestor}")
+    configured_home = tmp_path / "configured-cao-home"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    if symlinked_ancestor == "cao_home":
+        real_home = outside / "real-cao-home"
+        real_home.mkdir()
+        configured_home.symlink_to(real_home, target_is_directory=True)
+        managed_root = real_home / "grok" / "terminals"
+    elif symlinked_ancestor == "grok":
+        configured_home.mkdir()
+        grok_target = outside / "grok"
+        grok_target.mkdir()
+        (configured_home / "grok").symlink_to(grok_target, target_is_directory=True)
+        managed_root = grok_target / "terminals"
+    else:
+        (configured_home / "grok").mkdir(parents=True)
+        terminals_target = outside / "terminals"
+        terminals_target.mkdir()
+        (configured_home / "grok" / "terminals").symlink_to(
+            terminals_target, target_is_directory=True
+        )
+        managed_root = terminals_target
+
+    with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", configured_home):
+        escaped_home = managed_root / provider._home_path().name
+        escaped_home.mkdir(parents=True)
+        sentinel = escaped_home / "must-not-delete"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        provider.cleanup()
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_url_mcp_rejects_unknown_transport():
+    with pytest.raises(ProviderError, match="unsupported URL transport"):
+        make_provider()._render_mcp_config(
+            {"unknown": {"url": "https://mcp.example.invalid", "type": "websocket"}}
+        )
+
+
 def test_cleanup_failure_keeps_home_retryable(tmp_path):
     provider = make_provider()
     with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
@@ -501,6 +741,165 @@ def test_cleanup_failure_keeps_home_retryable(tmp_path):
     provider.cleanup()
     assert provider.grok_home is None
     assert not home.exists()
+
+
+def test_cleanup_stops_residual_process_before_removing_home(tmp_path):
+    provider = make_provider()
+    with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
+        home = provider._prepare_grok_home(None)
+        with (
+            patch.object(GrokCliProvider, "_pids_using_home", side_effect=[{12345}, set()]),
+            patch.object(GrokCliProvider, "_pid_uses_home", return_value=True),
+            patch("cli_agent_orchestrator.providers.grok_cli.os.kill") as kill,
+        ):
+            provider.cleanup()
+
+    kill.assert_called_once_with(12345, signal.SIGTERM)
+    assert not home.exists()
+
+
+def test_cleanup_retains_home_when_residual_process_cannot_stop(tmp_path):
+    provider = make_provider()
+    with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
+        home = provider._prepare_grok_home(None)
+        with patch.object(provider, "_stop_home_processes", return_value=False):
+            provider.cleanup()
+
+    assert home.exists()
+    assert provider.grok_home == home
+
+
+def test_cleanup_retains_home_when_process_scan_is_unavailable(tmp_path):
+    provider = make_provider()
+    with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
+        home = provider._prepare_grok_home(None)
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.grok_cli.os.scandir",
+                side_effect=OSError("blocked"),
+            ),
+            patch("cli_agent_orchestrator.providers.grok_cli.os.kill") as kill,
+            patch("cli_agent_orchestrator.providers.grok_cli.shutil.rmtree") as rmtree,
+        ):
+            provider.cleanup()
+
+    kill.assert_not_called()
+    rmtree.assert_not_called()
+    assert home.exists()
+    assert provider.grok_home == home
+
+
+def test_home_process_scan_fails_closed_for_unreadable_same_user_environment(tmp_path):
+    class Entry:
+        name = "987654"
+
+    class Entries:
+        def __enter__(self):
+            return [Entry()]
+
+        def __exit__(self, *_):
+            return False
+
+        def __iter__(self):
+            return iter([Entry()])
+
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.os.scandir", return_value=Entries()),
+        patch.object(GrokCliProvider, "_pid_uses_home", return_value=None),
+    ):
+        assert GrokCliProvider._pids_using_home(tmp_path) is None
+
+
+def test_home_process_stop_rechecks_home_before_signalling_reused_pid(tmp_path):
+    with (
+        patch.object(GrokCliProvider, "_pids_using_home", side_effect=[{12345}, set()]),
+        patch.object(GrokCliProvider, "_pid_uses_home", return_value=False),
+        patch("cli_agent_orchestrator.providers.grok_cli.os.kill") as kill,
+    ):
+        assert GrokCliProvider._stop_home_processes(tmp_path) is True
+
+    kill.assert_not_called()
+
+
+def test_home_process_recognizes_exact_cao_mcp_argv_with_private_home(tmp_path):
+    proc_stat = MagicMock()
+    proc_stat.st_uid = os.geteuid()
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.Path.stat", return_value=proc_stat),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.os.readlink", return_value="/usr/bin/python3"
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.Path.read_bytes",
+            side_effect=[
+                b"python3\0/usr/local/bin/cao-mcp-server\0",
+                f"GROK_HOME={tmp_path}\0".encode(),
+            ],
+        ),
+    ):
+        assert GrokCliProvider._pid_uses_home(12345, tmp_path) is True
+
+
+@pytest.mark.parametrize(
+    "cmdline",
+    [
+        b"python3\0/tmp/cao-mcp-server-evil\0",
+        b"python3\0-c\0cao-mcp-server\0",
+    ],
+)
+def test_home_process_rejects_nonexact_cao_mcp_argv_token(tmp_path, cmdline):
+    proc_stat = MagicMock()
+    proc_stat.st_uid = os.geteuid()
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.Path.stat", return_value=proc_stat),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.os.readlink", return_value="/usr/bin/python3"
+        ),
+        patch("cli_agent_orchestrator.providers.grok_cli.Path.read_bytes", return_value=cmdline),
+    ):
+        assert GrokCliProvider._pid_uses_home(12345, tmp_path) is False
+
+
+def test_home_process_rejects_arbitrary_python_even_with_matching_home(tmp_path):
+    proc_stat = MagicMock()
+    proc_stat.st_uid = os.geteuid()
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.Path.stat", return_value=proc_stat),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.os.readlink", return_value="/usr/bin/python3"
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.Path.read_bytes",
+            return_value=b"python3\0-c\0",
+        ),
+    ):
+        assert GrokCliProvider._pid_uses_home(12345, tmp_path) is False
+
+
+@pytest.mark.asyncio
+async def test_startup_trust_screen_fails_explicitly_without_auto_acceptance():
+    provider = make_provider()
+    trust_screen = (
+        "Do you trust the contents of this directory?\n"
+        "Grok Build may run or modify contents in this directory, posing security risks.\n"
+        "Yes, proceed  y\nNo, quit  n"
+    )
+    with (
+        patch.object(status_monitor, "get_buffer", return_value=trust_screen),
+        patch.object(status_monitor, "get_status"),
+    ):
+        with pytest.raises(ProviderError, match="does not automatically trust"):
+            await provider._wait_for_startup_ready(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_startup_ready_accepts_idle_status():
+    provider = make_provider()
+    with (
+        patch.object(status_monitor, "get_buffer", return_value="normal composer"),
+        patch.object(status_monitor, "get_status", return_value=TerminalStatus.IDLE),
+    ):
+        await provider._wait_for_startup_ready(timeout=1)
 
 
 @pytest.mark.asyncio
@@ -521,10 +920,7 @@ async def test_initialize_success_is_async_and_repairs_config_mode(tmp_path):
             "cli_agent_orchestrator.providers.grok_cli.wait_for_shell",
             new=AsyncMock(return_value=True),
         ),
-        patch(
-            "cli_agent_orchestrator.providers.grok_cli.wait_until_status",
-            new=AsyncMock(return_value=True),
-        ),
+        patch.object(provider, "_wait_for_startup_ready", new=AsyncMock()),
         patch("cli_agent_orchestrator.providers.grok_cli.get_backend", return_value=backend),
         patch("cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent"),
     ):
@@ -565,9 +961,10 @@ async def test_initialize_cli_timeout_removes_generated_home(tmp_path):
             "cli_agent_orchestrator.providers.grok_cli.wait_for_shell",
             new=AsyncMock(return_value=True),
         ),
-        patch(
-            "cli_agent_orchestrator.providers.grok_cli.wait_until_status",
-            new=AsyncMock(return_value=False),
+        patch.object(
+            provider,
+            "_wait_for_startup_ready",
+            new=AsyncMock(side_effect=TimeoutError("Grok CLI initialization timed out after 60s")),
         ),
         patch("cli_agent_orchestrator.providers.grok_cli.get_backend", return_value=backend),
         patch("cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent"),
@@ -597,9 +994,10 @@ async def test_initialize_failure_offloads_recursive_cleanup(tmp_path):
             "cli_agent_orchestrator.providers.grok_cli.wait_for_shell",
             new=AsyncMock(return_value=True),
         ),
-        patch(
-            "cli_agent_orchestrator.providers.grok_cli.wait_until_status",
-            new=AsyncMock(return_value=False),
+        patch.object(
+            provider,
+            "_wait_for_startup_ready",
+            new=AsyncMock(side_effect=TimeoutError("Grok CLI initialization timed out after 60s")),
         ),
         patch("cli_agent_orchestrator.providers.grok_cli.get_backend", return_value=backend),
         patch("cli_agent_orchestrator.providers.grok_cli.asyncio.to_thread", observing_to_thread),
