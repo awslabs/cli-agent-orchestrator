@@ -1088,6 +1088,19 @@ async def lifespan(app: FastAPI):
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
+    # Tmux panes intentionally survive API-process restarts. Recreate their
+    # FIFO readers and seed status before inbox reconciliation begins, otherwise
+    # pending worker callbacks can remain stranded behind UNKNOWN forever.
+    from cli_agent_orchestrator.services.terminal_service import (
+        recover_persisted_terminal_output_streams,
+    )
+
+    await asyncio.to_thread(recover_persisted_terminal_output_streams)
+    # Recovery publishes initial status before the consumer tasks get their first
+    # scheduling turn. Reconcile once here so a callback already pending at
+    # restart is not left waiting for the periodic sweep.
+    await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
+
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
     from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled
