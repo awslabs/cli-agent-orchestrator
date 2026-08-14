@@ -1,0 +1,81 @@
+# StatefulSet for CAO worker nodes.
+# Each pod = one CAO node (cao-server + tmux + agents). Workers are addressed
+# by stable DNS: cao-worker-{0..N-1}.cao-workers.cao.svc.cluster.local
+#
+# Why StatefulSet over Deployment:
+#   - Sessions are pinned to the pod that created them (stable addressing)
+#   - Predictable scale-down (highest ordinal first, supervisor can drain)
+#   - Enumerable fleet for MCP config rendering
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cao-worker
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-worker
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  serviceName: cao-workers
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-worker
+        app.kubernetes.io/part-of: cao-fleet
+    spec:
+      containers:
+        - name: cao-node
+          # TODO: Replace with your ECR image URI after push
+          image: 418295698799.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server:latest
+          ports:
+            - containerPort: 9889
+              name: http
+          env:
+            - name: CAO_BIND_HOST
+              value: "0.0.0.0"
+            - name: CAO_API_PORT
+              value: "9889"
+            # Each pod must accept requests addressed to its own DNS name.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CAO_ALLOWED_HOSTS
+              value: "$(POD_NAME).cao-workers,$(POD_NAME).cao-workers.cao-cluster.svc.cluster.local,localhost"
+            # Install profiles on startup
+            - name: CAO_INSTALL_PROFILES
+              value: "code_supervisor:mock_cli"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          volumeMounts:
+            - name: cao-state
+              mountPath: /home/cao/.cao
+      volumes:
+        - name: cao-state
+          emptyDir: {}

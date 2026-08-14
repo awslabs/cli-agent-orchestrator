@@ -1,0 +1,86 @@
+# Fleet Panel Deployment — web UI for observing and controlling the fleet.
+# Connects to all CAO nodes (supervisor + workers) via their service DNS names.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cao-fleet-panel
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-fleet-panel
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-fleet-panel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-fleet-panel
+        app.kubernetes.io/part-of: cao-fleet
+    spec:
+      containers:
+        - name: fleet-panel
+          image: 418295698799.dkr.ecr.ap-southeast-2.amazonaws.com/cao-fleet-panel:latest
+          ports:
+            - containerPort: 9888
+              name: http
+          env:
+            - name: CAO_PANEL_HOST
+              value: "0.0.0.0"
+            - name: CAO_PANEL_PORT
+              value: "9888"
+            # Mount the fleet config as a volume (ConfigMap)
+            - name: CAO_FLEET_CONFIG
+              value: "/config/fleet.json"
+            # Optional: set a shared token for panel auth
+            # - name: CAO_PANEL_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: cao-panel-secret
+            #       key: token
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /api/fleet
+              port: 9888
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/fleet
+              port: 9888
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: fleet-config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: fleet-config
+          configMap:
+            name: cao-fleet-config
+---
+# Service for the fleet panel (LoadBalancer for external access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-fleet-panel
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-fleet-panel
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: cao-fleet-panel
+  ports:
+    - name: http
+      port: 9888
+      targetPort: 9888

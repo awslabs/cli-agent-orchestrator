@@ -1,0 +1,54 @@
+# NetworkPolicy — restrict access to worker pods' port 9889.
+# Only the supervisor and fleet panel pods can reach workers.
+# This is critical: cao-server is an unauthenticated command-execution surface;
+# NetworkPolicy is the minimum trust boundary in k8s.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-worker-ingress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Allow supervisor to reach workers
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-supervisor
+        # Allow fleet panel to reach workers (for live console/health)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-fleet-panel
+      ports:
+        - port: 9889
+          protocol: TCP
+---
+# NetworkPolicy — restrict access to supervisor pod.
+# Only fleet panel can reach it externally within the namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-supervisor-ingress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-supervisor
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-fleet-panel
+      ports:
+        - port: 9889
+          protocol: TCP
