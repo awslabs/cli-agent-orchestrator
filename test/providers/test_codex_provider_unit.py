@@ -688,6 +688,24 @@ class TestCodexProviderCodexProfile:
         assert "CAO_TERMINAL_ID" in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_profile_yolo_composes_with_codex_profile(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = "chatgpt_web"
+        mock_profile.yolo = True
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider(
+            "tid", "sess", "win", "agent", allowed_tools=["fs_read", "fs_list"]
+        )
+        command = provider._build_codex_command()
+
+        assert "--profile chatgpt_web" in command
+        assert "--yolo" in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_yolo_overrides_codex_profile(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -700,7 +718,7 @@ class TestCodexProviderCodexProfile:
         command = provider._build_codex_command()
 
         assert "--yolo" in command
-        assert "--profile" not in command
+        assert "--profile cao_reviewer" in command
 
 
 class TestTomlScalar:

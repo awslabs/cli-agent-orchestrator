@@ -450,10 +450,10 @@ class CodexProvider(BaseProvider):
         # where approval prompts would block handoff/assign. Profiles can
         # opt out via `codexProfile` (names a [profiles.<name>] block in
         # ~/.codex/config.toml), unless unrestricted allowed tools are enabled.
-        # In practice, allowed_tools containing "*" is treated as yolo mode
-        # and overrides codexProfile in the same way as an explicit yolo launch.
-        yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
-
+        # Unrestricted mode can come from runtime allowed_tools or explicitly
+        # from the profile. A profile-level yolo composes with codexProfile so
+        # subscription/auth routing is preserved while approvals/sandbox are
+        # bypassed.
         profile = None
         if self._agent_profile is not None:
             try:
@@ -461,10 +461,14 @@ class CodexProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-        if profile and profile.codexProfile and not yolo:
-            command_parts = ["codex", "--profile", profile.codexProfile]
-        else:
-            command_parts = ["codex", "--yolo"]
+        profile_yolo = getattr(profile, "yolo", False) is True if profile else False
+        yolo = bool(self._allowed_tools and "*" in self._allowed_tools) or profile_yolo
+
+        command_parts = ["codex"]
+        if profile and profile.codexProfile:
+            command_parts.extend(["--profile", profile.codexProfile])
+        if yolo or not (profile and profile.codexProfile):
+            command_parts.append("--yolo")
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
         # self._model is an explicit per-call override (handoff/assign's own
@@ -486,7 +490,7 @@ class CodexProvider(BaseProvider):
             # Prepend security constraints for soft enforcement (Codex has no
             # native tool restriction mechanism). Only applied when tool
             # restrictions are active (not unrestricted "*").
-            if self._allowed_tools and "*" not in self._allowed_tools:
+            if not yolo and self._allowed_tools and "*" not in self._allowed_tools:
                 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 
                 tools_list = ", ".join(self._allowed_tools)
