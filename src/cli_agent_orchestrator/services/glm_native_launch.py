@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-GLM_MODEL_ALLOWLIST = frozenset({"glm-5.2", "glm-5.2[1m]"})
+GLM_MODEL_ALLOWLIST = frozenset({"glm-5.3[1m]"})
 PROVIDER_ROUTE_ANTHROPIC = "anthropic"
 PROVIDER_ROUTE_GLM = "glm"
 PROVIDER_ROUTES = (PROVIDER_ROUTE_ANTHROPIC, PROVIDER_ROUTE_GLM)
