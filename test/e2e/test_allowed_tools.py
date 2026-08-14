@@ -177,9 +177,10 @@ def _grok_restricted_diagnostics(
     """Return evidence needed to diagnose a Grok native-permission escape.
 
     This is intentionally evaluated only after the filesystem ground-truth
-    assertion fails.  It retains the raw TUI screen, exact launched argv, and
-    any CAO-created child terminals in pytest's failure report without logging
-    Grok's environment (which can contain credential-bearing paths).
+    assertion fails.  It records only policy-relevant process arguments and
+    aggregate TUI indicators: raw argv, the TUI transcript, and environment
+    are deliberately excluded because they can contain profile prompts,
+    filesystem paths, or credentials.
     """
     try:
         terminal = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=10).json()
@@ -218,7 +219,37 @@ def _grok_restricted_diagnostics(
             root = psutil.Process(int(pane_pid))
             for process in [root, *root.children(recursive=True)]:
                 with process.oneshot():
-                    processes.append({"pid": process.pid, "cmdline": process.cmdline()})
+                    cmdline = process.cmdline()
+                    policy_args = [
+                        argument
+                        for argument in cmdline
+                        if argument.startswith("--allow=") or argument.startswith("--deny=")
+                    ]
+                    for index, argument in enumerate(cmdline[:-1]):
+                        if argument in {"--allow", "--deny"}:
+                            policy_args.append(f"{argument} {cmdline[index + 1]}")
+                    processes.append(
+                        {
+                            "pid": process.pid,
+                            "name": process.name(),
+                            "policy_args": policy_args,
+                        }
+                    )
+
+        # A raw pane is model input/output and can contain the profile prompt.
+        # Keep bounded, boolean evidence useful to distinguish a direct Bash
+        # escape from a policy refusal without attaching that transcript.
+        normalized_pane = pane.stdout.lower()
+        pane_evidence = {
+            "captured_bytes": len(pane.stdout),
+            "mentions_bash": "bash" in normalized_pane,
+            "reports_bash_blocked": "bash was blocked by policy" in normalized_pane,
+            "mentions_permission_denied": "permission denied" in normalized_pane,
+            "mentions_child_assignment": any(
+                marker in normalized_pane
+                for marker in ("assigned", "handoff", "subagent", "worker")
+            ),
+        }
 
         return json.dumps(
             {
@@ -231,8 +262,8 @@ def _grok_restricted_diagnostics(
                 },
                 "new_child_terminals": child_terminals,
                 "pane_processes": processes,
-                "pane": pane.stdout[-24000:],
-                "pane_capture_error": pane.stderr,
+                "pane_evidence": pane_evidence,
+                "pane_capture_error": pane.stderr[-512:],
             },
             indent=2,
             default=str,
