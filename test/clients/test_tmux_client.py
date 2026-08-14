@@ -220,6 +220,31 @@ class TestCreateSessionEnvironmentFiltering:
         assert "RANDOM_VAR" not in env
         assert "MY_CUSTOM_THING" not in env
 
+    def test_pi_config_dir_reaches_initial_session_and_worker_window(self, tmux, tmp_path):
+        """Pi workers need the caller's private config directory after HOME isolation."""
+        initial_window = MagicMock()
+        initial_window.name = "supervisor"
+        session = MagicMock()
+        session.windows = [initial_window]
+        worker_window = MagicMock()
+        worker_window.name = "developer"
+        session.new_window.return_value = worker_window
+        tmux.server.new_session.return_value = session
+        tmux.server.sessions.get.return_value = session
+
+        with patch.dict(
+            os.environ,
+            {"HOME": "/isolated/home", "PI_CODING_AGENT_DIR": "/private/pi-agent"},
+            clear=True,
+        ):
+            tmux.create_session("cao-pi", "supervisor", "supervisor-id", str(tmp_path))
+            tmux.create_window("cao-pi", "developer", "developer-id", str(tmp_path))
+
+        session_env = tmux.server.new_session.call_args.kwargs["environment"]
+        worker_env = session.new_window.call_args.kwargs["environment"]
+        assert session_env["PI_CODING_AGENT_DIR"] == "/private/pi-agent"
+        assert worker_env["PI_CODING_AGENT_DIR"] == "/private/pi-agent"
+
 
 # ── create_window ────────────────────────────────────────────────────
 

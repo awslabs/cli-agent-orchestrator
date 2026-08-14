@@ -27,7 +27,10 @@ dependencies = [
     # internal (create_initialization_options); cap the major to avoid silent
     # breakage on a new major release. Tested against 3.x.
     "fastmcp>=2.14.0,<4.0.0",
-    "mcp>=1.23.0",
+    # Upper bound: providers/pi_mcp_proxy.py must correlate bridge tasks with
+    # MCP's private ClientSession._request_id. The real stdio cancellation test
+    # verifies 1.28.x; widen only after an explicit compatibility check.
+    "mcp>=1.28.1,<1.29.0",
     "pydantic>=2.10.6",
     "apscheduler>=3.10.4",
     "sqlalchemy>=2.0.0",

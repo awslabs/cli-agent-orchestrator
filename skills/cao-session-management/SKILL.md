@@ -28,6 +28,12 @@ Before launching a session, verify:
   ```
   If not running, start it in a separate terminal: `cao-server`.
 - **The agent profile is installed.** `cao launch --agents <profile>` fails if the profile is unknown. Install built-ins or custom files with `cao install <profile|path|url>`.
+- **The selected provider CLI is ready.** For Pi sessions, `pi` must be on the
+  `cao-server` process's `PATH` and already authenticated/model-configured. CAO
+  pins the resolved executable and does not directly write Pi credential or
+  configuration files or install Pi packages. Pi may still migrate or update
+  configuration or manage packages in its own agent directory during startup
+  and normal operation.
 
 ## Discovering Available Profiles
 
@@ -47,7 +53,7 @@ If unsure which profile to use, ask the user rather than guessing.
 
 ## Quick Example
 
-A complete, copy-pasteable supervisor launch. The default provider is `kiro_cli`; pass `--provider <name>` to use another (`claude_code`, `codex`, `antigravity_cli`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`).
+A complete, copy-pasteable supervisor launch. The default provider is `kiro_cli`; pass `--provider <name>` to use another (`claude_code`, `codex`, `antigravity_cli`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`, `hermes`, `pi`).
 
 This example assumes a configured CAO setup (server running, profiles installed). On an already-configured host you can skip straight to `cao launch`. The `cao install` lines below are only for first-time setup; remove them if your CAO is already configured.
 
@@ -94,6 +100,13 @@ cao launch --agents <profile> --headless --yolo \
 
 `--yolo` skips confirmation prompts. Required when launching from an agent — interactive
 prompts will stall the session.
+
+For Pi, CAO's `--headless` means "do not attach this caller"; Pi itself still
+runs its regular attachable TUI in the selected backend's window or pane. In an
+attached Pi TUI, `C-d` exits Pi; the explicit `run_agent_step` exit path uses
+that key too. Normal `cao shutdown` or terminal deletion instead terminates that
+window or pane without first sending Pi `C-d`. Generated `CAO_PI_*` variables
+are internal wiring and must not be set as user configuration.
 
 For SOP-driven workflows (Kiro provider): launch with `/prompts` to discover
 available SOPs, then send the matched SOP name prefixed with `@` (e.g.,

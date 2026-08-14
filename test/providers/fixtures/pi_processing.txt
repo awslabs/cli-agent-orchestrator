@@ -1,0 +1,12 @@
+ pi v0.84.1
+ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+
+ Summarize the provider state.
+
+ Working... (escape to interrupt)
+
+────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────
+~/work/project (feat/pi-provider)
+0.1%/400k (auto)                                      (openai) gpt-5 • high

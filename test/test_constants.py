@@ -6,6 +6,22 @@ from unittest.mock import patch
 import pytest
 
 
+def test_pi_is_public_in_enum_constants_and_terminal_validation():
+    from cli_agent_orchestrator.constants import PROVIDERS
+    from cli_agent_orchestrator.models.provider import ProviderType
+    from cli_agent_orchestrator.models.terminal import Terminal
+
+    assert ProviderType.PI.value == "pi"
+    assert "pi" in PROVIDERS
+    terminal = Terminal(
+        id="deadbeef",
+        name="pi-agent",
+        provider="pi",
+        session_name="cao-pi",
+    )
+    assert terminal.provider == "pi"
+
+
 class TestServerConstants:
     """Tests for server configuration constants."""
 

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the official xAI Grok Build CLI as the `grok_cli` provider, including
   isolated per-terminal MCP configuration, native hard tool restrictions,
   multi-turn TUI support, orchestration e2e coverage, and provider docs.
+- Add first-party Pi provider support with an attachable regular TUI, hard built-in tool restrictions, exact lifecycle/final-answer state, and CAO MCP orchestration through a bundled stdio bridge. See [Pi Provider](docs/pi.md).
 
 ### Fixed
 
@@ -849,4 +850,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-

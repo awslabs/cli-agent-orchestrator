@@ -366,6 +366,7 @@ class TmuxClient:
                 "DISPLAY",
                 "XDG_RUNTIME_DIR",
                 "DO_NOT_TRACK",
+                "PI_CODING_AGENT_DIR",
             }
             environment = {
                 k: v
@@ -477,7 +478,11 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window_env: dict[str, str] = {}
+            window_env = (
+                {"PI_CODING_AGENT_DIR": os.environ["PI_CODING_AGENT_DIR"]}
+                if "PI_CODING_AGENT_DIR" in os.environ
+                else {}
+            )
             self._merge_extra_env(window_env, extra_env)
             window_env["CAO_TERMINAL_ID"] = terminal_id
 

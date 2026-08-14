@@ -19,6 +19,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASErro
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+from cli_agent_orchestrator.providers.pi import PiProvider
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,16 @@ class ProviderManager:
                 )
             elif provider_type == ProviderType.GROK_CLI.value:
                 provider = GrokCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
+            elif provider_type == ProviderType.PI.value:
+                provider = PiProvider(
                     terminal_id,
                     tmux_session,
                     tmux_window,

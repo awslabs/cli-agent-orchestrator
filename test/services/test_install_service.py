@@ -119,6 +119,27 @@ class TestInstallAgent:
         assert "${API_TOKEN}" in context_text
         assert "${BASE_URL}" in context_text
 
+    def test_install_pi_accepts_provider_and_writes_standard_context_only(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """Pi needs no install-time provider config; launch owns its runtime files."""
+        profile = install_paths["local_store_dir"] / "pi-agent.md"
+        profile.write_text(
+            "---\nname: pi-agent\ndescription: Pi agent\nrole: reviewer\n---\nReview carefully.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("pi-agent", "pi")
+
+        assert result.success is True
+        assert result.provider == "pi"
+        assert result.agent_file is None
+        assert Path(result.context_file or "").read_text(encoding="utf-8") == profile.read_text(
+            encoding="utf-8"
+        )
+        assert list(install_paths["kiro_dir"].iterdir()) == []
+        assert list(install_paths["copilot_dir"].iterdir()) == []
+
     def test_install_from_flat_profile_in_provider_dir(
         self, install_paths: dict[str, Path]
     ) -> None:

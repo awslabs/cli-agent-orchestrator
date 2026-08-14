@@ -1,10 +1,13 @@
 """Unit tests for terminal service get_working_directory and send_special_key functions."""
 
-from unittest.mock import MagicMock, patch
+import logging
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.terminal_service import (
+    create_terminal,
     exit_terminal_cli,
     get_working_directory,
     list_siblings,
@@ -23,6 +26,71 @@ def test_grok_uses_runtime_skills_with_native_tool_enforcement():
 
 
 _TS = "cli_agent_orchestrator.services.terminal_service"
+
+
+def test_pi_uses_runtime_skill_prompt_with_hard_tool_enforcement():
+    """Pi appends the runtime catalog and must never enter the soft-policy guard."""
+    from cli_agent_orchestrator.services.terminal_service import (
+        RUNTIME_SKILL_PROMPT_PROVIDERS,
+        SOFT_ENFORCEMENT_PROVIDERS,
+    )
+
+    assert "pi" in RUNTIME_SKILL_PROMPT_PROVIDERS
+    assert "pi" not in SOFT_ENFORCEMENT_PROVIDERS
+
+
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+@patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+@patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+@patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+@patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+@patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+@patch("cli_agent_orchestrator.backends.registry._backend")
+@patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+@patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+@patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+@patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
+@patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+async def test_soft_enforcement_warning_lists_pi_as_a_hard_alternative(
+    mock_load_profile,
+    mock_build_skill_catalog,
+    mock_gen_id,
+    mock_gen_session,
+    mock_gen_window,
+    mock_backend,
+    mock_db_create,
+    mock_provider_manager,
+    mock_log_dir,
+    mock_fifo_dir,
+    mock_fifo_manager,
+    mock_status_monitor,
+    caplog,
+):
+    mock_gen_id.return_value = "test1234"
+    mock_gen_session.return_value = "cao-session"
+    mock_gen_window.return_value = "reviewer-abcd"
+    mock_backend.session_exists.return_value = False
+    mock_load_profile.return_value = AgentProfile(name="reviewer", description="Reviewer")
+    mock_build_skill_catalog.return_value = ""
+    mock_provider = AsyncMock()
+    mock_provider.initialize.return_value = True
+    mock_provider_manager.create_provider.return_value = mock_provider
+    mock_log_dir.__truediv__.return_value = MagicMock()
+    mock_fifo_dir.__truediv__.return_value = "fake.fifo"
+
+    with caplog.at_level(logging.WARNING):
+        await create_terminal(
+            "codex",
+            "reviewer",
+            new_session=True,
+            allowed_tools=["fs_read", "fs_list"],
+        )
+
+    assert (
+        "enforced restrictions use claude_code, grok_cli, kiro_cli, copilot_cli, or pi"
+        in caplog.text
+    )
 
 
 class TestTerminalServiceWorkingDirectory:

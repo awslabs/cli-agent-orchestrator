@@ -31,9 +31,8 @@ Install:
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
-  [OpenCode CLI](docs/opencode-cli.md),
-  [Cursor CLI](docs/cursor-cli.md), or
-  [Grok Build CLI](docs/grok-cli.md)
+  [OpenCode CLI](docs/opencode-cli.md), [Pi](docs/pi.md),
+  [Cursor CLI](docs/cursor-cli.md), or [Grok Build CLI](docs/grok-cli.md)
 
 The focused provider guides contain installation, authentication, and
 provider-specific behavior.
@@ -131,9 +130,8 @@ provider override while keeping the same sequence.
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
-  [OpenCode CLI](docs/opencode-cli.md),
-  [Cursor CLI](docs/cursor-cli.md), and
-  [Grok Build CLI](docs/grok-cli.md).
+  [OpenCode CLI](docs/opencode-cli.md), [Pi](docs/pi.md),
+  [Cursor CLI](docs/cursor-cli.md), and [Grok Build CLI](docs/grok-cli.md).
 - [Security policy](SECURITY.md): vulnerability reporting and deployment
   guidance.
 
