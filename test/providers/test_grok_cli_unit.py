@@ -14,11 +14,13 @@ import pytest
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.grok_cli import (
+    _STATUS_TAIL_CHARS,
     DIRECTORY_TRUST_PATTERN,
     GrokCliProvider,
     ProviderError,
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -195,6 +197,28 @@ def test_worked_for_prose_during_active_turn_is_not_completion(prose):
     provider = make_provider()
     provider.mark_input_received()
     output = f"Waiting for response…\n{prose}\n│❯│\nEsc:cancel"
+    assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_evicted_raw_completion_ordinal_does_not_match_tail_prose():
+    """A raw marker outside the 8 KiB tail must not complete same-duration prose."""
+
+    provider = make_provider()
+    provider.mark_input_received()
+    old_raw = _completed_turn("first question", "first answer", raw=True)
+    padding = ("padding line that evicts prior chrome\n") * 400
+    current = (
+        "Waiting for response…\n"
+        "     ❯ second question\n"
+        "     The benchmark Worked for 2.0s total\n"
+        "  Shift+Tab:mode  │  Ctrl+x:shortcuts\n"
+    )
+    output = f"{old_raw}\n{padding}{current}"
+    clean = strip_terminal_escapes(output)
+    tail = clean[-_STATUS_TAIL_CHARS:]
+    assert "first question" not in tail
+    assert tail.count("Worked for 2.0s") == 1
+    assert "The benchmark Worked for 2.0s total" in tail
     assert provider.get_status(output) == TerminalStatus.PROCESSING
 
 

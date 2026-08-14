@@ -637,7 +637,9 @@ class GrokCliProvider(BaseProvider):
             clean,
             at_rolling_capacity=len(raw_output) >= get_server_settings()["state_buffer_max"],
         )
-        tail = clean[-_STATUS_TAIL_CHARS:]
+        tail_start = max(0, len(clean) - _STATUS_TAIL_CHARS)
+        prefix = clean[:tail_start]
+        tail = clean[tail_start:]
 
         last_waiting = max(
             (match.start() for match in WAITING_USER_PATTERN.finditer(tail)), default=-1
@@ -676,7 +678,13 @@ class GrokCliProvider(BaseProvider):
         rendered_completion_starts = {
             match.start(1) for match in RENDERED_COMPLETION_PATTERN.finditer(tail)
         }
+        # Tail ordinals must continue the full-buffer sequence. Restarting at
+        # zero lets an evicted raw ``Worked for`` marker match later prose and
+        # falsely complete the current turn.
         clean_counts: dict[str, int] = {}
+        for match in COMPLETION_PATTERN.finditer(prefix):
+            marker = match.group()
+            clean_counts[marker] = clean_counts.get(marker, 0) + 1
         completion_matches = []
         for match in COMPLETION_PATTERN.finditer(tail):
             marker = match.group()
