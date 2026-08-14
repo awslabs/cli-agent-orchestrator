@@ -61,6 +61,12 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 ENABLE_PERSISTENT_AGENT_ROUTING = (
     os.getenv("CAO_ENABLE_PERSISTENT_AGENT_ROUTING", "false").lower() == "true"
 )
+# Trusted top-level orchestrators can also forbid raw terminal-address sends.
+# Semantic routing itself bypasses this guard only after resolving an exact
+# persistent_agent_id internally.
+REQUIRE_SEMANTIC_PERSISTENT_ROUTING = (
+    os.getenv("CAO_REQUIRE_SEMANTIC_PERSISTENT_ROUTING", "false").lower() == "true"
+)
 
 
 def _enforce_child_profile_policy(agent_profile: str) -> None:
@@ -1345,7 +1351,7 @@ else:
         )
 
 
-def _list_persistent_agents_impl() -> Dict[str, Any]:
+def _discover_persistent_agent_routes_impl() -> Dict[str, Any]:
     """Discover live terminals stamped with a canonical persistent agent ID.
 
     This deliberately fans out across every session and then reads each exact
@@ -1440,13 +1446,24 @@ def _list_persistent_agents_impl() -> Dict[str, Any]:
         }
 
 
+def _list_persistent_agents_impl() -> Dict[str, Any]:
+    """Return semantic persistent-agent identities without terminal addresses."""
+    discovered = _discover_persistent_agent_routes_impl()
+    if not discovered.get("success"):
+        return discovered
+    public_agents = []
+    for agent in discovered.get("agents", []):
+        public_agents.append({k: v for k, v in agent.items() if k != "terminal_id"})
+    return {"success": True, "agents": public_agents, "count": len(public_agents)}
+
+
 def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[str, Any]:
     """Resolve a canonical persistent agent ID to its current terminal and send."""
     agent_id = agent_id.strip()
     if not agent_id:
         return {"success": False, "error": "agent_id must not be empty"}
 
-    discovered = _list_persistent_agents_impl()
+    discovered = _discover_persistent_agent_routes_impl()
     if not discovered.get("success"):
         return discovered
     matches = [a for a in discovered.get("agents", []) if a.get("agent_id") == agent_id]
@@ -1456,22 +1473,20 @@ def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[
             "error": f"No live persistent agent matches agent_id '{agent_id}'",
         }
     if len(matches) != 1:
-        ids = sorted(str(a.get("terminal_id")) for a in matches)
         return {
             "success": False,
             "error": (
                 f"Persistent agent_id '{agent_id}' is ambiguous across {len(matches)} live "
-                f"terminals: {', '.join(ids)}"
+                "terminals. Repair duplicate persistent-agent metadata before routing."
             ),
         }
 
     target = matches[0]
-    result = _send_message_impl(str(target["terminal_id"]), message)
+    result = _send_message_impl(str(target["terminal_id"]), message, semantic_resolved=True)
     if result.get("success"):
         return {
             **result,
             "persistent_agent_id": agent_id,
-            "resolved_terminal_id": target["terminal_id"],
             "resolved_session_name": target.get("session_name"),
         }
     return result
@@ -1503,10 +1518,21 @@ async def send_message_to_persistent_agent(
 
 
 # Implementation function for send_message
-def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
+def _send_message_impl(
+    receiver_id: Optional[str], message: str, *, semantic_resolved: bool = False
+) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
         own_terminal_id = _current_terminal_id()
+
+        if REQUIRE_SEMANTIC_PERSISTENT_ROUTING and receiver_id and not semantic_resolved:
+            return {
+                "success": False,
+                "error": (
+                    "Raw terminal receiver IDs are disabled for this orchestrator. "
+                    "Use send_message_to_persistent_agent with a canonical agent_id."
+                ),
+            }
 
         # Default the receiver to the recorded caller (issue #284): handoff/
         # assign persist the creating terminal's ID on the worker's row, so a
