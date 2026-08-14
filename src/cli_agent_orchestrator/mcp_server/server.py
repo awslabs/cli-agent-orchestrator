@@ -54,6 +54,20 @@ ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lo
 # supervisor LLM remembering to hand-write its terminal ID into the message.
 ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
 
+
+def _enforce_child_profile_policy(agent_profile: str) -> None:
+    """Reject child profiles outside the optional per-supervisor allowlist."""
+    raw = os.getenv("CAO_ALLOWED_CHILD_PROFILES", "").strip()
+    if not raw:
+        return
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    if agent_profile not in allowed:
+        allowed_text = ", ".join(sorted(allowed))
+        raise ValueError(
+            f"Child agent profile '{agent_profile}' is not allowed by this supervisor. "
+            f"Allowed profiles: {allowed_text}"
+        )
+
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 MAX_USER_PROMPT_ANSWER_LENGTH = 4000
@@ -221,6 +235,7 @@ def _create_terminal(
     Raises:
         Exception: If terminal creation fails
     """
+    _enforce_child_profile_policy(agent_profile)
     provider = DEFAULT_PROVIDER
     parent_allowed_tools = None
 
@@ -746,6 +761,7 @@ async def _handoff_impl(
     terminal_id: Optional[str] = None
 
     try:
+        _enforce_child_profile_policy(agent_profile)
         # Resolve the supervisor context WITHOUT creating a terminal, so the
         # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
         # prompt-shaping can both run caller-side before the single combined
