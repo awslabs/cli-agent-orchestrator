@@ -1838,6 +1838,33 @@ class TestDeleteTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_delete_terminal_retains_metadata_when_grok_cleanup_is_deferred(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """A retryable Grok cleanup must not be reported as a successful delete."""
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider_manager.cleanup_provider.return_value = False
+
+        assert delete_terminal("test1234") is False
+        mock_db_delete.assert_not_called()
+        mock_provider_manager.cleanup_provider.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_no_metadata(
         self,

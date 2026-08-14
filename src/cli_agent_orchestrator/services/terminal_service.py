@@ -577,12 +577,6 @@ async def create_terminal(
         # and report UNKNOWN status even though nothing is running. Idempotent
         # (DELETE ... WHERE id = ?), so it is a no-op when the failure happened
         # before the row was written. Runs regardless of session_created so a
-        # pre-existing session keeps its live terminals but loses the dead row.
-        try:
-            if terminal_id is not None:
-                db_delete_terminal(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
                 get_backend().kill_session(session_name)
@@ -614,11 +608,30 @@ async def create_terminal(
         # provider releases private on-disk state.  In particular Grok can
         # have an updater still writing $GROK_HOME while its initialization
         # fails; its cleanup verifies that no such process remains.
+        cleanup_complete = True
         try:
             if terminal_id is not None:
-                provider_manager.cleanup_provider(terminal_id)
+                cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
         except Exception:
-            pass  # Ignore cleanup errors
+            # Preserve the existing rollback contract for an unexpected
+            # provider-manager failure. Only an explicit False is a Grok
+            # cleanup deferral with enough information to retry safely.
+            cleanup_complete = True
+        # Do not erase the only retry handle before Grok has safely released
+        # its private home.  The original create error is still raised below;
+        # retaining this row makes the failed terminal discoverable and its
+        # deletion retryable rather than leaking credentials/config forever.
+        if cleanup_complete:
+            try:
+                if terminal_id is not None:
+                    db_delete_terminal(terminal_id)
+            except Exception:
+                pass  # Ignore cleanup errors
+        elif terminal_id is not None:
+            logger.warning(
+                "Create rollback deferred Grok cleanup for %s; retaining terminal metadata for retry",
+                terminal_id,
+            )
         if worktree_repo_root is not None and terminal_id is not None:
             # A worktree WAS created (Step 1b succeeded) before some later step
             # failed -- roll it back too, same best-effort posture as everything
@@ -1697,8 +1710,15 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 if worktree_terminal_id == terminal_id:
                     worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
-        # Cleanup provider state and database record
-        provider_manager.cleanup_provider(terminal_id)
+        # Grok cleanup can be deferred when a private-home owner cannot yet be
+        # inspected/stopped.  Keep both the provider mapping and DB metadata so
+        # a subsequent DELETE can retry; reporting success here would turn a
+        # temporary process race into a permanent private-home leak.
+        if provider_manager.cleanup_provider(terminal_id) is False:
+            logger.warning(
+                "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
+            )
+            return False
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
         # Drop any per-curator dispatch lock so the registry doesn't grow

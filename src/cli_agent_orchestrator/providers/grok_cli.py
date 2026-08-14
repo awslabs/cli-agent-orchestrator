@@ -28,7 +28,9 @@ import stat
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+import psutil
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
@@ -795,30 +797,25 @@ class GrokCliProvider(BaseProvider):
         current_pid = os.getpid()
         pids: set[int] = set()
         try:
-            entries = os.scandir("/proc")
-        except OSError as exc:
-            logger.warning("Cannot inspect /proc before cleaning Grok home %s: %s", home, exc)
+            process_ids = psutil.pids()
+        except psutil.Error as exc:
+            logger.warning("Cannot enumerate processes before cleaning Grok home %s: %s", home, exc)
             # A failed inspection is not evidence of a CAO-owned process.  In
             # particular, cleanup may run in the server process, so never
             # synthesize and signal our own PID. Retain state for a later retry.
             return None
 
-        with entries:
-            for entry in entries:
-                if not entry.name.isdigit():
-                    continue
-                pid = int(entry.name)
-                if pid == current_pid:
-                    continue
-                uses_home = GrokCliProvider._pid_uses_home(pid, home)
-                if uses_home is None:
-                    # We know this is a same-user candidate only after reading
-                    # its /proc metadata.  An unreadable environment is not
-                    # proof it is safe to delete beneath: retain the private
-                    # home until we can establish quiescence.
-                    return None
-                if uses_home:
-                    pids.add(pid)
+        for pid in process_ids:
+            if pid == current_pid:
+                continue
+            uses_home = GrokCliProvider._pid_uses_home(pid, home)
+            if uses_home is None:
+                # ``_pid_uses_home`` returns uncertainty only after identifying
+                # a same-user Grok/cao-mcp candidate whose environment cannot
+                # be read.  Retain the home rather than race that process.
+                return None
+            if uses_home:
+                pids.add(pid)
         return pids
 
     @staticmethod
@@ -832,49 +829,73 @@ class GrokCliProvider(BaseProvider):
         deliberately fail-closed for private-home removal.
         """
 
-        proc = Path("/proc") / str(pid)
+        inspected = GrokCliProvider._inspect_home_process(pid, home)
+        if inspected is None:
+            return None
+        return not isinstance(inspected, bool)
+
+    @staticmethod
+    def _inspect_home_process(pid: int, home: Path) -> psutil.Process | Literal[False] | None:
+        """Return a verified, PID-reuse-safe process owning ``home``.
+
+        A returned ``psutil.Process`` has already cached its creation time.
+        Calling ``send_signal`` on that same object makes psutil re-check the
+        PID/create-time identity before signalling, rather than issuing a raw
+        ``kill(pid, ...)`` after a separate verification step.
+        """
+
         try:
-            if proc.stat().st_uid != os.geteuid():
+            proc = psutil.Process(pid)
+            # Seed psutil's pid+creation-time identity before examining the
+            # process. Its send_signal() then refuses a PID reused between this
+            # verification and delivery.
+            proc.create_time()
+            if proc.uids().effective != os.geteuid():
                 return False
-            executable = os.readlink(proc / "exe")
-        except (FileNotFoundError, ProcessLookupError):
+            executable = proc.exe()
+        except psutil.NoSuchProcess:
             return False
-        except (PermissionError, OSError):
-            # Cannot establish this process is a Grok candidate. Do not let an
-            # unrelated protected same-user service block cleanup; once an
-            # executable is known to be Grok, the environment read below is
-            # fail-closed instead.
+        except psutil.AccessDenied:
+            # This is not sufficient evidence that an arbitrary protected
+            # process uses this home.  If it is a candidate, the later
+            # environment read below is fail-closed.
+            return False
+        except psutil.Error as exc:
+            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
             return False
 
         try:
             # Avoid treating unrelated same-user services (which can protect
-            # their environment under Linux's ptrace policy) as Grok cleanup
+            # their environment) as Grok cleanup
             # candidates. A Grok main process/updater always has ``grok`` in
             # its executable basename. Its CAO MCP child is Python, so accept
             # only its observed launcher shape: a native binary in argv[0],
             # or a Python interpreter with the exact console-script path in
             # argv[1]. Do not accept an arbitrary later argument/source string.
             executable_name = Path(executable).name.lower()
-            is_grok = "grok" in executable_name
-            argv = [
-                argument for argument in (proc / "cmdline").read_bytes().split(b"\0") if argument
-            ]
-            argv0 = os.path.basename(argv[0]) if argv else b""
-            is_cao_mcp = (argv0 == b"cao-mcp-server" and executable_name == "cao-mcp-server") or (
+            # Accept the documented CLI binary and its updater naming shape,
+            # but not an arbitrary executable which merely contains ``grok``
+            # somewhere in its filename.
+            is_grok = executable_name == "grok" or executable_name.startswith("grok-")
+            argv = proc.cmdline()
+            argv0 = os.path.basename(argv[0]) if argv else ""
+            is_cao_mcp = (argv0 == "cao-mcp-server" and executable_name == "cao-mcp-server") or (
                 len(argv) >= 2
-                and argv0.startswith(b"python")
-                and os.path.basename(argv[1]) == b"cao-mcp-server"
+                and argv0.startswith("python")
+                and os.path.basename(argv[1]) == "cao-mcp-server"
             )
             if not (is_grok or is_cao_mcp):
                 return False
-            environ = (proc / "environ").read_bytes()
-        except (FileNotFoundError, ProcessLookupError):
+            environ = proc.environ()
+        except psutil.NoSuchProcess:
             return False
-        except (PermissionError, OSError) as exc:
+        except psutil.AccessDenied as exc:
             logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
             return None
-        expected = os.fsencode(f"GROK_HOME={home}")
-        return expected in environ.split(b"\0")
+        except psutil.Error as exc:
+            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
+            return None
+        return proc if environ.get("GROK_HOME") == str(home) else False
 
     @classmethod
     def _stop_home_processes(cls, home: Path) -> bool:
@@ -889,17 +910,17 @@ class GrokCliProvider(BaseProvider):
         def stop(pids: set[int], sig: signal.Signals) -> bool:
             delivered = True
             for pid in pids:
-                uses_home = cls._pid_uses_home(pid, home)
-                if uses_home is None:
+                inspected = cls._inspect_home_process(pid, home)
+                if inspected is None:
                     delivered = False
                     continue
-                if not uses_home:
+                if inspected is False:
                     continue
                 try:
-                    os.kill(pid, sig)
-                except ProcessLookupError:
+                    inspected.send_signal(sig)
+                except psutil.NoSuchProcess:
                     continue
-                except OSError as exc:
+                except psutil.Error as exc:
                     logger.warning("Cannot signal Grok-home process %s for %s: %s", pid, home, exc)
                     delivered = False
             return delivered
@@ -947,7 +968,14 @@ class GrokCliProvider(BaseProvider):
         )
         return False
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> bool:
+        """Remove this terminal's private home when no owner can recreate it.
+
+        ``False`` is intentionally a retryable outcome, not an exception: the
+        caller must retain terminal metadata and the provider mapping so a
+        subsequent DELETE can finish cleanup after a protected/orphaned process
+        becomes inspectable or exits.
+        """
         self._initialized = False
         # The provider object is reconstructed after a cao-server restart, so
         # `_grok_home` only describes the happy in-process lifecycle.  The
@@ -956,12 +984,12 @@ class GrokCliProvider(BaseProvider):
         home = self._grok_home or self._home_path()
         if not self._is_managed_home(home):
             logger.warning("Refusing to remove non-managed Grok home %s", home)
-            return
+            return False
         if not self._stop_home_processes(home):
             # A later terminal deletion/retry can safely revisit the exact
             # deterministic path.  Do not erase it while a process can still
             # recreate private files after cleanup.
-            return
+            return False
         try:
             # rmtree refuses a symlink root, which is safe but leaves the
             # managed entry behind.  Removing the link itself never follows
@@ -974,11 +1002,14 @@ class GrokCliProvider(BaseProvider):
         except FileNotFoundError:
             self._grok_home = None
             self._grok_home_root = None
+            return True
         except OSError as exc:
             logger.warning("Failed to remove Grok home %s: %s", home, exc)
+            return False
         else:
             self._grok_home = None
             self._grok_home_root = None
+            return True
 
     def mark_input_received(self) -> None:
         super().mark_input_received()

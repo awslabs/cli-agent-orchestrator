@@ -169,9 +169,17 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
 
         # Clean up each terminal (snapshot, kill window, FIFO reader,
         # status buffer, provider, DB) via the event-driven teardown path.
+        cleanup_complete = True
         for terminal in terminals:
             try:
-                terminal_service.delete_terminal(terminal["id"], registry=registry)
+                if terminal_service.delete_terminal(terminal["id"], registry=registry) is False:
+                    cleanup_complete = False
+                    result["errors"].append(
+                        {
+                            "terminal_id": terminal["id"],
+                            "error": "cleanup deferred; retry delete_session",
+                        }
+                    )
             except Exception as e:
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
@@ -183,8 +191,13 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         # even when no vars were forwarded — the helper is a no-op then.
         clear_session_env(session_name)
 
-        result["deleted"].append(session_name)
-        logger.info(f"Deleted session: {session_name}")
+        if cleanup_complete:
+            result["deleted"].append(session_name)
+            logger.info(f"Deleted session: {session_name}")
+        else:
+            logger.warning(
+                "Session %s backend was removed but terminal cleanup is deferred", session_name
+            )
         dispatch_plugin_event(
             registry,
             "post_kill_session",

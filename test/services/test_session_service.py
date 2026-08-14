@@ -341,6 +341,25 @@ class TestDeleteSession:
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_reports_deferred_terminal_cleanup(
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+    ):
+        """An explicit retryable teardown result must not be reported deleted."""
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_list_terminals.return_value = [{"id": "grok-terminal"}]
+        mock_delete_terminal.return_value = False
+
+        result = delete_session("cao-grok")
+
+        assert result["deleted"] == []
+        assert result["errors"] == [
+            {"terminal_id": "grok-terminal", "error": "cleanup deferred; retry delete_session"}
+        ]
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-grok")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_cleans_up_each_terminal(
         self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):

@@ -226,14 +226,25 @@ class ProviderManager:
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 
-    def cleanup_provider(self, terminal_id: str) -> None:
-        """Cleanup provider and remove from map (used when terminal is deleted)."""
+    def cleanup_provider(self, terminal_id: str) -> bool:
+        """Cleanup a provider, retaining retryable Grok state on failure.
+
+        Grok's private home can only be deleted after its escaped updater has
+        been positively stopped or ruled out.  A ``False`` return therefore
+        deliberately keeps the map entry (and lets the service keep DB
+        metadata) so a later lifecycle retry does not lose the only route to
+        that deterministic home.
+        """
         try:
-            provider = self._providers.pop(terminal_id, None)
+            provider = self._providers.get(terminal_id)
             if provider:
-                provider.cleanup()
+                cleanup_result = provider.cleanup()
+                if cleanup_result is False:
+                    logger.warning("Cleanup deferred for terminal: %s", terminal_id)
+                    return False
+                self._providers.pop(terminal_id, None)
                 logger.info(f"Cleaned up provider for terminal: {terminal_id}")
-                return
+                return True
 
             # Provider instances are in-memory only.  After cao-server
             # restarts terminal deletion still has database metadata, but no
@@ -242,15 +253,20 @@ class ProviderManager:
             # cleanup-only adapter rather than leaking that directory.
             metadata = get_terminal_metadata(terminal_id)
             if metadata and metadata.get("provider") == ProviderType.GROK_CLI.value:
-                GrokCliProvider(
+                cleanup_provider = GrokCliProvider(
                     terminal_id,
                     metadata["tmux_session"],
                     metadata["tmux_window"],
                     metadata.get("agent_profile"),
-                ).cleanup()
+                )
+                if cleanup_provider.cleanup() is False:
+                    logger.warning("Cleanup deferred for restored Grok provider: %s", terminal_id)
+                    return False
                 logger.info("Cleaned up restored Grok provider for terminal: %s", terminal_id)
+            return True
         except Exception as e:
             logger.error(f"Failed to cleanup provider for terminal {terminal_id}: {e}")
+            return False
 
     def list_providers(self) -> Dict[str, str]:
         """List all active providers (for debugging)."""

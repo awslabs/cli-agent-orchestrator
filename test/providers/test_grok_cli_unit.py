@@ -8,6 +8,7 @@ import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import psutil
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -801,16 +802,16 @@ def test_cleanup_failure_keeps_home_retryable(tmp_path):
 
 def test_cleanup_stops_residual_process_before_removing_home(tmp_path):
     provider = make_provider()
+    proc = MagicMock()
     with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
         home = provider._prepare_grok_home(None)
         with (
             patch.object(GrokCliProvider, "_pids_using_home", side_effect=[{12345}, set()]),
-            patch.object(GrokCliProvider, "_pid_uses_home", return_value=True),
-            patch("cli_agent_orchestrator.providers.grok_cli.os.kill") as kill,
+            patch.object(GrokCliProvider, "_inspect_home_process", return_value=proc),
         ):
             provider.cleanup()
 
-    kill.assert_called_once_with(12345, signal.SIGTERM)
+    proc.send_signal.assert_called_once_with(signal.SIGTERM)
     assert not home.exists()
 
 
@@ -831,8 +832,8 @@ def test_cleanup_retains_home_when_process_scan_is_unavailable(tmp_path):
         home = provider._prepare_grok_home(None)
         with (
             patch(
-                "cli_agent_orchestrator.providers.grok_cli.os.scandir",
-                side_effect=OSError("blocked"),
+                "cli_agent_orchestrator.providers.grok_cli.psutil.pids",
+                side_effect=psutil.Error("blocked"),
             ),
             patch("cli_agent_orchestrator.providers.grok_cli.os.kill") as kill,
             patch("cli_agent_orchestrator.providers.grok_cli.shutil.rmtree") as rmtree,
@@ -845,54 +846,69 @@ def test_cleanup_retains_home_when_process_scan_is_unavailable(tmp_path):
     assert provider.grok_home == home
 
 
+def test_cleanup_is_retryable_when_portable_process_inspection_is_unavailable(tmp_path):
+    """Simulate a macOS/permission failure without depending on Linux ``/proc``."""
+
+    provider = make_provider()
+    with patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path):
+        home = provider._prepare_grok_home(None)
+        with patch.object(GrokCliProvider, "_pids_using_home", side_effect=[None, set()]):
+            assert provider.cleanup() is False
+            assert home.exists()
+            # The next lifecycle attempt gets a fresh process enumeration and
+            # completes; this is the contract ProviderManager relies on.
+            assert provider.cleanup() is True
+    assert not home.exists()
+
+
 def test_home_process_scan_fails_closed_for_unreadable_same_user_environment(tmp_path):
-    class Entry:
-        name = "987654"
-
-    class Entries:
-        def __enter__(self):
-            return [Entry()]
-
-        def __exit__(self, *_):
-            return False
-
-        def __iter__(self):
-            return iter([Entry()])
-
     with (
-        patch("cli_agent_orchestrator.providers.grok_cli.os.scandir", return_value=Entries()),
+        patch("cli_agent_orchestrator.providers.grok_cli.psutil.pids", return_value=[987654]),
         patch.object(GrokCliProvider, "_pid_uses_home", return_value=None),
     ):
         assert GrokCliProvider._pids_using_home(tmp_path) is None
 
 
+def test_home_process_fails_closed_when_candidate_environment_is_protected(tmp_path):
+    proc = MagicMock()
+    proc.uids.return_value.effective = os.geteuid()
+    proc.exe.return_value = "/usr/local/bin/grok"
+    proc.cmdline.return_value = ["grok"]
+    proc.environ.side_effect = psutil.AccessDenied(pid=12345)
+    with patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc):
+        assert GrokCliProvider._pid_uses_home(12345, tmp_path) is None
+
+
 def test_home_process_stop_rechecks_home_before_signalling_reused_pid(tmp_path):
     with (
         patch.object(GrokCliProvider, "_pids_using_home", side_effect=[{12345}, set()]),
-        patch.object(GrokCliProvider, "_pid_uses_home", return_value=False),
-        patch("cli_agent_orchestrator.providers.grok_cli.os.kill") as kill,
+        patch.object(GrokCliProvider, "_inspect_home_process", return_value=False),
     ):
         assert GrokCliProvider._stop_home_processes(tmp_path) is True
 
-    kill.assert_not_called()
+
+def test_home_process_stop_does_not_signal_reused_pid_after_identity_verification(tmp_path):
+    """psutil's process object rejects PID reuse between inspect and signal."""
+    proc = MagicMock()
+    proc.send_signal.side_effect = psutil.NoSuchProcess(pid=12345)
+    with (
+        patch.object(GrokCliProvider, "_pids_using_home", side_effect=[{12345}, set()]),
+        patch.object(GrokCliProvider, "_inspect_home_process", return_value=proc),
+        patch("cli_agent_orchestrator.providers.grok_cli.os.kill") as raw_kill,
+    ):
+        assert GrokCliProvider._stop_home_processes(tmp_path) is True
+
+    proc.send_signal.assert_called_once_with(signal.SIGTERM)
+    raw_kill.assert_not_called()
 
 
 def test_home_process_recognizes_exact_cao_mcp_argv_with_private_home(tmp_path):
-    proc_stat = MagicMock()
-    proc_stat.st_uid = os.geteuid()
-    with (
-        patch("cli_agent_orchestrator.providers.grok_cli.Path.stat", return_value=proc_stat),
-        patch(
-            "cli_agent_orchestrator.providers.grok_cli.os.readlink", return_value="/usr/bin/python3"
-        ),
-        patch(
-            "cli_agent_orchestrator.providers.grok_cli.Path.read_bytes",
-            side_effect=[
-                b"python3\0/usr/local/bin/cao-mcp-server\0",
-                f"GROK_HOME={tmp_path}\0".encode(),
-            ],
-        ),
-    ):
+    proc = MagicMock()
+    proc.uids.return_value.effective = os.geteuid()
+    proc.exe.return_value = "/usr/bin/python3"
+    proc.cmdline.return_value = ["python3", "/usr/local/bin/cao-mcp-server"]
+    proc.environ.return_value = {"GROK_HOME": str(tmp_path)}
+    with (patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc),):
         assert GrokCliProvider._pid_uses_home(12345, tmp_path) is True
 
 
@@ -904,31 +920,30 @@ def test_home_process_recognizes_exact_cao_mcp_argv_with_private_home(tmp_path):
     ],
 )
 def test_home_process_rejects_nonexact_cao_mcp_argv_token(tmp_path, cmdline):
-    proc_stat = MagicMock()
-    proc_stat.st_uid = os.geteuid()
-    with (
-        patch("cli_agent_orchestrator.providers.grok_cli.Path.stat", return_value=proc_stat),
-        patch(
-            "cli_agent_orchestrator.providers.grok_cli.os.readlink", return_value="/usr/bin/python3"
-        ),
-        patch("cli_agent_orchestrator.providers.grok_cli.Path.read_bytes", return_value=cmdline),
-    ):
+    proc = MagicMock()
+    proc.uids.return_value.effective = os.geteuid()
+    proc.exe.return_value = "/usr/bin/python3"
+    proc.cmdline.return_value = [item.decode() for item in cmdline.split(b"\0") if item]
+    with (patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc),):
         assert GrokCliProvider._pid_uses_home(12345, tmp_path) is False
 
 
 def test_home_process_rejects_arbitrary_python_even_with_matching_home(tmp_path):
-    proc_stat = MagicMock()
-    proc_stat.st_uid = os.geteuid()
-    with (
-        patch("cli_agent_orchestrator.providers.grok_cli.Path.stat", return_value=proc_stat),
-        patch(
-            "cli_agent_orchestrator.providers.grok_cli.os.readlink", return_value="/usr/bin/python3"
-        ),
-        patch(
-            "cli_agent_orchestrator.providers.grok_cli.Path.read_bytes",
-            return_value=b"python3\0-c\0",
-        ),
-    ):
+    proc = MagicMock()
+    proc.uids.return_value.effective = os.geteuid()
+    proc.exe.return_value = "/usr/bin/python3"
+    proc.cmdline.return_value = ["python3", "-c"]
+    with (patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc),):
+        assert GrokCliProvider._pid_uses_home(12345, tmp_path) is False
+
+
+def test_home_process_rejects_non_grok_executable_with_matching_home(tmp_path):
+    proc = MagicMock()
+    proc.uids.return_value.effective = os.geteuid()
+    proc.exe.return_value = "/tmp/notgrok-helper"
+    proc.cmdline.return_value = ["notgrok-helper"]
+    proc.environ.return_value = {"GROK_HOME": str(tmp_path)}
+    with patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc):
         assert GrokCliProvider._pid_uses_home(12345, tmp_path) is False
 
 

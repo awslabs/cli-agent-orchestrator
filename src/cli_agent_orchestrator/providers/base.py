@@ -269,8 +269,13 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    def cleanup(self) -> None:
-        """Clean up provider resources."""
+    def cleanup(self) -> bool | None:
+        """Clean up provider resources.
+
+        Providers may return ``False`` when cleanup is intentionally deferred
+        and lifecycle metadata must be retained for a retry. Existing providers
+        that return ``None`` are treated as successfully cleaned up.
+        """
         pass
 
     def mark_input_received(self) -> None:
