@@ -54,6 +54,14 @@ ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lo
 # supervisor LLM remembering to hand-write its terminal ID into the message.
 ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
 
+# Persistent-agent routing is deliberately opt-in. A CAO MCP server is mounted
+# in many supervisors/workers; enabling semantic cross-session discovery for all
+# of them would widen their routing surface. The production AIVA profile enables
+# this explicitly, while department heads/workers leave it disabled.
+ENABLE_PERSISTENT_AGENT_ROUTING = (
+    os.getenv("CAO_ENABLE_PERSISTENT_AGENT_ROUTING", "false").lower() == "true"
+)
+
 
 def _enforce_child_profile_policy(agent_profile: str) -> None:
     """Reject child profiles outside the optional per-supervisor allowlist."""
@@ -67,6 +75,7 @@ def _enforce_child_profile_policy(agent_profile: str) -> None:
             f"Child agent profile '{agent_profile}' is not allowed by this supervisor. "
             f"Allowed profiles: {allowed_text}"
         )
+
 
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
@@ -1334,6 +1343,163 @@ else:
             model=model,
             use_worktree=use_worktree,
         )
+
+
+def _list_persistent_agents_impl() -> Dict[str, Any]:
+    """Discover live terminals stamped with a canonical persistent agent ID.
+
+    This deliberately fans out across every session and then reads each exact
+    terminal record because the per-session summary omits metadata. A partial
+    discovery is unsafe for semantic routing: if any session/detail read fails,
+    fail the whole operation rather than silently hiding a possible duplicate.
+    """
+    if not ENABLE_PERSISTENT_AGENT_ROUTING:
+        return {
+            "success": False,
+            "error": (
+                "Persistent-agent routing is disabled for this MCP process. "
+                "Set CAO_ENABLE_PERSISTENT_AGENT_ROUTING=true only on an "
+                "authorized orchestrator profile."
+            ),
+            "agents": [],
+        }
+
+    try:
+        sessions_response = requests.get(f"{API_BASE_URL}/sessions", timeout=_mcp_timeout())
+        sessions_response.raise_for_status()
+        sessions = sessions_response.json()
+        if not isinstance(sessions, list):
+            return {
+                "success": False,
+                "error": "CAO /sessions returned a non-list response",
+                "agents": [],
+            }
+
+        agents: List[Dict[str, Any]] = []
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            session_name = session.get("id") or session.get("name")
+            if not session_name:
+                continue
+            listing = requests.get(
+                f"{API_BASE_URL}/sessions/{session_name}/terminals", timeout=_mcp_timeout()
+            )
+            listing.raise_for_status()
+            terminals = listing.json()
+            if not isinstance(terminals, list):
+                return {
+                    "success": False,
+                    "error": f"CAO session {session_name} returned a non-list terminal response",
+                    "agents": [],
+                }
+            for summary in terminals:
+                if not isinstance(summary, dict) or not summary.get("id"):
+                    continue
+                terminal_id = str(summary["id"])
+                detail_response = requests.get(
+                    f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+                )
+                detail_response.raise_for_status()
+                detail = detail_response.json()
+                metadata = detail.get("metadata") if isinstance(detail, dict) else None
+                if not isinstance(metadata, dict):
+                    continue
+                persistent_agent_id = metadata.get("persistent_agent_id")
+                if not isinstance(persistent_agent_id, str) or not persistent_agent_id.strip():
+                    continue
+                agents.append(
+                    {
+                        "agent_id": persistent_agent_id,
+                        "terminal_id": terminal_id,
+                        "display_name": metadata.get("display_name"),
+                        "organization_id": metadata.get("organization_id"),
+                        "kind": metadata.get("kind"),
+                        "parent_agent_id": metadata.get("parent_agent_id"),
+                        "agent_profile": detail.get("agent_profile"),
+                        "session_name": detail.get("session_name") or session_name,
+                        "status": detail.get("status"),
+                    }
+                )
+        agents.sort(key=lambda item: (str(item.get("organization_id") or ""), item["agent_id"]))
+        return {"success": True, "agents": agents, "count": len(agents)}
+    except requests.HTTPError as exc:
+        detail = str(exc)
+        if exc.response is not None:
+            detail = _extract_error_detail(exc.response, detail)
+        return {
+            "success": False,
+            "error": f"Persistent-agent discovery failed closed: {detail}",
+            "agents": [],
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Persistent-agent discovery failed closed: {exc}",
+            "agents": [],
+        }
+
+
+def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[str, Any]:
+    """Resolve a canonical persistent agent ID to its current terminal and send."""
+    agent_id = agent_id.strip()
+    if not agent_id:
+        return {"success": False, "error": "agent_id must not be empty"}
+
+    discovered = _list_persistent_agents_impl()
+    if not discovered.get("success"):
+        return discovered
+    matches = [a for a in discovered.get("agents", []) if a.get("agent_id") == agent_id]
+    if not matches:
+        return {
+            "success": False,
+            "error": f"No live persistent agent matches agent_id '{agent_id}'",
+        }
+    if len(matches) != 1:
+        ids = sorted(str(a.get("terminal_id")) for a in matches)
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent_id '{agent_id}' is ambiguous across {len(matches)} live "
+                f"terminals: {', '.join(ids)}"
+            ),
+        }
+
+    target = matches[0]
+    result = _send_message_impl(str(target["terminal_id"]), message)
+    if result.get("success"):
+        return {
+            **result,
+            "persistent_agent_id": agent_id,
+            "resolved_terminal_id": target["terminal_id"],
+            "resolved_session_name": target.get("session_name"),
+        }
+    return result
+
+
+@mcp.tool()
+async def list_persistent_agents() -> Dict[str, Any]:
+    """List live persistent agents by canonical semantic ID.
+
+    This cross-session discovery surface is disabled unless the MCP process was
+    launched with CAO_ENABLE_PERSISTENT_AGENT_ROUTING=true. It is intended for
+    trusted top-level orchestrators, not ordinary workers or department heads.
+    """
+    return _list_persistent_agents_impl()
+
+
+@mcp.tool()
+async def send_message_to_persistent_agent(
+    agent_id: str = Field(description="Canonical persistent_agent_id, e.g. shaffer-estimating"),
+    message: str = Field(description="Message content to send"),
+) -> Dict[str, Any]:
+    """Send to a persistent agent without exposing ephemeral terminal IDs.
+
+    The current terminal is resolved from exact `persistent_agent_id` metadata at
+    call time. Missing and duplicate matches fail closed; no fuzzy name/profile
+    fallback is performed.
+    """
+    return _send_message_to_persistent_agent_impl(agent_id, message)
 
 
 # Implementation function for send_message
