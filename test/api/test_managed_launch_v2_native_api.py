@@ -440,7 +440,7 @@ def test_session_env_rebind_returns_409_for_a_fingerprint_mismatch(client, monke
     backend = MagicMock()
     backend.session_exists.return_value = True
     monkeypatch.setattr("cli_agent_orchestrator.api.main.get_backend", lambda: backend)
-    env_vars = {"CAO_CONDUCTOR_MODEL": "glm-5.2"}
+    env_vars = {"CAO_CONDUCTOR_MODEL": "glm-5.3"}
 
     response = client.put(
         "/sessions/cao-fingerprint/env",
