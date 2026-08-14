@@ -370,6 +370,42 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
             cleanup_terminal(terminal_id, actual_session)
 
 
+def _run_restricted_read_test(provider: str, agent_profile: str, allowed_tools: str):
+    """Prove a deny-by-default Grok profile can still use its allowed Read tool."""
+    session_suffix = uuid.uuid4().hex[:6]
+    session_name = f"e2e-tools-read-{provider[:5]}-{session_suffix}"
+    probe_file = Path(f"/tmp/cao_e2e_read_test_{uuid.uuid4().hex}.txt")
+    token = uuid.uuid4().hex
+    terminal_id = None
+    actual_session = None
+
+    try:
+        probe_file.write_text(token, encoding="utf-8")
+        terminal_id, actual_session = _create_terminal_with_tools(
+            provider, agent_profile, allowed_tools, session_name
+        )
+        assert _wait_for_ready(terminal_id) in ("idle", "completed")
+
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/{terminal_id}/input",
+            params={
+                "message": (
+                    f"Use your native Read tool to read {probe_file}. "
+                    "Return the file contents exactly. Do not use Bash or any shell command."
+                )
+            },
+        )
+        assert response.status_code == 200, f"Send message failed: {response.status_code}"
+        assert wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT)
+        assert token in extract_output(
+            terminal_id
+        ), "Restricted agent could not use its allowed Read tool"
+    finally:
+        probe_file.unlink(missing_ok=True)
+        if terminal_id and actual_session:
+            cleanup_terminal(terminal_id, actual_session)
+
+
 def _run_unrestricted_tool_test(provider: str, agent_profile: str):
     """Test that a terminal with wildcard allowedTools CAN execute bash.
 
@@ -843,6 +879,14 @@ class TestGrokCliAllowedTools:
     def test_restricted_supervisor_cannot_bash(self, require_grok):
         """A Grok supervisor cannot execute a command when execute_bash is absent."""
         _run_restricted_tool_test(
+            provider="grok_cli",
+            agent_profile="code_supervisor",
+            allowed_tools="@cao-mcp-server,fs_read,fs_list",
+        )
+
+    def test_restricted_supervisor_can_read(self, require_grok):
+        """Deny-by-default launch policy preserves explicitly allowed native reads."""
+        _run_restricted_read_test(
             provider="grok_cli",
             agent_profile="code_supervisor",
             allowed_tools="@cao-mcp-server,fs_read,fs_list",

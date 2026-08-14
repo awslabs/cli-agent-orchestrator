@@ -546,7 +546,7 @@ def test_profile_model_is_fallback(tmp_path):
     provider.cleanup()
 
 
-def test_restricted_command_has_native_denies_and_web_kill_switch(tmp_path):
+def test_restricted_command_uses_deny_by_default_with_native_denies(tmp_path):
     provider = make_provider(allowed_tools=["fs_read", "fs_list", "@cao-mcp-server"])
     with (
         patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
@@ -559,8 +559,62 @@ def test_restricted_command_has_native_denies_and_web_kill_switch(tmp_path):
     assert "Write" in denied
     assert "Read" not in denied
     assert "Grep" not in denied
+    assert "--always-approve" not in parts
+    assert parts[parts.index("--permission-mode") + 1] == "dontAsk"
+    allowed = [parts[index + 1] for index, part in enumerate(parts) if part == "--allow"]
+    assert {"Read", "NotebookRead", "Grep", "Glob", "MCPTool(cao-mcp-server__*)"} <= set(allowed)
+    assert "Bash" not in allowed
     # Live Grok 1.0.0 probing showed --deny WebSearch alone is insufficient.
     assert "--disable-web-search" in parts
+    provider.cleanup()
+
+
+def test_restricted_command_allows_only_valid_configured_mcp_servers(tmp_path):
+    profile = _profile(
+        mcpServers={
+            "inventory": {"command": "inventory-mcp"},
+            "github.com": {"command": "github-mcp"},
+            "1password": {"command": "password-mcp"},
+            "invalid name": {"command": "unused-mcp"},
+        }
+    )
+    provider = make_provider(
+        agent_profile="grok-worker",
+        allowed_tools=[
+            "@cao-mcp-server",
+            "@inventory",
+            "@github.com",
+            "@1password",
+            "@builtin",
+            "@*",
+            "@foo*",
+            "@foo)",
+            "@invalid name",
+            "@unconfigured",
+        ],
+    )
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+            return_value=profile,
+        ),
+    ):
+        parts = shlex.split(provider._build_grok_command())
+
+    allowed = [parts[index + 1] for index, part in enumerate(parts) if part == "--allow"]
+    expected_mcp_rules = {
+        "MCPTool(cao-mcp-server__*)",
+        "MCPTool(inventory__*)",
+        "MCPTool(github.com__*)",
+        "MCPTool(1password__*)",
+    }
+    assert expected_mcp_rules <= set(allowed)
+    assert not any(
+        candidate.startswith("MCPTool(") and candidate not in expected_mcp_rules
+        for candidate in allowed
+    )
     provider.cleanup()
 
 
@@ -583,7 +637,9 @@ def test_explicit_empty_allowlist_denies_every_native_surface(tmp_path):
     ):
         parts = shlex.split(provider._build_grok_command())
     denied = [parts[index + 1] for index, part in enumerate(parts) if part == "--deny"]
-    assert {"Bash", "Read", "Edit", "Write", "Grep", "WebFetch", "WebSearch"} <= set(denied)
+    assert denied == ["*"]
+    assert parts[parts.index("--permission-mode") + 1] == "dontAsk"
+    assert "--allow" not in parts
     assert "--disable-web-search" in parts
     provider.cleanup()
 

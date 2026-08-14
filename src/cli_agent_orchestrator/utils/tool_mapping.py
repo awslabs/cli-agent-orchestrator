@@ -199,6 +199,27 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
     return disallowed
 
 
+def get_allowed_tools(provider: str, allowed: List[str]) -> List[str]:
+    """Return native tools explicitly granted by a CAO allowlist.
+
+    Unlike :func:`get_disallowed_tools`, this is used where a provider has a
+    deny-by-default permission mode and must receive affirmative native rules
+    for every CAO capability it is allowed to use.
+    """
+    if "*" in allowed:
+        return sorted(ALL_NATIVE_TOOLS.get(provider, set()))
+
+    mapping = TOOL_MAPPING.get(provider)
+    if not mapping:
+        return []
+
+    allowed_native: Set[str] = set()
+    for cao_tool in allowed:
+        if cao_tool in mapping:
+            allowed_native.update(mapping[cao_tool])
+    return sorted(allowed_native)
+
+
 def format_tool_summary(allowed: List[str]) -> str:
     """Format allowedTools into a human-readable summary for the confirmation prompt.
 

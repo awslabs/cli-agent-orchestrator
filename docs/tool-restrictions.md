@@ -251,7 +251,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **Kiro CLI** | Hard | `allowedTools` in agent JSON at install time |
 | **Copilot CLI** | Hard | `--deny-tool` flags override `--allow-all` |
 | **OpenCode CLI** | Hard | `permission:` YAML frontmatter enforced natively at install time |
-| **Grok Build CLI** | Hard | Native `--deny` rules override `--always-approve`; native subagents are disabled |
+| **Grok Build CLI** | Native (mapped families) | Restricted profiles use deny-by-default `--permission-mode dontAsk` with explicit native/MCP allows and defense-in-depth denies; native subagents are disabled |
 | **Kimi CLI** | Soft | Security system prompt only |
 | **Codex** | Soft | Security system prompt only |
 | **Antigravity CLI** | Soft | Security system prompt only |
@@ -281,13 +281,24 @@ claude --dangerously-skip-permissions --disallowedTools Bash --disallowedTools E
 copilot --allow-all --deny-tool shell --deny-tool write
 ```
 
-**Grok Build CLI** — Adds native `--deny` rules alongside auto-approval and
+**Grok Build CLI** — For a restricted profile, uses deny-by-default
+`--permission-mode dontAsk`, explicitly grants mapped native tools and known
+configured MCP servers, adds native `--deny` rules as defense in depth, and
 disables Grok-native worker routes by default:
 
 ```bash
 GROK_SUBAGENTS=0 GROK_WORKFLOWS=0 GROK_GOAL=0 \
-  grok --always-approve --no-subagents --deny Bash --deny Edit --deny Write
+  grok --permission-mode dontAsk --no-subagents \
+  --allow Read --allow Grep --allow 'MCPTool(cao-mcp-server__*)' \
+  --deny Bash --deny Edit --deny Write
 ```
+
+`allowedTools: ["*"]` remains the unrestricted path and uses
+`--always-approve`. Grok may retain built-in read-only operations in some
+permission modes; this provider limitation is not represented by CAO's
+`allowedTools` vocabulary. An explicit empty allowlist sends `--deny *`, while
+restricted profiles explicitly grant mapped native/MCP families and literal,
+configured server names (plus `cao-mcp-server`).
 
 Set `grokNativeWorkflows: true` in a Grok agent profile only when intentionally
 allowing Grok-native workers outside CAO's orchestration accounting. It is
@@ -346,7 +357,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 1. **Claude Code tool mapping is nearly complete, with MCP tools the remaining gap.** The current mapping covers `Bash` (and its `Task`/`Agent`/`Monitor`/`BashOutput`/`KillShell` execution family), `Read`, `Edit`, `Write`, `Glob`, `Grep`, and — via `web_fetch` — [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch) and `WebSearch`. The subagent tool is intentionally **not** a separate category: it is folded into `execute_bash`, because a subagent spawns with its own full toolset and can run shell, so exposing it standalone would let a profile grant subagent access without `execute_bash` and re-open that escape. Claude Code **renamed this tool from `Task` to `Agent`**, so both names are denied — current builds expose only `Agent`, so denying just `Task` would be a silent no-op. Provider MCP tools remain unmapped (see limitation #2) — they cannot be blocked via `--disallowedTools`.
 
-2. **`@cao-mcp-server` is a pass-through marker, not enforced at the provider level.** Including `@cao-mcp-server` in `allowedTools` signals intent (this agent should have orchestration tools), but it does **not** translate to any native `--disallowedTools` flag. MCP tools (`handoff`, `assign`, `send_message`, `answer_user_prompt`) are always available to the agent regardless of `allowedTools` — providers do not currently support blocking individual MCP tools. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Additionally, `@cao-mcp-server` is all-or-nothing: there is no way to allow only `send_message` while blocking `assign`. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
+2. **`@cao-mcp-server` is server-level, not per-tool control.** Grok restricted profiles translate it to an allow rule for the configured CAO MCP server; other providers generally treat it as an intent marker. No provider currently blocks individual MCP tools: once the server is available, its `handoff`, `assign`, `send_message`, and `answer_user_prompt` tools are all available. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
 
 3. **Soft enforcement is best-effort.** Kimi CLI and Codex rely on system prompt instructions to restrict tools. The agent may ignore these restrictions. Do not rely on soft enforcement for security-critical workloads.
 

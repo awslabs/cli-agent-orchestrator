@@ -4,6 +4,7 @@ import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
     format_tool_summary,
+    get_allowed_tools,
     get_disallowed_tools,
     resolve_allowed_tools,
 )
@@ -214,6 +215,22 @@ class TestGrokCliToolMapping:
 
     def test_unrestricted_star_emits_no_deny_rules(self):
         assert get_disallowed_tools("grok_cli", ["*"]) == []
+
+    def test_restricted_allowlist_returns_only_explicit_native_capabilities(self):
+        assert get_allowed_tools("grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"]) == [
+            "Glob",
+            "Grep",
+            "NotebookRead",
+            "Read",
+        ]
+        assert "Bash" not in get_allowed_tools(
+            "grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"]
+        )
+
+    def test_wildcard_allowlist_returns_all_native_capabilities(self):
+        assert set(get_allowed_tools("grok_cli", ["*"])) == set(
+            get_allowed_tools("grok_cli", ["fs_*", "execute_bash", "web_fetch"])
+        )
 
     def test_each_category_remains_independently_governed(self):
         bash_only = get_disallowed_tools("grok_cli", ["execute_bash"])

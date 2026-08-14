@@ -114,6 +114,10 @@ _CHROME_LINE = re.compile(
     r"Grok\s+\S+.*always-approve|Clipboard may be unreachable)",
     re.IGNORECASE,
 )
+# Grok treats a server name before ``__`` as a literal identifier.  Accept the
+# conventional MCP names used by existing profiles (including dots and a
+# leading digit), but never accept pattern syntax or structural punctuation.
+_MCP_SERVER_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 def _toml_string(value: Any) -> str:
@@ -330,6 +334,36 @@ class GrokCliProvider(BaseProvider):
         return "\n".join(lines) + "\n"
 
     @staticmethod
+    def _permitted_mcp_server_refs(
+        allowed_tools: list, mcp_servers: Optional[dict[str, Any]]
+    ) -> list[str]:
+        """Return configured MCP server names safely referenced by ``allowedTools``.
+
+        Grok's ``MCPTool(server__*)`` permission language accepts a pattern.
+        Never interpolate an arbitrary ``@...`` CAO entry into that pattern:
+        only a conventional server name that is actually configured for this
+        profile (or CAO's built-in orchestration server) may grant MCP access.
+        ``@builtin`` is a CAO vocabulary marker, not an MCP server reference.
+        Unknown or malformed entries remain denied by the enclosing dontAsk
+        policy instead of widening it.
+        """
+        configured = {"cao-mcp-server"}
+        if isinstance(mcp_servers, dict):
+            configured.update(name for name in mcp_servers if isinstance(name, str))
+
+        return sorted(
+            {
+                name
+                for tool_ref in allowed_tools
+                if isinstance(tool_ref, str)
+                and tool_ref.startswith("@")
+                and (name := tool_ref[1:]) != "builtin"
+                and _MCP_SERVER_REF.fullmatch(name)
+                and name in configured
+            }
+        )
+
+    @staticmethod
     def _atomic_write_private(path: Path, content: str) -> None:
         """Atomically publish UTF-8 text at mode 0600 in ``path``'s directory."""
 
@@ -401,7 +435,6 @@ class GrokCliProvider(BaseProvider):
             f"GROK_GOAL={int(native_workflows)}",
             binary,
             "--no-alt-screen",
-            "--always-approve",
         ]
         if not native_workflows:
             command_parts.append("--no-subagents")
@@ -416,12 +449,37 @@ class GrokCliProvider(BaseProvider):
             command_parts.extend(["--rules", rules])
 
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
-            from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+            from cli_agent_orchestrator.utils.tool_mapping import (
+                get_allowed_tools,
+                get_disallowed_tools,
+            )
 
-            for tool in get_disallowed_tools("grok_cli", self._allowed_tools):
-                command_parts.extend(["--deny", tool])
+            # Grok 1.0.0's documented automation mode keeps deny rules in
+            # force, but live CAO probes observed an intermittent Bash escape
+            # under --always-approve.  Use Grok's deny-by-default mode for a
+            # restricted CAO profile instead: explicitly allow only native
+            # capabilities and CAO MCP tools, then retain native denials as a
+            # defense-in-depth guard. This remains unattended: a non-allowed
+            # Bash call is denied by dontAsk before it can prompt or execute.
+            command_parts.extend(["--permission-mode", "dontAsk"])
+            if self._allowed_tools:
+                for tool in get_allowed_tools("grok_cli", self._allowed_tools):
+                    command_parts.extend(["--allow", tool])
+                for server_name in self._permitted_mcp_server_refs(
+                    self._allowed_tools, mcp_servers
+                ):
+                    command_parts.extend(["--allow", f"MCPTool({server_name}__*)"])
+
+                for tool in get_disallowed_tools("grok_cli", self._allowed_tools):
+                    command_parts.extend(["--deny", tool])
+            else:
+                # dontAsk still grants Grok's built-in read-only operations;
+                # an explicit empty CAO list must deny every tool class.
+                command_parts.extend(["--deny", "*"])
             if "web_fetch" not in self._allowed_tools:
                 command_parts.append("--disable-web-search")
+        else:
+            command_parts.append("--always-approve")
 
         return shlex.join(command_parts)
 

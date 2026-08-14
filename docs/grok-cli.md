@@ -89,15 +89,21 @@ The command has this shape:
 
 ```text
 env GROK_SUBAGENTS=0 GROK_WORKFLOWS=0 GROK_GOAL=0 \
-  grok --no-alt-screen --always-approve --no-subagents \
-  [--model MODEL] [--rules RULES] [--deny RULE ...]
+  grok --no-alt-screen --no-subagents \
+  [--model MODEL] [--rules RULES] \
+  [--permission-mode dontAsk --allow RULE ... --deny RULE ...]
 ```
 
 - `--no-alt-screen` keeps the rendered conversation observable by CAO.
-- `--always-approve` prevents ordinary tool approval prompts from blocking
-  unattended orchestration.
-- Native `--deny` rules still override auto-approval and provide hard tool
-  restrictions.
+- With `allowedTools: ["*"]`, `--always-approve` keeps unrestricted sessions
+  unattended. For a restricted profile, CAO instead uses Grok's deny-by-default
+  `--permission-mode dontAsk`, explicitly grants mapped native tools and known
+  MCP servers, and adds native `--deny` rules as defense in depth.
+- Grok may retain built-in read-only behavior in some permission modes. That is
+  a provider limitation outside CAO's `allowedTools` vocabulary: an explicit
+  empty CAO allowlist sends `--deny *`, while restricted profiles explicitly
+  grant only the mapped native/MCP families below. Recheck this behavior after a
+  Grok CLI upgrade.
 - `--no-subagents`, `GROK_SUBAGENTS=0`, `GROK_WORKFLOWS=0`, and
   `GROK_GOAL=0` prevent Grok-native workers, workflows, and `/goal` from
   bypassing CAO roles, permissions, callbacks, or terminal accounting. This
@@ -173,12 +179,17 @@ native Grok deny rules:
 Grok-native delegation: CAO keeps subagents, workflows, and `/goal` disabled
 unless a profile explicitly sets `grokNativeWorkflows: true`, so `assign` and
 `handoff` remain the accountable orchestration mechanisms by default. For a
-restricted role, deny rules are applied alongside `--always-approve`;
-auto-approval does not turn a denied tool back on.
+restricted role, CAO uses `--permission-mode dontAsk` and emits explicit
+`--allow` rules for the mapped native tools and configured MCP server names.
+It also retains explicit native denies as defense in depth. Arbitrary
+`@server` strings never become Grok MCP permission patterns: a server name must
+be a literal Grok-safe identifier and be either `cao-mcp-server` or configured
+in that profile's `mcpServers` block.
 
-`@cao-mcp-server` follows CAO's current shared MCP limitation: it records the
-profile's orchestration intent, but individual MCP tools are not blocked at
-the provider level. See [Tool Restrictions](tool-restrictions.md).
+`@cao-mcp-server` grants Grok's configured CAO MCP server as an all-or-nothing
+server-level rule in a restricted profile. CAO does not yet express a rule for
+an individual MCP tool such as `send_message` without `assign`; see [Tool
+Restrictions](tool-restrictions.md).
 
 ## Assign and Handoff Example
 
