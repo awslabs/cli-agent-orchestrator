@@ -309,7 +309,13 @@ async def create_terminal(
             resolved_engine = None
 
         # Resolve tool policy before persistence for non-Kiro providers too.
-        if allowed_tools is None and profile is not None:
+        # Profile-level yolo is Codex-only and is an explicit permission floor:
+        # it overrides inherited restrictions from a parent/supervisor.
+        if profile is not None and getattr(profile, "yolo", False) is True:
+            if provider != ProviderType.CODEX.value:
+                raise ValueError("profile field 'yolo' is currently supported only for provider 'codex'")
+            allowed_tools = ["*"]
+        elif allowed_tools is None and profile is not None:
             from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
             mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None

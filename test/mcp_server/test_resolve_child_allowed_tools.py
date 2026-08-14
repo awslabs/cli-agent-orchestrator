@@ -32,6 +32,23 @@ class TestResolveChildAllowedTools:
 
     @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
     @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_profile_yolo_is_unrestricted_even_with_restricted_parent(
+        self, mock_load, mock_resolve
+    ):
+        mock_profile = MagicMock()
+        mock_profile.yolo = True
+        mock_load.return_value = mock_profile
+
+        result = _resolve_child_allowed_tools(
+            parent_allowed_tools=["@cao-mcp-server", "fs_read", "fs_list"],
+            child_profile_name="department-worker",
+        )
+
+        assert result is None
+        mock_resolve.assert_not_called()
+
+    @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
     def test_child_none_inherits_parent_restrictions(self, mock_load, mock_resolve):
         """Child with no profile (FileNotFoundError) inherits parent's tools."""
         mock_load.side_effect = FileNotFoundError("not found")

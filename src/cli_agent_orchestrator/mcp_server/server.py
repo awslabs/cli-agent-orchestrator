@@ -161,6 +161,10 @@ def _resolve_child_allowed_tools(
 
     try:
         child_profile = load_agent_profile(child_profile_name)
+        if getattr(child_profile, "yolo", False) is True:
+            # Explicit profile-level yolo is a permission-floor choice. None is
+            # CAO's canonical representation of unrestricted child tools.
+            return None
         mcp_server_names = (
             list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
         )

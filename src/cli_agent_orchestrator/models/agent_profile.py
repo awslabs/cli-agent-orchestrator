@@ -100,6 +100,10 @@ class AgentProfile(BaseModel):
     # empty string from silently degrading to --yolo, since this is a
     # permission-floor knob.
     codexProfile: Optional[str] = Field(default=None, min_length=1)
+    # Codex-only. When true, launch Codex with --yolo while preserving any
+    # configured codexProfile. This is an explicit profile-level permission
+    # choice, equivalent to unrestricted CAO tool access for the profile.
+    yolo: Optional[bool] = False
 
     # Codex-only. Inline Codex config overrides passed as `-c key=value` at
     # launch (e.g. {"model_reasoning_effort": "xhigh", "service_tier": "fast",

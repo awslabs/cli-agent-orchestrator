@@ -95,6 +95,10 @@
       "type": "string",
       "minLength": 1
     },
+    "yolo": {
+      "type": "boolean",
+      "description": "Codex-only profile-level unrestricted mode. Preserves codexProfile and launches with --yolo."
+    },
     "codexConfig": {
       "type": "object"
     },
