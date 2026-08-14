@@ -4,7 +4,24 @@ import { StatusBadge } from '../components/StatusBadge'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
 import { FALLBACK_PROVIDERS } from '../components/AgentPanel'
+import type { Annotation } from '../api'
 import { projectedTerminal } from './projectedTerminal'
+
+function workItem(phase: string): Annotation {
+  return {
+    namespace: 'cao.work-state',
+    kind: 'work-item',
+    version: 1,
+    label: phase === 'in-round' ? 'active' : phase,
+    semantic_role: 'info',
+    priority: 50,
+    subject: { type: 'terminal', terminal_id: 'term-1', generation: 'gen-1' },
+    valid_until: '2999-01-01T00:00:00Z',
+    colour_key: null,
+    details: { phase },
+    source: 'test',
+  }
+}
 
 describe('StatusBadge', () => {
   it('renders idle status', () => {
@@ -96,6 +113,54 @@ describe('StatusBadge', () => {
   it('renders a managed native terminal as live without claiming turn activity', () => {
     render(<StatusBadge status="not_fifo_monitored" />)
     expect(screen.getByText('Managed Live')).toBeInTheDocument()
+  })
+
+  it('pulses Managed Active only while pane rendering is recent', () => {
+    const recent = projectedTerminal({
+      status: 'not_fifo_monitored',
+      status_signals: [{ name: 'liveness', state: 'available', value: 5 }],
+    })
+    const quiet = projectedTerminal({
+      status: 'not_fifo_monitored',
+      status_signals: [{ name: 'liveness', state: 'available', value: 31 }],
+    })
+    const { rerender } = render(<StatusBadge status="not_fifo_monitored" terminal={recent} />)
+    const active = screen.getByRole('note', { name: /Managed Active/ })
+    expect(active.querySelector('.animate-pulse')).not.toBeNull()
+
+    rerender(<StatusBadge status="not_fifo_monitored" terminal={quiet} />)
+    const live = screen.getByRole('note', { name: /Managed Live/ })
+    expect(live.querySelector('.animate-pulse')).toBeNull()
+  })
+
+  it('lets a durable parked checkpoint suppress an incidental activity pulse', () => {
+    const terminal = projectedTerminal({
+      status: 'not_fifo_monitored',
+      status_signals: [{ name: 'liveness', state: 'available', value: 0 }],
+    })
+    render(<StatusBadge status="not_fifo_monitored" terminal={terminal} annotations={[workItem('parked')]} />)
+    const parked = screen.getByRole('note', { name: /Managed Parked/ })
+    expect(parked.querySelector('.animate-pulse')).toBeNull()
+  })
+
+  it('keeps a quiet managed processing claim in evidence instead of the headline', async () => {
+    const terminal = projectedTerminal({
+      status: 'processing',
+      status_confidence: 'high',
+      status_reason: 'classified from the rendered pane',
+      status_signals: [
+        { name: 'screen', state: 'available', value: 'processing' },
+        { name: 'liveness', state: 'available', value: 725 },
+      ],
+    })
+    render(<StatusBadge status="processing" terminal={terminal} annotations={[workItem('in-round')]} />)
+    const badge = screen.getByRole('note', { name: /Managed Live/ })
+    expect(badge.textContent).not.toContain('Processing')
+
+    fireEvent.mouseEnter(badge)
+    const card = await screen.findByTestId('status-hovercard')
+    expect(card.textContent).toContain('Processing')
+    expect(card.textContent).toContain('no pane rendering change for 12m 5s')
   })
 
   it('renders proven-dead and superseded dispositions explicitly', () => {

@@ -1354,3 +1354,67 @@ def test_managed_control_identity_does_not_hide_missing_columns(isolated_memory_
         conn.commit()
     with pytest.raises(Exception):
         managed_launch.managed_control_identity("a1b2c3d4")
+
+
+def test_input_carrying_managed_operation_arms_processing_transition(monkeypatch):
+    identity = {
+        "reservation_id": "reservation-1",
+        "terminal_id": "deadbeef",
+        "generation": "generation-1",
+        "provider": "codex",
+        "controllable": True,
+    }
+    events = []
+    monkeypatch.setattr(managed_launch, "managed_control_identity", lambda _tid: identity)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent",
+        lambda terminal_id: events.append(("armed", terminal_id)),
+    )
+
+    def request_bridge(_reservation_id, _command, *, timeout):
+        events.append(("submitted", timeout))
+        return {"receipt": {"state": "accepted"}}
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        request_bridge,
+    )
+
+    managed_launch.begin_managed_session_operation(
+        "deadbeef",
+        operation_id="operation-1",
+        action="follow-up",
+        generation="generation-1",
+        message="continue",
+    )
+
+    assert events == [("armed", "deadbeef"), ("submitted", 45.0)]
+
+
+def test_read_only_managed_operation_does_not_arm_processing_transition(monkeypatch):
+    identity = {
+        "reservation_id": "reservation-1",
+        "terminal_id": "deadbeef",
+        "generation": "generation-1",
+        "provider": "codex",
+        "controllable": True,
+    }
+    armed = []
+    monkeypatch.setattr(managed_launch, "managed_control_identity", lambda _tid: identity)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent",
+        armed.append,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        lambda *_args, **_kwargs: {"receipt": {"state": "completed"}},
+    )
+
+    managed_launch.begin_managed_session_operation(
+        "deadbeef",
+        operation_id="operation-1",
+        action="route-query",
+        generation="generation-1",
+    )
+
+    assert armed == []

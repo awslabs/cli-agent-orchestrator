@@ -31,7 +31,7 @@ describe('DashboardHome status filter row appearance', () => {
     useStore.setState({ sessions: [], terminalStatuses: {} })
   })
 
-  it('renders the options in STATUS_ORDER, with Managed Live directly after Processing', async () => {
+  it('renders the complete managed-worker vocabulary before raw provider states', async () => {
     await renderDashboard()
 
     // THE DELIBERATE CHANGE THIS REDESIGN WAS GRANTED. The container that
@@ -49,10 +49,13 @@ describe('DashboardHome status filter row appearance', () => {
     // ships in the generated STATUS_CONFIG and previously folded silently to
     // Unknown.
     expect(labels).toEqual([
-      'Processing',
+      'Managed Active',
+      'Managed Parked',
       'Managed Live',
+      'Processing',
       'Idle',
       'Awaiting Input',
+      'Managed Stalled',
       'Error',
       'Turn finished',
       'Stopped',
@@ -62,10 +65,10 @@ describe('DashboardHome status filter row appearance', () => {
     ])
   })
 
-  it('orders the summary chips by STATUS_ORDER too, so Managed Live precedes Idle', async () => {
+  it('orders active, live, and raw status summary chips by STATUS_ORDER', async () => {
     await renderDashboard()
 
-    expect(summaryChips()).toEqual(['2Managed Live', '1Idle'])
+    expect(summaryChips()).toEqual(['1Managed Active', '1Managed Live', '1Idle'])
   })
 
   it('dresses the selected Managed Live option in the info (blue) palette family', async () => {

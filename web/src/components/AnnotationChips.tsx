@@ -1,12 +1,9 @@
 // Conductor annotation chips (work-state design §9.5).
 //
-// THESE RENDER ALONGSIDE StatusBadge, NEVER INSTEAD OF IT. `status` on a
-// projection row is the fork's own statement and stays fork-owned:
-// `not_fifo_monitored` already IS a reachability claim ("Managed Live"), and
-// replacing it with a conductor label would delete the only thing the fork
-// knows and the conductor does not. A row therefore reads
-// "<provider status> <conductor chips>", two independent sources, neither
-// arbitrating the other.
+// These render alongside the headline StatusBadge. The badge may use a fresh
+// parked checkpoint to refine its managed-worker presentation, but it never
+// overwrites the raw provider/lifecycle observation: that evidence remains in
+// the status hover card and the row's complete details panel.
 //
 // COLOUR COMES FROM design-tokens/tokens.json, NOT design-tokens/status.json.
 // The six semantic roles already exist as the `cao-*` Tailwind family in the
@@ -67,6 +64,7 @@ import {
   UnplacedReason,
 } from '../lib/annotations'
 import { identityStyle } from '../lib/identityColour'
+import { annotationDisplayLabel } from '../lib/terminalDisplay'
 import { fmtAbs, fmtAge, fmtRel, parseTimestamp } from '../lib/time'
 
 /** Most SEVERITY chips drawn inline on one terminal row before the overflow marker. */
@@ -225,6 +223,10 @@ export function AnnotationChip({ annotation, stale }: { annotation: Annotation; 
  * ago is read as current at a glance, and the glance is the whole product.
  */
 function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: boolean }) {
+  const displayLabel = annotationDisplayLabel(annotation)
+  const displayedAnnotation = displayLabel === annotation.label
+    ? annotation
+    : { ...annotation, label: displayLabel }
   const state = stale === undefined ? freshness(annotation.valid_until) : stale ? 'stale' : 'fresh'
   const isOld = state !== 'fresh'
   const role = isOld ? 'neutral' : resolveRole(annotation.semantic_role)
@@ -243,7 +245,7 @@ function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: b
   // The card is portalled, so `hoverCard` adds no box here and `anchorProps`
   // go straight onto the chip — nothing is interposed between it and the flex
   // container whose rules the 390px layout depends on.
-  const { anchorProps, hoverCard } = useAnnotationHover(annotation)
+  const { anchorProps, hoverCard } = useAnnotationHover(displayedAnnotation)
 
   return (
     <>
@@ -255,7 +257,7 @@ function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: b
       data-stale={state === 'stale' ? 'true' : 'false'}
       data-freshness={state}
       role="note"
-      aria-label={`${annotation.label}${age ? `, ${age}` : ''} — ${hover}`}
+      aria-label={`${displayLabel}${age ? `, ${age}` : ''} — ${hover}`}
       // Staleness is signalled by the neutral role, a dashed outline and a
       // hollow dot — NOT by opacity. Dimming the whole chip was the first
       // attempt and axe caught it: `opacity-60` blends the label into the
@@ -263,12 +265,8 @@ function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: b
       // operator most needs to be able to read would have been the one hardest
       // to read. It also gives staleness a second, non-colour channel.
       //
-      // `rounded-md` AGAINST StatusBadge's `rounded-full` IS THE POINT. The two
-      // were the same object 20% smaller, separated by hue alone — and on a
-      // real fleet the badge is a constant "Managed Live" carrying no
-      // information while the chip is the only pill on the row that says
-      // anything. The eye went to the uninformative one. A squared silhouette
-      // is a pre-attentive difference that costs nothing structurally.
+      // `rounded-md` against StatusBadge's `rounded-full` separates durable
+      // work annotations from the operational headline without relying on hue.
       //
       // `shrink-0 whitespace-nowrap` IS LOAD-BEARING AT 390px. Without them
       // flexbox shrank the sibling profile-name span to zero and then wrapped
@@ -284,7 +282,7 @@ function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: b
         }`}
       />
       <span className={`text-[10px] font-medium truncate max-w-[16ch] ${cls.text}`}>
-        {annotation.label}
+        {displayLabel}
       </span>
       {age && <span className="text-[10px] text-gray-400 shrink-0">{age}</span>}
       {/* Visible, because `title` does not exist on a touch screen and the

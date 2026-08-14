@@ -56,8 +56,8 @@ describe('displayStatus is one fold for counting and filtering', () => {
     // The store uppercases the polled status; the row itself reports
     // 'not_fifo_monitored'. A fold accepting only uppercase filed every row
     // read straight from /sessions/{name} under UNKNOWN.
-    expect(displayStatus('not_fifo_monitored')).toBe('NOT_FIFO_MONITORED')
-    expect(displayStatus('NOT_FIFO_MONITORED')).toBe('NOT_FIFO_MONITORED')
+    expect(displayStatus('not_fifo_monitored')).toBe('MANAGED_LIVE')
+    expect(displayStatus('NOT_FIFO_MONITORED')).toBe('MANAGED_LIVE')
   })
 
   it('renders proven lifecycle dispositions and folds only unknown evidence', () => {

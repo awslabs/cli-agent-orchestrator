@@ -1061,6 +1061,49 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.ERROR
 
+    def test_fatal_provider_diagnostic_outranks_completed_history(self):
+        """A bridge auth failure is ERROR even after an earlier assistant reply."""
+        output = (
+            "› finish the design\n"
+            "• The design is complete.\n"
+            "\n"
+            "[provider diagnostic] 2026-08-10T22:35:00Z ERROR "
+            "failed to refresh available models: unexpected status 401 Unauthorized: "
+            "Provided authentication token is expired., auth error code: token_expired\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.ERROR
+
+    def test_nonfatal_provider_diagnostic_does_not_invent_error(self):
+        """Warnings from the bridge remain ordinary provider evidence."""
+        output = (
+            "› finish the design\n"
+            "• The design is complete.\n"
+            "\n"
+            "[provider diagnostic] WARN retrying model metadata refresh\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_later_provider_output_supersedes_stale_fatal_diagnostic(self):
+        """A recovered provider is not held in ERROR by old bridge history."""
+        output = (
+            "[provider diagnostic] ERROR unexpected status 401 Unauthorized: "
+            "auth error code: token_expired\n"
+            "› retry after login\n"
+            "• The request succeeded after authentication was refreshed.\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
     def test_get_status_completed_multi_turn_bullet(self):
         """COMPLETED uses last user message in multi-turn bullet format."""
         output = (

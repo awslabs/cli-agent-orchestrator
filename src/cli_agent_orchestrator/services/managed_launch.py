@@ -1615,6 +1615,14 @@ def begin_managed_session_operation(
         raise ManagedLaunchConflict("stale managed terminal generation")
     if not operation_id or not action:
         raise ManagedLaunchConflict("operation_id and action are required")
+    if action in {"follow-up", "compact"}:
+        # Managed bridge operations bypass terminal_service.send_input, so arm
+        # the same ready-to-processing transition explicitly before provider
+        # input. This lets a repaired generation leave a previously latched
+        # ERROR state when its next real turn begins.
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        status_monitor.notify_input_sent(terminal_id)
     command = {
         "bridge_version": "cao-native-provider-bridge-v1",
         "op": "session.op.begin",
