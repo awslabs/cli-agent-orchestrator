@@ -71,10 +71,16 @@ def load_profile_schema() -> dict:
     return json.loads(schema_path.read_text(encoding="utf-8"))
 
 
-def _non_string_key_findings(
-    value: object, path: str = "", _depth: int = 0
-) -> list["ValidationMessage"]:
-    """Report every mapping key in ``value`` that is not a string.
+# Ceilings for the key walk below, on a document that is genuinely huge or
+# deeply nested rather than aliased. Generous by ~1000x: the largest bundled
+# profile's frontmatter parses to 23 values and nests 3 deep, so no legitimate
+# profile approaches either bound.
+_MAX_WALK_VALUES = 20_000
+_MAX_WALK_DEPTH = 64
+
+
+def _non_string_key_findings(metadata: object) -> list["ValidationMessage"]:
+    """Report every mapping key reachable from ``metadata`` that is not a string.
 
     Closes a gap between the two formats in play. A profile arrives as **YAML**,
     which allows any scalar as a mapping key, but the format is described by
@@ -93,38 +99,100 @@ def _non_string_key_findings(
     unquoted dates, so ``2026-01-01:`` becomes a ``datetime.date`` key. Checking
     the key type generally covers those without enumerating them.
 
+    **Why the walk is bounded.** YAML anchors make a document's value *graph*
+    arbitrarily larger than its bytes: ``yaml.safe_load`` resolves each alias to
+    another reference to the *same* object, so N chained anchors that each
+    reference the previous one twice build a graph an unmemoized walk traverses
+    2**N times while memory stays linear. The first version of this function
+    carried only a depth cap, which bounded the wrong dimension -- depth was
+    never the problem, revisiting shared objects was -- and a 640-byte,
+    schema-valid document with 20 anchor levels took ~1s here against ~0s in
+    jsonschema, doubling per added level. That is reachable unauthenticated:
+    ``POST /agents/profiles/validate`` is scope-exempt and declared ``async``,
+    so a synchronous walk on its thread stalls the whole event loop.
+
+    Two bounds, each covering what the other does not:
+
+    - ``seen`` skips any container already walked, keyed on ``id()``. This
+      removes the amplification at its source and costs no coverage: a shared
+      subtree cannot hold a different set of keys on a second visit, so one
+      finding per offending key is the correct output, reported at the first
+      path that reaches it. Comparing identity is sound here specifically
+      because every value stays reachable from ``metadata`` for the duration of
+      the walk, so nothing can be collected and no id can be recycled midway.
+    - ``_MAX_WALK_VALUES`` and ``_MAX_WALK_DEPTH`` bound a document that is
+      merely enormous, which memoizing identity does not. Exceeding either adds
+      an **error** finding, so such a document is rejected rather than quietly
+      called valid on the strength of a partial walk.
+
     Args:
-        value: Any parsed YAML value. Only mappings and sequences are descended.
-        path: Dotted path of ``value`` within the document, for the finding.
-        _depth: Recursion guard. YAML aliases can build deeply nested or
-            self-referential structures, and a validator must not hang on input
-            whose whole problem is that it is malformed.
+        metadata: Any parsed YAML value. Only mappings and sequences are
+            descended into.
 
     Returns:
-        One error finding per offending key, in document order.
+        Error findings in document order: one per offending key, plus a final
+        one if a bound was reached.
     """
-    if _depth > 32:
-        return []
-
     findings: list[ValidationMessage] = []
+    seen: set[int] = set()
+    remaining = _MAX_WALK_VALUES
+    limit_reached: Optional[str] = None
 
-    if isinstance(value, dict):
-        for key, child in value.items():
-            child_path = f"{path}.{key}" if path else str(key)
-            if not isinstance(key, str):
-                findings.append(
-                    ValidationMessage(
-                        "error",
-                        f"Mapping key {key!r} is a {type(key).__name__}, not a string. "
-                        f"Profile fields are string-keyed; quote it as '{key}'.",
-                        child_path,
+    def walk(value: object, path: str, depth: int) -> None:
+        nonlocal remaining, limit_reached
+
+        if not isinstance(value, (dict, list)):
+            return  # A scalar has no keys, and nothing to descend into.
+        if limit_reached is not None:
+            return
+        if depth > _MAX_WALK_DEPTH:
+            limit_reached = f"is nested more than {_MAX_WALK_DEPTH} levels deep"
+            return
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+
+        children: list[tuple[str, object]]
+        if isinstance(value, dict):
+            children = []
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                if not isinstance(key, str):
+                    findings.append(
+                        ValidationMessage(
+                            "error",
+                            f"Mapping key {key!r} is a {type(key).__name__}, not a string. "
+                            f"Profile fields are string-keyed; quote it as '{key}'.",
+                            child_path,
+                        )
                     )
-                )
-            findings.extend(_non_string_key_findings(child, child_path, _depth + 1))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            child_path = f"{path}.{index}" if path else str(index)
-            findings.extend(_non_string_key_findings(child, child_path, _depth + 1))
+                children.append((child_path, child))
+        else:
+            children = [
+                (f"{path}.{index}" if path else str(index), child)
+                for index, child in enumerate(value)
+            ]
+
+        for child_path, child in children:
+            remaining -= 1
+            if remaining <= 0:
+                limit_reached = f"holds more than {_MAX_WALK_VALUES} values"
+                return
+            walk(child, child_path, depth + 1)
+            if limit_reached is not None:
+                return
+
+    walk(metadata, "", 0)
+
+    if limit_reached is not None:
+        findings.append(
+            ValidationMessage(
+                "error",
+                f"Frontmatter {limit_reached}, past the bound this validator will "
+                f"traverse, so its mapping keys cannot be fully checked. Simplify "
+                f"the document.",
+            )
+        )
 
     return findings
 

@@ -51,7 +51,10 @@ portable and make profile listings useful.
 
 ### Provider configuration
 
-- `mcpServers` (object): MCP server definitions.
+- `mcpServers` (object): MCP server definitions. Each entry defines either
+  `command` (with optional `args`, `env`, `timeout`) for a server CAO launches,
+  or `url` for a remote one, with `type` naming its transport (for example
+  `http` or `sse`). An entry defining neither is invalid.
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
   provider tool configuration.
 - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):

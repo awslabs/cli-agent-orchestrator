@@ -9,6 +9,8 @@ also serves as the no-behaviour-change guard for the extraction.
 Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/510
 """
 
+import time
+
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -330,3 +332,178 @@ class TestMalformedButParseableInput:
 
         assert any(f.severity == "warning" for f in tool_findings)
         assert any(f.severity == "warning" for f in role_findings)
+
+
+def _alias_amplified_yaml(levels: int, leaf: str = "{k: v}") -> str:
+    """A schema-valid profile whose value graph is 2**``levels`` paths.
+
+    Each anchor references the previous one twice, so ``yaml.safe_load`` returns
+    ``levels + 1`` dicts while an unmemoized walk sees an exponential number of
+    paths through them. Nested under ``toolsSettings`` because that field is a
+    free-form object, which keeps the document *valid* -- the point being that a
+    rejected document would never reach a full traversal anyway.
+    """
+    lines = ["---", "name: bomb", "description: A profile.", "toolsSettings:", f"  a0: &a0 {leaf}"]
+    for level in range(1, levels + 1):
+        lines.append(f"  a{level}: &a{level} {{x: *a{level - 1}, y: *a{level - 1}}}")
+    return "\n".join(lines) + "\n---\n\nBody.\n"
+
+
+class TestAliasAmplificationIsBounded:
+    """A YAML-anchor bomb must not stall the key walk.
+
+    Round 2 of review on #585 added a non-string mapping key check whose only
+    bound was a recursion depth cap. That bounded the wrong dimension: YAML
+    aliases resolve to repeated references to the *same* object, so the walk
+    revisited shared subtrees exponentially while the document stayed tiny. A
+    640-byte, schema-valid body took ~1s, doubling per added anchor level, on a
+    scope-exempt ``async`` route -- a denial of service reachable without
+    credentials. Reported by @haofeif.
+
+    The fix skips containers already walked, keyed on identity, so these tests
+    pin both halves of that: the traversal terminates, and skipping repeats does
+    not lose a finding.
+    """
+
+    def test_a_forty_level_bomb_validates_promptly(self) -> None:
+        """Forty levels is 2**40 paths: unbounded, this never returns."""
+        document = _alias_amplified_yaml(40)
+        assert len(document) < 1500  # the whole point: tiny input, huge graph
+
+        started = time.perf_counter()
+        findings = validate_profile_text(document)
+        elapsed = time.perf_counter() - started
+
+        assert findings == []
+        # Measured at ~0.0001s. The bound is loose enough to survive a loaded
+        # CI runner while still being unreachable for an exponential walk.
+        assert elapsed < 5.0, f"walk took {elapsed:.2f}s; the traversal bound is not holding"
+
+    def test_a_self_referential_document_terminates(self) -> None:
+        """An anchor that contains itself is a cycle, not merely deep nesting."""
+        document = (
+            "---\nname: cyc\ndescription: A profile.\ntoolsSettings: &c {self: *c}\n---\n\nB.\n"
+        )
+
+        started = time.perf_counter()
+        findings = validate_profile_text(document)
+
+        assert findings == []
+        assert time.perf_counter() - started < 5.0
+
+    def test_a_bad_key_in_a_shared_subtree_is_reported_exactly_once(self) -> None:
+        """Deterministic proof of the memoization, with no reliance on a clock.
+
+        The offending key sits in the one node every alias resolves to. Reported
+        once, it confirms shared nodes are visited once; the pre-fix walk would
+        have emitted 2**20 copies of the same finding.
+        """
+        document = _alias_amplified_yaml(20, leaf="{1: one}")
+
+        findings = validate_profile_text(document)
+        key_errors = [f for f in findings if "not a string" in f.message]
+
+        assert len(key_errors) == 1
+        assert key_errors[0].severity == "error"
+        assert key_errors[0].path == "toolsSettings.a0.1"
+
+    def test_legitimate_anchor_reuse_still_validates_clean(self) -> None:
+        """Anchors are a normal YAML convenience, not inherently suspect."""
+        document = (
+            "---\nname: shared\ndescription: A profile.\ntoolsSettings:\n"
+            "  common: &common {timeout: 30}\n  fs: *common\n  web: *common\n---\n\nBody.\n"
+        )
+
+        findings = validate_profile_text(document)
+
+        assert findings == []
+
+    def test_exceeding_a_bound_is_an_error_not_silence(self) -> None:
+        """A document too large to traverse is rejected, not called valid.
+
+        Identity memoization bounds an *aliased* document; these bounds cover one
+        that is merely enormous. Returning no findings there would report an
+        unchecked document as clean, which is the failure mode being avoided.
+        """
+        deep: dict = {"name": "deep", "description": "A profile."}
+        node = deep
+        for _ in range(70):
+            node["toolsSettings"] = {}
+            node = node["toolsSettings"]
+        wide = {
+            "name": "wide",
+            "description": "A profile.",
+            "toolsSettings": {f"k{index}": index for index in range(25_000)},
+        }
+
+        for metadata, expected in ((deep, "nested more than"), (wide, "holds more than")):
+            errors = [f for f in validate_frontmatter(metadata) if f.severity == "error"]
+            assert len(errors) == 1
+            assert expected in errors[0].message
+
+
+class TestMcpServerTransports:
+    """``mcpServers`` entries may be command-launched *or* url-based.
+
+    The schema required ``command`` unconditionally, which made the write routes
+    reject a form CAO supports: ``resolve_mcp_server_config`` documents entries
+    without a ``command`` (``{"type": "http", "url": ...}``) as passing through
+    untouched, and providers forward them to their own MCP config. Because
+    #585 made this schema the blocking gate in front of persistence, a latent
+    description gap became a broken save path. Reported by @haofeif.
+    """
+
+    ACCEPTED = {
+        "http url": {"docs": {"type": "http", "url": "https://example.test/mcp"}},
+        "sse url": {"docs": {"type": "sse", "url": "https://example.test/sse"}},
+        "url with headers": {
+            "docs": {"type": "http", "url": "https://example.test/mcp", "headers": {"A": "b"}}
+        },
+        "command": {"fs": {"command": "npx", "args": ["-y", "server"]}},
+        "bundled cao server": {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}},
+        "command and url together": {"z": {"command": "npx", "url": "https://example.test/mcp"}},
+    }
+
+    @pytest.mark.parametrize("label", sorted(ACCEPTED))
+    def test_supported_forms_validate(self, label: str) -> None:
+        findings = validate_frontmatter(
+            {"name": "x", "description": "d", "mcpServers": self.ACCEPTED[label]}
+        )
+
+        assert [f for f in findings if f.severity == "error"] == []
+
+    @pytest.mark.parametrize(
+        "entry", [{"type": "http"}, {}, {"args": ["-y"]}], ids=["type only", "empty", "args only"]
+    )
+    def test_an_entry_with_neither_command_nor_url_is_rejected(self, entry: dict) -> None:
+        """Widening the rule must not widen it into accepting anything.
+
+        An entry naming no transport cannot be launched or reached, so the gate
+        still has to catch it -- the fix is a second permitted shape, not the
+        removal of the requirement.
+        """
+        findings = validate_frontmatter(
+            {"name": "x", "description": "d", "mcpServers": {"broken": entry}}
+        )
+        errors = [f for f in findings if f.severity == "error"]
+
+        assert len(errors) == 1
+        assert errors[0].path == "mcpServers.broken"
+
+    def test_url_is_described_rather_than_merely_tolerated(self) -> None:
+        """The field is typed, so a form generator can render it and catch a typo.
+
+        The inner object does not set ``additionalProperties: false``, so a url
+        entry would pass even with no ``url`` property declared. Declaring it is
+        what makes ``GET /agents/profiles/schema`` describe the shape, and what
+        makes a wrong type a finding.
+        """
+        inner = load_profile_schema()["properties"]["mcpServers"]["additionalProperties"]
+        assert inner["properties"]["url"] == {"type": "string"}
+        assert inner["anyOf"] == [{"required": ["command"]}, {"required": ["url"]}]
+
+        findings = validate_frontmatter(
+            {"name": "x", "description": "d", "mcpServers": {"docs": {"url": 7}}}
+        )
+
+        assert any(f.severity == "error" and f.path == "mcpServers.docs.url" for f in findings)

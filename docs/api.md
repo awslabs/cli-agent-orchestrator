@@ -87,6 +87,21 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   validates clean and persists, then fails to load, since the model requires
   string keys. Note YAML also auto-types an unquoted date, so `2026-01-01:` is a
   date key rather than a string; quote such keys.
+- That key check walks the parsed document, and the walk is bounded, because YAML
+  anchors make a document's value graph arbitrarily larger than its bytes: each
+  alias resolves to another reference to the same object, so chained anchors give
+  a sub-kilobyte body an exponential number of paths. Containers already visited
+  are skipped, which removes the amplification and still reports each offending
+  key once, at the first path that reaches it. Separate ceilings on total values
+  (20,000) and nesting depth (64) bound a document that is merely enormous rather
+  than aliased; exceeding either is itself an error, so such a document is
+  rejected rather than reported clean on a partial walk. Both bounds are ~1000x
+  the largest bundled profile.
+- An `mcpServers` entry must define either `command`, for a server CAO launches,
+  or `url`, for a remote one whose `type` names its transport. The schema
+  previously required `command` unconditionally, which made the write routes
+  reject url-based servers that the runtime accepts and passes through to the
+  provider unchanged. An entry defining neither is still rejected.
 - Every 400 from the profile write and source routes uses one `detail` shape,
   `{"message", "errors"}`, so a client never has to switch on the type of
   `detail`. `errors` is empty for a failure that is not attributable to a field,

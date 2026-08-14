@@ -6,6 +6,7 @@ future UI, TUI, and external clients can consume the same ranking and validation
 paths as the CLI instead of reimplementing them.
 """
 
+import time
 from unittest.mock import patch
 
 import pytest
@@ -918,3 +919,121 @@ class TestWriteRejectionShape:
         )
 
         assert response.json()["detail"]["errors"] == []
+
+
+class TestValidateEndpointResistsAliasAmplification:
+    """The unauthenticated validate route must not be stallable by its body.
+
+    Reported as a P2 in round 2 of review on #585. The non-string mapping key
+    check added in round 1 walked the parsed document with only a depth cap, but
+    YAML anchors resolve to repeated references to one object, so a walk that
+    does not remember where it has been revisits shared subtrees exponentially.
+    A sub-kilobyte body reached seconds of CPU and doubled per anchor level.
+
+    This route is the exposed one: it is in the scope-exemption set, so it
+    answers without credentials even when OAuth is configured, and it is declared
+    ``async``, so a synchronous walk on its thread blocks the event loop for every
+    other request rather than just the attacker's own. That exemption is pinned in
+    ``test/api/test_scope_coverage.py::_EXEMPT``, which is the one place it is
+    asserted; if it is ever removed, the reasoning here changes.
+    """
+
+    @staticmethod
+    def _bomb(levels: int) -> str:
+        lines = [
+            "---",
+            "name: bomb",
+            "description: A profile.",
+            "toolsSettings:",
+            "  a0: &a0 {k: v}",
+        ]
+        for level in range(1, levels + 1):
+            lines.append(f"  a{level}: &a{level} {{x: *a{level - 1}, y: *a{level - 1}}}")
+        return "\n".join(lines) + "\n---\n\nBody.\n"
+
+    def test_an_anchor_bomb_is_answered_promptly(self, client) -> None:
+        content = self._bomb(40)
+        assert len(content) < 1500
+
+        started = time.perf_counter()
+        response = client.post("/agents/profiles/validate", json={"content": content})
+        elapsed = time.perf_counter() - started
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is True
+        assert elapsed < 10.0, f"validate took {elapsed:.2f}s on a {len(content)}-byte body"
+
+
+class TestUrlBasedMcpServersAreWritable:
+    """A url-based MCP entry is a supported form and must survive the write gate.
+
+    Reported as a P2 in round 2 of review on #585. ``agent_profile.schema.json``
+    required ``command`` on every ``mcpServers`` entry, while
+    ``resolve_mcp_server_config`` documents command-less entries shaped
+    ``{"type": "http", "url": ...}`` as passing through untouched. Making that
+    schema the blocking gate in front of persistence turned an incomplete
+    description into a rejected save, the mirror image of the round-1 P2: that one
+    let unloadable profiles through, this one blocked loadable ones.
+    """
+
+    URL_PROFILE = (
+        "---\nname: {name}\ndescription: A test profile.\nmcpServers:\n"
+        "  docs:\n    type: http\n    url: https://example.test/mcp\n---\n\nYou are a test agent.\n"
+    )
+
+    def test_create_accepts_a_url_based_server(self, client, write_store) -> None:
+        response = client.post(
+            "/agents/profiles",
+            json={"name": "remote", "content": self.URL_PROFILE.format(name="remote")},
+        )
+
+        assert response.status_code == 201, response.json()
+        assert (write_store / "remote.md").exists()
+
+    def test_the_written_profile_loads_and_keeps_its_transport(self, client, write_store) -> None:
+        """Accepting it is only correct if the runtime can then use it.
+
+        Guards against fixing the gate by loosening it past what CAO supports:
+        the entry has to survive both the profile parse and MCP resolution with
+        its ``type``/``url`` intact.
+        """
+        from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
+        from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+
+        client.post(
+            "/agents/profiles",
+            json={"name": "remote", "content": self.URL_PROFILE.format(name="remote")},
+        )
+        stored = (write_store / "remote.md").read_text(encoding="utf-8")
+
+        profile = parse_agent_profile_text(stored, "remote")
+        resolved = resolve_mcp_server_config(dict(profile.mcpServers["docs"]))
+
+        assert resolved == {"type": "http", "url": "https://example.test/mcp"}
+
+    def test_replace_accepts_a_url_based_server(self, client, write_store) -> None:
+        write_store.mkdir(parents=True, exist_ok=True)
+        (write_store / "remote.md").write_text(
+            VALID_PROFILE.format(name="remote"), encoding="utf-8"
+        )
+
+        response = client.put(
+            "/agents/profiles/remote",
+            json={"content": self.URL_PROFILE.format(name="remote")},
+        )
+
+        assert response.status_code == 200, response.json()
+        assert "url: https://example.test/mcp" in (write_store / "remote.md").read_text()
+
+    def test_an_entry_naming_no_transport_is_still_rejected(self, client, write_store) -> None:
+        """The rule gained a branch; it was not removed."""
+        content = (
+            "---\nname: broken\ndescription: A test profile.\nmcpServers:\n"
+            "  docs:\n    type: http\n---\n\nBody.\n"
+        )
+
+        response = client.post("/agents/profiles", json={"name": "broken", "content": content})
+
+        assert response.status_code == 400
+        assert not (write_store / "broken.md").exists()
+        assert response.json()["detail"]["errors"]
