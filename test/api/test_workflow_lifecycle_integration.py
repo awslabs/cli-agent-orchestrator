@@ -275,6 +275,45 @@ def test_composed_flow_yaml_tier(portal_client, monkeypatch):
 
 
 # ===========================================================================
+# N7: a mode: parallel spec accepts the async submit path (previously OR-3
+# rejected every non-sequential mode with 501) and drives to completion through
+# the real wave engine. The prepared-entry reserved guard now lets parallel/
+# pipeline through (only loop stays 501), and start_run_prepared routes it to
+# _drive_parallel — so this asserts the SUBMIT surface specifically.
+# ===========================================================================
+def test_composed_flow_parallel_tier(portal_client, monkeypatch):
+    _point_spec(
+        monkeypatch,
+        WorkflowSpec(
+            name="par-int",
+            mode="parallel",
+            steps=[
+                WorkflowStep(id="p1", provider="claude_code", agent="dev", prompt="a"),
+                WorkflowStep(id="p2", provider="claude_code", agent="dev", prompt="b"),
+                WorkflowStep(
+                    id="p3", provider="claude_code", agent="dev", prompt="c", needs=["p1", "p2"]
+                ),
+            ],
+        ),
+    )
+    monkeypatch.setattr(workflow_service, "run_agent_step", _instant_yaml_leaf())
+
+    body = _submit(portal_client, "par-int", "int-par")
+    row = workflow_journal.get_run("int-par")
+    assert row is not None, "durable-before-ack BROKEN for parallel submit"
+    assert row.tier == "yaml"
+    assert body["links"]["cancel"] == "/workflows/runs/int-par/cancel"
+
+    final = _poll_journal_terminal("int-par", portal_client)
+    assert final == "completed", final
+    result = portal_client.get("/workflows/runs/int-par/result")
+    assert result.status_code == 200
+    body_r = result.json()
+    assert body_r["state"] == "completed"
+    assert [s["id"] for s in body_r["steps"]] == ["p1", "p2", "p3"]
+
+
+# ===========================================================================
 # T1 (AA-1, IP-1) SCRIPT TIER: the same composed happy path against a REAL
 # subprocess spawned + reaped by the real script_runner (CG-3 two-tier parity).
 # ===========================================================================
