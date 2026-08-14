@@ -3325,11 +3325,18 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
 
 @app.get("/workflows")
 async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> List[Dict]:
-    """List indexed workflows, rebuilt from the spec files on disk (FR-2.1)."""
+    """List indexed workflows, rebuilt from the spec files on disk (FR-2.1).
+
+    The ``dir`` query parameter is confined to the configured workflow root (or
+    a subdirectory of it) before any filesystem scan, so an out-of-root
+    directory (e.g. ``~/.ssh``) is a 400 rather than an unauthenticated
+    arbitrary-directory probe.
+    """
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
-        rows = workflow_spec_service.list_workflows(scan_dir=dir)
+        scan_dir = workflow_spec_service._validate_scan_dir(dir)
+        rows = workflow_spec_service.list_workflows(scan_dir=scan_dir)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return [row.model_dump() for row in rows]
