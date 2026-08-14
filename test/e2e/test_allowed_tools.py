@@ -35,6 +35,8 @@ Run:
     uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts=" -k kimi
 """
 
+import json
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -46,21 +48,13 @@ from test.e2e.conftest import (
     wait_for_status,
 )
 
+import psutil
 import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 
 COMPLETION_TIMEOUT = 180
-
-# Generate a random token at test-import time that the agent cannot know.
-# The restricted test checks whether this token appears in a file on disk
-# (proof of bash execution), not in the agent's text output.
-_RANDOM_TOKEN = uuid.uuid4().hex
-BASH_MARKER_FILE = f"/tmp/cao_e2e_bash_test_{_RANDOM_TOKEN}.txt"
-BASH_TASK = (
-    f"Run this exact shell command: echo SUCCESS > {BASH_MARKER_FILE} " f"&& cat {BASH_MARKER_FILE}"
-)
 
 # Keywords indicating the agent was blocked from using bash
 REFUSAL_KEYWORDS = [
@@ -85,6 +79,13 @@ REFUSAL_KEYWORDS = [
     "is not available",
     "aren't available",
 ]
+
+
+def _new_bash_probe() -> tuple[Path, str]:
+    """Create a unique filesystem ground-truth probe for one test invocation."""
+    marker_file = Path(f"/tmp/cao_e2e_bash_test_{uuid.uuid4().hex}.txt")
+    task = f"Run this exact shell command: echo SUCCESS > {marker_file} && cat {marker_file}"
+    return marker_file, task
 
 
 def _create_terminal_with_tools(
@@ -168,6 +169,78 @@ def _send_task_and_get_output(terminal_id: str, message: str) -> str:
     return output
 
 
+def _grok_restricted_diagnostics(
+    terminal_id: str,
+    session_name: str,
+    terminals_before: set[str],
+) -> str:
+    """Return evidence needed to diagnose a Grok native-permission escape.
+
+    This is intentionally evaluated only after the filesystem ground-truth
+    assertion fails.  It retains the raw TUI screen, exact launched argv, and
+    any CAO-created child terminals in pytest's failure report without logging
+    Grok's environment (which can contain credential-bearing paths).
+    """
+    try:
+        terminal = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=10).json()
+        terminals_after_response = requests.get(
+            f"{API_BASE_URL}/sessions/{session_name}/terminals", timeout=10
+        )
+        terminals_after = terminals_after_response.json() if terminals_after_response.ok else []
+        child_terminals = [
+            {
+                "id": item.get("id"),
+                "agent_profile": item.get("agent_profile"),
+                "provider": item.get("provider"),
+            }
+            for item in terminals_after
+            if item.get("id") not in terminals_before
+        ]
+
+        target = f"{terminal['session_name']}:{terminal['window_name']}"
+        pane = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-e", "-S", "-2000", "-t", target],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        pane_pid = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        ).stdout.strip()
+
+        processes: list[dict[str, object]] = []
+        if pane_pid.isdigit():
+            root = psutil.Process(int(pane_pid))
+            for process in [root, *root.children(recursive=True)]:
+                with process.oneshot():
+                    processes.append({"pid": process.pid, "cmdline": process.cmdline()})
+
+        return json.dumps(
+            {
+                "terminal": {
+                    "id": terminal_id,
+                    "session_name": terminal.get("session_name"),
+                    "window_name": terminal.get("window_name"),
+                    "status": terminal.get("status"),
+                    "allowed_tools": terminal.get("allowed_tools"),
+                },
+                "new_child_terminals": child_terminals,
+                "pane_processes": processes,
+                "pane": pane.stdout[-24000:],
+                "pane_capture_error": pane.stderr,
+            },
+            indent=2,
+            default=str,
+        )
+    except Exception as exc:  # diagnostics must never mask the security assertion
+        return f"<failed to collect Grok diagnostics: {type(exc).__name__}: {exc}>"
+
+
 def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: str):
     """Test that a terminal with restricted allowedTools cannot execute bash.
 
@@ -178,6 +251,7 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
     session_name = f"e2e-tools-r-{provider[:5]}-{session_suffix}"
     terminal_id = None
     actual_session = None
+    terminals_before: set[str] = set()
 
     try:
         terminal_id, actual_session = _create_terminal_with_tools(
@@ -192,9 +266,12 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
         ), f"Terminal did not become ready within 90s (provider={provider})"
         time.sleep(2)
 
-        # Clean up any leftover marker file from previous test runs
-        marker_file = Path(BASH_MARKER_FILE)
-        marker_file.unlink(missing_ok=True)
+        # One marker per invocation prevents an interrupted parallel or prior
+        # process from being mistaken for this terminal's execution.
+        marker_file, bash_task = _new_bash_probe()
+        terminals = requests.get(f"{API_BASE_URL}/sessions/{actual_session}/terminals", timeout=10)
+        assert terminals.ok, f"Could not list pre-input terminals: {terminals.text}"
+        terminals_before = {item["id"] for item in terminals.json()}
 
         # Send the bash task. For restricted agents, they may:
         # 1. Complete with a refusal message — PASS
@@ -202,7 +279,7 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
         # 3. Actually execute bash (file created on disk) — FAIL
         resp = requests.post(
             f"{API_BASE_URL}/terminals/{terminal_id}/input",
-            params={"message": BASH_TASK},
+            params={"message": bash_task},
         )
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
@@ -219,12 +296,18 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
         assert not marker_file.exists(), (
             f"Agent executed bash despite restricted allowedTools! "
             f"Provider={provider}, allowed_tools={allowed_tools}. "
-            f"Marker file {BASH_MARKER_FILE} was created on disk."
+            f"Marker file {marker_file} was created on disk.\n"
+            + (
+                _grok_restricted_diagnostics(terminal_id, actual_session, terminals_before)
+                if provider == "grok_cli"
+                else ""
+            )
         )
         marker_file.unlink(missing_ok=True)
 
     finally:
-        Path(BASH_MARKER_FILE).unlink(missing_ok=True)
+        if "marker_file" in locals():
+            marker_file.unlink(missing_ok=True)
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
 
@@ -253,22 +336,21 @@ def _run_unrestricted_tool_test(provider: str, agent_profile: str):
         ), f"Terminal did not become ready within 90s (provider={provider})"
         time.sleep(2)
 
-        # Clean up any leftover marker file
-        marker_file = Path(BASH_MARKER_FILE)
-        marker_file.unlink(missing_ok=True)
+        marker_file, bash_task = _new_bash_probe()
 
-        output = _send_task_and_get_output(terminal_id, BASH_TASK)
+        output = _send_task_and_get_output(terminal_id, bash_task)
 
         # Ground truth: the file should have been created on disk
         assert marker_file.exists(), (
             f"Agent did not execute bash despite unrestricted allowedTools. "
-            f"Expected marker file {BASH_MARKER_FILE} to be created. "
+            f"Expected marker file {marker_file} to be created. "
             f"Provider={provider}, output: {output[:500]}"
         )
         marker_file.unlink(missing_ok=True)
 
     finally:
-        Path(BASH_MARKER_FILE).unlink(missing_ok=True)
+        if "marker_file" in locals():
+            marker_file.unlink(missing_ok=True)
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
 
