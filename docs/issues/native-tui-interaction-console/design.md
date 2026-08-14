@@ -2435,7 +2435,7 @@ Technical backlog (recorded; each names its trigger for promotion):
 - **SQLite/CAS attachment ledger** (full form of Sol P2-2) — deferred per
   the owner speed guard; promote if attachment contention or crash-window
   evidence ever outgrows the §8.4 manifest+lock discipline.
-- **B1 — GLM route caveat:** a `claude_code` pane may run glm-5.2; the
+- **B1 — GLM route caveat:** a `claude_code` pane may run Z.ai GLM; the
   registry's image/compact entries derive from Anthropic evidence — key or
   caveat the registry by route when such a profile is first used.
 - **B2 — Dedicated operator-message journal** (OD6 alternative): removes

@@ -21,7 +21,7 @@ with no snapshot, inferred from the CLI's own UI chrome.
 | `muse_cli` | **0** | — |
 | `opencode_cli` | **0** | — |
 
-**`muse_cli` and `opencode_cli` have no logs at all in this corpus.** Every `glm-5.2` / `GLM-5.2` /
+**`muse_cli` and `opencode_cli` have no logs at all in this corpus.** Every Z.ai GLM /
 `opencode` hit (≈450 across 12 files) is a Codex or Claude supervisor *writing prose about* routing to
 them — never a pane running them. We have zero rendered error strings for those two providers, and any
 detector rule for them would be invented, not observed.

@@ -61,6 +61,12 @@ def _fixtures(tmp_path):
     return worktree, inner, envelope, session
 
 
+def test_native_claude_route_requires_the_one_million_context_identifier():
+    assert glm.validate_requested_model("glm-5.3[1m]") == "glm-5.3[1m]"
+    with pytest.raises(glm.GlmRouteError, match="glm-5.3\\[1m\\]"):
+        glm.validate_requested_model("glm-5.3")
+
+
 def test_session_map_binds_wrapper_inner_worktree_and_marker(tmp_path):
     worktree, inner, envelope, session = _fixtures(tmp_path)
 
