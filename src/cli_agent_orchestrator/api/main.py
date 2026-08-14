@@ -6456,6 +6456,16 @@ if (WEB_DIST / "index.html").exists():
     from starlette.staticfiles import StaticFiles
 
     app.mount("/", StaticFiles(directory=str(WEB_DIST), html=True), name="web")
+else:
+    # Issue #610: a broken/skipped `npm run build` at package-build time ships a wheel
+    # with no web_ui/, and GET / then 404s with no indication why. Logging it here makes
+    # the cause diagnosable from the server's own startup log instead of guesswork.
+    logger.warning(
+        "web_ui/index.html not found at %s; no dashboard mounted, GET / will 404. "
+        "This install was packaged without a built web UI — rebuild with "
+        "`cd web && npm ci && npm run build` before packaging (see issue #610).",
+        WEB_DIST,
+    )
 
 
 def main():
