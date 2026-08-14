@@ -928,11 +928,58 @@ def test_home_process_scan_fails_closed_for_unreadable_same_user_environment(tmp
 def test_home_process_fails_closed_when_candidate_environment_is_protected(tmp_path):
     proc = MagicMock()
     proc.uids.return_value.effective = os.geteuid()
+    proc.name.return_value = "grok"
     proc.exe.return_value = "/usr/local/bin/grok"
     proc.cmdline.return_value = ["grok"]
     proc.environ.side_effect = psutil.AccessDenied(pid=12345)
     with patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc):
         assert GrokCliProvider._pid_uses_home(12345, tmp_path) is None
+
+
+@pytest.mark.parametrize("blocked_attribute", ["uids", "exe", "cmdline"])
+def test_cleanup_retains_home_when_process_identity_inspection_is_protected(
+    tmp_path, blocked_attribute
+):
+    """Identity metadata is uncertain on macOS too, so cleanup must fail closed."""
+
+    provider = make_provider()
+    proc = MagicMock()
+    proc.uids.return_value.effective = os.geteuid()
+    proc.name.return_value = "grok"
+    proc.exe.return_value = "/usr/local/bin/grok"
+    proc.cmdline.return_value = ["grok"]
+    getattr(proc, blocked_attribute).side_effect = psutil.AccessDenied(pid=12345)
+
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.psutil.pids", return_value=[12345]),
+        patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.rmtree") as rmtree,
+    ):
+        home = provider._prepare_grok_home(None)
+        assert provider.cleanup() is False
+
+    proc.send_signal.assert_not_called()
+    rmtree.assert_not_called()
+    assert home.exists()
+
+
+def test_home_process_ignores_different_uid_before_environment_inspection(tmp_path):
+    proc = MagicMock()
+    proc.uids.return_value.effective = os.geteuid() + 1
+
+    with patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc):
+        assert GrokCliProvider._pid_uses_home(12345, tmp_path) is False
+
+    proc.exe.assert_not_called()
+
+
+def test_home_process_ignores_process_that_exited_before_inspection(tmp_path):
+    with patch(
+        "cli_agent_orchestrator.providers.grok_cli.psutil.Process",
+        side_effect=psutil.NoSuchProcess(pid=12345),
+    ):
+        assert GrokCliProvider._pid_uses_home(12345, tmp_path) is False
 
 
 def test_home_process_stop_rechecks_home_before_signalling_reused_pid(tmp_path):
@@ -961,6 +1008,7 @@ def test_home_process_stop_does_not_signal_reused_pid_after_identity_verificatio
 def test_home_process_recognizes_exact_cao_mcp_argv_with_private_home(tmp_path):
     proc = MagicMock()
     proc.uids.return_value.effective = os.geteuid()
+    proc.name.return_value = "python3"
     proc.exe.return_value = "/usr/bin/python3"
     proc.cmdline.return_value = ["python3", "/usr/local/bin/cao-mcp-server"]
     proc.environ.return_value = {"GROK_HOME": str(tmp_path)}
@@ -978,6 +1026,7 @@ def test_home_process_recognizes_exact_cao_mcp_argv_with_private_home(tmp_path):
 def test_home_process_rejects_nonexact_cao_mcp_argv_token(tmp_path, cmdline):
     proc = MagicMock()
     proc.uids.return_value.effective = os.geteuid()
+    proc.name.return_value = "python3"
     proc.exe.return_value = "/usr/bin/python3"
     proc.cmdline.return_value = [item.decode() for item in cmdline.split(b"\0") if item]
     with (patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc),):
@@ -987,6 +1036,7 @@ def test_home_process_rejects_nonexact_cao_mcp_argv_token(tmp_path, cmdline):
 def test_home_process_rejects_arbitrary_python_even_with_matching_home(tmp_path):
     proc = MagicMock()
     proc.uids.return_value.effective = os.geteuid()
+    proc.name.return_value = "python3"
     proc.exe.return_value = "/usr/bin/python3"
     proc.cmdline.return_value = ["python3", "-c"]
     with (patch("cli_agent_orchestrator.providers.grok_cli.psutil.Process", return_value=proc),):

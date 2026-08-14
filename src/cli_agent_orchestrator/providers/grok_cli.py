@@ -910,17 +910,46 @@ class GrokCliProvider(BaseProvider):
             proc.create_time()
             if proc.uids().effective != os.geteuid():
                 return False
-            executable = proc.exe()
         except psutil.NoSuchProcess:
             return False
-        except psutil.AccessDenied:
-            # This is not sufficient evidence that an arbitrary protected
-            # process uses this home.  If it is a candidate, the later
-            # environment read below is fail-closed.
-            return False
+        except psutil.AccessDenied as exc:
+            # We cannot establish same-user ownership, so this can still be a
+            # Grok/updater process with this private home.  Retain it for a
+            # later retry rather than racing a live writer.
+            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
+            return None
         except psutil.Error as exc:
             logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
             return False
+
+        try:
+            # ``exe()`` can be protected even for an unrelated same-user
+            # service (for example macOS login helpers). Its short process
+            # name is enough to reject those before an unavailable executable
+            # turns every cleanup into a retry. Python is a possible name for
+            # the CAO MCP child, so it deliberately remains a candidate.
+            process_name = proc.name().lower()
+            possible_owner = (
+                process_name == "grok"
+                or process_name.startswith("grok-")
+                or process_name == "cao-mcp-server"
+                or process_name.startswith("python")
+            )
+            if not possible_owner:
+                return False
+            executable = proc.exe()
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied as exc:
+            # At this point the process is same-user and has a Grok/CAO
+            # candidate name, but its identity cannot be fully verified.
+            # Fail closed so cleanup never removes a home a live updater may
+            # recreate.
+            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
+            return None
+        except psutil.Error as exc:
+            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
+            return None
 
         try:
             # Avoid treating unrelated same-user services (which can protect
