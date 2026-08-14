@@ -602,15 +602,6 @@ async def test_get_run_status_carries_no_output_or_prompt(monkeypatch):
 # Reserved seams
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_reserved_mode_raises_not_built_yet(monkeypatch):
-    """A mode: parallel spec -> NotBuiltYetError, NOT a silent sequential run."""
-    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
-    spec = _spec(mode="parallel")
-    with pytest.raises(NotBuiltYetError):
-        await ws.start_run(spec, {}, "runPar")
-
-
-@pytest.mark.asyncio
 async def test_reserved_loop_mode_raises(monkeypatch):
     monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
     spec = _spec(mode="loop")
@@ -620,10 +611,9 @@ async def test_reserved_loop_mode_raises(monkeypatch):
 
 def test_reserved_seam_methods_raise():
     # ``resume_from_last_completed`` is NO LONGER reserved as of Bolt 4 / N6 — it is
-    # un-reserved here and exercised by test_workflow_journal_resume.py. The
-    # remaining parallel/loop/guard seams stay reserved (N7/N8).
-    with pytest.raises(NotBuiltYetError):
-        ws._run_parallel(None, None)
+    # un-reserved here and exercised by test_workflow_journal_resume.py.
+    # ``_run_parallel`` is no longer a reserved seam (N7 shipped the parallel
+    # driver); the loop/guard seams stay reserved (N8).
     with pytest.raises(NotBuiltYetError):
         ws._run_loop(None, None)
     with pytest.raises(NotBuiltYetError):

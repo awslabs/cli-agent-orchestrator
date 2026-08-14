@@ -175,6 +175,12 @@ class RunRecord:
     # constructed here; it binds to the running loop lazily on first await, so
     # building a RunRecord outside a loop (unit tests) is safe.
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Serializes per-run journal event-seq allocation under parallel execution
+    # (N7). ``_next_event_seq`` does ``event_seq += 1`` — read-modify-write —
+    # which races when concurrent steps journal simultaneously; this lock makes
+    # seq allocation atomic so per-run event order stays well-defined even with
+    # concurrent step coroutines (BR-3 event ordering under N7).
+    journal_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
@@ -354,7 +360,7 @@ async def _ajournal(fn: Any, *args: Any, **kwargs: Any) -> None:
 # never regresses.
 
 
-def _next_event_seq(record: RunRecord) -> int:
+async def _next_event_seq(record: RunRecord) -> int:
     """Allocate the next per-run event ``seq`` from the in-memory counter (U1 Algorithm 1).
 
     Advances ``record.event_seq`` and returns it. Side-effect-free w.r.t. the DB:
@@ -362,9 +368,16 @@ def _next_event_seq(record: RunRecord) -> int:
     permanent hole in the sequence (a declared gap on read), never a renumber
     (BR-1). Monotonic within a process; re-seeded across a restart by the rebuild
     to resume strictly above the recovered high-water.
+
+    ``async`` because under parallel execution (N7) concurrent step coroutines
+    share this counter: ``event_seq += 1`` is a read-modify-write, so allocation
+    is serialized on the per-run ``journal_lock`` to keep the sequence
+    well-defined (BR-3). Sequential mode is unchanged — one step journals at a
+    time, so the lock is uncontended.
     """
-    record.event_seq += 1
-    return record.event_seq
+    async with record.journal_lock:
+        record.event_seq += 1
+        return record.event_seq
 
 
 async def _journal_event(
@@ -387,7 +400,7 @@ async def _journal_event(
     ``_journal_*`` write-through helpers. ``iteration`` / ``which_guard_fired`` are
     left unset (NULL, reserved, FR-1.5).
     """
-    seq = _next_event_seq(record)
+    seq = await _next_event_seq(record)
     try:
         await _ajournal(workflow_journal.persist_high_water, record.run_id, seq)
     except (
@@ -974,11 +987,22 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
         logger.error("drive: run '%s' failed with an engine error", record.run_id)
         raise
 
-    # Finalize. A cancel that interrupted the FINAL (or only) step's in-flight
-    # wait (#409b) leaves the loop with no further boundary iteration to observe
-    # ``record.cancelled`` — converge to CANCELLED here so the run never settles
-    # COMPLETED after being cancelled. Any still-PENDING steps (none, for a
-    # last-step cancel) are marked SKIPPED for consistency with the boundary path.
+    return await _finalize_run(record, order)
+
+
+async def _finalize_run(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
+    """Settle a driven run to its terminal state, journal it, and aggregate (N7).
+
+    The SINGLE finalize shared by ``_drive`` (sequential) and ``_drive_parallel``
+    (N7 wave scheduling) — no parallel/sequential divergence in the terminal
+    transition, event emission, or result aggregation (B4-RD-5).
+
+    A cancel that interrupted the FINAL (or only) step's in-flight wait (#409b)
+    leaves the loop with no further boundary iteration to observe
+    ``record.cancelled`` — converge to CANCELLED here so the run never settles
+    COMPLETED after being cancelled. Any still-PENDING steps are marked SKIPPED
+    for consistency with the boundary path.
+    """
     if record.cancelled and record.state not in (RunState.FAILED, RunState.CANCELLED):
         await _skip_remaining(record, order, from_index=0)
         record.state = RunState.CANCELLED
@@ -1050,6 +1074,21 @@ def _check_run_id_available(run_id: str) -> None:
         raise KeyError(f"run_id '{run_id}' already exists")
 
 
+async def _dispatch_drive(record: RunRecord, spec: WorkflowSpec) -> WorkflowRunResult:
+    """Route a record to the driver its spec's ``mode`` owns (N7).
+
+    ``sequential`` -> ``_drive`` (wave-of-one loop); ``parallel``/``pipeline``
+    -> ``_drive_parallel`` (needs-based wave scheduling). ``loop`` never
+    reaches here: ``start_run`` routes it to the N8 reserved seam first. The
+    topo order is computed here so the sequential and parallel drivers share
+    the same deterministic order (B4-RD-5).
+    """
+    order = _topological_order(spec)
+    if spec.mode in ("parallel", "pipeline"):
+        return await _drive_parallel(record, order)
+    return await _drive(record, order)
+
+
 # ---------------------------------------------------------------------------
 # §1 — start_run entry point
 # ---------------------------------------------------------------------------
@@ -1077,9 +1116,10 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     # 2. Validate inputs BEFORE any side effect (B3-BR-2 / FR-1.5, fail fast).
     resolved_inputs = _validate_inputs(spec, inputs)
 
-    # Non-sequential mode dispatches to a reserved seam — NEVER silently run as
-    # sequential (B3-BR-6/B3-BR-10).
-    if spec.mode != "sequential":
+    # Non-sequential mode: ``loop`` dispatches to its N8 reserved seam — NEVER
+    # silently run as sequential (B3-BR-6/B3-BR-10). ``parallel``/``pipeline``
+    # are shipped (N7) and reach the parallel driver via ``_dispatch_drive``.
+    if spec.mode == "loop":
         _dispatch_reserved_mode(spec)
 
     # 3. Build the RunRecord.
@@ -1106,11 +1146,11 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         # register/insert/admission sequence above is unchanged (SEAM #1, BR-5).
         await _journal_event(record, "run.started", state=record.state.value)
 
-        # 5. Deterministic sequencing order.
-        order = _topological_order(spec)
-
-        # 6-8. Sequence, finalize, aggregate — the single shared drive (B4-RD-5).
-        return await _drive(record, order)
+        # 5-8. Sequence, finalize, aggregate — the single shared drive (B4-RD-5).
+        # ``_dispatch_drive`` computes the deterministic topo order and routes
+        # sequential vs parallel/pipeline to their drivers, so resume and fresh
+        # runs share one dispatch path.
+        return await _dispatch_drive(record, spec)
     finally:
         _active_drives.discard(run_id)
 
@@ -1140,8 +1180,7 @@ async def start_run_prepared(record: RunRecord) -> WorkflowRunResult:
     """
     _active_drives.add(record.run_id)
     try:
-        order = _topological_order(record.spec)
-        return await _drive(record, order)
+        return await _dispatch_drive(record, record.spec)
     finally:
         _active_drives.discard(record.run_id)
 
@@ -1449,12 +1488,12 @@ def _is_resumable_for_tier(row: workflow_journal.RunRow) -> bool:
 def _dispatch_reserved_mode(spec: WorkflowSpec) -> None:
     """Route a non-sequential ``mode`` to its reserved seam (B3-BR-6/B3-BR-10).
 
-    Each branch hits the owning reserved seam (which raises ``NotBuiltYetError``)
-    so the failure names the implementing unit; a non-sequential mode is NEVER
-    silently downgraded to sequential.
+    ``parallel``/``pipeline`` are shipped (N7) and are no longer reserved —
+    they reach ``_drive_parallel`` via ``_dispatch_drive``, never this seam.
+    ``loop`` remains reserved (N8) and hits its owning seam here so the failure
+    names the implementing unit; a reserved mode is NEVER silently downgraded
+    to sequential.
     """
-    if spec.mode in ("parallel", "pipeline"):
-        _run_parallel(None, None)
     if spec.mode == "loop":
         _run_loop(None, None)
     # Defensive: grammar restricts ``mode`` to the four literals, so any other
@@ -1577,15 +1616,135 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
         await _ajournal(_journal_current_step, record)
 
         # 7. Re-enter the SAME shared drive over the snapshotted spec's topo order
-        # (B4-RD-5).
-        return await _drive(record, _topological_order(spec))
+        # (B4-RD-5). Parallel/pipeline specs route to the N7 wave driver via the
+        # same dispatch — a resumed parallel run re-drives its step DAG with
+        # completed steps kept (B4-BR-9 boundary is applied above, pre-dispatch).
+        return await _dispatch_drive(record, spec)
     finally:
         _active_drives.discard(run_id)
 
 
+# ---------------------------------------------------------------------------
+# §7a — N7: parallel/pipeline DAG execution (wave scheduling)
+# ---------------------------------------------------------------------------
+async def _drive_parallel(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
+    """Drive ``record`` over its step DAG, running ready steps concurrently (N7).
+
+    ``mode: parallel`` and ``mode: pipeline`` share this driver; the only
+    difference is what ``needs`` the author declares. ``_topological_order``
+    already produces a deterministic dependency order (a step always appears
+    after everything it needs), so ``order`` here is the same order the
+    sequential drive uses — parallel scheduling is layered ON TOP of it:
+
+    * A step is *ready* once every step in its ``needs`` set has settled
+      COMPLETED/COMPLETED_UNVALIDATED (its output is available for
+      ``{{steps.<id>.output.<field>}}`` templating via ``_substitute``).
+    * All ready steps run CONCURRENTLY via ``asyncio.gather`` of the shared
+      ``_run_step`` — the same per-step retry/halt/reprompt semantics as
+      sequential mode, one coroutine per step.
+    * After each wave, the engine re-checks cancel + halt: a cancelled run
+      converges CANCELLED; an ``on_failure=halt`` step (record.state == FAILED)
+      stops scheduling new waves and skips the remaining steps.
+    * ``pipeline`` is a linear-chain DAG (each step needs the previous); it runs
+      through this same driver with waves of size 1.
+
+    The terminal-state journaling, event emission, and ``_build_result``
+    aggregation are shared with ``_drive`` via ``_finalize_run`` — one finalize,
+    no parallel/sequential divergence (B4-RD-5).
+
+    An unexpected engine error mid-run settles the record to terminal FAILED
+    before re-raising, exactly like ``_drive`` (B3-RD-3/RD-5).
+    """
+    remaining = list(order)
+    try:
+        while remaining:
+            if record.cancelled:
+                await _skip_remaining(record, remaining, from_index=0)
+                record.state = RunState.CANCELLED
+                break
+            if record.state == RunState.FAILED:  # halt from a prior wave
+                await _skip_remaining(record, remaining, from_index=0)
+                break
+
+            # The ready wave: steps whose every need has settled.
+            wave: List[WorkflowStep] = []
+            still_blocked: List[WorkflowStep] = []
+            for step in remaining:
+                if _deps_satisfied(record, step):
+                    wave.append(step)
+                else:
+                    still_blocked.append(step)
+
+            if not wave:
+                # Nothing ready but steps remain — a dependency cycle or a
+                # corrupted needs set. Grammar already rejects cycles, so this
+                # is an engine-invariant violation: fail loudly, never spin.
+                raise WorkflowEngineError(
+                    f"run '{record.run_id}': no ready steps but "
+                    f"{len(still_blocked)} blocked step(s) remain (broken needs DAG)"
+                )
+
+            # Run the wave concurrently. Each _run_step handles its own retries,
+            # reprompts, cancellation, and per-step journaling; gather waits for
+            # the whole wave before the next scheduling pass.
+            await asyncio.gather(*(_run_step(record, step) for step in wave))
+
+            # Remove the wave from remaining (settled or not — a FAILED/SKIPPED
+            # step is terminal for scheduling purposes; halt is observed next loop).
+            done_ids = {step.id for step in wave}
+            remaining = [step for step in remaining if step.id not in done_ids]
+    except WorkflowEngineError:
+        # Same settle-on-engine-error posture as _drive: leave the registry
+        # consistent and re-raise (-> 500) unmasked.
+        if record.current_step_id is not None:
+            cur = record.step_states.get(record.current_step_id)
+            if cur is not None and cur.state not in (
+                StepState.COMPLETED,
+                StepState.COMPLETED_UNVALIDATED,
+            ):
+                cur.state = StepState.FAILED
+        record.state = RunState.FAILED
+        record.current_step_id = None
+        record.finished_at = _now()
+        await _ajournal(_journal_current_step, record)
+        await _journal_event(record, "run.failed", state=record.state.value, error_kind="error")
+        await _ajournal(_journal_run_state, record)
+        logger.error("drive_parallel: run '%s' failed with an engine error", record.run_id)
+        raise
+
+    return await _finalize_run(record, order)
+
+
+def _deps_satisfied(record: RunRecord, step: WorkflowStep) -> bool:
+    """True when every step in ``step.needs`` has settled COMPLETED.
+
+    A COMPLETED_UNVALIDATED need (output present but schema-invalid) counts as
+    satisfied: its output is still templatable, matching the sequential driver's
+    treatment of that state as a settled step (decision note D1). An unknown
+    need id is a grammar error and never reaches the engine; defensively, an
+    absent step state means NOT satisfied (fail closed).
+    """
+    for dep in step.needs:
+        st = record.step_states.get(dep)
+        if st is None or st.state not in (
+            StepState.COMPLETED,
+            StepState.COMPLETED_UNVALIDATED,
+        ):
+            return False
+    return True
+
+
 def _run_parallel(record: Optional[RunRecord], steps: Any) -> None:
-    """RESERVED (N7) — parallel/pipeline execution. Raises ``NotBuiltYetError``."""
-    raise NotBuiltYetError("parallel/pipeline execution is reserved (not built yet; unit N7)")
+    """Compatibility seam — parallel/pipeline now runs via ``_drive_parallel``.
+
+    Kept as a raising stub named after the old reserved seam so any caller that
+    dispatched to the old seam gets a clear error pointing at the driver, rather
+    than silently running sequential. ``start_run`` no longer routes here.
+    """
+    raise WorkflowEngineError(
+        "parallel/pipeline execution must be driven via _drive_parallel "
+        "(the reserved-seam dispatch was removed in N7)"
+    )
 
 
 def _run_loop(record: Optional[RunRecord], step: Any) -> None:
