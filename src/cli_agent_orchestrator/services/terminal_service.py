@@ -1215,7 +1215,19 @@ def send_input(
         # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
         # arm set by notify_input_sent above; reset_buffer would wipe the arm and
         # latch-block the IDLE→PROCESSING transition for the whole turn.
-        status_monitor.clear_rolling_buffer(terminal_id)
+        # Give stateful providers the same explicit generation boundary as the
+        # rolling byte buffer.  Grok uses this to distinguish a new,
+        # byte-identical completion from a retained completion screen.
+        status_monitor.clear_rolling_buffer(terminal_id, provider)
+
+        # Mark the provider before send_keys rather than after it.  send_keys
+        # includes the provider-specific submit delay, during which a fast CLI
+        # can already emit its first processing and completion frames.  Those
+        # frames must be parsed as belonging to this turn, not as a stale
+        # post-clear redraw.  StatusMonitor has already armed and cleared the
+        # same dispatch boundary above.
+        if provider:
+            provider.mark_input_received()
 
         get_backend().send_keys(
             metadata["tmux_session"],
@@ -1225,13 +1237,6 @@ def send_input(
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
-
-        # Notify the provider that external input was received.
-        # This allows providers to adjust status
-        # detection — specifically to stop reporting IDLE for the post-init
-        # state and resume normal COMPLETED detection after a real task.
-        if provider:
-            provider.mark_input_received()
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")

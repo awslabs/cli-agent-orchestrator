@@ -17,7 +17,7 @@ from cli_agent_orchestrator.providers.grok_cli import (
     GrokCliProvider,
     ProviderError,
 )
-from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -292,6 +292,62 @@ def test_byte_identical_consecutive_turns_have_distinct_generations():
 
     provider.mark_input_received()
     assert provider.get_status(completed + "\n" + completed) == TerminalStatus.COMPLETED
+
+
+def test_buffer_clear_generation_accepts_coalesced_identical_completion():
+    """A real send-input boundary must not wedge a fast repeated turn.
+
+    This drives the same order used by ``terminal_service.send_input``:
+    completed first turn, arm StatusMonitor, clear its rolling buffer while
+    notifying Grok, mark the input received, then receive one FIFO chunk with
+    both the current processing marker and a byte-identical completion.  The
+    second direct status lookup models StatusMonitor's settled recheck.
+    """
+
+    provider = make_provider()
+    monitor = StatusMonitor()
+    completed = _completed_turn("repeat exactly", "same response")
+    coalesced = f"Waiting for response…\nEsc:cancel\n{completed}"
+
+    with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as manager:
+        manager.get_provider.return_value = provider
+
+        provider.mark_input_received()
+        monitor._process_chunk("test-terminal", completed)
+        assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
+
+        monitor.notify_input_sent("test-terminal")
+        monitor.clear_rolling_buffer("test-terminal", provider)
+        provider.mark_input_received()
+        monitor._process_chunk("test-terminal", coalesced)
+        assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
+
+        # While cached PROCESSING, get_status performs a direct settled
+        # recheck; pin the successful state through the same code path too.
+        monitor._last_status["test-terminal"] = TerminalStatus.PROCESSING
+        assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+
+
+def test_buffer_clear_generation_rejects_stale_identical_completion_without_activity():
+    """An old completed screen after clear is not proof a new turn completed."""
+
+    provider = make_provider()
+    monitor = StatusMonitor()
+    completed = _completed_turn("repeat exactly", "same response")
+
+    with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as manager:
+        manager.get_provider.return_value = provider
+
+        provider.mark_input_received()
+        monitor._process_chunk("test-terminal", completed)
+        assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
+
+        monitor.notify_input_sent("test-terminal")
+        monitor.clear_rolling_buffer("test-terminal", provider)
+        provider.mark_input_received()
+        monitor._process_chunk("test-terminal", completed)
+
+    assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
 
 
 @pytest.mark.parametrize("raw", [False, True])

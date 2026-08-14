@@ -1398,29 +1398,35 @@ class TestSendInput:
 
         mock_provider.mark_input_received.assert_called_once()
         mock_status_monitor.notify_input_sent.assert_called_once_with("test1234")
-        mock_status_monitor.clear_rolling_buffer.assert_called_once_with("test1234")
+        # The active provider receives the same explicit buffer-generation
+        # boundary, so stateful detectors never compare post-dispatch output
+        # with the discarded rolling buffer.
+        mock_status_monitor.clear_rolling_buffer.assert_called_once_with("test1234", mock_provider)
         # reset_buffer would wipe the arm — must NOT be called on send_input.
         mock_status_monitor.reset_buffer.assert_not_called()
 
-        # Ordering guard: the byte-buffer clear must run BEFORE send_keys, not
-        # after. send_keys includes a submit-delay sleep during which the agent
-        # can start emitting output; a post-send_keys clear would wipe that
-        # newly-emitted first chunk of the turn. Attach both calls to a shared
-        # manager so we can assert their relative order.
+        # Ordering guard: clear and the provider turn marker must both run
+        # BEFORE send_keys. send_keys includes a submit-delay sleep during
+        # which the agent can start emitting output; a post-send_keys clear or
+        # marker would parse that first chunk against stale state. Attach all
+        # three calls to a shared manager so we can assert their order.
         manager = MagicMock()
         manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_provider.mark_input_received, "mark_input")
         manager.attach_mock(mock_tmux.send_keys, "send_keys")
         # Re-run with the manager wired in to capture ordered calls.
         mock_status_monitor.reset_mock()
+        mock_provider.reset_mock()
         mock_tmux.reset_mock()
         manager.reset_mock()
         manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_provider.mark_input_received, "mark_input")
         manager.attach_mock(mock_tmux.send_keys, "send_keys")
         send_input("test1234", "hello again")
         ordered = [c[0] for c in manager.mock_calls]
-        assert ordered.index("clear") < ordered.index(
-            "send_keys"
-        ), f"clear_rolling_buffer must precede send_keys; got order {ordered}"
+        assert (
+            ordered.index("clear") < ordered.index("mark_input") < ordered.index("send_keys")
+        ), f"clear and mark_input must precede send_keys; got order {ordered}"
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")

@@ -153,7 +153,9 @@ class GrokCliProvider(BaseProvider):
         # when no new completion has happened.
         self._last_completion_identity: Optional[str] = None
         self._last_completion_stream_offset: Optional[int] = None
+        self._last_completion_buffer_epoch: Optional[int] = None
         self._turn_activity_seen = False
+        self._status_buffer_epoch = 0
         self._last_status_buffer: Optional[str] = None
         self._last_status_buffer_stream_start = 0
 
@@ -539,6 +541,21 @@ class GrokCliProvider(BaseProvider):
         self._last_status_buffer_stream_start = stream_start
         return stream_start, contiguous
 
+    def notify_status_buffer_reset(self, epoch: int) -> None:
+        """Start observing a fresh StatusMonitor byte-buffer generation.
+
+        Retain the previous completion identity so a delayed redraw can still
+        be rejected, but discard only the overlap-derived stream view.  The
+        monitor invokes this while its lock is held, before it can append the
+        first chunk for the newly dispatched turn.
+        """
+
+        if epoch <= self._status_buffer_epoch:
+            return
+        self._status_buffer_epoch = epoch
+        self._last_status_buffer = None
+        self._last_status_buffer_stream_start = 0
+
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         native = self._resolve_native_status(output)
         if native is not None:
@@ -647,6 +664,7 @@ class GrokCliProvider(BaseProvider):
                 ).hexdigest()
                 same_completion = (
                     self._last_completion_identity == fingerprint
+                    and self._last_completion_buffer_epoch == self._status_buffer_epoch
                     and self._last_completion_stream_offset == completion_stream_offset
                 )
                 if self._awaiting_turn_activity and same_completion:
@@ -660,6 +678,7 @@ class GrokCliProvider(BaseProvider):
                 if (
                     self._awaiting_turn_activity
                     and self._last_completion_identity == fingerprint
+                    and self._last_completion_buffer_epoch == self._status_buffer_epoch
                     and (
                         not stream_contiguous
                         or self._last_completion_stream_offset is None
@@ -678,17 +697,32 @@ class GrokCliProvider(BaseProvider):
                     and self._last_completion_identity is not None
                     and not self._turn_activity_seen
                 ):
-                    latest_query_start = query_matches[-1].start() if query_matches else None
+                    # A fresh buffer generation makes a processing marker that
+                    # precedes the completion reliable current-turn evidence,
+                    # even when Grok emits both frames in one FIFO chunk.  Do
+                    # not accept an identical completion without that marker:
+                    # a delayed old completed screen after clear must remain
+                    # PROCESSING.
                     if (
-                        latest_query_start is None
-                        or self._last_completion_stream_offset is not None
-                        and stream_start + latest_query_start <= self._last_completion_stream_offset
+                        self._last_completion_identity == fingerprint
+                        and self._last_completion_buffer_epoch != self._status_buffer_epoch
+                        and 0 <= last_processing < last_completion
                     ):
-                        return TerminalStatus.PROCESSING
-                    self._turn_activity_seen = True
+                        self._turn_activity_seen = True
+                    else:
+                        latest_query_start = query_matches[-1].start() if query_matches else None
+                        if (
+                            latest_query_start is None
+                            or self._last_completion_stream_offset is not None
+                            and stream_start + latest_query_start
+                            <= self._last_completion_stream_offset
+                        ):
+                            return TerminalStatus.PROCESSING
+                        self._turn_activity_seen = True
                 self._awaiting_turn_activity = False
                 self._last_completion_identity = fingerprint
                 self._last_completion_stream_offset = completion_stream_offset
+                self._last_completion_buffer_epoch = self._status_buffer_epoch
                 return TerminalStatus.COMPLETED
             # After dispatch, do not mistake the previous empty composer for
             # instant completion before Grok has rendered this turn.
