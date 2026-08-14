@@ -127,7 +127,7 @@ def test_send_to_persistent_agent_resolves_at_call_time():
     assert "resolved_terminal_id" not in result
     assert "receiver_id" not in result
     assert "sender_id" not in result
-    assert result["resolved_session_name"] == "cao-shaffer-estimating"
+    assert "resolved_session_name" not in result
 
 
 def test_send_to_persistent_agent_rejects_missing_and_duplicate_ids():
@@ -176,8 +176,19 @@ def test_public_list_redacts_terminal_ids():
         result = server._list_persistent_agents_impl()
 
     assert result["success"] is True
-    assert result["agents"][0]["agent_id"] == "shaffer-estimating"
-    assert "terminal_id" not in result["agents"][0]
+    public = result["agents"][0]
+    assert public["agent_id"] == "shaffer-estimating"
+    assert set(public) == {
+        "agent_id",
+        "display_name",
+        "organization_id",
+        "kind",
+        "parent_agent_id",
+        "status",
+    }
+    assert "terminal_id" not in public
+    assert "session_name" not in public
+    assert "agent_profile" not in public
 
 
 def test_semantic_only_mode_rejects_raw_receiver_but_allows_internal_resolution():
