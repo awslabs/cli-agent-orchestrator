@@ -122,6 +122,27 @@ This is deliberate (see the design discussion on [issue #432](https://github.com
 
 **`group` is an organizational label, not a security boundary.** On a default install with auth disabled, a worker already has local shell access, so `discovery`/`group`/session-scoping provide no isolation guarantee even when used together — see [docs/api.md](api.md) and the coexistence write-up linked above.
 
+#### OpenCode agents get a per-role MCP tool allowlist
+
+When a profile with a `role` is installed for `opencode_cli`, the cao-mcp-server
+grant in the agent's `tools` config is written **per tool** (e.g.
+`cao-mcp-server_send_message: true`) instead of the server-wide wildcard
+(`cao-mcp-server*: true`). OpenCode only advertises granted tool schemas to the
+model, so a worker carries the handful of schemas its role needs rather than
+all ~26 — a meaningful context/token saving per delegated task.
+
+- `supervisor` gets the orchestration trio (`handoff`, `assign`, `send_message`),
+  prompt answers, sibling discovery, and memory tools.
+- `developer` gets `send_message` (the assign callback), memory tools, and skill
+  load — deliberately **not** `handoff`/`assign`, so a worker cannot re-delegate.
+- `reviewer` gets `send_message`, memory, and skill load only.
+- Profiles **without** a `role` keep the server-wide grant (backward compatible);
+  third-party MCP servers are always granted server-wide (CAO has no per-tool
+  knowledge of them).
+
+This refines what the agent *sees*; the CAO `allowedTools` vocabulary above
+remains the enforcement layer for the provider-native tools.
+
 ### 3. `--yolo` — The Escape Hatch
 
 ```bash

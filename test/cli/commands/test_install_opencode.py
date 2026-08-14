@@ -364,6 +364,40 @@ class TestMcpWiring:
         assert agent_tools["srv-a*"] is True
         assert agent_tools["srv-b*"] is True
 
+    def test_role_grants_only_role_mcp_tools(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """A profile with role: developer gets per-tool grants, not the wildcard."""
+        _write_profile(
+            install_workspace["local_store"] / "test-agent.md",
+            extra_frontmatter="role: developer\n",
+            mcp_servers=("  cao-mcp-server:\n" "    command: cao-mcp-server\n" "    type: local\n"),
+        )
+
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        data = json.loads(install_workspace["config_file"].read_text())
+        tools = data["agent"]["test-agent"]["tools"]
+        # No server-wide wildcard: the role allowlist replaces it.
+        assert "cao-mcp-server*" not in tools
+        # Worker tools the role needs are granted per-tool.
+        assert tools["cao-mcp-server_send_message"] is True
+        assert tools["cao-mcp-server_memory_recall"] is True
+        # Supervisor-only tools are NOT advertised to a worker.
+        assert "cao-mcp-server_handoff" not in tools
+        assert "cao-mcp-server_assign" not in tools
+
+    def test_roleless_profile_keeps_server_wide_grant(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """No role -> backward-compatible server-wide grant (existing behavior)."""
+        self._mcp_profile(install_workspace["local_store"] / "test-agent.md")
+
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        data = json.loads(install_workspace["config_file"].read_text())
+        assert data["agent"]["test-agent"]["tools"]["cao-mcp-server*"] is True
+
 
 # ---------------------------------------------------------------------------
 # Scenario (e): agent without MCP — already covered in TestFreshInstall
