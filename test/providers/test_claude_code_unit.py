@@ -205,6 +205,34 @@ class TestClaudeCodeProviderInitialization:
             await provider.initialize()
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_resumes_pinned_claude_session(self, mock_load):
+        """A Claude profile can pin the exact conversation CAO must resume."""
+        session_id = "bcff4abd-706a-4d78-97f2-7edc9361d4b7"
+        mock_load.return_value = AgentProfile(
+            name="aiva",
+            description="AIVA",
+            provider="claude_code",
+            claudeSessionId=session_id,
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "aiva")
+        command = provider._build_claude_command()
+        args = shlex.split(command.split(";", 1)[1].strip())
+
+        assert "--resume" in args
+        assert args[args.index("--resume") + 1] == session_id
+
+    def test_agent_profile_rejects_empty_claude_session_id(self):
+        """An explicitly configured resume id cannot silently degrade to blank."""
+        with pytest.raises(ValueError):
+            AgentProfile(
+                name="aiva",
+                description="AIVA",
+                provider="claude_code",
+                claudeSessionId="",
+            )
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_uses_native_agent_from_profile(self, mock_load):
         """Test profile with native_agent field uses --agent passthrough."""
         mock_profile = MagicMock()

@@ -81,6 +81,11 @@
     "native_agent": {
       "type": "string"
     },
+    "claudeSessionId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Claude Code conversation/session id to resume with --resume. Claude Code provider only."
+    },
     "codexProfile": {
       "type": "string",
       "minLength": 1

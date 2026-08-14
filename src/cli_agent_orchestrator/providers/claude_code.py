@@ -368,6 +368,16 @@ class ClaudeCodeProvider(BaseProvider):
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
 
+        # Resume a specific Claude Code conversation when the profile pins one.
+        # This is intentionally profile-owned rather than inferred from CAO's
+        # tmux/session name: a CAO runtime session and a Claude conversation are
+        # different identities, and supervisors such as AIVA need the latter to
+        # survive CAO restarts unchanged. Claude Code accepts --resume alongside
+        # the prompt/MCP flags CAO adds below.
+        claude_session_id = getattr(profile, "claudeSessionId", None) if profile else None
+        if isinstance(claude_session_id, str) and claude_session_id:
+            command_parts.extend(["--resume", claude_session_id])
+
         # Route based on profile state
         native = getattr(profile, "native_agent", None) if profile else None
         if profile is not None and isinstance(native, str) and native:
