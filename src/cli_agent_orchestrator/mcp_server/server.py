@@ -67,6 +67,14 @@ ENABLE_PERSISTENT_AGENT_ROUTING = (
 REQUIRE_SEMANTIC_PERSISTENT_ROUTING = (
     os.getenv("CAO_REQUIRE_SEMANTIC_PERSISTENT_ROUTING", "false").lower() == "true"
 )
+# Persistent department/specialist supervisors use durable async workers. A
+# synchronous handoff auto-tears the child down when the step returns, which can
+# race startup/callback delivery and make a boot screen look like task output.
+# Enable this on supervisors whose child work must complete through assign +
+# durable caller_id callback instead.
+REQUIRE_ASYNC_CHILD_DELEGATION = (
+    os.getenv("CAO_REQUIRE_ASYNC_CHILD_DELEGATION", "false").lower() == "true"
+)
 
 
 def _enforce_child_profile_policy(agent_profile: str) -> None:
@@ -778,6 +786,18 @@ async def _handoff_impl(
     """
     start_time = time.time()
     terminal_id: Optional[str] = None
+
+    if REQUIRE_ASYNC_CHILD_DELEGATION:
+        return HandoffResult(
+            success=False,
+            message=(
+                "Synchronous handoff is disabled for this supervisor. Use assign so the "
+                "child remains alive for durable caller_id callback, then wait for the "
+                "callback before reviewing or reporting completion."
+            ),
+            output=None,
+            terminal_id=None,
+        )
 
     try:
         _enforce_child_profile_policy(agent_profile)
