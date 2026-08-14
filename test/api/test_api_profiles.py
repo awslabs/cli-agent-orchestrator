@@ -64,6 +64,63 @@ class TestGetAgentProfileEndpoint:
         assert response.status_code == 400
         assert "Invalid agent name" in response.json()["detail"]
 
+    def test_redacts_mcp_server_env_values(self, client) -> None:
+        """MCP server env values must never cross the wire as plaintext.
+
+        ``load_agent_profile`` resolves ``${VAR}`` placeholders server-side, so
+        ``mcpServers[].env`` can hold live credentials; the endpoint replaces
+        their values with ``"***"`` (keys and structure preserved) so an
+        authenticated caller still sees which servers a profile configures but
+        never their tokens.
+        """
+        profile = AgentProfile(
+            name="developer",
+            description="Developer agent",
+            system_prompt="Implement the task.",
+            mcpServers={
+                "cao": {"command": "cao-mcp-server", "env": {"API_TOKEN": "super-secret"}},
+                "db": {"command": "db-mcp", "env": {"HOST": "db.internal"}},
+            },
+        )
+
+        with patch(
+            "cli_agent_orchestrator.api.main.load_agent_profile",
+            return_value=profile,
+        ):
+            response = client.get("/agents/profiles/developer")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["mcpServers"]["cao"]["command"] == "cao-mcp-server"
+        assert body["mcpServers"]["cao"]["env"] == {"API_TOKEN": "***"}
+        assert body["mcpServers"]["db"]["env"] == {"HOST": "***"}
+        assert "super-secret" not in response.text
+
+    def test_requires_token_when_auth_enabled(self, client, monkeypatch) -> None:
+        """With auth enabled, the profile detail endpoint is gated: no token -> 401."""
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
+        response = client.get("/agents/profiles/developer")
+        assert response.status_code == 401
+
+    def test_authorized_token_can_read_profile(self, client, monkeypatch) -> None:
+        """A token holding cao:read passes the gate (not 401/403)."""
+        from cli_agent_orchestrator.api import main
+        from cli_agent_orchestrator.security import auth
+
+        monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
+        monkeypatch.setattr(auth, "extract_scopes_from_token", lambda tok: [auth.SCOPE_READ])
+        with patch(
+            "cli_agent_orchestrator.api.main.load_agent_profile",
+            return_value=AgentProfile(name="developer", description="Developer agent"),
+        ):
+            response = client.get(
+                "/agents/profiles/developer", headers={"Authorization": "Bearer test-token"}
+            )
+
+        assert response.status_code == 200
+        assert response.json()["name"] == "developer"
+        assert not main.app.dependency_overrides
+
 
 class TestInstallAgentProfileEndpoint:
     """Tests for POST /agents/profiles/install."""
