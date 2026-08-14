@@ -1451,9 +1451,17 @@ def _list_persistent_agents_impl() -> Dict[str, Any]:
     discovered = _discover_persistent_agent_routes_impl()
     if not discovered.get("success"):
         return discovered
+    public_fields = (
+        "agent_id",
+        "display_name",
+        "organization_id",
+        "kind",
+        "parent_agent_id",
+        "status",
+    )
     public_agents = []
     for agent in discovered.get("agents", []):
-        public_agents.append({k: v for k, v in agent.items() if k != "terminal_id"})
+        public_agents.append({key: agent.get(key) for key in public_fields})
     return {"success": True, "agents": public_agents, "count": len(public_agents)}
 
 
@@ -1490,7 +1498,6 @@ def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[
         return {
             **public_result,
             "persistent_agent_id": agent_id,
-            "resolved_session_name": target.get("session_name"),
         }
     return result
 
