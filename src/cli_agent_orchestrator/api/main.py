@@ -70,6 +70,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
+    is_http_origin_allowed,
     is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
@@ -1240,6 +1241,56 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
+
+# Methods whose request could change server state. The Origin check only
+# guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and
+# OPTIONS preflights must reach CORSMiddleware unchanged).
+_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+class OriginCheckMiddleware:
+    """Reject state-changing HTTP requests with a disallowed ``Origin``.
+
+    CSRF / CWE-352 guard for the default-unauthenticated surface. Browsers
+    attach an ``Origin`` header on every cross-site state-changing request
+    (fetch, XHR, and form POST alike — the simple-request paths CORS can't
+    preflight-block), while non-browser clients (curl, ``requests``, MCP, the
+    ``cao`` CLI) send none, so a present-but-untrusted ``Origin`` is exactly
+    the browser-only signal this rejects. Reads and OPTIONS preflights always
+    pass through. Registered FIRST so it runs inside ``TrustedHostMiddleware``:
+    Host is validated against ``ALLOWED_HOSTS`` on the same scope before the
+    same-origin branch below can trust it (see ``is_http_origin_allowed``).
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope["method"] in _STATE_CHANGING_METHODS:
+            headers = {
+                name.decode("latin-1").lower(): value.decode("latin-1")
+                for name, value in scope.get("headers", [])
+            }
+            origin = headers.get("origin")
+            if origin and not is_http_origin_allowed(origin, headers.get("host")):
+                logger.warning(
+                    "Rejected cross-origin %s request: disallowed Origin %r",
+                    scope["method"],
+                    origin,
+                )
+                response = JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Cross-origin request blocked"},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# Security: CSRF / Cross-Origin Request Forgery (CWE-352). See the middleware
+# docstring; the guard must sit INSIDE TrustedHostMiddleware's Host validation
+# (add_middleware stacks last-added outermost), hence it is registered first.
+app.add_middleware(OriginCheckMiddleware)
 
 # Security: DNS Rebinding Protection
 # Validate Host header to prevent DNS rebinding attacks (CVE mitigation)

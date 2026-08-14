@@ -534,6 +534,50 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
     return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
 
 
+def is_http_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
+    """Whether a state-changing HTTP request ``Origin`` header is trusted.
+
+    CSRF / CWE-352 guard for the default-unauthenticated HTTP surface, mirroring
+    ``is_ws_origin_allowed`` on the read/mutation HTTP split:
+
+    * A missing / empty ``Origin`` is allowed. Browsers always attach one on a
+      cross-site state-changing request (``fetch``, XHR, and form posts alike),
+      so its absence means a non-browser client (curl, ``requests``, MCP, the
+      ``cao`` CLI) — one with no ambient credentials a foreign page could use.
+    * A literal ``*`` in ``CORS_ORIGINS`` (i.e. ``CAO_CORS_ORIGINS="*"``) allows
+      every origin — the operator-visible wildcard that ``CORSMiddleware``
+      already honors for the read surface, so a ``"*"``-configured deployment
+      behaves consistently for writes too.
+    * **Same-origin**: the ``Origin`` authority equals the request ``Host``.
+      This is the request the bundled Web UI makes when served by cao-server
+      itself, and it is exactly what a cross-site attacker CANNOT forge —
+      script-set ``Host`` is forbidden and the real ``Host`` is the CAO server
+      the request was made to, not the attacker's page. Matching on the live
+      ``Host`` lets the imported-app deployment and dynamic reverse-proxy /
+      Codespaces hostnames work without pre-registering every origin.
+
+      Like the WebSocket branch, this trusts ``Host`` and is only as safe as
+      ``Host`` itself: ``TrustedHostMiddleware`` validates ``Host`` against
+      ``ALLOWED_HOSTS`` on the same scope BEFORE the HTTP origin check runs,
+      which keeps the match DNS-rebinding-safe in the default loopback config.
+      ``CAO_ALLOWED_HOSTS="*"`` opts out of that protection, matching the WS
+      guard's documented tradeoff.
+    * Otherwise the ``Origin`` must be in ``CORS_ORIGINS``. Exact-string match
+      mirrors how the browser serializes ``Origin`` and how ``CORSMiddleware``
+      compares it, so anything the CORS layer already trusts for reads is
+      trusted for writes too.
+    """
+    if not origin:
+        return True
+    if "*" in CORS_ORIGINS:
+        return True
+    if host:
+        authority = _origin_authority(origin)
+        if authority is not None and authority == host:
+            return True
+    return origin in CORS_ORIGINS
+
+
 # Trusted upstream IP allowlist for uvicorn's ``proxy_headers`` and
 # ``forwarded_allow_ips`` settings. When cao-server is bound to a
 # non-loopback address (Codespaces, devcontainer, reverse proxy), uvicorn
