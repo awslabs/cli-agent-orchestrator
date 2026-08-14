@@ -35,6 +35,16 @@ class TestLoadProfileSchema:
         assert schema["additionalProperties"] is False
         assert "engine" in schema["properties"]
 
+    def test_provider_schema_exposes_every_public_provider_including_pi(self) -> None:
+        from cli_agent_orchestrator.models.provider import ProviderType
+
+        schema = load_profile_schema()
+
+        assert set(schema["properties"]["provider"]["enum"]) == {
+            provider.value for provider in ProviderType
+        }
+        assert "pi" in schema["properties"]["provider"]["enum"]
+
     def test_is_cached(self) -> None:
         """Repeated calls must not re-read and re-parse the packaged file."""
         assert load_profile_schema() is load_profile_schema()

@@ -3,6 +3,8 @@
 import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
+    ALL_NATIVE_TOOLS,
+    TOOL_MAPPING,
     format_tool_summary,
     get_disallowed_tools,
     resolve_allowed_tools,
@@ -117,6 +119,69 @@ class TestGetDisallowedTools:
         result = get_disallowed_tools("claude_code", ["@cao-mcp-server", "@custom"])
         # Should block all native tools since no CAO tool categories are allowed
         assert len(result) > 0
+
+
+class TestPiToolPolicy:
+    """Pi's built-in denylist is a hard, exact translation of CAO policy."""
+
+    def test_mapping_and_native_tool_universe_are_exact(self):
+        assert TOOL_MAPPING["pi"] == {
+            "execute_bash": ["bash"],
+            "fs_read": ["read"],
+            "fs_write": ["edit", "write"],
+            "fs_list": ["grep", "find", "ls"],
+            "fs_*": ["read", "edit", "write", "grep", "find", "ls"],
+        }
+        assert ALL_NATIVE_TOOLS["pi"] == {
+            "bash",
+            "read",
+            "edit",
+            "write",
+            "grep",
+            "find",
+            "ls",
+        }
+
+    def test_reviewer_blocks_only_bash_and_write_tools(self):
+        assert get_disallowed_tools("pi", ["fs_read", "fs_list"]) == [
+            "bash",
+            "edit",
+            "write",
+        ]
+
+    def test_empty_policy_blocks_all_native_tools_in_sorted_order(self):
+        assert get_disallowed_tools("pi", []) == [
+            "bash",
+            "edit",
+            "find",
+            "grep",
+            "ls",
+            "read",
+            "write",
+        ]
+
+    def test_wildcard_blocks_no_native_tools(self):
+        assert ALL_NATIVE_TOOLS["pi"] == {
+            "bash",
+            "read",
+            "edit",
+            "write",
+            "grep",
+            "find",
+            "ls",
+        }
+        assert get_disallowed_tools("pi", ["*"]) == []
+
+    def test_web_fetch_does_not_grant_a_pi_builtin(self):
+        assert get_disallowed_tools("pi", ["web_fetch"]) == [
+            "bash",
+            "edit",
+            "find",
+            "grep",
+            "ls",
+            "read",
+            "write",
+        ]
 
 
 class TestClaudeCodeWebFetch:

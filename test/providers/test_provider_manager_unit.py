@@ -54,6 +54,39 @@ def test_create_provider_hermes_stores_mapping():
     assert manager.get_provider("t1") is provider
 
 
+def test_create_provider_pi_forwards_runtime_contract_and_stores_mapping():
+    """Pi receives the complete launch-time contract and is cached by terminal ID."""
+    manager = ProviderManager()
+    pi_provider = MagicMock()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.PiProvider",
+        return_value=pi_provider,
+    ) as pi_factory:
+        provider = manager.create_provider(
+            "pi",
+            terminal_id="t1",
+            tmux_session="s1",
+            tmux_window="w1",
+            agent_profile="reviewer",
+            allowed_tools=["fs_read", "fs_list"],
+            skill_prompt="runtime catalog",
+            model="openai/gpt-5",
+        )
+
+    pi_factory.assert_called_once_with(
+        "t1",
+        "s1",
+        "w1",
+        "reviewer",
+        ["fs_read", "fs_list"],
+        skill_prompt="runtime catalog",
+        model="openai/gpt-5",
+    )
+    assert provider is pi_provider
+    assert manager.get_provider("t1") is pi_provider
+
+
 def test_create_provider_unknown_type_raises():
     manager = ProviderManager()
     with pytest.raises(ValueError, match="Unknown provider type"):
@@ -100,6 +133,41 @@ def test_get_provider_creates_copilot_on_demand_from_metadata():
 
     assert isinstance(provider, CopilotCliProvider)
     assert manager.get_provider("t1") is provider
+
+
+def test_get_provider_creates_pi_on_demand_from_existing_metadata():
+    """Pi restoration uses only the provider fields already persisted by CAO."""
+    manager = ProviderManager()
+    pi_provider = MagicMock()
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": "pi",
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "reviewer",
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.PiProvider",
+            return_value=pi_provider,
+        ) as pi_factory,
+    ):
+        provider = manager.get_provider("t1")
+
+    pi_factory.assert_called_once_with(
+        "t1",
+        "s1",
+        "w1",
+        "reviewer",
+        None,
+        skill_prompt=None,
+        model=None,
+    )
+    assert provider is pi_provider
+    assert manager.get_provider("t1") is pi_provider
 
 
 def test_cleanup_provider_calls_cleanup_and_removes():

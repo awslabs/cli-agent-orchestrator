@@ -33,7 +33,20 @@
     },
     "provider": {
       "type": "string",
-      "description": "Provider override (e.g. claude_code, kiro_cli, codex)."
+      "enum": [
+        "kiro_cli",
+        "claude_code",
+        "codex",
+        "kimi_cli",
+        "copilot_cli",
+        "opencode_cli",
+        "hermes",
+        "cursor_cli",
+        "antigravity_cli",
+        "pi",
+        "mock_cli"
+      ],
+      "description": "Provider override."
     },
     "engine": {
       "type": "string",

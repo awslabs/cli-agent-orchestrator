@@ -1,7 +1,7 @@
 """Shared fixtures for end-to-end tests.
 
 E2E tests require:
-- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, gemini, copilot)
+- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, pi, gemini, copilot)
 - tmux available on the system
 
 The CAO server is started automatically by the ``cao_server`` fixture from
@@ -15,6 +15,7 @@ Run with: uv run pytest -m e2e test/e2e/ -v
 
 import shutil
 import time
+from pathlib import Path
 from test.fixtures.cao_server import CaoServer, _patch_api_base_url_for_e2e
 
 import pytest
@@ -69,6 +70,22 @@ def require_kiro():
     """Skip test if kiro-cli is not available."""
     if not _cli_available("kiro-cli"):
         pytest.skip("kiro-cli CLI not installed")
+
+
+@pytest.fixture()
+def require_pi(cao_server: CaoServer):
+    """Require Pi and seed assign profiles into the isolated CAO home."""
+    if shutil.which("pi") is None:
+        pytest.skip("pi CLI not installed")
+
+    profile_store = cao_server.home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    profile_store.mkdir(parents=True, exist_ok=True, mode=0o700)
+    profile_store.chmod(0o700)
+    examples = Path(__file__).resolve().parents[2] / "examples" / "assign"
+    for profile_name in ("analysis_supervisor", "data_analyst", "report_generator"):
+        target = profile_store / f"{profile_name}.md"
+        shutil.copy2(examples / f"{profile_name}.md", target)
+        target.chmod(0o600)
 
 
 @pytest.fixture()

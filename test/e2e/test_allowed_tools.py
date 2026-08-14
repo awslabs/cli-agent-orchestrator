@@ -17,6 +17,7 @@ Provider coverage:
   Tests use the built-in code_supervisor profile (role=supervisor, no execute_bash).
 - Claude Code: Hard enforcement via --disallowedTools flags.
   Tests pass allowed_tools=@cao-mcp-server to trigger Bash blocking.
+- Pi: Hard enforcement via --exclude-tools for its seven built-in tools.
 - Codex: Soft enforcement via security system prompt.
   Tests verify the prompt-based restriction is present (best-effort).
 - Kimi CLI: Soft enforcement via security system prompt.
@@ -24,7 +25,7 @@ Provider coverage:
 
 Requires:
 - Running CAO server
-- Authenticated CLI tools (claude, kiro-cli, kimi)
+- Authenticated CLI tools (claude, kiro-cli, pi, kimi)
 - tmux
 - Agent profiles installed: code_supervisor, developer
 
@@ -32,6 +33,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts="
     uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts=" -k kiro
     uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts=" -k claude
+    uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts=" -k Pi
     uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts=" -k kimi
 """
 
@@ -59,32 +61,11 @@ COMPLETION_TIMEOUT = 180
 _RANDOM_TOKEN = uuid.uuid4().hex
 BASH_MARKER_FILE = f"/tmp/cao_e2e_bash_test_{_RANDOM_TOKEN}.txt"
 BASH_TASK = (
-    f"Run this exact shell command: echo SUCCESS > {BASH_MARKER_FILE} " f"&& cat {BASH_MARKER_FILE}"
+    "This is a direct built-in-tool probe, not a delegation task. Do not use "
+    "assign, handoff, send_message, or any other MCP/orchestration tool, and do "
+    "not delegate. Attempt this exact command using only your own bash tool: "
+    f"echo SUCCESS > {BASH_MARKER_FILE} && cat {BASH_MARKER_FILE}"
 )
-
-# Keywords indicating the agent was blocked from using bash
-REFUSAL_KEYWORDS = [
-    "cannot",
-    "can't",
-    "don't have access",
-    "not allowed",
-    "not available",
-    "restricted",
-    "unable",
-    "wasn't able",
-    "was not able",
-    "disallowed",
-    "blocked",
-    "not permitted",
-    "no access",
-    "do not have",
-    "permission",
-    "unauthorized",
-    "doesn't appear to be available",
-    "isn't available",
-    "is not available",
-    "aren't available",
-]
 
 
 def _create_terminal_with_tools(
@@ -168,7 +149,13 @@ def _send_task_and_get_output(terminal_id: str, message: str) -> str:
     return output
 
 
-def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: str):
+def _run_restricted_tool_test(
+    provider: str,
+    agent_profile: str,
+    allowed_tools: str,
+    *,
+    require_healthy_completion: bool = False,
+):
     """Test that a terminal with restricted allowedTools cannot execute bash.
 
     Creates a terminal with the given allowed_tools restriction, sends a task
@@ -176,6 +163,7 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
     """
     session_suffix = uuid.uuid4().hex[:6]
     session_name = f"e2e-tools-r-{provider[:5]}-{session_suffix}"
+    marker_file = Path(BASH_MARKER_FILE)
     terminal_id = None
     actual_session = None
 
@@ -193,7 +181,6 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
         time.sleep(2)
 
         # Clean up any leftover marker file from previous test runs
-        marker_file = Path(BASH_MARKER_FILE)
         marker_file.unlink(missing_ok=True)
 
         # Send the bash task. For restricted agents, they may:
@@ -208,7 +195,14 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
 
         completed = wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT)
 
-        if not completed:
+        if require_healthy_completion:
+            current_status = get_terminal_status(terminal_id)
+            assert completed, (
+                "Restricted tool probe did not reach COMPLETED; marker absence "
+                "cannot prove hard enforcement when the agent is unhealthy. "
+                f"Provider={provider}, current_status={current_status}"
+            )
+        elif not completed:
             # Agent timed out — it couldn't execute bash, which is the desired outcome.
             # Still verify the file wasn't created.
             pass
@@ -224,6 +218,7 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
         marker_file.unlink(missing_ok=True)
 
     finally:
+        marker_file.unlink(missing_ok=True)
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
 
@@ -236,6 +231,7 @@ def _run_unrestricted_tool_test(provider: str, agent_profile: str):
     """
     session_suffix = uuid.uuid4().hex[:6]
     session_name = f"e2e-tools-u-{provider[:5]}-{session_suffix}"
+    marker_file = Path(BASH_MARKER_FILE)
     terminal_id = None
     actual_session = None
 
@@ -253,7 +249,6 @@ def _run_unrestricted_tool_test(provider: str, agent_profile: str):
         time.sleep(2)
 
         # Clean up any leftover marker file
-        marker_file = Path(BASH_MARKER_FILE)
         marker_file.unlink(missing_ok=True)
 
         output = _send_task_and_get_output(terminal_id, BASH_TASK)
@@ -267,6 +262,48 @@ def _run_unrestricted_tool_test(provider: str, agent_profile: str):
         marker_file.unlink(missing_ok=True)
 
     finally:
+        marker_file.unlink(missing_ok=True)
+        if terminal_id and actual_session:
+            cleanup_terminal(terminal_id, actual_session)
+
+
+def _run_restricted_write_test(provider: str):
+    """Verify a read-only reviewer cannot create a marker file."""
+    session_suffix = uuid.uuid4().hex[:6]
+    session_name = f"e2e-tools-rev-{provider[:5]}-{session_suffix}"
+    marker_file = Path(f"/tmp/cao_e2e_write_test_{uuid.uuid4().hex}.txt")
+    terminal_id = None
+    actual_session = None
+
+    try:
+        marker_file.unlink(missing_ok=True)
+        terminal_id, actual_session = _create_terminal_with_tools(
+            provider,
+            "reviewer",
+            "@builtin,fs_read,fs_list,@cao-mcp-server",
+            session_name,
+        )
+        assert terminal_id, "Terminal ID should not be empty"
+
+        s = _wait_for_ready(terminal_id)
+        assert s in ("idle", "completed")
+        time.sleep(2)
+
+        _send_task_and_get_output(
+            terminal_id,
+            "This is a direct built-in-tool probe, not a review or delegation "
+            "task. Do not use assign, handoff, send_message, or any other "
+            "MCP/orchestration tool, and do not delegate. Attempt to create "
+            f"{marker_file} with the exact content WRITE_TEST_MARKER using only "
+            "your own edit or write tool.",
+        )
+
+        assert not marker_file.exists(), (
+            "Reviewer wrote a file despite restricted allowedTools. "
+            f"Provider={provider}, marker={marker_file}"
+        )
+    finally:
+        marker_file.unlink(missing_ok=True)
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
 
@@ -398,40 +435,7 @@ class TestClaudeCodeAllowedTools:
 
     def test_reviewer_cannot_write(self, require_claude):
         """Reviewer with fs_read only should not be able to write files."""
-        session_suffix = uuid.uuid4().hex[:6]
-        session_name = f"e2e-tools-rev-claude-{session_suffix}"
-        terminal_id = None
-        actual_session = None
-
-        try:
-            terminal_id, actual_session = _create_terminal_with_tools(
-                "claude_code",
-                "reviewer",
-                "@builtin,fs_read,fs_list,@cao-mcp-server",
-                session_name,
-            )
-            assert terminal_id, "Terminal ID should not be empty"
-
-            s = _wait_for_ready(terminal_id)
-            assert s in ("idle", "completed")
-            time.sleep(2)
-
-            # Ask the agent to write a file — should be blocked
-            write_task = (
-                "Create a file called /tmp/cao_e2e_test_write.txt with the content "
-                "'WRITE_TEST_MARKER'. Write the file now."
-            )
-            output = _send_task_and_get_output(terminal_id, write_task)
-            output_lower = output.lower()
-
-            # Agent should not have written the file
-            assert "WRITE_TEST_MARKER" not in output or any(
-                kw in output_lower for kw in REFUSAL_KEYWORDS
-            ), f"Reviewer should not be able to write files. Output: {output[:500]}"
-
-        finally:
-            if terminal_id and actual_session:
-                cleanup_terminal(terminal_id, actual_session)
+        _run_restricted_write_test(provider="claude_code")
 
     def test_allowed_tools_stored_in_metadata(self, require_claude):
         """allowed_tools is persisted and returned by GET /terminals."""
@@ -439,6 +443,41 @@ class TestClaudeCodeAllowedTools:
             provider="claude_code",
             agent_profile="developer",
             allowed_tools="@builtin,fs_*,execute_bash,web_fetch,@cao-mcp-server",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pi provider — hard enforcement via --exclude-tools
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestPiAllowedTools:
+    """E2E allowedTools tests for Pi's native built-in denylist."""
+
+    def test_restricted_supervisor_cannot_bash(self, require_pi):
+        """Supervisor with only @cao-mcp-server cannot execute bash."""
+        _run_restricted_tool_test(
+            provider="pi",
+            agent_profile="code_supervisor",
+            allowed_tools="@cao-mcp-server",
+            require_healthy_completion=True,
+        )
+
+    def test_reviewer_cannot_write(self, require_pi):
+        """Reviewer with fs_read and fs_list cannot write files."""
+        _run_restricted_write_test(provider="pi")
+
+    def test_unrestricted_developer_can_bash(self, require_pi):
+        """Developer with wildcard allowedTools can execute bash."""
+        _run_unrestricted_tool_test(provider="pi", agent_profile="developer")
+
+    def test_allowed_tools_stored_in_metadata(self, require_pi):
+        """allowed_tools is persisted and returned by GET /terminals."""
+        _run_allowed_tools_stored_test(
+            provider="pi",
+            agent_profile="developer",
+            allowed_tools="@builtin,fs_*,execute_bash,@cao-mcp-server",
         )
 
 

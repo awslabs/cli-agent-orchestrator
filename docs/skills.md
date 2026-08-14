@@ -121,7 +121,7 @@ To advertise only a subset of skills to a given agent, set the `skills` field in
 
 This scopes the injected **catalog** only — it controls what an agent *sees* advertised, not what it can *load*. Skill resolution is unchanged: `load_skill` still resolves any installed skill by name, so this is a prompt-relevance / noise-reduction control, not an access boundary. (If you need a hard per-agent allowlist, that would have to be enforced in the `load_skill` path — out of scope here.)
 
-This applies only to the runtime-prompt providers that receive the injected catalog (Claude Code, Codex, Antigravity CLI, Kimi CLI). Providers that deliver skills natively (Kiro CLI, OpenCode, GitHub Copilot CLI) ignore the field.
+This applies only to the runtime-prompt providers that receive the injected catalog (Claude Code, Codex, Antigravity CLI, Kimi CLI, Pi). Providers that deliver skills natively (Kiro CLI, OpenCode, GitHub Copilot CLI) ignore the field.
 
 ```yaml
 ---
@@ -163,17 +163,22 @@ Skills are delivered to agents differently depending on the provider. The table 
 | Codex | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Antigravity CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kimi CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
+| Pi | Runtime prompt; ambient Pi skill discovery disabled | Every terminal creation | `load_skill` MCP tool |
 | Kiro CLI | Native `skill://` resources | Every terminal creation | Kiro progressive loading |
 | Copilot CLI | Baked into `.agent.md` at install | On `cao skills add/remove` | `load_skill` MCP tool |
 | OpenCode CLI | Native `skill` tool via `OPENCODE_CONFIG_DIR/skills` symlink | Every terminal creation | OpenCode progressive loading (also via `load_skill` MCP tool) |
 | Cursor CLI | Runtime prompt (currently disabled — see [Cursor CLI provider docs](cursor-cli.md#agent-profile-integration)) | Not injected in v2026 | `load_skill` MCP tool |
 | Hermes | Not injected — configure skills in the selected Hermes profile | N/A | N/A |
 
-### Runtime Prompt Providers (Claude Code, Codex, Antigravity CLI, Kimi CLI)
+### Runtime Prompt Providers (Claude Code, Codex, Antigravity CLI, Kimi CLI, Pi)
 
 For these providers, the skill catalog is built fresh each time a terminal is created. The catalog — a list of skill names and descriptions — is appended to the system prompt via the provider's native CLI flags.
 
 The agent retrieves full skill content at runtime by calling the `load_skill` MCP tool, which fetches the skill body from the CAO server.
+
+For Pi, CAO also disables ambient Pi-native skill discovery and appends this
+runtime catalog to the provider prompt. `load_skill` is a CAO MCP call, not a
+Pi-native skill lookup. See the [Pi provider guide](pi.md#skills).
 
 No action is needed after `cao skills add` or `cao skills remove` — the next terminal created will automatically reflect the current set of installed skills.
 

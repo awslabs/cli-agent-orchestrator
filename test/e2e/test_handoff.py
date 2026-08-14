@@ -10,13 +10,14 @@ Tests the worker side of the handoff flow — validates that each provider can:
 NOTE: These tests do NOT test a supervisor agent calling the handoff() MCP tool.
 For real supervisor→worker delegation tests, see test_supervisor_orchestration.py.
 
-Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, copilot), tmux.
+Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, pi, copilot), tmux.
 
 Run:
     uv run pytest -m e2e test/e2e/test_handoff.py -v
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k codex
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k kiro_cli
+    uv run pytest -m e2e test/e2e/test_handoff.py -v -k Pi
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k copilot
 """
 
@@ -38,7 +39,15 @@ import pytest
 COMPLETION_TIMEOUT = 180
 
 
-def _run_handoff_test(provider: str, agent_profile: str, task_message: str, content_keywords: list):
+def _run_handoff_test(
+    provider: str,
+    agent_profile: str,
+    task_message: str,
+    content_keywords: list,
+    *,
+    require_processing_transition: bool = False,
+    exact_output: str | None = None,
+):
     """Core handoff test logic shared across providers.
 
     Args:
@@ -78,6 +87,18 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
 
         # Step 3: Send handoff message
         send_handoff_message(terminal_id, task_message, provider)
+        if require_processing_transition:
+            transition_deadline = time.time() + 30.0
+            observed_status = get_terminal_status(terminal_id)
+            while observed_status not in ("processing", "completed", "error"):
+                if time.time() >= transition_deadline:
+                    break
+                time.sleep(0.25)
+                observed_status = get_terminal_status(terminal_id)
+            assert observed_status == "processing", (
+                "Terminal did not expose PROCESSING before its terminal state "
+                f"advanced (provider={provider}, observed={observed_status})"
+            )
 
         # Step 4: Poll for COMPLETED with stabilization.
         assert wait_for_status(
@@ -107,12 +128,23 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         # Handoff prefix should not appear in extracted output
         assert "[CAO Handoff]" not in output, "Handoff prefix leaked into output"
 
-        # At least one content keyword should be present
-        output_lower = output.lower()
-        matched = [kw for kw in content_keywords if kw.lower() in output_lower]
-        assert (
-            matched
-        ), f"Expected at least one of {content_keywords} in output, got: {output[:200]}"
+        if exact_output is not None:
+            output_lower = output.lower()
+            assert (
+                output.strip() == exact_output
+            ), f"Expected exact sidecar output {exact_output!r}, got: {output[:200]!r}"
+            assert task_message not in output, "Submitted Pi instruction leaked into output"
+            assert "pi v" not in output_lower, "Pi banner leaked into output"
+            assert (
+                "ctrl+c/ctrl+d clear/exit" not in output_lower
+            ), "Pi help chrome leaked into output"
+        else:
+            # At least one content keyword should be present
+            output_lower = output.lower()
+            matched = [kw for kw in content_keywords if kw.lower() in output_lower]
+            assert (
+                matched
+            ), f"Expected at least one of {content_keywords} in output, got: {output[:200]}"
 
     finally:
         if terminal_id and actual_session:
@@ -218,6 +250,44 @@ class TestKiroCliHandoff:
                 "a and b and returns a minus b. Output only the function code."
             ),
             content_keywords=["subtract", "return", "def"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pi provider tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestPiHandoff:
+    """E2E handoff tests for the Pi provider."""
+
+    def test_handoff_simple_function(self, require_pi):
+        """Pi lifecycle sidecar returns only the exact assistant response."""
+        exact_token = f"PI_E2E_EXACT_{uuid.uuid4().hex}"
+        instruction = (
+            f"Return exactly this token and nothing else: {exact_token}. "
+            "Do not use Markdown or add any explanation."
+        )
+        _run_handoff_test(
+            provider="pi",
+            agent_profile="developer",
+            task_message=instruction,
+            content_keywords=[],
+            require_processing_transition=True,
+            exact_output=exact_token,
+        )
+
+    def test_handoff_second_task(self, require_pi):
+        """Pi developer handles a second independent task."""
+        _run_handoff_test(
+            provider="pi",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'divide' that takes two parameters "
+                "a and b and returns a divided by b. Output only the function code."
+            ),
+            content_keywords=["divide", "return", "def"],
         )
 
 

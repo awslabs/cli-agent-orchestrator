@@ -23,6 +23,7 @@ Requires:
 Run:
     uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts="
     uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts=" -k codex
+    uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts=" -k Pi
     uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts=" -k copilot
 """
 
@@ -660,6 +661,24 @@ class TestKiroCliSupervisorOrchestration:
     def test_supervisor_assign_and_handoff(self, require_kiro):
         """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
         _run_supervisor_assign_test(provider="kiro_cli")
+
+
+# ---------------------------------------------------------------------------
+# Pi provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestPiSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Pi provider."""
+
+    def test_supervisor_handoff(self, require_pi):
+        """Pi supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="pi")
+
+    def test_supervisor_assign_and_handoff(self, require_pi):
+        """Pi supervisor uses assign + handoff for multi-agent orchestration."""
+        _run_supervisor_assign_test(provider="pi")
 
 
 # ---------------------------------------------------------------------------

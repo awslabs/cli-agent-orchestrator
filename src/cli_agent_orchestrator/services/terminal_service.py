@@ -158,6 +158,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.PI.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native
@@ -411,8 +412,8 @@ async def create_terminal(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
                 f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
                 f"requests {allowed_tools}. Treat this worker as unrestricted; for "
-                f"enforced restrictions use claude_code, kiro_cli, or "
-                f"copilot_cli."
+                f"enforced restrictions use claude_code, kiro_cli, "
+                f"copilot_cli, or pi."
             )
 
         # Step 3c: Persist terminal metadata to database after restrictions
@@ -468,7 +469,7 @@ async def create_terminal(
 
         # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
-        # Only runtime-prompt providers (Claude Code, Codex, Kimi) receive
+        # Only runtime-prompt providers (Claude Code, Codex, Kimi, Pi) receive
         # the skill catalog here; Kiro (skill:// resources) and OpenCode
         # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
         # Copilot gets the catalog baked at install time.

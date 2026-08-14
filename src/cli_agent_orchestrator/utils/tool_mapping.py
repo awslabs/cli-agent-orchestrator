@@ -69,6 +69,13 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         ],
         "web_fetch": ["web_fetch", "google_web_search"],
     },
+    "pi": {
+        "execute_bash": ["bash"],
+        "fs_read": ["read"],
+        "fs_write": ["edit", "write"],
+        "fs_list": ["grep", "find", "ls"],
+        "fs_*": ["read", "edit", "write", "grep", "find", "ls"],
+    },
 }
 
 # Complete set of all native tools per provider (used to compute disallowed set).

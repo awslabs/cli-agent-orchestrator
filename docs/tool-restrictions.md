@@ -99,18 +99,18 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 
 #### Tool Vocabulary
 
-| Tool | What it allows | Example: Claude Code | Example: Copilot CLI |
-|------|---------------|---------------------|-------------------|
-| `execute_bash` | Run shell commands | `Bash` | `shell` |
-| `fs_read` | Read files | `Read` | `read` |
-| `fs_write` | Write/edit files | `Edit`, `Write` | `write` |
-| `fs_list` | Search/list files | `Glob`, `Grep` | `list`, `grep` |
-| `fs_*` | All filesystem ops | All of the above | All of the above |
-| `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | (not mapped) |
-| `@builtin` | Provider built-in capabilities | (internal) | (internal) |
-| `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message`, plus Hermes prompt answers via `answer_user_prompt` | Same |
-| `discovery` | Sibling discovery/metadata (`list_siblings`, `update_metadata`) | Same | Same |
-| `*` | Everything (unrestricted) | All tools | All tools |
+| Tool | What it allows | Example: Claude Code | Example: Copilot CLI | Pi |
+|------|---------------|---------------------|-------------------|----|
+| `execute_bash` | Run shell commands | `Bash` | `shell` | `bash` |
+| `fs_read` | Read files | `Read` | `read` | `read` |
+| `fs_write` | Write/edit files | `Edit`, `Write` | `write` | `edit`, `write` |
+| `fs_list` | Search/list files | `Glob`, `Grep` | `list`, `grep` | `grep`, `find`, `ls` |
+| `fs_*` | All filesystem ops | All of the above | All of the above | `read`, `edit`, `write`, `grep`, `find`, `ls` |
+| `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | (not mapped) | (no core tool) |
+| `@builtin` | Provider built-in capabilities | (internal) | (internal) | (internal) |
+| `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message`, plus Hermes prompt answers via `answer_user_prompt` | Same | Same |
+| `discovery` | Sibling discovery/metadata (`list_siblings`, `update_metadata`) | Same | Same | Same |
+| `*` | Everything (unrestricted) | All tools | All tools | All tools |
 
 CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across supported providers.
 
@@ -197,15 +197,16 @@ The confirmation prompt is a **review gate** — it shows the resolved role and 
 
 CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, `fs_list`). However, not all providers understand this vocabulary natively. There are two categories:
 
-**Providers that need translation** — Claude Code and Copilot CLI each have their own native tool names (e.g., Claude Code calls bash execution `Bash`, Copilot calls it `shell`). CAO uses an internal `TOOL_MAPPING` to translate the CAO vocabulary to provider-native names, then computes which native tools to block and passes them as CLI flags (e.g., `--disallowedTools Bash`, `--deny-tool shell`).
+**Providers that need translation** — Claude Code, Copilot CLI, and Pi each have their own native tool names (e.g., Claude Code calls bash execution `Bash`, Copilot calls it `shell`, and Pi calls it `bash`). CAO uses an internal `TOOL_MAPPING` to translate the CAO vocabulary to provider-native names, then computes which native tools to block and passes them as CLI flags (e.g., `--disallowedTools Bash`, `--deny-tool shell`, or `--exclude-tools bash`).
 
-| CAO Tool | Claude Code | Copilot CLI |
-|----------|-------------|-------------|
-| `execute_bash` | `Bash` | `shell` |
-| `fs_read` | `Read` | `read` |
-| `fs_write` | `Edit`, `Write` | `write` |
-| `fs_list` | `Glob`, `Grep` | `list`, `grep` |
-| `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) |
+| CAO Tool | Claude Code | Copilot CLI | Pi |
+|----------|-------------|-------------|----|
+| `execute_bash` | `Bash` | `shell` | `bash` |
+| `fs_read` | `Read` | `read` | `read` |
+| `fs_write` | `Edit`, `Write` | `write` | `edit`, `write` |
+| `fs_list` | `Glob`, `Grep` | `list`, `grep` | `grep`, `find`, `ls` |
+| `fs_*` | `Read`, `Edit`, `Write`, `Glob`, `Grep` | `read`, `write`, `list`, `grep` | `read`, `edit`, `write`, `grep`, `find`, `ls` |
+| `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) | (no core tool) |
 
 **Providers that accept CAO vocabulary directly** — Kiro CLI accepts `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI and Codex use system prompt instructions to enforce restrictions. For all three, CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
 
@@ -251,13 +252,14 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **Kiro CLI** | Hard | `allowedTools` in agent JSON at install time |
 | **Copilot CLI** | Hard | `--deny-tool` flags override `--allow-all` |
 | **OpenCode CLI** | Hard | `permission:` YAML frontmatter enforced natively at install time |
+| **Pi** | Hard (built-ins) | `--exclude-tools` denies Pi's seven built-in tools; MCP remains all-or-nothing |
 | **Kimi CLI** | Soft | Security system prompt only |
 | **Codex** | Soft | Security system prompt only |
 | **Antigravity CLI** | Soft | Security system prompt only |
 | **Hermes** | Profile-defined | CAO launches default `hermes` or the optional `hermesProfile` wrapper declared by the CAO profile; restrict tools in that Hermes profile |
 | **Cursor CLI** | Not enforced (v2026) | `allowedTools` is currently ignored — no native flag or system-prompt path is active; see [Cursor CLI Tool Restrictions](cursor-cli.md#tool-restrictions) |
 
-**Hard enforcement** = the agent physically cannot use denied tools, enforced by the provider runtime.
+**Hard enforcement** = the agent physically cannot use denied tools, enforced by the provider runtime. It is not a filesystem/container sandbox; this label covers only the provider tools named by the policy.
 
 **Soft enforcement** = a system prompt tells the agent not to use certain tools. The agent may still attempt them. Use hard-enforcement providers for security-critical work.
 
@@ -279,6 +281,15 @@ claude --dangerously-skip-permissions --disallowedTools Bash --disallowedTools E
 ```bash
 copilot --allow-all --deny-tool shell --deny-tool write
 ```
+
+**Pi** — Adds one native denylist for the computed built-in tools:
+```bash
+pi --exclude-tools bash,edit,write
+```
+
+Pi has no core `web_fetch`. Its MCP tools come from CAO's bundled bridge and
+remain subject to the separate all-or-nothing MCP limitation below. See the
+[Pi provider guide](pi.md#tool-restrictions).
 
 **Kimi CLI / Codex** — Prepends to the system prompt:
 ```
@@ -303,6 +314,9 @@ Supervisor (role: supervisor → @cao-mcp-server, fs_read, fs_list)
 ```
 
 Each agent is restricted based on its own profile, not its parent's permissions.
+A restricted Pi parent may therefore deliberately delegate to a child profile
+with broader built-in access; the parent's `--exclude-tools` denylist does not
+propagate to that child.
 
 ## Quick Reference
 
@@ -322,7 +336,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 1. **Use `role: supervisor` for orchestrators.** They only need MCP tools + file reading for context.
 2. **Don't use `--yolo` in production.** It grants unrestricted access and skips all safety prompts.
-3. **Prefer hard-enforcement providers** (Claude Code, Kiro CLI, Copilot CLI) for sensitive workloads.
+3. **Prefer hard-enforcement providers** (Claude Code, Kiro CLI, Copilot CLI, OpenCode CLI, or Pi for its built-ins) for sensitive workloads, while still applying OS/container isolation when required.
 4. **Review the confirmation prompt.** It shows exactly what tools are allowed and blocked before you proceed.
 5. **Kimi CLI and Codex use soft enforcement** — use these only for non-critical tasks.
 
@@ -330,7 +344,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 1. **Claude Code tool mapping is nearly complete, with MCP tools the remaining gap.** The current mapping covers `Bash` (and its `Task`/`Agent`/`Monitor`/`BashOutput`/`KillShell` execution family), `Read`, `Edit`, `Write`, `Glob`, `Grep`, and — via `web_fetch` — [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch) and `WebSearch`. The subagent tool is intentionally **not** a separate category: it is folded into `execute_bash`, because a subagent spawns with its own full toolset and can run shell, so exposing it standalone would let a profile grant subagent access without `execute_bash` and re-open that escape. Claude Code **renamed this tool from `Task` to `Agent`**, so both names are denied — current builds expose only `Agent`, so denying just `Task` would be a silent no-op. Provider MCP tools remain unmapped (see limitation #2) — they cannot be blocked via `--disallowedTools`.
 
-2. **`@cao-mcp-server` is a pass-through marker, not enforced at the provider level.** Including `@cao-mcp-server` in `allowedTools` signals intent (this agent should have orchestration tools), but it does **not** translate to any native `--disallowedTools` flag. MCP tools (`handoff`, `assign`, `send_message`, `answer_user_prompt`) are always available to the agent regardless of `allowedTools` — providers do not currently support blocking individual MCP tools. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Additionally, `@cao-mcp-server` is all-or-nothing: there is no way to allow only `send_message` while blocking `assign`. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
+2. **`@cao-mcp-server` is a pass-through marker, not enforced at the provider level.** Including `@cao-mcp-server` in `allowedTools` signals intent (this agent should have orchestration tools), but it does **not** translate to any native built-in denylist flag. MCP tools (`handoff`, `assign`, `send_message`, `answer_user_prompt`) are always available to the agent regardless of `allowedTools` — providers do not currently support blocking individual MCP tools. For Pi, these tools are dynamically registered through CAO's bundled MCP bridge, but the same limitation applies: Pi's built-in `--exclude-tools` policy does not block individual MCP tools. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Additionally, `@cao-mcp-server` is all-or-nothing: there is no way to allow only `send_message` while blocking `assign`. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
 
 3. **Soft enforcement is best-effort.** Kimi CLI and Codex rely on system prompt instructions to restrict tools. The agent may ignore these restrictions. Do not rely on soft enforcement for security-critical workloads.
 
