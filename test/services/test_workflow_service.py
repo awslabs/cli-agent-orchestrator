@@ -385,12 +385,16 @@ async def test_mid_run_engine_error_finalizes_record_failed(monkeypatch):
 
     # The worker was never reached (the error is raised before run_agent_step).
     assert mock.await_count == 0
-    # The registered record settled to a terminal FAILED state, not RUNNING.
-    rec = ws.run_registry["runEngineErr"]
+    # The drive settled the run to a terminal FAILED state and journaled it
+    # BEFORE re-raising; the in-memory entry is then evicted (the durable
+    # journal is authoritative for cold reads), so the settled state is read
+    # back from the journal — never a stale RUNNING record left registered.
+    assert "runEngineErr" not in ws.run_registry
+    rec = ws._rebuild_record_from_journal("runEngineErr")
+    assert rec is not None
     assert rec.state == RunState.FAILED
     assert rec.finished_at is not None
     assert rec.current_step_id is None
-    assert rec.step_states["s1"].state == StepState.FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +579,19 @@ async def test_get_run_status_snapshot_shape(monkeypatch):
     assert status.state == RunState.COMPLETED
     assert [s.id for s in status.steps] == ["s1"]
     assert status.steps[0].state == StepState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_completed_run_is_evicted_from_registry(monkeypatch):
+    """A terminal run's in-memory record is evicted after the drive loop (the
+    journal is authoritative), bounding run_registry growth — get_run_status
+    still serves it via the cold-read journal rebuild."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    await ws.start_run(_spec(), {}, "runEvict")
+    assert "runEvict" not in ws.run_registry
+    status = ws.get_run_status("runEvict")
+    assert status.run_id == "runEvict"
+    assert status.state == RunState.COMPLETED
 
 
 def test_get_run_status_unknown_404():
@@ -787,6 +804,10 @@ async def test_start_run_prepared_does_not_readmit_or_reinsert(monkeypatch):
     # path on the same already-registered id WOULD raise KeyError (-> 409). This is
     # exactly the double-admission the prepared entry avoids by skipping the check.
     monkeypatch.undo()
+    # The drive loop evicted the terminal record (journal-authoritative), so the
+    # guard now blocks on the durable row — mirror what the async C1 handler did
+    # when it journaled the run BEFORE registering it.
+    ws._journal_insert_run(record)
     with pytest.raises(KeyError):
         ws._check_run_id_available("run-prep-2")
 

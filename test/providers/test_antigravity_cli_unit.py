@@ -219,14 +219,16 @@ def test_extract_filters_thought_and_tool_chrome():
 
 
 def test_build_command_raises_when_binary_missing():
-    with patch("cli_agent_orchestrator.providers.antigravity_cli.shutil.which", return_value=None):
-        with pytest.raises(ProviderError, match="not found"):
+    from cli_agent_orchestrator.providers.base import ProviderError as BaseProviderError
+
+    with patch("cli_agent_orchestrator.providers.base.shutil.which", return_value=None):
+        with pytest.raises(BaseProviderError, match="not found"):
             make_provider()._build_agy_command()
 
 
 def test_build_command_includes_skip_permissions_and_model():
     with patch(
-        "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+        "cli_agent_orchestrator.providers.base.shutil.which",
         return_value="/usr/local/bin/agy",
     ):
         cmd = make_provider(model="Gemini 3.1 Pro (High)")._build_agy_command()
@@ -242,7 +244,7 @@ def test_build_command_injects_system_prompt_via_i(tmp_path, monkeypatch):
     )
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -269,7 +271,7 @@ def test_mcp_registration_writes_config(tmp_path, monkeypatch):
     p = make_provider(agent_profile="reviewer_gemini")
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -310,7 +312,7 @@ def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
     MOD = "cli_agent_orchestrator.utils.mcp_resolution"
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -398,7 +400,7 @@ def test_build_command_appends_security_prompt_when_tool_restricted():
     )
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -421,7 +423,7 @@ def test_build_command_includes_skill_catalog():
     )
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -452,7 +454,7 @@ def test_mcp_registration_accepts_pydantic_mcpserver(tmp_path):
     p = make_provider(agent_profile="reviewer_gemini")
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -482,7 +484,7 @@ def test_mcp_registration_recovers_from_corrupt_config(tmp_path):
     p = make_provider(agent_profile="reviewer_gemini")
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -515,7 +517,7 @@ def test_mcp_registration_recovers_from_non_dict_config(tmp_path, payload):
     p = make_provider(agent_profile="reviewer_gemini")
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -546,7 +548,7 @@ def test_mcp_registration_replaces_non_dict_mcpservers(tmp_path):
     p = make_provider(agent_profile="reviewer_gemini")
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -621,7 +623,7 @@ def test_status_unknown_when_no_markers():
 def test_build_command_raises_on_bad_profile():
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -644,7 +646,7 @@ def test_profile_model_overrides_constructor_model():
     )
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -740,7 +742,7 @@ def test_concurrent_inits_get_distinct_mcp_keys(tmp_path):
     p_b = make_provider(terminal_id="terminal-B", agent_profile="dev_gemini")
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(
@@ -804,7 +806,7 @@ async def test_initialize_success(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+        "cli_agent_orchestrator.providers.base.shutil.which",
         lambda b: "/usr/local/bin/agy",
     )
     monkeypatch.setattr(
@@ -848,7 +850,7 @@ async def test_initialize_raises_when_agy_times_out(monkeypatch):
         return False
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+        "cli_agent_orchestrator.providers.base.shutil.which",
         lambda b: "/usr/local/bin/agy",
     )
     monkeypatch.setattr(
@@ -917,7 +919,7 @@ def test_prune_stale_mcp_entries_on_register(tmp_path):
 
     with (
         patch(
-            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            "cli_agent_orchestrator.providers.base.shutil.which",
             return_value="/usr/local/bin/agy",
         ),
         patch(

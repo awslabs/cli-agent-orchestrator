@@ -690,7 +690,12 @@ async def test_resume_engine_error_settles_failed_and_clears_drive_mark(
     with pytest.raises(ws.WorkflowEngineError, match="produced no output"):
         await ws.resume_from_last_completed("runEngErr")
 
-    rec = ws.run_registry["runEngErr"]
+    # The drive settled the run FAILED and journaled it before re-raising; the
+    # in-memory record is then evicted (journal-authoritative), so the settled
+    # state is read back from the durable journal — never a stale RUNNING entry.
+    assert "runEngErr" not in ws.run_registry
+    rec = ws._rebuild_record_from_journal("runEngErr")
+    assert rec is not None
     assert rec.state == RunState.FAILED
     assert rec.finished_at is not None
     row = workflow_journal.get_run("runEngErr")

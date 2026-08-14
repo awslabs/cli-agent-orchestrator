@@ -497,7 +497,13 @@ async def test_double_read_fault_does_not_reseed_below_a_live_records_counter(mo
     monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
     await ws.start_run(_spec(step_ids=("s1",)), {}, "runN3")
 
-    live = ws.run_registry["runN3"]
+    # The drive loop evicts a settled record (journal-authoritative). The live
+    # counter floor applies on the RESUME path, which rebuilds over a record
+    # ALREADY LIVE in this process — re-register the settled record to simulate
+    # that scenario.
+    live = ws._rebuild_record_from_journal("runN3")
+    assert live is not None
+    ws.run_registry["runN3"] = live
     allocated = live.event_seq
     assert allocated > 0
 
@@ -524,6 +530,10 @@ async def test_next_emission_after_a_double_fault_rebuild_does_not_collide(monke
 
     seqs_before = sorted(e.seq for e in workflow_journal.read_events("runN3b"))
     assert seqs_before, "expected the run to have journaled events"
+
+    # The resume path rebuilds over a record ALREADY LIVE in this process (a
+    # settled record is evicted post-drive) — re-register the rebuilt record.
+    ws.run_registry["runN3b"] = ws._rebuild_record_from_journal("runN3b")
 
     monkeypatch.setattr(ws.workflow_journal, "persisted_high_water", lambda rid: 0)
     monkeypatch.setattr(ws.workflow_journal, "max_event_seq", lambda rid: 0)

@@ -1,5 +1,6 @@
 """Tests for terminal-related API endpoints including working directory and exit."""
 
+import asyncio
 from typing import Dict
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -1209,6 +1210,37 @@ class TestWebSocketSubprocessTerm:
 
 class _StopHere(Exception):
     """Sentinel raised by the wiring test once Popen args are captured."""
+
+
+class TestPtyOutputQueueBounds:
+    """The terminal WS PTY output queue is bounded; a full queue drops the
+    newest chunk instead of raising into the fd callback (a stalled WS client
+    must not grow the queue without limit — terminal state lives in tmux's
+    scrollback, so only live-stream frames are lost)."""
+
+    def test_enqueue_pty_data_drops_when_full(self):
+        from cli_agent_orchestrator.api.main import _enqueue_pty_data
+
+        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=2)
+        _enqueue_pty_data(q, b"chunk-a")
+        _enqueue_pty_data(q, b"chunk-b")
+        # Queue is full: further enqueues must be dropped, never raise.
+        _enqueue_pty_data(q, b"chunk-c")
+        _enqueue_pty_data(q, b"chunk-d")
+
+        assert q.qsize() == 2
+        assert q.get_nowait() == b"chunk-a"  # oldest retained
+        assert q.get_nowait() == b"chunk-b"
+        assert q.empty()
+
+    def test_enqueue_pty_data_rejects_overflow_without_side_effects(self):
+        from cli_agent_orchestrator.api.main import _enqueue_pty_data
+
+        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
+        _enqueue_pty_data(q, b"only")
+        _enqueue_pty_data(q, b"dropped")  # must not raise QueueFull
+        assert q.qsize() == 1
+        assert q.get_nowait() == b"only"
 
 
 class TestCrossProviderResolution:

@@ -41,7 +41,11 @@ from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
+    ProviderError as BaseProviderError,
+    resolve_provider_binary,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -61,7 +65,7 @@ _KIMI_CONFIG_WRITE_LOCK = threading.Lock()
 
 
 # Custom exception for provider errors
-class ProviderError(Exception):
+class ProviderError(BaseProviderError):
     """Exception raised for Kimi CLI provider-specific errors."""
 
     pass
@@ -303,6 +307,10 @@ class KimiCliProvider(BaseProvider):
         The --yolo flag auto-approves all tool actions, which is required for
         non-interactive operation in CAO-managed tmux sessions.
         """
+        # Fail fast with a clear error before the pane prints "command not found"
+        # and the init wait burns the full provider_init_timeout.
+        resolve_provider_binary("kimi")
+
         command_parts = ["kimi", "--yolo"]
 
         # Always create a temp directory for this instance.

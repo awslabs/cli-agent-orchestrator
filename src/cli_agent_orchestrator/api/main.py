@@ -168,7 +168,7 @@ async def flow_daemon():
     logger.info("Flow daemon started")
     while True:
         try:
-            flows = flow_service.get_flows_to_run()
+            flows = await asyncio.to_thread(flow_service.get_flows_to_run)
             for flow in flows:
                 try:
                     executed = await flow_service.execute_flow(flow.name)
@@ -2513,7 +2513,8 @@ async def create_session(
 @app.get("/sessions")
 async def list_sessions() -> List[Dict]:
     try:
-        return session_service.list_sessions()
+        # Off the event loop: list_sessions shells out to tmux list-sessions.
+        return await asyncio.to_thread(session_service.list_sessions)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2530,7 +2531,8 @@ async def get_session(session_name: str) -> Dict:
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        return session_service.get_session(session_name)
+        # Off the event loop: get_session does tmux + status_monitor work.
+        return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2896,7 +2898,8 @@ async def get_terminal_memory_context(terminal_id: TerminalId):
         from cli_agent_orchestrator.services.memory_service import MemoryService
 
         svc = MemoryService()
-        context = svc.get_memory_context_for_terminal(terminal_id)
+        # File reads + SQLite lookups — off the event loop.
+        context = await asyncio.to_thread(svc.get_memory_context_for_terminal, terminal_id)
         return PlainTextResponse(content=context)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -2911,7 +2914,10 @@ async def get_terminal_memory_context(terminal_id: TerminalId):
 async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
-        working_directory = terminal_service.get_working_directory(terminal_id)
+        # Off the event loop: get_working_directory does tmux display-message.
+        working_directory = await asyncio.to_thread(
+            terminal_service.get_working_directory, terminal_id
+        )
         return WorkingDirectoryResponse(working_directory=working_directory)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -5530,6 +5536,21 @@ async def get_inbox_messages_endpoint(
         )
 
 
+def _enqueue_pty_data(output_queue: "asyncio.Queue[bytes]", data: bytes) -> None:
+    """Best-effort enqueue from the PTY fd callback; drop the newest chunk on overflow.
+
+    The queue is bounded so a stalled browser client can't grow it without
+    limit (issue #382 hazard class). On overflow the newest chunk is dropped
+    (logged at debug) rather than raising into the fd callback: the terminal
+    output keeps flowing into tmux's scrollback, so dropping a few WS chunks
+    only loses live-stream frames — never terminal state.
+    """
+    try:
+        output_queue.put_nowait(data)
+    except asyncio.QueueFull:
+        logger.debug("PTY output queue full; dropping %d bytes of live output", len(data))
+
+
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
@@ -5643,7 +5664,10 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
 
     loop = asyncio.get_event_loop()
-    output_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    # Bounded queue: a stalled WS client must not grow it without limit. The
+    # drain loop coalesces pending data; on overflow the newest chunk is
+    # dropped (see _enqueue_pty_data) — only live-stream frames are lost.
+    output_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=512)
     done = asyncio.Event()
 
     def _on_pty_data():
@@ -5651,7 +5675,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         try:
             data = os.read(master_fd, 65536)
             if data:
-                output_queue.put_nowait(data)
+                _enqueue_pty_data(output_queue, data)
             else:
                 done.set()
         except BlockingIOError:
@@ -5959,12 +5983,19 @@ async def list_memories_endpoint(
         # Internal limit 1000: recall truncates BEFORE the scope_id filter
         # below, so filtering a small page could return an under-filled result.
         # metadata mode: no query to rank, and it avoids the BM25 path.
-        memories = await svc.recall(
-            scope=scope.value if scope else None,
-            memory_type=memory_type.value if memory_type else None,
-            limit=1000,
-            scan_all=True,
-            search_mode="metadata",
+        # recall is async-def but only awaits async-in-name-only helpers that
+        # do blocking file walks / tokenize (rglob, read_text, BM25) — run the
+        # whole call in a worker thread (fresh loop via asyncio.run) so a slow
+        # memory scan can't stall the event loop (issue #382 hazard class).
+        memories = await asyncio.to_thread(
+            asyncio.run,
+            svc.recall(
+                scope=scope.value if scope else None,
+                memory_type=memory_type.value if memory_type else None,
+                limit=1000,
+                scan_all=True,
+                search_mode="metadata",
+            ),
         )
         if scope_id is not None:
             memories = [m for m in memories if _memory_matches_scope_id(m, scope_id, svc.base_dir)]

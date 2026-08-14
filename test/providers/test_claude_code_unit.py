@@ -22,6 +22,17 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, Pro
 
 
 @pytest.fixture(autouse=True)
+def _provider_binary_present(monkeypatch):
+    """Stub the shared binary pre-flight so command-builder tests run without
+    ``claude`` installed on $PATH. The real missing-binary raise is covered by
+    ``test_base_provider.py::test_resolve_provider_binary_missing``."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.claude_code.resolve_provider_binary",
+        lambda binary: f"/usr/local/bin/{binary}",
+    )
+
+
+@pytest.fixture(autouse=True)
 def cleanup_tmp_files():
     """Remove temp prompt/mcp files created by _build_claude_command during tests."""
     yield

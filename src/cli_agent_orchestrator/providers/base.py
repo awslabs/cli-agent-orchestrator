@@ -21,6 +21,7 @@ and output format to reliably detect status changes.
 
 import logging
 import re
+import shutil
 import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -31,6 +32,28 @@ if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 logger = logging.getLogger(__name__)
+
+
+class ProviderError(Exception):
+    """Raised when a provider CLI cannot be located or launched."""
+
+
+def resolve_provider_binary(binary: str) -> str:
+    """Resolve a provider CLI binary on $PATH, failing fast when it is missing.
+
+    Called from each provider's command builder BEFORE the launch command is
+    sent, so a missing CLI surfaces as a clear ``ProviderError`` instead of a
+    "command not found" pane followed by a full ``provider_init_timeout`` wait.
+    The launch command itself keeps the bare binary name (the pane's own shell
+    resolves it); this is a pre-flight check only.
+    """
+    resolved = shutil.which(binary)
+    if resolved is None:
+        raise ProviderError(
+            f"{binary} CLI not found: '{binary}' is not on $PATH. "
+            "Install it and ensure it is on PATH before creating terminals."
+        )
+    return resolved
 
 
 class BaseProvider(ABC):

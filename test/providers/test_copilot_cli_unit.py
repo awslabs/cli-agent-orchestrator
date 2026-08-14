@@ -12,6 +12,17 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 
 
+@pytest.fixture(autouse=True)
+def _provider_binary_present(monkeypatch):
+    """Stub the shared binary pre-flight so command-builder tests run without
+    ``copilot`` installed on $PATH. The real missing-binary raise is covered by
+    ``test_base_provider.py::test_resolve_provider_binary_missing``."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.copilot_cli.resolve_provider_binary",
+        lambda binary: f"/usr/local/bin/{binary}",
+    )
+
+
 class TestCopilotCliProviderCommand:
     @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
     @patch(

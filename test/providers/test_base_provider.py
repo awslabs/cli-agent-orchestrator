@@ -10,7 +10,11 @@ from cli_agent_orchestrator.models.agent_profile import (
     ContainerPathMap,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
+    ProviderError,
+    resolve_provider_binary,
+)
 
 
 class ConcreteProvider(BaseProvider):
@@ -281,3 +285,28 @@ class TestGetInitTimeout:
     def test_profile_override_wins(self, _):
         profile = AgentProfile(name="a", description="d", provider_init_timeout=180)
         assert self._provider().get_init_timeout(profile) == 180
+
+
+class TestResolveProviderBinary:
+    """Tests for the shared provider-binary pre-flight (fail-fast before launch)."""
+
+    def test_returns_resolved_path_when_present(self, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.base.shutil.which",
+            lambda binary: f"/opt/cao/bin/{binary}",
+        )
+        assert resolve_provider_binary("codex") == "/opt/cao/bin/codex"
+
+    def test_raises_provider_error_when_missing(self, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.base.shutil.which", lambda binary: None
+        )
+        with pytest.raises(ProviderError, match="not found"):
+            resolve_provider_binary("codex")
+
+    def test_raises_naming_the_missing_binary(self, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.base.shutil.which", lambda binary: None
+        )
+        with pytest.raises(ProviderError, match="'codex'"):
+            resolve_provider_binary("codex")

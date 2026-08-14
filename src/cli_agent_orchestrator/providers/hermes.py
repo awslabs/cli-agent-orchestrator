@@ -8,7 +8,11 @@ from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
+    ProviderError as BaseProviderError,
+    resolve_provider_binary,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -48,7 +52,7 @@ STATUS_LINE_PATTERN = r"^.*(?:YOLO|ctx|⏲|⏱|msg=interrupt|Ctrl\+C cancel).*$"
 MAX_STABLE_IDLE_TIMER_POLLS = int(os.environ.get("CAO_HERMES_MAX_STABLE_IDLE_POLLS", "8"))
 
 
-class ProviderError(Exception):
+class ProviderError(BaseProviderError):
     """Exception raised for Hermes provider-specific errors."""
 
     pass
@@ -150,6 +154,10 @@ class HermesProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         hermes_profile = profile.hermesProfile if profile and profile.hermesProfile else "hermes"
+
+        # Fail fast with a clear error before the pane prints "command not found"
+        # and the init wait burns the full provider_init_timeout.
+        resolve_provider_binary(hermes_profile)
 
         command_parts = [
             hermes_profile,

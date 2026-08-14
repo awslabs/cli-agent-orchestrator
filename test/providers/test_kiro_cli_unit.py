@@ -9,6 +9,18 @@ import pytest
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 
+
+@pytest.fixture(autouse=True)
+def _provider_binary_present(monkeypatch):
+    """Stub the shared binary pre-flight so initialize tests run without
+    ``kiro-cli`` installed on $PATH. The real missing-binary raise is covered
+    by ``test_base_provider.py::test_resolve_provider_binary_missing``."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.kiro_cli.resolve_provider_binary",
+        lambda binary: f"/usr/local/bin/{binary}",
+    )
+
+
 # Test fixtures directory
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

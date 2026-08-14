@@ -17,7 +17,7 @@ from libtmux.exc import LibTmuxException
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, resolve_provider_binary
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
@@ -143,6 +143,10 @@ class CopilotCliProvider(BaseProvider):
         return False
 
     def _command(self) -> str:
+        # Fail fast with a clear error before the pane prints "command not found"
+        # and the init wait burns the full provider_init_timeout.
+        resolve_provider_binary("copilot")
+
         config_dir = Path.home() / ".copilot"
 
         command_parts = ["copilot", "--allow-all"]

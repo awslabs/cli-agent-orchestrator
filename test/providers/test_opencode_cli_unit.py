@@ -21,6 +21,17 @@ from cli_agent_orchestrator.providers.opencode_cli import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _provider_binary_present(monkeypatch):
+    """Stub the shared binary pre-flight so command-builder tests run without
+    ``opencode`` installed on $PATH. The real missing-binary raise is covered by
+    ``test_base_provider.py::test_resolve_provider_binary_missing``."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.opencode_cli.resolve_provider_binary",
+        lambda binary: f"/usr/local/bin/{binary}",
+    )
+
+
 def load_fixture(name: str) -> str:
     """Load a plain-text fixture file."""
     return (FIXTURES_DIR / name).read_text(encoding="utf-8")
