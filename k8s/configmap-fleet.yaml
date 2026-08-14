@@ -1,0 +1,41 @@
+# ConfigMap containing the fleet registry (fleet.json).
+# The panel reads this to discover CAO nodes.
+# Update the machines list to match your StatefulSet replica count.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cao-fleet-config
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+data:
+  fleet.json: |
+    {
+      "port": 9889,
+      "machines": [
+        {
+          "name": "supervisor",
+          "host": "cao-supervisor.cao-cluster.svc.cluster.local",
+          "label": "Supervisor",
+          "role": "supervisor"
+        },
+        {
+          "name": "worker-0",
+          "host": "cao-worker-0.cao-workers.cao-cluster.svc.cluster.local",
+          "label": "Worker 0",
+          "role": "worker"
+        },
+        {
+          "name": "worker-1",
+          "host": "cao-worker-1.cao-workers.cao-cluster.svc.cluster.local",
+          "label": "Worker 1",
+          "role": "worker"
+        },
+        {
+          "name": "worker-2",
+          "host": "cao-worker-2.cao-workers.cao-cluster.svc.cluster.local",
+          "label": "Worker 2",
+          "role": "worker"
+        }
+      ]
+    }
