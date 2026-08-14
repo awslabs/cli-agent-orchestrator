@@ -57,7 +57,7 @@ def test_list_persistent_agents_uses_exact_terminal_metadata():
         patch.object(server, "ENABLE_PERSISTENT_AGENT_ROUTING", True),
         patch.object(server.requests, "get", side_effect=responses) as get,
     ):
-        result = server._list_persistent_agents_impl()
+        result = server._discover_persistent_agent_routes_impl()
 
     assert result["success"] is True
     assert result["count"] == 1
@@ -92,7 +92,7 @@ def test_discovery_fails_closed_on_partial_session_failure():
             side_effect=[_response([{"id": "cao-a"}]), bad],
         ),
     ):
-        result = server._list_persistent_agents_impl()
+        result = server._discover_persistent_agent_routes_impl()
 
     assert result["success"] is False
     assert result["agents"] == []
@@ -113,7 +113,7 @@ def test_send_to_persistent_agent_resolves_at_call_time():
         ],
     }
     with (
-        patch.object(server, "_list_persistent_agents_impl", return_value=discovered),
+        patch.object(server, "_discover_persistent_agent_routes_impl", return_value=discovered),
         patch.object(
             server,
             "_send_message_impl",
@@ -122,9 +122,9 @@ def test_send_to_persistent_agent_resolves_at_call_time():
     ):
         result = server._send_message_to_persistent_agent_impl("shaffer-estimating", "bounded task")
 
-    send.assert_called_once_with("aaaa1111", "bounded task")
+    send.assert_called_once_with("aaaa1111", "bounded task", semantic_resolved=True)
     assert result["persistent_agent_id"] == "shaffer-estimating"
-    assert result["resolved_terminal_id"] == "aaaa1111"
+    assert "resolved_terminal_id" not in result
     assert result["resolved_session_name"] == "cao-shaffer-estimating"
 
 
@@ -132,7 +132,9 @@ def test_send_to_persistent_agent_rejects_missing_and_duplicate_ids():
     from cli_agent_orchestrator.mcp_server import server
 
     with patch.object(
-        server, "_list_persistent_agents_impl", return_value={"success": True, "agents": []}
+        server,
+        "_discover_persistent_agent_routes_impl",
+        return_value={"success": True, "agents": []},
     ):
         missing = server._send_message_to_persistent_agent_impl("missing", "x")
     assert missing["success"] is False
@@ -145,9 +147,49 @@ def test_send_to_persistent_agent_rejects_missing_and_duplicate_ids():
             {"agent_id": "dup", "terminal_id": "bbbb2222"},
         ],
     }
-    with patch.object(server, "_list_persistent_agents_impl", return_value=duplicate):
+    with patch.object(server, "_discover_persistent_agent_routes_impl", return_value=duplicate):
         ambiguous = server._send_message_to_persistent_agent_impl("dup", "x")
     assert ambiguous["success"] is False
     assert "ambiguous" in ambiguous["error"]
-    assert "aaaa1111" in ambiguous["error"]
-    assert "bbbb2222" in ambiguous["error"]
+    assert "aaaa1111" not in ambiguous["error"]
+    assert "bbbb2222" not in ambiguous["error"]
+
+
+def test_public_list_redacts_terminal_ids():
+    from cli_agent_orchestrator.mcp_server import server
+
+    discovered = {
+        "success": True,
+        "count": 1,
+        "agents": [
+            {
+                "agent_id": "shaffer-estimating",
+                "terminal_id": "aaaa1111",
+                "display_name": "Estimating",
+                "session_name": "cao-shaffer-estimating",
+            }
+        ],
+    }
+    with patch.object(server, "_discover_persistent_agent_routes_impl", return_value=discovered):
+        result = server._list_persistent_agents_impl()
+
+    assert result["success"] is True
+    assert result["agents"][0]["agent_id"] == "shaffer-estimating"
+    assert "terminal_id" not in result["agents"][0]
+
+
+def test_semantic_only_mode_rejects_raw_receiver_but_allows_internal_resolution():
+    from cli_agent_orchestrator.mcp_server import server
+
+    with (
+        patch.object(server, "REQUIRE_SEMANTIC_PERSISTENT_ROUTING", True),
+        patch.object(server, "_send_to_inbox", return_value={"success": True}) as inbox,
+        patch.dict("os.environ", {"CAO_TERMINAL_ID": "deadbeef"}),
+    ):
+        raw = server._send_message_impl("aaaa1111", "raw")
+        semantic = server._send_message_impl("aaaa1111", "semantic", semantic_resolved=True)
+
+    assert raw["success"] is False
+    assert "Raw terminal receiver IDs are disabled" in raw["error"]
+    assert semantic["success"] is True
+    inbox.assert_called_once()
