@@ -1484,8 +1484,11 @@ def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[
     target = matches[0]
     result = _send_message_impl(str(target["terminal_id"]), message, semantic_resolved=True)
     if result.get("success"):
+        public_result = {
+            key: value for key, value in result.items() if key not in {"sender_id", "receiver_id"}
+        }
         return {
-            **result,
+            **public_result,
             "persistent_agent_id": agent_id,
             "resolved_session_name": target.get("session_name"),
         }
