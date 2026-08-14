@@ -74,8 +74,11 @@ export function AgentPanel() {
       if (liveTerminal?.id === id) setLiveTerminal(null)
       if (activeSession) await selectSession(activeSession)
       showSnackbar({ type: 'success', message: `Terminal ${id} closed — tmux window killed` })
-    } catch {
-      showSnackbar({ type: 'error', message: `Failed to close terminal ${id}` })
+    } catch (e: any) {
+      showSnackbar({
+        type: 'error',
+        message: e.detail || e.message || `Failed to close terminal ${id}`,
+      })
     }
     setClosingTerminal(null)
     setPendingClose(null)

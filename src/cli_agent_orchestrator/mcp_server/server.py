@@ -1530,6 +1530,14 @@ def delete_terminal(
         response = requests.delete(
             f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
         )
+        if response.status_code == 409:
+            return {
+                "success": False,
+                "message": (
+                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
+                    "after the Grok process exits."
+                ),
+            }
         response.raise_for_status()
         payload = response.json()
         if not payload.get("success", False):
@@ -1544,6 +1552,14 @@ def delete_terminal(
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id} not found"}
+        if e.response is not None and e.response.status_code == 409:
+            return {
+                "success": False,
+                "message": (
+                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
+                    "after the Grok process exits."
+                ),
+            }
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
     except Exception as e:
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}

@@ -139,7 +139,10 @@ export const useStore = create<Store>((set, get) => ({
       }
       await get().fetchSessions()
     } catch (e: any) {
-      get().showSnackbar({ type: 'error', message: e.message || 'Failed to delete session' })
+      get().showSnackbar({
+        type: 'error',
+        message: e.detail || e.message || 'Failed to delete session; retry after cleanup finishes',
+      })
     }
   },
 

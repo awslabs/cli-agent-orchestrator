@@ -2560,7 +2560,17 @@ async def delete_session(
         result = await asyncio.to_thread(
             session_service.delete_session, session_name, registry=get_plugin_registry(request)
         )
+        if result.get("errors") or session_name not in result.get("deleted", []):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"cleanup deferred for session '{session_name}'; "
+                    "retry delete after residual Grok processes exit"
+                ),
+            )
         return {"success": True, **result}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -5421,7 +5431,17 @@ async def delete_terminal(
             terminal_id,
             registry=get_plugin_registry(request),
         )
-        return {"success": success}
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"cleanup deferred for terminal '{terminal_id}'; "
+                    "retry delete after residual Grok processes exit"
+                ),
+            )
+        return {"success": True}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
