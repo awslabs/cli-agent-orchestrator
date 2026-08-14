@@ -184,7 +184,7 @@ class AntigravityCliProvider(BaseProvider):
             allowed_tools: Optional list of CAO tool names the agent may use.
                 When restricted (not wildcard), the security prompt is appended
                 to the injected system prompt for soft enforcement.
-            model: Optional model override (e.g. ``"gemini-3.6-flash"``).
+            model: Optional model override (e.g. ``"gemini-3.7-flash"``).
                 The profile's ``model`` field takes precedence when set.
             skill_prompt: Optional skill catalog text built by the service
                 layer. Appended to the system prompt at launch.

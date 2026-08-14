@@ -853,10 +853,10 @@ def test_antigravity_launch_argv_resumes_minted_id():
     from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 
     sid = str(uuid.uuid4())
-    provider = AntigravityCliProvider("t1", "cao-s", "w1", native_session_id=sid, model="gemini-3.6-flash", effort="high")
+    provider = AntigravityCliProvider("t1", "cao-s", "w1", native_session_id=sid, model="gemini-3.7-flash", effort="high")
     command = provider._build_agy_command()
     assert f"--conversation {sid}" in command
-    assert "--model gemini-3.6-flash" in command
+    assert "--model gemini-3.7-flash" in command
     assert "--effort high" in command
     assert "-i" not in command
 
@@ -873,12 +873,12 @@ def test_provider_manager_creates_antigravity_provider_with_native_id_and_effort
         "w1",
         agent_profile="implementer-gemini",
         native_session_id=sid,
-        expected_model="gemini-3.6-flash",
+        expected_model="gemini-3.7-flash",
         expected_effort="high",
     )
     command = provider._build_agy_command()
     assert f"--conversation {sid}" in command
-    assert "--model gemini-3.6-flash" in command
+    assert "--model gemini-3.7-flash" in command
     assert "--effort high" in command
     assert "-i" not in command
 
@@ -908,7 +908,7 @@ def test_provider_manager_get_provider_reconstructs_antigravity_metadata(monkeyp
         "tmux_window": "w1",
         "agent_profile": "implementer-gemini",
         "native_session_id": sid,
-        "model": "gemini-3.6-flash",
+        "model": "gemini-3.7-flash",
         "effort": "high",
     }
 
@@ -919,6 +919,6 @@ def test_provider_manager_get_provider_reconstructs_antigravity_metadata(monkeyp
 
     provider = manager.get_provider("t1")
     assert provider._native_session_id == sid
-    assert provider._model == "gemini-3.6-flash"
+    assert provider._model == "gemini-3.7-flash"
     assert provider._effort == "high"
 
