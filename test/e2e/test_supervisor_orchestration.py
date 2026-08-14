@@ -158,19 +158,34 @@ def _final_report_matches(output: str) -> tuple[bool, str]:
     return has_report and has_synthesis, cleaned
 
 
+def _has_post_input_output(output_before: str, current_output: str) -> bool:
+    """Return whether the terminal has rendered non-empty output after input.
+
+    A PROCESSING -> ready transition alone does not establish that the explicit
+    synthesis request was handled: Grok can report a late status repaint while
+    its scrollback still contains the completed turn from before the request.
+    The E2E test therefore requires an observed full-output change from the
+    snapshot taken immediately before posting the final-synthesis input.
+    """
+    return bool(current_output.strip()) and current_output != output_before
+
+
 def _wait_for_grok_final_synthesis_turn(
     terminal_id: str,
+    output_before_input: str,
     timeout: float = 180.0,
     poll: float = 2.0,
 ) -> bool:
     """Wait for the explicit Grok report request to make a fresh full turn.
 
     The terminal is known ready before this helper is called.  Seeing
-    PROCESSING followed by two quiet ready frames proves the request was not
-    satisfied by the old completed frame that preceded the prompt.
+    PROCESSING, a changed post-input output frame, and two quiet ready frames
+    prove the request was not satisfied by the old completed frame that
+    preceded the prompt.
     """
     start = time.time()
     saw_processing = False
+    saw_post_input_output = False
     stable_ready = 0
     previous_output = None
 
@@ -183,8 +198,11 @@ def _wait_for_grok_final_synthesis_turn(
             stable_ready = 0
 
         current_output = _get_full_output(terminal_id)
+        if _has_post_input_output(output_before_input, current_output):
+            saw_post_input_output = True
         if (
             saw_processing
+            and saw_post_input_output
             and status in _SUPERVISOR_DONE_STATES
             and current_output == previous_output
             and bool(current_output.strip())
@@ -652,6 +670,7 @@ def _run_supervisor_assign_three_analysts_test(provider: str):
         # helper requires a new PROCESSING -> settled ready cycle so this is not
         # mistaken for the previous completed frame.
         if provider == "grok_cli":
+            output_before_synthesis = _get_full_output(supervisor_id)
             resp = requests.post(
                 f"{API_BASE_URL}/terminals/{supervisor_id}/input",
                 params={"message": _GROK_FINAL_SYNTHESIS_PROMPT},
@@ -660,7 +679,7 @@ def _run_supervisor_assign_three_analysts_test(provider: str):
                 resp.status_code == 200
             ), f"Send final Grok synthesis request failed: {resp.status_code}"
             assert _wait_for_grok_final_synthesis_turn(
-                supervisor_id
+                supervisor_id, output_before_synthesis
             ), "Grok did not complete the explicit final synthesis turn within 180s"
 
         # Validate the final assistant turn.  For Grok this is the explicit

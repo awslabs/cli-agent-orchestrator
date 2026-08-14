@@ -88,6 +88,15 @@ def _new_bash_probe() -> tuple[Path, str]:
     return marker_file, task
 
 
+def _terminal_tmux_target(terminal: dict[str, object]) -> str:
+    """Build a tmux target from the terminal API's documented response shape."""
+    session_name = terminal.get("session_name")
+    name = terminal.get("name")
+    if not isinstance(session_name, str) or not isinstance(name, str):
+        raise ValueError("terminal response is missing session_name or name")
+    return f"{session_name}:{name}"
+
+
 def _create_terminal_with_tools(
     provider: str,
     agent_profile: str,
@@ -198,7 +207,7 @@ def _grok_restricted_diagnostics(
             if item.get("id") not in terminals_before
         ]
 
-        target = f"{terminal['session_name']}:{terminal['window_name']}"
+        target = _terminal_tmux_target(terminal)
         pane = subprocess.run(
             ["tmux", "capture-pane", "-p", "-e", "-S", "-2000", "-t", target],
             text=True,
@@ -216,25 +225,43 @@ def _grok_restricted_diagnostics(
 
         processes: list[dict[str, object]] = []
         if pane_pid.isdigit():
-            root = psutil.Process(int(pane_pid))
-            for process in [root, *root.children(recursive=True)]:
-                with process.oneshot():
-                    cmdline = process.cmdline()
-                    policy_args = [
-                        argument
-                        for argument in cmdline
-                        if argument.startswith("--allow=") or argument.startswith("--deny=")
-                    ]
-                    for index, argument in enumerate(cmdline[:-1]):
-                        if argument in {"--allow", "--deny"}:
-                            policy_args.append(f"{argument} {cmdline[index + 1]}")
+            try:
+                root = psutil.Process(int(pane_pid))
+                process_tree = [root, *root.children(recursive=True)]
+            except psutil.Error:
+                process_tree = []
+            for process in process_tree:
+                try:
+                    with process.oneshot():
+                        name = process.name()
+                        cmdline = process.cmdline()
+                    executable = Path(cmdline[0]).name.lower() if cmdline else name.lower()
+                    if "grok" not in executable and "grok" not in name.lower():
+                        continue
+                    deny_bash = any(
+                        argument == "--deny=Bash"
+                        or (
+                            argument == "--deny"
+                            and index + 1 < len(cmdline)
+                            and cmdline[index + 1] == "Bash"
+                        )
+                        for index, argument in enumerate(cmdline)
+                    )
                     processes.append(
                         {
                             "pid": process.pid,
-                            "name": process.name(),
-                            "policy_args": policy_args,
+                            "name": name,
+                            "has_deny_bash": deny_bash,
+                            "has_rules": any(
+                                argument == "--rules" or argument.startswith("--rules=")
+                                for argument in cmdline
+                            ),
                         }
                     )
+                except psutil.Error:
+                    # A transient child should not hide diagnostics for the
+                    # remaining Grok process tree.
+                    continue
 
         # A raw pane is model input/output and can contain the profile prompt.
         # Keep bounded, boolean evidence useful to distinguish a direct Bash
@@ -256,7 +283,7 @@ def _grok_restricted_diagnostics(
                 "terminal": {
                     "id": terminal_id,
                     "session_name": terminal.get("session_name"),
-                    "window_name": terminal.get("window_name"),
+                    "name": terminal.get("name"),
                     "status": terminal.get("status"),
                     "allowed_tools": terminal.get("allowed_tools"),
                 },
