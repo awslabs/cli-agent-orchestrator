@@ -247,6 +247,11 @@ def _validate_route_provenance(value: Any) -> Optional[dict[str, Any]]:
         return None
     if not isinstance(value, dict):
         raise StableAgentInvalid(f"route_provenance must be a mapping; got {value!r}")
+    if not value:
+        # Empty provenance is the same semantic fact as absent provenance; the
+        # lineage stores it as NULL and the restore contract normalizes it to
+        # None too, so the two validators never disagree about an empty map.
+        return None
     unknown = sorted(set(value) - ROUTE_PROVENANCE_KEYS)
     if unknown:
         raise StableAgentInvalid(
@@ -1137,18 +1142,19 @@ def transition_dormant(
                 f"{terminal_id}/{generation}: recorded {contract['contract_digest']}, "
                 f"expected {contract_digest}; changed content conflicts"
             )
-        # Total revalidation of the STORED contract against the authoritative
-        # rows before any mutation: a legacy/corrupt/mismatched stored row never
-        # retires the source.  `stored_payload_mismatch` refuses every
-        # malformed/unknown shape (invalid JSON, non-mapping, missing identity
-        # keys, unknown schema version) with a typed refusal, and compares a
-        # well-shaped payload exactly (agent, lineage, harness, native id, route
-        # provenance, mode) — never a raw KeyError/TypeError.
+        # Total revalidation of the STORED row record before any mutation: a
+        # legacy/corrupt/mismatched stored row never retires the source.
+        # `stored_record_refusal` decodes the stored payload into a complete
+        # typed RestoreContract through the same constructor used at
+        # publication, requires the stored JSON to equal the decoded canonical
+        # serialization and hash to the stored digest, checks every duplicated
+        # row column against the decoded payload, and compares the decoded
+        # contract's exact source identity and roster identity — never a raw
+        # KeyError/TypeError.
         lineage = _lineage_by_id(session, lineage_id)
         if lineage is None:  # pragma: no cover - FK-less store, defensive
             raise StableAgentUnavailable(f"lineage {lineage_id} has no row")
-        stored_payload = contract.get("contract")
-        mismatch = restore_contract.stored_payload_mismatch(stored_payload, incarnation, lineage)
+        mismatch = restore_contract.stored_record_refusal(contract, incarnation, lineage)
         if mismatch is not None:
             raise StableAgentConflict(
                 f"stored restore contract cannot authorize the dormant transition: {mismatch}"
@@ -1246,11 +1252,8 @@ def transition_dormant(
         }
 
     if db is not None:
-        # The caller owns this session's transaction: the transition's writes
-        # run directly in it (NO savepoint), so the caller's commit/rollback is
-        # the atomic boundary and a rollback truthfully leaves the roster
-        # unchanged.  A lost CAS or a busy store is a typed refusal the caller
-        # retries; the winner's committed state is adopted on that retry.
+        # The caller owns the transaction; a lost CAS or busy store is a typed
+        # refusal the caller retries (adopting the winner's committed state).
         try:
             return _transition(db)
         except (_TransitionLostUpdate, IntegrityError, OperationalError) as exc:

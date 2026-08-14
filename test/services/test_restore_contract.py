@@ -175,7 +175,26 @@ def _gate_first_call(fn, barrier):
 def _corrupt_contract_json(isolated_memory_db, terminal_id, generation, new_json):
     """Overwrite the persisted restore-contract payload directly (raw SQL), the
     only way a malformed/corrupt stored contract can exist now that publication
-    binds identity."""
+    binds identity.
+
+    The stored digest is recomputed to match the new payload, so the refusal the
+    transition produces comes from the stored-record decoder/validator, not from
+    a content/digest divergence.
+    """
+    new_digest = hashlib.sha256(new_json.encode("utf-8")).hexdigest()
+    with isolated_memory_db.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE restore_contracts SET contract_json=:j, contract_digest=:d "
+                "WHERE terminal_id=:t AND generation=:g"
+            ),
+            {"j": new_json, "d": new_digest, "t": terminal_id, "g": generation},
+        )
+
+
+def _corrupt_contract_json_keep_digest(isolated_memory_db, terminal_id, generation, new_json):
+    """Overwrite only the payload, leaving the stored digest column untouched —
+    the content/digest-divergence corruption."""
     with isolated_memory_db.begin() as conn:
         conn.execute(
             text(
@@ -183,6 +202,19 @@ def _corrupt_contract_json(isolated_memory_db, terminal_id, generation, new_json
                 "WHERE terminal_id=:t AND generation=:g"
             ),
             {"j": new_json, "t": terminal_id, "g": generation},
+        )
+
+
+def _corrupt_column(isolated_memory_db, terminal_id, generation, column, value):
+    """Overwrite one duplicated restore-contract row column directly (raw SQL),
+    leaving the stored JSON and digest untouched — the column-only mismatch."""
+    with isolated_memory_db.begin() as conn:
+        conn.execute(
+            text(
+                f"UPDATE restore_contracts SET {column}=:v "
+                "WHERE terminal_id=:t AND generation=:g"
+            ),
+            {"v": value, "t": terminal_id, "g": generation},
         )
 
 
@@ -196,6 +228,21 @@ def _read_stored_payload(isolated_memory_db, terminal_id, generation) -> str:
             {"t": terminal_id, "g": generation},
         ).fetchone()
     return row[0]
+
+
+def _rewrite_stored_payload(isolated_memory_db, bind, contract, mutate) -> str:
+    """Rewrite the persisted contract_json through ``mutate(parsed)``, keeping the
+    record digest-consistent (json AND digest column), and return the NEW digest
+    so the caller can present it to the transition.  This exercises the stored-
+    record decoder/validator boundary rather than the caller-vs-stored digest
+    check."""
+    parsed = json.loads(
+        _read_stored_payload(isolated_memory_db, contract.terminal_id, contract.generation)
+    )
+    mutate(parsed)
+    new_json = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+    _corrupt_contract_json(isolated_memory_db, contract.terminal_id, contract.generation, new_json)
+    return hashlib.sha256(new_json.encode("utf-8")).hexdigest()
 
 
 @pytest.fixture
@@ -326,7 +373,7 @@ def test_schema_version_is_part_of_the_immutable_identity(isolated_memory_db):
 
 
 # ---------------------------------------------------------------------------
-# authoritative M3-A identity binding (Fix 1)
+# authoritative M3-A identity binding
 # ---------------------------------------------------------------------------
 
 
@@ -417,24 +464,84 @@ def test_publish_matches_identity_missing_none(isolated_memory_db):
     assert result["incarnation"]["disposition"] == roster.INCARNATION_RETIRED
 
 
+def test_empty_route_provenance_binds_and_publishes(isolated_memory_db):
+    """An empty route-provenance launch ({} accepted by both APIs) normalizes to
+    None consistently and can bind plus publish a matching restore contract —
+    empty provenance and absent provenance are the same semantic fact."""
+    bind = _bind_worker(route_provenance={})
+    # The roster stores the empty provenance as None (its canonical form).
+    assert bind["lineage"]["route_provenance"] is None
+    contract = _contract_for(bind, route_provenance={})
+    # The restore contract normalizes the empty map to None too, so the
+    # identity comparison sees two absences, not "{}" vs NULL.
+    assert contract.route_provenance is None
+    record = rc.publish_contract(contract)
+    assert record["adopted"] is False
+    result = _transition(bind, contract)
+    assert result["adopted"] is False
+    assert result["agent"]["disposition"] == roster.DISPOSITION_DORMANT
+
+
+def test_structured_fact_values_are_immutable(isolated_memory_db):
+    """A structured fact map is frozen at construction: a direct mutation
+    through the contract is refused (read-only snapshot), so validated state
+    cannot be changed after construction."""
+    bind, contract = _bound_worker()
+    with pytest.raises(TypeError):
+        contract.profile_material.value["profile_config_sha256"] = "c" * 64
+    with pytest.raises(TypeError):
+        contract.executable.value["path"] = "/usr/local/bin/other"
+    with pytest.raises(TypeError):
+        contract.route_provenance["provider_route"] = "glm"
+    # The contract still serializes exactly its validated state.
+    assert contract.profile_material.value["profile_config_sha256"] == "b" * 64
+    assert contract.executable.value["path"] == "/usr/local/bin/claude"
+
+
+def test_mutating_caller_input_dict_does_not_change_contract(isolated_memory_db):
+    """Mutating the caller's ORIGINAL input dict after construction cannot change
+    the contract or its deterministic digest — the validated facts are fresh
+    snapshots, never aliases of the caller's input."""
+    profile = {
+        "profile_config_path": "/Users/colin/.claude/settings.json",
+        "profile_config_sha256": "b" * 64,
+    }
+    contract = _detached_contract(profile_material=_fact(profile))
+    digest_before = contract.digest()
+    profile["profile_config_sha256"] = "c" * 64
+    assert contract.profile_material.value["profile_config_sha256"] == "b" * 64
+    assert contract.digest() == digest_before
+
+
+def test_mutated_fact_map_cannot_be_published(isolated_memory_db):
+    """A post-construction mutation of a validated fact map is impossible (the
+    map is frozen), so no unvalidated state can ever reach publication — the
+    contract publishes exactly its validated state."""
+    bind, contract = _bound_worker()
+    with pytest.raises(TypeError):
+        contract.profile_material.value["settings_content"] = "apiKey=super-secret"
+    record = rc.publish_contract(contract)
+    assert record["adopted"] is False
+    stored = rc.get_contract_by_incarnation(
+        terminal_id=contract.terminal_id, generation=contract.generation
+    )
+    assert "apiKey" not in stored["contract_json"]
+
+
 def test_transition_refuses_corrupt_stored_contract(isolated_memory_db):
     """A legacy/corrupt stored contract whose stored payload no longer matches
     the authoritative roster identity never retires the source: the transition
     revalidates the STORED contract before any mutation."""
     bind, contract = _bound_worker()
     rc.publish_contract(contract)
-    parsed = json.loads(
-        _read_stored_payload(isolated_memory_db, contract.terminal_id, contract.generation)
-    )
-    parsed["agent_id"] = str(uuid.uuid4())
-    _corrupt_contract_json(
+    new_digest = _rewrite_stored_payload(
         isolated_memory_db,
-        contract.terminal_id,
-        contract.generation,
-        json.dumps(parsed, sort_keys=True, separators=(",", ":")),
+        bind,
+        contract,
+        lambda parsed: parsed.__setitem__("agent_id", str(uuid.uuid4())),
     )
     with pytest.raises(roster.StableAgentConflict):
-        _transition(bind, contract)
+        _transition(bind, contract, contract_digest=new_digest)
     assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
     assert (
         roster.get_incarnation_by_terminal(
@@ -449,11 +556,11 @@ def test_transition_refuses_invalid_json_stored_payload(isolated_memory_db):
     transition: refused with zero roster mutation."""
     bind, contract = _bound_worker()
     rc.publish_contract(contract)
-    _corrupt_contract_json(
-        isolated_memory_db, contract.terminal_id, contract.generation, "not-json{{"
-    )
+    new_json = "not-json{{"
+    new_digest = hashlib.sha256(new_json.encode("utf-8")).hexdigest()
+    _corrupt_contract_json(isolated_memory_db, contract.terminal_id, contract.generation, new_json)
     with pytest.raises(roster.StableAgentConflict):
-        _transition(bind, contract)
+        _transition(bind, contract, contract_digest=new_digest)
     assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
     assert (
         roster.get_incarnation_by_terminal(
@@ -468,11 +575,11 @@ def test_transition_refuses_non_dict_stored_payload(isolated_memory_db):
     schema drift) cannot authorize the transition: refused, never a crash."""
     bind, contract = _bound_worker()
     rc.publish_contract(contract)
-    _corrupt_contract_json(
-        isolated_memory_db, contract.terminal_id, contract.generation, json.dumps([1, 2, 3])
-    )
+    new_json = json.dumps([1, 2, 3])
+    new_digest = hashlib.sha256(new_json.encode("utf-8")).hexdigest()
+    _corrupt_contract_json(isolated_memory_db, contract.terminal_id, contract.generation, new_json)
     with pytest.raises(roster.StableAgentConflict):
-        _transition(bind, contract)
+        _transition(bind, contract, contract_digest=new_digest)
     assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
 
 
@@ -481,18 +588,11 @@ def test_transition_refuses_missing_required_identity_key(isolated_memory_db):
     StableAgentConflict — never a raw KeyError."""
     bind, contract = _bound_worker()
     rc.publish_contract(contract)
-    parsed = json.loads(
-        _read_stored_payload(isolated_memory_db, contract.terminal_id, contract.generation)
-    )
-    del parsed["agent_id"]
-    _corrupt_contract_json(
-        isolated_memory_db,
-        contract.terminal_id,
-        contract.generation,
-        json.dumps(parsed, sort_keys=True, separators=(",", ":")),
+    new_digest = _rewrite_stored_payload(
+        isolated_memory_db, bind, contract, lambda parsed: parsed.pop("agent_id", None)
     )
     with pytest.raises(roster.StableAgentConflict):
-        _transition(bind, contract)
+        _transition(bind, contract, contract_digest=new_digest)
     assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
 
 
@@ -501,15 +601,11 @@ def test_transition_refuses_unknown_schema_version_but_read_stays_lenient(isolat
     cannot authorize this binary's dormant transition."""
     bind, contract = _bound_worker()
     rc.publish_contract(contract)
-    parsed = json.loads(
-        _read_stored_payload(isolated_memory_db, contract.terminal_id, contract.generation)
-    )
-    parsed["schema_version"] = "cao-m3-restore-contract-v9"
-    _corrupt_contract_json(
+    new_digest = _rewrite_stored_payload(
         isolated_memory_db,
-        contract.terminal_id,
-        contract.generation,
-        json.dumps(parsed, sort_keys=True, separators=(",", ":")),
+        bind,
+        contract,
+        lambda parsed: parsed.__setitem__("schema_version", "cao-m3-restore-contract-v9"),
     )
     # The read API stays lenient — the unknown-schema record is still readable.
     read = rc.get_contract_by_incarnation(
@@ -519,12 +615,153 @@ def test_transition_refuses_unknown_schema_version_but_read_stays_lenient(isolat
     assert read["contract"]["schema_version"] == "cao-m3-restore-contract-v9"
     # But it cannot authorize this binary's dormant transition.
     with pytest.raises(roster.StableAgentConflict):
+        _transition(bind, contract, contract_digest=new_digest)
+    assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
+
+
+def test_transition_refuses_missing_relaunch_fact(isolated_memory_db):
+    """Deleting a required non-identity relaunch fact (working_directory) from
+    the stored record leaves an incomplete contract that must NOT authorize the
+    dormant transition — zero roster mutation."""
+    bind, contract = _bound_worker()
+    rc.publish_contract(contract)
+    new_digest = _rewrite_stored_payload(
+        isolated_memory_db, bind, contract, lambda parsed: parsed.pop("working_directory", None)
+    )
+    with pytest.raises(roster.StableAgentConflict):
+        _transition(bind, contract, contract_digest=new_digest)
+    assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
+    assert (
+        roster.get_incarnation_by_terminal(
+            terminal_id=contract.terminal_id, generation=contract.generation
+        )["disposition"]
+        == roster.INCARNATION_BOUND
+    )
+
+
+def test_transition_refuses_missing_model_fact(isolated_memory_db):
+    """Deleting the model fact (a ContractFact, not a plain identity key) from
+    the stored record is refused at the transition boundary."""
+    bind, contract = _bound_worker()
+    rc.publish_contract(contract)
+    new_digest = _rewrite_stored_payload(
+        isolated_memory_db, bind, contract, lambda parsed: parsed.pop("model", None)
+    )
+    with pytest.raises(roster.StableAgentConflict):
+        _transition(bind, contract, contract_digest=new_digest)
+    assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
+
+
+def test_transition_refuses_malformed_relaunch_fact(isolated_memory_db):
+    """A malformed relaunch fact (a non-dict executable) that the constructor
+    would refuse is refused at the transition boundary — the stored record must
+    fully decode into a valid typed contract."""
+    bind, contract = _bound_worker()
+    rc.publish_contract(contract)
+    new_digest = _rewrite_stored_payload(
+        isolated_memory_db,
+        bind,
+        contract,
+        lambda parsed: parsed.__setitem__(
+            "executable", {"state": "present", "value": "not-a-mapping", "reason": None}
+        ),
+    )
+    with pytest.raises(roster.StableAgentConflict):
+        _transition(bind, contract, contract_digest=new_digest)
+    assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
+
+
+def test_transition_refuses_stored_source_identity_mismatch(isolated_memory_db):
+    """A stored record that claims a different terminal/generation than the exact
+    authoritative source incarnation is refused — the transition binds to the
+    exact source identity, never to a detached record."""
+    bind, contract = _bound_worker()
+    rc.publish_contract(contract)
+    new_digest = _rewrite_stored_payload(
+        isolated_memory_db,
+        bind,
+        contract,
+        lambda parsed: parsed.__setitem__("terminal_id", "ffffffff"),
+    )
+    with pytest.raises(roster.StableAgentConflict):
+        _transition(bind, contract, contract_digest=new_digest)
+    assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
+
+
+def test_transition_refuses_stored_digest_divergence(isolated_memory_db):
+    """A stored payload whose bytes no longer hash to the stored digest column
+    (content/digest divergence) is refused — the stored record must prove its
+    own canonical digest before authorizing the transition."""
+    bind, contract = _bound_worker()
+    rc.publish_contract(contract)
+    parsed = json.loads(
+        _read_stored_payload(isolated_memory_db, contract.terminal_id, contract.generation)
+    )
+    parsed["working_directory"] = "/Users/colin/Projects/other"
+    _corrupt_contract_json_keep_digest(
+        isolated_memory_db,
+        contract.terminal_id,
+        contract.generation,
+        json.dumps(parsed, sort_keys=True, separators=(",", ":")),
+    )
+    with pytest.raises(roster.StableAgentConflict):
+        _transition(bind, contract)
+    assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
+
+
+def test_transition_refuses_row_column_identity_mismatch(isolated_memory_db):
+    """An accidental column-only edit (the row's agent_id column changed while the
+    JSON/digest are intact) produces contradictory reads and must not authorize
+    the transition — zero roster mutation."""
+    bind, contract = _bound_worker()
+    rc.publish_contract(contract)
+    _corrupt_column(
+        isolated_memory_db,
+        contract.terminal_id,
+        contract.generation,
+        "agent_id",
+        str(uuid.uuid4()),
+    )
+    with pytest.raises(roster.StableAgentConflict):
+        _transition(bind, contract)
+    assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
+    assert (
+        roster.get_incarnation_by_terminal(
+            terminal_id=contract.terminal_id, generation=contract.generation
+        )["disposition"]
+        == roster.INCARNATION_BOUND
+    )
+
+
+def test_transition_refuses_noncanonical_json_with_matching_digest(isolated_memory_db):
+    """A semantically valid but NON-canonical stored JSON (unsorted keys) that
+    hashes to its own stored digest is still refused — the stored bytes must
+    equal the decoded contract's canonical serialization, not merely hash to a
+    digest."""
+    bind, contract = _bound_worker()
+    rc.publish_contract(contract)
+    parsed = json.loads(
+        _read_stored_payload(isolated_memory_db, contract.terminal_id, contract.generation)
+    )
+    # Re-serialize with the keys in REVERSE order: same parsed payload (JSON
+    # objects are unordered), non-canonical bytes.
+    reordered = {key: parsed[key] for key in reversed(list(parsed))}
+    noncanonical = json.dumps(reordered, sort_keys=False, separators=(",", ":"))
+    canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+    assert noncanonical != canonical
+    _corrupt_contract_json(
+        isolated_memory_db,
+        contract.terminal_id,
+        contract.generation,
+        noncanonical,
+    )
+    with pytest.raises(roster.StableAgentConflict):
         _transition(bind, contract)
     assert roster.get_agent(contract.agent_id)["disposition"] == roster.DISPOSITION_LIVE
 
 
 # ---------------------------------------------------------------------------
-# canonical realpaths at the immutable boundary (Fix 3)
+# canonical realpaths at the immutable boundary
 # ---------------------------------------------------------------------------
 
 
@@ -572,6 +809,31 @@ def test_canonical_real_path_accepted(isolated_memory_db):
         trusted_project_root="/Users/colin/Projects/cao",
     )
     assert contract.working_directory == "/Users/colin/Projects/cao"
+
+
+def test_executable_refuses_unknown_keys(isolated_memory_db):
+    """The executable fact rejects unknown keys rather than silently dropping
+    them — an exact executable identity carries exactly path/sha256(/version)."""
+    with pytest.raises(rc.RestoreContractInvalid):
+        _detached_contract(
+            executable=_fact({"path": "/usr/local/bin/claude", "sha256": _DIGEST64, "env": "extra"})
+        )
+
+
+def test_strict_restore_contract_validators(isolated_memory_db):
+    """The strict RestoreContract validators reject obvious violations: a
+    non-UUID agent id, an unknown execution mode, an empty model, and a
+    non-digest executable sha256."""
+    with pytest.raises(rc.RestoreContractInvalid):
+        _detached_contract(agent_id="not-a-uuid")
+    with pytest.raises(rc.RestoreContractInvalid):
+        _detached_contract(execution_mode="unknown_mode")
+    with pytest.raises(rc.RestoreContractInvalid):
+        _detached_contract(model=_fact(""))
+    with pytest.raises(rc.RestoreContractInvalid):
+        _detached_contract(
+            executable=_fact({"path": "/usr/local/bin/claude", "sha256": "not-a-64-hex-digest"})
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1021,7 +1283,7 @@ def test_publish_and_transition_atomic_commit(isolated_memory_db):
 
 
 # ---------------------------------------------------------------------------
-# concurrent dormant transitions (Fix 2)
+# concurrent dormant transitions
 # ---------------------------------------------------------------------------
 
 
@@ -1086,7 +1348,7 @@ def test_concurrent_transitions_one_mutation_one_adoption(file_db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# concurrent publishers (P2)
+# concurrent publishers
 # ---------------------------------------------------------------------------
 
 
@@ -1153,6 +1415,58 @@ def test_concurrent_differing_publishers_one_winner_typed_conflict(file_db, monk
     assert others == [], f"unexpected non-Conflict publish errors: {others}"
     assert len(results) == 1, f"expected exactly one winner, got {results}"
     assert len(conflicts) == 1, f"expected exactly one typed conflict, got {len(conflicts)}"
+    assert len(rc.list_contracts()) == 1
+
+
+def test_caller_owned_two_session_contention_is_typed_and_recoverable(file_db, monkeypatch):
+    """Two caller-owned sessions racing the same source slot: exactly one wins;
+    the OTHER receives exactly one typed RestoreContractUnavailable (never a raw
+    SQLite IntegrityError/OperationalError), rolls back its now-unusable
+    transaction, and retries the whole caller-owned call to adopt the winner's
+    row.  The barrier at the pre-flush seam makes the typed mapping
+    deterministic."""
+    bind, contract = _bound_worker()
+    barrier = threading.Barrier(2)
+    monkeypatch.setattr(rc, "_now", _gate_first_call(rc._now, barrier))
+
+    outcomes: list[dict] = []
+    refusals: list[str] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        session = database.SessionLocal()
+        try:
+            session.begin()
+            try:
+                outcomes.append(rc.publish_contract(contract, db=session))
+                session.commit()
+            except rc.RestoreContractUnavailable as exc:
+                # Record the typed refusal, then recover: the loser's caller-
+                # owned transaction is unusable after the unique-slot collision,
+                # so roll it back and retry the whole call.
+                refusals.append(str(exc))
+                session.rollback()
+                session.begin()
+                outcomes.append(rc.publish_contract(contract, db=session))
+                session.commit()
+        except BaseException as exc:  # noqa: BLE001 - surface for assertions
+            errors.append(exc)
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert errors == [], f"unexpected caller-owned publish errors: {errors}"
+    # The barrier forces both callers to race the empty slot, so exactly one
+    # caller observes the typed refusal and the other publishes without one.
+    assert len(refusals) == 1, f"expected exactly one typed refusal, got {len(refusals)}"
+    assert len(outcomes) == 2
+    assert len([o for o in outcomes if not o["adopted"]]) == 1
+    assert len([o for o in outcomes if o["adopted"]]) == 1
     assert len(rc.list_contracts()) == 1
 
 

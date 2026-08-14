@@ -55,6 +55,7 @@ provider, tmux, or network I/O.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -63,6 +64,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Callable, Optional
 
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -194,6 +196,12 @@ def _validate_route_provenance(value: Any) -> Optional[dict[str, str]]:
         return None
     if not isinstance(value, dict):
         raise RestoreContractInvalid(f"route_provenance must be a mapping; got {value!r}")
+    if not value:
+        # Empty provenance and absent provenance are the same semantic fact: the
+        # roster stores falsy provenance as NULL, so the contract must normalize
+        # {} to None or the identity comparison would see "{}" vs NULL and
+        # falsely refuse a provenance-less launch.
+        return None
     unknown = sorted(set(value) - ROUTE_PROVENANCE_KEYS)
     if unknown:
         raise RestoreContractInvalid(
@@ -267,6 +275,12 @@ def _validate_executable(value: Any, *, field: str) -> Optional[dict[str, str]]:
         return None
     if not isinstance(value, dict):
         raise RestoreContractInvalid(f"{field} value must be a mapping; got {value!r}")
+    unknown = sorted(set(value) - {"path", "sha256", "version"})
+    if unknown:
+        raise RestoreContractInvalid(
+            f"{field} carries unknown key(s) {unknown}; only path/sha256/version "
+            "are accepted (an exact executable fact never carries extra keys)"
+        )
     path = _require_canonical_realpath(value.get("path"), field=f"{field}.path")
     sha256 = value.get("sha256")
     if not isinstance(sha256, str) or _SHA256_RE.fullmatch(sha256) is None:
@@ -287,6 +301,30 @@ def _validated_fact(fact: "ContractFact", *, field: str, validator: Callable) ->
     if fact.state != FACT_PRESENT:
         return fact
     return ContractFact.present(validator(fact.value, field=field))
+
+
+def _freeze_mapping(value: Any, *, field: str) -> Optional[MappingProxyType]:
+    """An immutable value-semantic snapshot of a flat bounded mapping.
+
+    These maps (route provenance, executable, profile/provider-home reference
+    dicts) are flat bounded string dictionaries; a read-only
+    ``MappingProxyType`` gives them value semantics without a framework, so a
+    caller can never mutate validated state after construction, and a caller's
+    original input dict is never aliased.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RestoreContractInvalid(f"{field} must be a mapping; got {value!r}")
+    return MappingProxyType(dict(value))
+
+
+def _freeze_fact_value(fact: "ContractFact") -> "ContractFact":
+    """Freeze a present structured fact's dict value; strings and absent facts
+    pass through unchanged (model/effort are immutable strings)."""
+    if fact.state != FACT_PRESENT or not isinstance(fact.value, dict):
+        return fact
+    return ContractFact.present(MappingProxyType(dict(fact.value)))
 
 
 @dataclass(frozen=True)
@@ -338,8 +376,20 @@ class ContractFact:
         return cls(FACT_MISSING)
 
     def to_json(self) -> dict[str, Any]:
-        """Deterministic serialized form (nulls included for exact replay)."""
-        return {"state": self.state, "value": self.value, "reason": self.reason}
+        """Deterministic serialized form (nulls included for exact replay).
+
+        The present value is returned as a fresh ordinary JSON value — a
+        frozen ``MappingProxyType`` snapshot becomes a fresh dict — so the
+        serializer never sees a live mutable object and a caller can never
+        mutate the returned mapping and, through it, the contract.
+        """
+        value = self.value
+        if self.state == FACT_PRESENT:
+            if isinstance(value, MappingProxyType):
+                value = dict(value)
+            elif value is not None:
+                value = copy.deepcopy(value)
+        return {"state": self.state, "value": value, "reason": self.reason}
 
 
 @dataclass(frozen=True)
@@ -397,14 +447,18 @@ class RestoreContract:
             self, "provider", _optional_text(self.provider, field="provider", max_len=128)
         )
         object.__setattr__(
-            self, "route_provenance", _validate_route_provenance(self.route_provenance)
+            self,
+            "route_provenance",
+            _freeze_mapping(
+                _validate_route_provenance(self.route_provenance), field="route_provenance"
+            ),
         )
         if self.execution_mode is not None:
-            object.__setattr__(
-                self,
-                "execution_mode",
-                em.validate_mode(self.execution_mode, field="execution_mode"),
-            )
+            try:
+                mode = em.validate_mode(self.execution_mode, field="execution_mode")
+            except em.ExecutionModeInvalid as exc:
+                raise RestoreContractInvalid(str(exc)) from exc
+            object.__setattr__(self, "execution_mode", mode)
         object.__setattr__(
             self,
             "working_directory",
@@ -428,27 +482,34 @@ class RestoreContract:
         object.__setattr__(
             self,
             "executable",
-            _validated_fact(self.executable, field="executable", validator=_validate_executable),
+            _freeze_fact_value(
+                _validated_fact(self.executable, field="executable", validator=_validate_executable)
+            ),
         )
         object.__setattr__(
             self,
             "profile_material",
-            _validated_fact(
-                self.profile_material, field="profile_material", validator=_validate_reference_dict
+            _freeze_fact_value(
+                _validated_fact(
+                    self.profile_material,
+                    field="profile_material",
+                    validator=_validate_reference_dict,
+                )
             ),
         )
         object.__setattr__(
             self,
             "provider_home_facts",
-            _validated_fact(
-                self.provider_home_facts,
-                field="provider_home_facts",
-                validator=_validate_reference_dict,
+            _freeze_fact_value(
+                _validated_fact(
+                    self.provider_home_facts,
+                    field="provider_home_facts",
+                    validator=_validate_reference_dict,
+                )
             ),
         )
 
     def digest(self) -> str:
-        """The deterministic sha256 over the canonical payload."""
         return contract_digest(self)
 
 
@@ -462,7 +523,9 @@ def _payload_dict(contract: RestoreContract) -> dict[str, Any]:
         "native_session_id": contract.native_session_id,
         "harness": contract.harness,
         "provider": contract.provider,
-        "route_provenance": contract.route_provenance,
+        "route_provenance": (
+            dict(contract.route_provenance) if contract.route_provenance is not None else None
+        ),
         "execution_mode": contract.execution_mode,
         "model": contract.model.to_json(),
         "effort": contract.effort.to_json(),
@@ -475,7 +538,6 @@ def _payload_dict(contract: RestoreContract) -> dict[str, Any]:
 
 
 def canonical_payload(contract: RestoreContract) -> str:
-    """The deterministic canonical serialization (sorted keys, compact JSON)."""
     return json.dumps(_payload_dict(contract), sort_keys=True, separators=(",", ":"))
 
 
@@ -490,7 +552,6 @@ def _canonical_json(value: Any) -> str:
 
 
 def contract_digest(contract: RestoreContract) -> str:
-    """The sha256 of the canonical payload — the deterministic identity."""
     return hashlib.sha256(canonical_payload(contract).encode("utf-8")).hexdigest()
 
 
@@ -514,6 +575,7 @@ def _contract_row_dict(row: Any) -> dict[str, Any]:
         "generation": row.generation,
         "native_session_id": row.native_session_id,
         "contract": _parse_json(row.contract_json),
+        "contract_json": row.contract_json,
         "created_at": row.created_at,
     }
 
@@ -619,51 +681,124 @@ def identity_mismatch_reason(
     return None
 
 
-def stored_payload_mismatch(payload: Any, incarnation: Any, lineage: Any) -> Optional[str]:
-    """Total revalidation of a STORED contract payload against authoritative rows.
+_FACT_FIELDS = ("model", "effort", "executable", "profile_material", "provider_home_facts")
 
-    ``payload`` is the raw stored payload (the parsed ``contract_json`` from the
-    read surface — possibly ``None`` for invalid JSON, a non-mapping, or a
-    mapping missing identity keys).  Returns a refusal reason for EVERY
-    malformed/unknown shape so the transition can never mutate on a stored
-    contract it cannot fully verify, and never raises a raw ``KeyError`` or
-    ``TypeError``.  Specifically:
 
-    - non-mapping / invalid JSON (parsed to ``None``) is refused;
-    - an unknown ``schema_version`` is refused for this binary's transition
-      (the read surface stays lenient — unknown-schema records remain readable);
-    - a missing required identity key is refused;
-    - then the well-shaped payload is compared against the authoritative rows by
-      :func:`identity_mismatch_reason`.
+def _decode_contract_fact(raw: Any) -> "ContractFact":
+    """Decode one serialized ``ContractFact`` from a stored payload."""
+    if not isinstance(raw, dict):
+        raise RestoreContractInvalid("a serialized contract fact must be a mapping")
+    state = raw.get("state")
+    if not isinstance(state, str):
+        raise RestoreContractInvalid("a serialized contract fact must carry a string state")
+    return ContractFact(state=state, value=raw.get("value"), reason=raw.get("reason"))
 
-    This is bounded partial-write/schema-drift safety at the effect boundary,
-    not a general corruption framework or hostile tamper protection.
+
+def decode_stored_contract(payload: Any) -> Optional["RestoreContract"]:
+    """Rebuild a complete typed ``RestoreContract`` from a stored payload.
+
+    The payload runs through the SAME constructor used at publication, which
+    validates every required fact, path, mode, and identity — so a stored record
+    missing a required relaunch fact, carrying a malformed fact value, an
+    unknown schema version, or a non-object shape cannot decode.  Returns
+    ``None`` for any shape this binary cannot fully validate; never raises.
     """
     if not isinstance(payload, dict):
+        return None
+    try:
+        kwargs: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in _FACT_FIELDS:
+                kwargs[key] = _decode_contract_fact(value)
+            else:
+                kwargs[key] = value
+        return RestoreContract(**kwargs)
+    except (RestoreContractInvalid, TypeError, ValueError):
+        return None
+
+
+def stored_record_refusal(record: Any, incarnation: Any, lineage: Any) -> Optional[str]:
+    """Total refusal reason for one STORED restore-contract row record at the
+    effect boundary (the dormant transition's gate).
+
+    ``record`` is the full stored row dict from the read surface — the parsed
+    payload (``record["contract"]``), the raw canonical JSON
+    (``record["contract_json"]``), and every duplicated indexed column
+    (``schema_version``, ``agent_id``, ``lineage_id``, ``terminal_id``,
+    ``generation``, ``native_session_id``).  Verifies, before any mutation:
+
+    1. complete shape — the stored payload decodes into a full typed
+       ``RestoreContract`` through the same constructor used at publication
+       (every required relaunch fact and path is validated; an unknown schema,
+       a missing/malformed fact, or a non-object shape cannot decode);
+    2. canonical bytes — the stored JSON bytes equal the decoded contract's
+       canonical serialization AND hash to the stored digest, so a semantically
+       valid but non-canonical representation (or a content/digest divergence)
+       is refused;
+    3. column consistency — every duplicated row column equals the decoded
+       canonical payload, so an accidental column-only edit cannot produce
+       contradictory reads;
+    4. exact source identity — the decoded contract's terminal/generation equal
+       the authoritative source incarnation, and its identity matches the
+       authoritative roster rows (agent, lineage, harness, native id, route
+       provenance, execution mode).
+
+    Returns ``None`` only for a complete, canonical, digest-consistent record
+    whose row and JSON agree and that is exactly bound to the authoritative
+    source.  Never raises on malformed input; every malformed/unknown/divergent
+    shape maps to a typed reason.  This is bounded partial-write/schema-drift
+    safety at the effect boundary, not a general corruption framework or hostile
+    tamper protection.
+    """
+    stored_json = record.get("contract_json")
+    stored_digest = record.get("contract_digest")
+    payload = record.get("contract")
+    if stored_json is None or stored_digest is None:
+        return "stored restore contract record is missing its canonical JSON or digest"
+    contract = decode_stored_contract(payload)
+    if contract is None:
         return (
-            "stored restore contract payload is not a mapping (invalid JSON or "
-            "non-object shape); it cannot authorize a dormant transition"
+            "stored restore contract payload does not decode into a complete "
+            "validated contract (missing/malformed relaunch facts, unknown "
+            "schema, or non-object shape)"
         )
-    if payload.get("schema_version") != SCHEMA_VERSION:
+    canonical = canonical_payload(contract)
+    if stored_json != canonical:
         return (
-            f"stored restore contract schema_version {payload.get('schema_version')!r} is not "
-            f"this binary's {SCHEMA_VERSION!r}; an unknown-schema contract cannot authorize "
-            "this binary's dormant transition"
+            "stored restore contract JSON is not the decoded contract's canonical "
+            "serialization; a non-canonical or divergent representation is refused"
         )
-    for key in (
+    if hashlib.sha256(stored_json.encode("utf-8")).hexdigest() != stored_digest:
+        return (
+            "stored restore contract JSON does not hash to the stored digest; "
+            "content/digest divergence"
+        )
+    canonical_payload_map = _payload_dict(contract)
+    for column_key in (
+        "schema_version",
         "agent_id",
         "lineage_id",
-        "harness",
+        "terminal_id",
+        "generation",
         "native_session_id",
-        "route_provenance",
-        "execution_mode",
     ):
-        if key not in payload:
+        if record.get(column_key) != canonical_payload_map.get(column_key):
             return (
-                f"stored restore contract payload is missing required identity key {key!r}; "
-                "it cannot authorize a dormant transition"
+                f"stored restore contract row column {column_key!r} ({record.get(column_key)!r}) "
+                f"differs from the decoded contract's canonical payload "
+                f"({canonical_payload_map.get(column_key)!r}); contradictory row/JSON copies"
             )
-    return identity_mismatch_reason(payload, incarnation, lineage)
+    if (
+        contract.terminal_id != incarnation.terminal_id
+        or contract.generation != incarnation.generation
+    ):
+        return (
+            f"stored restore contract records source {contract.terminal_id}/"
+            f"{contract.generation} but the authoritative source is "
+            f"{incarnation.terminal_id}/{incarnation.generation}; the transition "
+            "binds to the exact source incarnation"
+        )
+    return identity_mismatch_reason(canonical_payload_map, incarnation, lineage)
 
 
 def publish_contract(contract: RestoreContract, db: Any = None) -> dict[str, Any]:
@@ -683,14 +818,26 @@ def publish_contract(contract: RestoreContract, db: Any = None) -> dict[str, Any
     new record.
 
     ``db`` — when supplied, the write runs directly in the caller's transaction
-    (no savepoint), so the caller's commit/rollback is the atomic boundary and
-    a caller rollback truthfully leaves no contract.  When omitted, a
-    standalone transaction is opened and committed, and a concurrent duplicate
-    is adopted on retry.
+    (no savepoint), so the caller's commit/rollback is the atomic boundary and a
+    caller rollback truthfully leaves no contract.  A concurrent unique-slot or
+    SQLite lock race raises a typed ``RestoreContractUnavailable``; the caller's
+    transaction may be unusable after the race, so the caller must roll back the
+    whole outer transaction and retry the entire caller-owned call — adoption
+    happens on that retry.  When omitted, a standalone transaction is opened
+    and committed, and a concurrent duplicate is adopted on retry.
     """
     if not isinstance(contract, RestoreContract):
         raise RestoreContractInvalid(f"contract must be a RestoreContract; got {contract!r}")
-    payload_dict = _payload_dict(contract)
+    # Snapshot and revalidate the contract's CURRENT state through the canonical
+    # decoder before persisting: a post-construction mutation of a structured
+    # fact map cannot reach a durable record the constructor would refuse.
+    decoded = decode_stored_contract(_payload_dict(contract))
+    if decoded is None:
+        raise RestoreContractInvalid(
+            "the contract's current state does not validate as a complete restore "
+            "contract; a structured fact value was mutated after construction"
+        )
+    payload_dict = _payload_dict(decoded)
     payload = json.dumps(payload_dict, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -751,16 +898,17 @@ def publish_contract(contract: RestoreContract, db: Any = None) -> dict[str, Any
         return record
 
     if db is not None:
-        # The caller owns this session's transaction: the write runs directly
-        # in it (NO savepoint), so the caller's commit/rollback is the atomic
-        # boundary and a rollback truthfully leaves no contract.  A lost
-        # unique-slot race is a typed refusal the caller retries; the winner's
-        # row is adopted/conflicted against on that retry.
+        # The write runs in the caller's transaction; a unique-slot or lock race
+        # (IntegrityError / OperationalError) may leave that transaction
+        # unusable, so both map to a typed refusal and the caller retries the
+        # whole caller-owned call after rolling back.
         try:
             return _publish(db)
-        except IntegrityError as exc:
+        except (IntegrityError, OperationalError) as exc:
             raise RestoreContractUnavailable(
-                f"concurrent restore-contract write refused; retry to adopt: {exc}"
+                f"concurrent restore-contract write refused; the caller's transaction "
+                f"may be unusable after the race — roll it back and retry the whole "
+                f"caller-owned call: {exc}"
             ) from exc
 
     last_error: Optional[BaseException] = None
@@ -811,8 +959,6 @@ def get_contract_by_incarnation(
 
 
 def get_contract(contract_id: str, db: Any = None) -> dict[str, Any]:
-    """One immutable restore contract by id."""
-
     def _get(session: Any) -> dict[str, Any]:
         row = (
             session.query(database.RestoreContractModel)
