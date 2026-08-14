@@ -233,6 +233,21 @@ class TestClaudeCodeProviderInitialization:
             )
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_adds_non_strict_mcp_config_files(self, mock_load):
+        profile = AgentProfile(
+            name="test-agent",
+            description="test",
+            provider="claude_code",
+            claudeMcpConfigFiles=["/tmp/runtime-mcp.json"],
+        )
+        mock_load.return_value = profile
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
+        args = shlex.split(provider._build_claude_command())
+        idx = args.index("--mcp-config")
+        assert args[idx + 1] == "/tmp/runtime-mcp.json"
+        assert "--strict-mcp-config" not in args
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_uses_native_agent_from_profile(self, mock_load):
         """Test profile with native_agent field uses --agent passthrough."""
         mock_profile = MagicMock()

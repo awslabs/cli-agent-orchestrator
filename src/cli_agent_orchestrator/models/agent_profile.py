@@ -86,6 +86,13 @@ class AgentProfile(BaseModel):
             "Claude Code provider only."
         ),
     )
+    claudeMcpConfigFiles: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Additional Claude Code MCP config files to load with --mcp-config "
+            "without --strict-mcp-config. Claude Code provider only."
+        ),
+    )
 
     # Codex-only. Names a [profiles.<name>] block in ~/.codex/config.toml.
     # Used as --profile <name> when yolo mode is not active; unrestricted
