@@ -923,6 +923,17 @@ class ClaudeCodeProvider(BaseProvider):
         otherwise read as an idle prompt and declare the terminal ready before
         Claude's TUI has even rendered, breaking init (observed live).
         """
+        # M6a recovery classification precedes the ordinary ready-composer
+        # signature.  The proven failure ends at that same composer, so letting
+        # the generic box logic run first would fabricate IDLE/COMPLETED from a
+        # terminal provider turn.  Static dispatch also keeps this vocabulary
+        # identical to the restart-safe projection path.
+        from cli_agent_orchestrator.services import provider_recovery_evidence
+
+        recovery = provider_recovery_evidence.detect("claude_code", screen_lines)
+        if recovery is not None:
+            return recovery.status or TerminalStatus.UNKNOWN
+
         rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
         if not rows:
             return TerminalStatus.UNKNOWN
