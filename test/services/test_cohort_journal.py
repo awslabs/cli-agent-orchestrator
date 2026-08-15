@@ -1,4 +1,4 @@
-"""Dark M3-C C1 cohort journal and closed transition tests (cond-0379)."""
+"""Dark M3-C cohort journal and paired C2 transition tests (cond-0379)."""
 
 from __future__ import annotations
 
@@ -144,6 +144,19 @@ def test_claim_refuses_a_stale_roster_or_lifecycle_observation():
         cohort.claim_operation(_request(fresh))
 
 
+def test_pause_claim_refuses_an_already_paused_session_without_taking_the_slot():
+    _bind_agent(suffix="1")
+    sl.declare(SESSION, sl.PAUSED, declared_by="supervisor")
+    boundary = cohort.observe_boundary(SESSION)
+
+    with pytest.raises(cohort.CohortJournalConflict, match="already paused"):
+        cohort.claim_operation(_request(boundary))
+
+    stop = cohort.claim_operation(_request(boundary, kind=cohort.KIND_STOP))
+    assert stop["operation_kind"] == cohort.KIND_STOP
+    assert stop["lifecycle_observation"] == sl.PAUSED
+
+
 def test_safe_pause_never_silently_becomes_force():
     _bind_agent(suffix="1")
     operation = cohort.claim_operation(_request(cohort.observe_boundary(SESSION)))
@@ -221,15 +234,9 @@ def test_reconciliation_requires_a_receipted_retry_or_force_promotion():
     ("kind", "mode", "in_progress_state", "terminal_state"),
     [
         (cohort.KIND_PAUSE, cohort.MODE_SAFE, cohort.STATE_DRAINING, cohort.STATE_PAUSED),
-        (
-            cohort.KIND_STOP,
-            cohort.MODE_FORCE,
-            cohort.STATE_TEARING_DOWN,
-            cohort.STATE_STOPPED,
-        ),
     ],
 )
-def test_c1_cannot_record_terminal_state_without_the_later_lifecycle_cas(
+def test_generic_pause_transition_cannot_record_terminal_state_without_paired_cas(
     kind, mode, in_progress_state, terminal_state
 ):
     _bind_agent(suffix="1")
@@ -244,7 +251,7 @@ def test_c1_cannot_record_terminal_state_without_the_later_lifecycle_cas(
         cohort.transition_operation(_transition(in_progress, terminal_state))
 
 
-def test_force_stop_has_its_own_closed_path_and_transition_replay_adopts():
+def test_stop_cannot_record_terminal_state_without_the_paired_lifecycle_cas():
     _bind_agent(suffix="1")
     operation = cohort.claim_operation(
         _request(
@@ -253,14 +260,42 @@ def test_force_stop_has_its_own_closed_path_and_transition_replay_adopts():
             mode=cohort.MODE_FORCE,
         )
     )
-    request = _transition(operation, cohort.STATE_TEARING_DOWN)
-    first = cohort.transition_operation(request)
-    replay = cohort.transition_operation(request)
+    in_progress = cohort.begin_stop_teardown(
+        cohort.StopTeardownRequest(
+            transition_id=str(uuid.uuid4()),
+            operation_id=operation["operation_id"],
+            expected_state_epoch=operation["state_epoch"],
+            actor="colin",
+        )
+    )["operation"]
+
+    with pytest.raises(cohort.CohortJournalConflict, match="cannot move"):
+        cohort.transition_operation(_transition(in_progress, cohort.STATE_STOPPED))
+
+
+def test_force_stop_paired_barrier_path_and_transition_replay_adopts():
+    _bind_agent(suffix="1")
+    operation = cohort.claim_operation(
+        _request(
+            cohort.observe_boundary(SESSION),
+            kind=cohort.KIND_STOP,
+            mode=cohort.MODE_FORCE,
+        )
+    )
+    request = cohort.StopTeardownRequest(
+        transition_id=str(uuid.uuid4()),
+        operation_id=operation["operation_id"],
+        expected_state_epoch=operation["state_epoch"],
+        actor="colin",
+    )
+    first = cohort.begin_stop_teardown(request)
+    replay = cohort.begin_stop_teardown(request)
 
     assert first["adopted"] is False
     assert replay["adopted"] is True
     assert replay["operation"]["state"] == cohort.STATE_TEARING_DOWN
     assert replay["operation"]["state_epoch"] == 1
+    assert replay["barrier"]["claimed_by"] == operation["operation_id"]
 
 
 def test_member_evidence_is_bounded_cas_state_and_safe_mode_cannot_interrupt():
@@ -316,7 +351,7 @@ def test_an_included_member_cannot_be_relabeled_excluded_historical():
         )
 
 
-def test_c1_journaling_has_no_lifecycle_or_stop_barrier_effect():
+def test_c2_stop_teardown_claims_barrier_but_has_no_lifecycle_effect():
     _bind_agent(suffix="1")
     before = sl.describe(SESSION)
     operation = cohort.claim_operation(
@@ -326,11 +361,18 @@ def test_c1_journaling_has_no_lifecycle_or_stop_barrier_effect():
             mode=cohort.MODE_FORCE,
         )
     )
-    cohort.transition_operation(_transition(operation, cohort.STATE_TEARING_DOWN))
+    cohort.begin_stop_teardown(
+        cohort.StopTeardownRequest(
+            transition_id=str(uuid.uuid4()),
+            operation_id=operation["operation_id"],
+            expected_state_epoch=operation["state_epoch"],
+            actor="colin",
+        )
+    )
 
     after = sl.describe(SESSION)
     assert after == before
-    assert oj.get_session_barrier(SESSION) is None
+    assert oj.get_session_barrier(SESSION)["claimed_by"] == operation["operation_id"]
 
 
 def test_list_operations_is_session_scoped_and_tmux_independent():
