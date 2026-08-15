@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
@@ -46,6 +46,32 @@ class TerminalLifecycleState(str, Enum):
     SUPERSEDED = "superseded"
     DEAD = "dead"
     UNKNOWN_LIVENESS = "unknown-liveness"
+
+
+class ProviderRecoveryEvidence(BaseModel):
+    """M6a's dark, exact-generation provider recovery observation."""
+
+    schema_: Literal["cao.provider-recovery-evidence.v1"] = Field(alias="schema")
+    occurrence_id: str
+    agent_id: Optional[str] = None
+    incarnation_id: Optional[str] = None
+    detector: str
+    detector_version: str
+    pattern: str
+    terminal_id: str
+    generation: Optional[str] = None
+    native_session_id: Optional[str] = None
+    provider: str
+    provider_version: Optional[str] = None
+    turn_state: Literal["terminal", "self-retrying", "unknown"]
+    recovery_action: Literal["nudge", "ignore", "layer-2"]
+    raw_text: str
+    raw_sha256: str
+    raw_text_truncated: bool
+    confidence: str
+    reason: str
+    signals: List[Dict[str, Any]]
+    opened_at: str
 
 
 class Terminal(BaseModel):
@@ -117,6 +143,21 @@ class Terminal(BaseModel):
     pane_pid: Optional[int] = Field(None, description="The pane's primary process id")
     native_session_id: Optional[str] = Field(
         None, description="The provider-native session running in this pane"
+    )
+    status_confidence: Optional[str] = Field(
+        None, description="Confidence of the fused terminal-status observation"
+    )
+    status_reason: Optional[str] = Field(
+        None, description="Why the fused terminal-status observation was selected"
+    )
+    status_signals: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Signals used by status fusion"
+    )
+    wedged: Optional[bool] = Field(
+        None, description="Whether independent quiet clocks contradict a working claim"
+    )
+    recovery_evidence: Optional[ProviderRecoveryEvidence] = Field(
+        None, description="Durable provider-terminal recovery episode for this generation"
     )
 
 

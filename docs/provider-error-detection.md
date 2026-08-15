@@ -6,7 +6,19 @@ provider API documentation — an API returns `overloaded_error`, but the pane
 shows whatever the CLI chose to render, and only the second is visible to a
 detector reading a screen.
 
-Status: research complete, detector not implemented.
+Status: the narrow M6a initial contract is implemented dark. Static provider-
+name dispatch recognizes only the locally proven Claude connection-closed line
+as `terminal`/`nudge`, the observed retry banner as `self-retrying`/`ignore`,
+and an anchored generic Claude API error as `unknown`/`layer-2`. The other
+patterns below remain research candidates and have no executing action until a
+targeted local evidence gate admits them.
+
+Each active match is published as one nested, bounded
+`recovery_evidence` object. Its occurrence id is durable per exact terminal
+generation across polling and daemon restart. A clear or different match closes
+that occurrence; a later recurrence in the same generation receives a new id.
+This journal is observation/dedupe evidence only: it sends no input, wakes no
+supervisor, and has no completion or task-effect authority.
 
 ---
 

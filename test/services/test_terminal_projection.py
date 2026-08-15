@@ -292,6 +292,65 @@ class TestVintageBoundary:
             assert field in v1
 
 
+class TestProviderRecoveryProjection:
+    def test_recovery_evidence_is_additive_and_keeps_fusion_fields(self, backend, monkeypatch):
+        fake = backend({"%10": _pane()})
+        evidence = {
+            "schema": "cao.provider-recovery-evidence.v1",
+            "occurrence_id": "occurrence-1",
+            "turn_state": "terminal",
+            "recovery_action": "nudge",
+        }
+        monkeypatch.setattr(
+            projection,
+            "_recovery_observation",
+            lambda _row, _lines: evidence,
+        )
+
+        out = projection.project_row(_row(), fake.observe_pane_identities(), vintage="v1")
+
+        assert out["recovery_evidence"] == evidence
+        assert out["status_confidence"]
+        assert out["status_reason"]
+        assert isinstance(out["status_signals"], list)
+        assert isinstance(out["wedged"], bool)
+        assert "recovery_evidence" in projection.PROJECTION_FIELDS
+
+    def test_static_dispatch_survives_without_a_live_provider(
+        self, isolated_memory_db, backend, monkeypatch
+    ):
+        fake = backend({"%10": _pane()})
+        screen = [
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+        monkeypatch.setattr(projection.observer, "observe", lambda _pane_id: (screen, 5))
+        monkeypatch.setattr(projection, "_provider_instance", lambda _terminal_id: None)
+        monkeypatch.setattr(projection, "_is_native_tui", lambda _terminal_id: True)
+
+        out = projection.project_row(
+            _row(
+                v2_session_id="$1",
+                v2_pane_pid=4242,
+                v2_native_session_id="native-1",
+                v2_lifecycle_state=None,
+                v2_lifecycle_reason=None,
+                v2_superseded_by_terminal_id=None,
+                v2_superseded_by_generation=None,
+            ),
+            fake.observe_pane_identities(),
+            vintage="v2",
+        )
+
+        assert out["status"] == "error"
+        assert out["recovery_evidence"]["turn_state"] == "terminal"
+        assert out["recovery_evidence"]["recovery_action"] == "nudge"
+        assert out["recovery_evidence"]["terminal_id"] == "aaaa1111"
+        assert out["recovery_evidence"]["generation"] == "gen-1"
+
+
 class TestLiveResolution:
     def test_demoted_rows_are_excluded_not_ranked_last(
         self, isolated_memory_db, backend, monkeypatch

@@ -1285,6 +1285,54 @@ class NativeStatusRepairEvidenceModel(Base):
     )
 
 
+class ProviderRecoveryEpisodeModel(Base):
+    """One active or historical provider-terminal error episode (M6a).
+
+    Pane text is an observation, not occurrence identity.  This small journal
+    supplies the missing stable identity: repeated observations of the same
+    pattern on one exact terminal generation retain one occurrence id across
+    daemon restart, while a clear/different observation closes it so a later
+    recurrence cannot inherit the earlier recovery budget.
+
+    The table is observation-only.  It carries no input, wake, completion, or
+    task-effect authority.
+    """
+
+    __tablename__ = "provider_recovery_episodes"
+
+    occurrence_id = Column(Text, primary_key=True)
+    terminal_id = Column(Text, nullable=False)
+    # Empty string is the explicit legacy generation key.  ``generation``
+    # remains nullable in the published evidence so absence is never invented
+    # as a real incarnation id.
+    generation_key = Column(Text, nullable=False)
+    generation = Column(Text, nullable=True)
+    provider = Column(Text, nullable=False)
+    pattern = Column(Text, nullable=False)
+    fingerprint = Column(Text, nullable=False)
+    match_json = Column(Text, nullable=False)
+    active = Column(Integer, nullable=False)
+    opened_at = Column(Text, nullable=False)
+    last_observed_at = Column(Text, nullable=False)
+    closed_at = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_provider_recovery_episode_active_generation",
+            "terminal_id",
+            "generation_key",
+            unique=True,
+            sqlite_where=text("active = 1"),
+        ),
+        Index(
+            "ix_provider_recovery_episode_generation_history",
+            "terminal_id",
+            "generation_key",
+            "opened_at",
+        ),
+    )
+
+
 class LegacyIdentityMigrationModel(Base):
     """One explicit opt-in one-candidate legacy identity migration (cond-0377D).
 
@@ -1787,6 +1835,7 @@ def init_db() -> None:
     _migrate_operation_journal()
     _migrate_session_cohort_journal()
     _migrate_native_status_repair()
+    _migrate_provider_recovery_episodes()
     _migrate_native_status_observation_attempt()
     _migrate_legacy_identity_migration()
     _migrate_provider_canary_receipts()
@@ -2679,6 +2728,50 @@ def _migrate_native_status_repair() -> None:
                 )
     except Exception as e:  # noqa: BLE001 - the repair path fails closed
         logger.warning(f"native status-repair migration failed: {e}")
+
+
+def _migrate_provider_recovery_episodes() -> None:
+    """Create the additive M6a provider-recovery occurrence journal.
+
+    ``Base.metadata.create_all`` handles fresh stores.  This idempotent DDL is
+    for already-installed databases and is intentionally dark: only status
+    observation writes it, and old binaries ignore it.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS provider_recovery_episodes ("
+                "occurrence_id TEXT NOT NULL PRIMARY KEY, "
+                "terminal_id TEXT NOT NULL, "
+                "generation_key TEXT NOT NULL, "
+                "generation TEXT, "
+                "provider TEXT NOT NULL, "
+                "pattern TEXT NOT NULL, "
+                "fingerprint TEXT NOT NULL, "
+                "match_json TEXT NOT NULL, "
+                "active INTEGER NOT NULL, "
+                "opened_at TEXT NOT NULL, "
+                "last_observed_at TEXT NOT NULL, "
+                "closed_at TEXT"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_provider_recovery_episode_active_generation "
+                "ON provider_recovery_episodes(terminal_id, generation_key) "
+                "WHERE active = 1"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_provider_recovery_episode_generation_history "
+                "ON provider_recovery_episodes(terminal_id, generation_key, opened_at)"
+            )
+    except Exception as e:  # noqa: BLE001 - evidence degrades, status remains readable
+        logger.warning(f"provider recovery-episode migration failed: {e}")
 
 
 def _migrate_legacy_identity_migration() -> None:

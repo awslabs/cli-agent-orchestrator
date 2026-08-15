@@ -83,6 +83,11 @@ PROJECTION_FIELDS = (
     "superseded_by_generation",
     "status",
     "fifo_monitored",
+    "status_confidence",
+    "status_reason",
+    "status_signals",
+    "wedged",
+    "recovery_evidence",
     "last_active",
 )
 
@@ -233,15 +238,52 @@ def _inactive_seconds(row: Dict[str, Any]) -> Optional[float]:
 
 def _fused_status(row: Dict[str, Any], *, native_tui: bool):
     """Fuse every available signal for one LIVE terminal."""
+    from cli_agent_orchestrator.services import provider_recovery_evidence
     from cli_agent_orchestrator.services import status_fusion as sf
 
     terminal_id = row["id"]
+    provider_name = row.get("provider")
+    if not isinstance(provider_name, str):
+        provider_name = ""
     lines, unchanged_for = observer.observe(row.get("pane_id"))
 
-    return sf.fuse(
+    # Recovery detection is provider-name dispatched and therefore remains
+    # available after a daemon restart when no live provider object is cached.
+    # A recognized terminal/retry pattern outranks a stale ordinary status; an
+    # unknown generic API error is preserved as evidence but supplies no guessed
+    # status to the fusion.
+    matched = provider_recovery_evidence.detect(provider_name, lines)
+    if matched is not None and matched.status is not None:
+        fifo = sf.Signal(
+            "fifo",
+            state="absent",
+            detail="a newer settled provider-recovery frame supersedes the rolling stream",
+        )
+        screen = sf.Signal(
+            "screen",
+            value=matched.status,
+            state="available",
+            detail=f"static recovery detector matched {matched.pattern}",
+        )
+    elif matched is not None:
+        fifo = sf.Signal(
+            "fifo",
+            state="absent",
+            detail="a newer settled provider-recovery frame supersedes the rolling stream",
+        )
+        screen = sf.Signal(
+            "screen",
+            state="unreadable",
+            detail=f"static recovery detector preserved {matched.pattern} for layer 2",
+        )
+    else:
+        fifo = sf.fifo_signal(_provider_status(terminal_id), monitored=not native_tui)
+        screen = sf.screen_signal(_provider_instance(terminal_id), lines)
+
+    fused = sf.fuse(
         lifecycle=LIFECYCLE_LIVE,
-        fifo=sf.fifo_signal(_provider_status(terminal_id), monitored=not native_tui),
-        screen=sf.screen_signal(_provider_instance(terminal_id), lines),
+        fifo=fifo,
+        screen=screen,
         liveness=sf.liveness_signal(
             "prior" if unchanged_for is not None else None,
             "prior" if lines is not None else None,
@@ -249,6 +291,51 @@ def _fused_status(row: Dict[str, Any], *, native_tui: bool):
         ),
         activity=sf.activity_signal(_inactive_seconds(row)),
     )
+    return fused, lines
+
+
+def _recovery_observation(row: Dict[str, Any], lines: Any) -> Optional[dict[str, Any]]:
+    """Reconcile M6a evidence without making status depend on the journal."""
+    from cli_agent_orchestrator.services import provider_recovery_evidence
+
+    if lines is None:
+        # Unreadable is not clear.  Keep any prior durable episode active and
+        # avoid paying identity/store reads for a frame that says nothing.
+        return None
+    provider_name = row.get("provider")
+    if not isinstance(provider_name, str) or not provider_name:
+        return None
+
+    matched = provider_recovery_evidence.detect(provider_name, lines)
+    if matched is None:
+        # A clear frame still has to close any active occurrence, but it does
+        # not need roster/build lookups.  Keep ordinary status polling cheap.
+        context = {
+            "native_session_id": row.get("native_session_id"),
+            "provider_version": None,
+            "agent_id": None,
+            "incarnation_id": None,
+        }
+    else:
+        context = provider_recovery_evidence.identity_context(
+            terminal_id=row["id"],
+            generation=row.get("generation"),
+            native_session_id=row.get("native_session_id"),
+        )
+    try:
+        return provider_recovery_evidence.observe(
+            terminal_id=row["id"],
+            generation=row.get("generation"),
+            provider=provider_name,
+            screen_lines=lines,
+            **context,
+        )
+    except provider_recovery_evidence.RecoveryEvidenceUnavailable as exc:
+        # The status classifier remains truthful even if its additive durable
+        # journal is unreadable.  Do not turn a status read into an outage or
+        # publish a fabricated non-durable occurrence id.
+        logger.warning("Recovery evidence unavailable for terminal %s: %s", row["id"], exc)
+        return None
 
 
 def _is_native_tui(terminal_id: str) -> bool:
@@ -273,7 +360,7 @@ def _is_native_tui(terminal_id: str) -> bool:
                 .filter(ManagedLaunchV2ReservationModel.terminal_id == terminal_id)
                 .first()
             )
-            return row is not None and row.execution_mode == em.NATIVE_TUI
+            return bool(row is not None and row.execution_mode == em.NATIVE_TUI)
     except Exception as exc:  # pragma: no cover - an absent v2 surface is not native
         logger.debug("Execution mode unavailable for %s: %s", terminal_id, exc)
         return False
@@ -346,7 +433,7 @@ def project_row(
         #
         # ``not_fifo_monitored`` survives as the honest answer for a provider
         # that ships no viewport detector either -- see ``status_fusion``.
-        fused = _fused_status(row, native_tui=native_tui)
+        fused, screen_lines = _fused_status(row, native_tui=native_tui)
         status = fused.status.value
         if session_paused and fused.wedged:
             # A correctly-paused pane is frozen mid-turn, which satisfies
@@ -360,12 +447,14 @@ def project_row(
             # session-awareness keyword would push a concept it does not own
             # into thirty of them.
             fused = replace(fused, wedged=False, reason="session-paused-by-declaration")
+        recovery_evidence = _recovery_observation(row, screen_lines)
     else:
         # A row whose identity does not resolve reports its lifecycle, not
         # a provider status. Reporting provider ``unknown`` for a deleted
         # window is what produced a wall of phantom cards that looked like
         # workers waiting to be talked to.
         status = state
+        recovery_evidence = None
     return {
         "terminal_id": row["id"],
         # The three pre-existing display keys, kept alongside the canonical
@@ -411,6 +500,7 @@ def project_row(
         # The join no single signal can make: a working claim contradicted by
         # two independent quiet clocks.
         "wedged": bool(fused.wedged) if fused else False,
+        "recovery_evidence": recovery_evidence,
         "last_active": row.get("last_active"),
     }
 

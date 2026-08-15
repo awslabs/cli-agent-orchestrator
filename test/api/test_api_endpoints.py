@@ -741,6 +741,61 @@ class TestGetTerminal:
         assert data["window_id"] == "@42"
         mock_svc.get_terminal.assert_called_once_with("abcd1234")
 
+    def test_get_terminal_preserves_fusion_and_recovery_evidence(self, client):
+        """The public response model retains M6a's additive projection fields."""
+        recovery = {
+            "schema": "cao.provider-recovery-evidence.v1",
+            "occurrence_id": "occurrence-1",
+            "agent_id": "agent-1",
+            "incarnation_id": "incarnation-1",
+            "detector": "cao-provider-terminal-error",
+            "detector_version": "1",
+            "pattern": "claude.connection-closed-mid-response",
+            "terminal_id": "abcd1234",
+            "generation": "generation-1",
+            "native_session_id": "native-1",
+            "provider": "claude_code",
+            "provider_version": "2.1.220",
+            "turn_state": "terminal",
+            "recovery_action": "nudge",
+            "raw_text": (
+                "API Error: Connection closed mid-response. "
+                "The response above may be incomplete."
+            ),
+            "raw_sha256": "a" * 64,
+            "raw_text_truncated": False,
+            "confidence": "high",
+            "reason": "locally proven exact line",
+            "signals": [],
+            "opened_at": "2026-08-15T00:00:00Z",
+        }
+        projected = {
+            "id": "abcd1234",
+            "name": "worker",
+            "session_name": "cao-test",
+            "provider": "claude_code",
+            "status": "error",
+            "status_confidence": "high",
+            "status_reason": "provider recovery evidence",
+            "status_signals": [{"name": "screen", "state": "available", "value": "error"}],
+            "wedged": False,
+            "recovery_evidence": recovery,
+        }
+
+        with patch(
+            "cli_agent_orchestrator.api.main._projected_terminal",
+            return_value=projected,
+        ):
+            response = client.get("/terminals/abcd1234")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status_confidence"] == "high"
+        assert body["status_reason"] == "provider recovery evidence"
+        assert body["status_signals"] == projected["status_signals"]
+        assert body["wedged"] is False
+        assert body["recovery_evidence"] == recovery
+
     def test_get_terminal_not_found(self, client):
         """GET /terminals/{id} returns 404 for nonexistent terminal."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:

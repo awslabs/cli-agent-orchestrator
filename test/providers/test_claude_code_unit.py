@@ -1890,6 +1890,45 @@ class TestClaudeCodeScreenDetection:
     def test_empty_screen_is_unknown(self):
         assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.UNKNOWN
 
+    def test_connection_closed_with_idle_composer_is_error_not_completion(self):
+        screen = [
+            "✻ Crunched for 7m 21s",
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.ERROR
+
+    def test_three_row_connection_closed_wrap_is_error_not_idle(self):
+        screen = [
+            "API Error: Connection closed",
+            "mid-response. The response above may",
+            "be incomplete.",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.ERROR
+
+    def test_self_retry_banner_remains_processing(self):
+        screen = ["✻ API error · Retrying in 1s · attempt 1/10"]
+
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+    def test_unproven_generic_api_error_is_unknown_not_completed(self):
+        screen = [
+            "● Work was in progress.",
+            "API Error: A new provider failure that M6a has not proven",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
 
 class TestClaudeCodeBackgroundTaskNotCompleted:
     """A backgrounded task must not read as COMPLETED (GH #392).
