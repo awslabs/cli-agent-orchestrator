@@ -3587,8 +3587,19 @@ def delete_terminal(
     via_destructive_endpoint: bool = False,
     backend_already_closed: bool = False,
     unregister_inbox: bool = True,
+    release_native_attachments: bool = True,
+    retire_roster: bool = True,
 ) -> bool:
-    """Delete under the same exact-generation claim recovery admission uses."""
+    """Delete under the same exact-generation claim recovery admission uses.
+
+    ``release_native_attachments=False`` / ``retire_roster=False`` are the
+    narrow B3 executor options: a caller that performs the native-session
+    release and the roster retirement under its OWN authorized effect
+    steps (the B2 ``release_attachment`` intent and the final roster
+    bind) holds both here so the teardown only reaps the exact pane/
+    process.  Every ordinary caller keeps the defaults and the teardown
+    keeps closing its own claims exactly as before.
+    """
     from cli_agent_orchestrator.services import callback_recovery
 
     if expected_generation is not None:
@@ -3608,6 +3619,8 @@ def delete_terminal(
                     via_destructive_endpoint=via_destructive_endpoint,
                     backend_already_closed=backend_already_closed,
                     unregister_inbox=unregister_inbox,
+                    release_native_attachments=release_native_attachments,
+                    retire_roster=retire_roster,
                 )
 
     metadata = get_terminal_metadata(terminal_id)
@@ -3625,6 +3638,8 @@ def delete_terminal(
             via_destructive_endpoint=via_destructive_endpoint,
             backend_already_closed=backend_already_closed,
             unregister_inbox=unregister_inbox,
+            release_native_attachments=release_native_attachments,
+            retire_roster=retire_roster,
         )
 
 
@@ -3637,6 +3652,8 @@ def _delete_terminal_claimed(
     via_destructive_endpoint: bool = False,
     backend_already_closed: bool = False,
     unregister_inbox: bool = True,
+    release_native_attachments: bool = True,
+    retire_roster: bool = True,
 ) -> bool:
     """Delete terminal and kill its tmux window.
 
@@ -3851,35 +3868,41 @@ def _delete_terminal_claimed(
         # go; failing here would abort a teardown part-way and leave worse
         # state than the claim it was trying to resolve.
         _recheck_teardown_claim()
-        try:
-            from cli_agent_orchestrator.services import native_attachment_recovery
+        if release_native_attachments:
+            try:
+                from cli_agent_orchestrator.services import native_attachment_recovery
 
-            for outcome in native_attachment_recovery.release_owned_by_terminal(
-                terminal_id, generation=expected_generation
-            ):
-                if outcome["action"] == "released":
-                    logger.info(
-                        "Released the %s session claim held by terminal %s",
-                        outcome["provider"],
-                        terminal_id,
-                    )
-                else:
-                    logger.warning(
-                        "Terminal %s was torn down while still holding %s session %s (%s): %s",
-                        terminal_id,
-                        outcome["provider"],
-                        outcome["native_session_id"],
-                        outcome["reason"],
-                        outcome.get("detail", ""),
-                    )
-        except Exception as e:
-            logger.warning(f"Failed to resolve native session claims for {terminal_id}: {e}")
+                for outcome in native_attachment_recovery.release_owned_by_terminal(
+                    terminal_id, generation=expected_generation
+                ):
+                    if outcome["action"] == "released":
+                        logger.info(
+                            "Released the %s session claim held by terminal %s",
+                            outcome["provider"],
+                            terminal_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Terminal %s was torn down while still holding %s session %s (%s): %s",
+                            terminal_id,
+                            outcome["provider"],
+                            outcome["native_session_id"],
+                            outcome["reason"],
+                            outcome.get("detail", ""),
+                        )
+            except Exception as e:
+                logger.warning(f"Failed to resolve native session claims for {terminal_id}: {e}")
         # Retire the roster incarnation so the physical history is
         # truthful while the stable agent survives teardown.  Best-effort
         # and never raised: missing roster records or an unreadable store
         # must not block cleanup (Stop is best-effort for every roster).
+        # The B3 executor holds this too: its prior incarnation was already
+        # retired by the B1 dormant transition, and a second teardown-side
+        # retirement would bump the roster revision the winning B2 operation
+        # is bound to.
         _recheck_teardown_claim()
-        _roster_retire_incarnation_best_effort(terminal_id, expected_generation)
+        if retire_roster:
+            _roster_retire_incarnation_best_effort(terminal_id, expected_generation)
         _recheck_teardown_claim()
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)

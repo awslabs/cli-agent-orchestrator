@@ -603,6 +603,24 @@ def declare(
             db.commit()
             if updated != 1:
                 current = _fetch(db, provider, native_session_id)
+                if current is None:  # pragma: no cover - the claimed key is never deleted
+                    raise NativeAttachmentConflict(
+                        f"lost the race to re-acquire {provider} session "
+                        f"{native_session_id}; the attachment disappeared"
+                    )
+                _guard_frozen(current)
+                if (
+                    current.state in LIVE_STATES
+                    and current.owner_terminal_id == terminal_id
+                    and current.owner_generation == generation
+                    and current.owner_execution_mode == mode
+                ):
+                    # Two executor processes may have adopted the same durable
+                    # successor and raced from the same detached epoch.  The
+                    # CAS loser did not lose ownership when the winner is its
+                    # exact terminal/generation/mode; this is the same replay
+                    # case handled by the live-state branch above.
+                    return _row_dict(current), False
                 raise NativeAttachmentConflict(
                     f"lost the race to re-acquire {provider} session {native_session_id}; "
                     f"it is now {current.state!r} held by {_describe_owner(current)}"
@@ -716,7 +734,6 @@ def mark_starting(
         from_states=frozenset({DECLARED}),
         to_state=STARTING,
         extra=extra,
-        idempotent_from=frozenset({STARTING}),
     )
 
 
