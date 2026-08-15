@@ -2959,7 +2959,12 @@ def _send_keys_copy_mode_guarded(
         server_socket_path=verified.server_socket_path or None,
     )
     try:
-        with pane_input_lease(verified.pane_id, holder=f"send-input:{terminal_id}", timeout=0.0):
+        from cli_agent_orchestrator.services import cohort_journal
+
+        with (
+            cohort_journal.session_effect_admission(metadata.get("tmux_session")),
+            pane_input_lease(verified.pane_id, holder=f"send-input:{terminal_id}", timeout=0.0),
+        ):
             if client is not None:
                 refusal = control_input_service._copy_mode_guard_refusal(
                     client,
@@ -3003,6 +3008,12 @@ def _send_keys_copy_mode_guarded(
                 submit_delay=submit_delay,
                 pane_id=verified.pane_id,
             )
+    except cohort_journal.SessionEffectRefused as exc:
+        from cli_agent_orchestrator.services.control_input_contract import (
+            REASON_SESSION_EFFECT_BARRIER,
+        )
+
+        raise TerminalInputRefusedError(REASON_SESSION_EFFECT_BARRIER, str(exc)) from exc
     except PaneBusyError as exc:
         raise TerminalInputRefusedError(
             REASON_PANE_BUSY,
@@ -3024,6 +3035,8 @@ def send_input(
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
     """
+    from cli_agent_orchestrator.services import cohort_journal
+
     try:
         # Managed panes are human-readable renderers over a private native-RPC
         # bridge.  Raw tmux input would target the bridge console/transport, not
@@ -3126,30 +3139,21 @@ def send_input(
             # IDLE/COMPLETED). Without this, sticky ready-status would block
             # the genuine PROCESSING signal that arrives once the agent starts
             # working on the new message.
-            status_monitor.notify_input_sent(terminal_id)
+            with cohort_journal.session_effect_admission(metadata.get("tmux_session")):
+                status_monitor.notify_input_sent(terminal_id)
 
-            # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
-            # prompts from BEFORE the input can't trigger a false COMPLETED
-            # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
-            # buffer, which combined with input_received=True would return COMPLETED
-            # within seconds of send_input). Clearing here — not after send_keys —
-            # avoids a race: send_keys includes a submit-delay sleep during which
-            # the agent can begin emitting output; a post-send_keys clear would wipe
-            # that newly-emitted first chunk of the turn (lost from
-            # GET /terminals/{id}/output?mode=full and from early detection). This
-            # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
-            # arm set by notify_input_sent above; reset_buffer would wipe the arm and
-            # latch-block the IDLE→PROCESSING transition for the whole turn.
-            status_monitor.clear_rolling_buffer(terminal_id)
+                # Clear only the rolling byte buffer before the write so stale
+                # ready prompts cannot win status detection for the new turn.
+                status_monitor.clear_rolling_buffer(terminal_id)
 
-            get_backend().send_keys(
-                metadata["tmux_session"],
-                metadata["tmux_window"],
-                message,
-                enter_count=enter_count,
-                force_bracketed_paste=True,
-                submit_delay=submit_delay,
-            )
+                get_backend().send_keys(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    message,
+                    enter_count=enter_count,
+                    force_bracketed_paste=True,
+                    submit_delay=submit_delay,
+                )
 
         # Notify the provider that external input was received.
         # This allows providers to adjust status
@@ -3190,6 +3194,12 @@ def send_input(
                 )
         return True
 
+    except cohort_journal.SessionEffectRefused as exc:
+        from cli_agent_orchestrator.services.control_input_contract import (
+            REASON_SESSION_EFFECT_BARRIER,
+        )
+
+        raise TerminalInputRefusedError(REASON_SESSION_EFFECT_BARRIER, str(exc)) from exc
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
         raise
@@ -3220,6 +3230,8 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         TerminalIdentityMismatchError: If the recorded pane is no longer the
             registered one. Nothing is delivered.
     """
+    from cli_agent_orchestrator.services import cohort_journal
+
     try:
         from cli_agent_orchestrator.services import managed_launch
 
@@ -3237,22 +3249,28 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         # input.
         target = verified_pane_target(terminal_id, metadata, operation=f"special key {key!r}")
 
-        # Arm StatusMonitor stickiness: special keys (Enter on a permission
-        # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
-        # processing cycle that must be allowed to push past any latched
-        # ready status.
-        status_monitor.notify_input_sent(terminal_id)
-        if target is not None:
-            get_backend().send_special_key(
-                target.session_name, target.window_name, key, pane_id=target.pane_id
-            )
-        else:
-            get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+        with cohort_journal.session_effect_admission(metadata.get("tmux_session")):
+            # Arm StatusMonitor stickiness only after Stop admission.
+            status_monitor.notify_input_sent(terminal_id)
+            if target is not None:
+                get_backend().send_special_key(
+                    target.session_name, target.window_name, key, pane_id=target.pane_id
+                )
+            else:
+                get_backend().send_special_key(
+                    metadata["tmux_session"], metadata["tmux_window"], key
+                )
 
         update_last_active(terminal_id)
         logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
         return True
 
+    except cohort_journal.SessionEffectRefused as exc:
+        from cli_agent_orchestrator.services.control_input_contract import (
+            REASON_SESSION_EFFECT_BARRIER,
+        )
+
+        raise TerminalInputRefusedError(REASON_SESSION_EFFECT_BARRIER, str(exc)) from exc
     except Exception as e:
         logger.error(f"Failed to send special key to terminal {terminal_id}: {e}")
         raise

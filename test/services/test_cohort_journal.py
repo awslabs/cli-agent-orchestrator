@@ -16,7 +16,10 @@ _DIGEST = "a" * 64
 
 
 @pytest.fixture(autouse=True)
-def _db(isolated_memory_db):
+def _db(isolated_memory_db, monkeypatch, tmp_path):
+    from cli_agent_orchestrator import constants
+
+    monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
     return isolated_memory_db
 
 

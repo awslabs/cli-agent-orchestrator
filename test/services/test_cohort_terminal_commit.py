@@ -18,7 +18,10 @@ _DIGEST = "b" * 64
 
 
 @pytest.fixture(autouse=True)
-def _db(isolated_memory_db):
+def _db(isolated_memory_db, monkeypatch, tmp_path):
+    from cli_agent_orchestrator import constants
+
+    monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
     return isolated_memory_db
 
 
@@ -399,6 +402,35 @@ def test_concurrent_stop_teardown_transitions_have_one_durable_winner():
     stored = cohort.get_operation(operation["operation_id"])
     assert stored["state"] == cohort.STATE_TEARING_DOWN
     assert len(stored["transitions"]) == 1
+    assert oj.get_session_barrier(SESSION)["claimed_by"] == operation["operation_id"]
+
+
+def test_concurrent_exact_stop_replay_adopts_fresh_post_lock_snapshot():
+    """A db=None waiter must not carry its pre-winner SQLite read past the lock."""
+    _bind_agent(suffix="1")
+    operation = _claim(kind=cohort.KIND_STOP, mode=cohort.MODE_FORCE)
+    request = _begin_teardown(operation)
+    start = threading.Barrier(2)
+    results: list[dict] = []
+    unexpected: list[BaseException] = []
+
+    def run():
+        try:
+            start.wait(timeout=5)
+            results.append(cohort.begin_stop_teardown(request))
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            unexpected.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert unexpected == []
+    assert sorted(result["adopted"] for result in results) == [False, True]
+    assert {result["transition"]["transition_id"] for result in results} == {request.transition_id}
     assert oj.get_session_barrier(SESSION)["claimed_by"] == operation["operation_id"]
 
 

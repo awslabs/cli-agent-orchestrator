@@ -1887,6 +1887,51 @@ class TestGetWorkingDirectory:
 class TestSendInput:
     """Tests for send_input function."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_effect_admission(self, isolated_memory_db, monkeypatch, tmp_path):
+        from cli_agent_orchestrator import constants
+
+        monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
+        return isolated_memory_db
+
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.verified_pane_target",
+        return_value=None,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_stop_barrier_refuses_unverified_input_before_any_effect(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        _mock_verified,
+    ):
+        from cli_agent_orchestrator.services import operation_journal
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 2
+        mock_provider.paste_submit_delay = 0.3
+        operation_journal.claim_session_barrier("cao-session", claimed_by="stop-operation")
+
+        with pytest.raises(TerminalInputBlockedError, match="session-effect-barrier"):
+            send_input("test1234", "test message")
+
+        mock_status_monitor.notify_input_sent.assert_not_called()
+        mock_status_monitor.clear_rolling_buffer.assert_not_called()
+        mock_tmux.send_keys.assert_not_called()
+        mock_provider.mark_input_received.assert_not_called()
+        mock_update.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")

@@ -20,9 +20,18 @@ from cli_agent_orchestrator.models.managed_launch import (
 )
 from cli_agent_orchestrator.services import managed_launch
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+from cli_agent_orchestrator.services import operation_journal
 from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION
 
 DELIVERY_ID = "33333333-3333-4333-8333-333333333333"
+
+
+@pytest.fixture
+def isolated_effect_admission(isolated_memory_db, monkeypatch, tmp_path):
+    from cli_agent_orchestrator import constants
+
+    monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
+    return isolated_memory_db
 
 
 def _reserve_request(tmp_path, **changes):
@@ -1239,7 +1248,7 @@ def test_ready_and_admission_publish_exact_companion_receipts(
     assert "message" not in ack
 
 
-def test_deliver_inbox_via_bridge_exact_binding(isolated_memory_db, tmp_path, monkeypatch):
+def test_deliver_inbox_via_bridge_exact_binding(isolated_effect_admission, tmp_path, monkeypatch):
     # P1-7: one exact queued inbox message is submitted through the receiver's
     # live managed bridge; anything else falls back WITHOUT an ack.
     request = _reserve_request(tmp_path)
@@ -1274,7 +1283,7 @@ def test_deliver_inbox_via_bridge_exact_binding(isolated_memory_db, tmp_path, mo
 
 
 def test_deliver_inbox_via_bridge_unavailable_is_no_ack_fallback(
-    isolated_memory_db, tmp_path, monkeypatch
+    isolated_effect_admission, tmp_path, monkeypatch
 ):
     request = _reserve_request(tmp_path)
     record = _ready_record(request)
@@ -1289,6 +1298,45 @@ def test_deliver_inbox_via_bridge_unavailable_is_no_ack_fallback(
     assert not managed_launch.deliver_inbox_via_bridge(
         record["terminal_id"], message_id=7, message="ping", sender_id="sup-1"
     )
+
+
+def test_stop_barrier_refuses_managed_inbox_before_bridge(isolated_effect_admission, monkeypatch):
+    identity = {
+        "reservation_id": "reservation-1",
+        "terminal_id": "deadbeef",
+        "generation": "generation-1",
+        "session_name": "cao-test",
+        "provider": "codex",
+        "state": "admitted",
+    }
+    monkeypatch.setattr(managed_launch, "managed_control_identity", lambda _tid: identity)
+    operation_journal.claim_session_barrier("cao-test", claimed_by="stop-operation")
+    refusals = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.callback_recovery.mark_delivery_refused",
+        lambda operation_key, **kwargs: refusals.append((operation_key, kwargs)),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        lambda *_args, **_kwargs: pytest.fail("bridge must not receive a post-Stop inbox payload"),
+    )
+
+    assert not managed_launch.deliver_inbox_via_bridge(
+        "deadbeef",
+        message_id=7,
+        message="ping",
+        sender_id="supervisor",
+        recovery_operation_key="recovery-1",
+    )
+    assert refusals == [
+        (
+            "recovery-1",
+            {
+                "reason_code": "session-effect-barrier",
+                "proven_before_provider_io": True,
+            },
+        )
+    ]
 
 
 def test_managed_control_identity_does_not_hide_missing_columns(isolated_memory_db):
@@ -1356,11 +1404,14 @@ def test_managed_control_identity_does_not_hide_missing_columns(isolated_memory_
         managed_launch.managed_control_identity("a1b2c3d4")
 
 
-def test_input_carrying_managed_operation_arms_processing_transition(monkeypatch):
+def test_input_carrying_managed_operation_arms_processing_transition(
+    isolated_effect_admission, monkeypatch
+):
     identity = {
         "reservation_id": "reservation-1",
         "terminal_id": "deadbeef",
         "generation": "generation-1",
+        "session_name": "cao-test",
         "provider": "codex",
         "controllable": True,
     }
@@ -1391,11 +1442,14 @@ def test_input_carrying_managed_operation_arms_processing_transition(monkeypatch
     assert events == [("armed", "deadbeef"), ("submitted", 45.0)]
 
 
-def test_read_only_managed_operation_does_not_arm_processing_transition(monkeypatch):
+def test_read_only_managed_operation_does_not_arm_processing_transition(
+    isolated_effect_admission, monkeypatch
+):
     identity = {
         "reservation_id": "reservation-1",
         "terminal_id": "deadbeef",
         "generation": "generation-1",
+        "session_name": "cao-test",
         "provider": "codex",
         "controllable": True,
     }
@@ -1418,3 +1472,35 @@ def test_read_only_managed_operation_does_not_arm_processing_transition(monkeypa
     )
 
     assert armed == []
+
+
+def test_stop_barrier_refuses_managed_operation_before_status_or_bridge(
+    isolated_effect_admission, monkeypatch
+):
+    identity = {
+        "reservation_id": "reservation-1",
+        "terminal_id": "deadbeef",
+        "generation": "generation-1",
+        "session_name": "cao-test",
+        "provider": "codex",
+        "controllable": True,
+    }
+    monkeypatch.setattr(managed_launch, "managed_control_identity", lambda _tid: identity)
+    operation_journal.claim_session_barrier("cao-test", claimed_by="stop-operation")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent",
+        lambda *_args: pytest.fail("status must not arm after Stop"),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        lambda *_args, **_kwargs: pytest.fail("bridge must not receive a post-Stop effect"),
+    )
+
+    with pytest.raises(managed_launch.ManagedLaunchConflict, match="Stop barrier is claimed"):
+        managed_launch.begin_managed_session_operation(
+            "deadbeef",
+            operation_id="operation-1",
+            action="follow-up",
+            generation="generation-1",
+            message="continue",
+        )

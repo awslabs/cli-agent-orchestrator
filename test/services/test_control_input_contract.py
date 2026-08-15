@@ -503,6 +503,7 @@ class TestV3SequenceDigest:
         assert contract.outcome_for_reason(contract.REASON_COMPOSER_NONEMPTY) == contract.REFUSED
         assert contract.REASON_MALFORMED_COMMAND_DECLARATION in contract.CONTROL_INPUT_REASON_CODES
         assert contract.REASON_COMPOSER_NONEMPTY in contract.CONTROL_INPUT_REASON_CODES
+        assert contract.REASON_SESSION_EFFECT_BARRIER in contract.CONTROL_INPUT_REASON_CODES
         assert contract.is_reattemptable(
             contract.outcome_for_reason(contract.REASON_COMPOSER_NONEMPTY)
         )
