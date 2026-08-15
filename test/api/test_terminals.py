@@ -639,6 +639,58 @@ class TestCreateInboxMessageEndpoint:
             )
         assert response.status_code == 409
 
+    def test_managed_persistent_message_strips_legacy_runtime_suffix_server_side(self, client):
+        mock_msg = MagicMock()
+        mock_msg.id = 7
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+        request_id = "a" * 32
+        managed = (
+            f"[Managed persistent request request_id={request_id}] task"
+            "\n\n[Message from terminal deadbeef. "
+            "Use send_message MCP tool for any follow-up work.]"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message", return_value=mock_msg
+            ) as create,
+            patch("cli_agent_orchestrator.api.main.inbox_service"),
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": managed},
+            )
+        assert response.status_code == 200
+        create.assert_called_once_with(
+            "sender1",
+            "abcd1234",
+            f"[Managed persistent request request_id={request_id}] task",
+        )
+
+    def test_ordinary_message_keeps_legacy_runtime_suffix(self, client):
+        mock_msg = MagicMock()
+        mock_msg.id = 8
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+        ordinary = (
+            "ordinary task\n\n[Message from terminal deadbeef. "
+            "Use send_message MCP tool for any follow-up work.]"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message", return_value=mock_msg
+            ) as create,
+            patch("cli_agent_orchestrator.api.main.inbox_service"),
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": ordinary},
+            )
+        assert response.status_code == 200
+        create.assert_called_once_with("sender1", "abcd1234", ordinary)
+
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
         mock_msg = MagicMock()
