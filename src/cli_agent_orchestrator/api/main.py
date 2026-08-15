@@ -2184,12 +2184,37 @@ async def get_agent_profile_schema_endpoint() -> Dict:
     return load_profile_schema()
 
 
+def _redact_profile_mcp_env(profile_data: Dict) -> Dict:
+    """Replace ``mcpServers[].env`` values in a serialized profile with ``"***"``.
+
+    ``load_agent_profile`` resolves ``${VAR}`` placeholders server-side, so
+    these values can hold live credentials (per-MCP-server API tokens). Keys
+    and structure are preserved so callers still see which servers a profile
+    configures, but their secrets never cross the wire.
+    """
+    mcp_servers = profile_data.get("mcpServers")
+    if isinstance(mcp_servers, dict):
+        for config in mcp_servers.values():
+            if isinstance(config, dict) and isinstance(config.get("env"), dict):
+                config["env"] = {key: "***" for key in config["env"]}
+    return profile_data
+
+
 @app.get("/agents/profiles/{name}")
-async def get_agent_profile_endpoint(name: str) -> Dict:
-    """Return the full parsed content of a named agent profile."""
+async def get_agent_profile_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the full parsed content of a named agent profile.
+
+    Scope-gated (READ/WRITE/ADMIN) and env-redacted: ``mcpServers[].env``
+    values are replaced with ``"***"`` before the response is serialized so an
+    authenticated caller sees which MCP servers a profile configures but never
+    their credentials.
+    """
     try:
         profile = load_agent_profile(name)
-        return profile.model_dump(exclude_none=True)
+        return _redact_profile_mcp_env(profile.model_dump(exclude_none=True))
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -3325,11 +3350,18 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
 
 @app.get("/workflows")
 async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> List[Dict]:
-    """List indexed workflows, rebuilt from the spec files on disk (FR-2.1)."""
+    """List indexed workflows, rebuilt from the spec files on disk (FR-2.1).
+
+    The ``dir`` query parameter is confined to the configured workflow root (or
+    a subdirectory of it) before any filesystem scan, so an out-of-root
+    directory (e.g. ``~/.ssh``) is a 400 rather than an unauthenticated
+    arbitrary-directory probe.
+    """
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
-        rows = workflow_spec_service.list_workflows(scan_dir=dir)
+        scan_dir = workflow_spec_service._validate_scan_dir(dir)
+        rows = workflow_spec_service.list_workflows(scan_dir=scan_dir)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return [row.model_dump() for row in rows]

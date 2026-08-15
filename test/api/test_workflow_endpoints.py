@@ -102,6 +102,24 @@ class TestListEndpoint:
         resp = client.get("/workflows", params={"dir": "/etc"})
         assert resp.status_code == 400
 
+    def test_out_of_root_dir_maps_to_400(self, client, isolated_db, spec_dir, tmp_path):
+        """A directory outside the configured workflow root is rejected, not
+        scanned: without this, ``?dir=/home/<user>/.ssh`` (or any other
+        arbitrary directory) is an unauthenticated filesystem probe."""
+        outside = tmp_path / "outside-root"
+        outside.mkdir(parents=True, exist_ok=True)
+        resp = client.get("/workflows", params={"dir": str(outside)})
+        assert resp.status_code == 400
+
+    def test_subdir_inside_root_still_works(self, client, isolated_db, spec_dir):
+        """A directory inside the configured workflow root stays scannable."""
+        sub = spec_dir / "subdir"
+        sub.mkdir(parents=True, exist_ok=True)
+        _write(sub, "nested")
+        resp = client.get("/workflows", params={"dir": str(sub)})
+        assert resp.status_code == 200
+        assert [r["name"] for r in resp.json()] == ["nested"]
+
 
 class TestGetEndpoint:
     def test_get_known(self, client, isolated_db, spec_dir):

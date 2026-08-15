@@ -93,6 +93,31 @@ def _safe_dir(scan_dir: Optional[str]) -> str:
     return tmux_client._resolve_and_validate_working_directory(scan_dir)
 
 
+def _validate_scan_dir(scan_dir: Optional[str]) -> Optional[str]:
+    """Confine an explicit HTTP-supplied ``scan_dir`` to the workflow root.
+
+    ``None`` (the ``?dir=`` query param omitted) passes through unchanged so the
+    default ``WORKFLOW_SPEC_DIR`` applies. An explicit directory is realpath-
+    resolved and must be the configured root or a subdirectory of it; anything
+    else raises ``ValueError`` (-> HTTP 400 at the API boundary) so an
+    unauthenticated caller cannot use ``GET /workflows?dir=`` as an
+    arbitrary-directory scan (e.g. ``~/.ssh``) for workflow YAML, or probe file
+    layout via the ``source_path`` the listing echoes. Mirrors
+    ``_safe_spec_path``'s resolve-then-contain idiom; ``_safe_dir`` still
+    applies the blocked-directory policy to the accepted value.
+    """
+    if scan_dir is None:
+        return None
+    root = os.path.realpath(os.path.abspath(str(WORKFLOW_SPEC_DIR)))
+    candidate = os.path.realpath(os.path.abspath(os.path.expanduser(scan_dir)))
+    if candidate != root and not candidate.startswith(root + os.sep):
+        raise ValueError(
+            f"scan_dir '{scan_dir}' must be the configured workflow directory "
+            f"or a subdirectory of it"
+        )
+    return scan_dir
+
+
 def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> str:
     """Canonicalize a spec FILE path and bind it to a CONFIGURED base directory.
 
