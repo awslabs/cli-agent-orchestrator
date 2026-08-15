@@ -74,7 +74,10 @@ If no boundary is detected, extraction raises `ValueError("No Cursor CLI respons
 By default, CAO launches Cursor CLI with the following flags to skip the interactive dialogs that would otherwise block headless orchestration:
 
 - `--force` — auto-approves every tool call (Bash, file writes, etc.).
-- `--approve-mcps` — pre-approves MCP servers declared via `--plugin-dir`.
+- `--plugin-dir <temporary-dir>` — loads a valid, terminal-private Agent
+  Plugin containing the worker's MCP servers.
+- `--approve-mcps` — pre-approves MCP servers declared by that temporary
+  plugin.
 
 `--trust` is **not** passed because Cursor CLI v2026+ rejects it in interactive REPL mode with `Error: --trust can only be used with --print/headless mode`. The CAO launch flow already confirms workspace trust, and the interactive REPL has no per-directory trust dialog for `--trust` to skip.
 
@@ -88,7 +91,16 @@ When launched with an agent profile (e.g., `--agents code_supervisor`), CAO:
 
 1. Loads the profile from the agent store (`~/.aws/cli-agent-orchestrator/agent-store`).
 2. Honors the profile's `model` field by passing `--model <id>` at launch (overridable via the constructor).
-3. For MCP servers: writes a synthetic Cursor plugin manifest under `~/.aws/cli-agent-orchestrator/tmp/<tid>-cursor-plugins/plugin.json` and passes the directory via `--plugin-dir`. The manifest's `mcpServers` map carries the `CAO_TERMINAL_ID` env var so MCP tools can identify the current terminal for handoff/assign operations. `--approve-mcps` is added so the REPL does not block on a per-server approval dialog.
+3. For CAO's bundled `cao-mcp-server`: creates a schema-conformant Agent
+   Plugin in a fresh, owner-only directory under CAO's temporary directory.
+   The plugin has root `plugin.json`, `mcp.json`, and a plugin-relative bridge
+   launcher; it forwards `CAO_TERMINAL_ID` and is passed with `--plugin-dir`.
+   Every terminal gets its own plugin, so parent/child workers can share a
+   project directory without MCP-name or terminal-ID collisions. CAO removes
+   the directory on cleanup and never writes `.cursor/mcp.json` in the source
+   worktree. This runtime bridge intentionally accepts only the bundled stdio
+   server (and only `CAO_TERMINAL_ID` in its environment); configure other
+   Cursor MCP servers with a Cursor-native plugin.
 4. **Does not** pass the profile body via `--system-prompt` in v2026.06.15: the backend rejects every request that carries a `--system-prompt <file>` payload with `[invalid_argument] unknown option '--system-prompt'` regardless of the file's contents (the bug is reproducible with a 3-character file). The CAO role context still reaches the agent via the `cao-mcp-server` MCP tool's handoff/assign payloads, so the agent has the right capabilities and the right inbox tools; only the role body is not pre-loaded as a system prompt. The preserved `_write_system_prompt_file` helper is ready to re-enable this path when Cursor ships a fixed client.
 
 ### Launch Command
@@ -96,7 +108,7 @@ When launched with an agent profile (e.g., `--agents code_supervisor`), CAO:
 The provider builds the command via `_build_cursor_command()`. The provider prefers the unambiguous `cursor-agent` alias (which only the Cursor CLI ships) and falls back to the documented primary `agent` name when only that is installed. When `agent` is selected the provider runs an `agent --version` probe to confirm the resolved binary is the Cursor CLI (a number of unrelated tools also install an `agent` binary on `$PATH`).
 
 ```
-cursor-agent --force [--model <id>] [--plugin-dir <path> --approve-mcps]
+cursor-agent --force [--model <id>] [--plugin-dir <temporary-dir>] [--approve-mcps]
 ```
 
 The `--print` flag is intentionally **not** passed: CAO drives the interactive REPL so the inbox service can stream follow-up prompts via MCP handoff. Print mode is a one-shot CLI flag that exits after the first response and is therefore incompatible with multi-turn CAO sessions.
@@ -202,8 +214,8 @@ If the supervisor completes the analysis work itself, the per-directory lock or 
    - If the dialog still appears, verify the `agent` (or `cursor-agent`) version supports `--force` (`agent --help`).
 
 2. **MCP Approval Dialog Blocking**
-   - The provider launches with `--approve-mcps` when the profile declares `mcpServers`, and the MCP servers are written into a `--plugin-dir` manifest.
-   - If MCP servers still prompt, check the synthesised `plugin.json` under `~/.aws/cli-agent-orchestrator/tmp/<tid>-cursor-plugins/`.
+   - The provider launches with `--plugin-dir` and `--approve-mcps` when the profile declares the bundled `cao-mcp-server`. The generated Agent Plugin is terminal-private under CAO's temporary directory; it is not a project file. Other MCP servers must use a Cursor-native plugin.
+   - If MCP servers still prompt or are absent, inspect that temporary plugin's `mcp.json` from the terminal launch command. Do not add CAO's per-terminal MCP server to `~/.cursor/mcp.json`: that would expose it to unrelated Cursor sessions.
 
 3. **Authentication Issues**
    ```bash

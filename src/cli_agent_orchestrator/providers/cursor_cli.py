@@ -18,14 +18,12 @@ relied on. The v2026 launch command the provider builds:
   per-tool approval prompts during orchestration.
 - ``--model`` selects a specific model (e.g. ``gpt-5``, ``sonnet-4``,
   ``composer-2.5``).
-- ``--plugin-dir <path>`` injects MCP server configuration. v2026
-  removed the ``--mcp <json>`` flag in favour of ``--plugin-dir``
-  pointing at a directory holding Cursor plugin manifests. The
-  provider synthesises that directory from the agent profile's
-  ``mcpServers`` map at launch time.
-- ``--approve-mcps`` pre-approves MCP servers declared via
-  ``--plugin-dir`` so the REPL does not block on a per-server
-  approval dialog.
+- ``--plugin-dir <path>`` loads a temporary, valid Agent Plugin for the
+  bundled ``cao-mcp-server`` bridge. The plugin is unique to a terminal,
+  lives under CAO's private temporary directory, and is removed during
+  cleanup; CAO never edits a project's ``.cursor/mcp.json``.
+- ``--approve-mcps`` pre-approves the plugin MCP servers so the REPL does
+  not block on a per-server approval dialog.
 
 Flags deliberately omitted for v2026.06.15:
 
@@ -41,7 +39,8 @@ Flags deliberately omitted for v2026.06.15:
   (issue #300).
 - ``--trust`` is omitted because v2026 rejects it in interactive
   REPL mode ("only works with --print/headless mode").
-- ``--mcp <json>`` is replaced by ``--plugin-dir`` as noted above.
+- ``--mcp <json>`` is not supported by the current Cursor CLI. CAO uses a
+  documented Agent Plugin passed by ``--plugin-dir`` instead.
 
 Skill catalog injection: the provider forwards the skill catalog via
 the shared ``_apply_skill_prompt`` helper from :class:`BaseProvider`
@@ -63,12 +62,15 @@ from the Claude Code provider to avoid stale-spinner false positives.
 
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
@@ -76,7 +78,6 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -230,12 +231,10 @@ class CursorCliProvider(BaseProvider):
         self._agent_profile = agent_profile
         self._model = model
         # Temp paths the provider has created under the CAO tmp dir.
-        # ``cleanup()`` deletes every entry in this list so the
-        # per-session files (system prompt + plugin dir) do not
-        # accumulate on disk. Initialised lazily on the first
-        # ``_build_cursor_command`` so providers that never get
-        # launched (e.g. because the binary is missing) leave the
-        # tmp dir untouched.
+        # ``cleanup()`` deletes every entry in this list so per-session files
+        # (system prompts and MCP plugins) do not accumulate on disk.
+        # Initialised lazily so providers that never launch leave the tmp dir
+        # untouched.
         self._tmp_paths: list[Path] = []
         # Turn counter. ``get_status`` returns ``IDLE`` while
         # ``_turns == 0`` (fresh spawn, no user input yet) and
@@ -252,7 +251,18 @@ class CursorCliProvider(BaseProvider):
         """Cursor CLI submits on a single Enter after bracketed paste."""
         return 1
 
-    def _build_cursor_command(self) -> str:
+    def _load_profile(self):
+        """Load the configured CAO profile with a provider-specific error."""
+        if self._agent_profile is None:
+            return None
+        try:
+            return load_agent_profile(self._agent_profile)
+        except Exception as exc:
+            raise ProviderError(
+                f"Failed to load agent profile '{self._agent_profile}': {exc}"
+            ) from exc
+
+    def _build_cursor_command(self, profile: Optional[Any] = None) -> str:
         """Build the ``agent`` (Cursor CLI) launch command.
 
         Cursor's primary command per the official documentation is
@@ -272,20 +282,14 @@ class CursorCliProvider(BaseProvider):
           '--system-prompt'`` regardless of file contents. The
           CAO role context still reaches the agent via the
           ``cao-mcp-server`` MCP tool's handoff / assign payloads.
-        - ``--plugin-dir`` injects MCP server configuration. v2026
-          removed the ``--mcp <json>`` flag in favour of
-          ``--plugin-dir <path>`` pointing at a directory that holds
-          Cursor plugin / MCP server manifests. We synthesise the
-          directory from the agent profile's ``mcpServers`` map at
-          launch time and keep it under the CAO tmp dir.
-        - ``--approve-mcps`` pre-approves MCP servers declared via
-          ``--plugin-dir`` so the REPL does not block on a per-server
-          approval dialog.
+        - ``--plugin-dir <path>`` loads a temporary Agent Plugin for the
+          bundled CAO MCP bridge without modifying the project worktree.
+        - ``--approve-mcps`` pre-approves the plugin's MCP servers.
 
         The CAO agent profile is no longer passed as ``--agent <name>``
         — that flag was removed in v2026. The profile's identity is
         preserved via the system-prompt content (the profile markdown
-        body) and the synthesised plugin-dir layout. Multi-agent
+        body) and the temporary MCP plugin. Multi-agent
         orchestration (handoff / assign) continues to work because the
         inbox / MCP tools are the same across all profiles.
 
@@ -293,12 +297,8 @@ class CursorCliProvider(BaseProvider):
         :func:`tmux_client.send_keys`. Uses :func:`shlex.join` to handle
         multiline strings and special characters correctly.
         """
-        profile = None
-        if self._agent_profile is not None:
-            try:
-                profile = load_agent_profile(self._agent_profile)
-            except Exception as exc:
-                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {exc}")
+        if profile is None:
+            profile = self._load_profile()
 
         # Resolve the binary. ``agent`` is a common name and a
         # number of unrelated tools (e.g. the Linux ``gpg-agent``)
@@ -417,20 +417,13 @@ class CursorCliProvider(BaseProvider):
         # ``extract_last_message_from_script`` docstring to point at
         # the new behaviour.
 
-        # MCP server injection via --plugin-dir. v2026 removed
-        # ``--mcp <json>``; the replacement is ``--plugin-dir
-        # <path>`` pointing at a directory containing plugin / MCP
-        # server manifests. We synthesise the directory from the
-        # agent profile's ``mcpServers`` map at launch time, inject
-        # CAO_TERMINAL_ID into each server's env so MCP tools can
-        # identify the current terminal for handoff / assign
-        # operations, and keep the layout under the CAO tmp dir so
-        # it is removed with the session.
+        # Cursor loads local Agent Plugins supplied by --plugin-dir. A unique
+        # plugin directory isolates terminal-specific MCP environment values
+        # without touching the source worktree or sharing state with another
+        # Cursor terminal.
         if profile is not None and profile.mcpServers:
             plugin_dir = self._write_plugin_dir(profile.mcpServers)
             command_parts.extend(["--plugin-dir", plugin_dir])
-            # --approve-mcps is required to skip per-server approval
-            # dialogs on first run; otherwise the REPL blocks.
             command_parts.append("--approve-mcps")
 
         return shlex.join(command_parts)
@@ -467,65 +460,143 @@ class CursorCliProvider(BaseProvider):
         self._register_tmp_path(prompt_path)
         return str(prompt_path)
 
-    def _write_plugin_dir(self, mcp_servers) -> str:
-        """Materialise a Cursor plugin directory for the session's MCP servers.
+    @staticmethod
+    def _write_file_atomically(path: Path, contents: bytes) -> None:
+        """Write a sensitive JSON config atomically with owner-only mode."""
+        fd, temporary_name = tempfile.mkstemp(prefix=".cao-mcp-", dir=path.parent)
+        temporary_path = Path(temporary_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as temporary_file:
+                temporary_file.write(contents)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary_path, path)
+        except OSError:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
-        Cursor CLI v2026.06.15 dropped the ``--mcp <json>`` flag in
-        favour of ``--plugin-dir <path>``: a directory that holds
-        Cursor plugin manifests. We translate the CAO agent
-        profile's ``mcpServers`` map into a minimal manifest layout
-        so the same MCP servers (cao-mcp-server, ops-mcp-server,
-        etc.) start transparently under the new flag.
+    def _write_plugin_dir(self, mcp_servers: dict[str, Any]) -> str:
+        """Create an isolated Agent Plugin for CAO's runtime MCP bridge.
 
-        The synthesised directory lives under the CAO tmp dir keyed
-        by the terminal id and is registered in ``self._tmp_paths``
-        so ``cleanup()`` deletes it (and the per-session manifest
-        inside it) when the session ends.
+        Cursor Agent Plugins use a root ``plugin.json`` manifest and an
+        ``mcp.json`` file. CAO generates a schema-conformant plugin for its
+        bundled ``cao-mcp-server`` inside a fresh, owner-only directory under
+        ``CAO_TMP_DIR`` and passes it through ``--plugin-dir``. Parent and
+        child terminals therefore do not share CWD-scoped config or each
+        other's ``CAO_TERMINAL_ID``.
 
-        Args:
-            mcp_servers: The agent profile's ``mcpServers`` map. Keys
-                are server names; values are either plain dicts (from
-                YAML) or Pydantic models (from programmatic install).
-
-        Returns:
-            Absolute path to the plugin directory. Pass this to
-            ``--plugin-dir <path>``.
+        The Agent Plugin MCP schema intentionally cannot represent CAO's
+        broader provider-neutral MCP configuration safely: it has closed
+        transport variants and forbids credentials in ``env``. Reject other
+        profile MCP entries before launch instead of emitting a plugin Cursor
+        would silently skip.
         """
-        plugin_dir = self._cao_tmp_dir() / f"{self.terminal_id}-cursor-plugins"
-        plugin_dir.mkdir(parents=True, exist_ok=True)
+        plugin_dir = Path(
+            tempfile.mkdtemp(prefix=f"{self.terminal_id}-cursor-plugin-", dir=self._cao_tmp_dir())
+        )
+        try:
+            os.chmod(plugin_dir, 0o700)
+            manifest = {
+                "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+                "name": f"cao-terminal-{self.terminal_id}",
+                "description": "Ephemeral CAO MCP bridge for one Cursor terminal",
+                "version": "0.0.0",
+                "author": {"name": "cli-agent-orchestrator"},
+            }
+            mcp_config = self._cao_mcp_plugin_config(mcp_servers)
+            self._write_file_atomically(
+                plugin_dir / "plugin.json",
+                (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+            )
+            self._write_file_atomically(
+                plugin_dir / "mcp.json",
+                (json.dumps(mcp_config, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+            )
+            launcher_path = plugin_dir / "bin" / "cao-mcp-server"
+            launcher_path.parent.mkdir(mode=0o700)
+            launcher = (
+                f"#!{sys.executable}\n"
+                "from cli_agent_orchestrator.mcp_server.server import main\n\n"
+                'if __name__ == "__main__":\n'
+                "    main()\n"
+            )
+            self._write_file_atomically(launcher_path, launcher.encode("utf-8"))
+            os.chmod(launcher_path, 0o700)
+        except ProviderError:
+            shutil.rmtree(plugin_dir, ignore_errors=True)
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            shutil.rmtree(plugin_dir, ignore_errors=True)
+            raise ProviderError(f"Could not create temporary Cursor MCP plugin: {exc}") from exc
 
-        # CAO_TERMINAL_ID is forwarded into every server's env so
-        # MCP tools (cao-mcp-server, ops-mcp-server) can resolve
-        # the current terminal for handoff / assign operations. We
-        # do not override an explicit preset — the same rule the
-        # --mcp <json> path used to follow (issue #300 is the v2026
-        # equivalent).
-        servers: dict = {}
-        for server_name, server_config in mcp_servers.items():
-            if isinstance(server_config, dict):
-                servers[server_name] = dict(server_config)
-            else:
-                servers[server_name] = server_config.model_dump(exclude_none=True)
-            # Resolve the bundled cao-mcp-server console script to a
-            # PATH-independent invocation.
-            servers[server_name] = resolve_mcp_server_config(servers[server_name])
-            env = servers[server_name].get("env", {})
-            if "CAO_TERMINAL_ID" not in env:
-                env["CAO_TERMINAL_ID"] = self.terminal_id
-                servers[server_name]["env"] = env
-
-        # Cursor v2026 plugin manifests are JSON files inside the
-        # plugin dir. The exact schema is undocumented in the help
-        # text we captured; the minimum that the CLI accepts is a
-        # ``mcpServers`` object matching the well-known MCP config
-        # layout, written as ``plugin.json`` at the root. If the
-        # schema proves more strict in a later v2026 point release
-        # this layout can be tweaked without touching the rest of
-        # the provider.
-        manifest = {"mcpServers": servers}
-        (plugin_dir / "plugin.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         self._register_tmp_path(plugin_dir)
         return str(plugin_dir)
+
+    def _cao_mcp_plugin_config(self, mcp_servers: dict[str, Any]) -> dict[str, Any]:
+        """Translate the CAO bridge profile entry into the closed MCP schema.
+
+        This provider's runtime plugin is deliberately limited to the bundled
+        stdio bridge. A profile can omit ``type`` for legacy compatibility;
+        CAO emits the required ``"stdio"`` type in the generated plugin.
+        """
+        if set(mcp_servers) != {"cao-mcp-server"}:
+            raise ProviderError(
+                "Cursor runtime MCP plugins support only the bundled "
+                "'cao-mcp-server' entry; remove other mcpServers or use a "
+                "Cursor-native plugin for them"
+            )
+
+        server_config = mcp_servers["cao-mcp-server"]
+        if isinstance(server_config, dict):
+            config = dict(server_config)
+        else:
+            config = server_config.model_dump(exclude_none=True)
+
+        supported_fields = {"type", "command", "args", "env"}
+        unsupported_fields = sorted(set(config).difference(supported_fields))
+        if unsupported_fields:
+            raise ProviderError(
+                "Cursor runtime MCP plugin cannot represent fields on "
+                "'cao-mcp-server': " + ", ".join(unsupported_fields)
+            )
+        if config.get("type") not in (None, "stdio"):
+            raise ProviderError("Cursor runtime MCP plugin requires 'cao-mcp-server' type: 'stdio'")
+        if config.get("command") != "cao-mcp-server":
+            raise ProviderError(
+                "Cursor runtime MCP plugin requires the bundled " "'cao-mcp-server' command"
+            )
+
+        args = config.get("args") or []
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ProviderError("'cao-mcp-server' args must be a list of strings")
+        env = config.get("env") or {}
+        if not isinstance(env, dict) or not all(
+            isinstance(name, str) and isinstance(value, str) for name, value in env.items()
+        ):
+            raise ProviderError("'cao-mcp-server' env must be a mapping of strings")
+        unsupported_env = sorted(set(env).difference({"CAO_TERMINAL_ID"}))
+        if unsupported_env:
+            raise ProviderError(
+                "Cursor runtime MCP plugin accepts only CAO_TERMINAL_ID in "
+                "'cao-mcp-server' env; configure other values in the CAO server environment"
+            )
+
+        terminal_id = env.get("CAO_TERMINAL_ID", self.terminal_id)
+        return {
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+            "mcpServers": {
+                "cao-mcp-server": {
+                    "type": "stdio",
+                    "command": "./bin/cao-mcp-server",
+                    "args": args,
+                    "env": {"CAO_TERMINAL_ID": terminal_id},
+                }
+            },
+        }
 
     def _cao_tmp_dir(self) -> Path:
         """Resolve the CAO tmp directory and create it on demand.
@@ -574,7 +645,10 @@ class CursorCliProvider(BaseProvider):
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
-        command = self._build_cursor_command()
+        # Load once so the command and any temporary MCP plugin are derived
+        # from the same immutable profile snapshot.
+        profile = self._load_profile()
+        command = self._build_cursor_command(profile)
         # Arm the StatusMonitor stickiness gate so the launching
         # command can drive a fresh PROCESSING transition past any
         # stale ready latch. Without this, a previously-latched
@@ -928,11 +1002,8 @@ class CursorCliProvider(BaseProvider):
         """Clean up Cursor CLI provider state.
 
         Resets the initialised flag and removes every per-session
-        temp file the provider has created under the CAO tmp dir
-        (system prompt file, plugin directory). Removing the
-        plugin directory also drops the per-session ``plugin.json``
-        manifest that forwards ``CAO_TERMINAL_ID`` into the MCP
-        server env.
+        temporary file or plugin directory the provider has created under the
+        CAO tmp dir. CAO never creates or changes project-local MCP files.
 
         Errors during cleanup are logged and swallowed — the
         session is already going away at this point and we do not
