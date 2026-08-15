@@ -294,9 +294,8 @@ def test_mcp_registration_writes_config(tmp_path, monkeypatch):
 
 def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
     """The bundled bare `cao-mcp-server` command is resolved to a PATH-
-    independent invocation before it is written to mcp_config.json. agy reads
-    that file at a later launch (persisted=True), so the stable PATH launcher
-    is preferred over the versioned interpreter-sibling path."""
+    independent invocation before it is written for this terminal's agy launch.
+    Its current interpreter-sibling helper wins over an older global launcher."""
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
     cfg = tmp_path / "mcp_config.json"
@@ -304,7 +303,12 @@ def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
         name="reviewer_gemini",
         description="Reviewer",
         system_prompt="You review code.",
-        mcpServers={"cao-mcp-server": {"command": "cao-mcp-server", "args": []}},
+        mcpServers={
+            "cao-mcp-server": {
+                "command": "cao-mcp-server",
+                "args": ["--log-level", "debug"],
+            }
+        },
     )
     p = make_provider(agent_profile="reviewer_gemini")
     MOD = "cli_agent_orchestrator.utils.mcp_resolution"
@@ -325,10 +329,8 @@ def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
         import json
 
         entry = json.loads(cfg.read_text())["mcpServers"]["cao-mcp-server-test-tid"]
-        # persisted=True prefers the stable PATH launcher, not the bare command
-        # or the versioned sibling.
-        assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
-        assert entry["args"] == []
+        assert entry["command"] == "/versioned/venv/bin/cao-mcp-server"
+        assert entry["args"] == ["--log-level", "debug"]
 
 
 # --------------------------------------------------------------------------- #

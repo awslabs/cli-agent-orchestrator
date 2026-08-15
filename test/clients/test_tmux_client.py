@@ -103,25 +103,15 @@ class TestCreateSession:
 class TestCreateSessionEnvironmentFiltering:
     """Tests for environment variable filtering in create_session (#242)."""
 
-    def _get_passed_environment(self, tmux, tmp_path, env_override):
+    def _get_passed_environment(self, tmux, tmp_path, env_override, extra_env=None):
         mock_window = MagicMock()
         mock_window.name = "w"
         mock_session = MagicMock()
         mock_session.windows = [mock_window]
         tmux.server.new_session.return_value = mock_session
 
-        # Pin the sibling helper dir to "" so these tests assert env FILTERING
-        # only, independent of whether a real cao-mcp-server sits beside this
-        # test interpreter. PATH augmentation is covered by
-        # TestCreateSessionSiblingPath.
-        with (
-            patch.dict(os.environ, env_override, clear=True),
-            patch(
-                "cli_agent_orchestrator.clients.tmux.cao_mcp_server_sibling_dir",
-                return_value="",
-            ),
-        ):
-            tmux.create_session("ses", "w", "tid1", str(tmp_path))
+        with patch.dict(os.environ, env_override, clear=True):
+            tmux.create_session("ses", "w", "tid1", str(tmp_path), extra_env=extra_env)
 
         return tmux.server.new_session.call_args.kwargs["environment"]
 
@@ -230,87 +220,15 @@ class TestCreateSessionEnvironmentFiltering:
         assert "RANDOM_VAR" not in env
         assert "MY_CUSTOM_THING" not in env
 
-
-# ── create_session: cao-mcp-server sibling PATH skew ────────────────
-
-
-class TestCreateSessionSiblingPath:
-    """PATH skew fix: prefer the cao-mcp-server beside the running cao-server
-    interpreter on the spawned terminal's PATH, without breaking operator
-    overrides or no-sibling/custom launches.
-
-    The sibling detector (``cao_mcp_server_sibling_dir``) is patched directly
-    so these tests stay hermetic — no real interpreter filesystem layout is
-    asserted here (that is ``test_mcp_resolution.py``'s job).
-    """
-
-    _SIBLING_PATCH = "cli_agent_orchestrator.clients.tmux.cao_mcp_server_sibling_dir"
-
-    def _get_passed_environment(self, tmux, tmp_path, env_override, sibling_dir, extra_env=None):
-        mock_window = MagicMock()
-        mock_window.name = "w"
-        mock_session = MagicMock()
-        mock_session.windows = [mock_window]
-        tmux.server.new_session.return_value = mock_session
-
-        with (
-            patch.dict(os.environ, env_override, clear=True),
-            patch(self._SIBLING_PATCH, return_value=sibling_dir, create=True),
-        ):
-            tmux.create_session("ses", "w", "tid1", str(tmp_path), extra_env=extra_env)
-
-        return tmux.server.new_session.call_args.kwargs["environment"]
-
-    def test_sibling_dir_prepended_to_inherited_path(self, tmux, tmp_path):
-        """A sibling helper dir is prepended so the bundled helper resolves first."""
+    def test_operator_path_is_forwarded_unchanged(self, tmux, tmp_path):
+        """``cao launch --env PATH=...`` remains the pane's user-command PATH."""
         env = self._get_passed_environment(
             tmux,
             tmp_path,
-            {"HOME": "/h", "PATH": "/usr/bin:/bin"},
-            sibling_dir="/venv/bin",
-        )
-        assert env["PATH"] == f"/venv/bin{os.pathsep}/usr/bin:/bin"
-
-    def test_no_sibling_keeps_inherited_path_unchanged(self, tmux, tmp_path):
-        """No sibling executable → inherited PATH is retained verbatim."""
-        env = self._get_passed_environment(
-            tmux,
-            tmp_path,
-            {"HOME": "/h", "PATH": "/usr/bin:/bin"},
-            sibling_dir="",
-        )
-        assert env["PATH"] == "/usr/bin:/bin"
-
-    def test_operator_supplied_path_wins_over_sibling(self, tmux, tmp_path):
-        """An explicit ``--env PATH=...`` overrides; the sibling is NOT prepended."""
-        env = self._get_passed_environment(
-            tmux,
-            tmp_path,
-            {"HOME": "/h", "PATH": "/usr/bin"},
-            sibling_dir="/venv/bin",
+            {"HOME": "/home/user", "PATH": "/inherited/bin"},
             extra_env={"PATH": "/operator/bin"},
         )
         assert env["PATH"] == "/operator/bin"
-
-    def test_sibling_not_duplicated_when_already_first(self, tmux, tmp_path):
-        """Idempotent: don't prepend a dir that already leads the inherited PATH."""
-        env = self._get_passed_environment(
-            tmux,
-            tmp_path,
-            {"HOME": "/h", "PATH": "/venv/bin:/usr/bin"},
-            sibling_dir="/venv/bin",
-        )
-        assert env["PATH"] == "/venv/bin:/usr/bin"
-
-    def test_no_inherited_path_is_not_invented_from_sibling(self, tmux, tmp_path):
-        """If the process env has no PATH, don't synthesize one of just the sibling dir."""
-        env = self._get_passed_environment(
-            tmux,
-            tmp_path,
-            {"HOME": "/h"},
-            sibling_dir="/venv/bin",
-        )
-        assert "PATH" not in env
 
 
 # ── create_window ────────────────────────────────────────────────────

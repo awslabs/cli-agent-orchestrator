@@ -61,44 +61,6 @@ class TestSiblingScript:
             assert _sibling_script() == ""
 
 
-class TestSiblingDir:
-    """cao_mcp_server_sibling_dir: the *directory* of the interpreter-sibling
-    helper, for callers that put it on PATH rather than invoke it directly."""
-
-    def test_returns_parent_dir_when_script_exists(self, tmp_path):
-        from cli_agent_orchestrator.utils.mcp_resolution import (
-            _SCRIPT_FILENAME,
-            cao_mcp_server_sibling_dir,
-        )
-
-        fake_python = tmp_path / "python3"
-        fake_python.touch()
-        (tmp_path / _SCRIPT_FILENAME).touch()
-        with patch(f"{MOD}.sys") as mock_sys:
-            mock_sys.executable = str(fake_python)
-            assert cao_mcp_server_sibling_dir() == str(tmp_path)
-
-    def test_returns_empty_when_script_missing(self, tmp_path):
-        from cli_agent_orchestrator.utils.mcp_resolution import (
-            cao_mcp_server_sibling_dir,
-        )
-
-        fake_python = tmp_path / "python3"
-        fake_python.touch()
-        with patch(f"{MOD}.sys") as mock_sys:
-            mock_sys.executable = str(fake_python)
-            assert cao_mcp_server_sibling_dir() == ""
-
-    def test_returns_empty_for_empty_sys_executable(self):
-        from cli_agent_orchestrator.utils.mcp_resolution import (
-            cao_mcp_server_sibling_dir,
-        )
-
-        with patch(f"{MOD}.sys") as mock_sys:
-            mock_sys.executable = ""
-            assert cao_mcp_server_sibling_dir() == ""
-
-
 class TestArgsPreservation:
     """Caller-supplied args survive resolution in every tier."""
 
@@ -145,14 +107,19 @@ class TestRuntimeResolution:
         assert cmd == "/venv/bin/cao-mcp-server"
         assert args == []
 
-    def test_falls_back_to_path_when_no_sibling(self):
+    def test_falls_back_to_module_when_no_sibling_even_if_path_has_helper(self):
         with (
             patch(f"{MOD}._sibling_script", return_value=""),
-            patch(f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"),
+            patch(
+                f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"
+            ) as mock_which,
+            patch(f"{MOD}.sys") as mock_sys,
         ):
+            mock_sys.executable = "/current/venv/bin/python3"
             cmd, args = resolve_cao_mcp_command("cao-mcp-server", [])
-        assert cmd == "/usr/local/bin/cao-mcp-server"
-        assert args == []
+        mock_which.assert_not_called()
+        assert cmd == "/current/venv/bin/python3"
+        assert args == ["-m", CAO_MCP_SERVER_MODULE]
 
     def test_falls_back_to_module_entrypoint(self):
         """No sibling, nothing on PATH → run the module via the interpreter."""
@@ -209,7 +176,9 @@ class TestResolveMcpServerConfig:
         with (
             patch(f"{MOD}._sibling_script", return_value=""),
             patch(f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"),
+            patch(f"{MOD}.sys") as mock_sys,
         ):
+            mock_sys.executable = "/current/venv/bin/python3"
             out = resolve_mcp_server_config(
                 {
                     "type": "stdio",
@@ -218,8 +187,8 @@ class TestResolveMcpServerConfig:
                     "env": {"CAO_TERMINAL_ID": "abc"},
                 }
             )
-        assert out["command"] == "/usr/local/bin/cao-mcp-server"
-        assert out["args"] == []
+        assert out["command"] == "/current/venv/bin/python3"
+        assert out["args"] == ["-m", CAO_MCP_SERVER_MODULE]
         assert out["type"] == "stdio"
         assert out["env"] == {"CAO_TERMINAL_ID": "abc"}
 
@@ -241,11 +210,13 @@ class TestResolveMcpServerConfig:
         with (
             patch(f"{MOD}._sibling_script", return_value=""),
             patch(f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"),
+            patch(f"{MOD}.sys") as mock_sys,
         ):
+            mock_sys.executable = "/current/venv/bin/python3"
             once = resolve_mcp_server_config({"command": "cao-mcp-server", "args": []})
             twice = resolve_mcp_server_config(once)
         assert once == twice
-        assert twice["command"] == "/usr/local/bin/cao-mcp-server"
+        assert twice["command"] == "/current/venv/bin/python3"
 
     def test_persisted_forwarded(self):
         with (

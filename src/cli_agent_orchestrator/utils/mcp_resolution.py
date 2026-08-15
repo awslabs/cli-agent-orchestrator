@@ -8,15 +8,19 @@ non-standard location). When it fails to resolve, the agent starts without its
 orchestration tools (handoff / assign / send_message) and silently no-ops.
 
 ``resolve_cao_mcp_command`` rewrites the bare command to a PATH-independent
-invocation, mirroring the three-tier fallback the Copilot provider already used
-inline:
+invocation:
 
-    1. the ``cao-mcp-server`` script sitting next to the running interpreter
+    1. Runtime configs use the ``cao-mcp-server`` script sitting next to the
+       running interpreter
        (the same environment that launched cao-server — the common case for
-       ``uv tool install`` / ``pipx``), then
-    2. ``cao-mcp-server`` as resolved on ``PATH``, then
-    3. ``<python> -m cli_agent_orchestrator.mcp_server.server`` — always
-       runnable because it does not depend on a console script being on PATH.
+       ``uv tool install`` / ``pipx``), then the current interpreter's module
+       entrypoint.
+    2. Persisted configs may prefer ``cao-mcp-server`` as resolved on ``PATH``
+       so a stable launcher can survive an upgrade, then fall back to the
+       interpreter sibling/module target.
+
+The module entrypoint (``<python> -m cli_agent_orchestrator.mcp_server.server``)
+is always runnable because it does not depend on a console script being on PATH.
 
 Any command other than the bare ``cao-mcp-server`` (e.g. a user's custom MCP
 server, or an explicit absolute path) passes through unchanged.
@@ -26,7 +30,7 @@ import logging
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -52,22 +56,6 @@ def _sibling_script() -> str:
     return str(sibling) if sibling.exists() else ""
 
 
-def cao_mcp_server_sibling_dir() -> str:
-    """Directory holding the ``cao-mcp-server`` script beside the interpreter.
-
-    Companion to :func:`_sibling_script` for callers that need to put the
-    bundled helper on ``PATH`` (e.g. spawned agent tmux terminals) rather than
-    invoke it directly. Returns the script's parent directory when a sibling
-    console script exists next to :data:`sys.executable`, and ``""``
-    otherwise — so callers can treat an empty result as "no augmentation
-    available" and leave the inherited ``PATH`` untouched. An operator-supplied
-    ``PATH`` is still expected to win over any augmentation applied by the
-    caller.
-    """
-    sibling = _sibling_script()
-    return str(Path(sibling).parent) if sibling else ""
-
-
 def resolve_cao_mcp_command(
     command: str, args: List[str], *, persisted: bool = False
 ) -> Tuple[str, List[str]]:
@@ -78,8 +66,9 @@ def resolve_cao_mcp_command(
     the result is written to disk:
 
     - ``persisted=False`` (default, runtime providers that rebuild the launch
-      config every time): prefer the script next to the running interpreter —
-      an exact, hijack-proof match recomputed each launch.
+      config every time): prefer the script next to the running interpreter,
+      then its module entrypoint. Do not resolve a global PATH launcher, which
+      could belong to an older CAO installation.
     - ``persisted=True`` (the resolved command is written to a config file the
       provider reads later, e.g. Kiro/Q agent JSON): prefer the script as
       resolved on ``PATH``. Tool installers (uv, pipx) keep a *stable* launcher
@@ -104,15 +93,9 @@ def resolve_cao_mcp_command(
         return command, list(args)
 
     sibling = _sibling_script()
-    on_path = shutil.which(CAO_MCP_SERVER_COMMAND)
-    order = (
-        [("PATH", on_path), ("sibling", sibling)]
-        if persisted
-        else [
-            ("sibling", sibling),
-            ("PATH", on_path),
-        ]
-    )
+    order: List[Tuple[str, Optional[str]]] = [("sibling", sibling)]
+    if persisted:
+        order.insert(0, ("PATH", shutil.which(CAO_MCP_SERVER_COMMAND)))
     for label, candidate in order:
         if candidate:
             logger.debug("Resolved %s via %s: %s", command, label, candidate)

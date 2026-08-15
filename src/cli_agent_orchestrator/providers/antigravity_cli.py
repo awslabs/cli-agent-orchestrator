@@ -413,12 +413,11 @@ class AntigravityCliProvider(BaseProvider):
                     cfg = dict(server_config)
                 else:
                     cfg = server_config.model_dump(exclude_none=True)
-                # Resolve the bundled cao-mcp-server console script to a
-                # PATH-independent invocation. persisted=True: this command is
-                # written to mcp_config.json and read by agy at later launches,
-                # so prefer the stable PATH launcher over the versioned venv path.
+                # This entry is recreated for each terminal initialization, so
+                # bind the bare bundled helper to this server's current
+                # interpreter rather than an older global launcher.
                 command, args = resolve_cao_mcp_command(
-                    cfg.get("command", ""), cfg.get("args", []) or [], persisted=True
+                    cfg.get("command", ""), cfg.get("args", []) or []
                 )
                 entry: dict = {
                     "command": command,

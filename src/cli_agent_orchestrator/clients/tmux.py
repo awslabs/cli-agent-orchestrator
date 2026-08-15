@@ -18,7 +18,6 @@ from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
     TMUX_HISTORY_LINES,
 )
-from cli_agent_orchestrator.utils.mcp_resolution import cao_mcp_server_sibling_dir
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
     resolve_and_validate_path,
@@ -381,22 +380,6 @@ class TmuxClient:
                     )
                 )
             }
-            # Prefer the cao-mcp-server console script that sits beside THIS
-            # interpreter on the spawned terminal's PATH, so the bundled
-            # orchestration helper resolves even when cao-server's own PATH
-            # does not include the install bin dir (unactivated venv,
-            # devcontainer, ``pip install --prefix``). Only augments when a
-            # sibling executable actually exists and there is an inherited
-            # PATH to prepend onto — a process with no PATH is left to tmux's
-            # default rather than handed a one-entry PATH. Idempotent: if the
-            # sibling dir already leads the inherited PATH it is left alone.
-            # The operator --env merge below runs AFTER this and overrides on
-            # key collision, so an explicit ``--env PATH=...`` still wins.
-            sibling_dir = cao_mcp_server_sibling_dir()
-            if sibling_dir and environment.get("PATH"):
-                path_parts = environment["PATH"].split(os.pathsep)
-                if path_parts[0] != sibling_dir:
-                    environment["PATH"] = os.pathsep.join([sibling_dir, *path_parts])
             # Operator-forwarded vars (from ``cao launch --env``) merge AFTER
             # the inherited slice and override on key collision, so an
             # explicit ``--env AWS_REGION=us-west-2`` wins over the inherited

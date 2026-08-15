@@ -44,6 +44,10 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
     context_dir = tmp_path / "agent-context"
     kiro_dir = tmp_path / "kiro"
     copilot_dir = tmp_path / "copilot"
+    opencode_agents_dir = tmp_path / "opencode-agents"
+    opencode_config_dir = tmp_path / "opencode"
+    opencode_config_file = opencode_config_dir / "opencode.json"
+    skills_dir = tmp_path / "skills"
     provider_dir = tmp_path / "provider"
     extra_dir = tmp_path / "extra"
     env_file = tmp_path / ".env"
@@ -53,6 +57,8 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         context_dir,
         kiro_dir,
         copilot_dir,
+        opencode_agents_dir,
+        skills_dir,
         provider_dir,
         extra_dir,
     ):
@@ -75,6 +81,19 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         "cli_agent_orchestrator.services.install_service.COPILOT_AGENTS_DIR",
         copilot_dir,
     )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.install_service.OPENCODE_AGENTS_DIR",
+        opencode_agents_dir,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.opencode_config.OPENCODE_CONFIG_DIR",
+        opencode_config_dir,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.opencode_config.OPENCODE_CONFIG_FILE",
+        opencode_config_file,
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.utils.opencode_config.SKILLS_DIR", skills_dir)
     monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", env_file)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
@@ -90,6 +109,8 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         "context_dir": context_dir,
         "kiro_dir": kiro_dir,
         "copilot_dir": copilot_dir,
+        "opencode_agents_dir": opencode_agents_dir,
+        "opencode_config_file": opencode_config_file,
         "provider_dir": provider_dir,
         "extra_dir": extra_dir,
         "env_file": env_file,
@@ -266,6 +287,56 @@ class TestInstallAgent:
         entry = kiro_config["mcpServers"]["cao-mcp-server"]
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
+
+    def test_install_opencode_uses_current_sibling_not_old_global_helper(
+        self, install_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """OpenCode's actual MCP command binds the bare bundled helper to CAO.
+
+        The old global executable simulates a stale installation on PATH.  A
+        custom entry and both servers' caller-supplied args must remain intact.
+        """
+        profile_text = (
+            "---\n"
+            "name: opencode-agent\n"
+            "description: Test agent\n"
+            "role: developer\n"
+            "mcpServers:\n"
+            "  cao-mcp-server:\n"
+            "    command: cao-mcp-server\n"
+            "    args: [--log-level, debug]\n"
+            "  user-server:\n"
+            "    command: custom-mcp\n"
+            "    args: [--port, '9876']\n"
+            "prompt: |\n  Do work\n"
+            "---\n"
+            "Body.\n"
+        )
+        (install_paths["local_store_dir"] / "opencode-agent.md").write_text(
+            profile_text, encoding="utf-8"
+        )
+
+        sibling = tmp_path / "server-bin" / "cao-mcp-server"
+        sibling.parent.mkdir()
+        sibling.touch()
+        old_global = tmp_path / "old-global" / "cao-mcp-server"
+        old_global.parent.mkdir()
+        old_global.write_text("#!/bin/sh\n", encoding="utf-8")
+        old_global.chmod(0o755)
+        monkeypatch.setenv("PATH", str(old_global.parent))
+
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with patch(f"{MOD}._sibling_script", return_value=str(sibling)):
+            result = install_agent("opencode-agent", "opencode_cli")
+
+        assert result.success is True
+        config = json.loads(install_paths["opencode_config_file"].read_text())
+        assert config["mcp"]["cao-mcp-server"]["command"] == [
+            str(sibling),
+            "--log-level",
+            "debug",
+        ]
+        assert config["mcp"]["user-server"]["command"] == ["custom-mcp", "--port", "9876"]
 
     def test_install_rejects_kas_profile_before_writing_kiro_config(
         self, install_paths: dict[str, Path]

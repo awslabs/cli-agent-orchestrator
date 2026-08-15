@@ -320,19 +320,6 @@ def install_agent(
                     )
                 provider = DEFAULT_PROVIDER
 
-        # Resolve the bundled cao-mcp-server console script to a PATH-independent
-        # invocation before materializing provider configs. The
-        # configs Kiro/Q write to disk are consumed verbatim by those CLIs, so
-        # resolution must happen here rather than at launch time. persisted=True
-        # prefers the stable PATH launcher (e.g. ~/.local/bin/cao-mcp-server)
-        # over the versioned venv-internal path, so a later `uv tool upgrade`
-        # does not leave the written config pointing at a relocated binary.
-        if profile.mcpServers:
-            profile.mcpServers = {
-                name: resolve_mcp_server_config(dict(cfg), persisted=True)
-                for name, cfg in profile.mcpServers.items()
-            }
-
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
         context_file = _write_context_file(profile.name, raw_content)
 
@@ -349,6 +336,14 @@ def install_agent(
                     "render KAS profiles or translate allowedTools/toolsSettings to Cedar. "
                     "Set engine: v2 or wait for a later migration phase."
                 )
+            # Kiro consumes this durable agent JSON at later launches. Keep
+            # its stable PATH-launcher preference rather than pinning the
+            # versioned interpreter sibling into a long-lived config.
+            if profile.mcpServers:
+                profile.mcpServers = {
+                    name: resolve_mcp_server_config(dict(cfg), persisted=True)
+                    for name, cfg in profile.mcpServers.items()
+                }
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
             # (metadata at startup, full content on demand).

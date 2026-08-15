@@ -109,12 +109,11 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     - ``"enabled": true`` added
     - ``env`` → ``environment`` (OpenCode's key for process env vars)
     """
-    # Resolve the bundled cao-mcp-server console script to a PATH-independent
-    # invocation before flattening into OpenCode's command list.
-    # persisted=True: OpenCode reads this from opencode.json at launch, so prefer
-    # the stable PATH launcher over a versioned venv path that upgrades relocate.
+    # Resolve only the bare bundled helper to the current CAO interpreter's
+    # sibling/module target before flattening it into OpenCode's command list.
+    # A globally resolved launcher may belong to an older CAO installation.
     command_str, args = resolve_cao_mcp_command(
-        cao_config.get("command", ""), cao_config.get("args", []) or [], persisted=True
+        cao_config.get("command", ""), cao_config.get("args", []) or []
     )
     full_command: List[str] = ([command_str] if command_str else []) + list(args)
 
