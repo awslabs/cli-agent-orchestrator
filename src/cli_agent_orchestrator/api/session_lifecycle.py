@@ -45,6 +45,7 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_WRITE,
     require_any_scope,
 )
+from cli_agent_orchestrator.services import cohort_journal as cohort
 from cli_agent_orchestrator.services import session_lifecycle as sl
 from cli_agent_orchestrator.services import session_resumability, session_service
 
@@ -61,6 +62,13 @@ _STATUS_FOR_CODE = {
     "session-lifecycle-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
 }
 
+_COHORT_STATUS_FOR_CODE = {
+    "cohort-journal-invalid": status.HTTP_400_BAD_REQUEST,
+    "cohort-journal-conflict": status.HTTP_409_CONFLICT,
+    "cohort-journal-not-found": status.HTTP_404_NOT_FOUND,
+    "cohort-journal-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
+}
+
 
 def _http(exc: sl.SessionLifecycleError) -> HTTPException:
     # First line only. A store failure wraps the driver's exception, which
@@ -68,6 +76,13 @@ def _http(exc: sl.SessionLifecycleError) -> HTTPException:
     # generated query.
     return HTTPException(
         status_code=_STATUS_FOR_CODE.get(exc.code, status.HTTP_400_BAD_REQUEST),
+        detail=str(exc).splitlines()[0],
+    )
+
+
+def _cohort_http(exc: cohort.CohortJournalError) -> HTTPException:
+    return HTTPException(
+        status_code=_COHORT_STATUS_FOR_CODE.get(exc.code, status.HTTP_400_BAD_REQUEST),
         detail=str(exc).splitlines()[0],
     )
 
@@ -140,6 +155,36 @@ class KindBody(StrictBody):
     kind: str = Field(pattern=r"^(campaign|service)$")
     declared_by: str = Field(min_length=1, max_length=200)
     expected_epoch: Optional[int] = Field(default=None, ge=0)
+
+
+@router.get("/cohort-operations/{operation_id}")
+async def get_cohort_operation(
+    operation_id: str,
+    _scopes: List[str] = _READ,
+) -> Dict[str, Any]:
+    """Read one durable cohort journal with members and transitions.
+
+    C1 exposes only this tmux-free read projection. No cohort mutation route
+    exists until the later executor can perform the matching lifecycle,
+    barrier, physical-resource, wait-runner, and supervisor effects.
+    """
+    try:
+        return await asyncio.to_thread(cohort.get_operation, operation_id)
+    except cohort.CohortJournalError as exc:
+        raise _cohort_http(exc)
+
+
+@router.get("/sessions/{session_name}/cohort-operations")
+async def list_session_cohort_operations(
+    session_name: str,
+    _scopes: List[str] = _READ,
+) -> Dict[str, Any]:
+    """List durable cohort-operation projections without consulting tmux."""
+    try:
+        operations = await asyncio.to_thread(cohort.list_operations, session_name)
+    except cohort.CohortJournalError as exc:
+        raise _cohort_http(exc)
+    return {"operations": operations, "count": len(operations)}
 
 
 @router.get("/session-lifecycle")

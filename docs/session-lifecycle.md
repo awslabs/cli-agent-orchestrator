@@ -7,11 +7,13 @@ because every declared state is a suppressor for the recovery path.
 
 Status: phased. The lifecycle storage, the HTTP/CLI routes, and the
 row-preserving stop/archive collection described here are **implemented**
-(by this work). Two things remain **deferred**: resuming a stopped session
-(relaunching each worker against its recorded native session — see §4), and
-the Fire Marshal cutover that consumes these declarations. The lifecycle
-foundation is a prerequisite for both, sequenced first because without it a
-deliberately-stopped session is indistinguishable from a stalled one.
+(by this work). M3-C C1 also implements the **dark cohort journal** described
+in §4.3: exact lifecycle/roster boundary claims, member snapshots, receipted
+state transitions, and read-only HTTP projections. The new safe/force
+Pause/Stop/Resume effects and controls remain deferred. The legacy stop route
+therefore behaves exactly as documented in §4.0, and importing or reading the
+new journal cannot claim a Stop barrier or touch a pane. Fire Marshal cutover
+also remains deferred.
 
 ---
 
@@ -243,6 +245,42 @@ wall-clock, and treating a mismatch as a recycled pid would turn a daylight
 at, and what the system could still see, under a schema distinct from the
 machine proof. Resuming past a live owner stays refused; resuming past an
 *unresponsive* one is possible, deliberately, with a name attached.
+
+### 4.3 Dark M3-C cohort journal (C1)
+
+The fleet lifecycle needs a durable whole-cohort record before safe/force
+effects can be made retryable. C1 adds three additive tables:
+
+- `session_cohort_operations` binds a caller-minted operation ID and canonical
+  request digest to the exact declared lifecycle epoch, an opaque SHA-256 of
+  the sorted stable-agent ID/revision vector, and a digest of the full member
+  snapshot. One exact lifecycle/roster slot has one winner.
+- `session_cohort_members` retains every stable agent at the boundary. Agents
+  already dormant/retired are visible but marked excluded, so fleet Resume
+  cannot resurrect them accidentally. Nullable task-occurrence and boundary
+  evidence carriers remain empty until M3-D supplies that authority.
+- `session_cohort_transitions` is an append-only state-epoch CAS log. Safe mode
+  cannot become force through an ordinary transition; explicit promotion
+  requires and preserves a receipt digest.
+
+The closed state vocabulary is `preparing`, `draining-to-boundary`,
+`interrupting`, `tearing-down`, `paused`, `stopped`, `restoring`,
+`reconciliation-required`, and `settled`. C1 implements only the Pause/Stop
+journal paths needed by its schema slice. In particular, its journal-only
+transition function cannot enter terminal `paused` or `stopped`: a later slice
+must add a paired function that advances the session lifecycle epoch and
+terminal cohort state atomically. A retry out of `reconciliation-required`
+requires a receipt, and a safe-to-force recovery from that state remains the
+distinct receipted promotion path. C1 intentionally exposes no mutation route
+and performs no lifecycle, Stop-barrier, tmux, provider, wait-runner, inbox, or
+conductor effect. Read projections are available at
+`GET /cohort-operations/{operation_id}` and
+`GET /sessions/{session_name}/cohort-operations` without consulting tmux.
+
+Later M3-C slices consume this journal to pair each recorded transition with
+the matching physical and lifecycle effect, then add operator-only partial
+Resume. M3-D remains the sole task-occurrence and supervisor-drain authority;
+C1 does not infer task meaning from CAO's physical roster.
 
 ---
 
