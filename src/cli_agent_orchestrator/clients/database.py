@@ -931,6 +931,151 @@ class RestoreContractModel(Base):
     )
 
 
+class ReincarnationOperationModel(Base):
+    """One durable, idempotent physical-reincarnation operation (cond-0378 B2).
+
+    A claim binds every immutable fact of an exact same-native-session
+    reincarnation — caller-minted operation id and canonical request digest,
+    canonical session name, the stable agent's exact post-B1 roster revision
+    and role/profile family, current lineage and exact retired prior
+    incarnation, lifecycle epoch and declared lifecycle observation, harness
+    and same-harness native session id, the exact B1 restore-contract
+    id/digest/schema, and the requested route/provider/model/effort/execution-
+    mode facts plus a bounded compatibility-cell reference/digest (recorded,
+    never inferred as passing here).
+
+    ``request_json`` is the canonical serialization and ``request_digest`` its
+    sha256.  The winner slot — (agent, prior incarnation, lifecycle epoch,
+    roster revision) — admits exactly one operation: an exact
+    operation-id/request replay adopts the durable truth first (even after a
+    post-commit barrier/lifecycle/roster change), changed immutable input
+    under one operation id conflicts, and a concurrent different id for the
+    same slot queries/adopts the durable winner.  ``phase`` is the journal
+    phase the winner is in — ``claimed``, then the last authorized physical
+    step in the exact accepted sequence; the shared session-effect seam
+    CAS-advances it to each authorized step and never permits skips,
+    reversals, or two intents for one logical step.
+    """
+
+    __tablename__ = "reincarnation_operations"
+
+    operation_id = Column(Text, primary_key=True)
+    request_digest = Column(Text, nullable=False)
+    schema_version = Column(Text, nullable=False)
+    session_name = Column(Text, nullable=False)
+    agent_id = Column(Text, nullable=False)
+    roster_revision = Column(Integer, nullable=False)
+    role = Column(Text, nullable=False)
+    profile_family = Column(Text, nullable=False)
+    lineage_id = Column(Text, nullable=False)
+    harness = Column(Text, nullable=False)
+    native_session_id = Column(Text, nullable=False)
+    prior_terminal_id = Column(Text, nullable=False)
+    prior_generation = Column(Text, nullable=True)
+    prior_incarnation_id = Column(Text, nullable=False)
+    lifecycle_epoch = Column(Integer, nullable=False)
+    lifecycle_observation = Column(Text, nullable=False)
+    restore_contract_id = Column(Text, nullable=False)
+    restore_contract_digest = Column(Text, nullable=False)
+    restore_contract_schema = Column(Text, nullable=False)
+    route_provider = Column(Text, nullable=True)
+    model_requested = Column(Text, nullable=True)
+    effort_requested = Column(Text, nullable=True)
+    execution_mode_requested = Column(Text, nullable=True)
+    compatibility_cell_ref = Column(Text, nullable=True)
+    compatibility_cell_digest = Column(Text, nullable=True)
+    phase = Column(Text, nullable=False)
+    request_json = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        #: One winning operation per exact source slot; every column is NOT
+        #: NULL so the plain unique index is the exact invariant.
+        Index(
+            "ix_reincarnation_operations_slot",
+            "agent_id",
+            "prior_incarnation_id",
+            "lifecycle_epoch",
+            "roster_revision",
+            unique=True,
+        ),
+        Index("ix_reincarnation_operations_session", "session_name"),
+        Index("ix_reincarnation_operations_agent", "agent_id"),
+    )
+
+
+class ReincarnationEffectIntentModel(Base):
+    """One append-only physical-effect intent recorded by the shared seam.
+
+    The seam CAS-authorizes the NEXT physical effect intent only while the
+    exact winning operation is in the expected journal phase, the session
+    lifecycle is still the bound epoch and not ``stopped``, the fork-owned
+    session barrier is unclaimed, and the bound stable-agent/source/restore
+    facts still agree with the operation.  The intent row is the durable
+    linearization point written BEFORE the caller performs any physical I/O:
+    if the barrier is claimed afterwards, the intent stays readable so M3-C
+    can adopt/drain or force-reap it; if the barrier was claimed first, no
+    intent row is ever created.
+
+    ``effect_payload_json`` is the canonical bounded payload (flat string
+    references/digests only — never task text, provider output, secrets, or
+    arbitrary environment values) and ``effect_digest`` its sha256; an exact
+    replay of one (operation, effect) id adopts, changed payload conflicts.
+    One logical physical step has exactly one intent: the unique
+    (operation, step) slot prevents two caller-minted effect ids from
+    authorizing the same step.
+    """
+
+    __tablename__ = "reincarnation_effect_intents"
+
+    effect_id = Column(Text, primary_key=True)
+    operation_id = Column(Text, nullable=False)
+    effect_step = Column(Text, nullable=False)
+    effect_digest = Column(Text, nullable=False)
+    effect_payload_json = Column(Text, nullable=False)
+    recorded_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        Index("ix_reincarnation_effect_intents_operation", "operation_id"),
+        #: One logical physical step has exactly one intent: the unique
+        #: (operation, step) slot prevents two caller-minted effect ids from
+        #: authorizing the same step, which would let a good-faith
+        #: response-loss/reconstruction retry perform one physical step twice.
+        Index(
+            "ix_reincarnation_effect_intents_step",
+            "operation_id",
+            "effect_step",
+            unique=True,
+        ),
+    )
+
+
+class SessionEffectBarrierModel(Base):
+    """The durable fork-owned per-session barrier M3-C claims during Stop.
+
+    ``open`` means no Stop has claimed the session; ``claimed`` is the
+    linearization point after which no later reincarnation effect phase may
+    begin.  A claimed barrier never expires and is never cleared
+    automatically, by a condition becoming true, or by a timeout — only a
+    later operator-authorized Resume lifecycle (M3-C/M3-F scope) may open the
+    stopped campaign again.  Replaying a claim adopts the existing record and
+    never overwrites the first claimer.
+    """
+
+    __tablename__ = "session_effect_barriers"
+
+    session_name = Column(Text, primary_key=True)
+    state = Column(Text, nullable=False)
+    claimed_by = Column(Text, nullable=True)
+    reason = Column(Text, nullable=True)
+    #: Monotonic per-row counter; every CAS transition bumps it so a lost
+    #: update is detectable rather than silently last-write-wins.
+    epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
 class NativeStatusRepairEvidenceModel(Base):
     """One immutable bounded record of a native /status identity repair.
 
@@ -1464,6 +1609,7 @@ def init_db() -> None:
     _migrate_managed_launch_v2()
     _migrate_stable_agent_roster()
     _migrate_restore_contracts()
+    _migrate_operation_journal()
     _migrate_native_status_repair()
     _migrate_native_status_observation_attempt()
     _migrate_legacy_identity_migration()
@@ -2045,6 +2191,106 @@ def _migrate_restore_contracts() -> None:
             )
     except Exception as e:  # noqa: BLE001 - the transition path fails closed
         logger.warning(f"restore-contract migration failed: {e}")
+
+
+def _migrate_operation_journal() -> None:
+    """Create the operation-journal tables on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via the
+    ``ReincarnationOperationModel`` / ``ReincarnationEffectIntentModel`` /
+    ``SessionEffectBarrierModel`` models; this idempotent migration covers
+    databases created before cond-0378 B2.  The DDL is byte-compatible with
+    the ORM models so both paths yield one schema.  Additive and dark: an old
+    binary never reads these tables, and existing B1 restore-contract and
+    M3-A roster rows are untouched.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS reincarnation_operations ("
+                "operation_id TEXT NOT NULL PRIMARY KEY, "
+                "request_digest TEXT NOT NULL, "
+                "schema_version TEXT NOT NULL, "
+                "session_name TEXT NOT NULL, "
+                "agent_id TEXT NOT NULL, "
+                "roster_revision INTEGER NOT NULL, "
+                "role TEXT NOT NULL, "
+                "profile_family TEXT NOT NULL, "
+                "lineage_id TEXT NOT NULL, "
+                "harness TEXT NOT NULL, "
+                "native_session_id TEXT NOT NULL, "
+                "prior_terminal_id TEXT NOT NULL, "
+                "prior_generation TEXT, "
+                "prior_incarnation_id TEXT NOT NULL, "
+                "lifecycle_epoch INTEGER NOT NULL, "
+                "lifecycle_observation TEXT NOT NULL, "
+                "restore_contract_id TEXT NOT NULL, "
+                "restore_contract_digest TEXT NOT NULL, "
+                "restore_contract_schema TEXT NOT NULL, "
+                "route_provider TEXT, "
+                "model_requested TEXT, "
+                "effort_requested TEXT, "
+                "execution_mode_requested TEXT, "
+                "compatibility_cell_ref TEXT, "
+                "compatibility_cell_digest TEXT, "
+                "phase TEXT NOT NULL, "
+                "request_json TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            # One winning operation per exact source slot (agent, prior
+            # incarnation, lifecycle epoch, roster revision).
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_reincarnation_operations_slot "
+                "ON reincarnation_operations"
+                "(agent_id, prior_incarnation_id, lifecycle_epoch, roster_revision)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_reincarnation_operations_session "
+                "ON reincarnation_operations(session_name)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_reincarnation_operations_agent "
+                "ON reincarnation_operations(agent_id)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS reincarnation_effect_intents ("
+                "effect_id TEXT NOT NULL PRIMARY KEY, "
+                "operation_id TEXT NOT NULL, "
+                "effect_step TEXT NOT NULL, "
+                "effect_digest TEXT NOT NULL, "
+                "effect_payload_json TEXT NOT NULL, "
+                "recorded_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_reincarnation_effect_intents_operation "
+                "ON reincarnation_effect_intents(operation_id)"
+            )
+            # One logical physical step has exactly one intent (ORM/raw-DDL
+            # parity with the model's unique step index).
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_reincarnation_effect_intents_step "
+                "ON reincarnation_effect_intents(operation_id, effect_step)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_effect_barriers ("
+                "session_name TEXT NOT NULL PRIMARY KEY, "
+                "state TEXT NOT NULL, "
+                "claimed_by TEXT, "
+                "reason TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - the effect seam fails closed
+        logger.warning(f"operation-journal migration failed: {e}")
 
 
 def _migrate_native_status_repair() -> None:
