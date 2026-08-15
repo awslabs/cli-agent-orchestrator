@@ -38,9 +38,11 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.providers.codex import render_trusted_project_override
 from cli_agent_orchestrator.services import exact_executor as xe
 from cli_agent_orchestrator.services import (
     managed_launch_v2,
+    muse_native_launch,
 )
 from cli_agent_orchestrator.services import native_attachment as na
 from cli_agent_orchestrator.services import native_attachment_recovery as recovery
@@ -1150,6 +1152,72 @@ def test_trusted_project_root_drift_refuses_before_effects(launch_root, monkeypa
     assert oj.list_effect_intents(request.operation_id) == []
 
 
+@pytest.mark.parametrize("material_field", ["extra_args", "profile_args"])
+def test_codex_material_cannot_shadow_the_contract_trusted_root(
+    launch_root, monkeypatch, material_field
+):
+    """A later Codex projects override cannot win over contract-owned trust.
+
+    Exact resume adds the canonical trusted root before sealed material.  A
+    second projects override in either later material lane would make option
+    precedence, rather than the restore contract, decide which root is trusted.
+    """
+    bind, contract = _codex_dormant_worker(launch_root, launch_root["workdir"])
+    request = _codex_request(bind, contract)
+    _reap_noop(monkeypatch)
+    transport = FakeTransport(workdir=launch_root["workdir"])
+    material = xe.LaunchMaterial(
+        **{
+            material_field: [
+                "-c",
+                'projects={"/tmp/other"={trust_level="trusted"}}',
+            ]
+        }
+    )
+
+    with pytest.raises(xe.ExactExecutorRefused) as excinfo:
+        _run(_execute(request, transport, material=material))
+
+    assert "trusted project root" in str(excinfo.value)
+    assert transport.created == 0
+    assert oj.list_effect_intents(request.operation_id) == []
+
+
+def test_trusted_project_root_drift_at_launch_is_a_retryable_typed_refusal(
+    launch_root, monkeypatch
+):
+    """A root can drift after the pre-effect check but before argv rendering.
+
+    At that point the prior incarnation is already reaped and detached, but
+    no successor effect may be authorized.  Preserve that truthful phase as
+    a durable retryable refusal instead of leaking a bare ``ValueError``.
+    """
+    bind, contract = _codex_dormant_worker(launch_root, launch_root["workdir"])
+    request = _codex_request(bind, contract)
+    _reap_noop(monkeypatch)
+    transport = FakeTransport(workdir=launch_root["workdir"])
+
+    def _drifted_root(_root):
+        raise ValueError("trusted project root is no longer canonical")
+
+    monkeypatch.setattr(xe, "render_trusted_project_override", _drifted_root)
+
+    with pytest.raises(xe.ExactExecutorRefused) as excinfo:
+        _run(_execute(request, transport))
+
+    assert "drifted before successor launch" in str(excinfo.value)
+    assert transport.created == 0
+    effects = oj.list_effect_intents(request.operation_id)
+    assert [effect["effect_step"] for effect in effects] == [
+        oj.EFFECT_STEP_FENCE_PRIOR,
+        oj.EFFECT_STEP_REAP_PRIOR,
+        oj.EFFECT_STEP_RELEASE_ATTACHMENT,
+    ]
+    result = oj.get_result(request.operation_id)
+    assert result["result_state"] == oj.RESULT_REFUSED
+    assert "no successor effect was authorized" in result["result_detail"]
+
+
 def test_trusted_project_root_on_a_non_codex_harness_refuses(launch_root, monkeypatch):
     """A trusted project root applies only to the Codex harness: a contract
     carrying one for any other harness cannot authorize an exact launch."""
@@ -1485,16 +1553,202 @@ def test_codex_pins_and_trusted_root_reach_the_managed_creation(launch_root, mon
     # explicit CODEX_HOME carrier lane — never an ambient HOME default.
     assert kwargs["env_vars"]["CODEX_HOME"] == launch_root["home_dir"]
     argv = kwargs["managed_native_command"]
-    # Codex profile/route options precede the resume subcommand; the
-    # identity pair stays final.
+    # Codex route and invocation-only trust options precede the resume
+    # subcommand; the identity pair stays final. Passing the trusted root as
+    # terminal metadata alone is insufficient because managed_native_command
+    # bypasses the provider command builder.
     assert argv[-2:] == ["resume", _NATIVE_ID]
-    assert argv[:5] == [
+    assert argv[:7] == [
         launch_root["binary"],
         "--model",
         "gpt-5.3-codex",
         "-c",
         'model_reasoning_effort="high"',
+        "-c",
+        render_trusted_project_override(launch_root["workdir"]),
     ]
+
+
+def test_muse_resume_revalidates_the_profile_carrier_and_proves_its_inner_image(
+    launch_root, monkeypatch
+):
+    """The canaried wrapper may exec only its exact proven Muse inner image."""
+    bind = _bind_worker(
+        harness="muse_cli",
+        route_provenance={"provider_route": "meta"},
+    )
+    full_banner = "Muse Code 0.1.0 (0.1.0-R708.1)"
+    inner = os.path.realpath(os.path.join(launch_root["workdir"], "muse-bin-0.1.0-R708.1"))
+    with open(inner, "wb") as handle:
+        handle.write(b"#!/bin/sh\nsleep 60\n")
+    os.chmod(inner, os.stat(inner).st_mode | stat.S_IXUSR)
+    inner_digest = hashlib.sha256(open(inner, "rb").read()).hexdigest()
+    contract = _contract_for(
+        bind,
+        launch_root,
+        harness="muse_cli",
+        provider="muse_cli",
+        model=_fact("muse-spark-1.2"),
+        effort=_fact("high"),
+        executable=_fact(
+            {
+                "path": launch_root["binary"],
+                "sha256": launch_root["binary_sha256"],
+                "version": full_banner,
+            }
+        ),
+        profile_material=_fact(
+            {
+                "profile_system_prompt_path": launch_root["profile_path"],
+                "profile_system_prompt_sha256": launch_root["profile_sha256"],
+            }
+        ),
+    )
+    rc.publish_contract(contract)
+    roster.transition_dormant(
+        terminal_id=contract.terminal_id,
+        generation=contract.generation,
+        agent_id=contract.agent_id,
+        lineage_id=contract.lineage_id,
+        contract_digest=contract.digest(),
+        reason="pane lost",
+    )
+    request = _operation_request(
+        bind,
+        contract,
+        harness="muse_cli",
+        route_provider="muse_cli",
+        model_requested="muse-spark-1.2",
+        effort_requested="high",
+        compatibility_cell_ref="muse_cli:meta:native_tui:r708.1",
+    )
+    capability = muse_native_launch.MuseProfileCarrierCapability(
+        True,
+        "",
+        cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+        full_banner=full_banner,
+        inner_executable=inner,
+        inner_executable_sha256=inner_digest,
+    )
+    monkeypatch.setattr(
+        muse_native_launch,
+        "profile_carrier_capability",
+        lambda **_kwargs: capability,
+    )
+    _prior_attachment(provider="muse_cli")
+    _reap_noop(monkeypatch)
+    transport = FakeTransport(
+        workdir=launch_root["workdir"],
+        observed_argv=[
+            inner,
+            "resume",
+            _NATIVE_ID,
+            "--model",
+            "muse-spark-1.2",
+            "--reasoning-effort",
+            "high",
+            "--trust-workspace",
+            "--yolo",
+        ],
+    )
+    material = xe.LaunchMaterial(
+        profile_args=["--trust-workspace", "--yolo"],
+        profile_environment={
+            muse_native_launch.PROFILE_SYSTEM_PROMPT_ENV: launch_root["profile_path"],
+            "MUSE_NO_AUTO_UPDATE": "1",
+        },
+    )
+    launch_call: dict[str, Any] = {}
+    original_start = native_tui_launch.start
+
+    def _spy_start(**kwargs):
+        launch_call.update(kwargs)
+        return original_start(**kwargs)
+
+    monkeypatch.setattr(native_tui_launch, "start", _spy_start)
+
+    result = _run(_execute(request, transport, material=material))
+
+    assert result["outcome"] == xe.OUTCOME_ACCEPTED
+    assert transport.argv == [
+        launch_root["binary"],
+        "resume",
+        _NATIVE_ID,
+        "--model",
+        "muse-spark-1.2",
+        "--reasoning-effort",
+        "high",
+        "--trust-workspace",
+        "--yolo",
+    ]
+    assert launch_call["expected_inner_executable"] == inner
+    assert launch_call["expected_inner_executable_sha256"] == inner_digest
+    evidence = oj.get_operation(request.operation_id)["result_evidence"]
+    assert evidence["profile_carrier_inner_sha256"] == inner_digest
+
+
+def test_muse_profile_carrier_drift_refuses_before_effects(launch_root, monkeypatch):
+    """A changed wrapper/inner pair cannot consume the exact Muse cell."""
+    bind = _bind_worker(
+        harness="muse_cli",
+        route_provenance={"provider_route": "meta"},
+    )
+    contract = _contract_for(
+        bind,
+        launch_root,
+        harness="muse_cli",
+        provider="muse_cli",
+        model=_fact("muse-spark-1.2"),
+        effort=_fact("high"),
+        executable=_fact(
+            {
+                "path": launch_root["binary"],
+                "sha256": launch_root["binary_sha256"],
+                "version": "Muse Code 0.1.0 (0.1.0-R708.1)",
+            }
+        ),
+        profile_material=_fact(
+            {
+                "profile_system_prompt_path": launch_root["profile_path"],
+                "profile_system_prompt_sha256": launch_root["profile_sha256"],
+            }
+        ),
+    )
+    rc.publish_contract(contract)
+    roster.transition_dormant(
+        terminal_id=contract.terminal_id,
+        generation=contract.generation,
+        agent_id=contract.agent_id,
+        lineage_id=contract.lineage_id,
+        contract_digest=contract.digest(),
+        reason="pane lost",
+    )
+    request = _operation_request(
+        bind,
+        contract,
+        harness="muse_cli",
+        route_provider="muse_cli",
+        model_requested="muse-spark-1.2",
+        effort_requested="high",
+        compatibility_cell_ref="muse_cli:meta:native_tui:r708.1",
+    )
+    monkeypatch.setattr(
+        muse_native_launch,
+        "profile_carrier_capability",
+        lambda **_kwargs: muse_native_launch.MuseProfileCarrierCapability(
+            False,
+            "the installed wrapper digest no longer selects the proven inner image",
+        ),
+    )
+    _reap_noop(monkeypatch)
+    transport = FakeTransport(workdir=launch_root["workdir"])
+
+    with pytest.raises(xe.ExactExecutorRefused, match="profile carrier"):
+        _run(_execute(request, transport))
+
+    assert transport.created == 0
+    assert oj.list_effect_intents(request.operation_id) == []
+    assert oj.get_operation(request.operation_id)["successor_terminal_id"] is None
 
 
 def test_route_pin_maps_each_supported_harness():
@@ -2252,6 +2506,24 @@ def test_launch_material_is_bounded_and_validated(launch_root, monkeypatch):
     with pytest.raises(xe.ExactExecutorInvalid):
         _run(_execute(request, transport, material=xe.LaunchMaterial(extra_args="--flag")))
     assert transport.created == 0
+
+
+def test_composed_profile_args_have_a_larger_bounded_lane_than_extra_args():
+    """Generated Codex profile text is launch material, not a task message.
+
+    It can exceed the compact generic argv cap, while unrelated extra args
+    retain that smaller bound and the profile lane retains its own hard cap.
+    """
+    composed = "developer_instructions=" + ("x" * 15000)
+    validated = xe._validate_launch_material(xe.LaunchMaterial(profile_args=[composed]))
+    assert validated.profile_args == (composed,)
+
+    with pytest.raises(xe.ExactExecutorInvalid, match="extra_args entries"):
+        xe._validate_launch_material(xe.LaunchMaterial(extra_args=[composed]))
+    with pytest.raises(xe.ExactExecutorInvalid, match="profile_args entries"):
+        xe._validate_launch_material(
+            xe.LaunchMaterial(profile_args=["x" * (xe.MAX_PROFILE_ARG_LEN + 1)])
+        )
 
 
 def test_secret_bearing_carrier_requires_the_exact_cell(launch_root, monkeypatch):

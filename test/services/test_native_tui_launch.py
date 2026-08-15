@@ -782,6 +782,55 @@ def test_a_drifted_binary_is_refused_with_nothing_claimed(
     assert native_attachment.get(PROVIDER, SESSION) is None
 
 
+def test_a_drifted_inner_binary_is_refused_with_nothing_claimed(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], tmp_path: Any
+) -> None:
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"first")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    pane = FakePane(observation=_observation([inner_path, "--session", SESSION]))
+
+    with pytest.raises(native_tui_launch.NativeLaunchInvalid, match="digest"):
+        _start(
+            pinned_binary,
+            pane,
+            expected_inner_executable=inner_path,
+            expected_inner_executable_sha256="0" * 64,
+        )
+
+    assert pane.created == []
+    assert native_attachment.get(PROVIDER, SESSION) is None
+
+
+def test_inner_binary_drift_during_launch_freezes_before_publication(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], tmp_path: Any
+) -> None:
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"first")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    inner_digest = hashlib.sha256(inner.read_bytes()).hexdigest()
+
+    class DriftPane(FakePane):
+        def observe(self) -> Optional[Mapping[str, Any]]:
+            inner.write_bytes(b"second")
+            return super().observe()
+
+    pane = DriftPane(observation=_observation([inner_path, "--session", SESSION]))
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(
+            pinned_binary,
+            pane,
+            expected_inner_executable=inner_path,
+            expected_inner_executable_sha256=inner_digest,
+        )
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
+
+
 def test_a_bare_binary_name_is_refused(
     isolated_memory_db: Any, pinned_binary: tuple[str, str]
 ) -> None:

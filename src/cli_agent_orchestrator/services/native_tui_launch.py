@@ -940,6 +940,7 @@ def _publish(
     working_directory: str,
     observation: Mapping[str, Any],
     expected_inner_executable: Optional[str] = None,
+    expected_inner_executable_sha256: Optional[str] = None,
     session_proof: str = SESSION_PROOF_ARGV,
     proven_rendered_rows: Optional[Sequence[str]] = None,
     provider_version: Optional[str] = None,
@@ -1007,6 +1008,23 @@ def _publish(
                     f"inner executable {expected_inner_executable!r}"
                 ),
             )
+        if expected_inner_executable_sha256 is not None:
+            try:
+                observed_digest = _sha256_file(expected_inner_executable)
+            except OSError:
+                _freeze(
+                    provider=provider,
+                    native_session_id=native_session_id,
+                    reason=AMBIGUOUS_PROCESS_IMAGE_MISMATCH,
+                    detail="the declared inner executable became unreadable before publication",
+                )
+            if observed_digest != expected_inner_executable_sha256:
+                _freeze(
+                    provider=provider,
+                    native_session_id=native_session_id,
+                    reason=AMBIGUOUS_PROCESS_IMAGE_MISMATCH,
+                    detail="the declared inner executable digest changed before publication",
+                )
     try:
         return native_attachment.mark_attached(
             provider=provider,
@@ -1235,6 +1253,7 @@ def start(
     extra_args: Optional[Sequence[str]] = None,
     launch_kind: str = LAUNCH_KIND_RESUME,
     expected_inner_executable: Optional[str] = None,
+    expected_inner_executable_sha256: Optional[str] = None,
     provider_version: Optional[str] = None,
     authorize: Optional[Callable[[str], None]] = None,
 ) -> dict[str, Any]:
@@ -1282,6 +1301,12 @@ def start(
         )
 
     binary = _validate_binary(binary, binary_sha256)
+    if expected_inner_executable_sha256 is not None:
+        if expected_inner_executable is None:
+            raise NativeLaunchInvalid("an inner executable digest requires an inner executable")
+        inner = _validate_binary(expected_inner_executable, expected_inner_executable_sha256)
+        if inner != expected_inner_executable:
+            raise NativeLaunchInvalid("inner executable must be canonical")
     # Before ``declare``, so a non-canonical directory costs a refusal
     # with nothing claimed and no pane started, rather than a frozen
     # attachment.
@@ -1385,6 +1410,7 @@ def start(
             working_directory=working_directory,
             observation=observation,
             expected_inner_executable=expected_inner_executable,
+            expected_inner_executable_sha256=expected_inner_executable_sha256,
             session_proof=session_proof,
             proven_rendered_rows=proven_rendered_rows,
             provider_version=provider_version,
@@ -1471,6 +1497,7 @@ def start(
         working_directory=working_directory,
         observation=observation,
         expected_inner_executable=expected_inner_executable,
+        expected_inner_executable_sha256=expected_inner_executable_sha256,
         session_proof=session_proof,
         proven_rendered_rows=proven_rendered_rows,
         provider_version=provider_version,
