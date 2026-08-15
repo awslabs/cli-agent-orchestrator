@@ -5453,6 +5453,29 @@ async def delete_terminal(
         )
 
 
+_LEGACY_RUNTIME_ADDRESS_SUFFIX = re.compile(
+    r"\n\n\[Message from terminal [^]\n]+\. "
+    r"Use send_message MCP tool for any follow-up work\.\]\s*$"
+)
+_MANAGED_PERSISTENT_MESSAGE_PREFIXES = (
+    "[Managed persistent request request_id=",
+    "[Persistent department result request_id=",
+)
+
+
+def _sanitize_managed_persistent_message(message: str) -> str:
+    """Strip legacy model-visible runtime addresses from managed semantic messages.
+
+    The sender/receiver runtime IDs remain in structured inbox columns for routing
+    and audit. They must never be duplicated into model-visible managed persistent
+    message text. Enforcing this at the API boundary protects even an already-running
+    older MCP client until it restarts onto the client-side suppression code.
+    """
+    if not message.startswith(_MANAGED_PERSISTENT_MESSAGE_PREFIXES):
+        return message
+    return _LEGACY_RUNTIME_ADDRESS_SUFFIX.sub("", message)
+
+
 @app.post("/terminals/{receiver_id}/inbox/messages")
 async def create_inbox_message_endpoint(
     request: Request,
@@ -5467,7 +5490,7 @@ async def create_inbox_message_endpoint(
         inbox_msg = create_inbox_message(
             sender_id,
             receiver_id,
-            message,
+            _sanitize_managed_persistent_message(message),
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
