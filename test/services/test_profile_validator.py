@@ -9,8 +9,6 @@ also serves as the no-behaviour-change guard for the extraction.
 Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/510
 """
 
-import time
-
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -334,96 +332,120 @@ class TestMalformedButParseableInput:
         assert any(f.severity == "warning" for f in role_findings)
 
 
-def _alias_amplified_yaml(levels: int, leaf: str = "{k: v}") -> str:
-    """A schema-valid profile whose value graph is 2**``levels`` paths.
+def _alias_amplified_yaml(levels: int, leaf: str = "{k: v}", tail: str = "") -> str:
+    """A profile whose *expanded* value count is exponential in ``levels``.
 
     Each anchor references the previous one twice, so ``yaml.safe_load`` returns
-    ``levels + 1`` dicts while an unmemoized walk sees an exponential number of
-    paths through them. Nested under ``toolsSettings`` because that field is a
-    free-form object, which keeps the document *valid* -- the point being that a
-    rejected document would never reach a full traversal anyway.
+    ``levels + 1`` dicts while a full expansion of them contains ~2**levels
+    values. Nested under ``toolsSettings``/``hooks`` because those fields are
+    free-form objects, which keeps the document otherwise *valid*: a document
+    rejected on its own merits would never reach the expensive steps anyway.
+
+    ``tail`` appends a final line, used to plant a schema error whose offending
+    instance is the amplified node.
     """
-    lines = ["---", "name: bomb", "description: A profile.", "toolsSettings:", f"  a0: &a0 {leaf}"]
+    lines = ["---", "name: bomb", "description: A profile.", "hooks:", f"  a0: &a0 {leaf}"]
     for level in range(1, levels + 1):
         lines.append(f"  a{level}: &a{level} {{x: *a{level - 1}, y: *a{level - 1}}}")
+    if tail:
+        lines.append(tail)
     return "\n".join(lines) + "\n---\n\nBody.\n"
 
 
 class TestAliasAmplificationIsBounded:
-    """A YAML-anchor bomb must not stall the key walk.
+    """A YAML-anchor bomb must not reach anything that pays for its expansion.
 
-    Round 2 of review on #585 added a non-string mapping key check whose only
-    bound was a recursion depth cap. That bounded the wrong dimension: YAML
-    aliases resolve to repeated references to the *same* object, so the walk
-    revisited shared subtrees exponentially while the document stayed tiny. A
-    640-byte, schema-valid body took ~1s, doubling per added anchor level, on a
-    scope-exempt ``async`` route -- a denial of service reachable without
-    credentials. Reported by @haofeif.
+    Two rounds of review on #585 landed here. Round 2 added a non-string mapping
+    key check whose only bound was a recursion depth cap, which bounded the wrong
+    dimension: aliases resolve to repeated references to the *same* object, so the
+    walk revisited shared subtrees exponentially while the document stayed tiny. A
+    640-byte body took ~1s, doubling per anchor level. Reported by @haofeif.
 
-    The fix skips containers already walked, keyed on identity, so these tests
-    pin both halves of that: the traversal terminates, and skipping repeats does
-    not lose a finding.
+    Round 3's own strawman then found the larger half. jsonschema builds each error
+    message eagerly, interpolating ``repr`` of the offending instance, so an
+    amplified value that trips one ``type`` error produced a 25 MB message at 20
+    levels and 101 MB at 22, which is an allocation ceiling rather than a stall and
+    was reachable on merged ``main`` independently of this PR.
+
+    Both are now closed ahead of either step, by rejecting a document whose
+    expansion exceeds a ceiling. Every assertion below is deterministic: a
+    regression fails on a count or a length rather than hanging until CI's job
+    timeout, which is what the earlier timing-only assertions would have done.
     """
 
-    def test_a_forty_level_bomb_validates_promptly(self) -> None:
-        """Forty levels is 2**40 paths: unbounded, this never returns."""
+    def test_an_anchor_bomb_is_rejected_rather_than_traversed(self) -> None:
         document = _alias_amplified_yaml(40)
-        assert len(document) < 1500  # the whole point: tiny input, huge graph
+        assert len(document) < 1500  # the whole point: tiny input, huge expansion
 
-        started = time.perf_counter()
         findings = validate_profile_text(document)
-        elapsed = time.perf_counter() - started
+        errors = [f for f in findings if f.severity == "error"]
 
-        assert findings == []
-        # Measured at ~0.0001s. The bound is loose enough to survive a loaded
-        # CI runner while still being unreachable for an exponential walk.
-        assert elapsed < 5.0, f"walk took {elapsed:.2f}s; the traversal bound is not holding"
+        assert len(errors) == 1
+        assert "expands to more than" in errors[0].message
 
-    def test_a_self_referential_document_terminates(self) -> None:
-        """An anchor that contains itself is a cycle, not merely deep nesting."""
+    def test_the_rejection_does_not_grow_with_the_bomb(self) -> None:
+        """Rejecting must not itself render the document.
+
+        This is the regression guard for the jsonschema message vector: the
+        offending instance below is the amplified node, so before the ceiling
+        existed the returned message *was* its full ``repr``. Asserting a bound on
+        the response size catches that without measuring time.
+        """
+        for levels in (20, 22, 30):
+            document = _alias_amplified_yaml(levels, tail="toolsSettings: [*a%d]" % levels)
+
+            findings = validate_profile_text(document)
+
+            assert len(findings) == 1, levels
+            assert len(findings[0].message) < 1000, (
+                f"{levels} levels produced a {len(findings[0].message)}-char message; "
+                f"the offending instance is being rendered"
+            )
+
+    def test_a_self_referential_document_is_accepted(self) -> None:
+        """An anchor containing itself is a cycle, and expands to almost nothing."""
         document = (
             "---\nname: cyc\ndescription: A profile.\ntoolsSettings: &c {self: *c}\n---\n\nB.\n"
         )
 
-        started = time.perf_counter()
-        findings = validate_profile_text(document)
-
-        assert findings == []
-        assert time.perf_counter() - started < 5.0
+        assert validate_profile_text(document) == []
 
     def test_a_bad_key_in_a_shared_subtree_is_reported_exactly_once(self) -> None:
         """Deterministic proof of the memoization, with no reliance on a clock.
 
-        The offending key sits in the one node every alias resolves to. Reported
-        once, it confirms shared nodes are visited once; the pre-fix walk would
-        have emitted 2**20 copies of the same finding.
+        Ten levels is 1024 paths to the single node every alias resolves to, and
+        expands to well under the ceiling so the walk still runs. One finding
+        confirms shared nodes are visited once; the unmemoized walk emitted 1024
+        copies of it.
         """
-        document = _alias_amplified_yaml(20, leaf="{1: one}")
+        document = _alias_amplified_yaml(10, leaf="{1: one}")
 
         findings = validate_profile_text(document)
         key_errors = [f for f in findings if "not a string" in f.message]
 
         assert len(key_errors) == 1
         assert key_errors[0].severity == "error"
-        assert key_errors[0].path == "toolsSettings.a0.1"
+        assert key_errors[0].path == "hooks.a0.1"
 
     def test_legitimate_anchor_reuse_still_validates_clean(self) -> None:
-        """Anchors are a normal YAML convenience, not inherently suspect."""
+        """Anchors are a normal YAML convenience, not inherently suspect.
+
+        The ceiling is on expansion, not on aliasing, so ordinary reuse has to
+        pass. Without this, satisfying the bound by rejecting anchors outright
+        would look like a fix.
+        """
         document = (
             "---\nname: shared\ndescription: A profile.\ntoolsSettings:\n"
             "  common: &common {timeout: 30}\n  fs: *common\n  web: *common\n---\n\nBody.\n"
         )
 
-        findings = validate_profile_text(document)
+        assert validate_profile_text(document) == []
 
-        assert findings == []
+    def test_exceeding_a_ceiling_is_an_error_not_silence(self) -> None:
+        """A document past a ceiling is rejected, not called valid.
 
-    def test_exceeding_a_bound_is_an_error_not_silence(self) -> None:
-        """A document too large to traverse is rejected, not called valid.
-
-        Identity memoization bounds an *aliased* document; these bounds cover one
-        that is merely enormous. Returning no findings there would report an
-        unchecked document as clean, which is the failure mode being avoided.
+        Reporting nothing would present an uninspected document as clean, which is
+        the failure mode of the depth cap this replaced: it returned an empty list.
         """
         deep: dict = {"name": "deep", "description": "A profile."}
         node = deep
@@ -436,7 +458,7 @@ class TestAliasAmplificationIsBounded:
             "toolsSettings": {f"k{index}": index for index in range(25_000)},
         }
 
-        for metadata, expected in ((deep, "nested more than"), (wide, "holds more than")):
+        for metadata, expected in ((deep, "nests more than"), (wide, "expands to more than")):
             errors = [f for f in validate_frontmatter(metadata) if f.severity == "error"]
             assert len(errors) == 1
             assert expected in errors[0].message

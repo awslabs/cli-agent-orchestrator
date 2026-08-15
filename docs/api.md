@@ -87,21 +87,25 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   validates clean and persists, then fails to load, since the model requires
   string keys. Note YAML also auto-types an unquoted date, so `2026-01-01:` is a
   date key rather than a string; quote such keys.
-- That key check walks the parsed document, and the walk is bounded, because YAML
-  anchors make a document's value graph arbitrarily larger than its bytes: each
-  alias resolves to another reference to the same object, so chained anchors give
-  a sub-kilobyte body an exponential number of paths. Containers already visited
-  are skipped, which removes the amplification and still reports each offending
-  key once, at the first path that reaches it. Separate ceilings on total values
-  (20,000) and nesting depth (64) bound a document that is merely enormous rather
-  than aliased; exceeding either is itself an error, so such a document is
-  rejected rather than reported clean on a partial walk. Both bounds are ~1000x
-  the largest bundled profile.
+- That key check walks the parsed document, and a document is rejected up front if
+  it is too large to inspect, because YAML anchors make a document's value graph
+  arbitrarily larger than its bytes: each alias resolves to another reference to
+  the same object, so chained anchors give a sub-kilobyte body an exponential
+  expansion. Two ceilings, both far above real input, which for the largest
+  bundled profile is 23 expanded values nested 3 deep: a document may expand to at
+  most 20,000 values (~870x) and nest at most 64 levels (~21x). Exceeding either
+  is itself an error, and nothing further runs, since the later steps are what
+  such a document is expensive in. Within the ceilings, containers already visited
+  are skipped, so each offending key is reported once, at the first path that
+  reaches it. Note that differs from the schema step, which does not memoize and
+  so reports a shared invalid value once per referencing path.
 - An `mcpServers` entry must define either `command`, for a server CAO launches,
   or `url`, for a remote one whose `type` names its transport. The schema
   previously required `command` unconditionally, which made the write routes
   reject url-based servers that the runtime accepts and passes through to the
-  provider unchanged. An entry defining neither is still rejected.
+  provider unchanged. An entry defining neither is still rejected. `url` is the
+  spelling `resolve_mcp_server_config` documents; an entry naming its endpoint
+  under any other key satisfies neither branch and is rejected.
 - Every 400 from the profile write and source routes uses one `detail` shape,
   `{"message", "errors"}`, so a client never has to switch on the type of
   `detail`. `errors` is empty for a failure that is not attributable to a field,
@@ -114,11 +118,10 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   profile, having applied `${VAR}` substitution from the managed environment
   file to the raw text before parsing. Round-tripping a resolved document
   through a write would persist substituted values into a plaintext profile.
-  Requires `cao:read`, `cao:write`, or `cao:admin`. The pre-existing profile
-  reads beside it are ungated and stay that way, since tightening a shipped
-  route could break an existing unauthenticated reader; this one is gated
-  because it returns the stored bytes verbatim from every configured store,
-  including documents that fail to parse.
+  Requires `cao:read`, `cao:write`, or `cao:admin`, the same guard the profile
+  reads beside it now carry. Gating matters at least as much here as on the parsed
+  route, because this one returns the stored bytes verbatim from every configured
+  store, including documents that fail to parse.
 - Template validation and preview require the selected template to include a
   `schema.json` file.
 - `/agents/providers` reports provider availability.

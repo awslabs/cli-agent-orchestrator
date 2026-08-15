@@ -6,7 +6,6 @@ future UI, TUI, and external clients can consume the same ranking and validation
 paths as the CLI instead of reimplementing them.
 """
 
-import time
 from unittest.mock import patch
 
 import pytest
@@ -922,46 +921,86 @@ class TestWriteRejectionShape:
 
 
 class TestValidateEndpointResistsAliasAmplification:
-    """The unauthenticated validate route must not be stallable by its body.
+    """The unauthenticated validate route must not be stallable or OOM'd by its body.
 
-    Reported as a P2 in round 2 of review on #585. The non-string mapping key
-    check added in round 1 walked the parsed document with only a depth cap, but
-    YAML anchors resolve to repeated references to one object, so a walk that
-    does not remember where it has been revisits shared subtrees exponentially.
-    A sub-kilobyte body reached seconds of CPU and doubled per anchor level.
+    Two findings, both on this route. Round 2 of review on #585 added a
+    non-string mapping key check bounded only by a depth cap, so the walk
+    revisited alias-shared subtrees exponentially. Round 3's own strawman then
+    found the larger half: jsonschema interpolates ``repr`` of an offending
+    instance into every error message it builds, so an amplified value that trips
+    one ``type`` error yielded a 25 MB message at 20 anchor levels and 101 MB at
+    22, which the route would then serialise into its response body.
 
-    This route is the exposed one: it is in the scope-exemption set, so it
-    answers without credentials even when OAuth is configured, and it is declared
-    ``async``, so a synchronous walk on its thread blocks the event loop for every
-    other request rather than just the attacker's own. That exemption is pinned in
+    This route is the exposed one: it is in the scope-exemption set, so it answers
+    without credentials even when OAuth is configured, and it is declared
+    ``async``, so work on its thread delays every other request rather than only
+    the caller's own. That exemption is pinned in
     ``test/api/test_scope_coverage.py::_EXEMPT``, which is the one place it is
     asserted; if it is ever removed, the reasoning here changes.
+
+    Both are closed by rejecting a document whose expansion exceeds a ceiling,
+    ahead of either step. The assertions are on status and response size rather
+    than elapsed time, so a regression fails rather than hanging to CI's timeout.
     """
 
     @staticmethod
-    def _bomb(levels: int) -> str:
+    def _bomb(levels: int, tail: str = "") -> str:
         lines = [
             "---",
             "name: bomb",
             "description: A profile.",
-            "toolsSettings:",
+            "hooks:",
             "  a0: &a0 {k: v}",
         ]
         for level in range(1, levels + 1):
             lines.append(f"  a{level}: &a{level} {{x: *a{level - 1}, y: *a{level - 1}}}")
+        if tail:
+            lines.append(tail)
         return "\n".join(lines) + "\n---\n\nBody.\n"
 
-    def test_an_anchor_bomb_is_answered_promptly(self, client) -> None:
+    def test_an_anchor_bomb_is_rejected_with_a_small_response(self, client) -> None:
         content = self._bomb(40)
         assert len(content) < 1500
 
-        started = time.perf_counter()
         response = client.post("/agents/profiles/validate", json={"content": content})
-        elapsed = time.perf_counter() - started
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["valid"] is False
+        assert any("expands to more than" in m["message"] for m in body["messages"])
+        assert (
+            len(response.content) < 2000
+        ), f"a {len(content)}-byte body produced a {len(response.content)}-byte response"
+
+    def test_a_bomb_that_trips_a_schema_error_does_not_render_itself(self, client) -> None:
+        """The response must not grow with the bomb.
+
+        Before the ceiling, the offending instance here was the amplified node, so
+        the schema error's message was its full expansion: 25 MB of JSON out of a
+        sub-kilobyte request.
+        """
+        for levels in (20, 22, 30):
+            content = self._bomb(levels, tail="toolsSettings: [*a%d]" % levels)
+
+            response = client.post("/agents/profiles/validate", json={"content": content})
+
+            assert response.status_code == 200, levels
+            assert response.json()["valid"] is False, levels
+            assert (
+                len(response.content) < 2000
+            ), f"{levels} levels produced a {len(response.content)}-byte response"
+
+    def test_a_profile_using_anchors_normally_is_still_valid(self, client) -> None:
+        """The ceiling is on expansion, not on anchors."""
+        content = (
+            "---\nname: shared\ndescription: A profile.\ntoolsSettings:\n"
+            "  common: &common {timeout: 30}\n  fs: *common\n  web: *common\n---\n\nBody.\n"
+        )
+
+        response = client.post("/agents/profiles/validate", json={"content": content})
 
         assert response.status_code == 200
         assert response.json()["valid"] is True
-        assert elapsed < 10.0, f"validate took {elapsed:.2f}s on a {len(content)}-byte body"
 
 
 class TestUrlBasedMcpServersAreWritable:
