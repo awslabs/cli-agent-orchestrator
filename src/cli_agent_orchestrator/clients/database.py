@@ -1406,6 +1406,27 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
     return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
 
 
+def find_inbox_message_by_marker(receiver_id: str, marker: str) -> Optional[InboxMessage]:
+    """Find the newest inbox row for a receiver containing an exact managed marker."""
+    with SessionLocal() as db:
+        row = (
+            db.query(InboxModel)
+            .filter(InboxModel.receiver_id == receiver_id, InboxModel.message.contains(marker))
+            .order_by(InboxModel.created_at.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        return InboxMessage(
+            id=row.id,
+            sender_id=row.sender_id,
+            receiver_id=row.receiver_id,
+            message=row.message,
+            status=MessageStatus(row.status),
+            created_at=row.created_at,
+        )
+
+
 def get_inbox_messages(
     receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
 ) -> List[InboxMessage]:

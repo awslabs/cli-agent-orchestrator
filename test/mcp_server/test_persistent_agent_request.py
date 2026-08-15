@@ -151,3 +151,57 @@ def test_assign_and_wait_default_is_within_enforced_maximum():
     assert field.default == 540
     assert field.metadata
     assert server._assign_and_wait_impl.__defaults__[0] == 540
+
+
+def test_dispatch_persistent_agent_is_async_and_redacts_terminal_address():
+    with (
+        patch.object(server, "_discover_persistent_agent_routes_impl", return_value=_route()),
+        patch.object(
+            server, "_send_message_impl", return_value={"success": True, "message_id": 91}
+        ) as send,
+    ):
+        result = server._dispatch_persistent_agent_impl("shaffer-estimating", "estimate task")
+
+    assert result["success"] is True
+    assert result["status"] == "dispatched"
+    assert result["persistent_agent_id"] == "shaffer-estimating"
+    assert len(result["request_id"]) == 32
+    assert not any("terminal" in key for key in result)
+    send.assert_called_once()
+    args, kwargs = send.call_args
+    assert args[0] == "aaaa1111"
+    assert kwargs["semantic_resolved"] is True
+    assert result["request_id"] in args[1]
+    assert "assign_async" in args[1]
+    assert "reply_to_persistent_request" in args[1]
+
+
+def test_reply_to_persistent_request_resolves_original_sender_internally():
+    lookup = _response({"message_id": 17, "sender_id": "cccc3333", "status": "delivered"})
+    with (
+        patch.dict("os.environ", {"CAO_TERMINAL_ID": "aaaa1111"}),
+        patch.object(server.requests, "get", return_value=lookup) as get,
+        patch.object(server, "_send_message_impl", return_value={"success": True}) as send,
+    ):
+        result = server._reply_to_persistent_request_impl("a" * 32, "reviewed result")
+
+    assert result == {"success": True, "request_id": "a" * 32, "status": "returned"}
+    assert get.call_args.args[0].endswith(f"/terminals/aaaa1111/inbox/managed-request/{'a' * 32}")
+    send.assert_called_once_with(
+        "cccc3333",
+        f"[Persistent department result request_id={'a' * 32}]\nreviewed result",
+        semantic_resolved=True,
+    )
+
+
+def test_managed_persistent_dispatch_gate_prefers_async_but_keeps_wait_optional():
+    with (
+        patch.object(server, "REQUIRE_MANAGED_PERSISTENT_DISPATCH", True),
+        patch.object(server, "REQUIRE_PERSISTENT_AGENT_REQUEST", False),
+        patch.object(server, "_discover_persistent_agent_routes_impl") as discover,
+    ):
+        result = server._send_message_to_persistent_agent_impl("shaffer-estimating", "task")
+    assert result["success"] is False
+    assert "dispatch_persistent_agent" in result["error"]
+    assert "request_persistent_agent" in result["error"]
+    discover.assert_not_called()

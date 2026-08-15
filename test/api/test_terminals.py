@@ -687,6 +687,30 @@ class TestCreateInboxMessageEndpoint:
             assert response.status_code == 500
             assert "Failed to create inbox message" in response.json()["detail"]
 
+    def test_get_managed_request_success(self, client):
+        request_id = "a" * 32
+        row = InboxMessage(
+            id=17,
+            sender_id="sender-1",
+            receiver_id="abcd1234",
+            message=f"[Managed persistent request request_id={request_id}] task",
+            status=MessageStatus.DELIVERED,
+            created_at=datetime(2026, 3, 13, 12, 0, 0),
+        )
+        with patch(
+            "cli_agent_orchestrator.api.main.find_inbox_message_by_marker", return_value=row
+        ) as find:
+            response = client.get(f"/terminals/abcd1234/inbox/managed-request/{request_id}")
+        assert response.status_code == 200
+        assert response.json()["sender_id"] == "sender-1"
+        find.assert_called_once_with(
+            "abcd1234", f"[Managed persistent request request_id={request_id}]"
+        )
+
+    def test_get_managed_request_rejects_bad_id(self, client):
+        response = client.get("/terminals/abcd1234/inbox/managed-request/not-valid")
+        assert response.status_code == 400
+
 
 class TestWebSocketLocalhostRestriction:
     """Test that WebSocket endpoint rejects non-loopback clients."""

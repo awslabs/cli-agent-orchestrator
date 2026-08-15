@@ -44,6 +44,7 @@ from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     claim_inbox_message,
     create_inbox_message,
+    find_inbox_message_by_marker,
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
@@ -2682,7 +2683,23 @@ async def create_terminal_in_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
-            env_vars={"CAO_MANAGED_CALLBACK": "true"} if managed_callback else None,
+            env_vars=(
+                {
+                    "CAO_MANAGED_CALLBACK": "true",
+                    "CAO_MANAGED_CALLBACK_MODE": (
+                        str(metadata.get("managed_callback_mode") or "wait")
+                        if isinstance(metadata, dict)
+                        else "wait"
+                    ),
+                    "CAO_MANAGED_ASSIGNMENT_ID": (
+                        str(metadata.get("managed_assignment_id") or "")
+                        if isinstance(metadata, dict)
+                        else ""
+                    ),
+                }
+                if managed_callback
+                else None
+            ),
             caller_id=caller_id,
             defer_init=defer_init,
             initial_message=initial_message,
@@ -5499,6 +5516,26 @@ async def claim_inbox_message_endpoint(
         "message": claimed.message,
         "status": claimed.status.value,
         "created_at": claimed.created_at.isoformat() if claimed.created_at else None,
+    }
+
+
+@app.get("/terminals/{terminal_id}/inbox/managed-request/{request_id}")
+async def get_managed_request_endpoint(
+    terminal_id: TerminalId,
+    request_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict:
+    """Resolve one durable managed request to its original sender internally."""
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        raise HTTPException(status_code=400, detail="Invalid managed request id")
+    marker = f"[Managed persistent request request_id={request_id}]"
+    row = find_inbox_message_by_marker(terminal_id, marker)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Managed request not found")
+    return {
+        "message_id": row.id,
+        "sender_id": row.sender_id,
+        "status": row.status.value,
     }
 
 

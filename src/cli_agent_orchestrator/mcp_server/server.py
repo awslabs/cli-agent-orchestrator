@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import requests
@@ -74,6 +75,12 @@ REQUIRE_SEMANTIC_PERSISTENT_ROUTING = (
 REQUIRE_PERSISTENT_AGENT_REQUEST = (
     os.getenv("CAO_REQUIRE_PERSISTENT_AGENT_REQUEST", "false").lower() == "true"
 )
+# Top-level orchestrators can require managed async semantic dispatch. This keeps
+# department work non-blocking while preserving a durable request ID and a
+# callback route that never exposes terminal addresses to either model.
+REQUIRE_MANAGED_PERSISTENT_DISPATCH = (
+    os.getenv("CAO_REQUIRE_MANAGED_PERSISTENT_DISPATCH", "false").lower() == "true"
+)
 # Persistent department/specialist supervisors use durable async workers. A
 # synchronous handoff auto-tears the child down when the step returns, which can
 # race startup/callback delivery and make a boot screen look like task output.
@@ -82,10 +89,10 @@ REQUIRE_PERSISTENT_AGENT_REQUEST = (
 REQUIRE_ASYNC_CHILD_DELEGATION = (
     os.getenv("CAO_REQUIRE_ASYNC_CHILD_DELEGATION", "false").lower() == "true"
 )
-# Persistent supervisors can require one managed primitive that creates the
-# worker, waits for its durable callback row, and returns that callback as the
-# tool result. This prevents the provider from receiving the callback as a
-# second user turn behind its current reasoning.
+# Persistent supervisors can require managed child delegation. Bare assign is
+# blocked, but the supervisor may choose either async managed dispatch (the
+# default) or an explicit synchronous wait when the current turn truly depends
+# on the worker result. Both routes pin callbacks to the recorded caller.
 REQUIRE_MANAGED_CHILD_CALLBACK = (
     os.getenv("CAO_REQUIRE_MANAGED_CHILD_CALLBACK", "false").lower() == "true"
 )
@@ -1160,6 +1167,8 @@ def _assign_impl(
     use_worktree: bool = False,
     *,
     managed_wait: bool = False,
+    managed_async: bool = False,
+    assignment_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1173,15 +1182,19 @@ def _assign_impl(
     """
     terminal_id: Optional[str] = None
     try:
-        if REQUIRE_MANAGED_CHILD_CALLBACK and not managed_wait:
+        managed_mode = "wait" if managed_wait else ("async" if managed_async else None)
+        if REQUIRE_MANAGED_CHILD_CALLBACK and managed_mode is None:
             return {
                 "success": False,
                 "terminal_id": None,
                 "message": (
-                    "Bare assign is disabled for this supervisor. Use assign_and_wait so "
-                    "the worker callback is durably claimed and returned for review."
+                    "Bare assign is disabled for this supervisor. Use assign_async for the "
+                    "normal non-blocking path, or assign_and_wait only when this turn truly "
+                    "cannot continue without the worker result."
                 ),
             }
+        if managed_mode is not None and not assignment_id:
+            assignment_id = uuid.uuid4().hex
 
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
@@ -1208,11 +1221,12 @@ def _assign_impl(
         # suffix depends on ``CAO_TERMINAL_ID``, which lives in this MCP
         # subprocess's env (the supervisor-owned instance), not on the
         # cao-server side.
-        if managed_wait:
+        if managed_mode is not None:
             worker_message = (
                 message
-                + "\n\n[Managed CAO callback: when done, call send_message with receiver_id "
-                "omitted. CAO will route the durable callback to your recorded caller.]"
+                + f"\n\n[Managed CAO assignment {assignment_id}: when done, call send_message "
+                "with receiver_id omitted. CAO will route the durable callback to your "
+                "recorded caller. Do not transcribe or invent a terminal ID.]"
             )
         elif ENABLE_SENDER_ID_INJECTION:
             worker_message = (
@@ -1237,12 +1251,22 @@ def _assign_impl(
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
             use_worktree=use_worktree,
-            metadata={"managed_callback": True} if managed_wait else None,
+            metadata=(
+                {
+                    "managed_callback": True,
+                    "managed_callback_mode": managed_mode,
+                    "managed_assignment_id": assignment_id,
+                }
+                if managed_mode is not None
+                else None
+            ),
         )
 
         return {
             "success": True,
             "terminal_id": terminal_id,
+            "assignment_id": assignment_id,
+            "managed_mode": managed_mode,
             "message": (
                 f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
                 f"Worker is initializing in the background; your task will be "
@@ -1412,6 +1436,66 @@ else:
         )
 
 
+def _assign_async_impl(
+    agent_profile: str,
+    message: str,
+    working_directory: Optional[str] = None,
+    engine: Optional[str] = None,
+    model: Optional[str] = None,
+    use_worktree: bool = False,
+) -> Dict[str, Any]:
+    """Create a managed worker and return immediately with a stable assignment ID."""
+    assignment_id = uuid.uuid4().hex
+    assigned = _assign_impl(
+        agent_profile,
+        message,
+        working_directory,
+        engine=engine,
+        model=model,
+        use_worktree=use_worktree,
+        managed_async=True,
+        assignment_id=assignment_id,
+    )
+    if not assigned.get("success"):
+        return assigned
+    # Terminal IDs are intentionally private implementation details. The durable
+    # assignment ID is the only address the supervisor should retain.
+    return {
+        "success": True,
+        "assignment_id": assignment_id,
+        "agent_profile": agent_profile,
+        "status": "dispatched",
+        "message": (
+            "Worker dispatched asynchronously. Continue other work; its durable callback "
+            f"will arrive automatically with assignment_id={assignment_id}."
+        ),
+    }
+
+
+@mcp.tool()
+async def assign_async(
+    agent_profile: str = Field(description="Allowed worker agent profile"),
+    message: str = Field(description="Bounded task for the worker"),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
+    use_worktree: bool = Field(
+        default=False,
+        description="Run the worker in an isolated git worktree",
+    ),
+) -> Dict[str, Any]:
+    """Dispatch a callback-safe worker without blocking the supervisor.
+
+    This is the normal managed child path for persistent supervisors. CAO records
+    the caller relationship and a stable assignment ID, returns immediately, and
+    later delivers the worker callback through the supervisor inbox.
+    """
+    return _assign_async_impl(
+        agent_profile,
+        message,
+        model=model,
+        use_worktree=use_worktree,
+    )
+
+
 def _claim_managed_callback(supervisor_id: str, worker_id: str, timeout: int) -> Dict[str, Any]:
     """Wait for and claim one durable callback row from a specific worker."""
     deadline = time.monotonic() + timeout
@@ -1511,6 +1595,7 @@ def _assign_and_wait_impl(
         model=model,
         use_worktree=use_worktree,
         managed_wait=True,
+        assignment_id=uuid.uuid4().hex,
     )
     if not assigned.get("success"):
         return assigned
@@ -1672,13 +1757,13 @@ def _list_persistent_agents_impl() -> Dict[str, Any]:
 
 def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[str, Any]:
     """Resolve a canonical persistent agent ID to its current terminal and send."""
-    if REQUIRE_PERSISTENT_AGENT_REQUEST:
+    if REQUIRE_PERSISTENT_AGENT_REQUEST or REQUIRE_MANAGED_PERSISTENT_DISPATCH:
         return {
             "success": False,
             "error": (
-                "Fire-and-forget persistent-agent sends are disabled for this orchestrator. "
-                "Use request_persistent_agent so the persistent head's reviewed result is "
-                "returned in the same tool call."
+                "Unmanaged persistent-agent sends are disabled for this orchestrator. "
+                "Use dispatch_persistent_agent for normal non-blocking department work, "
+                "or request_persistent_agent only when the current turn truly must wait."
             ),
         }
     agent_id = agent_id.strip()
@@ -1714,6 +1799,107 @@ def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[
             "persistent_agent_id": agent_id,
         }
     return result
+
+
+def _resolve_persistent_target_for_dispatch(agent_id: str) -> Dict[str, Any]:
+    agent_id = agent_id.strip()
+    if not agent_id:
+        return {"success": False, "error": "agent_id must not be empty"}
+    discovered = _discover_persistent_agent_routes_impl()
+    if not discovered.get("success"):
+        return discovered
+    matches = [a for a in discovered.get("agents", []) if a.get("agent_id") == agent_id]
+    if not matches:
+        return {
+            "success": False,
+            "error": f"No live persistent agent matches agent_id '{agent_id}'",
+        }
+    if len(matches) != 1:
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent_id '{agent_id}' is ambiguous across {len(matches)} live "
+                "terminals. Repair duplicate persistent-agent metadata before routing."
+            ),
+        }
+    return {"success": True, "target": matches[0]}
+
+
+def _dispatch_persistent_agent_impl(agent_id: str, message: str) -> Dict[str, Any]:
+    """Queue durable department work and return immediately with a request ID."""
+    resolved = _resolve_persistent_target_for_dispatch(agent_id)
+    if not resolved.get("success"):
+        return resolved
+    target = resolved["target"]
+    request_id = uuid.uuid4().hex
+    wrapped = (
+        f"[Managed persistent request request_id={request_id}] This request is asynchronous. "
+        "Do not hold this turn open waiting on child work. Use assign_async for normal child "
+        "delegation and continue other work while children run. When the final reviewed result "
+        f"is ready, call reply_to_persistent_request with request_id={request_id}. Never use a "
+        "terminal ID for the return path.\n\n" + message
+    )
+    result = _send_message_impl(str(target["terminal_id"]), wrapped, semantic_resolved=True)
+    if not result.get("success"):
+        return result
+    return {
+        "success": True,
+        "persistent_agent_id": agent_id,
+        "request_id": request_id,
+        "status": "dispatched",
+        "message": (
+            "Department work dispatched asynchronously. Continue other work; the reviewed "
+            f"result will return automatically with request_id={request_id}."
+        ),
+    }
+
+
+def _reply_to_persistent_request_impl(request_id: str, message: str) -> Dict[str, Any]:
+    """Reply to the original managed requester without exposing its terminal ID."""
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        return {"success": False, "error": "Invalid managed request id"}
+    own_terminal_id = _current_terminal_id()
+    if not own_terminal_id:
+        return {"success": False, "error": "CAO_TERMINAL_ID is required"}
+    response = requests.get(
+        f"{API_BASE_URL}/terminals/{own_terminal_id}/inbox/managed-request/{request_id}",
+        timeout=_mcp_timeout(),
+    )
+    if response.status_code == 404:
+        return {"success": False, "error": "Managed request not found for this terminal"}
+    response.raise_for_status()
+    sender_id = response.json().get("sender_id")
+    if not isinstance(sender_id, str) or not sender_id:
+        return {"success": False, "error": "Managed request has no durable sender"}
+    callback = f"[Persistent department result request_id={request_id}]\n{message}"
+    result = _send_message_impl(sender_id, callback, semantic_resolved=True)
+    if not result.get("success"):
+        return result
+    return {
+        "success": True,
+        "request_id": request_id,
+        "status": "returned",
+    }
+
+
+@mcp.tool()
+async def dispatch_persistent_agent(
+    agent_id: str = Field(description="Canonical persistent_agent_id, e.g. shaffer-estimating"),
+    message: str = Field(
+        description="Task packet for the persistent department or specialist head"
+    ),
+) -> Dict[str, Any]:
+    """Dispatch persistent department work asynchronously by semantic ID."""
+    return _dispatch_persistent_agent_impl(agent_id, message)
+
+
+@mcp.tool()
+async def reply_to_persistent_request(
+    request_id: str = Field(description="Managed persistent request ID from the task packet"),
+    message: str = Field(description="Final reviewed result to return to the original requester"),
+) -> Dict[str, Any]:
+    """Return a reviewed async department result to its durable original requester."""
+    return _reply_to_persistent_request_impl(request_id, message)
 
 
 def _request_persistent_agent_impl(
@@ -1768,8 +1954,8 @@ def _request_persistent_agent_impl(
     prompt = (
         f"[CAO Persistent Request: {agent_id}] This is a synchronous semantic request from "
         "the top-level orchestrator. Complete the task under your canonical doctrine. If "
-        "fresh child work is needed, use your enforced assign_and_wait path and review its "
-        "returned callback before responding. Return the final reviewed result directly in "
+        "fresh child work is needed in this explicitly synchronous request, use assign_and_wait "
+        "and review its returned callback before responding. Return the final reviewed result directly in "
         "this assistant turn. Do not use send_message for this request result; CAO captures "
         "this turn's output synchronously.\n\n" + message
     )
@@ -1902,12 +2088,14 @@ def _send_message_impl(
             }
 
         managed_callback = os.getenv("CAO_MANAGED_CALLBACK", "false").lower() == "true"
+        managed_callback_mode = os.getenv("CAO_MANAGED_CALLBACK_MODE", "wait").lower()
+        managed_assignment_id = os.getenv("CAO_MANAGED_ASSIGNMENT_ID", "").strip()
         if managed_callback and receiver_id:
             return {
                 "success": False,
                 "error": (
-                    "This worker uses a managed callback. Omit receiver_id; CAO must route "
-                    "to the durable recorded caller so assign_and_wait can claim it."
+                    "This worker uses a managed callback. Omit receiver_id; CAO routes "
+                    "to the durable recorded caller automatically."
                 ),
             }
 
@@ -1969,13 +2157,19 @@ def _send_message_impl(
         # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
         # address (issue #284); _send_to_inbox raises a clear error for that
         # case anyway.
+        if managed_callback and managed_assignment_id:
+            message = f"[Managed worker callback assignment_id={managed_assignment_id}]\n" + message
         if ENABLE_SENDER_ID_INJECTION and own_terminal_id and not managed_callback:
             message += (
                 f"\n\n[Message from terminal {own_terminal_id}. "
                 "Use send_message MCP tool for any follow-up work.]"
             )
 
-        return _send_to_inbox(receiver_id, message, defer_delivery=managed_callback)
+        return _send_to_inbox(
+            receiver_id,
+            message,
+            defer_delivery=managed_callback and managed_callback_mode == "wait",
+        )
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
