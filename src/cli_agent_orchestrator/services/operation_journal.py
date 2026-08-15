@@ -633,6 +633,14 @@ def _operation_row_dict(row: Any) -> dict[str, Any]:
         "phase": row.phase,
         "request": _parse_json(row.request_json),
         "request_json": row.request_json,
+        "successor_terminal_id": row.successor_terminal_id,
+        "successor_generation": row.successor_generation,
+        "successor_incarnation_id": row.successor_incarnation_id,
+        "result_state": row.result_state,
+        "result_detail": row.result_detail,
+        "result_evidence": _parse_json(row.result_evidence_json),
+        "result_evidence_json": row.result_evidence_json,
+        "result_at": row.result_at,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -1168,6 +1176,23 @@ def _authorize_once(
         .one_or_none()
     )
     if step_winner is not None:
+        # The winner may have committed after the effect-id lookup above but
+        # before this logical-step lookup.  The deterministic exact retry is
+        # still adoption, not the different-id conflict this branch normally
+        # represents.
+        if (
+            step_winner.effect_id == effect_id
+            and step_winner.operation_id == operation_id
+            and step_winner.effect_step == effect_step
+            and step_winner.effect_payload_json == payload
+            and step_winner.effect_digest == effect_digest
+        ):
+            db.refresh(row)
+            return {
+                "intent": _intent_row_dict(step_winner),
+                "operation": _operation_row_dict(row),
+                "adopted": True,
+            }
         raise OperationJournalConflict(
             f"logical step {effect_step!r} of operation {operation_id} is already won "
             f"by effect {step_winner.effect_id}; query or adopt the durable step "
@@ -1353,6 +1378,25 @@ def _authorize_once(
             .one_or_none()
         )
         if step_winner is not None:
+            # The exact deterministic retry can race between the initial
+            # effect-id lookup and the phase CAS: the concurrent writer commits
+            # this SAME intent, our CAS loses, and only this second lookup sees
+            # it.  Adopt it by the same byte-for-byte rule as the fast path
+            # above; treating it as a different-winner conflict would turn a
+            # safe cross-process duplicate into reconciliation-required.
+            if (
+                step_winner.effect_id == effect_id
+                and step_winner.operation_id == operation_id
+                and step_winner.effect_step == effect_step
+                and step_winner.effect_payload_json == payload
+                and step_winner.effect_digest == effect_digest
+            ):
+                db.refresh(row)
+                return {
+                    "intent": _intent_row_dict(step_winner),
+                    "operation": _operation_row_dict(row),
+                    "adopted": True,
+                }
             raise OperationJournalConflict(
                 f"logical step {effect_step!r} of operation {operation_id} is already "
                 f"won by effect {step_winner.effect_id}; query or adopt the durable "
@@ -1464,6 +1508,338 @@ def authorize_effect_intent(
     raise OperationJournalUnavailable(
         f"concurrent effect-intent writes kept conflicting; refusing after retry: {last_error}"
     )
+
+
+# ---------------------------------------------------------------------------
+# the B3 successor reservation + durable bounded result
+# ---------------------------------------------------------------------------
+
+#: Durable bounded outcomes of one winning operation.  ``pending`` means a
+#: successor is reserved and physical effects may be in flight; ``refused``
+#: is a retryable observation about the world (a live competing owner, a
+#: claimed barrier, an unproven fact) that a later attempt re-evaluates;
+#: ``accepted`` and ``reconciliation-required`` are FINAL — an accepted
+#: reincarnation is never re-run, and an ambiguous physical result is never
+#: overwritten or hidden by a later outcome.
+RESULT_PENDING = "pending"
+RESULT_ACCEPTED = "accepted"
+RESULT_REFUSED = "refused"
+RESULT_RECONCILIATION_REQUIRED = "reconciliation-required"
+RESULT_STATES = frozenset(
+    {RESULT_PENDING, RESULT_ACCEPTED, RESULT_REFUSED, RESULT_RECONCILIATION_REQUIRED}
+)
+#: Write-once states: once recorded, no later caller may replace them.
+RESULT_FINAL_STATES = frozenset({RESULT_ACCEPTED, RESULT_RECONCILIATION_REQUIRED})
+
+MAX_RESULT_DETAIL_LEN = 2000
+MAX_RESULT_EVIDENCE_KEYS = 24
+MAX_RESULT_EVIDENCE_BYTES = 4096
+
+
+def _validate_result_evidence(value: Any) -> Optional[dict[str, str]]:
+    """Bound the durable result evidence: a flat mapping of bounded strings.
+
+    The evidence carries only references/digests/bounded labels — never
+    task text, provider output, secret values, or environment values.
+    This is cooperative schema discipline at the storage boundary; the
+    executor is the caller that constructs it.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise OperationJournalInvalid(
+            f"result evidence must be a flat mapping of strings; got {value!r}"
+        )
+    if len(value) > MAX_RESULT_EVIDENCE_KEYS:
+        raise OperationJournalInvalid(
+            f"result evidence may carry at most {MAX_RESULT_EVIDENCE_KEYS} entries"
+        )
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key:
+            raise OperationJournalInvalid(f"result evidence key {key!r} must be non-empty")
+        if not isinstance(item, str) or not item:
+            raise OperationJournalInvalid(
+                f"result evidence.{key} must be a non-empty string; got {item!r}"
+            )
+        if len(item) > MAX_EFFECT_PAYLOAD_VALUE_LEN:
+            raise OperationJournalInvalid(
+                f"result evidence.{key} must be at most "
+                f"{MAX_EFFECT_PAYLOAD_VALUE_LEN} characters"
+            )
+        result[key] = item
+    if len(_canonical_json(result)) > MAX_RESULT_EVIDENCE_BYTES:
+        raise OperationJournalInvalid(
+            f"result evidence must serialize to at most {MAX_RESULT_EVIDENCE_BYTES} bytes"
+        )
+    return result
+
+
+def _require_successor_terminal_id(value: Any) -> str:
+    text_value: str = _require_text(value, field="successor_terminal_id", max_len=64)
+    if re.fullmatch(r"[a-f0-9]{8}", text_value) is None:
+        raise OperationJournalInvalid(
+            f"successor_terminal_id must be exactly 8 lowercase hex characters; "
+            f"got {text_value!r}"
+        )
+    return text_value
+
+
+def _reserve_successor_once(
+    db: Any, operation_id: str, successor_terminal_id: str, successor_generation: str
+) -> dict[str, Any]:
+    """One successor-reservation pass inside the caller's transaction.
+
+    The reservation is a CAS on the null successor slot: only the first
+    caller allocates it, every exact replay adopts it, and a different id
+    for the already-reserved operation is a typed conflict — response
+    loss and restart therefore return the SAME successor terminal id and
+    generation, never a second successor.  The first reservation also
+    moves the durable outcome to ``pending``.
+    """
+    row = _operation_by_id(db, operation_id)
+    if row is None:
+        raise OperationJournalNotFound(f"unknown operation: {operation_id}")
+    refusal = stored_operation_refusal(_operation_row_dict(row))
+    if refusal is not None:
+        raise OperationJournalConflict(
+            f"stored operation {operation_id} cannot reserve a successor: {refusal}"
+        )
+    if row.result_state in RESULT_FINAL_STATES and (
+        row.successor_terminal_id is None
+        or row.successor_terminal_id != successor_terminal_id
+        or row.successor_generation != successor_generation
+    ):
+        raise OperationJournalConflict(
+            f"operation {operation_id} already has the final result "
+            f"{row.result_state!r}; a finished operation never reserves a successor"
+        )
+    if row.successor_terminal_id is not None or row.successor_generation is not None:
+        if (
+            row.successor_terminal_id == successor_terminal_id
+            and row.successor_generation == successor_generation
+        ):
+            return {"operation": _operation_row_dict(row), "adopted": True}
+        raise OperationJournalConflict(
+            f"operation {operation_id} already reserved successor "
+            f"{row.successor_terminal_id}/{row.successor_generation}; a second "
+            "successor is never allocated — adopt the durable reservation"
+        )
+    stamp = _now()
+    result = db.execute(
+        sa_update(database.ReincarnationOperationModel)
+        .where(
+            database.ReincarnationOperationModel.operation_id == operation_id,
+            database.ReincarnationOperationModel.successor_terminal_id.is_(None),
+            database.ReincarnationOperationModel.successor_generation.is_(None),
+        )
+        .values(
+            successor_terminal_id=successor_terminal_id,
+            successor_generation=successor_generation,
+            result_state=RESULT_PENDING,
+            updated_at=stamp,
+        )
+    )
+    if result.rowcount != 1:
+        raise OperationJournalConflict(
+            f"concurrent successor reservation for operation {operation_id}; "
+            "re-read the operation and adopt the durable reservation"
+        )
+    db.refresh(row)
+    return {"operation": _operation_row_dict(row), "adopted": False}
+
+
+def reserve_successor(
+    operation_id: str,
+    successor_terminal_id: str,
+    successor_generation: str,
+    db: Any = None,
+) -> dict[str, Any]:
+    """Durably reserve the one successor terminal id + fresh generation for
+    the winning operation (the B3 executor's pre-physical-I/O allocation).
+
+    The first call allocates; an exact replay adopts; a different id for
+    the already-reserved operation conflicts.  ``db`` and race semantics
+    follow ``claim_operation``.
+    """
+    successor_terminal_id = _require_successor_terminal_id(successor_terminal_id)
+    successor_generation = _require_text(
+        successor_generation, field="successor_generation", max_len=128
+    )
+    if db is not None:
+        try:
+            return _reserve_successor_once(
+                db, operation_id, successor_terminal_id, successor_generation
+            )
+        except (IntegrityError, OperationalError) as exc:
+            raise OperationJournalUnavailable(
+                f"concurrent successor reservation refused; the caller's transaction "
+                f"may be unusable after the race — roll it back and retry the whole "
+                f"caller-owned call: {exc}"
+            ) from exc
+    last_error: Optional[BaseException] = None
+    for _attempt in range(5):
+        try:
+            with database.SessionLocal() as session:
+                result = _reserve_successor_once(
+                    session, operation_id, successor_terminal_id, successor_generation
+                )
+                session.commit()
+                return result
+        except (IntegrityError, OperationalError) as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise OperationJournalUnavailable(
+        f"concurrent successor reservations kept conflicting; refusing after retry: "
+        f"{last_error}"
+    )
+
+
+def _record_result_once(
+    db: Any,
+    operation_id: str,
+    *,
+    state: str,
+    detail: Optional[str],
+    evidence: Optional[dict[str, str]],
+    successor_incarnation_id: Optional[str],
+) -> dict[str, Any]:
+    """One result-record pass inside the caller's transaction.
+
+    Write-once for final states: an accepted or reconciliation-required
+    outcome is never overwritten, so an ambiguous physical result cannot
+    be hidden.  ``pending`` and ``refused`` are observations a later
+    attempt may supersede.
+    """
+    row = _operation_by_id(db, operation_id)
+    if row is None:
+        raise OperationJournalNotFound(f"unknown operation: {operation_id}")
+    if row.result_state in RESULT_FINAL_STATES:
+        # The durable final truth stands; surface it rather than overwrite.
+        return {"operation": _operation_row_dict(row), "adopted": True}
+    evidence_json = _canonical_json(evidence) if evidence is not None else None
+    stamp = _now()
+    result = db.execute(
+        sa_update(database.ReincarnationOperationModel)
+        .where(
+            database.ReincarnationOperationModel.operation_id == operation_id,
+            database.ReincarnationOperationModel.result_state.notin_(sorted(RESULT_FINAL_STATES))
+            | database.ReincarnationOperationModel.result_state.is_(None),
+        )
+        .values(
+            result_state=state,
+            result_detail=detail,
+            result_evidence_json=evidence_json,
+            result_at=stamp,
+            updated_at=stamp,
+            **(
+                {"successor_incarnation_id": successor_incarnation_id}
+                if successor_incarnation_id is not None
+                else {}
+            ),
+        )
+    )
+    if result.rowcount != 1:
+        db.refresh(row)
+        if row.result_state in RESULT_FINAL_STATES:
+            return {"operation": _operation_row_dict(row), "adopted": True}
+        raise OperationJournalConflict(
+            f"concurrent result recording for operation {operation_id}; the "
+            "durable outcome must be re-read before recording another"
+        )
+    db.refresh(row)
+    return {"operation": _operation_row_dict(row), "adopted": False}
+
+
+def record_result(
+    operation_id: str,
+    state: str,
+    *,
+    detail: Optional[str] = None,
+    evidence: Optional[dict[str, str]] = None,
+    successor_incarnation_id: Optional[str] = None,
+    db: Any = None,
+) -> dict[str, Any]:
+    """Record the durable bounded outcome of the winning operation.
+
+    ``accepted`` and ``reconciliation-required`` are write-once; a call
+    that arrives after a final outcome adopts the durable truth instead
+    of overwriting it.  Returns the effective stored operation record.
+    ``db`` and race semantics follow ``claim_operation``.
+    """
+    if state not in RESULT_STATES:
+        raise OperationJournalInvalid(
+            f"result state must be one of {sorted(RESULT_STATES)}; got {state!r}"
+        )
+    detail = _optional_text(detail, field="detail", max_len=MAX_RESULT_DETAIL_LEN)
+    evidence = _validate_result_evidence(evidence)
+    if successor_incarnation_id is not None:
+        successor_incarnation_id = _require_uuid(
+            successor_incarnation_id, field="successor_incarnation_id"
+        )
+    if db is not None:
+        try:
+            return _record_result_once(
+                db,
+                operation_id,
+                state=state,
+                detail=detail,
+                evidence=evidence,
+                successor_incarnation_id=successor_incarnation_id,
+            )
+        except (IntegrityError, OperationalError) as exc:
+            raise OperationJournalUnavailable(
+                f"concurrent result recording refused; the caller's transaction "
+                f"may be unusable after the race — roll it back and retry the whole "
+                f"caller-owned call: {exc}"
+            ) from exc
+    last_error: Optional[BaseException] = None
+    for _attempt in range(5):
+        try:
+            with database.SessionLocal() as session:
+                result = _record_result_once(
+                    session,
+                    operation_id,
+                    state=state,
+                    detail=detail,
+                    evidence=evidence,
+                    successor_incarnation_id=successor_incarnation_id,
+                )
+                session.commit()
+                return result
+        except (IntegrityError, OperationalError) as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise OperationJournalUnavailable(
+        f"concurrent result recordings kept conflicting; refusing after retry: " f"{last_error}"
+    )
+
+
+def get_result(operation_id: str, db: Any = None) -> dict[str, Any]:
+    """The successor reservation and durable bounded outcome of one
+    operation (the response-loss GET surface B3 callers query)."""
+
+    def _get(session: Any) -> dict[str, Any]:
+        row = _operation_by_id(session, operation_id)
+        if row is None:
+            raise OperationJournalNotFound(f"unknown operation: {operation_id}")
+        record = _operation_row_dict(row)
+        return {
+            "operation_id": record["operation_id"],
+            "phase": record["phase"],
+            "successor_terminal_id": record["successor_terminal_id"],
+            "successor_generation": record["successor_generation"],
+            "successor_incarnation_id": record["successor_incarnation_id"],
+            "result_state": record["result_state"],
+            "result_detail": record["result_detail"],
+            "result_evidence": record["result_evidence"],
+            "result_at": record["result_at"],
+        }
+
+    if db is not None:
+        return _get(db)
+    with database.SessionLocal() as session:
+        return _get(session)
 
 
 # ---------------------------------------------------------------------------

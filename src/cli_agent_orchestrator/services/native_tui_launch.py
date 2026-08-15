@@ -1088,6 +1088,41 @@ LAUNCH_KIND_NEW = "new"
 LAUNCH_KIND_RESUME = "resume"
 LAUNCH_KINDS = (LAUNCH_KIND_NEW, LAUNCH_KIND_RESUME)
 
+#: The internal boundaries an optional ``authorize`` callback is invoked
+#: at, immediately BEFORE the effect each one names.  A caller that needs
+#: to linearize its own authorization against this launch (the B3 exact
+#: executor's B2 effect intents) supplies one; every existing caller
+#: supplies none and the launch behaves exactly as before.  A callback
+#: refusal propagates out of :func:`start` unchanged, and because each
+#: boundary precedes the effect it names, a refusal at ``declare``
+#: leaves nothing claimed, one at ``create_pane`` leaves the attachment
+#: ``declared`` with no pane started, and one at ``publish`` leaves the
+#: running pane unreconciled for the launch's own re-entry contract.
+#:
+#: ``create_pane`` covers the pane's atomic creation *and* the resume
+#: argv it starts: tmux window creation execs the argv directly, so one
+#: callback guards both ordered intents back-to-back and a refusal
+#: between them creates no pane at all.
+AUTHORIZE_BOUNDARY_DECLARE = "declare"
+AUTHORIZE_BOUNDARY_CREATE_PANE = "create_pane"
+AUTHORIZE_BOUNDARY_PUBLISH = "publish"
+AUTHORIZE_BOUNDARIES = (
+    AUTHORIZE_BOUNDARY_DECLARE,
+    AUTHORIZE_BOUNDARY_CREATE_PANE,
+    AUTHORIZE_BOUNDARY_PUBLISH,
+)
+
+
+def _run_authorize(authorize: Optional[Callable[[str], None]], boundary: str) -> None:
+    """Invoke the optional pre-effect authorization callback.
+
+    Deliberately not wrapped: the callback's own typed exception is the
+    caller's linearization decision and must surface as-is, never as a
+    launch-typed error that would obscure which boundary refused.
+    """
+    if authorize is not None:
+        authorize(boundary)
+
 
 def _kimi_argv(
     *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
@@ -1201,6 +1236,7 @@ def start(
     launch_kind: str = LAUNCH_KIND_RESUME,
     expected_inner_executable: Optional[str] = None,
     provider_version: Optional[str] = None,
+    authorize: Optional[Callable[[str], None]] = None,
 ) -> dict[str, Any]:
     """Claim, launch, prove, and publish one native TUI attachment.
 
@@ -1222,6 +1258,13 @@ def start(
     native header instead; for every other provider and build the argv remains
     the proof.  Absent (``None``), it leaves the argv proof in place, so a
     caller that does not know the version is unchanged.
+
+    ``authorize`` is the optional pre-effect authorization callback (B3's
+    smallest launch seam): invoked immediately before the attachment
+    declaration, the atomic pane-with-resume-argv creation, and the
+    identity-verification publication, with the boundary name.  Supplying
+    none preserves the historical behavior exactly — no callback, no
+    change.
     """
     provider = _require_text(provider, field="provider")
     native_session_id = _require_text(native_session_id, field="native_session_id")
@@ -1263,6 +1306,7 @@ def start(
         raise NativeLaunchInvalid("the constructed argv does not bind exactly the bound session")
 
     try:
+        _run_authorize(authorize, AUTHORIZE_BOUNDARY_DECLARE)
         record, _acquired = native_attachment.declare(
             provider=provider,
             native_session_id=native_session_id,
@@ -1332,6 +1376,7 @@ def start(
             observation=observation,
             absent_reason=AMBIGUOUS_START_CROSSED_NO_PANE,
         )
+        _run_authorize(authorize, AUTHORIZE_BOUNDARY_PUBLISH)
         attachment = _publish(
             provider=provider,
             native_session_id=native_session_id,
@@ -1354,6 +1399,12 @@ def start(
         )
 
     try:
+        # The atomic creation boundary: the callback authorizes the ordered
+        # create_pane and launch_resume intents back-to-back here, immediately
+        # before the single atomic transport call that creates the pane AND
+        # starts the resume argv.  A refusal between those two authorizations
+        # raises here, before mark_starting and before any pane exists.
+        _run_authorize(authorize, AUTHORIZE_BOUNDARY_CREATE_PANE)
         native_attachment.mark_starting(
             provider=provider,
             native_session_id=native_session_id,
@@ -1411,6 +1462,7 @@ def start(
         observation=observation,
         absent_reason=AMBIGUOUS_PANE_ABSENT_AFTER_CREATE,
     )
+    _run_authorize(authorize, AUTHORIZE_BOUNDARY_PUBLISH)
     attachment = _publish(
         provider=provider,
         native_session_id=native_session_id,

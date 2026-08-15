@@ -639,11 +639,17 @@ class TestCrashPointsConverge:
         assert replayed["state"] == na.ATTACHED
         assert replayed["epoch"] == attached["epoch"]
 
-    def test_replaying_mark_starting_after_a_crash_is_idempotent(self):
+    def test_mark_starting_is_an_exclusive_declared_to_starting_transition(self):
+        """A stale DECLARED observer cannot pass the pane-start boundary.
+
+        Crash re-entry goes back through ``declare`` and branches on its
+        returned STARTING row.  Calling this lower-level transition twice
+        would instead let a concurrent stale caller create a second pane.
+        """
         record, _ = _declare()
-        first = na.mark_starting(provider=PROVIDER, native_session_id=SESSION, **_owner(record))
-        second = na.mark_starting(provider=PROVIDER, native_session_id=SESSION, **_owner(record))
-        assert first["epoch"] == second["epoch"]
+        na.mark_starting(provider=PROVIDER, native_session_id=SESSION, **_owner(record))
+        with pytest.raises(na.NativeAttachmentConflict):
+            na.mark_starting(provider=PROVIDER, native_session_id=SESSION, **_owner(record))
 
     def test_publication_cannot_skip_the_starting_state(self):
         record, _ = _declare()

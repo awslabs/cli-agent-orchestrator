@@ -716,7 +716,6 @@ def mark_starting(
         from_states=frozenset({DECLARED}),
         to_state=STARTING,
         extra=extra,
-        idempotent_from=frozenset({STARTING}),
     )
 
 

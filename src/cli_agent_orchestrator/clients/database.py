@@ -986,6 +986,31 @@ class ReincarnationOperationModel(Base):
     compatibility_cell_digest = Column(Text, nullable=True)
     phase = Column(Text, nullable=False)
     request_json = Column(Text, nullable=False)
+    # --- additive B3 successor reservation/result facts (cond-0378 B3) ---
+    # All nullable: an operation claimed before the executor ran carries no
+    # successor and no result, and an old binary reading these rows ignores
+    # them entirely.  The successor reservation is allocated once by the
+    # exact executor before any physical I/O; response loss and restart
+    # adopt the same ids rather than allocating a second successor.  The
+    # unique indexes below are the store-level enforcement that one 8-hex
+    # successor terminal id (and one successor generation) can never name
+    # two operations.
+    successor_terminal_id = Column(Text, nullable=True)
+    successor_generation = Column(Text, nullable=True)
+    #: The roster incarnation id the final bind appended, recorded in the
+    # same transaction that binds the successor.
+    successor_incarnation_id = Column(Text, nullable=True)
+    #: The durable bounded outcome: ``pending`` once a successor is
+    #: reserved, then ``accepted`` / ``refused`` / ``reconciliation-required``.
+    #: ``accepted`` and ``reconciliation-required`` are write-once final —
+    #: an ambiguous physical result is never overwritten or hidden.
+    result_state = Column(Text, nullable=True)
+    result_detail = Column(Text, nullable=True)
+    #: Bounded, redacted canonical-JSON evidence only — references and
+    #: digests, never task text, provider output, secrets, or environment
+    #: values.
+    result_evidence_json = Column(Text, nullable=True)
+    result_at = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
 
@@ -1002,6 +1027,18 @@ class ReincarnationOperationModel(Base):
         ),
         Index("ix_reincarnation_operations_session", "session_name"),
         Index("ix_reincarnation_operations_agent", "agent_id"),
+        #: One successor terminal id per store (SQLite treats NULLs as
+        #: distinct, so unreserved operations never collide).
+        Index(
+            "ix_reincarnation_operations_successor_terminal",
+            "successor_terminal_id",
+            unique=True,
+        ),
+        Index(
+            "ix_reincarnation_operations_successor_generation",
+            "successor_generation",
+            unique=True,
+        ),
     )
 
 
@@ -2193,6 +2230,25 @@ def _migrate_restore_contracts() -> None:
         logger.warning(f"restore-contract migration failed: {e}")
 
 
+def _add_columns_if_missing(
+    conn: Any, table: str, columns: Dict[str, str], *, index: Optional[Dict[str, str]] = None
+) -> None:
+    """Idempotently add nullable columns (and optional indexes) to one table.
+
+    The same PRAGMA-gated ``ALTER TABLE ADD COLUMN`` pattern the per-table
+    migrations above inline, factored once for the additive B3 successor/
+    result facts: fresh databases already carry the columns from
+    ``Base.metadata.create_all``, an in-place store gains them without
+    touching existing rows, and a rerun is a no-op.
+    """
+    present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for column, ddl in columns.items():
+        if column not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    for name, statement in (index or {}).items():
+        conn.execute(statement)
+
+
 def _migrate_operation_journal() -> None:
     """Create the operation-journal tables on older databases.
 
@@ -2288,6 +2344,35 @@ def _migrate_operation_journal() -> None:
                 "created_at TEXT NOT NULL, "
                 "updated_at TEXT NOT NULL"
                 ")"
+            )
+            # --- additive B3 successor/result columns on an existing B2
+            # table.  ``CREATE TABLE IF NOT EXISTS`` above already carries
+            # them for fresh stores; an in-place store gains them here,
+            # idempotently, with existing rows keeping their bytes.
+            _add_columns_if_missing(
+                conn,
+                "reincarnation_operations",
+                {
+                    "successor_terminal_id": "TEXT",  # noqa: E501 - B3 successor reservation
+                    "successor_generation": "TEXT",
+                    "successor_incarnation_id": "TEXT",
+                    "result_state": "TEXT",
+                    "result_detail": "TEXT",
+                    "result_evidence_json": "TEXT",
+                    "result_at": "TEXT",
+                },
+            )
+            # One successor terminal id / generation per store; SQLite
+            # treats NULLs as distinct so unreserved operations coexist.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_reincarnation_operations_successor_terminal "
+                "ON reincarnation_operations(successor_terminal_id)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_reincarnation_operations_successor_generation "
+                "ON reincarnation_operations(successor_generation)"
             )
     except Exception as e:  # noqa: BLE001 - the effect seam fails closed
         logger.warning(f"operation-journal migration failed: {e}")
