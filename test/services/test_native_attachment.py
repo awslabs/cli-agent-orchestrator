@@ -12,6 +12,7 @@ converging on one adjudicable outcome.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy.orm import Query
 
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import native_attachment as na
@@ -690,6 +691,48 @@ class TestResumeBindsBeforeAdmission:
         )
         assert resumed["release_proof"]["terminal_id"] == attached["owner"]["terminal_id"]
         assert resumed["epoch"] > attached["epoch"]
+
+    def test_reacquire_cas_loser_adopts_the_exact_same_owner(self, monkeypatch):
+        """A stale detached observer must adopt an identical winning claim.
+
+        Two executor processes can reserve the same successor, both observe the
+        released attachment, and race its detached -> declared CAS.  The loser
+        must re-read and adopt the exact terminal/generation/mode winner rather
+        than refuse the operation while its own durable owner is live.
+        """
+        attached = _advance_to_attached()
+        na.release(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            proof=_proof(attached),
+            **_owner(attached),
+        )
+        real_update = Query.update
+
+        def _apply_winner_but_report_lost_cas(query, values, *args, **kwargs):
+            updated = real_update(query, values, *args, **kwargs)
+            if values.get("state") == na.DECLARED:
+                assert updated == 1
+                return 0
+            return updated
+
+        monkeypatch.setattr(Query, "update", _apply_winner_but_report_lost_cas)
+        resumed, acquired = _declare(
+            terminal_id="1ad645c8",
+            generation="bbbbbbbb",
+            pane_id=None,
+            intent=_intent(na.ACQUISITION_RESUME),
+        )
+
+        assert acquired is False
+        assert resumed["state"] == na.DECLARED
+        assert resumed["owner"] == {
+            "terminal_id": "1ad645c8",
+            "generation": "bbbbbbbb",
+            "execution_mode": em.NATIVE_TUI,
+            "pane_id": None,
+            "process_identity": None,
+        }
 
     def test_a_resume_cannot_claim_a_session_that_was_never_released(self):
         _advance_to_attached()
