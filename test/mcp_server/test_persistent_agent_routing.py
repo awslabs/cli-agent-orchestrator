@@ -124,7 +124,12 @@ def test_send_to_persistent_agent_resolves_at_call_time():
     ):
         result = server._send_message_to_persistent_agent_impl("shaffer-estimating", "bounded task")
 
-    send.assert_called_once_with("aaaa1111", "bounded task", semantic_resolved=True)
+    send.assert_called_once_with(
+        "aaaa1111",
+        "bounded task",
+        semantic_resolved=True,
+        suppress_runtime_address=True,
+    )
     assert result["persistent_agent_id"] == "shaffer-estimating"
     assert "resolved_terminal_id" not in result
     assert "receiver_id" not in result

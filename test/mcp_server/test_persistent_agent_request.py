@@ -171,6 +171,7 @@ def test_dispatch_persistent_agent_is_async_and_redacts_terminal_address():
     args, kwargs = send.call_args
     assert args[0] == "aaaa1111"
     assert kwargs["semantic_resolved"] is True
+    assert kwargs["suppress_runtime_address"] is True
     assert result["request_id"] in args[1]
     assert "assign_async" in args[1]
     assert "reply_to_persistent_request" in args[1]
@@ -191,6 +192,7 @@ def test_reply_to_persistent_request_resolves_original_sender_internally():
         "cccc3333",
         f"[Persistent department result request_id={'a' * 32}]\nreviewed result",
         semantic_resolved=True,
+        suppress_runtime_address=True,
     )
 
 
@@ -205,3 +207,43 @@ def test_managed_persistent_dispatch_gate_prefers_async_but_keeps_wait_optional(
     assert "dispatch_persistent_agent" in result["error"]
     assert "request_persistent_agent" in result["error"]
     discover.assert_not_called()
+
+
+def test_managed_semantic_send_never_injects_terminal_address_into_payload():
+    with (
+        patch.object(server, "ENABLE_SENDER_ID_INJECTION", True),
+        patch.dict("os.environ", {"CAO_TERMINAL_ID": "deadbeef"}, clear=True),
+        patch.object(server, "_send_to_inbox", return_value={"success": True}) as inbox,
+    ):
+        result = server._send_message_impl(
+            "aaaa1111",
+            "managed payload",
+            semantic_resolved=True,
+            suppress_runtime_address=True,
+        )
+
+    assert result["success"] is True
+    inbox.assert_called_once_with("aaaa1111", "managed payload", defer_delivery=False)
+    assert "deadbeef" not in inbox.call_args.args[1]
+    assert "Message from terminal" not in inbox.call_args.args[1]
+
+
+def test_managed_semantic_delivery_error_redacts_runtime_address():
+    response = _response({"detail": "Terminal aaaa1111 vanished"}, status_code=404)
+    error = requests.HTTPError("404")
+    error.response = response
+    with (
+        patch.object(server, "ENABLE_SENDER_ID_INJECTION", True),
+        patch.dict("os.environ", {"CAO_TERMINAL_ID": "deadbeef"}, clear=True),
+        patch.object(server, "_send_to_inbox", side_effect=error),
+    ):
+        result = server._send_message_impl(
+            "aaaa1111",
+            "managed payload",
+            semantic_resolved=True,
+            suppress_runtime_address=True,
+        )
+
+    assert result["success"] is False
+    assert "aaaa1111" not in result["error"]
+    assert "[runtime address]" in result["error"]
