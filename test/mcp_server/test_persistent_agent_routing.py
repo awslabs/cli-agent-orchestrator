@@ -33,6 +33,7 @@ def test_list_persistent_agents_uses_exact_terminal_metadata():
                 "id": "aaaa1111",
                 "session_name": "cao-a",
                 "agent_profile": "shaffer-estimating",
+                "provider": "codex",
                 "status": "completed",
                 "metadata": {
                     "persistent_agent_id": "shaffer-estimating",
@@ -69,6 +70,7 @@ def test_list_persistent_agents_uses_exact_terminal_metadata():
         "kind": "department",
         "parent_agent_id": None,
         "agent_profile": "shaffer-estimating",
+        "provider": "codex",
         "session_name": "cao-a",
         "status": "completed",
     }
