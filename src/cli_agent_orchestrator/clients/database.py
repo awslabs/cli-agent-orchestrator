@@ -1113,6 +1113,142 @@ class SessionEffectBarrierModel(Base):
     updated_at = Column(Text, nullable=False)
 
 
+class SessionCohortOperationModel(Base):
+    """One durable fleet lifecycle cohort operation (cond-0379 C1).
+
+    The row is the fork-owned, tmux-independent truth for a whole-fleet
+    lifecycle operation. Its immutable request binds the exact session
+    lifecycle epoch and an opaque revision of the stable-agent roster. C1
+    admits Pause/Stop claims; the nullable source/target carriers reserve the
+    accepted later operator-Resume extension. The mutable
+    ``state``/``state_epoch`` pair is advanced only through the cohort
+    journal's closed transition vocabulary. C1 deliberately performs no
+    lifecycle, barrier, tmux, provider, wait-runner, or conductor effects.
+    """
+
+    __tablename__ = "session_cohort_operations"
+
+    operation_id = Column(Text, primary_key=True)
+    request_digest = Column(Text, nullable=False)
+    schema_version = Column(Text, nullable=False)
+    session_name = Column(Text, nullable=False)
+    operation_kind = Column(Text, nullable=False)
+    requested_mode = Column(Text, nullable=False)
+    current_mode = Column(Text, nullable=False)
+    initiator_kind = Column(Text, nullable=False)
+    initiated_by = Column(Text, nullable=False)
+    source_operation_id = Column(Text, nullable=True)
+    resume_target = Column(Text, nullable=True)
+    lifecycle_epoch = Column(Integer, nullable=False)
+    lifecycle_observation = Column(Text, nullable=False)
+    # Opaque sha256 of the sorted stable-agent id/revision vector. It is a
+    # revision token, not an inferred session-wide counter.
+    roster_revision = Column(Text, nullable=False)
+    member_snapshot_digest = Column(Text, nullable=False)
+    state = Column(Text, nullable=False)
+    state_epoch = Column(Integer, nullable=False, default=0, server_default="0")
+    request_json = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        # At one exact lifecycle/roster boundary there is one cohort winner.
+        # A retry query-adopts it rather than starting a conflicting fleet
+        # operation from the same observation.
+        Index(
+            "ix_session_cohort_operations_slot",
+            "session_name",
+            "lifecycle_epoch",
+            "roster_revision",
+            unique=True,
+        ),
+        Index("ix_session_cohort_operations_session", "session_name"),
+    )
+
+
+class SessionCohortMemberModel(Base):
+    """One stable-agent member captured at a cohort operation boundary.
+
+    Every stable agent in the session is retained in the snapshot. Agents
+    already dormant/retired are marked excluded rather than erased, so fleet
+    Resume cannot silently resurrect them while an operator can still see why
+    they were outside the Stop cohort. Result/evidence columns are nullable C1
+    carriers for later safe-drain, interrupt, teardown, and restore slices.
+    """
+
+    __tablename__ = "session_cohort_members"
+
+    operation_id = Column(Text, primary_key=True)
+    agent_id = Column(Text, primary_key=True)
+    snapshot_digest = Column(Text, nullable=False)
+    snapshot_json = Column(Text, nullable=False)
+    role = Column(Text, nullable=False)
+    profile_family = Column(Text, nullable=False)
+    pre_disposition = Column(Text, nullable=False)
+    agent_revision = Column(Integer, nullable=False)
+    included = Column(Integer, nullable=False)
+    exclusion_reason = Column(Text, nullable=True)
+    lineage_id = Column(Text, nullable=True)
+    harness = Column(Text, nullable=True)
+    native_session_id = Column(Text, nullable=True)
+    incarnation_id = Column(Text, nullable=True)
+    terminal_id = Column(Text, nullable=True)
+    generation = Column(Text, nullable=True)
+    pane_id = Column(Text, nullable=True)
+    restore_contract_id = Column(Text, nullable=True)
+    restore_contract_digest = Column(Text, nullable=True)
+    task_occurrence_id = Column(Text, nullable=True)
+    boundary_digest = Column(Text, nullable=True)
+    report_digest = Column(Text, nullable=True)
+    checkpoint_digest = Column(Text, nullable=True)
+    interrupt_action = Column(Text, nullable=True)
+    interrupt_outcome = Column(Text, nullable=True)
+    background_command_loss_risk = Column(Text, nullable=False)
+    final_state = Column(Text, nullable=False)
+    result_detail = Column(Text, nullable=True)
+    result_revision = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (Index("ix_session_cohort_members_agent", "agent_id"),)
+
+
+class SessionCohortTransitionModel(Base):
+    """One append-only, caller-minted cohort state transition receipt.
+
+    The unique ``(operation_id, from_state_epoch)`` slot prevents two
+    good-faith retrying actors from advancing the same observed state in
+    different directions. Explicit safe-to-force promotion is represented by
+    ``from_mode != to_mode`` and requires a receipt digest in the service.
+    """
+
+    __tablename__ = "session_cohort_transitions"
+
+    transition_id = Column(Text, primary_key=True)
+    operation_id = Column(Text, nullable=False)
+    transition_digest = Column(Text, nullable=False)
+    transition_json = Column(Text, nullable=False)
+    from_state = Column(Text, nullable=False)
+    to_state = Column(Text, nullable=False)
+    from_mode = Column(Text, nullable=False)
+    to_mode = Column(Text, nullable=False)
+    from_state_epoch = Column(Integer, nullable=False)
+    actor = Column(Text, nullable=False)
+    reason = Column(Text, nullable=True)
+    receipt_digest = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_session_cohort_transitions_epoch",
+            "operation_id",
+            "from_state_epoch",
+            unique=True,
+        ),
+        Index("ix_session_cohort_transitions_operation", "operation_id"),
+    )
+
+
 class NativeStatusRepairEvidenceModel(Base):
     """One immutable bounded record of a native /status identity repair.
 
@@ -1647,6 +1783,7 @@ def init_db() -> None:
     _migrate_stable_agent_roster()
     _migrate_restore_contracts()
     _migrate_operation_journal()
+    _migrate_session_cohort_journal()
     _migrate_native_status_repair()
     _migrate_native_status_observation_attempt()
     _migrate_legacy_identity_migration()
@@ -2376,6 +2513,122 @@ def _migrate_operation_journal() -> None:
             )
     except Exception as e:  # noqa: BLE001 - the effect seam fails closed
         logger.warning(f"operation-journal migration failed: {e}")
+
+
+def _migrate_session_cohort_journal() -> None:
+    """Create the dark M3-C cohort journal on older databases.
+
+    Fresh stores receive the same schema through ORM ``create_all``. This
+    migration is additive and idempotent: no legacy lifecycle route reads or
+    writes these tables, and creating them performs no Stop/Pause/Resume,
+    provider, tmux, wait-runner, or conductor effect.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_cohort_operations ("
+                "operation_id TEXT NOT NULL PRIMARY KEY, "
+                "request_digest TEXT NOT NULL, "
+                "schema_version TEXT NOT NULL, "
+                "session_name TEXT NOT NULL, "
+                "operation_kind TEXT NOT NULL, "
+                "requested_mode TEXT NOT NULL, "
+                "current_mode TEXT NOT NULL, "
+                "initiator_kind TEXT NOT NULL, "
+                "initiated_by TEXT NOT NULL, "
+                "source_operation_id TEXT, "
+                "resume_target TEXT, "
+                "lifecycle_epoch INTEGER NOT NULL, "
+                "lifecycle_observation TEXT NOT NULL, "
+                "roster_revision TEXT NOT NULL, "
+                "member_snapshot_digest TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "state_epoch INTEGER NOT NULL DEFAULT 0, "
+                "request_json TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_session_cohort_operations_slot "
+                "ON session_cohort_operations"
+                "(session_name, lifecycle_epoch, roster_revision)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_session_cohort_operations_session "
+                "ON session_cohort_operations(session_name)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_cohort_members ("
+                "operation_id TEXT NOT NULL, "
+                "agent_id TEXT NOT NULL, "
+                "snapshot_digest TEXT NOT NULL, "
+                "snapshot_json TEXT NOT NULL, "
+                "role TEXT NOT NULL, "
+                "profile_family TEXT NOT NULL, "
+                "pre_disposition TEXT NOT NULL, "
+                "agent_revision INTEGER NOT NULL, "
+                "included INTEGER NOT NULL, "
+                "exclusion_reason TEXT, "
+                "lineage_id TEXT, "
+                "harness TEXT, "
+                "native_session_id TEXT, "
+                "incarnation_id TEXT, "
+                "terminal_id TEXT, "
+                "generation TEXT, "
+                "pane_id TEXT, "
+                "restore_contract_id TEXT, "
+                "restore_contract_digest TEXT, "
+                "task_occurrence_id TEXT, "
+                "boundary_digest TEXT, "
+                "report_digest TEXT, "
+                "checkpoint_digest TEXT, "
+                "interrupt_action TEXT, "
+                "interrupt_outcome TEXT, "
+                "background_command_loss_risk TEXT NOT NULL, "
+                "final_state TEXT NOT NULL, "
+                "result_detail TEXT, "
+                "result_revision INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (operation_id, agent_id)"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_session_cohort_members_agent "
+                "ON session_cohort_members(agent_id)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_cohort_transitions ("
+                "transition_id TEXT NOT NULL PRIMARY KEY, "
+                "operation_id TEXT NOT NULL, "
+                "transition_digest TEXT NOT NULL, "
+                "transition_json TEXT NOT NULL, "
+                "from_state TEXT NOT NULL, "
+                "to_state TEXT NOT NULL, "
+                "from_mode TEXT NOT NULL, "
+                "to_mode TEXT NOT NULL, "
+                "from_state_epoch INTEGER NOT NULL, "
+                "actor TEXT NOT NULL, "
+                "reason TEXT, "
+                "receipt_digest TEXT, "
+                "created_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_session_cohort_transitions_epoch "
+                "ON session_cohort_transitions(operation_id, from_state_epoch)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_session_cohort_transitions_operation "
+                "ON session_cohort_transitions(operation_id)"
+            )
+    except Exception as e:  # noqa: BLE001 - dark journal fails closed
+        logger.warning(f"session-cohort journal migration failed: {e}")
 
 
 def _migrate_native_status_repair() -> None:
