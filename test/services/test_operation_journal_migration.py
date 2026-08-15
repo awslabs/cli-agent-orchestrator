@@ -165,12 +165,14 @@ def test_create_all_enforces_operation_journal_invariants(tmp_path):
         intent_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(reincarnation_effect_intents)")
         }
-        barrier_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(session_effect_barriers)")
+        barrier_info = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(session_effect_barriers)")
         }
+        barrier_cols = set(barrier_info)
         assert _OPERATION_COLUMNS <= op_cols
         assert _INTENT_COLUMNS <= intent_cols
         assert _BARRIER_COLUMNS <= barrier_cols
+        assert barrier_info["epoch"][4] in {"0", "'0'"}
         # The winner slot (agent, prior incarnation, lifecycle epoch, roster
         # revision) admits exactly one operation.
         slot_cols = (
@@ -264,6 +266,10 @@ def test_operation_journal_migration_is_idempotent_and_preserves_prior_rows(tmp_
     conn = sqlite3.connect(str(db_path))
     try:
         _assert_journal_index_set(conn)
+        barrier_info = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(session_effect_barriers)")
+        }
+        assert barrier_info["epoch"][4] in {"0", "'0'"}
         agents = conn.execute("SELECT COUNT(*) FROM stable_agents").fetchone()[0]
         contracts = conn.execute("SELECT COUNT(*) FROM restore_contracts").fetchone()[0]
         assert agents == 1

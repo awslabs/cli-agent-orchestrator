@@ -1071,7 +1071,7 @@ class SessionEffectBarrierModel(Base):
     reason = Column(Text, nullable=True)
     #: Monotonic per-row counter; every CAS transition bumps it so a lost
     #: update is detectable rather than silently last-write-wins.
-    epoch = Column(Integer, nullable=False, default=0)
+    epoch = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
 

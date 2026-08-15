@@ -224,6 +224,18 @@ def _require_text(value: Any, *, field: str, max_len: int = MAX_TEXT_LEN) -> str
     return value
 
 
+def _normalise_session_name(value: Any) -> str:
+    """Return one bounded canonical CAO session key using journal errors."""
+    raw = _require_text(value, field="session_name", max_len=MAX_SESSION_LEN)
+    name = sl.normalise_session_name(raw)
+    if len(name) > MAX_SESSION_LEN:
+        raise OperationJournalInvalid(
+            f"session_name normalises to {len(name)} characters, "
+            f"exceeding the {MAX_SESSION_LEN}-character limit"
+        )
+    return name
+
+
 def _optional_text(value: Any, *, field: str, max_len: int = MAX_TEXT_LEN) -> Optional[str]:
     if value is None:
         return None
@@ -352,16 +364,7 @@ class OperationRequest:
         # to one stored/digested request and one lifecycle row.  The NORMALISED
         # form is bounded, so adding the ``cao-`` prefix cannot exceed the
         # limit.
-        raw_session = _require_text(
-            self.session_name, field="session_name", max_len=MAX_SESSION_LEN
-        )
-        normalised_session = sl.normalise_session_name(raw_session)
-        if len(normalised_session) > MAX_SESSION_LEN:
-            raise OperationJournalInvalid(
-                f"session_name normalises to {len(normalised_session)} characters, "
-                f"exceeding the {MAX_SESSION_LEN}-character limit"
-            )
-        object.__setattr__(self, "session_name", normalised_session)
+        object.__setattr__(self, "session_name", _normalise_session_name(self.session_name))
         object.__setattr__(self, "agent_id", _require_uuid(self.agent_id, field="agent_id"))
         if (
             not isinstance(self.roster_revision, int)
@@ -690,7 +693,7 @@ def _lifecycle_in_session(db: Any, session_name: str) -> tuple[str, int]:
     read surface; an unknown stored lifecycle value is returned as-is so the
     equality checks below refuse it truthfully.
     """
-    name = sl.normalise_session_name(session_name)
+    name = _normalise_session_name(session_name)
     if not sa_inspect(db.get_bind()).has_table(database.SessionLifecycleModel.__tablename__):
         return sl.WORKING, 0
     row = (
@@ -704,7 +707,7 @@ def _lifecycle_in_session(db: Any, session_name: str) -> tuple[str, int]:
 
 
 def _barrier_row(db: Any, session_name: str) -> Any:
-    name = sl.normalise_session_name(session_name)
+    name = _normalise_session_name(session_name)
     if not sa_inspect(db.get_bind()).has_table(database.SessionEffectBarrierModel.__tablename__):
         return None
     return (
@@ -1478,7 +1481,7 @@ def _claim_barrier_once(
     is never cleared automatically — only a later operator-authorized Resume
     lifecycle (M3-C/M3-F scope) may open the stopped campaign again.
     """
-    name = sl.normalise_session_name(session_name)
+    name = _normalise_session_name(session_name)
     row = _barrier_row(db, name)
     if row is not None:
         if row.state == BARRIER_CLAIMED:
@@ -1639,7 +1642,10 @@ def list_operations(
         if agent_id is not None:
             query = query.filter(database.ReincarnationOperationModel.agent_id == agent_id)
         if session_name is not None:
-            query = query.filter(database.ReincarnationOperationModel.session_name == session_name)
+            query = query.filter(
+                database.ReincarnationOperationModel.session_name
+                == _normalise_session_name(session_name)
+            )
         rows = query.order_by(
             database.ReincarnationOperationModel.created_at,
             database.ReincarnationOperationModel.operation_id,

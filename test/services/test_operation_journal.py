@@ -734,6 +734,15 @@ def test_barriers_are_per_session(isolated_memory_db):
     assert record["adopted"] is False
 
 
+def test_barrier_session_names_use_journal_validation(isolated_memory_db):
+    """Barrier entry points fail through the journal's typed error surface."""
+    with pytest.raises(oj.OperationJournalInvalid):
+        oj.claim_session_barrier("", claimed_by="stop")
+    with pytest.raises(oj.OperationJournalInvalid):
+        oj.get_session_barrier(None)
+    assert oj.list_session_barriers() == []
+
+
 # ---------------------------------------------------------------------------
 # 7. every subsequent phase authorization rechecks the same facts
 # ---------------------------------------------------------------------------
