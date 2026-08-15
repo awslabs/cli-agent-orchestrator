@@ -64,6 +64,111 @@ export interface SessionLifecycle {
   unreadable?: string
 }
 
+// ---------------------------------------------------------------------------
+// Fleet cohort operations (M3-C)
+// ---------------------------------------------------------------------------
+
+/**
+ * A whole-fleet Pause/Stop/Resume. Deliberately a different dimension again
+ * from both `SessionLifecycle.lifecycle` (what the session has declared) and
+ * `Terminal.lifecycle_state` (observed pane liveness): this is *an operation
+ * somebody performed*, with its own state machine and its own history.
+ */
+export type CohortOperationKind = 'pause' | 'stop' | 'resume'
+export type CohortMode = 'safe' | 'force'
+export type CohortState =
+  | 'preparing'
+  | 'draining-to-boundary'
+  | 'interrupting'
+  | 'tearing-down'
+  | 'paused'
+  | 'stopped'
+  | 'restoring'
+  | 'reconciliation-required'
+  | 'settled'
+
+/**
+ * One member's outcome. All of `restored-exact`, `restored-fresh`, `failed`
+ * and `unresumable` are *terminal*: a fleet that came back with one worker
+ * missing is a settled fleet that lost a worker, not an unresolved one. Only
+ * `reconciliation-required` means "we do not know yet".
+ */
+export type CohortMemberOutcome =
+  | 'pending'
+  | 'excluded-historical'
+  | 'drained'
+  | 'interrupted'
+  | 'already-idle'
+  | 'parked'
+  | 'exited'
+  | 'stopped'
+  | 'restored-exact'
+  | 'restored-fresh'
+  | 'failed'
+  | 'unresumable'
+  | 'reconciliation-required'
+
+/** Which stable agent kept which native session across the operation. */
+export interface CohortContinuity {
+  agent_id: string
+  role: 'supervisor' | 'worker'
+  included: boolean
+  exclusion_reason: string | null
+  /** The native-session lineage. Distinct from both ids below. */
+  lineage_id: string | null
+  harness: string | null
+  native_session_id: string | null
+  /** One run of a stable agent. A restore makes a new one; the agent persists. */
+  incarnation_id: string | null
+  terminal_id: string | null
+  generation: string | null
+  final_state: CohortMemberOutcome
+}
+
+export interface CohortProvenance {
+  operation_id: string
+  session_name: string
+  operation_kind: CohortOperationKind
+  state: CohortState
+  state_epoch: number
+  lifecycle_epoch: number
+  lifecycle_observation: SessionLifecycleValue
+  roster_revision: string
+  member_snapshot_digest: string
+  requested_mode: CohortMode
+  current_mode: CohortMode
+  /** Safe never becomes force implicitly; a promotion always has a receipt. */
+  promoted_to_force: boolean
+  promotion_receipt_digest: string | null
+  promoted_by: string | null
+  initiator_kind: 'operator' | 'supervisor'
+  initiated_by: string
+  /** The Stop a Resume descends from. Null for Pause/Stop. */
+  source_operation_id: string | null
+  resume_target: string | null
+  member_outcomes: Partial<Record<CohortMemberOutcome, number>>
+  continuity: CohortContinuity[]
+}
+
+export interface CohortOperation {
+  operation_id: string
+  session_name: string
+  operation_kind: CohortOperationKind
+  requested_mode: CohortMode
+  current_mode: CohortMode
+  initiator_kind: 'operator' | 'supervisor'
+  initiated_by: string
+  state: CohortState
+  state_epoch: number
+  lifecycle_epoch: number
+  source_operation_id: string | null
+  resume_target: string | null
+  created_at: string
+  updated_at: string
+  /** Only on the single-operation read; the list projection is deliberately light. */
+  provenance?: CohortProvenance
+}
+
 export interface StopImpactWorker {
   terminal_id: string
   provider: string
@@ -683,6 +788,75 @@ export const api = {
   // They come back with the buttons.
   getStopImpact: (name: string) =>
     fetchJSON<StopImpact>(`/sessions/${encodeURIComponent(name)}/stop-impact`),
+
+  // Fleet cohort operations. Six write methods, not two with a mode argument:
+  // the separation that keeps force out of reach of a caller who meant safe
+  // has to survive the client, or the client becomes the way around it.
+  //
+  // `operationId` is caller-supplied so a retried request is the *same*
+  // operation and adopts the durable winner instead of starting a second one.
+  listCohortOperations: (name: string) =>
+    fetchJSON<{ operations: CohortOperation[]; count: number }>(
+      `/sessions/${encodeURIComponent(name)}/cohort-operations`),
+  getCohortOperation: (operationId: string) =>
+    fetchJSON<CohortOperation & { provenance: CohortProvenance }>(
+      `/cohort-operations/${encodeURIComponent(operationId)}`),
+
+  cohortPauseForce: (name: string, operationId: string, initiatedBy: string, reason?: string) =>
+    fetchJSON<CohortOperation>(`/sessions/${encodeURIComponent(name)}/cohort/pause/force`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      timeoutMs: 120000,
+      body: JSON.stringify({
+        operation_id: operationId, initiated_by: initiatedBy, reason: reason ?? null,
+        acknowledged_interrupt: true,
+      }),
+    }),
+  cohortStopSafe: (
+    name: string, operationId: string, initiatedBy: string,
+    drainReceiptDigest: string, reason?: string,
+  ) =>
+    fetchJSON<CohortOperation>(`/sessions/${encodeURIComponent(name)}/cohort/stop/safe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      timeoutMs: 120000,
+      body: JSON.stringify({
+        operation_id: operationId, initiated_by: initiatedBy, reason: reason ?? null,
+        drain_receipt_digest: drainReceiptDigest, acknowledged_one_way: true,
+      }),
+    }),
+  cohortStopForce: (name: string, operationId: string, initiatedBy: string, reason?: string) =>
+    fetchJSON<CohortOperation>(`/sessions/${encodeURIComponent(name)}/cohort/stop/force`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      timeoutMs: 120000,
+      body: JSON.stringify({
+        operation_id: operationId, initiated_by: initiatedBy, reason: reason ?? null,
+        acknowledged_one_way: true, acknowledged_force: true,
+      }),
+    }),
+  // Restores the panes and stops. Sends zero input — no keystroke, no
+  // supervisor bump — so an operator can look before anything moves.
+  cohortResumePaused: (name: string, operationId: string, initiatedBy: string, reason?: string) =>
+    fetchJSON<CohortOperation>(`/sessions/${encodeURIComponent(name)}/cohort/resume/paused`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      timeoutMs: 180000,
+      body: JSON.stringify({
+        operation_id: operationId, initiated_by: initiatedBy, reason: reason ?? null,
+      }),
+    }),
+  // Restores and wakes the supervisor exactly once, after every member
+  // outcome is durable.
+  cohortResumeStart: (name: string, operationId: string, initiatedBy: string, reason?: string) =>
+    fetchJSON<CohortOperation>(`/sessions/${encodeURIComponent(name)}/cohort/resume/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      timeoutMs: 180000,
+      body: JSON.stringify({
+        operation_id: operationId, initiated_by: initiatedBy, reason: reason ?? null,
+      }),
+    }),
 
   // Conductor annotations (§9.5). The route takes no parameters — that is the
   // security property, not an omission — and never errors: an absent or

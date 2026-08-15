@@ -32,6 +32,12 @@ The journal provides six integrity seams:
   commits the cohort plus declared session lifecycle to ``paused``/``stopped``.
   Stop additionally requires the exact operation-owned barrier. Terminal
   member evidence is immutable except for exact response-loss replay.
+* ``begin_resume_restore`` is Stop's mirror image and the C4 addition: it
+  atomically releases the exact Stop barrier that operation claimed and
+  declares the recorded Resume target, so restore effects become legal in the
+  same transaction that stops the session reading ``stopped``. It is reachable
+  only once, from ``preparing``, and only for an operator-initiated Resume
+  whose source is a terminally stopped cohort of the same session.
 * ``record_member_result`` CAS-records the bounded per-member evidence carriers
   named by the accepted design. It stores references/digests and concise
   outcomes, never task text, provider output, environment values, or secrets.
@@ -66,7 +72,8 @@ SCHEMA_VERSION = "cao-m3-cohort-journal-v1"
 
 KIND_PAUSE = "pause"
 KIND_STOP = "stop"
-OPERATION_KINDS = frozenset({KIND_PAUSE, KIND_STOP})
+KIND_RESUME = "resume"
+OPERATION_KINDS = frozenset({KIND_PAUSE, KIND_STOP, KIND_RESUME})
 
 MODE_SAFE = "safe"
 MODE_FORCE = "force"
@@ -141,6 +148,24 @@ PAUSE_TERMINAL_MEMBER_STATES = {
     MODE_FORCE: frozenset({FINAL_INTERRUPTED, FINAL_ALREADY_IDLE, FINAL_PARKED, FINAL_EXITED}),
 }
 STOP_TERMINAL_MEMBER_STATES = frozenset({FINAL_STOPPED, FINAL_EXITED, FINAL_UNRESUMABLE})
+#: A Resume settles once every included member reached a *decided* restore
+#: outcome, and ``failed`` is one of them.
+#:
+#: This is load-bearing and easy to get backwards. A worker that could not be
+#: brought back is a decided fact about that worker, not an unknown about the
+#: fleet: its siblings are running, its supervisor is up, and the campaign can
+#: make progress. Blocking the terminal commit on it would strand the whole
+#: restored fleet in ``reconciliation-required`` — supervisor included — over
+#: one pane, which is the opposite of what a partial restore should cost. The
+#: failure is not swallowed: it is durable per-member evidence, and
+#: Resume-and-start's single wake describes every exact/fresh/failed outcome
+#: so the supervisor reconciles against the truth.
+#:
+#: ``reconciliation-required`` stays for outcomes that are genuinely *not*
+#: decided — pending, ambiguous, or otherwise nonterminal.
+RESUME_TERMINAL_MEMBER_STATES = frozenset(
+    {FINAL_RESTORED_EXACT, FINAL_RESTORED_FRESH, FINAL_FAILED, FINAL_UNRESUMABLE}
+)
 
 MAX_TEXT_LEN = 512
 MAX_DETAIL_LEN = 2000
@@ -281,7 +306,34 @@ def _lifecycle_observation(db: Any, session_name: str) -> dict[str, Any]:
     return {"lifecycle": row.lifecycle, "epoch": int(row.epoch or 0), "declared": True}
 
 
-def _member_snapshot(db: Any, agent: Any) -> dict[str, Any]:
+def _resumed_cohort_agent_ids(db: Any, source_operation_id: str) -> frozenset[str]:
+    """The stable agents an operator Resume is entitled to bring back.
+
+    Inclusion cannot be read off the live roster here the way a Pause/Stop
+    boundary reads it. A Stop retires every incarnation it collects, so by the
+    time a Resume observes the session *every* agent is dormant and the
+    disposition rule would exclude the entire fleet. The exact set is instead
+    the one the Stop cohort captured: stable agent identity is what survives a
+    stop, while incarnations do not.
+
+    This is also what keeps Resume from resurrecting an agent that was already
+    dormant *before* the Stop — that agent was excluded then and is not in
+    this set now.
+    """
+    rows = (
+        db.query(database.SessionCohortMemberModel.agent_id)
+        .filter(
+            database.SessionCohortMemberModel.operation_id == source_operation_id,
+            database.SessionCohortMemberModel.included == 1,
+        )
+        .all()
+    )
+    return frozenset(row[0] for row in rows)
+
+
+def _member_snapshot(
+    db: Any, agent: Any, resumed: Optional[frozenset[str]] = None
+) -> dict[str, Any]:
     lineage = None
     if agent.current_lineage_id is not None:
         lineage = (
@@ -313,11 +365,15 @@ def _member_snapshot(db: Any, agent: Any) -> dict[str, Any]:
             )
         restore_contract = contract_query.one_or_none()
 
-    included = agent.disposition in {
-        roster.DISPOSITION_LIVE,
-        roster.DISPOSITION_IDENTITY_MISSING,
-    }
-    exclusion_reason = None if included else f"pre-disposition:{agent.disposition}"
+    if resumed is None:
+        included = agent.disposition in {
+            roster.DISPOSITION_LIVE,
+            roster.DISPOSITION_IDENTITY_MISSING,
+        }
+        exclusion_reason = None if included else f"pre-disposition:{agent.disposition}"
+    else:
+        included = agent.agent_id in resumed
+        exclusion_reason = None if included else "outside-resumed-cohort"
     snapshot = {
         "agent_id": agent.agent_id,
         "role": agent.role,
@@ -353,7 +409,9 @@ def _member_snapshot(db: Any, agent: Any) -> dict[str, Any]:
     return {**snapshot, "snapshot_digest": _digest(snapshot)}
 
 
-def _observe_boundary(db: Any, session_name: str) -> dict[str, Any]:
+def _observe_boundary(
+    db: Any, session_name: str, resume_source_operation_id: Optional[str] = None
+) -> dict[str, Any]:
     name = _normalise_session_name(session_name)
     lifecycle = _lifecycle_observation(db, name)
     agents = (
@@ -362,7 +420,12 @@ def _observe_boundary(db: Any, session_name: str) -> dict[str, Any]:
         .order_by(database.StableAgentModel.agent_id)
         .all()
     )
-    members = [_member_snapshot(db, agent) for agent in agents]
+    resumed = (
+        None
+        if resume_source_operation_id is None
+        else _resumed_cohort_agent_ids(db, resume_source_operation_id)
+    )
+    members = [_member_snapshot(db, agent, resumed) for agent in agents]
     revision_vector = [
         {"agent_id": member["agent_id"], "revision": member["agent_revision"]} for member in members
     ]
@@ -381,13 +444,20 @@ def _observe_boundary(db: Any, session_name: str) -> dict[str, Any]:
     }
 
 
-def observe_boundary(session_name: str, db: Any = None) -> dict[str, Any]:
-    """Read the exact lifecycle/roster boundary a claim must revalidate."""
+def observe_boundary(
+    session_name: str, db: Any = None, resume_source_operation_id: Optional[str] = None
+) -> dict[str, Any]:
+    """Read the exact lifecycle/roster boundary a claim must revalidate.
+
+    Pass ``resume_source_operation_id`` to observe a *Resume* boundary: the
+    included set then comes from that Stop cohort's captured membership rather
+    than from live dispositions, which a completed Stop has already retired.
+    """
     try:
         if db is not None:
-            return _observe_boundary(db, session_name)
+            return _observe_boundary(db, session_name, resume_source_operation_id)
         with database.SessionLocal() as session:
-            return _observe_boundary(session, session_name)
+            return _observe_boundary(session, session_name, resume_source_operation_id)
     except CohortJournalError:
         raise
     except SQLAlchemyError as exc:
@@ -499,10 +569,33 @@ class OperationRequest:
             "member_snapshot_digest",
             _require_digest(self.member_snapshot_digest, field="member_snapshot_digest"),
         )
-        if self.source_operation_id is not None or self.resume_target is not None:
+        if self.operation_kind == KIND_RESUME:
+            # Resume provenance is mandatory and immutable: the exact Stop
+            # cohort this Resume descends from, and the declared lifecycle it
+            # is authorized to restore.  Without both, a later reader could
+            # not tell which stopped fleet a restore belongs to.
+            object.__setattr__(
+                self,
+                "source_operation_id",
+                _require_uuid(self.source_operation_id, field="source_operation_id"),
+            )
+            if self.resume_target not in sl.RESTORE_TARGETS:
+                raise CohortJournalInvalid(
+                    f"resume_target must be one of {sorted(sl.RESTORE_TARGETS)}; "
+                    f"got {self.resume_target!r}"
+                )
+            if self.initiator_kind != INITIATOR_OPERATOR:
+                raise CohortJournalInvalid(
+                    "only an operator may claim a Resume boundary for a stopped session"
+                )
+            if self.requested_mode != MODE_SAFE:
+                raise CohortJournalInvalid(
+                    "Resume has no force mode: there is no live work to interrupt in a "
+                    "stopped session"
+                )
+        elif self.source_operation_id is not None or self.resume_target is not None:
             raise CohortJournalInvalid(
-                "this slice claims Pause/Stop boundaries only; Resume source/target fields "
-                "must be absent"
+                f"a {self.operation_kind} boundary carries no Resume source/target fields"
             )
 
     def payload(self) -> dict[str, Any]:
@@ -626,6 +719,53 @@ def _transition_dict(row: Any) -> dict[str, Any]:
     }
 
 
+def _validate_resume_source(db: Any, request: OperationRequest) -> Any:
+    """Bind a Resume to the exact stopped cohort it descends from.
+
+    A Resume is only meaningful against a session this fork actually stopped
+    through a durable cohort operation.  Requiring the source row here — at
+    claim, before any state exists — means a Resume can never be pointed at
+    another session's Stop, at a Pause, or at a Stop that never reached its
+    terminal commit, and the provenance a later reader needs is written once
+    and never recomputed.
+    """
+    if request.lifecycle_observation != sl.STOPPED:
+        raise CohortJournalConflict(
+            f"session {request.session_name} is {request.lifecycle_observation!r}; a Resume "
+            "boundary exists only for a stopped session"
+        )
+    source = _operation_by_id(db, str(request.source_operation_id))
+    if source is None:
+        raise CohortJournalNotFound(
+            f"unknown Resume source cohort operation: {request.source_operation_id}"
+        )
+    if source.session_name != request.session_name:
+        raise CohortJournalConflict(
+            f"Resume source {request.source_operation_id} belongs to session "
+            f"{source.session_name!r}, not {request.session_name!r}"
+        )
+    if source.operation_kind != KIND_STOP or source.state != STATE_STOPPED:
+        raise CohortJournalConflict(
+            f"Resume source {request.source_operation_id} is a {source.operation_kind} in state "
+            f"{source.state!r}; only a terminally stopped cohort can be resumed"
+        )
+    row = (
+        db.query(database.SessionLifecycleModel)
+        .filter(database.SessionLifecycleModel.session_name == request.session_name)
+        .one_or_none()
+    )
+    restore_to = row.restore_to if row is not None else None
+    # Resume-paused is always available: it restores the panes and stops
+    # there, which is a strictly smaller act than whatever the session was
+    # doing before. Any other target must be the one the Stop recorded.
+    if request.resume_target != sl.PAUSED and request.resume_target != restore_to:
+        raise CohortJournalConflict(
+            f"session {request.session_name} recorded restore_to={restore_to!r}; a Resume may "
+            f"target that or {sl.PAUSED!r}, not {request.resume_target!r}"
+        )
+    return source
+
+
 def _claim_once(db: Any, request: OperationRequest) -> dict[str, Any]:
     existing = _operation_by_id(db, request.operation_id)
     if existing is not None:
@@ -646,7 +786,18 @@ def _claim_once(db: Any, request: OperationRequest) -> dict[str, Any]:
             f"already claimed by winning operation {winner.operation_id}"
         )
 
-    boundary = _observe_boundary(db, request.session_name)
+    if request.operation_kind == KIND_RESUME:
+        # Validated first: the Resume boundary's membership is *derived* from
+        # the source Stop cohort, so an unusable source has to be refused
+        # before the observation it would define.
+        _validate_resume_source(db, request)
+    elif request.lifecycle_observation == sl.STOPPED:
+        raise CohortJournalConflict(
+            f"session {request.session_name} is stopped; only an operator Resume may claim a "
+            "boundary on it"
+        )
+
+    boundary = _observe_boundary(db, request.session_name, request.source_operation_id)
     mismatches = {
         field: {"observed": boundary[field], "requested": getattr(request, field)}
         for field in (
@@ -661,11 +812,6 @@ def _claim_once(db: Any, request: OperationRequest) -> dict[str, Any]:
         raise CohortJournalConflict(
             f"session {request.session_name} moved since the cohort boundary was observed: "
             f"{mismatches}"
-        )
-    if request.lifecycle_observation == sl.STOPPED:
-        raise CohortJournalConflict(
-            f"session {request.session_name} is already stopped; this slice admits only a new "
-            "Pause/Stop boundary, not Resume"
         )
     if request.operation_kind == KIND_PAUSE and request.lifecycle_observation == sl.PAUSED:
         raise CohortJournalConflict(
@@ -688,8 +834,8 @@ def _claim_once(db: Any, request: OperationRequest) -> dict[str, Any]:
         current_mode=request.requested_mode,
         initiator_kind=request.initiator_kind,
         initiated_by=request.initiated_by,
-        source_operation_id=None,
-        resume_target=None,
+        source_operation_id=request.source_operation_id,
+        resume_target=request.resume_target,
         lifecycle_epoch=request.lifecycle_epoch,
         lifecycle_observation=request.lifecycle_observation,
         roster_revision=request.roster_revision,
@@ -860,6 +1006,20 @@ def _allowed_target(operation_kind: str, current_mode: str, state: str) -> froze
             if current_mode == MODE_SAFE:
                 return frozenset({STATE_DRAINING})
             return frozenset()
+    if operation_kind == KIND_RESUME:
+        if state == STATE_PREPARING:
+            # Entering ``restoring`` releases the Stop barrier and rewrites the
+            # declared lifecycle in one transaction. ``begin_resume_restore``
+            # owns that pairing; the generic path must never reopen a stopped
+            # campaign as a side effect of an ordinary state advance.
+            return frozenset()
+        if state == STATE_RESTORING:
+            return frozenset({STATE_RECONCILIATION_REQUIRED})
+        if state == STATE_RECONCILIATION_REQUIRED:
+            # A retry re-enters restore through the generic receipted path:
+            # the barrier is already open and the lifecycle already written, so
+            # re-running the paired entry would be a second release.
+            return frozenset({STATE_RESTORING})
     return frozenset()
 
 
@@ -909,6 +1069,8 @@ def _transition_once(db: Any, request: TransitionRequest) -> dict[str, Any]:
     from_mode = operation.current_mode
     to_mode = from_mode
     if request.promote_to_force:
+        if operation.operation_kind == KIND_RESUME:
+            raise CohortJournalConflict("a Resume operation has no force mode to promote to")
         expected_target = (
             STATE_INTERRUPTING if operation.operation_kind == KIND_PAUSE else STATE_TEARING_DOWN
         )
@@ -1309,6 +1471,290 @@ def begin_stop_teardown(request: StopTeardownRequest, db: Any = None) -> dict[st
 
 
 @dataclass(frozen=True)
+class ResumeRestoreRequest:
+    """Reopen one stopped campaign: release its barrier and declare its target.
+
+    This is Resume's linearization point and the mirror image of
+    ``begin_stop_teardown``.  Stop writes ``stopped`` *before* collecting a
+    pane so a failure can never leave a collected fleet declared live; Resume
+    writes the target and reopens the barrier *before* creating a pane for the
+    same reason in reverse — a restore that dies half way leaves a session
+    declared live with missing panes, which ``session_lifecycle.divergence``
+    surfaces, rather than a fleet quietly running under a ``stopped`` row that
+    refuses every effect it needs.
+    """
+
+    transition_id: str
+    operation_id: str
+    expected_state_epoch: int
+    actor: str
+    reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "transition_id", _require_uuid(self.transition_id, field="transition_id")
+        )
+        object.__setattr__(
+            self, "operation_id", _require_uuid(self.operation_id, field="operation_id")
+        )
+        _non_negative_int(self.expected_state_epoch, field="expected_state_epoch")
+        object.__setattr__(self, "actor", _require_text(self.actor, field="actor"))
+        object.__setattr__(self, "reason", _optional_text(self.reason, field="reason"))
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "transition_id": self.transition_id,
+            "operation_id": self.operation_id,
+            "expected_state_epoch": self.expected_state_epoch,
+            "to_state": STATE_RESTORING,
+            "actor": self.actor,
+            "reason": self.reason,
+            "receipt_digest": None,
+            "promote_to_force": False,
+            "paired_effect": "release-stop-barrier-and-declare-resume-target",
+        }
+
+    @property
+    def transition_digest(self) -> str:
+        return _digest(self.payload())
+
+
+def _resume_lifecycle_row(db: Any, operation: Any) -> Any:
+    row = (
+        db.query(database.SessionLifecycleModel)
+        .filter(database.SessionLifecycleModel.session_name == operation.session_name)
+        .one_or_none()
+    )
+    if row is None:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} has no declared lifecycle row; a stopped "
+            "session always has one, so this Resume has lost its boundary"
+        )
+    return row
+
+
+def _begin_resume_restore_once(db: Any, request: ResumeRestoreRequest) -> dict[str, Any]:
+    existing = (
+        db.query(database.SessionCohortTransitionModel)
+        .filter(database.SessionCohortTransitionModel.transition_id == request.transition_id)
+        .one_or_none()
+    )
+    if existing is not None:
+        if existing.transition_digest != request.transition_digest:
+            raise CohortJournalConflict(
+                f"cohort transition {request.transition_id} already exists with different "
+                "immutable request content"
+            )
+        operation = _operation_by_id(db, request.operation_id)
+        if operation is None:
+            raise CohortJournalNotFound(
+                f"cohort transition {request.transition_id} references missing operation "
+                f"{request.operation_id}"
+            )
+        return {
+            "transition": _transition_dict(existing),
+            "operation": _operation_dict(operation),
+            "lifecycle": _lifecycle_row_dict(_resume_lifecycle_row(db, operation)),
+            "barrier": oj.get_session_barrier(operation.session_name, db=db),
+            "adopted": True,
+        }
+
+    operation = _operation_by_id(db, request.operation_id)
+    if operation is None:
+        raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
+    if operation.operation_kind != KIND_RESUME:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} is {operation.operation_kind!r}, not Resume"
+        )
+    if operation.initiator_kind != INITIATOR_OPERATOR:
+        raise CohortJournalConflict("only an operator may reopen a stopped campaign")
+    if int(operation.state_epoch or 0) != request.expected_state_epoch:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} moved to state epoch "
+            f"{operation.state_epoch}; expected {request.expected_state_epoch}"
+        )
+    if operation.state != STATE_PREPARING:
+        raise CohortJournalConflict(
+            f"Resume may release the Stop barrier only once, from {STATE_PREPARING!r}; got "
+            f"{operation.state!r}. A retry re-enters {STATE_RESTORING!r} through the receipted "
+            "transition path."
+        )
+
+    boundary = _observe_boundary(db, operation.session_name, operation.source_operation_id)
+    mismatches = {
+        field: {"observed": boundary[field], "claimed": getattr(operation, field)}
+        for field in (
+            "lifecycle_epoch",
+            "lifecycle_observation",
+            "roster_revision",
+            "member_snapshot_digest",
+        )
+        if boundary[field] != getattr(operation, field)
+    }
+    if mismatches:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} moved before Resume restore: {mismatches}"
+        )
+
+    source = _operation_by_id(db, str(operation.source_operation_id))
+    if source is None or source.operation_kind != KIND_STOP or source.state != STATE_STOPPED:
+        raise CohortJournalConflict(
+            f"Resume source {operation.source_operation_id} is no longer a terminally stopped "
+            "cohort for this session"
+        )
+
+    # Release *then* write, both inside this one transaction. The barrier is
+    # what refuses provider/input effects while stopped, so it must be open
+    # before anything can restore a member; the lifecycle CAS immediately
+    # after it means no reader ever observes an open barrier on a stopped row.
+    try:
+        barrier = oj.release_session_barrier(
+            operation.session_name,
+            claimed_by=str(operation.source_operation_id),
+            reason=request.reason or f"operator Resume {operation.operation_id}",
+            db=db,
+        )
+    except oj.OperationJournalNotFound as exc:
+        raise CohortJournalNotFound(str(exc)) from exc
+    except oj.OperationJournalConflict as exc:
+        raise CohortJournalConflict(str(exc)) from exc
+    except oj.OperationJournalError as exc:
+        raise CohortJournalUnavailable(str(exc)) from exc
+
+    row = _resume_lifecycle_row(db, operation)
+    stamp = _now()
+    result = db.execute(
+        sa_update(database.SessionLifecycleModel)
+        .where(
+            database.SessionLifecycleModel.session_name == operation.session_name,
+            database.SessionLifecycleModel.epoch == int(operation.lifecycle_epoch),
+            database.SessionLifecycleModel.lifecycle == sl.STOPPED,
+        )
+        .values(
+            lifecycle=operation.resume_target,
+            declared_by=request.actor,
+            note=request.reason,
+            pause_requested_at=None,
+            pause_deadline_at=None,
+            epoch=int(operation.lifecycle_epoch) + 1,
+            updated_at=stamp,
+        )
+    )
+    if result.rowcount != 1:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} lifecycle moved concurrently; the Resume "
+            "barrier release was rolled back with it"
+        )
+    # ``restore_to`` is deliberately preserved rather than cleared: it is the
+    # durable record of what this session was doing when it was stopped, and a
+    # Resume-paused that later needs a start still needs to read it.
+    updated = db.execute(
+        sa_update(database.SessionCohortOperationModel)
+        .where(
+            database.SessionCohortOperationModel.operation_id == request.operation_id,
+            database.SessionCohortOperationModel.state_epoch == request.expected_state_epoch,
+            database.SessionCohortOperationModel.state == STATE_PREPARING,
+        )
+        .values(
+            state=STATE_RESTORING,
+            state_epoch=request.expected_state_epoch + 1,
+            updated_at=stamp,
+        )
+    )
+    if updated.rowcount != 1:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} moved concurrently; the Resume lifecycle "
+            "write and barrier release were rolled back"
+        )
+    transition = database.SessionCohortTransitionModel(
+        transition_id=request.transition_id,
+        operation_id=request.operation_id,
+        transition_digest=request.transition_digest,
+        transition_json=_canonical_json(request.payload()),
+        from_state=STATE_PREPARING,
+        to_state=STATE_RESTORING,
+        from_mode=operation.current_mode,
+        to_mode=operation.current_mode,
+        from_state_epoch=request.expected_state_epoch,
+        actor=request.actor,
+        reason=request.reason,
+        receipt_digest=None,
+        created_at=stamp,
+    )
+    db.add(transition)
+    db.flush()
+    db.refresh(operation)
+    db.refresh(row)
+    return {
+        "transition": _transition_dict(transition),
+        "operation": _operation_dict(operation),
+        "lifecycle": _lifecycle_row_dict(row),
+        "barrier": barrier,
+        "adopted": False,
+    }
+
+
+def begin_resume_restore(request: ResumeRestoreRequest, db: Any = None) -> dict[str, Any]:
+    """Atomically release the Stop barrier and declare the Resume target.
+
+    A short database transaction. It creates no pane, launches no provider,
+    sends no input, and wakes no supervisor: it only makes those acts legal
+    again for this session.
+    """
+    if not isinstance(request, ResumeRestoreRequest):
+        raise CohortJournalInvalid(
+            f"request must be a ResumeRestoreRequest; got {type(request).__name__}"
+        )
+    from cli_agent_orchestrator.services.callback_recovery import (
+        session_lifecycle_write_claim,
+    )
+
+    def _run_with_fresh_locked_snapshot(session: Any) -> dict[str, Any]:
+        operation = _operation_by_id(session, request.operation_id)
+        if operation is None:
+            raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
+        session_name = operation.session_name
+        session.rollback()
+        with session_lifecycle_write_claim(session_name):
+            return _begin_resume_restore_once(session, request)
+
+    if db is not None:
+        try:
+            _anchor_caller_transaction(db)
+            with db.begin_nested():
+                operation = _operation_by_id(db, request.operation_id)
+                if operation is None:
+                    raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
+                with session_lifecycle_write_claim(operation.session_name):
+                    return _begin_resume_restore_once(db, request)
+        except CohortJournalError:
+            raise
+        except (IntegrityError, OperationalError) as exc:
+            raise CohortJournalUnavailable(
+                f"concurrent Resume restore refused; roll back and retry: {exc}"
+            ) from exc
+
+    last_error: Optional[BaseException] = None
+    for _attempt in range(5):
+        try:
+            with database.SessionLocal() as session:
+                result = _run_with_fresh_locked_snapshot(session)
+                session.commit()
+                return result
+        except CohortJournalUnavailable as exc:
+            last_error = exc
+            time.sleep(0.05)
+        except CohortJournalError:
+            raise
+        except (IntegrityError, OperationalError) as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise CohortJournalUnavailable(
+        f"concurrent Resume restores kept conflicting; refusing after retry: {last_error}"
+    )
+
+
+@dataclass(frozen=True)
 class MemberResult:
     operation_id: str
     agent_id: str
@@ -1549,6 +1995,8 @@ def _terminal_member_refusals(db: Any, operation: Any) -> list[dict[str, str]]:
     )
     if operation.operation_kind == KIND_PAUSE:
         allowed = PAUSE_TERMINAL_MEMBER_STATES[operation.current_mode]
+    elif operation.operation_kind == KIND_RESUME:
+        allowed = RESUME_TERMINAL_MEMBER_STATES
     else:
         allowed = STOP_TERMINAL_MEMBER_STATES
     refusals: list[dict[str, str]] = []
@@ -1560,6 +2008,25 @@ def _terminal_member_refusals(db: Any, operation: Any) -> list[dict[str, str]]:
         if member.final_state not in allowed:
             refusals.append({"agent_id": member.agent_id, "final_state": member.final_state})
     return refusals
+
+
+def _verify_resume_lifecycle(db: Any, operation: Any) -> Any:
+    """Resume's terminal commit reads the lifecycle; it never rewrites it.
+
+    ``begin_resume_restore`` already declared the target before any pane was
+    created. Settling only asserts that nothing moved the row since — a
+    concurrent Stop or an operator declaration means this Resume no longer
+    describes the session it is about to call settled.
+    """
+    row = _resume_lifecycle_row(db, operation)
+    expected_epoch = int(operation.lifecycle_epoch) + 1
+    if row.lifecycle != operation.resume_target or int(row.epoch or 0) != expected_epoch:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} lifecycle is {row.lifecycle!r} epoch "
+            f"{int(row.epoch or 0)}; this Resume restored {operation.resume_target!r} epoch "
+            f"{expected_epoch}"
+        )
+    return row
 
 
 def _commit_session_lifecycle(db: Any, operation: Any, request: TerminalCommitRequest) -> Any:
@@ -1642,11 +2109,19 @@ def _commit_session_lifecycle(db: Any, operation: Any, request: TerminalCommitRe
     return row
 
 
+def _terminal_state_for(operation_kind: str) -> str:
+    if operation_kind == KIND_PAUSE:
+        return STATE_PAUSED
+    if operation_kind == KIND_RESUME:
+        return STATE_SETTLED
+    return STATE_STOPPED
+
+
 def _commit_terminal_once(db: Any, request: TerminalCommitRequest) -> dict[str, Any]:
     operation = _operation_by_id(db, request.operation_id)
     if operation is None:
         raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
-    to_state = STATE_PAUSED if operation.operation_kind == KIND_PAUSE else STATE_STOPPED
+    to_state = _terminal_state_for(operation.operation_kind)
     transition_digest = request.transition_digest(to_state=to_state)
     existing = (
         db.query(database.SessionCohortTransitionModel)
@@ -1681,6 +2156,8 @@ def _commit_terminal_once(db: Any, request: TerminalCommitRequest) -> dict[str, 
         required_state = (
             STATE_DRAINING if operation.current_mode == MODE_SAFE else STATE_INTERRUPTING
         )
+    elif operation.operation_kind == KIND_RESUME:
+        required_state = STATE_RESTORING
     else:
         required_state = STATE_TEARING_DOWN
     if operation.state != required_state:
@@ -1706,8 +2183,21 @@ def _commit_terminal_once(db: Any, request: TerminalCommitRequest) -> dict[str, 
                 f"Stop terminal commit requires the exact barrier claimed by cohort "
                 f"operation {operation.operation_id}"
             )
+    if operation.operation_kind == KIND_RESUME and (
+        barrier is not None and barrier["state"] == oj.BARRIER_CLAIMED
+    ):
+        # A Stop claimed the barrier again while this Resume was restoring.
+        # Settling now would declare a fleet live that a newer Stop is
+        # already tearing down.
+        raise CohortJournalConflict(
+            f"session {operation.session_name} Stop barrier was reclaimed by "
+            f"{barrier['claimed_by']!r}; this Resume cannot settle"
+        )
 
-    lifecycle = _commit_session_lifecycle(db, operation, request)
+    if operation.operation_kind == KIND_RESUME:
+        lifecycle = _verify_resume_lifecycle(db, operation)
+    else:
+        lifecycle = _commit_session_lifecycle(db, operation, request)
     stamp = _now()
     result = db.execute(
         sa_update(database.SessionCohortOperationModel)
@@ -1819,6 +2309,73 @@ def commit_terminal(request: TerminalCommitRequest, db: Any = None) -> dict[str,
     )
 
 
+def operation_provenance(record: dict[str, Any]) -> dict[str, Any]:
+    """The single derived block every read surface renders.
+
+    Derived here rather than in the API, the CLI, and the dashboard, because
+    three copies of "was this safe operation promoted to force?" would drift,
+    and they would drift in the direction of a surface that shows an operator
+    a *safe* Stop that actually reaped panes.
+
+    Everything in it is already durable; nothing is inferred beyond counting.
+    """
+    transitions = record.get("transitions") or []
+    promotion = next(
+        (
+            transition
+            for transition in transitions
+            if transition["from_mode"] == MODE_SAFE and transition["to_mode"] == MODE_FORCE
+        ),
+        None,
+    )
+    members = record.get("members") or []
+    outcomes: dict[str, int] = {}
+    for member in members:
+        outcomes[member["final_state"]] = outcomes.get(member["final_state"], 0) + 1
+    return {
+        "operation_id": record["operation_id"],
+        "session_name": record["session_name"],
+        "operation_kind": record["operation_kind"],
+        "state": record["state"],
+        "state_epoch": record["state_epoch"],
+        "lifecycle_epoch": record["lifecycle_epoch"],
+        "lifecycle_observation": record["lifecycle_observation"],
+        "roster_revision": record["roster_revision"],
+        "member_snapshot_digest": record["member_snapshot_digest"],
+        "requested_mode": record["requested_mode"],
+        "current_mode": record["current_mode"],
+        # Safe never becomes force by accident, so "was it promoted" is a fact
+        # with a receipt behind it rather than a mode comparison.
+        "promoted_to_force": promotion is not None,
+        "promotion_receipt_digest": promotion["receipt_digest"] if promotion else None,
+        "promoted_by": promotion["actor"] if promotion else None,
+        "initiator_kind": record["initiator_kind"],
+        "initiated_by": record["initiated_by"],
+        "source_operation_id": record["source_operation_id"],
+        "resume_target": record["resume_target"],
+        "member_outcomes": outcomes,
+        # Continuity provenance: which stable agent kept which native session
+        # across the operation. Stable agent, incarnation, and native lineage
+        # stay three separate identities here on purpose.
+        "continuity": [
+            {
+                "agent_id": member["agent_id"],
+                "role": member["role"],
+                "included": member["included"],
+                "exclusion_reason": member["exclusion_reason"],
+                "lineage_id": member["lineage_id"],
+                "harness": member["harness"],
+                "native_session_id": member["native_session_id"],
+                "incarnation_id": member["incarnation_id"],
+                "terminal_id": member["terminal_id"],
+                "generation": member["generation"],
+                "final_state": member["final_state"],
+            }
+            for member in members
+        ],
+    }
+
+
 def get_operation(operation_id: str, db: Any = None) -> dict[str, Any]:
     """Return an operation with its exact member snapshot and transition log."""
     operation_id = _require_uuid(operation_id, field="operation_id")
@@ -1842,11 +2399,13 @@ def get_operation(operation_id: str, db: Any = None) -> dict[str, Any]:
             )
             .all()
         )
-        return {
+        record = {
             **_operation_dict(row),
             "members": [_member_dict(member) for member in members],
             "transitions": [_transition_dict(transition) for transition in transitions],
         }
+        record["provenance"] = operation_provenance(record)
+        return record
 
     try:
         if db is not None:

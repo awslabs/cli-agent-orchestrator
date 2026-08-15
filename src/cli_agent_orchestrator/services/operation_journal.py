@@ -1958,6 +1958,95 @@ def claim_session_barrier(
     )
 
 
+def release_session_barrier(
+    session_name: str, *, claimed_by: str, reason: Optional[str] = None, db: Any = None
+) -> dict[str, Any]:
+    """Reopen the barrier the named Stop claimed (operator Resume only).
+
+    A claimed barrier never expires and no condition, timeout, or retry clears
+    it.  This is the single reopening seam, and it is deliberately narrow: the
+    caller must name the *exact* operation that claimed the barrier, so a
+    Resume descended from one Stop can never release a different Stop's
+    barrier that landed in between.  Releasing an already-open barrier is a
+    no-op adoption, which is what a response-loss retry needs.
+
+    Callers pass ``db`` so the release commits in the same transaction as the
+    lifecycle write that reopens the campaign; there is no window in which the
+    barrier is open while the session still reads ``stopped``.
+    """
+    claimed_by = _require_text(claimed_by, field="claimed_by", max_len=MAX_TEXT_LEN)
+    reason = _optional_text(reason, field="reason", max_len=MAX_TEXT_LEN)
+
+    def _release(session: Any) -> dict[str, Any]:
+        name = _normalise_session_name(session_name)
+        row = _barrier_row(session, name)
+        if row is None:
+            raise OperationJournalNotFound(f"session {name} has no durable effect barrier")
+        if row.state == BARRIER_OPEN:
+            if row.claimed_by is not None and row.claimed_by != claimed_by:
+                raise OperationJournalConflict(
+                    f"session {name} barrier was last released for {row.claimed_by!r}, not "
+                    f"{claimed_by!r}"
+                )
+            record = _barrier_row_dict(row)
+            record["adopted"] = True
+            return record
+        if row.state != BARRIER_CLAIMED:
+            raise OperationJournalConflict(
+                f"session {name} barrier is in unknown state {row.state!r}; only "
+                f"{sorted(BARRIER_STATES)} are known"
+            )
+        if row.claimed_by != claimed_by:
+            raise OperationJournalConflict(
+                f"session {name} barrier is claimed by {row.claimed_by!r}; only that operation's "
+                f"Resume may release it, not {claimed_by!r}"
+            )
+        stamp = _now()
+        result = session.execute(
+            sa_update(database.SessionEffectBarrierModel)
+            .where(
+                database.SessionEffectBarrierModel.session_name == name,
+                database.SessionEffectBarrierModel.state == BARRIER_CLAIMED,
+                database.SessionEffectBarrierModel.claimed_by == claimed_by,
+                database.SessionEffectBarrierModel.epoch == int(row.epoch or 0),
+            )
+            .values(
+                state=BARRIER_OPEN,
+                reason=reason,
+                epoch=int(row.epoch or 0) + 1,
+                updated_at=stamp,
+            )
+        )
+        if result.rowcount != 1:
+            raise OperationJournalConflict(
+                f"session {name} barrier moved concurrently; read and retry the release"
+            )
+        session.refresh(row)
+        record = _barrier_row_dict(row)
+        record["adopted"] = False
+        return record
+
+    if db is not None:
+        try:
+            return _release(db)
+        except (IntegrityError, OperationalError) as exc:
+            raise OperationJournalUnavailable(
+                f"concurrent barrier write refused; roll the caller-owned transaction back "
+                f"and retry: {exc}"
+            ) from exc
+
+    with database.SessionLocal() as session:
+        try:
+            result = _release(session)
+            session.commit()
+            return result
+        except (IntegrityError, OperationalError) as exc:
+            session.rollback()
+            raise OperationJournalUnavailable(
+                f"concurrent barrier release refused; read and retry: {exc}"
+            ) from exc
+
+
 # ---------------------------------------------------------------------------
 # read / audit surface (deliberately small)
 # ---------------------------------------------------------------------------

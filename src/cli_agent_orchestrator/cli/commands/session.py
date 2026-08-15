@@ -3,6 +3,7 @@
 import json
 import sys
 import time
+import uuid
 from urllib.parse import quote
 
 import click
@@ -504,3 +505,276 @@ def session_stop(session_name, declared_by, note, yes, as_json):
         note=note,
     )
     click.echo(json.dumps(record, indent=2)) if as_json else _render(record)
+
+
+# --------------------------------------------------------------------------
+# fleet cohort controls (M3-C C4)
+# --------------------------------------------------------------------------
+#
+# Separate commands rather than `--force`, for the same reason the API has
+# separate routes: a flag is something shell history repeats and a wrapper
+# script sets once. `cao session cohort stop-force` cannot be reached by
+# somebody who typed `stop-safe` and hit the up arrow.
+
+
+def _cohort_url(session_name: str, *suffix: str) -> str:
+    parts = "/".join(suffix)
+    return f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/cohort/{parts}"
+
+
+def _cohort_post(session_name: str, *suffix: str, **payload):
+    payload.setdefault("operation_id", str(uuid.uuid4()))
+    try:
+        response = requests.post(_cohort_url(session_name, *suffix), json=payload)
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail") or ""
+        except Exception:  # noqa: BLE001 - a non-JSON body is still worth showing
+            detail = response.text.strip()
+        raise click.ClickException(f"{response.status_code}: {detail}")
+    return response.json()
+
+
+_OUTCOME_LABELS = {
+    "restored-exact": "restored on its own session",
+    "restored-fresh": "restored fresh",
+    "failed": "did NOT come back",
+    "unresumable": "no resume path",
+    "reconciliation-required": "needs reconciliation",
+}
+
+
+def _render_operation(record: dict) -> None:
+    provenance = record.get("provenance") or {}
+    mode = provenance.get("current_mode", record.get("current_mode"))
+    kind = provenance.get("operation_kind", record.get("operation_kind"))
+    click.echo(f"{kind} ({mode})  {record['state']}")
+    click.echo(f"  operation       {record['operation_id']}")
+    if provenance.get("promoted_to_force"):
+        # Never let a promoted operation read as the safe one it started as.
+        click.echo(
+            f"  PROMOTED        safe -> force by {provenance.get('promoted_by')} "
+            f"(receipt {str(provenance.get('promotion_receipt_digest'))[:12]}…)"
+        )
+    click.echo(f"  lifecycle epoch {provenance.get('lifecycle_epoch')}")
+    click.echo(f"  roster revision {str(provenance.get('roster_revision', ''))[:12]}…")
+    click.echo(
+        f"  initiated by    {provenance.get('initiated_by')} "
+        f"({provenance.get('initiator_kind')})"
+    )
+    if provenance.get("source_operation_id"):
+        click.echo(f"  resumes         {provenance['source_operation_id']}")
+        click.echo(f"  restores to     {provenance.get('resume_target')}")
+    outcomes = provenance.get("member_outcomes") or {}
+    if outcomes:
+        click.echo("\nmembers:")
+        for state, count in sorted(outcomes.items()):
+            click.echo(f"  {count:>3}  {state:<26} {_OUTCOME_LABELS.get(state, '')}")
+    failed = [
+        item
+        for item in (provenance.get("continuity") or [])
+        if item["final_state"] in {"failed", "unresumable"}
+    ]
+    if failed:
+        click.echo("\ndid not come back:")
+        for item in failed:
+            click.echo(
+                f"  {item['terminal_id'] or '-':<12} {item['harness'] or '-':<14} "
+                f"{item['final_state']}"
+            )
+
+
+@session.group(name="cohort")
+def session_cohort():
+    """Whole-fleet Pause, Stop, and Resume.
+
+    Distinct from `cao session pause`, which asks the supervisor to settle the
+    fleet and changes only the declared lifecycle. These commands act on every
+    member of the cohort and record a durable operation you can read back.
+
+    There is deliberately no `pause-safe` here. A safe Pause consumes M3-D's
+    drain receipt and its per-member classification — evidence a human cannot
+    type at a prompt — so it is driven through the API by the component that
+    owns it. Everything a person can honestly decide has a command.
+    """
+
+
+@session_cohort.command(name="pause-force")
+@click.argument("session_name")
+@click.option("--by", "initiated_by", required=True, help="Who is asking. Recorded.")
+@click.option("--reason", default=None)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.option("--json", "as_json", is_flag=True)
+def cohort_pause_force(session_name, initiated_by, reason, yes, as_json):
+    """Interrupt every worker's current turn, then the supervisor's.
+
+    In-flight background work a worker started may be lost. Commits only on
+    positive proof each turn actually stopped; anything unproven lands in
+    reconciliation rather than being called paused.
+    """
+    if not yes:
+        click.confirm(f"Interrupt every running turn in {session_name}?", abort=True)
+    record = _cohort_post(
+        session_name,
+        "pause",
+        "force",
+        initiated_by=initiated_by,
+        reason=reason,
+        acknowledged_interrupt=True,
+    )
+    click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)
+
+
+@session_cohort.command(name="stop-safe")
+@click.argument("session_name")
+@click.option("--by", "initiated_by", required=True)
+@click.option(
+    "--drain-receipt",
+    required=True,
+    help="The opaque M3-D receipt proving the fleet reached a boundary.",
+)
+@click.option("--reason", default=None)
+@click.option("--yes", "-y", is_flag=True)
+@click.option("--json", "as_json", is_flag=True)
+def cohort_stop_safe(session_name, initiated_by, drain_receipt, reason, yes, as_json):
+    """Stop once the fleet has drained to a boundary.
+
+    Requires the drain receipt: a Stop with no proof the fleet reached a
+    boundary is a force Stop, and has to be asked for as one.
+    """
+    _confirm_stop(session_name, yes)
+    record = _cohort_post(
+        session_name,
+        "stop",
+        "safe",
+        initiated_by=initiated_by,
+        reason=reason,
+        drain_receipt_digest=drain_receipt,
+        acknowledged_one_way=True,
+    )
+    click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)
+
+
+@session_cohort.command(name="stop-force")
+@click.argument("session_name")
+@click.option("--by", "initiated_by", required=True)
+@click.option("--reason", default=None)
+@click.option("--yes", "-y", is_flag=True)
+@click.option("--json", "as_json", is_flag=True)
+def cohort_stop_force(session_name, initiated_by, reason, yes, as_json):
+    """Reap the fleet now, without waiting for anything to finish."""
+    _confirm_stop(session_name, yes)
+    if not yes:
+        click.confirm("Reap without draining to a boundary?", abort=True)
+    record = _cohort_post(
+        session_name,
+        "stop",
+        "force",
+        initiated_by=initiated_by,
+        reason=reason,
+        acknowledged_one_way=True,
+        acknowledged_force=True,
+    )
+    click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)
+
+
+def _confirm_stop(session_name: str, yes: bool) -> None:
+    if yes:
+        return
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/stop-impact"
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    _render_impact(response.json())
+    click.confirm(f"\nStop {session_name} and collect all of its panes?", abort=True)
+
+
+@session_cohort.command(name="resume-paused")
+@click.argument("session_name")
+@click.option("--by", "initiated_by", required=True)
+@click.option("--reason", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def cohort_resume_paused(session_name, initiated_by, reason, as_json):
+    """Bring a stopped fleet's panes back and leave it paused.
+
+    Sends nothing: not a keystroke into any pane, and no bump to the
+    supervisor. Use this when you want to look at the fleet before anything
+    starts moving again.
+    """
+    record = _cohort_post(
+        session_name, "resume", "paused", initiated_by=initiated_by, reason=reason
+    )
+    click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)
+
+
+@session_cohort.command(name="resume-start")
+@click.argument("session_name")
+@click.option("--by", "initiated_by", required=True)
+@click.option("--reason", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def cohort_resume_start(session_name, initiated_by, reason, as_json):
+    """Restore a stopped fleet and wake its supervisor once.
+
+    The session returns to whatever it was doing when it was stopped. The
+    supervisor gets exactly one reconciliation bump, sent only after every
+    member's outcome is durable and describing all of them — so a fleet that
+    came back with one worker missing still starts, and still says so.
+    """
+    record = _cohort_post(session_name, "resume", "start", initiated_by=initiated_by, reason=reason)
+    click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)
+
+
+@session_cohort.command(name="list")
+@click.argument("session_name")
+@click.option("--json", "as_json", is_flag=True)
+def cohort_list(session_name, as_json):
+    """Every durable fleet operation recorded for this session."""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/cohort-operations"
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    payload = response.json()
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+        return
+    if not payload["operations"]:
+        click.echo("no fleet operations recorded")
+        return
+    for operation in payload["operations"]:
+        promoted = (
+            " (promoted from safe)"
+            if operation["requested_mode"] != operation["current_mode"]
+            else ""
+        )
+        click.echo(
+            f"{operation['operation_id']}  {operation['operation_kind']:<7} "
+            f"{operation['current_mode']:<5} {operation['state']:<24} "
+            f"{operation['initiated_by']}{promoted}"
+        )
+
+
+@session_cohort.command(name="show")
+@click.argument("operation_id")
+@click.option("--json", "as_json", is_flag=True)
+def cohort_show(operation_id, as_json):
+    """The full durable record of one fleet operation."""
+    try:
+        response = requests.get(f"{API_BASE_URL}/cohort-operations/{quote(operation_id, safe='')}")
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail") or ""
+        except Exception:  # noqa: BLE001
+            detail = response.text.strip()
+        raise click.ClickException(f"{response.status_code}: {detail}")
+    record = response.json()
+    click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)

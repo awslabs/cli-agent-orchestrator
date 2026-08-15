@@ -46,6 +46,7 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import cohort_journal as cohort
+from cli_agent_orchestrator.services import cohort_operations
 from cli_agent_orchestrator.services import session_lifecycle as sl
 from cli_agent_orchestrator.services import session_resumability, session_service
 
@@ -67,6 +68,9 @@ _COHORT_STATUS_FOR_CODE = {
     "cohort-journal-conflict": status.HTTP_409_CONFLICT,
     "cohort-journal-not-found": status.HTTP_404_NOT_FOUND,
     "cohort-journal-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "cohort-operation-invalid": status.HTTP_400_BAD_REQUEST,
+    "cohort-operation-conflict": status.HTTP_409_CONFLICT,
+    "cohort-operation-error": status.HTTP_409_CONFLICT,
 }
 
 
@@ -80,9 +84,11 @@ def _http(exc: sl.SessionLifecycleError) -> HTTPException:
     )
 
 
-def _cohort_http(exc: cohort.CohortJournalError) -> HTTPException:
+def _cohort_http(exc: Any) -> HTTPException:
     return HTTPException(
-        status_code=_COHORT_STATUS_FOR_CODE.get(exc.code, status.HTTP_400_BAD_REQUEST),
+        status_code=_COHORT_STATUS_FOR_CODE.get(
+            getattr(exc, "code", ""), status.HTTP_400_BAD_REQUEST
+        ),
         detail=str(exc).splitlines()[0],
     )
 
@@ -185,6 +191,248 @@ async def list_session_cohort_operations(
     except cohort.CohortJournalError as exc:
         raise _cohort_http(exc)
     return {"operations": operations, "count": len(operations)}
+
+
+# ---------------------------------------------------------------------------
+# operator fleet controls (M3-C C4)
+# ---------------------------------------------------------------------------
+#
+# Six routes, not two with a mode field. Safe and force are different acts
+# with different costs, and a mode string is exactly the kind of parameter a
+# client library defaults, a script sets once, and a retry carries forward.
+# Making force a different URL means an operator (or an agent acting for one)
+# cannot reach it without having typed it.
+#
+# All six are admin-scoped. Force obviously so; safe too, because the cheap
+# door is how operators learn to reach an expensive state — the asymmetry
+# between `/lifecycle/stop` (admin) and `/lifecycle/archived` (write) is the
+# same defect this router already documents.
+
+
+class CohortBody(StrictBody):
+    """What every operator fleet control needs.
+
+    ``operation_id`` is caller-minted so a lost response is retried as the
+    *same* operation and adopts the durable winner. A client that omits it
+    gets a server-minted one and forfeits that guarantee, which is why it is
+    required rather than defaulted.
+    """
+
+    operation_id: str = Field(min_length=36, max_length=36)
+    initiated_by: str = Field(min_length=1, max_length=200)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class CohortMemberResultBody(StrictBody):
+    """One member's classification, as decided by M3-D.
+
+    CAO carries these; it does not compute them. ``task_occurrence_id`` is an
+    opaque M3-D reference and is never parsed here.
+    """
+
+    agent_id: str = Field(min_length=36, max_length=36)
+    expected_result_revision: int = Field(ge=0)
+    final_state: str = Field(pattern=r"^(drained|already-idle|parked)$")
+    background_command_loss_risk: str = Field(pattern=r"^(unknown|none|possible|known)$")
+    task_occurrence_id: Optional[str] = Field(default=None, max_length=512)
+    boundary_digest: Optional[str] = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    report_digest: Optional[str] = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    checkpoint_digest: Optional[str] = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class SafePauseBody(CohortBody):
+    """Safe Pause consumes M3-D's proof; it never decides a worker is idle."""
+
+    drain_receipt_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    members: List[CohortMemberResultBody]
+
+
+class ForcePauseBody(CohortBody):
+    """Force Pause interrupts a running turn, so it says so out loud."""
+
+    acknowledged_interrupt: bool
+
+
+class SafeStopBody(CohortBody):
+    drain_receipt_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    acknowledged_one_way: bool
+
+
+class ForceStopBody(CohortBody):
+    acknowledged_one_way: bool
+    acknowledged_force: bool
+
+
+def _require(flag: bool, detail: str) -> None:
+    if not flag:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
+def _operator(body: CohortBody, session_name: str) -> cohort_operations.OperatorRequest:
+    try:
+        return cohort_operations.OperatorRequest(
+            session_name=session_name,
+            initiated_by=body.initiated_by,
+            operation_id=body.operation_id,
+            reason=body.reason,
+        )
+    except cohort_operations.CohortOperationError as exc:
+        raise _cohort_http(exc)
+
+
+@router.post("/sessions/{session_name}/cohort/pause/safe")
+async def cohort_pause_safe(
+    session_name: str,
+    body: SafePauseBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Terminalize a Pause at a boundary M3-D proved the fleet reached.
+
+    No interrupt, no pane inspection, no turn cancelled. This route is the
+    consumer of M3-D's opaque drain receipt and its per-member
+    classification — it carries them into the durable journal and stops.
+    """
+    request = _operator(body, session_name)
+    try:
+        return await asyncio.to_thread(
+            cohort_operations.pause_safe,
+            request,
+            drain_receipt_digest=body.drain_receipt_digest,
+            member_results=[
+                cohort.MemberResult(operation_id=body.operation_id, **member.model_dump())
+                for member in body.members
+            ],
+        )
+    except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
+        raise _cohort_http(exc)
+
+
+@router.post("/sessions/{session_name}/cohort/pause/force")
+async def cohort_pause_force(
+    session_name: str,
+    body: ForcePauseBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Interrupt every member's current turn, workers before the supervisor.
+
+    Commits only on positive per-member quiescence proof: a worker whose
+    task child cannot be shown to be gone lands in reconciliation rather than
+    being called paused, because a false pause is how background work gets
+    silently orphaned.
+    """
+    _require(
+        body.acknowledged_interrupt,
+        "force Pause interrupts each worker's current turn and may lose in-flight "
+        "background work; set acknowledged_interrupt",
+    )
+    request = _operator(body, session_name)
+    try:
+        return await asyncio.to_thread(cohort_operations.pause_force, request)
+    except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
+        raise _cohort_http(exc)
+
+
+@router.post("/sessions/{session_name}/cohort/stop/safe")
+async def cohort_stop_safe(
+    session_name: str,
+    body: SafeStopBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Stop once M3-D has proved the fleet drained to a boundary.
+
+    Refuses physical teardown while a pre-barrier reincarnation cannot be
+    positively drained — a safe Stop that reaped a half-finished restore
+    would be a force Stop wearing the wrong label.
+    """
+    _require(
+        body.acknowledged_one_way,
+        "stopping collects every pane; read "
+        f"GET /sessions/{session_name}/stop-impact and set acknowledged_one_way",
+    )
+    request = _operator(body, session_name)
+    try:
+        return await asyncio.to_thread(
+            cohort_operations.stop_safe,
+            request,
+            drain_receipt_digest=body.drain_receipt_digest,
+        )
+    except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
+        raise _cohort_http(exc)
+
+
+@router.post("/sessions/{session_name}/cohort/stop/force")
+async def cohort_stop_force(
+    session_name: str,
+    body: ForceStopBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Reap the captured cohort now, without waiting for any provider I/O.
+
+    Two acknowledgements rather than one, because this is two decisions: that
+    the session is being collected at all, and that it is being collected
+    without waiting for anything to finish.
+    """
+    _require(
+        body.acknowledged_one_way,
+        "stopping collects every pane; read "
+        f"GET /sessions/{session_name}/stop-impact and set acknowledged_one_way",
+    )
+    _require(
+        body.acknowledged_force,
+        "force Stop reaps panes without draining to a boundary and may lose in-flight "
+        "background work; set acknowledged_force",
+    )
+    request = _operator(body, session_name)
+    try:
+        return await asyncio.to_thread(cohort_operations.stop_force, request)
+    except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
+        raise _cohort_http(exc)
+
+
+@router.post("/sessions/{session_name}/cohort/resume/paused")
+async def cohort_resume_paused(
+    session_name: str,
+    body: CohortBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Bring a stopped fleet's panes back and leave it paused. Zero input.
+
+    Not a byte is typed into any pane and no supervisor is woken. The point
+    is an operator who can look at a restored fleet *before* anything starts
+    moving; a wake here would destroy exactly that.
+
+    Operator-only, like every Resume: the durable Stop barrier is never
+    cleared by a timeout, a condition, or an agent deciding it is time.
+    """
+    request = _operator(body, session_name)
+    try:
+        return await cohort_operations.resume_paused(request)
+    except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
+        raise _cohort_http(exc)
+
+
+@router.post("/sessions/{session_name}/cohort/resume/start")
+async def cohort_resume_start(
+    session_name: str,
+    body: CohortBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Restore a stopped fleet and wake its supervisor exactly once.
+
+    The wake is emitted only after every member's outcome is durable, so the
+    supervisor's first look at its fleet is complete rather than half-written,
+    and it carries every exact/fresh/failed outcome — a partially restored
+    fleet still starts, and still tells the truth about what it lost.
+
+    The target is the lifecycle the Stop recorded, never a new one chosen
+    here. Resume returns a session to what it was doing; choosing a different
+    destination would be a goal, and goals are not M3-C's.
+    """
+    request = _operator(body, session_name)
+    try:
+        return await cohort_operations.resume_and_start(request)
+    except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
+        raise _cohort_http(exc)
 
 
 @router.get("/session-lifecycle")
