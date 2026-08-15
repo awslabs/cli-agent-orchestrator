@@ -67,6 +67,13 @@ ENABLE_PERSISTENT_AGENT_ROUTING = (
 REQUIRE_SEMANTIC_PERSISTENT_ROUTING = (
     os.getenv("CAO_REQUIRE_SEMANTIC_PERSISTENT_ROUTING", "false").lower() == "true"
 )
+# Canonical AIVA can require synchronous semantic requests for persistent
+# department work. When enabled, fire-and-forget semantic sends are rejected so
+# the orchestrator cannot report completion before the persistent head's reviewed
+# turn has actually finished.
+REQUIRE_PERSISTENT_AGENT_REQUEST = (
+    os.getenv("CAO_REQUIRE_PERSISTENT_AGENT_REQUEST", "false").lower() == "true"
+)
 # Persistent department/specialist supervisors use durable async workers. A
 # synchronous handoff auto-tears the child down when the step returns, which can
 # race startup/callback delivery and make a boot screen look like task output.
@@ -1480,7 +1487,7 @@ def _claim_managed_callback(supervisor_id: str, worker_id: str, timeout: int) ->
 def _assign_and_wait_impl(
     agent_profile: str,
     message: str,
-    timeout: int = 600,
+    timeout: int = 540,
     working_directory: Optional[str] = None,
     engine: Optional[str] = None,
     model: Optional[str] = None,
@@ -1522,9 +1529,9 @@ async def assign_and_wait(
     agent_profile: str = Field(description="Allowed worker agent profile"),
     message: str = Field(description="Bounded task for the worker"),
     timeout: int = Field(
-        default=600,
+        default=540,
         ge=1,
-        le=3600,
+        le=540,
         description="Maximum seconds to wait for the durable callback",
     ),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
@@ -1620,6 +1627,7 @@ def _discover_persistent_agent_routes_impl() -> Dict[str, Any]:
                         "kind": metadata.get("kind"),
                         "parent_agent_id": metadata.get("parent_agent_id"),
                         "agent_profile": detail.get("agent_profile"),
+                        "provider": detail.get("provider"),
                         "session_name": detail.get("session_name") or session_name,
                         "status": detail.get("status"),
                     }
@@ -1664,6 +1672,15 @@ def _list_persistent_agents_impl() -> Dict[str, Any]:
 
 def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[str, Any]:
     """Resolve a canonical persistent agent ID to its current terminal and send."""
+    if REQUIRE_PERSISTENT_AGENT_REQUEST:
+        return {
+            "success": False,
+            "error": (
+                "Fire-and-forget persistent-agent sends are disabled for this orchestrator. "
+                "Use request_persistent_agent so the persistent head's reviewed result is "
+                "returned in the same tool call."
+            ),
+        }
     agent_id = agent_id.strip()
     if not agent_id:
         return {"success": False, "error": "agent_id must not be empty"}
@@ -1697,6 +1714,149 @@ def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[
             "persistent_agent_id": agent_id,
         }
     return result
+
+
+def _request_persistent_agent_impl(
+    agent_id: str, message: str, timeout: int = 560
+) -> Dict[str, Any]:
+    """Run one synchronous turn on an existing persistent agent terminal."""
+    agent_id = agent_id.strip()
+    if not agent_id:
+        return {"success": False, "error": "agent_id must not be empty"}
+    if timeout < 1 or timeout > 560:
+        return {"success": False, "error": "timeout must be between 1 and 560 seconds"}
+
+    discovered = _discover_persistent_agent_routes_impl()
+    if not discovered.get("success"):
+        return discovered
+    matches = [a for a in discovered.get("agents", []) if a.get("agent_id") == agent_id]
+    if not matches:
+        return {
+            "success": False,
+            "error": f"No live persistent agent matches agent_id '{agent_id}'",
+        }
+    if len(matches) != 1:
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent_id '{agent_id}' is ambiguous across {len(matches)} live "
+                "terminals. Repair duplicate persistent-agent metadata before routing."
+            ),
+        }
+
+    target = matches[0]
+    status_value = str(target.get("status") or "").lower()
+    if status_value not in {"idle", "completed"}:
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent '{agent_id}' is busy (status={status_value or 'unknown'}). "
+                "Retry after its current turn completes; concurrent driving is not allowed."
+            ),
+        }
+    terminal_id = target.get("terminal_id")
+    provider = target.get("provider")
+    agent_profile = target.get("agent_profile")
+    if not all(
+        isinstance(value, str) and value for value in (terminal_id, provider, agent_profile)
+    ):
+        return {
+            "success": False,
+            "error": f"Persistent agent '{agent_id}' is missing runtime metadata; routing failed closed",
+        }
+
+    prompt = (
+        f"[CAO Persistent Request: {agent_id}] This is a synchronous semantic request from "
+        "the top-level orchestrator. Complete the task under your canonical doctrine. If "
+        "fresh child work is needed, use your enforced assign_and_wait path and review its "
+        "returned callback before responding. Return the final reviewed result directly in "
+        "this assistant turn. Do not use send_message for this request result; CAO captures "
+        "this turn's output synchronously.\n\n" + message
+    )
+    payload: Dict[str, Any] = {
+        "provider": provider,
+        "agent": agent_profile,
+        "prompt": prompt,
+        "reuse_terminal_id": terminal_id,
+        "teardown": False,
+        "timeout": float(timeout),
+    }
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/run-step",
+            json=payload,
+            timeout=float(timeout) + 20.0,
+        )
+    except requests.Timeout:
+        return {
+            "success": False,
+            "error": f"Persistent agent '{agent_id}' timed out after {timeout} seconds",
+        }
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "error": f"Persistent agent request failed: {exc}",
+        }
+
+    if response.status_code != 200:
+        kind, detail, _runtime_terminal_id = _parse_run_step_error(response)
+        if kind == "timeout" or response.status_code == 504:
+            return {
+                "success": False,
+                "error": f"Persistent agent '{agent_id}' timed out after {timeout} seconds",
+            }
+        if kind == "error" or response.status_code == 502:
+            return {
+                "success": False,
+                "error": f"Persistent agent '{agent_id}' errored: {detail}",
+            }
+        return {
+            "success": False,
+            "error": f"Persistent agent '{agent_id}' request failed: {detail}",
+        }
+
+    data = response.json()
+    if data.get("terminal_id") != terminal_id:
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent '{agent_id}' response came from an unexpected runtime "
+                "terminal; routing failed closed"
+            ),
+        }
+    if "last_message" not in data:
+        return {
+            "success": False,
+            "error": f"Persistent agent '{agent_id}' returned no reviewed output",
+        }
+    return {
+        "success": True,
+        "persistent_agent_id": agent_id,
+        "output": data.get("last_message"),
+        "status": data.get("status"),
+    }
+
+
+@mcp.tool()
+async def request_persistent_agent(
+    agent_id: str = Field(description="Canonical persistent_agent_id, e.g. shaffer-estimating"),
+    message: str = Field(
+        description="Task packet for the persistent department or specialist head"
+    ),
+    timeout: int = Field(
+        default=560,
+        ge=1,
+        le=560,
+        description="Maximum seconds to wait for the persistent head's reviewed turn",
+    ),
+) -> Dict[str, Any]:
+    """Run and await one reviewed turn on a persistent agent by semantic ID.
+
+    The target terminal is resolved internally at call time, driven synchronously
+    through CAO's existing-terminal run-step substrate, and never exposed to the
+    calling model. The persistent head remains alive after the turn.
+    """
+    return _request_persistent_agent_impl(agent_id, message, timeout)
 
 
 @mcp.tool()
