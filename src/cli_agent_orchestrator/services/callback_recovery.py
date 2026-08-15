@@ -162,8 +162,12 @@ def _claim_lock_path(key: tuple[str, str, str]) -> Path:
     )
 
 
-def _flock_acquire(path: Path) -> int:
-    """Create (if needed) and exclusively flock the lock file; return the fd.
+def _flock_acquire(path: Path, *, shared: bool = False) -> int:
+    """Create (if needed) and flock the lock file; return the fd.
+
+    Exclusive by default.  ``shared=True`` takes ``LOCK_SH`` instead, for
+    holders that only need to exclude the exclusive writers and not each
+    other — see ``session_effect_claim``.
 
     The fd owns the lock; ``_flock_release`` releases it. Blocking, so callers
     that must not stall an event loop acquire it off-loop (see
@@ -172,7 +176,7 @@ def _flock_acquire(path: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
     except BaseException:
         os.close(descriptor)
         raise
@@ -180,7 +184,7 @@ def _flock_acquire(path: Path) -> int:
 
 
 def _flock_release(descriptor: int) -> None:
-    """Drop the exclusive flock and close the fd that owned it."""
+    """Drop the flock and close the fd that owned it."""
     try:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
     finally:
@@ -188,15 +192,24 @@ def _flock_release(descriptor: int) -> None:
 
 
 @contextmanager
-def generation_lifecycle_claims(keys):
+def generation_lifecycle_claims(keys, *, shared: bool = False):
     """Claim exact terminal incarnations in one canonical global order.
 
     Any operation that needs more than one lifecycle key must pass the complete
     set here.  Acquiring source then supervisor (or model generation then pane)
     in caller order can deadlock against session retirement, which necessarily
     observes the same keys in a different order.
+
+    ``shared=True`` takes the same lock files in shared mode: concurrent shared
+    holders admit each other, and every exclusive claim still waits for all of
+    them to drain.  A shared hold is *not* an exclusive one, so an inner
+    exclusive claim on a key this thread already holds shared raises rather
+    than silently running an exclusive critical section under a shared lock
+    (re-acquiring the same file exclusively on a second fd would deadlock the
+    thread against itself).
     """
     held = getattr(_LIFECYCLE_CLAIMS, "held", set())
+    held_shared: set[tuple[str, str, str]] = getattr(_LIFECYCLE_CLAIMS, "held_shared", set())
     canonical = sorted(
         {
             (
@@ -207,12 +220,22 @@ def generation_lifecycle_claims(keys):
             for key in keys
         }
     )
-    missing = [key for key in canonical if key not in held]
+    satisfied = held | held_shared if shared else held
+    missing = [key for key in canonical if key not in satisfied]
     if not missing:
         yield
         return
 
-    if held and min(missing) < max(held):
+    if not shared:
+        upgrades = [key for key in missing if key in held_shared]
+        if upgrades:
+            raise RuntimeError(
+                "lifecycle keys held shared cannot be upgraded to exclusive; "
+                f"already holding {sorted(upgrades)} in shared mode"
+            )
+
+    outstanding = held | held_shared
+    if outstanding and min(missing) < max(outstanding):
         raise RuntimeError(
             "lifecycle keys must be acquired together in canonical order; "
             "nested acquisition would invert the global lock order"
@@ -220,13 +243,19 @@ def generation_lifecycle_claims(keys):
 
     with ExitStack() as stack:
         for key in missing:
-            descriptor = _flock_acquire(_claim_lock_path(key))
+            descriptor = _flock_acquire(_claim_lock_path(key), shared=shared)
             stack.callback(_flock_release, descriptor)
-        _LIFECYCLE_CLAIMS.held = {*held, *missing}
+        if shared:
+            _LIFECYCLE_CLAIMS.held_shared = {*held_shared, *missing}
+        else:
+            _LIFECYCLE_CLAIMS.held = {*held, *missing}
         try:
             yield
         finally:
-            _LIFECYCLE_CLAIMS.held = held
+            if shared:
+                _LIFECYCLE_CLAIMS.held_shared = held_shared
+            else:
+                _LIFECYCLE_CLAIMS.held = held
 
 
 def terminal_lifecycle_claim_set(*terminals: Any) -> set[tuple[str, str, str]]:
@@ -295,6 +324,25 @@ def session_lifecycle_write_claim(session_name: str):
     rather than a deadlock.
     """
     with generation_lifecycle_claims((("", "session-workspace-write", session_name),)):
+        yield
+
+
+@contextmanager
+def session_effect_claim(session_name: str):
+    """Hold the lifecycle-write claim *shared*, for the span of one effect.
+
+    A provider/input effect must be linearized against the declared-lifecycle
+    writes — Stop must not install its barrier while an effect is mid-write,
+    and an effect must not start once Stop has — but effects do not exclude
+    each other: concurrent writes are arbitrated per pane by the pane-input
+    lease, which refuses a busy pane instead of queueing behind a write whose
+    duration the caller cannot know.  Taking this claim exclusively made one
+    session's effects a single global queue and turned that refusal into an
+    unbounded wait, so effects take the same lock file in shared mode: they
+    admit each other, while every exclusive lifecycle write (Stop included)
+    still waits for all of them to drain before it can commit.
+    """
+    with generation_lifecycle_claims((("", "session-workspace-write", session_name),), shared=True):
         yield
 
 

@@ -400,21 +400,29 @@ def observe_boundary(session_name: str, db: Any = None) -> dict[str, Any]:
 def session_effect_admission(session_name: Any):
     """Serialize one provider/input effect against the Stop linearization.
 
-    The cross-process lifecycle-write claim is the same claim held while C2
-    installs the durable Stop barrier.  An effect that entered first finishes
-    before Stop can claim; once Stop wins, every later effect refuses before
-    its own write/bridge claim.  The lock spans external I/O by necessity: a
-    check released before the pane write would recreate the exact check/use
-    race this boundary exists to close.
+    The claim taken here is the *shared* mode of the same lifecycle-write claim
+    held exclusively while C2 installs the durable Stop barrier.  An effect that
+    entered first finishes before Stop can claim; once Stop wins, every later
+    effect refuses before its own write/bridge claim.  The lock spans external
+    I/O by necessity: a check released before the pane write would recreate the
+    exact check/use race this boundary exists to close.
+
+    Shared rather than exclusive because this boundary linearizes effects
+    against *lifecycle writes*, not against each other.  Concurrent effects are
+    arbitrated where they actually collide — the per-pane input lease, which
+    refuses a busy pane with zero bytes.  Holding this claim exclusively put
+    every effect in one per-session queue, so a second control arriving
+    mid-write waited out the whole write instead of being refused, and was then
+    typed after it.
     """
     if not isinstance(session_name, str) or not session_name:
         raise SessionEffectRefused("provider effect has no durable CAO session identity")
     name = _normalise_session_name(session_name)
     from cli_agent_orchestrator.services.callback_recovery import (
-        session_lifecycle_write_claim,
+        session_effect_claim,
     )
 
-    with session_lifecycle_write_claim(name):
+    with session_effect_claim(name):
         barrier = oj.get_session_barrier(name)
         if barrier is not None and barrier["state"] == oj.BARRIER_CLAIMED:
             raise SessionEffectRefused(
