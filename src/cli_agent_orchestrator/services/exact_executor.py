@@ -65,8 +65,9 @@ reference exactly the selected paths — so the resumed harness loads the
 verified bytes, never an ambient HOME/default profile; a selected
 reference with no safe lane and no sealed application is typed-disabled
 before effects.  The stored trusted project root is validated before
-effects (canonical real directory, Codex only) and passed exactly to
-managed terminal creation.
+effects (canonical real directory, Codex only), applied to the Codex
+resume argv through its canonical invocation-only trust override, and
+passed exactly to managed terminal creation.
 
 Outcomes are durable and bounded: response loss and restart return the
 same successor terminal id/generation and the recorded outcome —
@@ -100,12 +101,17 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from cli_agent_orchestrator.clients import database
-from cli_agent_orchestrator.providers.codex import CodexRoute, codex_route_suffix
+from cli_agent_orchestrator.providers.codex import (
+    CodexRoute,
+    codex_route_suffix,
+    render_trusted_project_override,
+)
 from cli_agent_orchestrator.services import (
     claude_native_launch,
 )
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import (
+    muse_native_launch,
     native_attachment,
     native_attachment_recovery,
     native_tui_launch,
@@ -139,6 +145,12 @@ _EFFECT_NAMESPACE = uuid.UUID("03780000-b3ef-4acc-a7e3-000000000003")
 MAX_EXTRA_ARGS = 32
 MAX_EXTRA_ARG_LEN = 512
 MAX_EXTRA_ARGS_BYTES = 8192
+# Codex carries the ordinary launcher's composed profile/system prompt in a
+# single ``-c developer_instructions=...`` argument.  Keep that explicit
+# profile lane bounded, but large enough to replay the launcher's generated
+# profile material; do not widen unrelated route or caller-extra lanes.
+MAX_PROFILE_ARG_LEN = 65536
+MAX_PROFILE_ARGS_BYTES = 131072
 MAX_ENV_KEYS = 32
 MAX_ENV_VALUE_LEN = 4096
 MAX_ENV_BYTES = 16384
@@ -275,7 +287,13 @@ class LaunchMaterial:
     route_environment: Mapping[str, str] = field(default_factory=dict)
 
 
-def _bounded_args(value: Any, *, field: str) -> tuple[str, ...]:
+def _bounded_args(
+    value: Any,
+    *,
+    field: str,
+    max_arg_len: int = MAX_EXTRA_ARG_LEN,
+    max_bytes: int = MAX_EXTRA_ARGS_BYTES,
+) -> tuple[str, ...]:
     if value is None:
         args: tuple[str, ...] = ()
     elif isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
@@ -291,14 +309,10 @@ def _bounded_args(value: Any, *, field: str) -> tuple[str, ...]:
             raise ExactExecutorInvalid(
                 f"{field} entries must be non-empty NUL-free strings; got {arg!r}"
             )
-        if len(arg) > MAX_EXTRA_ARG_LEN:
-            raise ExactExecutorInvalid(
-                f"{field} entries must be at most {MAX_EXTRA_ARG_LEN} characters"
-            )
-    if sum(len(arg) + 1 for arg in args) > MAX_EXTRA_ARGS_BYTES:
-        raise ExactExecutorInvalid(
-            f"{field} must serialize to at most {MAX_EXTRA_ARGS_BYTES} bytes"
-        )
+        if len(arg) > max_arg_len:
+            raise ExactExecutorInvalid(f"{field} entries must be at most {max_arg_len} characters")
+    if sum(len(arg) + 1 for arg in args) > max_bytes:
+        raise ExactExecutorInvalid(f"{field} must serialize to at most {max_bytes} bytes")
     return args
 
 
@@ -344,7 +358,12 @@ def _reference_mapping(value: Any, *, field: str) -> Optional[dict[str, str]]:
 
 def _validate_launch_material(material: LaunchMaterial) -> LaunchMaterial:
     extra = _bounded_args(material.extra_args, field="extra_args")
-    profile_args = _bounded_args(material.profile_args, field="profile_args")
+    profile_args = _bounded_args(
+        material.profile_args,
+        field="profile_args",
+        max_arg_len=MAX_PROFILE_ARG_LEN,
+        max_bytes=MAX_PROFILE_ARGS_BYTES,
+    )
     route_args = _bounded_args(material.route_args, field="route_args")
     environment = _bounded_env(material.environment, field="environment")
     profile_environment = _bounded_env(material.profile_environment, field="profile_environment")
@@ -474,6 +493,44 @@ def _stored_executable_version(contract: restore_contract.RestoreContract) -> Op
     value = contract.executable.value or {}
     version = value.get("version")
     return version if isinstance(version, str) else None
+
+
+def _muse_profile_carrier(
+    request: operation_journal.OperationRequest,
+    contract: restore_contract.RestoreContract,
+) -> tuple[Optional[muse_native_launch.MuseProfileCarrierCapability], Optional[str]]:
+    """Resolve the already-canaried Muse wrapper/inner pair before effects.
+
+    Managed Muse launches intentionally execute the update-aware wrapper while
+    proving the exact pinned inner image it selects.  Exact restoration must
+    preserve that same distinction: treating the wrapper as the final process
+    would reject a healthy ``exec`` into the canaried inner binary, while
+    accepting an arbitrary descendant would lose the profile-carrier proof.
+    """
+    if request.harness != "muse_cli":
+        return None, None
+    executable = contract.executable.value or {}
+    wrapper = executable.get("path")
+    full_banner = executable.get("version")
+    if not isinstance(wrapper, str) or not isinstance(full_banner, str):
+        return None, (
+            "the Muse restore contract lacks the wrapper path/full version banner "
+            "required to revalidate its exact profile carrier"
+        )
+    capability = muse_native_launch.profile_carrier_capability(
+        wrapper_executable=wrapper,
+        full_banner=full_banner,
+    )
+    if (
+        not capability.supported
+        or capability.inner_executable is None
+        or capability.inner_executable_sha256 is None
+    ):
+        return capability, (
+            "the Muse wrapper/inner profile carrier is no longer the exact proven "
+            f"cell ({capability.reason}); refusing before any physical effect"
+        )
+    return capability, None
 
 
 def _variations(
@@ -980,10 +1037,17 @@ def _material_agreement_refusal(
                 )
             if harness == "codex" and arg == "-c":
                 override = extra[index + 1] if index + 1 < len(extra) else ""
+                override_key = override.split("=", 1)[0].strip()
                 if override.startswith("model=") or override.startswith("model_reasoning_effort="):
                     return (
                         f"launch material {label} override the executor-owned codex route "
                         f"via {override!r}; the effective route is pinned from the bound facts"
+                    )
+                if override_key == "projects" or override_key.startswith("projects."):
+                    return (
+                        f"launch material {label} override the executor-owned codex trusted "
+                        f"project root via {override!r}; project trust is pinned from the "
+                        "restore contract"
                     )
     overlap = set(profile_env) & set(route_env)
     if overlap:
@@ -1206,6 +1270,8 @@ class _Execution:
         self.effective_model: Optional[str] = None
         self.effective_effort: Optional[str] = None
         self.effective_provider_version: Optional[str] = None
+        self.expected_inner_executable: Optional[str] = None
+        self.expected_inner_executable_sha256: Optional[str] = None
 
     # -- journal steps ----------------------------------------------------
 
@@ -1379,11 +1445,13 @@ async def _execute_locked(
             else None
         )
     )
+    muse_carrier, muse_carrier_refusal = _muse_profile_carrier(request, contract)
     variations = _variations(request, contract, material)
     cell_reasons = variations + _carrier_cell_reasons(material)
     pre_effect_gates: list[Callable[[], Optional[str]]] = [
         lambda: _fact_refusal(contract),
         lambda: _trust_refusal(request, contract),
+        lambda: muse_carrier_refusal,
         lambda: _reference_live_drift("profile_material", selected_profile),
         lambda: _reference_live_drift("provider_home_facts", selected_home),
         lambda: _explicit_profile_refusal(selected_profile, selected_home),
@@ -1445,6 +1513,13 @@ async def _execute_locked(
         if material.provider_version is not None
         else _stored_executable_version(contract)
     )
+    if muse_carrier is not None and muse_carrier.supported:
+        execution.expected_inner_executable = muse_carrier.inner_executable
+        execution.expected_inner_executable_sha256 = muse_carrier.inner_executable_sha256
+        if muse_carrier.inner_executable_sha256 is not None:
+            execution.evidence["profile_carrier_inner_sha256"] = (
+                muse_carrier.inner_executable_sha256
+            )
     # Durable evidence carries digests/references only — never
     # profile/home/carrier values.
     profile_digest = _present_fact_digest(contract.profile_material)
@@ -1885,8 +1960,28 @@ async def _launch_successor(
     # extra args come last — already proven to restate none of the owned
     # flags.  Env layers merge in ascending authority order, each proven
     # disjoint from the keys a later layer owns.
+    try:
+        trust_args = (
+            ["-c", render_trusted_project_override(contract.trusted_project_root)]
+            if execution.request.harness == "codex" and contract.trusted_project_root is not None
+            else []
+        )
+    except ValueError as exc:
+        # The root was canonical at the pre-effect gate but changed before
+        # launch composition (for example, a directory was replaced by a
+        # symlink).  The prior incarnation is already authoritatively reaped
+        # and detached, so record a retryable, typed refusal: no successor
+        # effect has been authorized and a later exact retry can adopt the
+        # reservation and continue from this phase.
+        detail = (
+            "the recorded trusted project root drifted before successor launch; "
+            f"no successor effect was authorized: {exc}"
+        )
+        execution.record_refused(detail)
+        raise ExactExecutorRefused(detail) from exc
     launch_args = (
         list(execution.route_argv)
+        + trust_args
         + list(execution.profile_argv)
         + list(execution.material.profile_args)
         + list(execution.material.extra_args)
@@ -2014,6 +2109,8 @@ async def _launch_successor(
             transport=transport,
             extra_args=launch_args or None,
             launch_kind=native_tui_launch.LAUNCH_KIND_RESUME,
+            expected_inner_executable=execution.expected_inner_executable,
+            expected_inner_executable_sha256=execution.expected_inner_executable_sha256,
             provider_version=execution.effective_provider_version,
             authorize=_authorize,
         )
