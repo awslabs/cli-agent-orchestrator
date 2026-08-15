@@ -2560,7 +2560,12 @@ async def delete_session(
         result = await asyncio.to_thread(
             session_service.delete_session, session_name, registry=get_plugin_registry(request)
         )
-        if result.get("errors") or session_name not in result.get("deleted", []):
+        deleted = result.get("deleted") or []
+        errors = result.get("errors") or []
+        deferred = (isinstance(errors, list) and bool(errors)) or (
+            isinstance(deleted, (list, tuple)) and session_name not in deleted
+        )
+        if deferred:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
