@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from cli_agent_orchestrator.models.flow import Flow
@@ -209,6 +210,41 @@ Test prompt.
 
             assert result.name == "test-flow"
             mock_db_create.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.flow_service.db_create_flow")
+    def test_add_flow_accepts_api_safe_dump_frontmatter(self, mock_db_create, tmp_path):
+        """A flow file serialized with yaml.safe_dump (the API's new format)
+        registers cleanly with a single-line schedule and no script key."""
+        mock_db_create.return_value = Flow(
+            name="safe-flow",
+            file_path="/path/to/flow.md",
+            schedule="0 * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            next_run=datetime.now(),
+        )
+        file_path = tmp_path / "safe.flow.md"
+        file_path.write_text(
+            "---\n"
+            + yaml.safe_dump(
+                {
+                    "name": "safe-flow",
+                    "schedule": "0 * * * *",
+                    "agent_profile": "developer",
+                    "provider": "kiro_cli",
+                },
+                sort_keys=False,
+            )
+            + "---\n"
+            + "Prompt body."
+        )
+
+        flow = add_flow(str(file_path))
+
+        assert flow.name == "safe-flow"
+        assert flow.schedule == "0 * * * *"
+        assert flow.script == ""
+        mock_db_create.assert_called_once()
 
     def test_add_flow_missing_required_field(self):
         """Test that missing required field raises error."""

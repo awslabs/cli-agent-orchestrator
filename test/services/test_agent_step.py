@@ -710,3 +710,54 @@ class TestInterruptibleCancel:
                 )
         m_delete.assert_not_called()
         m_exit.assert_not_called()
+
+
+class TestOutputExtractionTeardown:
+    def test_extraction_failure_tears_down_created_terminal(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.COMPLETED,
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            patch(
+                f"{_MODULE}.terminal_service.get_output",
+                side_effect=ValueError("No completion marker found after last user message"),
+            ) as m_out,
+            exit_cli as m_exit,
+            wait,
+            status,
+        ):
+            with pytest.raises(ValueError, match="No completion marker found"):
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        m_out.assert_called_once_with("abc12345", OutputMode.LAST)
+        # A terminal this call created is reclaimed exactly like the success path.
+        m_exit.assert_called_once_with("abc12345")
+        m_delete.assert_called_once_with("abc12345", registry=None)
+
+    def test_extraction_failure_does_not_tear_down_reused_terminal(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.COMPLETED,
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            patch(
+                f"{_MODULE}.terminal_service.get_output",
+                side_effect=ValueError("No completion marker found after last user message"),
+            ) as m_out,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+        ):
+            with pytest.raises(ValueError, match="No completion marker found"):
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99"))
+        m_out.assert_called_once_with("reuse99", OutputMode.LAST)
+        m_delete.assert_not_called()
+        m_exit.assert_not_called()

@@ -28,6 +28,7 @@ from typing import (
     cast,
 )
 
+import yaml
 from fastapi import (
     BackgroundTasks,
     Body,
@@ -1054,6 +1055,22 @@ class CreateFlowRequest(BaseModel):
             raise ValueError("Flow name must not contain '/', '\\', or '..'")
         return v
 
+    @field_validator("schedule", "agent_profile", "provider")
+    @classmethod
+    def validate_no_control_characters(cls, v: str) -> str:
+        """Prevent YAML frontmatter injection — a newline could otherwise
+        smuggle extra keys (e.g. script) into the serialized file."""
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+            raise ValueError("must not contain control characters")
+        return v
+
+    @field_validator("agent_profile", "provider")
+    @classmethod
+    def validate_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
+        return v
+
 
 def _reconcile_memory_at_startup() -> None:
     """Apply bounded memory repair and keep server startup resilient."""
@@ -2045,7 +2062,9 @@ mount_widget_static(app)
 
 
 @app.get("/agents/profiles")
-async def list_agent_profiles_endpoint() -> List[Dict]:
+async def list_agent_profiles_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List all available agent profiles from all configured directories."""
     try:
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
@@ -2345,7 +2364,10 @@ def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidati
 
 
 @app.get("/agents/profiles/{name}")
-async def get_agent_profile_endpoint(name: str) -> Dict:
+async def get_agent_profile_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Return the full parsed content of a named agent profile.
 
     Note this response is *resolved*: ``load_agent_profile`` applies
@@ -2511,13 +2533,15 @@ async def get_agent_profile_source_endpoint(
     be fetched as the starting point for a clone. Writing it back still requires
     the local store, which is enforced by the write routes.
 
-    Scope-gated, unlike the pre-existing profile reads beside it, following the
-    precedent set on #505: a newly added read route carries the gate, while
-    already-shipped ungated siblings are left alone because tightening them could
-    break an existing unauthenticated reader. Gating matters more here than on
-    those siblings because this route returns the stored bytes verbatim from the
-    local, provider, extra and built-in stores, including documents that fail to
-    parse, whereas the parsed route can only return what the model accepts.
+    Scope-gated like the profile reads beside it. This route was gated on its own
+    when it was added here, on the #505 precedent that a *new* read route carries
+    the gate while already-shipped ungated siblings are left alone; #606 has since
+    gated those siblings too, so the asymmetry that reasoning managed no longer
+    exists. Gating matters at least as much here as on the parsed route because
+    this one returns the stored bytes verbatim from the local, provider, extra and
+    built-in stores, including documents that fail to parse, whereas the parsed
+    route can only return what the model accepts. Registered alongside them in
+    ``test/api/test_auth_read_gating.py::_GATED_ROUTES``.
     """
     from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
 
@@ -2656,7 +2680,10 @@ async def set_skill_dirs_endpoint(
 
 
 @app.get("/skills/{name}", response_model=SkillContentResponse)
-async def get_skill_content(name: str) -> SkillContentResponse:
+async def get_skill_content(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> SkillContentResponse:
     """Return the full Markdown body for an installed skill."""
     try:
         skill_name = validate_skill_name(name)
@@ -2818,7 +2845,9 @@ async def create_session(
 
 
 @app.get("/sessions")
-async def list_sessions() -> List[Dict]:
+async def list_sessions(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     try:
         return session_service.list_sessions()
     except Exception as e:
@@ -2829,7 +2858,10 @@ async def list_sessions() -> List[Dict]:
 
 
 @app.get("/sessions/{session_name}")
-async def get_session(session_name: str) -> Dict:
+async def get_session(
+    session_name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     # Validate before entering the try block so a malformed name surfaces
     # as 400 instead of being mapped to 404 by the not-found handler below.
     try:
@@ -3036,7 +3068,10 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 
 
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
-async def get_terminal(terminal_id: TerminalId) -> Terminal:
+async def get_terminal(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
     try:
         # get_terminal reads status_monitor.get_status(), which for a
         # PROCESSING terminal does a fresh detection that can shell out to
@@ -3191,7 +3226,10 @@ async def list_terminal_siblings(
 
 
 @app.get("/terminals/{terminal_id}/memory-context")
-async def get_terminal_memory_context(terminal_id: TerminalId):
+async def get_terminal_memory_context(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
     """Return the CAO memory context block for a terminal as plain text.
 
     Used by the Kiro AgentSpawn hook to inject memory into agent context.
@@ -3294,7 +3332,9 @@ async def send_terminal_key(
 
 @app.get("/terminals/{terminal_id}/output", response_model=TerminalOutputResponse)
 async def get_terminal_output(
-    terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
+    terminal_id: TerminalId,
+    mode: OutputMode = OutputMode.FULL,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> TerminalOutputResponse:
     try:
         # get_output does a blocking tmux capture-pane plus provider regex
@@ -3330,13 +3370,12 @@ async def get_terminal_output_range(
     that has not logged anything yet returns 200 with empty ``data`` so playback
     degrades gracefully (BR-4), rather than 404.
 
-    Scope-gated (PR #526 review): this route is NEW in #504 and returns raw
-    terminal log bytes, the same payload class as the run read routes gated
-    alongside it. Its only caller is this repo's own web UI, so adding the gate
-    breaks nothing. The sibling ``GET /terminals/{id}/output`` is deliberately
-    left as-is — it predates #504 and the wider ``/terminals/*`` surface is
-    uniformly ungated, so gating one pre-existing member of it belongs to a
-    separate, deliberate decision about that whole surface rather than to this PR.
+    Scope-gated: this route returns raw terminal log bytes, the same payload
+    class as the run read routes gated alongside it. Its only caller is this
+    repo's own web UI, so adding the gate breaks nothing. The sibling
+    ``GET /terminals/{id}/output`` — which returns the rolling transcript — is
+    gated with the same read tier, so both output read paths enforce
+    ``require_any_scope(READ, WRITE, ADMIN)`` when auth is enabled.
     """
     try:
         # Reads a byte slice off disk — run it off the loop so a large range
@@ -3575,7 +3614,10 @@ async def run_step(
 
 
 @app.post("/workflows/validate")
-async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
+async def validate_workflow_endpoint(
+    body: WorkflowValidateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Validate a workflow spec without running it (FR-1.3/A1a). Returns ValidationResult.
 
     Extension-based dispatch (U5, A1a, BR-23a): ``.yaml``/``.yml`` calls
@@ -3631,7 +3673,10 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
 
 
 @app.get("/workflows")
-async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> List[Dict]:
+async def list_workflows_endpoint(
+    dir: Optional[str] = Query(default=None),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List indexed workflows, rebuilt from the spec files on disk (FR-2.1)."""
     from cli_agent_orchestrator.services import workflow_spec_service
 
@@ -3703,7 +3748,10 @@ async def list_workflow_runs_endpoint(
 
 
 @app.get("/workflows/{name}")
-async def get_workflow_endpoint(name: str) -> Dict:
+async def get_workflow_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Return the parsed/validated spec for a workflow name (FR-2.1, A1).
 
     Widened return: ``get_workflow`` may now resolve a ``.py`` name to a
@@ -5783,6 +5831,7 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -6046,7 +6095,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
 
 
 @app.get("/flows", response_model=List[Flow])
-async def list_flows() -> List[Flow]:
+async def list_flows(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Flow]:
     """List all flows."""
     try:
         return flow_service.list_flows()
@@ -6058,7 +6109,10 @@ async def list_flows() -> List[Flow]:
 
 
 @app.get("/flows/{name}", response_model=Flow)
-async def get_flow(name: str) -> Flow:
+async def get_flow(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Flow:
     """Get a specific flow by name."""
     try:
         return flow_service.get_flow(name)
@@ -6087,16 +6141,18 @@ async def create_flow(
 
         file_path = flows_dir / f"{body.name}.flow.md"
 
-        # Build YAML frontmatter content
-        frontmatter_lines = [
-            "---",
-            f"name: {body.name}",
-            f'schedule: "{body.schedule}"',
-            f"agent_profile: {body.agent_profile}",
-            f"provider: {body.provider}",
-            "---",
-        ]
-        file_content = "\n".join(frontmatter_lines) + "\n" + body.prompt_template
+        # Serialize via yaml.safe_dump so a multi-line value becomes a quoted
+        # scalar rather than injecting a new frontmatter key.
+        frontmatter = yaml.safe_dump(
+            {
+                "name": body.name,
+                "schedule": body.schedule,
+                "agent_profile": body.agent_profile,
+                "provider": body.provider,
+            },
+            sort_keys=False,
+        )
+        file_content = "---\n" + frontmatter + "---\n" + body.prompt_template
 
         file_path.write_text(file_content)
 
@@ -6258,6 +6314,7 @@ async def list_memories_endpoint(
     memory_type: Optional[MemoryType] = Query(default=None, alias="type"),
     scope_id: Optional[MemoryScopeId] = None,
     limit: int = Query(default=50, ge=1, le=100),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[MemorySummary]:
     """List stored memories across all projects (mirrors `cao memory list --all`)."""
     _require_memory_enabled()
@@ -6548,6 +6605,7 @@ async def get_memory_endpoint(
     key: MemoryKey,
     scope: Optional[MemoryScope] = None,
     scope_id: Optional[MemoryScopeId] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> MemoryDetail:
     """Show a memory by key (mirrors `cao memory show`; first match wins)."""
     _require_memory_enabled()

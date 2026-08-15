@@ -485,9 +485,16 @@ async def run_agent_step(
     # provider's extract_last_message_from_script under the hood). This does a
     # blocking tmux capture-pane plus regex extraction over the scrollback —
     # potentially seconds for a large transcript — so run it off the loop.
-    last_message = await asyncio.to_thread(
-        terminal_service.get_output, terminal_id, OutputMode.LAST
-    )
+    # Clean up a terminal owned by this call if output extraction fails. Reused
+    # terminals remain owned by the caller.
+    try:
+        last_message = await asyncio.to_thread(
+            terminal_service.get_output, terminal_id, OutputMode.LAST
+        )
+    except BaseException:
+        if teardown and created_here:
+            await _best_effort_teardown(terminal_id, registry)
+        raise
 
     result = AgentStepResult(
         terminal_id=terminal_id,
