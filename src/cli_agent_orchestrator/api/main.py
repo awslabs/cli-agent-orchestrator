@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Dict, List, Literal, Optional, Tuple, cast
 
+import yaml
 from fastapi import (
     BackgroundTasks,
     Body,
@@ -986,6 +987,22 @@ class CreateFlowRequest(BaseModel):
         """Prevent path traversal — flow name becomes a filename."""
         if "/" in v or "\\" in v or ".." in v:
             raise ValueError("Flow name must not contain '/', '\\', or '..'")
+        return v
+
+    @field_validator("schedule", "agent_profile", "provider")
+    @classmethod
+    def validate_no_control_characters(cls, v: str) -> str:
+        """Prevent YAML frontmatter injection — a newline could otherwise
+        smuggle extra keys (e.g. script) into the serialized file."""
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+            raise ValueError("must not contain control characters")
+        return v
+
+    @field_validator("agent_profile", "provider")
+    @classmethod
+    def validate_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
         return v
 
 
@@ -5795,16 +5812,18 @@ async def create_flow(
 
         file_path = flows_dir / f"{body.name}.flow.md"
 
-        # Build YAML frontmatter content
-        frontmatter_lines = [
-            "---",
-            f"name: {body.name}",
-            f'schedule: "{body.schedule}"',
-            f"agent_profile: {body.agent_profile}",
-            f"provider: {body.provider}",
-            "---",
-        ]
-        file_content = "\n".join(frontmatter_lines) + "\n" + body.prompt_template
+        # Serialize via yaml.safe_dump so a multi-line value becomes a quoted
+        # scalar rather than injecting a new frontmatter key.
+        frontmatter = yaml.safe_dump(
+            {
+                "name": body.name,
+                "schedule": body.schedule,
+                "agent_profile": body.agent_profile,
+                "provider": body.provider,
+            },
+            sort_keys=False,
+        )
+        file_content = "---\n" + frontmatter + "---\n" + body.prompt_template
 
         file_path.write_text(file_content)
 
