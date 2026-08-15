@@ -48,6 +48,7 @@ import json
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -165,6 +166,12 @@ class CohortJournalNotFound(CohortJournalError):
 
 class CohortJournalUnavailable(CohortJournalError):
     code = "cohort-journal-unavailable"
+
+
+class SessionEffectRefused(CohortJournalConflict):
+    """A provider/input effect lost to the durable Stop boundary."""
+
+    code = "session-effect-refused"
 
 
 def _now() -> str:
@@ -387,6 +394,51 @@ def observe_boundary(session_name: str, db: Any = None) -> dict[str, Any]:
         raise CohortJournalUnavailable(
             f"cohort boundary read failed: {str(exc).splitlines()[0]}"
         ) from exc
+
+
+@contextmanager
+def session_effect_admission(session_name: Any):
+    """Serialize one provider/input effect against the Stop linearization.
+
+    The claim taken here is the *shared* mode of the same lifecycle-write claim
+    held exclusively while C2 installs the durable Stop barrier.  An effect that
+    entered first finishes before Stop can claim; once Stop wins, every later
+    effect refuses before its own write/bridge claim.  The lock spans external
+    I/O by necessity: a check released before the pane write would recreate the
+    exact check/use race this boundary exists to close.
+
+    Shared rather than exclusive because this boundary linearizes effects
+    against *lifecycle writes*, not against each other.  Concurrent effects are
+    arbitrated where they actually collide — the per-pane input lease, which
+    refuses a busy pane with zero bytes.  Holding this claim exclusively put
+    every effect in one per-session queue, so a second control arriving
+    mid-write waited out the whole write instead of being refused, and was then
+    typed after it.
+    """
+    if not isinstance(session_name, str) or not session_name:
+        raise SessionEffectRefused("provider effect has no durable CAO session identity")
+    name = _normalise_session_name(session_name)
+    from cli_agent_orchestrator.services.callback_recovery import (
+        session_effect_claim,
+    )
+
+    with session_effect_claim(name):
+        barrier = oj.get_session_barrier(name)
+        if barrier is not None and barrier["state"] == oj.BARRIER_CLAIMED:
+            raise SessionEffectRefused(
+                f"session {name} Stop barrier is claimed by {barrier['claimed_by']!r}; "
+                "no later provider/input effect is admitted"
+            )
+        lifecycle = sl.describe(name)
+        if lifecycle.get("unreadable"):
+            raise SessionEffectRefused(
+                f"session {name} lifecycle is unreadable; refusing a new provider/input effect"
+            )
+        if lifecycle["lifecycle"] == sl.STOPPED:
+            raise SessionEffectRefused(
+                f"session {name} is stopped; only an operator Resume may reopen effects"
+            )
+        yield
 
 
 @dataclass(frozen=True)
@@ -1209,6 +1261,20 @@ def begin_stop_teardown(request: StopTeardownRequest, db: Any = None) -> dict[st
         with session_lifecycle_write_claim(operation.session_name):
             return _begin_stop_teardown_once(session, request)
 
+    def _run_with_fresh_locked_snapshot(session: Any) -> dict[str, Any]:
+        # Resolve the immutable lock key, then end the implicit db=None read
+        # transaction before waiting on the cross-process claim.  Otherwise a
+        # waiter can carry a pre-winner SQLite snapshot through the wait and
+        # miss the transition/barrier that just committed.  The fresh read
+        # under the claim adopts or refuses that durable winner truthfully.
+        operation = _operation_by_id(session, request.operation_id)
+        if operation is None:
+            raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
+        session_name = operation.session_name
+        session.rollback()
+        with session_lifecycle_write_claim(session_name):
+            return _begin_stop_teardown_once(session, request)
+
     if db is not None:
         try:
             _anchor_caller_transaction(db)
@@ -1225,7 +1291,7 @@ def begin_stop_teardown(request: StopTeardownRequest, db: Any = None) -> dict[st
     for _attempt in range(5):
         try:
             with database.SessionLocal() as session:
-                result = _run(session)
+                result = _run_with_fresh_locked_snapshot(session)
                 session.commit()
                 return result
         except CohortJournalUnavailable as exc:
@@ -1711,6 +1777,15 @@ def commit_terminal(request: TerminalCommitRequest, db: Any = None) -> dict[str,
         with session_lifecycle_write_claim(operation.session_name):
             return _commit_terminal_once(session, request)
 
+    def _run_with_fresh_locked_snapshot(session: Any) -> dict[str, Any]:
+        operation = _operation_by_id(session, request.operation_id)
+        if operation is None:
+            raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
+        session_name = operation.session_name
+        session.rollback()
+        with session_lifecycle_write_claim(session_name):
+            return _commit_terminal_once(session, request)
+
     if db is not None:
         try:
             _anchor_caller_transaction(db)
@@ -1727,7 +1802,7 @@ def commit_terminal(request: TerminalCommitRequest, db: Any = None) -> dict[str,
     for _attempt in range(5):
         try:
             with database.SessionLocal() as session:
-                result = _run(session)
+                result = _run_with_fresh_locked_snapshot(session)
                 session.commit()
                 return result
         except CohortJournalUnavailable as exc:

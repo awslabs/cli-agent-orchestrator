@@ -394,7 +394,9 @@ class ReapRecorder:
     error: Optional[Exception] = None
 
     def __call__(self, terminal_id, registry=None, **kwargs):
-        self.calls.append({"terminal_id": terminal_id, **kwargs})
+        self.calls.append(
+            {"terminal_id": terminal_id, "thread_id": threading.get_ident(), **kwargs}
+        )
         if self.error is not None:
             raise self.error
         return self.result
@@ -2294,6 +2296,180 @@ def test_pane_create_failure_is_reconciliation_required(launch_root, monkeypatch
 # ---------------------------------------------------------------------------
 
 
+def _materialize_after_stop_then_fail(request, failure_factory, *, entered=None, release=None):
+    """A blocking launch that materializes after Stop's first reap scan."""
+
+    def _start(**kwargs):
+        authorize = kwargs["authorize"]
+        transport = kwargs["transport"]
+        authorize(native_tui_launch.AUTHORIZE_BOUNDARY_DECLARE)
+        authorize(native_tui_launch.AUTHORIZE_BOUNDARY_CREATE_PANE)
+        transport.create_pane(argv=[kwargs["binary"], "--resume", _NATIVE_ID])
+        oj.claim_session_barrier(
+            request.session_name, claimed_by="force-stop", reason="Stop won before materialization"
+        )
+        if entered is not None:
+            entered.set()
+        if release is not None:
+            assert release.wait(timeout=5)
+        raise failure_factory()
+
+    return _start
+
+
+@pytest.mark.parametrize("failure_kind", ["ambiguous", "conflict"])
+def test_stop_reaps_late_successor_on_every_post_physical_launch_exit(
+    launch_root, monkeypatch, failure_kind
+):
+    bind, contract = _dormant_worker(launch_root)
+    _prior_attachment()
+    request = _operation_request(bind, contract)
+    reaper = _reap_noop(monkeypatch)
+    caller_thread = threading.get_ident()
+
+    def failure_factory():
+        if failure_kind == "ambiguous":
+            return native_tui_launch.NativeLaunchAmbiguous(
+                native_tui_launch.AMBIGUOUS_PANE_CREATE,
+                "pane materialized after force Stop's first scan",
+            )
+        return native_tui_launch.NativeLaunchConflict(
+            "post-physical attachment publication conflicted"
+        )
+
+    monkeypatch.setattr(
+        native_tui_launch,
+        "start",
+        _materialize_after_stop_then_fail(request, failure_factory),
+    )
+    transport = FakeTransport(workdir=launch_root["workdir"])
+
+    with pytest.raises(xe.ExactExecutorReconciliation):
+        _run(_execute(request, transport))
+
+    reserved = oj.get_operation(request.operation_id)
+    assert transport.created == 1
+    assert reaper.calls[-1]["terminal_id"] == reserved["successor_terminal_id"]
+    assert reaper.calls[-1]["expected_generation"] == reserved["successor_generation"]
+    assert reaper.calls[-1]["thread_id"] != caller_thread
+    result = oj.get_result(request.operation_id)
+    assert result["result_state"] == oj.RESULT_RECONCILIATION_REQUIRED
+    assert len(result["result_evidence"]["stop_reap_digest"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_cancellation_waits_for_late_materialization_and_stop_reap(launch_root, monkeypatch):
+    bind, contract = _dormant_worker(launch_root)
+    _prior_attachment()
+    request = _operation_request(bind, contract)
+    reaper = _reap_noop(monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _published_then_blocked(**kwargs):
+        authorize = kwargs["authorize"]
+        transport = kwargs["transport"]
+        authorize(native_tui_launch.AUTHORIZE_BOUNDARY_DECLARE)
+        authorize(native_tui_launch.AUTHORIZE_BOUNDARY_CREATE_PANE)
+        pane_id = transport.create_pane(argv=[kwargs["binary"], "--resume", _NATIVE_ID])
+        authorize(native_tui_launch.AUTHORIZE_BOUNDARY_PUBLISH)
+        oj.claim_session_barrier(
+            request.session_name,
+            claimed_by="force-stop",
+            reason="Stop won after publication but before worker return",
+        )
+        entered.set()
+        assert release.wait(timeout=5)
+        return {
+            "outcome": native_tui_launch.OUTCOME_LAUNCHED,
+            "session_proof": native_tui_launch.SESSION_PROOF_ARGV,
+            "pane_observation": {"pane_id": pane_id},
+        }
+
+    monkeypatch.setattr(
+        native_tui_launch,
+        "start",
+        _published_then_blocked,
+    )
+    transport = FakeTransport(workdir=launch_root["workdir"])
+    execution = asyncio.create_task(_execute(request, transport))
+    assert await asyncio.to_thread(entered.wait, 5)
+
+    execution.cancel()
+    await asyncio.sleep(0)
+    assert not execution.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    reserved = oj.get_operation(request.operation_id)
+    assert reaper.calls[-1]["terminal_id"] == reserved["successor_terminal_id"]
+    assert reaper.calls[-1]["expected_generation"] == reserved["successor_generation"]
+    result = oj.get_result(request.operation_id)
+    assert result["result_state"] == oj.RESULT_RECONCILIATION_REQUIRED
+    assert len(result["result_evidence"]["stop_reap_digest"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_cancellation_durably_reconciles_a_failed_late_stop_reap(launch_root, monkeypatch):
+    bind, contract = _dormant_worker(launch_root)
+    _prior_attachment()
+    request = _operation_request(bind, contract)
+    _reap_noop(monkeypatch)
+    cleanup_calls = []
+
+    def _failed_resource_reap(operation, **_kwargs):
+        cleanup_calls.append(dict(operation))
+        raise RuntimeError("late exact successor teardown failed")
+
+    from cli_agent_orchestrator.services import cohort_effects
+
+    monkeypatch.setattr(cohort_effects, "reap_reincarnation_resources", _failed_resource_reap)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _published_then_blocked(**kwargs):
+        authorize = kwargs["authorize"]
+        transport = kwargs["transport"]
+        authorize(native_tui_launch.AUTHORIZE_BOUNDARY_DECLARE)
+        authorize(native_tui_launch.AUTHORIZE_BOUNDARY_CREATE_PANE)
+        pane_id = transport.create_pane(argv=[kwargs["binary"], "--resume", _NATIVE_ID])
+        authorize(native_tui_launch.AUTHORIZE_BOUNDARY_PUBLISH)
+        oj.claim_session_barrier(
+            request.session_name,
+            claimed_by="force-stop",
+            reason="Stop won before the cancelled worker returned",
+        )
+        entered.set()
+        assert release.wait(timeout=5)
+        return {
+            "outcome": native_tui_launch.OUTCOME_LAUNCHED,
+            "session_proof": native_tui_launch.SESSION_PROOF_ARGV,
+            "pane_observation": {"pane_id": pane_id},
+        }
+
+    monkeypatch.setattr(native_tui_launch, "start", _published_then_blocked)
+    execution = asyncio.create_task(
+        _execute(request, FakeTransport(workdir=launch_root["workdir"]))
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+
+    execution.cancel()
+    await asyncio.sleep(0)
+    assert not execution.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    reserved = oj.get_operation(request.operation_id)
+    assert cleanup_calls[-1]["successor_terminal_id"] == reserved["successor_terminal_id"]
+    assert cleanup_calls[-1]["successor_generation"] == reserved["successor_generation"]
+    result = oj.get_result(request.operation_id)
+    assert result["result_state"] == oj.RESULT_RECONCILIATION_REQUIRED
+    assert len(result["result_evidence"]["stop_reap_error_digest"]) == 64
+    assert "stop_reap_digest" not in result["result_evidence"]
+
+
 def _barrier_between_intents(monkeypatch, after_step: str):
     """Claim the session barrier from inside the executor's own authorize
     callback, immediately after ``after_step`` commits — the exact window in
@@ -2391,7 +2567,7 @@ def test_barrier_after_each_intent_resolves_without_a_later_effect(
     bind, contract = _dormant_worker(launch_root)
     _prior_attachment()
     request = _operation_request(bind, contract)
-    _reap_noop(monkeypatch)
+    reaper = _reap_noop(monkeypatch)
     _barrier_between_intents(monkeypatch, armed_step)
     transport = FakeTransport(workdir=launch_root["workdir"])
     with pytest.raises(xe.ExactExecutorError) as excinfo:
@@ -2407,6 +2583,9 @@ def test_barrier_after_each_intent_resolves_without_a_later_effect(
     if pane_may_exist:
         assert isinstance(excinfo.value, xe.ExactExecutorReconciliation)
         assert result["result_state"] == xe.OUTCOME_RECONCILIATION_REQUIRED
+        reserved = oj.get_operation(request.operation_id)
+        assert reaper.calls[-1]["terminal_id"] == reserved["successor_terminal_id"]
+        assert reaper.calls[-1]["expected_generation"] == reserved["successor_generation"]
         # The successor pane may exist but is never bound and never admitted.
         agent = roster.get_agent(bind["agent"]["agent_id"])
         assert (
@@ -2422,7 +2601,7 @@ def test_barrier_before_final_bind_prevents_the_bind(launch_root, monkeypatch):
     bind, contract = _dormant_worker(launch_root)
     _prior_attachment()
     request = _operation_request(bind, contract)
-    _reap_noop(monkeypatch)
+    reaper = _reap_noop(monkeypatch)
     # The launch completes; Stop lands between verification and the bind.
     _barrier_between_intents(monkeypatch, oj.EFFECT_STEP_VERIFY_IDENTITY)
     transport = FakeTransport(workdir=launch_root["workdir"])
@@ -2434,6 +2613,12 @@ def test_barrier_before_final_bind_prevents_the_bind(launch_root, monkeypatch):
     assert xe.get_result(request.operation_id)["result_state"] == (
         xe.OUTCOME_RECONCILIATION_REQUIRED
     )
+    reserved = oj.get_operation(request.operation_id)
+    assert [call["terminal_id"] for call in reaper.calls] == [
+        request.prior_terminal_id,
+        reserved["successor_terminal_id"],
+    ]
+    assert reaper.calls[-1]["expected_generation"] == reserved["successor_generation"]
     # The successor pane exists but was never bound and never admitted.
     attachment = na.get("claude_code", _NATIVE_ID)
     assert attachment["owner"]["terminal_id"] != bind["incarnation"]["terminal_id"]

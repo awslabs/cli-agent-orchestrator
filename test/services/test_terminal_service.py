@@ -6,6 +6,7 @@ import pytest
 
 from cli_agent_orchestrator.services.terminal_service import (
     TerminalInputBlockedError,
+    TerminalInputRefusedError,
     exit_terminal_cli,
     get_working_directory,
     send_input,
@@ -13,6 +14,15 @@ from cli_agent_orchestrator.services.terminal_service import (
 )
 
 _TS = "cli_agent_orchestrator.services.terminal_service"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db(isolated_memory_db, monkeypatch, tmp_path):
+    """The Stop admission gate must never make these unit tests read live CAO state."""
+    from cli_agent_orchestrator import constants
+
+    monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
+    return isolated_memory_db
 
 
 class TestTerminalServiceWorkingDirectory:
@@ -225,6 +235,27 @@ class TestSendSpecialKey:
         mock_tmux_client.send_special_key.assert_called_once_with(
             "cao-session", "developer-mnop", "Escape"
         )
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor.notify_input_sent")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_stop_barrier_refuses_special_key_before_status_or_tmux(
+        self, mock_get_metadata, mock_tmux_client, mock_notify_input
+    ):
+        from cli_agent_orchestrator.services import operation_journal
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-mnop",
+        }
+        operation_journal.claim_session_barrier("cao-session", claimed_by="stop-operation")
+
+        with pytest.raises(TerminalInputRefusedError) as exc_info:
+            send_special_key("test-terminal-004", "C-c")
+
+        assert exc_info.value.reason_code == "session-effect-barrier"
+        mock_notify_input.assert_not_called()
+        mock_tmux_client.send_special_key.assert_not_called()
 
 
 class TestExitTerminalCli:

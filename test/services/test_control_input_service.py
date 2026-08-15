@@ -266,9 +266,12 @@ def _metadata(**overrides):
 
 
 @pytest.fixture(autouse=True)
-def _isolated_state(monkeypatch, tmp_path):
+def _isolated_state(isolated_memory_db, monkeypatch, tmp_path):
     """Pane locks and the journal both follow the state root, never the host's."""
+    from cli_agent_orchestrator import constants
+
     monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
     reset_pane_input_arbiter()
     service.reset_control_input_journal()
     yield
@@ -841,6 +844,20 @@ class TestDelivery:
                 "expected_server_identity": SOCKET,
             }
         ]
+
+    def test_stop_barrier_refuses_before_any_provider_byte(self, isolated_memory_db, tmux, journal):
+        from cli_agent_orchestrator.services import operation_journal
+        from cli_agent_orchestrator.services.control_input_contract import (
+            REASON_SESSION_EFFECT_BARRIER,
+        )
+
+        operation_journal.claim_session_barrier("cao", claimed_by="stop-operation")
+
+        result = _deliver(journal)
+
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_SESSION_EFFECT_BARRIER
+        assert tmux.writes == []
 
     def test_nothing_written_carries_paste_framing(self, tmux, journal):
         """The leakage this lane exists to remove is structurally absent
@@ -1670,6 +1687,26 @@ class TestNativeInboxPayload:
         assert result.enter_sent is True
         assert result.chunks_sent == 5
         assert executed == [(plan, True)]
+
+    def test_stop_barrier_refuses_native_payload_before_adapter_write(self, monkeypatch):
+        from cli_agent_orchestrator.services import operation_journal
+
+        resolved = self._resolved()
+        executed = []
+
+        class _Adapter:
+            def execute_composer_plan(self, **_kwargs):
+                executed.append(True)
+                pytest.fail("adapter must not receive a post-Stop payload")
+
+        self._wire(monkeypatch, resolved, _Adapter(), {"deliverable": True})
+        operation_journal.claim_session_barrier(resolved.session_name, claimed_by="stop-operation")
+
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="hello")
+
+        assert result.outcome == REFUSED
+        assert result.reason_code == "session-effect-barrier"
+        assert executed == []
 
     def test_preflight_refusal_is_zero_bytes(self, monkeypatch):
         resolved = self._resolved()

@@ -200,9 +200,12 @@ def _verified_target():
 
 
 @pytest.fixture(autouse=True)
-def _isolated_state(monkeypatch, tmp_path):
+def _isolated_state(isolated_memory_db, monkeypatch, tmp_path):
     """Pane locks and wake-receipt sidecars follow the test state root."""
+    from cli_agent_orchestrator import constants
+
     monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
     from cli_agent_orchestrator.services import wake_receipts
 
     monkeypatch.setattr(wake_receipts, "WAKE_RECEIPT_DIR", tmp_path / "wake-receipts")
@@ -277,6 +280,27 @@ def _pane_held_elsewhere(pane_id=PANE):
 
 class TestV1SendInputCopyModeGuard:
     """G6 mechanism: exact-pane exit, then once-only payload+Enter."""
+
+    def test_stop_barrier_refuses_verified_input_before_copy_mode_or_payload(
+        self, v1_harness, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import operation_journal
+
+        events, make_tmux, make_backend, status_monitor = v1_harness
+        make_tmux(mode_reading=True)
+        make_backend()
+        update_last_active = MagicMock()
+        monkeypatch.setattr(terminal_service, "update_last_active", update_last_active)
+        operation_journal.claim_session_barrier(SESSION, claimed_by="stop-operation")
+
+        with pytest.raises(terminal_service.TerminalInputRefusedError) as exc_info:
+            terminal_service.send_input(TERMINAL, MESSAGE)
+
+        assert exc_info.value.reason_code == "session-effect-barrier"
+        assert events == []
+        status_monitor.notify_input_sent.assert_not_called()
+        status_monitor.clear_rolling_buffer.assert_not_called()
+        update_last_active.assert_not_called()
 
     def test_copy_mode_exit_then_payload_exactly_once(self, v1_harness):
         events, make_tmux, make_backend, status_monitor = v1_harness

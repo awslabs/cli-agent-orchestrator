@@ -340,6 +340,13 @@ class TestTerminalPluginEvents:
 class TestMessagePluginEvents:
     """Verify message delivery emits the correct event payloads."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_effect_admission(self, isolated_memory_db, monkeypatch, tmp_path):
+        from cli_agent_orchestrator import constants
+
+        monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
+        return isolated_memory_db
+
     @pytest.mark.parametrize("orchestration_type", ["send_message", "assign", "handoff"])
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.backends.registry._backend")

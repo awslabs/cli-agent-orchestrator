@@ -95,6 +95,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_PROTOCOL_MISMATCH,
     REASON_PROVIDER_UNSUPPORTED,
     REASON_REQUEST_REBOUND,
+    REASON_SESSION_EFFECT_BARRIER,
     REASON_STALE_GENERATION,
     REASON_SUBMISSION_UNPROVEN,
     REASON_UNKNOWN_TERMINAL,
@@ -1949,10 +1950,13 @@ def deliver_control_input(
         # sequence controls.  The generation fence is intentionally outer to
         # the pane lease: it spans final identity/readiness, journal claim,
         # every literal chunk, and submit/chord without a check-then-write gap.
-        from cli_agent_orchestrator.services import generation_fence
+        from cli_agent_orchestrator.services import cohort_journal, generation_fence
 
         assert binding.generation is not None
-        with provider_byte_admission(resolved, terminal_id, binding.generation):
+        with (
+            cohort_journal.session_effect_admission(resolved.session_name),
+            provider_byte_admission(resolved, terminal_id, binding.generation),
+        ):
             with pane_input_lease(resolved.pane_id, holder=holder, timeout=lease_timeout):
                 if normalized_events is not None:
                     return _deliver_sequence_under_lease(
@@ -1977,6 +1981,32 @@ def deliver_control_input(
                     resolved=resolved,
                     digest=digest,
                 )
+    except cohort_journal.SessionEffectRefused as exc:
+        if normalized_events is not None:
+            return _record_sequence_refusal(
+                book,
+                control_id,
+                REASON_SESSION_EFFECT_BARRIER,
+                str(exc),
+                events=normalized_events,
+                terminal_id=terminal_id,
+                resolved=resolved,
+                digest=digest,
+                request_schema_version=(
+                    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+                    if declared_command or declared_interactive
+                    else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+                ),
+            )
+        return _record_refusal(
+            book,
+            control_id,
+            REASON_SESSION_EFFECT_BARRIER,
+            str(exc),
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
     except generation_fence.FencedError as exc:
         if normalized_events is not None:
             return _record_sequence_refusal(
@@ -4690,10 +4720,11 @@ def deliver_native_inbox_payload(
     client = _tmux_client()
     deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
     try:
-        from cli_agent_orchestrator.services import generation_fence
+        from cli_agent_orchestrator.services import cohort_journal, generation_fence
 
         assert binding.generation is not None
         with (
+            cohort_journal.session_effect_admission(resolved.session_name),
             provider_byte_admission(resolved, terminal_id, binding.generation),
             pane_input_lease(
                 resolved.pane_id, holder=f"inbox-payload:{terminal_id}", timeout=lease_timeout
@@ -4838,6 +4869,8 @@ def deliver_native_inbox_payload(
                 chunks_sent=transport.chunks_sent,
                 enter_sent=True,
             )
+    except cohort_journal.SessionEffectRefused as exc:
+        return NativePayloadResult(REFUSED, REASON_SESSION_EFFECT_BARRIER, str(exc))
     except generation_fence.FencedError as exc:
         return NativePayloadResult(REFUSED, REASON_GENERATION_FENCED, str(exc))
     except PaneBusyError as exc:

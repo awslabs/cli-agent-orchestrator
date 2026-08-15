@@ -1269,6 +1269,7 @@ def deliver_inbox_via_bridge(
     bridge is unavailable — the caller then uses the ordinary delivery path
     and NO acknowledgement is inferred from it.
     """
+    from cli_agent_orchestrator.services import cohort_journal
     from cli_agent_orchestrator.services.managed_provider_bridge import request_bridge
 
     try:
@@ -1306,32 +1307,43 @@ def deliver_inbox_via_bridge(
             ):
                 return False
         reservation_id = identity["reservation_id"]
-        request_bridge(
-            reservation_id,
-            {
-                "bridge_version": "cao-native-provider-bridge-v1",
-                "op": "deliver",
-                "reservation_id": reservation_id,
-                "terminal_id": identity["terminal_id"],
-                "generation": identity["generation"],
-                "expected_provider": expected_provider,
-                "expected_provider_session_id": expected_provider_session_id,
-                "expected_execution_mode": expected_execution_mode,
-                "recovery_operation_key": recovery_operation_key,
-                "message_id": str(message_id),
-                "message": message,
-                "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
-                "sender_id": sender_id,
-                "sender_generation": sender_generation,
-                "message_created_at": (
-                    message_created_at.isoformat()
-                    if isinstance(message_created_at, datetime)
-                    else None
-                ),
-            },
-            timeout=30.0,
-        )
+        with cohort_journal.session_effect_admission(identity["session_name"]):
+            request_bridge(
+                reservation_id,
+                {
+                    "bridge_version": "cao-native-provider-bridge-v1",
+                    "op": "deliver",
+                    "reservation_id": reservation_id,
+                    "terminal_id": identity["terminal_id"],
+                    "generation": identity["generation"],
+                    "expected_provider": expected_provider,
+                    "expected_provider_session_id": expected_provider_session_id,
+                    "expected_execution_mode": expected_execution_mode,
+                    "recovery_operation_key": recovery_operation_key,
+                    "message_id": str(message_id),
+                    "message": message,
+                    "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    "sender_id": sender_id,
+                    "sender_generation": sender_generation,
+                    "message_created_at": (
+                        message_created_at.isoformat()
+                        if isinstance(message_created_at, datetime)
+                        else None
+                    ),
+                },
+                timeout=30.0,
+            )
         return True
+    except cohort_journal.SessionEffectRefused:
+        if recovery_operation_key:
+            from cli_agent_orchestrator.services import callback_recovery
+
+            callback_recovery.mark_delivery_refused(
+                recovery_operation_key,
+                reason_code="session-effect-barrier",
+                proven_before_provider_io=True,
+            )
+        return False
     except Exception as exc:  # noqa: BLE001 - preserve or terminalize by exact outcome
         detail = str(exc).lower()
         if recovery_operation_key and "w13-fenced-before-provider-io:" in detail:
@@ -1522,6 +1534,7 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
                     database.ManagedLaunchV2ReservationModel.reservation_id,
                     database.ManagedLaunchV2ReservationModel.terminal_id,
                     database.ManagedLaunchV2ReservationModel.generation,
+                    database.ManagedLaunchV2ReservationModel.session_name,
                     database.ManagedLaunchV2ReservationModel.provider,
                     database.ManagedLaunchV2ReservationModel.execution_mode,
                     database.ManagedLaunchV2ReservationModel.execution_mode_source,
@@ -1566,6 +1579,7 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
                 "reservation_id": str(row.reservation_id),
                 "terminal_id": str(row.terminal_id),
                 "generation": str(row.generation),
+                "session_name": str(row.session_name),
                 "provider": str(row.provider),
                 "execution_mode": em.ACP,
                 "state": str(row.state),
@@ -1577,6 +1591,7 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
                 "reservation_id": str(row_v2.reservation_id),
                 "terminal_id": str(row_v2.terminal_id),
                 "generation": str(row_v2.generation),
+                "session_name": str(row_v2.session_name),
                 "provider": str(row_v2.provider),
                 "state": str(row_v2.state),
                 "controllable": str(row_v2.state) == "admitted",
@@ -1602,6 +1617,7 @@ def begin_managed_session_operation(
     **payload: Any,
 ) -> dict[str, Any]:
     """Submit one semantic human control to the exact provider generation."""
+    from cli_agent_orchestrator.services import cohort_journal
     from cli_agent_orchestrator.services.managed_provider_bridge import request_bridge
 
     identity = managed_control_identity(terminal_id)
@@ -1615,14 +1631,6 @@ def begin_managed_session_operation(
         raise ManagedLaunchConflict("stale managed terminal generation")
     if not operation_id or not action:
         raise ManagedLaunchConflict("operation_id and action are required")
-    if action in {"follow-up", "compact"}:
-        # Managed bridge operations bypass terminal_service.send_input, so arm
-        # the same ready-to-processing transition explicitly before provider
-        # input. This lets a repaired generation leave a previously latched
-        # ERROR state when its next real turn begins.
-        from cli_agent_orchestrator.services.status_monitor import status_monitor
-
-        status_monitor.notify_input_sent(terminal_id)
     command = {
         "bridge_version": "cao-native-provider-bridge-v1",
         "op": "session.op.begin",
@@ -1634,7 +1642,16 @@ def begin_managed_session_operation(
         **payload,
     }
     try:
-        response = request_bridge(identity["reservation_id"], command, timeout=timeout)
+        with cohort_journal.session_effect_admission(identity["session_name"]):
+            if action in {"follow-up", "compact"}:
+                # Managed bridge operations bypass terminal_service.send_input,
+                # so arm ready-to-processing only after Stop admission.
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                status_monitor.notify_input_sent(terminal_id)
+            response = request_bridge(identity["reservation_id"], command, timeout=timeout)
+    except cohort_journal.SessionEffectRefused as exc:
+        raise ManagedLaunchConflict(str(exc)) from exc
     except Exception as exc:
         raise ManagedLaunchUnavailable(f"managed session control unavailable: {exc}") from exc
     receipt = response.get("receipt")

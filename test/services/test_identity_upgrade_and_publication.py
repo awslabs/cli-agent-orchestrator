@@ -764,6 +764,12 @@ class TestRegistrationAndNativeSession:
 
 
 class TestSpecialKeyIsIdentityBound:
+    @pytest.fixture(autouse=True)
+    def _isolated_effect_lock(self, monkeypatch, tmp_path):
+        from cli_agent_orchestrator import constants
+
+        monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
+
     def test_a_control_key_reaches_the_verified_pane(self, isolated_memory_db, backend):
         fake = backend({"%10": _pane()})
         database.create_terminal(

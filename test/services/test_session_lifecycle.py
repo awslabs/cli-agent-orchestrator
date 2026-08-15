@@ -666,6 +666,100 @@ class TestLifecycleWritesAreSerialized:
                     pass
 
 
+class TestEffectClaimsShareWhatWritesHoldExclusively:
+    """Effects linearize against lifecycle *writes*, not against each other.
+
+    ``session_effect_claim`` takes the write claim's lock file in shared mode.
+    Making it exclusive puts every provider/input effect for one session into a
+    single queue, so a second control arriving mid-write waits out the whole
+    write instead of getting the pane-busy refusal the boundary promises — and
+    is then typed after it.  Concurrent effects are arbitrated where they
+    actually collide, at the per-pane input lease.
+    """
+
+    def test_two_effects_on_one_session_admit_each_other(self):
+        import threading
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        first_in, release, second_in = (threading.Event() for _ in range(3))
+
+        def _first():
+            with callback_recovery.session_effect_claim(SESSION):
+                first_in.set()
+                release.wait(timeout=10)
+
+        def _second():
+            with callback_recovery.session_effect_claim(SESSION):
+                second_in.set()
+
+        holder = threading.Thread(target=_first)
+        holder.start()
+        assert first_in.wait(timeout=10)
+        contender = threading.Thread(target=_second)
+        contender.start()
+        contender.join(timeout=10)
+        try:
+            assert second_in.is_set(), "one session's effects were serialized into a queue"
+        finally:
+            release.set()
+            holder.join(timeout=10)
+
+    def test_a_lifecycle_write_waits_for_every_effect_to_drain(self):
+        """The Stop linearization the shared claim must not weaken."""
+        import threading
+
+        from cli_agent_orchestrator.services import callback_recovery
+
+        effect_in, release, write_in = (threading.Event() for _ in range(3))
+
+        def _effect():
+            with callback_recovery.session_effect_claim(SESSION):
+                effect_in.set()
+                release.wait(timeout=10)
+
+        def _write():
+            with callback_recovery.session_lifecycle_write_claim(SESSION):
+                write_in.set()
+
+        effect = threading.Thread(target=_effect)
+        effect.start()
+        assert effect_in.wait(timeout=10)
+        writer = threading.Thread(target=_write)
+        writer.start()
+        writer.join(timeout=2)
+        try:
+            assert writer.is_alive(), "a lifecycle write committed during an in-flight effect"
+            assert not write_in.is_set()
+        finally:
+            release.set()
+            effect.join(timeout=10)
+        writer.join(timeout=10)
+        assert write_in.is_set(), "the write never entered after the effect drained"
+
+    def test_upgrading_a_shared_hold_to_exclusive_is_refused_rather_than_deadlocking(self):
+        """Re-taking the same file exclusively on a second fd would wedge the
+        thread against itself, so the shared hold is not silently treated as an
+        exclusive one."""
+        from cli_agent_orchestrator.services import callback_recovery
+
+        with callback_recovery.session_effect_claim(SESSION):
+            with pytest.raises(RuntimeError, match="shared mode"):
+                with callback_recovery.session_lifecycle_write_claim(SESSION):
+                    pass
+
+    def test_a_shared_hold_still_admits_the_canonical_inner_generation_claim(self):
+        """Effects take terminal claims under the shared session hold; the
+        canonical-order guard must read the shared hold as outstanding."""
+        from cli_agent_orchestrator.services import callback_recovery
+
+        with callback_recovery.session_effect_claim(SESSION):
+            with callback_recovery.generation_lifecycle_claims(
+                (("term-1", "model-generation", "g1"),)
+            ):
+                pass  # accepted — "" sorts before every real terminal id
+
+
 class TestLifecycleWriteClaimIsCrossProcess:
     """The lifecycle write claim must serialize across processes (a flock), not
     just threads. A mutation probe swapping it for a process-local mutex would

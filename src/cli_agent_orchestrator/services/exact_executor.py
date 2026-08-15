@@ -1347,6 +1347,56 @@ def _classify_journal_conflict(
     return ExactExecutorRefused(str(exc))
 
 
+async def _reap_successor_after_stop(execution: _Execution) -> list[dict[str, Any]]:
+    """Best-effort exact cleanup when Stop wins after pane materialization.
+
+    M3-B cannot authorize any further effect after the session barrier, but
+    pane creation is an external atomic call: Stop can reap its first scan
+    while that call is still returning.  The losing executor therefore owns
+    one final query/reap of its immutable reservation before it records the
+    reconciliation outcome.  The import is local so M3-C can depend on M3-B
+    without creating a module-import cycle.
+    """
+
+    def _query_and_reap() -> tuple[bool, list[dict[str, Any]]]:
+        barrier = operation_journal.get_session_barrier(execution.request.session_name)
+        if not barrier or barrier.get("state") != operation_journal.BARRIER_CLAIMED:
+            return False, []
+        from cli_agent_orchestrator.services import cohort_effects
+
+        operation = operation_journal.get_operation(execution.request.operation_id)
+        return True, cohort_effects.reap_reincarnation_resources(operation)
+
+    try:
+        barrier_won, results = await asyncio.to_thread(_query_and_reap)
+        if not barrier_won:
+            return []
+        execution.evidence["stop_reap_digest"] = hashlib.sha256(
+            json.dumps(results, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return results
+    except Exception as exc:  # noqa: BLE001 - preserve the reconciliation write
+        # Cleanup/query failure is evidence for reconciliation, never a reason
+        # to skip recording that the late successor may exist.
+        execution.evidence["stop_reap_error_digest"] = hashlib.sha256(
+            f"{type(exc).__name__}:{exc}".encode("utf-8")
+        ).hexdigest()
+        return []
+
+
+def _stop_reap_observed(execution: _Execution) -> bool:
+    """Whether the Stop-winner cleanup attempt has a durable evidence carrier."""
+    return any(key in execution.evidence for key in ("stop_reap_digest", "stop_reap_error_digest"))
+
+
+def _stop_reap_reconciliation_detail(execution: _Execution, *, timing: str) -> str:
+    if "stop_reap_digest" in execution.evidence:
+        outcome = "the exact late successor was reaped"
+    else:
+        outcome = "exact late-successor cleanup failed and remains reconciliation-owned"
+    return f"the Stop barrier won {timing}; {outcome}"
+
+
 async def execute(
     request: operation_journal.OperationRequest,
     *,
@@ -1707,6 +1757,8 @@ async def _execute_locked(
                 "exists, is not bound, and is not admitted — reconciliation owns it"
             )
             execution.evidence["successor_pane"] = window
+            if "stop_reap_digest" not in execution.evidence:
+                await _reap_successor_after_stop(execution)
             execution.record_reconciliation(detail)
             raise ExactExecutorReconciliation(detail) from exc
         except (
@@ -1945,6 +1997,100 @@ async def _launch_successor(
     *,
     concurrent_retry: bool = False,
 ) -> dict[str, Any]:
+    """Observe the whole blocking launch through caller cancellation.
+
+    Cancelling an ``asyncio.to_thread`` await does not stop its worker.  Keep
+    the launch/effect handler in a shielded child task so a cancelled caller
+    cannot return while that worker may still materialize the reserved pane.
+    The child reaches its normal durable accept/refuse/reconcile path first;
+    any Stop-winner exact reap therefore finishes before cancellation is
+    re-raised to the caller.
+    """
+    launch = asyncio.create_task(
+        _launch_successor_effect(
+            execution,
+            contract,
+            successor_terminal_id,
+            successor_generation,
+            window,
+            concurrent_retry=concurrent_retry,
+        )
+    )
+    try:
+        return await asyncio.shield(launch)
+    except asyncio.CancelledError:
+        while not launch.done():
+            try:
+                await asyncio.shield(launch)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if launch.done():
+            try:
+                launch.result()
+            except (asyncio.CancelledError, Exception):
+                # The child already recorded its durable outcome and any
+                # Stop-winner cleanup; caller cancellation remains primary.
+                pass
+        raise
+
+
+async def _launch_successor_effect(
+    execution: _Execution,
+    contract: restore_contract.RestoreContract,
+    successor_terminal_id: str,
+    successor_generation: str,
+    window: str,
+    *,
+    concurrent_retry: bool = False,
+) -> dict[str, Any]:
+    """Enforce Stop cleanup on every exit after the pane boundary."""
+    try:
+        outcome = await _launch_successor_effect_inner(
+            execution,
+            contract,
+            successor_terminal_id,
+            successor_generation,
+            window,
+            concurrent_retry=concurrent_retry,
+        )
+    except BaseException as exc:  # noqa: BLE001 - cleanup precedes every re-raised exit
+        if execution.successor_physical:
+            if "stop_reap_digest" not in execution.evidence:
+                await _reap_successor_after_stop(execution)
+            if _stop_reap_observed(execution) and not isinstance(
+                exc, (ExactExecutorReconciliation, _AdoptedAccepted)
+            ):
+                detail = _stop_reap_reconciliation_detail(
+                    execution,
+                    timing="while the successor launch was post-physical",
+                )
+                execution.record_reconciliation(detail)
+                if not isinstance(exc, asyncio.CancelledError):
+                    raise ExactExecutorReconciliation(detail) from exc
+        raise
+    if execution.successor_physical:
+        await _reap_successor_after_stop(execution)
+        if _stop_reap_observed(execution):
+            detail = _stop_reap_reconciliation_detail(
+                execution,
+                timing="after successor publication but before final bind",
+            )
+            execution.record_reconciliation(detail)
+            raise ExactExecutorReconciliation(detail)
+    return outcome
+
+
+async def _launch_successor_effect_inner(
+    execution: _Execution,
+    contract: restore_contract.RestoreContract,
+    successor_terminal_id: str,
+    successor_generation: str,
+    window: str,
+    *,
+    concurrent_retry: bool = False,
+) -> dict[str, Any]:
     """Acquire, create, launch, and verify — through ``start(resume)``.
 
     The launch's authorize callback is the pre-effect linearization
@@ -2121,6 +2267,7 @@ async def _launch_successor(
             "durably reconciliation-required"
         )
         execution.evidence["successor_pane"] = window
+        await _reap_successor_after_stop(execution)
         execution.record_reconciliation(detail)
         raise ExactExecutorReconciliation(detail) from exc
     except native_tui_launch.NativeLaunchConflict as exc:
@@ -2141,6 +2288,7 @@ async def _launch_successor(
                 "reconciliation owns the successor pane"
             )
             execution.evidence["successor_pane"] = window
+            await _reap_successor_after_stop(execution)
             execution.record_reconciliation(detail)
             raise ExactExecutorReconciliation(detail) from exc
         execution.record_refused(str(exc))
@@ -2164,6 +2312,7 @@ async def _launch_successor(
         refusal = _classify_journal_conflict(execution, exc)
         if isinstance(refusal, ExactExecutorReconciliation):
             execution.evidence["successor_pane"] = window
+            await _reap_successor_after_stop(execution)
             execution.record_reconciliation(str(refusal))
         else:
             execution.record_refused(str(refusal))
