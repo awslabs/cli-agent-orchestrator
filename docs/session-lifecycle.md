@@ -7,13 +7,14 @@ because every declared state is a suppressor for the recovery path.
 
 Status: phased. The lifecycle storage, the HTTP/CLI routes, and the
 row-preserving stop/archive collection described here are **implemented**
-(by this work). M3-C C1 also implements the **dark cohort journal** described
+(by this work). M3-C C1-C2 also implements the **dark cohort service** described
 in §4.3: exact lifecycle/roster boundary claims, member snapshots, receipted
-state transitions, and read-only HTTP projections. The new safe/force
-Pause/Stop/Resume effects and controls remain deferred. The legacy stop route
-therefore behaves exactly as documented in §4.0, and importing or reading the
-new journal cannot claim a Stop barrier or touch a pane. Fire Marshal cutover
-also remains deferred.
+state transitions, atomic Stop-barrier entry, paired terminal lifecycle commits,
+and read-only HTTP projections. Public safe/force Pause/Stop/Resume controls and
+physical effects remain deferred. The legacy stop route therefore behaves
+exactly as documented in §4.0. No public route invokes the C2 mutation seams;
+importing or reading the journal cannot claim a Stop barrier or touch a pane.
+Fire Marshal cutover also remains deferred.
 
 ---
 
@@ -246,7 +247,7 @@ at, and what the system could still see, under a schema distinct from the
 machine proof. Resuming past a live owner stays refused; resuming past an
 *unresponsive* one is possible, deliberately, with a name attached.
 
-### 4.3 Dark M3-C cohort journal (C1)
+### 4.3 Dark M3-C cohort service (C1-C2)
 
 The fleet lifecycle needs a durable whole-cohort record before safe/force
 effects can be made retryable. C1 adds three additive tables:
@@ -265,22 +266,38 @@ effects can be made retryable. C1 adds three additive tables:
 
 The closed state vocabulary is `preparing`, `draining-to-boundary`,
 `interrupting`, `tearing-down`, `paused`, `stopped`, `restoring`,
-`reconciliation-required`, and `settled`. C1 implements only the Pause/Stop
-journal paths needed by its schema slice. In particular, its journal-only
-transition function cannot enter terminal `paused` or `stopped`: a later slice
-must add a paired function that advances the session lifecycle epoch and
-terminal cohort state atomically. A retry out of `reconciliation-required`
-requires a receipt, and a safe-to-force recovery from that state remains the
-distinct receipted promotion path. C1 intentionally exposes no mutation route
-and performs no lifecycle, Stop-barrier, tmux, provider, wait-runner, inbox, or
-conductor effect. Read projections are available at
+`reconciliation-required`, and `settled`. The generic transition function
+cannot enter Stop teardown or terminal `paused`/`stopped` states. C2 adds two
+paired database primitives instead:
+
+- `begin_stop_teardown` revalidates the exact lifecycle epoch, lifecycle value,
+  roster revision, and member snapshot before atomically claiming the M3-B
+  barrier and appending the `tearing-down` transition. A still-safe Stop
+  requires an opaque M3-D drain receipt. Safe-to-force promotion instead
+  requires its own explicit promotion receipt and is recorded in that same
+  barrier-paired transition; force Stop never waits for provider I/O here.
+- `commit_terminal` accepts an opaque execution receipt, verifies every
+  included member has an allowed terminal result, and atomically advances the
+  cohort and declared lifecycle to `paused` or `stopped`. Stop additionally
+  requires the exact barrier owned by that operation. A failed CAS rolls the
+  lifecycle write back with the cohort write; terminal member evidence cannot
+  later be rewritten, while exact response-loss replay still adopts. For safe
+  Pause, members that were already idle or parked at the boundary are terminal
+  alongside members explicitly drained by M3-D; they need no synthetic drain
+  transition or needless work.
+
+Caller-owned transactions stay rollback-capable even under SQLite's lazy
+transaction behavior. A retry out of `reconciliation-required` still requires
+a receipt, and safe-to-force recovery remains a distinct receipted path. C2
+intentionally exposes no public mutation route and performs no tmux, provider,
+wait-runner, inbox, or conductor effect. Read projections are available at
 `GET /cohort-operations/{operation_id}` and
 `GET /sessions/{session_name}/cohort-operations` without consulting tmux.
 
-Later M3-C slices consume this journal to pair each recorded transition with
-the matching physical and lifecycle effect, then add operator-only partial
-Resume. M3-D remains the sole task-occurrence and supervisor-drain authority;
-C1 does not infer task meaning from CAO's physical roster.
+Later M3-C slices consume this service to perform and reconcile each physical
+effect, then add operator-only partial Resume. M3-D remains the sole
+task-occurrence and supervisor-drain authority; C2 treats its receipt as opaque
+and does not infer task meaning from CAO's physical roster.
 
 ---
 

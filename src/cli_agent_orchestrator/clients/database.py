@@ -1114,16 +1114,17 @@ class SessionEffectBarrierModel(Base):
 
 
 class SessionCohortOperationModel(Base):
-    """One durable fleet lifecycle cohort operation (cond-0379 C1).
+    """One durable fleet lifecycle cohort operation (cond-0379 C1-C2).
 
     The row is the fork-owned, tmux-independent truth for a whole-fleet
     lifecycle operation. Its immutable request binds the exact session
-    lifecycle epoch and an opaque revision of the stable-agent roster. C1
-    admits Pause/Stop claims; the nullable source/target carriers reserve the
-    accepted later operator-Resume extension. The mutable
+    lifecycle epoch and an opaque revision of the stable-agent roster. The
+    current slices admit Pause/Stop claims; the nullable source/target carriers
+    reserve the accepted later operator-Resume extension. The mutable
     ``state``/``state_epoch`` pair is advanced only through the cohort
-    journal's closed transition vocabulary. C1 deliberately performs no
-    lifecycle, barrier, tmux, provider, wait-runner, or conductor effects.
+    journal's closed transition vocabulary. C2 pairs Stop teardown with the
+    session barrier and terminal cohort state with the lifecycle row, but
+    deliberately performs no tmux, provider, wait-runner, or conductor effect.
     """
 
     __tablename__ = "session_cohort_operations"
@@ -1172,8 +1173,9 @@ class SessionCohortMemberModel(Base):
     Every stable agent in the session is retained in the snapshot. Agents
     already dormant/retired are marked excluded rather than erased, so fleet
     Resume cannot silently resurrect them while an operator can still see why
-    they were outside the Stop cohort. Result/evidence columns are nullable C1
-    carriers for later safe-drain, interrupt, teardown, and restore slices.
+    they were outside the Stop cohort. Result/evidence columns are bounded
+    carriers for safe-drain, interrupt, teardown, and restore slices; C2 makes
+    them immutable once their cohort reaches a terminal state.
     """
 
     __tablename__ = "session_cohort_members"

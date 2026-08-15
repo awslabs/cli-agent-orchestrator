@@ -1,12 +1,14 @@
-"""Dark durable cohort journal for fleet Pause/Stop (cond-0379 C1).
+"""Dark durable cohort journal for fleet Pause/Stop (cond-0379 C1-C2).
 
-C1 records the closed cohort boundary that later M3-C slices will execute. It
-does not claim the M3-B Stop barrier, change ``session_lifecycle``, touch tmux or
-a provider, interrupt a worker, terminate a wait, or send conductor input.
-Shipping this module therefore cannot activate Pause/Stop merely because a
-server imports it.
+C1 records the closed cohort boundary that later M3-C slices execute. C2 adds
+the two database-only atomic seams that execution needs: Stop enters teardown
+in the same transaction that claims the M3-B barrier, and a proven terminal
+cohort commits ``session_lifecycle`` in the same transaction as its terminal
+state. Neither seam touches tmux or a provider, interrupts a worker, terminates
+a wait, or sends conductor input. No public mutation route invokes them yet,
+so importing or reading this module cannot activate Pause/Stop.
 
-The journal provides four integrity seams:
+The journal provides six integrity seams:
 
 * ``observe_boundary`` returns the exact declared lifecycle epoch, an opaque
   digest of the sorted stable-agent id/revision vector, and a digest-bound
@@ -20,15 +22,23 @@ The journal provides four integrity seams:
 * ``transition_operation`` advances a closed, action-specific state machine by
   state-epoch CAS. Safe never becomes force implicitly: promotion requires an
   explicit flag and receipt digest and is preserved as an append-only
-  transition. C1 cannot enter terminal ``paused``/``stopped`` through this
-  journal-only function; the later executor must pair those states atomically
-  with the corresponding session-lifecycle CAS.
+  transition. The generic path cannot enter Stop teardown or terminal
+  ``paused``/``stopped`` states.
+* ``begin_stop_teardown`` atomically revalidates the exact lifecycle/roster
+  boundary, claims the M3-B Stop barrier for this operation, and appends the
+  teardown transition. Safe Stop requires the opaque M3-D receipt; explicit
+  safe-to-force promotion stays visible and receipted.
+* ``commit_terminal`` validates the bounded member result set and atomically
+  commits the cohort plus declared session lifecycle to ``paused``/``stopped``.
+  Stop additionally requires the exact operation-owned barrier. Terminal
+  member evidence is immutable except for exact response-loss replay.
 * ``record_member_result`` CAS-records the bounded per-member evidence carriers
   named by the accepted design. It stores references/digests and concise
   outcomes, never task text, provider output, environment values, or secrets.
 
-All mutation is short SQLite work. No transaction or Python lock crosses
-future provider, tmux, network, or conductor I/O.
+All mutation is short SQLite work. Caller-owned transactions remain caller
+owned, including on SQLite's lazy transaction driver. No transaction or Python
+lock crosses future provider, tmux, network, or conductor I/O.
 """
 
 from __future__ import annotations
@@ -42,10 +52,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sqlalchemy import exists as sa_exists
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.services import operation_journal as oj
 from cli_agent_orchestrator.services import session_lifecycle as sl
 from cli_agent_orchestrator.services import stable_agent_roster as roster
 
@@ -123,6 +135,12 @@ LOSS_POSSIBLE = "possible"
 LOSS_KNOWN = "known"
 BACKGROUND_LOSS_RISKS = frozenset({LOSS_UNKNOWN, LOSS_NONE, LOSS_POSSIBLE, LOSS_KNOWN})
 
+PAUSE_TERMINAL_MEMBER_STATES = {
+    MODE_SAFE: frozenset({FINAL_DRAINED, FINAL_ALREADY_IDLE, FINAL_PARKED}),
+    MODE_FORCE: frozenset({FINAL_INTERRUPTED, FINAL_ALREADY_IDLE, FINAL_PARKED, FINAL_EXITED}),
+}
+STOP_TERMINAL_MEMBER_STATES = frozenset({FINAL_STOPPED, FINAL_EXITED, FINAL_UNRESUMABLE})
+
 MAX_TEXT_LEN = 512
 MAX_DETAIL_LEN = 2000
 MAX_SESSION_LEN = 128
@@ -159,6 +177,24 @@ def _canonical_json(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _anchor_caller_transaction(db: Any) -> None:
+    """Ensure SQLite has a physical outer transaction before a savepoint.
+
+    SQLAlchemy's Session transaction is lazy on SQLite. If ``begin_nested`` is
+    the first statement, SQLite treats that SAVEPOINT as the outer transaction
+    and RELEASE commits it, so the caller's later rollback cannot undo the
+    journal write. An explicit deferred BEGIN only when the DB-API connection
+    is not already in a transaction preserves the caller-owned boundary. Other
+    dialects already give a nested transaction a real outer transaction.
+    """
+    connection = db.connection()
+    if connection.dialect.name != "sqlite":
+        return
+    driver_connection = connection.connection.driver_connection
+    if not driver_connection.in_transaction:
+        connection.exec_driver_sql("BEGIN")
 
 
 def _parse_json(raw: Optional[str]) -> Optional[Any]:
@@ -296,8 +332,8 @@ def _member_snapshot(db: Any, agent: Any) -> dict[str, Any]:
         "restore_contract_digest": (
             restore_contract.contract_digest if restore_contract is not None else None
         ),
-        # M3-D is the sole task-occurrence/boundary authority. C1 carries the
-        # fields truthfully empty until that integration records its receipt.
+        # M3-D is the sole task-occurrence/boundary authority. The journal
+        # carries these fields truthfully empty until M3-D records its receipt.
         "task_occurrence_id": None,
         "boundary_digest": None,
         "report_digest": None,
@@ -413,7 +449,8 @@ class OperationRequest:
         )
         if self.source_operation_id is not None or self.resume_target is not None:
             raise CohortJournalInvalid(
-                "C1 claims Pause/Stop boundaries only; Resume source/target fields must be absent"
+                "this slice claims Pause/Stop boundaries only; Resume source/target fields "
+                "must be absent"
             )
 
     def payload(self) -> dict[str, Any]:
@@ -575,8 +612,13 @@ def _claim_once(db: Any, request: OperationRequest) -> dict[str, Any]:
         )
     if request.lifecycle_observation == sl.STOPPED:
         raise CohortJournalConflict(
-            f"session {request.session_name} is already stopped; C1 admits only a new "
+            f"session {request.session_name} is already stopped; this slice admits only a new "
             "Pause/Stop boundary, not Resume"
+        )
+    if request.operation_kind == KIND_PAUSE and request.lifecycle_observation == sl.PAUSED:
+        raise CohortJournalConflict(
+            f"session {request.session_name} is already paused; "
+            "there is no working fleet to pause again"
         )
     if request.operation_kind == KIND_PAUSE and request.lifecycle_observation == sl.COMPLETE:
         raise CohortJournalConflict(
@@ -658,6 +700,7 @@ def claim_operation(request: OperationRequest, db: Any = None) -> dict[str, Any]
         )
     if db is not None:
         try:
+            _anchor_caller_transaction(db)
             with db.begin_nested():
                 return _claim_once(db, request)
         except (IntegrityError, OperationalError) as exc:
@@ -742,30 +785,29 @@ def _allowed_target(operation_kind: str, current_mode: str, state: str) -> froze
         if state == STATE_PREPARING:
             return frozenset({STATE_DRAINING if current_mode == MODE_SAFE else STATE_INTERRUPTING})
         if state in {STATE_DRAINING, STATE_INTERRUPTING}:
-            # C1 cannot record journal-only completion. A later executor must
-            # add the paired lifecycle-CAS function that commits ``paused`` in
-            # the same transaction as the terminal cohort state.
+            # The generic path cannot record journal-only completion. C2's
+            # paired lifecycle-CAS function owns terminal commit.
             return frozenset({STATE_RECONCILIATION_REQUIRED})
         if state == STATE_RECONCILIATION_REQUIRED:
             return frozenset({STATE_DRAINING if current_mode == MODE_SAFE else STATE_INTERRUPTING})
         return frozenset()
     if operation_kind == KIND_STOP:
         if state == STATE_PREPARING:
-            return frozenset({STATE_DRAINING if current_mode == MODE_SAFE else STATE_TEARING_DOWN})
+            # Entering teardown is Stop's linearization point and must claim
+            # the M3-B barrier in the same transaction. The paired C2 entry
+            # point owns that transition; the generic journal path may only
+            # begin a safe drain.
+            return frozenset({STATE_DRAINING}) if current_mode == MODE_SAFE else frozenset()
         if state == STATE_DRAINING:
-            return frozenset({STATE_TEARING_DOWN, STATE_RECONCILIATION_REQUIRED})
+            return frozenset({STATE_RECONCILIATION_REQUIRED})
         if state == STATE_TEARING_DOWN:
-            # As above, C1 never records ``stopped`` without the later paired
-            # lifecycle/barrier commit.
+            # As above, the generic path never records ``stopped`` without
+            # C2's paired lifecycle/barrier commit.
             return frozenset({STATE_RECONCILIATION_REQUIRED})
         if state == STATE_RECONCILIATION_REQUIRED:
             if current_mode == MODE_SAFE:
-                # A safe-stop reconciliation may have been entered while
-                # draining or while tearing down after a valid drain receipt.
-                # The retry receipt disambiguates the operator/supervisor's
-                # chosen continuation; force promotion stays a distinct path.
-                return frozenset({STATE_DRAINING, STATE_TEARING_DOWN})
-            return frozenset({STATE_TEARING_DOWN})
+                return frozenset({STATE_DRAINING})
+            return frozenset()
     return frozenset()
 
 
@@ -830,6 +872,11 @@ def _transition_once(db: Any, request: TransitionRequest) -> dict[str, Any]:
         if request.to_state != expected_target:
             raise CohortJournalConflict(
                 f"safe {operation.operation_kind} promotion must move to " f"{expected_target!r}"
+            )
+        if operation.operation_kind == KIND_STOP:
+            raise CohortJournalConflict(
+                "safe Stop promotion must use begin_stop_teardown(); entering teardown and "
+                "claiming the Stop barrier are one atomic transition"
             )
         to_mode = MODE_FORCE
     else:
@@ -898,6 +945,7 @@ def transition_operation(request: TransitionRequest, db: Any = None) -> dict[str
         )
     if db is not None:
         try:
+            _anchor_caller_transaction(db)
             with db.begin_nested():
                 return _transition_once(db, request)
         except (IntegrityError, OperationalError) as exc:
@@ -914,6 +962,284 @@ def transition_operation(request: TransitionRequest, db: Any = None) -> dict[str
             raise CohortJournalUnavailable(
                 f"concurrent cohort transition refused; retry by reading the winner: {exc}"
             ) from exc
+
+
+@dataclass(frozen=True)
+class StopTeardownRequest:
+    """Enter Stop teardown while atomically claiming the M3-B barrier.
+
+    Safe Stop supplies the M3-D drain receipt. A safe-to-force promotion is
+    explicit and uses the same receipt-bearing transition rather than changing
+    mode as a side effect of timeout or retry. Force Stop starts directly from
+    ``preparing`` and never waits for provider I/O.
+    """
+
+    transition_id: str
+    operation_id: str
+    expected_state_epoch: int
+    actor: str
+    reason: Optional[str] = None
+    receipt_digest: Optional[str] = None
+    promote_to_force: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "transition_id", _require_uuid(self.transition_id, field="transition_id")
+        )
+        object.__setattr__(
+            self, "operation_id", _require_uuid(self.operation_id, field="operation_id")
+        )
+        _non_negative_int(self.expected_state_epoch, field="expected_state_epoch")
+        object.__setattr__(self, "actor", _require_text(self.actor, field="actor"))
+        object.__setattr__(self, "reason", _optional_text(self.reason, field="reason"))
+        object.__setattr__(
+            self,
+            "receipt_digest",
+            _optional_digest(self.receipt_digest, field="receipt_digest"),
+        )
+        if not isinstance(self.promote_to_force, bool):
+            raise CohortJournalInvalid("promote_to_force must be a boolean")
+        if self.promote_to_force and self.receipt_digest is None:
+            raise CohortJournalInvalid(
+                "an explicit safe-to-force Stop promotion requires a receipt_digest"
+            )
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "transition_id": self.transition_id,
+            "operation_id": self.operation_id,
+            "expected_state_epoch": self.expected_state_epoch,
+            "to_state": STATE_TEARING_DOWN,
+            "actor": self.actor,
+            "reason": self.reason,
+            "receipt_digest": self.receipt_digest,
+            "promote_to_force": self.promote_to_force,
+            "paired_effect": "claim-stop-barrier",
+        }
+
+    @property
+    def transition_digest(self) -> str:
+        return _digest(self.payload())
+
+
+def _claim_exact_stop_barrier(
+    db: Any, operation: Any, request: StopTeardownRequest
+) -> dict[str, Any]:
+    try:
+        barrier = oj.claim_session_barrier(
+            operation.session_name,
+            claimed_by=operation.operation_id,
+            reason=request.reason or f"{operation.current_mode} cohort Stop",
+            db=db,
+        )
+    except oj.OperationJournalInvalid as exc:
+        raise CohortJournalInvalid(str(exc)) from exc
+    except oj.OperationJournalConflict as exc:
+        raise CohortJournalConflict(str(exc)) from exc
+    except oj.OperationJournalError as exc:
+        raise CohortJournalUnavailable(str(exc)) from exc
+    return _require_exact_stop_barrier(operation, barrier)
+
+
+def _require_exact_stop_barrier(
+    operation: Any, barrier: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    if barrier is None or barrier["state"] != oj.BARRIER_CLAIMED:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} Stop barrier is not durably claimed"
+        )
+    if barrier["claimed_by"] != operation.operation_id:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} Stop barrier was claimed by "
+            f"{barrier['claimed_by']!r}, not cohort operation {operation.operation_id}"
+        )
+    return barrier
+
+
+def _begin_stop_teardown_once(db: Any, request: StopTeardownRequest) -> dict[str, Any]:
+    existing = (
+        db.query(database.SessionCohortTransitionModel)
+        .filter(database.SessionCohortTransitionModel.transition_id == request.transition_id)
+        .one_or_none()
+    )
+    if existing is not None:
+        if existing.transition_digest != request.transition_digest:
+            raise CohortJournalConflict(
+                f"cohort transition {request.transition_id} already exists with different "
+                "immutable request content"
+            )
+        operation = _operation_by_id(db, request.operation_id)
+        if operation is None:
+            raise CohortJournalNotFound(
+                f"cohort transition {request.transition_id} references missing operation "
+                f"{request.operation_id}"
+            )
+        barrier = _require_exact_stop_barrier(
+            operation,
+            oj.get_session_barrier(operation.session_name, db=db),
+        )
+        return {
+            "transition": _transition_dict(existing),
+            "operation": _operation_dict(operation),
+            "barrier": barrier,
+            "adopted": True,
+        }
+
+    operation = _operation_by_id(db, request.operation_id)
+    if operation is None:
+        raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
+    if operation.operation_kind != KIND_STOP:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} is {operation.operation_kind!r}, not Stop"
+        )
+    if int(operation.state_epoch or 0) != request.expected_state_epoch:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} moved to state epoch "
+            f"{operation.state_epoch}; expected {request.expected_state_epoch}"
+        )
+
+    from_state = operation.state
+    from_mode = operation.current_mode
+    to_mode = from_mode
+    if from_mode == MODE_SAFE:
+        if from_state not in {STATE_DRAINING, STATE_RECONCILIATION_REQUIRED}:
+            raise CohortJournalConflict(
+                f"safe Stop teardown must start from {STATE_DRAINING!r} or "
+                f"{STATE_RECONCILIATION_REQUIRED!r}; got {from_state!r}"
+            )
+        if not request.promote_to_force and request.receipt_digest is None:
+            raise CohortJournalConflict(
+                "safe Stop teardown requires the exact M3-D drain receipt_digest"
+            )
+        if request.promote_to_force:
+            to_mode = MODE_FORCE
+    elif from_mode == MODE_FORCE:
+        if request.promote_to_force:
+            raise CohortJournalConflict("a force Stop cannot be promoted to force again")
+        if from_state not in {STATE_PREPARING, STATE_RECONCILIATION_REQUIRED}:
+            raise CohortJournalConflict(
+                f"force Stop teardown must start from {STATE_PREPARING!r} or "
+                f"{STATE_RECONCILIATION_REQUIRED!r}; got {from_state!r}"
+            )
+    else:  # pragma: no cover - persisted rows are validated at claim
+        raise CohortJournalConflict(f"unknown cohort mode {from_mode!r}")
+
+    boundary = _observe_boundary(db, operation.session_name)
+    mismatches = {
+        field: {"observed": boundary[field], "claimed": getattr(operation, field)}
+        for field in (
+            "lifecycle_epoch",
+            "lifecycle_observation",
+            "roster_revision",
+            "member_snapshot_digest",
+        )
+        if boundary[field] != getattr(operation, field)
+    }
+    if mismatches:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} moved before Stop teardown: {mismatches}"
+        )
+
+    barrier = _claim_exact_stop_barrier(db, operation, request)
+    stamp = _now()
+    result = db.execute(
+        sa_update(database.SessionCohortOperationModel)
+        .where(
+            database.SessionCohortOperationModel.operation_id == request.operation_id,
+            database.SessionCohortOperationModel.state_epoch == request.expected_state_epoch,
+            database.SessionCohortOperationModel.state == from_state,
+            database.SessionCohortOperationModel.current_mode == from_mode,
+        )
+        .values(
+            state=STATE_TEARING_DOWN,
+            current_mode=to_mode,
+            state_epoch=request.expected_state_epoch + 1,
+            updated_at=stamp,
+        )
+    )
+    if result.rowcount != 1:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} moved concurrently; retry by reading "
+            "the durable operation and Stop barrier"
+        )
+    transition = database.SessionCohortTransitionModel(
+        transition_id=request.transition_id,
+        operation_id=request.operation_id,
+        transition_digest=request.transition_digest,
+        transition_json=_canonical_json(request.payload()),
+        from_state=from_state,
+        to_state=STATE_TEARING_DOWN,
+        from_mode=from_mode,
+        to_mode=to_mode,
+        from_state_epoch=request.expected_state_epoch,
+        actor=request.actor,
+        reason=request.reason,
+        receipt_digest=request.receipt_digest,
+        created_at=stamp,
+    )
+    db.add(transition)
+    db.flush()
+    db.refresh(operation)
+    return {
+        "transition": _transition_dict(transition),
+        "operation": _operation_dict(operation),
+        "barrier": barrier,
+        "adopted": False,
+    }
+
+
+def begin_stop_teardown(request: StopTeardownRequest, db: Any = None) -> dict[str, Any]:
+    """Atomically enter Stop teardown and claim the exact M3-B barrier.
+
+    This is a short database transaction. It performs no provider, tmux,
+    wait-runner, inbox, lifecycle-terminal, or conductor effect.
+    """
+    if not isinstance(request, StopTeardownRequest):
+        raise CohortJournalInvalid(
+            f"request must be a StopTeardownRequest; got {type(request).__name__}"
+        )
+    from cli_agent_orchestrator.services.callback_recovery import (
+        session_lifecycle_write_claim,
+    )
+
+    def _run(session: Any) -> dict[str, Any]:
+        operation = _operation_by_id(session, request.operation_id)
+        if operation is None:
+            raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
+        with session_lifecycle_write_claim(operation.session_name):
+            return _begin_stop_teardown_once(session, request)
+
+    if db is not None:
+        try:
+            _anchor_caller_transaction(db)
+            with db.begin_nested():
+                return _run(db)
+        except CohortJournalError:
+            raise
+        except (IntegrityError, OperationalError) as exc:
+            raise CohortJournalUnavailable(
+                f"concurrent Stop-barrier transition refused; roll back and retry: {exc}"
+            ) from exc
+
+    last_error: Optional[BaseException] = None
+    for _attempt in range(5):
+        try:
+            with database.SessionLocal() as session:
+                result = _run(session)
+                session.commit()
+                return result
+        except CohortJournalUnavailable as exc:
+            last_error = exc
+            time.sleep(0.05)
+        except CohortJournalError:
+            raise
+        except (IntegrityError, OperationalError) as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise CohortJournalUnavailable(
+        f"concurrent Stop-barrier transitions kept conflicting; refusing after retry: "
+        f"{last_error}"
+    )
 
 
 @dataclass(frozen=True)
@@ -1009,6 +1335,11 @@ def _record_member_result_once(db: Any, request: MemberResult) -> dict[str, Any]
         record = _member_dict(member)
         record["adopted"] = True
         return record
+    if operation.state in {STATE_PAUSED, STATE_STOPPED, STATE_SETTLED}:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} is terminal in state "
+            f"{operation.state!r}; its member evidence is immutable"
+        )
     if int(member.result_revision or 0) != request.expected_result_revision:
         raise CohortJournalConflict(
             f"cohort member {request.agent_id} moved to result revision "
@@ -1035,6 +1366,11 @@ def _record_member_result_once(db: Any, request: MemberResult) -> dict[str, Any]
             database.SessionCohortMemberModel.operation_id == request.operation_id,
             database.SessionCohortMemberModel.agent_id == request.agent_id,
             database.SessionCohortMemberModel.result_revision == request.expected_result_revision,
+            sa_exists().where(
+                database.SessionCohortOperationModel.operation_id == request.operation_id,
+                database.SessionCohortOperationModel.state == operation.state,
+                database.SessionCohortOperationModel.state_epoch == int(operation.state_epoch or 0),
+            ),
         )
         .values(
             **values,
@@ -1058,6 +1394,7 @@ def record_member_result(request: MemberResult, db: Any = None) -> dict[str, Any
         raise CohortJournalInvalid(f"request must be a MemberResult; got {type(request).__name__}")
     if db is not None:
         try:
+            _anchor_caller_transaction(db)
             with db.begin_nested():
                 return _record_member_result_once(db, request)
         except (IntegrityError, OperationalError) as exc:
@@ -1074,6 +1411,337 @@ def record_member_result(request: MemberResult, db: Any = None) -> dict[str, Any
             raise CohortJournalUnavailable(
                 f"concurrent cohort member write refused; read and retry: {exc}"
             ) from exc
+
+
+@dataclass(frozen=True)
+class TerminalCommitRequest:
+    """Commit one cohort and its declared session lifecycle atomically."""
+
+    transition_id: str
+    operation_id: str
+    expected_state_epoch: int
+    actor: str
+    receipt_digest: str
+    reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "transition_id", _require_uuid(self.transition_id, field="transition_id")
+        )
+        object.__setattr__(
+            self, "operation_id", _require_uuid(self.operation_id, field="operation_id")
+        )
+        _non_negative_int(self.expected_state_epoch, field="expected_state_epoch")
+        object.__setattr__(self, "actor", _require_text(self.actor, field="actor"))
+        object.__setattr__(
+            self,
+            "receipt_digest",
+            _require_digest(self.receipt_digest, field="receipt_digest"),
+        )
+        object.__setattr__(self, "reason", _optional_text(self.reason, field="reason"))
+
+    def payload(self, *, to_state: str) -> dict[str, Any]:
+        return {
+            "transition_id": self.transition_id,
+            "operation_id": self.operation_id,
+            "expected_state_epoch": self.expected_state_epoch,
+            "to_state": to_state,
+            "actor": self.actor,
+            "reason": self.reason,
+            "receipt_digest": self.receipt_digest,
+            "paired_effect": "commit-session-lifecycle",
+        }
+
+    def transition_digest(self, *, to_state: str) -> str:
+        return _digest(self.payload(to_state=to_state))
+
+
+def _lifecycle_row_dict(row: Any) -> dict[str, Any]:
+    return {
+        "session_name": row.session_name,
+        "lifecycle": row.lifecycle,
+        "restore_to": row.restore_to,
+        "archived": bool(row.archived),
+        "kind": row.kind,
+        "declared_by": row.declared_by,
+        "note": row.note,
+        "pause_requested_at": row.pause_requested_at,
+        "pause_deadline_at": row.pause_deadline_at,
+        "epoch": int(row.epoch or 0),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "declared": True,
+    }
+
+
+def _terminal_member_refusals(db: Any, operation: Any) -> list[dict[str, str]]:
+    members = (
+        db.query(database.SessionCohortMemberModel)
+        .filter(database.SessionCohortMemberModel.operation_id == operation.operation_id)
+        .order_by(database.SessionCohortMemberModel.agent_id)
+        .all()
+    )
+    if operation.operation_kind == KIND_PAUSE:
+        allowed = PAUSE_TERMINAL_MEMBER_STATES[operation.current_mode]
+    else:
+        allowed = STOP_TERMINAL_MEMBER_STATES
+    refusals: list[dict[str, str]] = []
+    for member in members:
+        if not bool(member.included):
+            if member.final_state != FINAL_EXCLUDED_HISTORICAL:
+                refusals.append({"agent_id": member.agent_id, "final_state": member.final_state})
+            continue
+        if member.final_state not in allowed:
+            refusals.append({"agent_id": member.agent_id, "final_state": member.final_state})
+    return refusals
+
+
+def _commit_session_lifecycle(db: Any, operation: Any, request: TerminalCommitRequest) -> Any:
+    row = (
+        db.query(database.SessionLifecycleModel)
+        .filter(database.SessionLifecycleModel.session_name == operation.session_name)
+        .one_or_none()
+    )
+    observed_lifecycle = row.lifecycle if row is not None else sl.WORKING
+    observed_epoch = int(row.epoch or 0) if row is not None else 0
+    if observed_lifecycle != operation.lifecycle_observation or observed_epoch != int(
+        operation.lifecycle_epoch
+    ):
+        raise CohortJournalConflict(
+            f"session {operation.session_name} lifecycle moved to "
+            f"{observed_lifecycle!r} epoch {observed_epoch}; cohort claimed "
+            f"{operation.lifecycle_observation!r} epoch {operation.lifecycle_epoch}"
+        )
+
+    target = STATE_PAUSED if operation.operation_kind == KIND_PAUSE else STATE_STOPPED
+    if observed_lifecycle == sl.STOPPED:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} is already stopped outside this terminal commit"
+        )
+    if target == STATE_PAUSED and observed_lifecycle in {sl.PAUSED, sl.COMPLETE}:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} is {observed_lifecycle!r}; a new cohort Pause "
+            "cannot terminal-commit it"
+        )
+
+    stamp = _now()
+    if row is None:
+        restore_to = sl.WORKING if target == STATE_STOPPED else None
+        row = database.SessionLifecycleModel(
+            session_name=operation.session_name,
+            lifecycle=target,
+            restore_to=restore_to,
+            archived=0,
+            kind=sl.CAMPAIGN,
+            declared_by=request.actor,
+            note=request.reason,
+            pause_requested_at=None,
+            pause_deadline_at=None,
+            epoch=1,
+            created_at=stamp,
+            updated_at=stamp,
+        )
+        db.add(row)
+        db.flush()
+        return row
+
+    values: dict[str, Any] = {
+        "lifecycle": target,
+        "declared_by": request.actor,
+        "note": request.reason,
+        "pause_requested_at": None,
+        "pause_deadline_at": None,
+        "epoch": observed_epoch + 1,
+        "updated_at": stamp,
+    }
+    if target == STATE_STOPPED:
+        values["restore_to"] = (
+            observed_lifecycle if observed_lifecycle in sl.RESTORE_TARGETS else sl.WORKING
+        )
+    result = db.execute(
+        sa_update(database.SessionLifecycleModel)
+        .where(
+            database.SessionLifecycleModel.session_name == operation.session_name,
+            database.SessionLifecycleModel.epoch == observed_epoch,
+            database.SessionLifecycleModel.lifecycle == observed_lifecycle,
+        )
+        .values(**values)
+    )
+    if result.rowcount != 1:
+        raise CohortJournalConflict(
+            f"session {operation.session_name} lifecycle moved concurrently; read and retry"
+        )
+    db.flush()
+    db.refresh(row)
+    return row
+
+
+def _commit_terminal_once(db: Any, request: TerminalCommitRequest) -> dict[str, Any]:
+    operation = _operation_by_id(db, request.operation_id)
+    if operation is None:
+        raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
+    to_state = STATE_PAUSED if operation.operation_kind == KIND_PAUSE else STATE_STOPPED
+    transition_digest = request.transition_digest(to_state=to_state)
+    existing = (
+        db.query(database.SessionCohortTransitionModel)
+        .filter(database.SessionCohortTransitionModel.transition_id == request.transition_id)
+        .one_or_none()
+    )
+    if existing is not None:
+        if existing.transition_digest != transition_digest:
+            raise CohortJournalConflict(
+                f"cohort transition {request.transition_id} already exists with different "
+                "immutable request content"
+            )
+        lifecycle = (
+            db.query(database.SessionLifecycleModel)
+            .filter(database.SessionLifecycleModel.session_name == operation.session_name)
+            .one()
+        )
+        return {
+            "transition": _transition_dict(existing),
+            "operation": _operation_dict(operation),
+            "lifecycle": _lifecycle_row_dict(lifecycle),
+            "barrier": oj.get_session_barrier(operation.session_name, db=db),
+            "adopted": True,
+        }
+
+    if int(operation.state_epoch or 0) != request.expected_state_epoch:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} moved to state epoch "
+            f"{operation.state_epoch}; expected {request.expected_state_epoch}"
+        )
+    if operation.operation_kind == KIND_PAUSE:
+        required_state = (
+            STATE_DRAINING if operation.current_mode == MODE_SAFE else STATE_INTERRUPTING
+        )
+    else:
+        required_state = STATE_TEARING_DOWN
+    if operation.state != required_state:
+        raise CohortJournalConflict(
+            f"{operation.current_mode} {operation.operation_kind} terminal commit requires "
+            f"state {required_state!r}; got {operation.state!r}"
+        )
+
+    refusals = _terminal_member_refusals(db, operation)
+    if refusals:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} has members outside the terminal "
+            f"result set: {refusals}"
+        )
+    barrier = oj.get_session_barrier(operation.session_name, db=db)
+    if operation.operation_kind == KIND_STOP:
+        if (
+            barrier is None
+            or barrier["state"] != oj.BARRIER_CLAIMED
+            or barrier["claimed_by"] != operation.operation_id
+        ):
+            raise CohortJournalConflict(
+                f"Stop terminal commit requires the exact barrier claimed by cohort "
+                f"operation {operation.operation_id}"
+            )
+
+    lifecycle = _commit_session_lifecycle(db, operation, request)
+    stamp = _now()
+    result = db.execute(
+        sa_update(database.SessionCohortOperationModel)
+        .where(
+            database.SessionCohortOperationModel.operation_id == request.operation_id,
+            database.SessionCohortOperationModel.state_epoch == request.expected_state_epoch,
+            database.SessionCohortOperationModel.state == operation.state,
+            database.SessionCohortOperationModel.current_mode == operation.current_mode,
+        )
+        .values(
+            state=to_state,
+            state_epoch=request.expected_state_epoch + 1,
+            updated_at=stamp,
+        )
+    )
+    if result.rowcount != 1:
+        raise CohortJournalConflict(
+            f"cohort operation {request.operation_id} moved concurrently; terminal lifecycle "
+            "commit was rolled back"
+        )
+    transition = database.SessionCohortTransitionModel(
+        transition_id=request.transition_id,
+        operation_id=request.operation_id,
+        transition_digest=transition_digest,
+        transition_json=_canonical_json(request.payload(to_state=to_state)),
+        from_state=operation.state,
+        to_state=to_state,
+        from_mode=operation.current_mode,
+        to_mode=operation.current_mode,
+        from_state_epoch=request.expected_state_epoch,
+        actor=request.actor,
+        reason=request.reason,
+        receipt_digest=request.receipt_digest,
+        created_at=stamp,
+    )
+    db.add(transition)
+    db.flush()
+    db.refresh(operation)
+    return {
+        "transition": _transition_dict(transition),
+        "operation": _operation_dict(operation),
+        "lifecycle": _lifecycle_row_dict(lifecycle),
+        "barrier": barrier,
+        "adopted": False,
+    }
+
+
+def commit_terminal(request: TerminalCommitRequest, db: Any = None) -> dict[str, Any]:
+    """Atomically commit terminal cohort and declared lifecycle state.
+
+    The receipt and per-member results are evidence carriers only. This
+    function does not infer task completion, inspect provider output, touch a
+    pane, stop a wait, wake a supervisor, or perform any other external I/O.
+    """
+    if not isinstance(request, TerminalCommitRequest):
+        raise CohortJournalInvalid(
+            f"request must be a TerminalCommitRequest; got {type(request).__name__}"
+        )
+    from cli_agent_orchestrator.services.callback_recovery import (
+        session_lifecycle_write_claim,
+    )
+
+    def _run(session: Any) -> dict[str, Any]:
+        operation = _operation_by_id(session, request.operation_id)
+        if operation is None:
+            raise CohortJournalNotFound(f"unknown cohort operation: {request.operation_id}")
+        with session_lifecycle_write_claim(operation.session_name):
+            return _commit_terminal_once(session, request)
+
+    if db is not None:
+        try:
+            _anchor_caller_transaction(db)
+            with db.begin_nested():
+                return _run(db)
+        except CohortJournalError:
+            raise
+        except (IntegrityError, OperationalError) as exc:
+            raise CohortJournalUnavailable(
+                f"concurrent terminal cohort commit refused; roll back and retry: {exc}"
+            ) from exc
+
+    last_error: Optional[BaseException] = None
+    for _attempt in range(5):
+        try:
+            with database.SessionLocal() as session:
+                result = _run(session)
+                session.commit()
+                return result
+        except CohortJournalUnavailable as exc:
+            last_error = exc
+            time.sleep(0.05)
+        except CohortJournalError:
+            raise
+        except (IntegrityError, OperationalError) as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise CohortJournalUnavailable(
+        f"concurrent terminal cohort commits kept conflicting; refusing after retry: "
+        f"{last_error}"
+    )
 
 
 def get_operation(operation_id: str, db: Any = None) -> dict[str, Any]:

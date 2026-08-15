@@ -1,4 +1,4 @@
-"""C1 cohort-journal ORM/migration parity and restart persistence."""
+"""C1-C2 cohort-journal ORM/migration parity and restart persistence."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.services import cohort_journal as cohort
+from cli_agent_orchestrator.services import operation_journal as oj
 from cli_agent_orchestrator.services import stable_agent_roster as roster
 
 _OPERATION_COLUMNS = {
@@ -174,12 +175,11 @@ def test_operation_members_and_transitions_survive_engine_restart(tmp_path, monk
         member_snapshot_digest=boundary["member_snapshot_digest"],
     )
     operation = cohort.claim_operation(request)
-    cohort.transition_operation(
-        cohort.TransitionRequest(
+    cohort.begin_stop_teardown(
+        cohort.StopTeardownRequest(
             transition_id=str(uuid.uuid4()),
             operation_id=operation["operation_id"],
             expected_state_epoch=0,
-            to_state=cohort.STATE_TEARING_DOWN,
             actor="colin",
         )
     )
@@ -192,4 +192,5 @@ def test_operation_members_and_transitions_survive_engine_restart(tmp_path, monk
     assert stored["state"] == cohort.STATE_TEARING_DOWN
     assert stored["members"][0]["agent_id"] == bind["agent"]["agent_id"]
     assert len(stored["transitions"]) == 1
+    assert oj.get_session_barrier("cao-restart")["claimed_by"] == operation["operation_id"]
     second_engine.dispose()
