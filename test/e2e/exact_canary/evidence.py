@@ -45,7 +45,9 @@ class EvidenceSanitizer:
         for source, replacement in sorted(self._redactions, key=lambda item: -len(item[0])):
             sanitized = sanitized.replace(source, replacement)
         for replacement in {item[1] for item in self._redactions}:
-            sanitized = sanitized.replace(f"/private{replacement}", replacement)
+            private_alias = f"/private{replacement}"
+            while private_alias in sanitized:
+                sanitized = sanitized.replace(private_alias, replacement)
         sanitized = _EMAIL_RE.sub("<ACCOUNT>", sanitized)
         sanitized = _BEARER_RE.sub(r"\1<SECRET>", sanitized)
         sanitized = _OPENAI_KEY_RE.sub("<SECRET>", sanitized)
