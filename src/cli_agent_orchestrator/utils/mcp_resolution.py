@@ -52,6 +52,22 @@ def _sibling_script() -> str:
     return str(sibling) if sibling.exists() else ""
 
 
+def cao_mcp_server_sibling_dir() -> str:
+    """Directory holding the ``cao-mcp-server`` script beside the interpreter.
+
+    Companion to :func:`_sibling_script` for callers that need to put the
+    bundled helper on ``PATH`` (e.g. spawned agent tmux terminals) rather than
+    invoke it directly. Returns the script's parent directory when a sibling
+    console script exists next to :data:`sys.executable`, and ``""``
+    otherwise — so callers can treat an empty result as "no augmentation
+    available" and leave the inherited ``PATH`` untouched. An operator-supplied
+    ``PATH`` is still expected to win over any augmentation applied by the
+    caller.
+    """
+    sibling = _sibling_script()
+    return str(Path(sibling).parent) if sibling else ""
+
+
 def resolve_cao_mcp_command(
     command: str, args: List[str], *, persisted: bool = False
 ) -> Tuple[str, List[str]]:

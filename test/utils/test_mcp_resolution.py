@@ -61,6 +61,44 @@ class TestSiblingScript:
             assert _sibling_script() == ""
 
 
+class TestSiblingDir:
+    """cao_mcp_server_sibling_dir: the *directory* of the interpreter-sibling
+    helper, for callers that put it on PATH rather than invoke it directly."""
+
+    def test_returns_parent_dir_when_script_exists(self, tmp_path):
+        from cli_agent_orchestrator.utils.mcp_resolution import (
+            _SCRIPT_FILENAME,
+            cao_mcp_server_sibling_dir,
+        )
+
+        fake_python = tmp_path / "python3"
+        fake_python.touch()
+        (tmp_path / _SCRIPT_FILENAME).touch()
+        with patch(f"{MOD}.sys") as mock_sys:
+            mock_sys.executable = str(fake_python)
+            assert cao_mcp_server_sibling_dir() == str(tmp_path)
+
+    def test_returns_empty_when_script_missing(self, tmp_path):
+        from cli_agent_orchestrator.utils.mcp_resolution import (
+            cao_mcp_server_sibling_dir,
+        )
+
+        fake_python = tmp_path / "python3"
+        fake_python.touch()
+        with patch(f"{MOD}.sys") as mock_sys:
+            mock_sys.executable = str(fake_python)
+            assert cao_mcp_server_sibling_dir() == ""
+
+    def test_returns_empty_for_empty_sys_executable(self):
+        from cli_agent_orchestrator.utils.mcp_resolution import (
+            cao_mcp_server_sibling_dir,
+        )
+
+        with patch(f"{MOD}.sys") as mock_sys:
+            mock_sys.executable = ""
+            assert cao_mcp_server_sibling_dir() == ""
+
+
 class TestArgsPreservation:
     """Caller-supplied args survive resolution in every tier."""
 
