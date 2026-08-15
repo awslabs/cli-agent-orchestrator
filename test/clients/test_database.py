@@ -21,6 +21,7 @@ from cli_agent_orchestrator.clients.database import (
     delete_flow,
     delete_terminal,
     delete_terminals_by_session,
+    find_inbox_message_by_marker,
     get_flow,
     get_inbox_messages,
     get_pending_messages,
@@ -1044,6 +1045,34 @@ class TestListSiblingsByGroupPrefix:
 
 class TestInboxOperations:
     """Tests for inbox database operations."""
+
+    def test_find_inbox_message_by_marker_returns_matching_receiver_row(self, test_db):
+        marker = "[Managed persistent request request_id=" + ("a" * 32) + "]"
+        with test_db() as db:
+            db.add_all(
+                [
+                    InboxModel(
+                        sender_id="sender-1",
+                        receiver_id="recv-1",
+                        message=marker + " task",
+                        status=MessageStatus.DELIVERED.value,
+                        created_at=datetime.now(),
+                    ),
+                    InboxModel(
+                        sender_id="sender-2",
+                        receiver_id="recv-2",
+                        message=marker + " other",
+                        status=MessageStatus.DELIVERED.value,
+                        created_at=datetime.now(),
+                    ),
+                ]
+            )
+            db.commit()
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            found = find_inbox_message_by_marker("recv-1", marker)
+        assert found is not None
+        assert found.sender_id == "sender-1"
+        assert found.receiver_id == "recv-1"
 
     def test_claim_inbox_message_marks_only_matching_pending_row_delivered(self, test_db):
         with test_db() as db:
