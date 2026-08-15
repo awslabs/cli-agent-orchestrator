@@ -75,6 +75,13 @@ REQUIRE_SEMANTIC_PERSISTENT_ROUTING = (
 REQUIRE_ASYNC_CHILD_DELEGATION = (
     os.getenv("CAO_REQUIRE_ASYNC_CHILD_DELEGATION", "false").lower() == "true"
 )
+# Persistent supervisors can require one managed primitive that creates the
+# worker, waits for its durable callback row, and returns that callback as the
+# tool result. This prevents the provider from receiving the callback as a
+# second user turn behind its current reasoning.
+REQUIRE_MANAGED_CHILD_CALLBACK = (
+    os.getenv("CAO_REQUIRE_MANAGED_CHILD_CALLBACK", "false").lower() == "true"
+)
 
 
 def _enforce_child_profile_policy(agent_profile: str) -> None:
@@ -226,6 +233,7 @@ def _create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -319,10 +327,12 @@ def _create_terminal(
             params["model"] = model
         if use_worktree:
             params["use_worktree"] = "true"
+        if isinstance(metadata, dict) and metadata.get("managed_callback") is True:
+            params["managed_callback"] = "true"
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
-        json_body = None
+        json_body: Optional[Dict[str, Any]] = None
         if defer_init:
             params["defer_init"] = "true"
             json_body = {}
@@ -334,6 +344,8 @@ def _create_terminal(
                     if isinstance(initial_message_orchestration_type, OrchestrationType)
                     else str(initial_message_orchestration_type)
                 )
+            if metadata is not None:
+                json_body["metadata"] = metadata
 
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
@@ -693,7 +705,9 @@ def _parse_run_step_error(
     return None, fallback, None
 
 
-def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
+def _send_to_inbox(
+    receiver_id: str, message: str, *, defer_delivery: bool = False
+) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Args:
@@ -716,6 +730,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         params={
             "sender_id": sender_id,
             "message": message,
+            "defer_delivery": "true" if defer_delivery else "false",
         },
         timeout=_mcp_timeout(),
     )
@@ -946,7 +961,7 @@ if ENABLE_WORKING_DIRECTORY:
             default=600,
             description="Maximum time to wait for the agent to complete the task (in seconds)",
             ge=1,
-            le=3600,
+            le=540,
         ),
         working_directory: Optional[str] = Field(
             default=None,
@@ -1136,6 +1151,8 @@ def _assign_impl(
     engine: Optional[str] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    *,
+    managed_wait: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1149,6 +1166,16 @@ def _assign_impl(
     """
     terminal_id: Optional[str] = None
     try:
+        if REQUIRE_MANAGED_CHILD_CALLBACK and not managed_wait:
+            return {
+                "success": False,
+                "terminal_id": None,
+                "message": (
+                    "Bare assign is disabled for this supervisor. Use assign_and_wait so "
+                    "the worker callback is durably claimed and returned for review."
+                ),
+            }
+
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
         # path only forwards the initial message on the existing-session branch
@@ -1174,7 +1201,13 @@ def _assign_impl(
         # suffix depends on ``CAO_TERMINAL_ID``, which lives in this MCP
         # subprocess's env (the supervisor-owned instance), not on the
         # cao-server side.
-        if ENABLE_SENDER_ID_INJECTION:
+        if managed_wait:
+            worker_message = (
+                message
+                + "\n\n[Managed CAO callback: when done, call send_message with receiver_id "
+                "omitted. CAO will route the durable callback to your recorded caller.]"
+            )
+        elif ENABLE_SENDER_ID_INJECTION:
             worker_message = (
                 message
                 + f"\n\n[Assigned by terminal {current_terminal_id}. "
@@ -1197,6 +1230,7 @@ def _assign_impl(
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
             use_worktree=use_worktree,
+            metadata={"managed_callback": True} if managed_wait else None,
         )
 
         return {
@@ -1369,6 +1403,149 @@ else:
             model=model,
             use_worktree=use_worktree,
         )
+
+
+def _claim_managed_callback(supervisor_id: str, worker_id: str, timeout: int) -> Dict[str, Any]:
+    """Wait for and claim one durable callback row from a specific worker."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{supervisor_id}/inbox/messages",
+            params={"limit": 100},
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        rows = response.json()
+        matches = [
+            row for row in rows if isinstance(row, dict) and row.get("sender_id") == worker_id
+        ]
+        if matches:
+            row = matches[-1]
+            status_value = row.get("status")
+            if status_value == "failed":
+                return {
+                    "success": False,
+                    "message": "Worker callback delivery failed",
+                    "terminal_id": worker_id,
+                    "message_id": row.get("id"),
+                }
+            if status_value == "pending":
+                claim = requests.post(
+                    f"{API_BASE_URL}/terminals/{supervisor_id}/inbox/messages/{row['id']}/claim",
+                    params={"sender_id": worker_id},
+                    timeout=_mcp_timeout(),
+                )
+                if claim.status_code == 409:
+                    time.sleep(0.1)
+                    continue
+                claim.raise_for_status()
+                claimed = claim.json()
+                return {
+                    "success": True,
+                    "terminal_id": worker_id,
+                    "message_id": claimed.get("message_id"),
+                    "callback": claimed.get("message", ""),
+                    "callback_status": claimed.get("status"),
+                }
+            if status_value == "delivered":
+                # Recovery path only. Managed callbacks skip eager delivery, so
+                # this means the normal reconciler won a >grace-period race.
+                return {
+                    "success": True,
+                    "terminal_id": worker_id,
+                    "message_id": row.get("id"),
+                    "callback": row.get("message", ""),
+                    "callback_status": "delivered",
+                    "delivery_race": True,
+                }
+
+        # Fail early if the worker vanished instead of burning the full timeout.
+        worker = requests.get(f"{API_BASE_URL}/terminals/{worker_id}", timeout=_mcp_timeout())
+        if worker.status_code == 404:
+            return {
+                "success": False,
+                "terminal_id": worker_id,
+                "message": "Worker disappeared before sending its durable callback",
+            }
+        worker.raise_for_status()
+        time.sleep(0.25)
+
+    return {
+        "success": False,
+        "terminal_id": worker_id,
+        "message": f"Timed out after {timeout}s waiting for durable worker callback",
+    }
+
+
+def _assign_and_wait_impl(
+    agent_profile: str,
+    message: str,
+    timeout: int = 600,
+    working_directory: Optional[str] = None,
+    engine: Optional[str] = None,
+    model: Optional[str] = None,
+    use_worktree: bool = False,
+) -> Dict[str, Any]:
+    """Create one worker and return only after its durable callback is claimed."""
+    if timeout < 1 or timeout > 540:
+        return {"success": False, "message": "timeout must be between 1 and 540 seconds"}
+    supervisor_id = _current_terminal_id()
+    if not supervisor_id:
+        return {
+            "success": False,
+            "message": "assign_and_wait requires CAO_TERMINAL_ID inside a CAO terminal",
+        }
+
+    assigned = _assign_impl(
+        agent_profile,
+        message,
+        working_directory,
+        engine=engine,
+        model=model,
+        use_worktree=use_worktree,
+        managed_wait=True,
+    )
+    if not assigned.get("success"):
+        return assigned
+    worker_id = assigned.get("terminal_id")
+    if not isinstance(worker_id, str):
+        return {"success": False, "message": "assign returned no worker terminal id"}
+
+    callback = _claim_managed_callback(supervisor_id, worker_id, timeout)
+    if callback.get("success"):
+        callback["agent_profile"] = agent_profile
+    return callback
+
+
+@mcp.tool()
+async def assign_and_wait(
+    agent_profile: str = Field(description="Allowed worker agent profile"),
+    message: str = Field(description="Bounded task for the worker"),
+    timeout: int = Field(
+        default=600,
+        ge=1,
+        le=3600,
+        description="Maximum seconds to wait for the durable callback",
+    ),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
+    use_worktree: bool = Field(
+        default=False,
+        description="Run the worker in an isolated git worktree",
+    ),
+) -> Dict[str, Any]:
+    """Assign a worker and block until its durable caller callback is claimed.
+
+    The worker is stamped for managed callback delivery. Its send_message reply
+    is persisted but not injected as a second supervisor user turn; this tool
+    claims the exact callback row and returns it for immediate review.
+    """
+    return _assign_and_wait_impl(
+        agent_profile,
+        message,
+        timeout=timeout,
+        model=model,
+        use_worktree=use_worktree,
+    )
 
 
 def _discover_persistent_agent_routes_impl() -> Dict[str, Any]:
@@ -1564,6 +1741,16 @@ def _send_message_impl(
                 ),
             }
 
+        managed_callback = os.getenv("CAO_MANAGED_CALLBACK", "false").lower() == "true"
+        if managed_callback and receiver_id:
+            return {
+                "success": False,
+                "error": (
+                    "This worker uses a managed callback. Omit receiver_id; CAO must route "
+                    "to the durable recorded caller so assign_and_wait can claim it."
+                ),
+            }
+
         # Default the receiver to the recorded caller (issue #284): handoff/
         # assign persist the creating terminal's ID on the worker's row, so a
         # worker can reply without parsing an ID out of the task message text.
@@ -1622,13 +1809,13 @@ def _send_message_impl(
         # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
         # address (issue #284); _send_to_inbox raises a clear error for that
         # case anyway.
-        if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
+        if ENABLE_SENDER_ID_INJECTION and own_terminal_id and not managed_callback:
             message += (
                 f"\n\n[Message from terminal {own_terminal_id}. "
                 "Use send_message MCP tool for any follow-up work.]"
             )
 
-        return _send_to_inbox(receiver_id, message)
+        return _send_to_inbox(receiver_id, message, defer_delivery=managed_callback)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw

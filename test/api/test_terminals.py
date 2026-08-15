@@ -1,5 +1,6 @@
 """Tests for terminal-related API endpoints including working directory and exit."""
 
+from datetime import datetime
 from typing import Dict
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -12,6 +13,7 @@ from cli_agent_orchestrator.constants import (
     TERMINAL_GROUP_MAX_ELEMENTS,
     TERMINAL_METADATA_MAX_BYTES,
 )
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import Terminal
 
 
@@ -587,6 +589,55 @@ class TestCreateInboxMessageEndpoint:
                 "hello",
             )
             mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
+
+    def test_create_inbox_message_deferred_skips_provider_delivery(self, client):
+        mock_msg = MagicMock()
+        mock_msg.id = 9
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+        with (
+            patch("cli_agent_orchestrator.api.main.create_inbox_message", return_value=mock_msg),
+            patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={
+                    "sender_id": "sender1",
+                    "message": "callback",
+                    "defer_delivery": "true",
+                },
+            )
+        assert response.status_code == 200
+        mock_inbox.deliver_pending.assert_not_called()
+
+    def test_claim_inbox_message_success(self, client):
+        claimed = InboxMessage(
+            id=9,
+            sender_id="bbbb2222",
+            receiver_id="abcd1234",
+            message="callback",
+            status=MessageStatus.DELIVERED,
+            created_at=datetime(2026, 3, 13, 12, 0, 0),
+        )
+        with patch(
+            "cli_agent_orchestrator.api.main.claim_inbox_message", return_value=claimed
+        ) as claim:
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages/9/claim",
+                params={"sender_id": "bbbb2222"},
+            )
+        assert response.status_code == 200
+        assert response.json()["message"] == "callback"
+        claim.assert_called_once_with("abcd1234", 9, sender_id="bbbb2222")
+
+    def test_claim_inbox_message_conflict_when_not_pending(self, client):
+        with patch("cli_agent_orchestrator.api.main.claim_inbox_message", return_value=None):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages/9/claim",
+                params={"sender_id": "bbbb2222"},
+            )
+        assert response.status_code == 409
 
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
