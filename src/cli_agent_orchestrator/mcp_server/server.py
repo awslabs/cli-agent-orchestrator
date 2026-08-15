@@ -1789,7 +1789,12 @@ def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[
         }
 
     target = matches[0]
-    result = _send_message_impl(str(target["terminal_id"]), message, semantic_resolved=True)
+    result = _send_message_impl(
+        str(target["terminal_id"]),
+        message,
+        semantic_resolved=True,
+        suppress_runtime_address=True,
+    )
     if result.get("success"):
         public_result = {
             key: value for key, value in result.items() if key not in {"sender_id", "receiver_id"}
@@ -1798,7 +1803,9 @@ def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[
             **public_result,
             "persistent_agent_id": agent_id,
         }
-    return result
+    detail = str(result.get("error") or "Semantic persistent delivery failed")
+    detail = detail.replace(str(target["terminal_id"]), "[runtime address]")
+    return {"success": False, "error": detail}
 
 
 def _resolve_persistent_target_for_dispatch(agent_id: str) -> Dict[str, Any]:
@@ -1839,9 +1846,16 @@ def _dispatch_persistent_agent_impl(agent_id: str, message: str) -> Dict[str, An
         f"is ready, call reply_to_persistent_request with request_id={request_id}. Never use a "
         "terminal ID for the return path.\n\n" + message
     )
-    result = _send_message_impl(str(target["terminal_id"]), wrapped, semantic_resolved=True)
+    result = _send_message_impl(
+        str(target["terminal_id"]),
+        wrapped,
+        semantic_resolved=True,
+        suppress_runtime_address=True,
+    )
     if not result.get("success"):
-        return result
+        detail = str(result.get("error") or "Managed persistent dispatch failed")
+        detail = detail.replace(str(target["terminal_id"]), "[runtime address]")
+        return {"success": False, "error": detail}
     return {
         "success": True,
         "persistent_agent_id": agent_id,
@@ -1872,9 +1886,16 @@ def _reply_to_persistent_request_impl(request_id: str, message: str) -> Dict[str
     if not isinstance(sender_id, str) or not sender_id:
         return {"success": False, "error": "Managed request has no durable sender"}
     callback = f"[Persistent department result request_id={request_id}]\n{message}"
-    result = _send_message_impl(sender_id, callback, semantic_resolved=True)
+    result = _send_message_impl(
+        sender_id,
+        callback,
+        semantic_resolved=True,
+        suppress_runtime_address=True,
+    )
     if not result.get("success"):
-        return result
+        detail = str(result.get("error") or "Managed persistent reply failed")
+        detail = detail.replace(str(sender_id), "[runtime address]")
+        return {"success": False, "error": detail}
     return {
         "success": True,
         "request_id": request_id,
@@ -2072,7 +2093,11 @@ async def send_message_to_persistent_agent(
 
 # Implementation function for send_message
 def _send_message_impl(
-    receiver_id: Optional[str], message: str, *, semantic_resolved: bool = False
+    receiver_id: Optional[str],
+    message: str,
+    *,
+    semantic_resolved: bool = False,
+    suppress_runtime_address: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
@@ -2159,7 +2184,12 @@ def _send_message_impl(
         # case anyway.
         if managed_callback and managed_assignment_id:
             message = f"[Managed worker callback assignment_id={managed_assignment_id}]\n" + message
-        if ENABLE_SENDER_ID_INJECTION and own_terminal_id and not managed_callback:
+        if (
+            ENABLE_SENDER_ID_INJECTION
+            and own_terminal_id
+            and not managed_callback
+            and not suppress_runtime_address
+        ):
             message += (
                 f"\n\n[Message from terminal {own_terminal_id}. "
                 "Use send_message MCP tool for any follow-up work.]"
@@ -2177,6 +2207,13 @@ def _send_message_impl(
         detail = str(exc)
         if exc.response is not None:
             detail = _extract_error_detail(exc.response, detail)
+        if suppress_runtime_address:
+            if receiver_id:
+                detail = detail.replace(str(receiver_id), "[runtime address]")
+            return {
+                "success": False,
+                "error": f"Managed semantic delivery failed: {detail}",
+            }
         return {
             "success": False,
             "error": f"Failed to deliver to terminal {receiver_id}: {detail}",
