@@ -336,7 +336,6 @@ async def create_terminal(
             session_name = generate_session_name()
 
         window_name = generate_window_name(agent_profile)
-        resolved_working_directory = _resolve_working_directory(working_directory)
 
         # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
         # the tmux session/window below consumes `working_directory` -- the
@@ -359,6 +358,13 @@ async def create_terminal(
             working_directory = await asyncio.to_thread(
                 worktree_service.create_worktree, worktree_repo_root, terminal_id
             )
+
+        # Resolve AFTER the worktree block, not before: when `use_worktree` is set
+        # the block above REPLACES `working_directory` with the new worktree path,
+        # so resolving earlier would both launch tmux in the pre-worktree directory
+        # (defeating the isolation #100 provides) and persist that stale path as the
+        # terminal's working_directory. This is the effective launch cwd either way.
+        resolved_working_directory = _resolve_working_directory(working_directory)
 
         # Step 2: Create tmux session or window
         if new_session:

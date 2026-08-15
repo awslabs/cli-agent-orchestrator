@@ -915,6 +915,7 @@ class TestCreateTerminalWorktree:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        tmp_path,
     ):
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -926,24 +927,39 @@ class TestCreateTerminalWorktree:
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        # Both directories are real: create_terminal validates the EFFECTIVE launch
+        # cwd (post-worktree-override) before handing it to tmux. Using a real
+        # SOURCE dir too is deliberate -- it means the assertions below fail on the
+        # override semantics rather than on a synthetic path being rejected first,
+        # so this test still catches a regression that resolves the cwd before the
+        # worktree block instead of after it.
+        source_dir = tmp_path / "some" / "subdir"
+        source_dir.mkdir(parents=True)
+        worktree_dir = tmp_path / "worktrees" / "test1234"
+        worktree_dir.mkdir(parents=True)
         mock_worktree_service.find_repo_root.return_value = "/repo"
-        mock_worktree_service.create_worktree.return_value = "/repo/.cao/worktrees/test1234"
+        mock_worktree_service.create_worktree.return_value = str(worktree_dir)
 
         result = await create_terminal(
             "kiro_cli",
             "developer",
             session_name="cao-existing",
-            working_directory="/repo/some/subdir",
+            working_directory=str(source_dir),
             use_worktree=True,
         )
 
         assert result.id == "test1234"
-        mock_worktree_service.find_repo_root.assert_called_once_with("/repo/some/subdir")
+        mock_worktree_service.find_repo_root.assert_called_once_with(str(source_dir))
         mock_worktree_service.create_worktree.assert_called_once_with("/repo", "test1234")
         # The worktree path -- NOT the originally-given working_directory -- is
         # what actually reaches the tmux window (create_window's 4th positional
         # arg, per its own call site in terminal_service.py).
-        assert mock_tmux.create_window.call_args.args[3] == "/repo/.cao/worktrees/test1234"
+        assert mock_tmux.create_window.call_args.args[3] == os.path.realpath(worktree_dir)
+        # ...and is also what gets persisted as the terminal's working_directory,
+        # so list_sessions ownership metadata points at the isolated checkout.
+        assert mock_db_create.call_args.kwargs["working_directory"] == os.path.realpath(
+            worktree_dir
+        )
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -1039,6 +1055,7 @@ class TestCreateTerminalWorktree:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        tmp_path,
     ):
         """The worktree WAS created before provider.initialize() failed later --
         the failure-cleanup path must roll it back too, or a provider-init
@@ -1054,8 +1071,12 @@ class TestCreateTerminalWorktree:
         mock_provider.initialize.side_effect = TimeoutError("provider init timed out")
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        # Real directory so the effective-cwd validation passes and the failure
+        # under test is the provider-init timeout this test is actually about.
+        worktree_dir = tmp_path / "worktrees" / "test1234"
+        worktree_dir.mkdir(parents=True)
         mock_worktree_service.find_repo_root.return_value = "/repo"
-        mock_worktree_service.create_worktree.return_value = "/repo/.cao/worktrees/test1234"
+        mock_worktree_service.create_worktree.return_value = str(worktree_dir)
 
         with pytest.raises(TimeoutError):
             await create_terminal(
