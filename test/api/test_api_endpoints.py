@@ -1085,6 +1085,49 @@ class TestDeleteTerminal:
             expected_session="cao-p",
         )
 
+    def test_delete_terminal_exact_legacy_pane_passes(self, client):
+        """A v1 terminal can be retired through its exact session+pane observation."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.retire_observed_terminal.return_value = True
+
+            response = client.delete(
+                "/terminals/abcd1234?expected_session=cao-p&expected_pane_id=%2511"
+            )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        mock_svc.retire_observed_terminal.assert_called_once_with(
+            "abcd1234",
+            registry=ANY,
+            expected_session="cao-p",
+            expected_pane_id="%11",
+            backend_already_closed=False,
+        )
+        mock_svc.delete_terminal.assert_not_called()
+
+    def test_delete_terminal_pane_requires_session(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.delete("/terminals/abcd1234?expected_pane_id=%2511")
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == ("pane-fenced deletion requires expected_session")
+        mock_svc.retire_observed_terminal.assert_not_called()
+        mock_svc.delete_terminal.assert_not_called()
+
+    def test_delete_terminal_refuses_mixed_generation_and_pane_fences(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.delete(
+                "/terminals/abcd1234?expected_generation=g-1"
+                "&expected_session=cao-p&expected_pane_id=%2511"
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == (
+            "choose generation-fenced or pane-fenced deletion, not both"
+        )
+        mock_svc.retire_observed_terminal.assert_not_called()
+        mock_svc.delete_terminal.assert_not_called()
+
 
 # ── flow_daemon ──────────────────────────────────────────────────────
 

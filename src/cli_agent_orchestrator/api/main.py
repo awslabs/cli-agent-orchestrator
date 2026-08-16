@@ -4465,6 +4465,7 @@ async def delete_terminal(
     terminal_id: TerminalId,
     expected_generation: Optional[str] = None,
     expected_session: Optional[str] = None,
+    expected_pane_id: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     """Delete a terminal, optionally only its exact reserved generation.
@@ -4478,20 +4479,42 @@ async def delete_terminal(
         # loop so a stalled tmux/FIFO op bounds its blast radius to this one
         # request instead of wedging the whole server (issue #382 fixed this
         # for DELETE /sessions; the per-terminal path had the same hazard).
-        conditional: Dict[str, Any] = {}
-        if expected_generation is not None:
-            conditional["expected_generation"] = expected_generation
-        if expected_session is not None:
-            conditional["expected_session"] = expected_session
-        success = await asyncio.to_thread(
-            terminal_service.delete_terminal,
-            terminal_id,
-            registry=get_plugin_registry(request),
-            **conditional,
-        )
+        if expected_pane_id is not None:
+            if expected_generation is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="choose generation-fenced or pane-fenced deletion, not both",
+                )
+            if expected_session is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="pane-fenced deletion requires expected_session",
+                )
+            success = await asyncio.to_thread(
+                terminal_service.retire_observed_terminal,
+                terminal_id,
+                registry=get_plugin_registry(request),
+                expected_session=expected_session,
+                expected_pane_id=expected_pane_id,
+                backend_already_closed=False,
+            )
+        else:
+            conditional: Dict[str, Any] = {}
+            if expected_generation is not None:
+                conditional["expected_generation"] = expected_generation
+            if expected_session is not None:
+                conditional["expected_session"] = expected_session
+            success = await asyncio.to_thread(
+                terminal_service.delete_terminal,
+                terminal_id,
+                registry=get_plugin_registry(request),
+                **conditional,
+            )
         return {"success": success}
     except TerminalGenerationMismatchError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

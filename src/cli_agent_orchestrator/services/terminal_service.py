@@ -3586,11 +3586,22 @@ def retire_observed_terminal(
             raise TerminalGenerationMismatchError(
                 f"terminal {terminal_id} has an open callback-recovery operation"
             )
+        generation = observed.get("generation")
         return _delete_terminal_claimed(
             terminal_id,
             registry=registry,
-            expected_generation=observed.get("generation"),
-            expected_session=expected_session or observed.get("tmux_session"),
+            expected_generation=generation,
+            # A legacy/v1 row has no model generation.  Its exact authority
+            # is the session+pane observation rechecked above while holding
+            # the lifecycle/session claims.  Passing a session without a
+            # generation into the lower-level generic delete is deliberately
+            # refused as ID-only destruction, so do not discard the stronger
+            # pane-fenced proof by translating it into that weaker shape.
+            expected_session=(
+                (expected_session or observed.get("tmux_session"))
+                if generation is not None
+                else None
+            ),
             backend_already_closed=backend_already_closed,
             unregister_inbox=unregister_inbox,
         )
