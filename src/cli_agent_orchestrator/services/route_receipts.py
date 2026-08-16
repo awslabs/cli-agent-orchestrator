@@ -51,7 +51,7 @@ ROUTE_RECEIPT_SCHEMA = "cao-route-receipt-v1"
 _CAPABILITY_PROVIDER = {"codex": "codex", "kimi_cli": "kimi", "claude_code": "claude"}
 
 # The provider wire protocol each managed bridge speaks (receipt field).
-_PROTOCOL_VERSION = {"codex": "app-server/1", "kimi_cli": "acp/1"}
+_PROTOCOL_VERSION = {"codex": "app-server/1", "kimi_cli": "acp/1", "claude_code": "stream-json/1"}
 
 
 class RouteReceiptError(RuntimeError):

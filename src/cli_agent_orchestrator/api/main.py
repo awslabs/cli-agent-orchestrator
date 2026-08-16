@@ -1952,6 +1952,12 @@ async def managed_launch_capabilities(
         # must negotiate this exact capability before sending route fields;
         # an older fork would otherwise ignore them and run Anthropic.
         "glm_route_envelope": True,
+        # Managed DeepSeek ACP is the same shape of closed route envelope
+        # on the v1 bridged surface: a conductor must negotiate this exact
+        # capability before sending provider_route='deepseek', because an
+        # older fork would ignore the field and run the pinned Claude
+        # binary on its default Anthropic path.
+        "deepseek_acp_route_envelope": True,
         "bridge_environment_inventory": "names-only-sha256",
         "post_allocation_bridge_failure_finalization": True,
         "launch_failure_evidence_schema": "cao-managed-bridge-launch-failure-v1",

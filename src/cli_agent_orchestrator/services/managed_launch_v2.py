@@ -108,6 +108,7 @@ logger = logging.getLogger(__name__)
 _READINESS_RECEIPT_KINDS = {
     "codex": "codex-thread-start",
     "kimi_cli": "kimi-acp-session-new",
+    "claude_code": "claude-session-start",
 }
 
 

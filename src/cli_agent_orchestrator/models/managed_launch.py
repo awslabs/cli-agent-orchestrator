@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import Literal, Optional, TypeAlias
+from typing import Any, Literal, Optional, TypeAlias
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -73,6 +73,19 @@ class ManagedLaunchReserveRequest(BaseModel):
             "unspecified",
         ]
     ] = None
+    #: The explicit provider route for this reservation.  ``anthropic`` is
+    #: the historical default and names no route envelope; ``deepseek``
+    #: names the managed DeepSeek ACP route, which requires a validated
+    #: wrapper/inner route envelope.  A caller that never heard of the
+    #: field behaves exactly as before, and an older fork that ignores it
+    #: would silently run Anthropic — which is why a conductor must
+    #: negotiate the companion capability before sending it.
+    provider_route: Literal["anthropic", "deepseek"] = "anthropic"
+    #: The path-only, digest-bound wrapper/inner route envelope, valid
+    #: only for ``provider_route='deepseek'``.  Never carries credential
+    #: bytes: only canonical paths, digests, and the token/marker
+    #: topology names.
+    route_envelope: Optional[dict[str, Any]] = None
 
     @field_validator("reservation_id")
     @classmethod

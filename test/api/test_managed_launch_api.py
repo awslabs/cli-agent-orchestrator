@@ -91,9 +91,10 @@ def test_capability_handshake_is_exact_and_versioned(client, monkeypatch):
         "native_bind_not_ready_status": 425,
         "native_bind_not_ready_reason": "bind-bridge-not-durably-ready",
         "trusted_project_root_providers": ["codex"],
-        "readiness_providers": ["codex", "kimi_cli"],
+        "readiness_providers": ["claude_code", "codex", "kimi_cli"],
         "execution_mode_selection": True,
         "glm_route_envelope": True,
+        "deepseek_acp_route_envelope": True,
         # Only the modes this surface can actually run. Native TUI is
         # absent until a native launch branch exists, so a consumer that
         # gates a native claim on this list is fail-closed by default.

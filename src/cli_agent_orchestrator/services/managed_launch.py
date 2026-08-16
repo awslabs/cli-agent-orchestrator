@@ -118,7 +118,13 @@ SUPPORTED_EXECUTION_MODES: tuple[str, ...] = (em.ACP,)
 
 #: Request keys introduced after this surface shipped.  A reservation
 #: written before they existed simply has no such key.
-_ADDITIVE_REQUEST_KEYS = ("execution_mode", "worker_class")
+_ADDITIVE_REQUEST_KEYS = ("execution_mode", "worker_class", "provider_route", "route_envelope")
+
+#: The subset of additive keys the execution-mode contract shipped with.
+#: The legacy projection answers "did this row predate the *mode*
+#: contract", so a modern row (which also carries provider-route keys)
+#: whose mode keys were dropped still reads as legacy ACP.
+_MODE_REQUEST_KEYS = ("execution_mode", "worker_class")
 
 
 def _resolve_execution_mode(
@@ -169,7 +175,7 @@ def _mode_projection(request: Any) -> dict[str, Any]:
     contract" from "the caller named nothing", which resolve to the same
     mode by different routes.
     """
-    if not isinstance(request, dict) or not any(k in request for k in _ADDITIVE_REQUEST_KEYS):
+    if not isinstance(request, dict) or not any(k in request for k in _MODE_REQUEST_KEYS):
         return {
             "execution_mode": em.ACP,
             "execution_mode_source": em.SOURCE_LEGACY,
@@ -215,8 +221,18 @@ def _request_matches(stored_json: str, incoming: dict[str, Any]) -> bool:
         return False
     normalized = dict(stored)
     for key in _ADDITIVE_REQUEST_KEYS:
-        if key not in normalized and incoming.get(key) is None:
-            normalized[key] = None
+        if key not in normalized:
+            if key in {"provider_route", "route_envelope"}:
+                # Rows created before route envelopes existed are the
+                # historical Anthropic/default form.  Preserve idempotent
+                # replay for that form while refusing every explicit
+                # DeepSeek replay against an old row.
+                if key == "provider_route" and incoming.get(key) == "anthropic":
+                    normalized[key] = "anthropic"
+                elif key == "route_envelope" and incoming.get(key) is None:
+                    normalized[key] = None
+            elif incoming.get(key) is None:
+                normalized[key] = None
     return _canonical_json(normalized) == _canonical_json(incoming)
 
 
@@ -291,10 +307,12 @@ def _assert_bound_evidence(row: Any, evidence: dict[str, Any]) -> None:
 _READINESS_RECEIPT_KINDS = {
     "codex": "codex-thread-start",
     "kimi_cli": "kimi-acp-session-new",
+    "claude_code": "claude-session-start",
 }
 _SUBMISSION_RECEIPT_KINDS = {
     "codex": "codex-turn-start",
     "kimi_cli": "kimi-session-update",
+    "claude_code": "claude-turn-start",
 }
 
 #: The providers *this* surface can prove readiness for, derived from the
@@ -457,10 +475,36 @@ def _validate_request_identity(request: ManagedLaunchReserveRequest) -> dict[str
         provider_contracts.validate_route_effort(request.expected_model, request.expected_effort)
     except provider_contracts.ProviderContractError as exc:
         raise ManagedLaunchConflict(str(exc)) from exc
+    # The provider route is validated closed before the payload is built:
+    # a DeepSeek route without a proven wrapper/inner/token topology would
+    # otherwise become a durable reservation whose launch can only fail
+    # (or silently run Anthropic) later.
+    from cli_agent_orchestrator.services import deepseek_acp_route
+
+    try:
+        route_envelope = deepseek_acp_route.validate_envelope(
+            provider=request.provider,
+            provider_route=request.provider_route,
+            expected_model=request.expected_model,
+            working_directory=request.working_directory,
+            provider_executable=request.provider_executable,
+            provider_executable_sha256=request.provider_executable_sha256,
+            envelope=request.route_envelope,
+            check_files=True,
+        )
+    except deepseek_acp_route.DeepSeekRouteError as exc:
+        raise ManagedLaunchConflict(str(exc)) from exc
+    if request.provider_route == "anthropic" and request.expected_model.startswith("deepseek"):
+        raise ManagedLaunchConflict(
+            "a deepseek model requires provider_route='deepseek' with a route envelope"
+        )
     # Resolved and admitted before the payload is built, so an
     # unsupported or contradictory mode fails with nothing persisted.
     _resolve_execution_mode(request)
-    return request.model_dump(mode="json")
+    payload = request.model_dump(mode="json")
+    payload["provider_route"] = request.provider_route
+    payload["route_envelope"] = route_envelope
+    return payload
 
 
 def _allocate_terminal_id(db) -> str:
@@ -1912,6 +1956,12 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             "working_directory": record["working_directory"],
             "provider_executable": provider_executable,
             "provider_executable_sha256": provider_digest,
+            # The validated provider route crosses the boundary with the
+            # request it was admitted from: the bridge derives the bounded
+            # conductor route environment from the envelope and never from
+            # ambient server credentials or PATH.
+            "provider_route": request.get("provider_route", "anthropic"),
+            "route_envelope": request.get("route_envelope"),
             "project": request["project"],
             "task_id": request["task_id"],
             "delivery_id": request["delivery_id"],
