@@ -141,7 +141,23 @@ class StatusMonitor:
           resumed) and at quiescence (output stopped) — see
           _schedule_screen_detection.
         """
-        provider = provider_manager.get_provider(terminal_id)
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except ValueError:
+            # harness-control#890 (TOCTOU crash-harden): the terminal was deleted between this
+            # output event being enqueued and now -- a normal race during session teardown / phantom
+            # reap, where `get_provider` finds no metadata row and raises "Terminal X not found in
+            # database". There is nothing left to detect or publish for a gone terminal, so drop the
+            # chunk quietly. Previously this propagated to the loop's generic handler and surfaced as
+            # a full `logger.exception` stack trace once per buffered chunk of every just-deleted
+            # terminal -- pure noise that looked like a fault. Any non-ValueError (e.g.
+            # KiroPhase0KASError) still propagates unchanged.
+            logger.debug(
+                "StatusMonitor: terminal %s vanished before status detection (TOCTOU); "
+                "dropping its output chunk",
+                terminal_id,
+            )
+            return
         use_screen = (
             CAO_PYTE_STATUS
             and provider is not None

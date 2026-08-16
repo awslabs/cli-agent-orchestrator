@@ -759,8 +759,15 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = True
         return True
 
-    async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
+    async def wait_until_input_ready(self, timeout: Optional[float] = None) -> bool:
         """Settle-check readiness gate for the Ink input box.
+
+        harness-control#890: the base settle budget is configurable via
+        ``CAO_INPUT_READY_TIMEOUT`` (default 5.0s) and is scaled UP under CPU load by
+        ``load_scaled_timeout`` -- an Ink renderer painting startup content on an oversubscribed
+        box legitimately needs more than 5s to go quiet, and this gate never fails init (a timeout
+        just logs and proceeds), so extending it only reduces dropped-first-keystroke races, it can
+        never route to teardown. Pass an explicit ``timeout`` to override (tests).
 
         The new-TUI input box matching NEW_TUI_BOX_PATTERN appears one render
         pass before the widget accepts keystrokes. Require the rendered pane
@@ -772,6 +779,10 @@ class ClaudeCodeProvider(BaseProvider):
         Uses capture-pane (rendered screen) rather than the pipe-pane buffer:
         stability of the RENDERED output is the actual readiness signal.
         """
+        if timeout is None:
+            from cli_agent_orchestrator.providers.base import _env_float, load_scaled_timeout
+
+            timeout = load_scaled_timeout(_env_float("CAO_INPUT_READY_TIMEOUT", 5.0))
         poll = 0.5
         deadline = time.monotonic() + timeout
         previous: Optional[str] = None
