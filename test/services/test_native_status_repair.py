@@ -4109,3 +4109,36 @@ def test_provider_without_a_pinned_barrier_keeps_its_existing_behaviour(
 
     assert outcome["status"] == "repaired"
     assert outcome["native_session_id"] == SESSION_ID
+
+
+def test_deadline_cut_observation_is_unknown_not_unsubmitted(isolated_memory_db, harness):
+    """A window cut by the deadline classifies ``unknown``, never ``unsubmitted``.
+
+    Deliberately runs WITHOUT the ``fast_barrier`` fixture: the sandbox pins
+    the pane-ready timeout well below the barrier's own bound, so the
+    post-Enter window is cut short and nothing about what the composer did
+    can be classified.  Both classifications refuse identically, which is
+    exactly why the distinction needs its own test -- collapsing them would
+    turn "we could not look" into the positive sighting "it did not submit",
+    and no assertion on the refusal reason alone would notice.
+    """
+    harness.screens.append(codex_panel_rows())
+    harness.composer_keeps_text = True
+    _seed_all("codex")
+
+    op = _uuid()
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CODEX_VERSION,
+        operation_id=op,
+    )
+
+    assert outcome["status"] == nsr.STATUS_REFUSED
+    assert outcome["reason"] == "submission-unproven"
+    assert "(unknown)" in outcome["detail"]
+    assert "(unsubmitted)" not in outcome["detail"]
+
+    journal = _attempt(op)
+    assert journal["status"] == nsr.OBSERVATION_ATTEMPTED
+    assert journal["status_action_count"] == 0

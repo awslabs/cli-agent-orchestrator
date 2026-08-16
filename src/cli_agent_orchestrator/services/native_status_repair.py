@@ -4,8 +4,10 @@ A missing native session id is repairable metadata, not a reason to throw
 away the worker's conversation.  This is the bounded M3-A health
 operation: for one *currently live, rostered* terminal, prove the exact
 stored pane/session/window/process identity is live and the provider
-composer is idle, type literal ``/status`` and one Enter exactly once,
-parse only the *panel-attested branded* provider/build identity fields,
+composer is idle, type literal ``/status`` and *at most* one Enter — the
+Enter is withheld entirely where a pinned submission barrier cannot first
+prove the text reached the composer — parse only the *panel-attested
+branded* provider/build identity fields,
 persist the repaired identity atomically, and leave an exclusive
 ``NativeSessionAttachmentModel`` owner for the exact running pane.
 
@@ -1739,7 +1741,7 @@ def _claim_observation_attempt(
 
 
 def _record_observation_submitted(operation_id: str) -> None:
-    """Confirm the sole /status action was submitted (Enter succeeded).
+    """Record that the sole /status action was submitted.
 
     Best-effort: the conservative no-resend rule holds even if this write
     fails (the attempt row still exists); a failure merely degrades the
@@ -2518,7 +2520,9 @@ def _repair_under_claims(
             composer_restored=prior.get("composer_restored"),
         )
 
-    # The one observation: literal /status and exactly one Enter.  The
+    # The one observation: literal /status and AT MOST one Enter — a pinned
+    # submission barrier withholds it entirely when the text is never proven
+    # to have reached the composer, so zero Enters is a legal outcome.  The
     # observation-attempt journal is the at-most-once barrier at the actual
     # byte seam: exactly one caller may claim the attempt; a loser observes
     # the journal and returns a typed outcome with zero bytes (never a
