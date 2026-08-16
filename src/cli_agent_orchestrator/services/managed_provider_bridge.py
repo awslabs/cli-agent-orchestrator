@@ -2770,20 +2770,28 @@ class _ProviderSession:
                 start_index=start_index,
                 timeout=30.0,
             )
-            result = self.rpc.wait_response(request_id, timeout=30 * 24 * 60 * 60)
+            journal.transition(
+                operation_id,
+                CONTROL_ACCEPTED,
+                evidence_digest=_digest(params),
+            )
+            result = self.rpc.wait_response(request_id, timeout=15 * 60)
             journal.transition(
                 operation_id,
                 CONTROL_COMPLETED,
                 result=result,
-                evidence_digest=_digest({"request": params, "response": result}),
+                evidence_digest=_digest(result),
             )
-        except Exception as exc:  # noqa: BLE001 - the control surface reports loss
-            journal.transition(
-                operation_id,
-                CONTROL_AMBIGUOUS,
-                reason_code="compact_outcome_ambiguous",
-                reason_detail=str(exc),
-            )
+        except Exception as exc:  # noqa: BLE001 - journal exact uncertainty
+            current = journal.get(operation_id)
+            if current["state"] in {CONTROL_SUBMITTED, CONTROL_ACCEPTED}:
+                with contextlib.suppress(Exception):
+                    journal.transition(
+                        operation_id,
+                        CONTROL_AMBIGUOUS,
+                        reason_code="compact_outcome_ambiguous",
+                        reason_detail=str(exc),
+                    )
         finally:
             with self._active_prompt_lock:
                 if self._active_prompt_request_id == request_id:
