@@ -163,6 +163,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.ANTIGRAVITY_CLI.value,
     ProviderType.OMP.value,
     ProviderType.GROK_CLI.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native
@@ -172,6 +173,7 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
     ProviderType.OMP.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 
@@ -1238,7 +1240,10 @@ def send_input(
         # IDLE/COMPLETED). Without this, sticky ready-status would block
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
-        status_monitor.notify_input_sent(terminal_id)
+        if provider and provider.assume_processing_on_dispatch is True:
+            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+        else:
+            status_monitor.notify_input_sent(terminal_id)
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED

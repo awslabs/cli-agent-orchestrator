@@ -207,7 +207,7 @@ CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, 
 | `fs_list` | `Glob`, `Grep` | `list`, `grep` | `Grep`, `Glob` |
 | `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) | `WebFetch`, `WebSearch` + disabled web search |
 
-**Providers that accept CAO vocabulary directly** — Kiro CLI accepts `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI and Codex use system prompt instructions to enforce restrictions. For all three, CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
+**Providers that accept CAO vocabulary directly** — Kiro CLI accepts `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI, MiniMax Code, and Codex use system prompt instructions to enforce restrictions. CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
 
 ## How Overrides Work
 
@@ -253,6 +253,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **OpenCode CLI** | Hard | `permission:` YAML frontmatter enforced natively at install time |
 | **Grok Build CLI** | Native (mapped families) | Restricted profiles use deny-by-default `--permission-mode dontAsk` with explicit native/MCP allows and defense-in-depth denies; native subagents are disabled |
 | **Kimi CLI** | Soft | Security system prompt only |
+| **MiniMax Code** | Soft | Security bootstrap prompt only |
 | **Codex** | Soft | Security system prompt only |
 | **Antigravity CLI** | Soft | Security system prompt only |
 | **Hermes** | Profile-defined | CAO launches default `hermes` or the optional `hermesProfile` wrapper declared by the CAO profile; restrict tools in that Hermes profile |
@@ -307,7 +308,7 @@ separate from `allowedTools`, including `allowedTools: ["*"]`.
 See the [Grok Build CLI provider guide](grok-cli.md#tool-restrictions) for the
 complete mapping and isolation behavior.
 
-**Kimi CLI / Codex** — Prepends to the system prompt:
+**Kimi CLI / MiniMax Code / Codex** — Prepends to the system or bootstrap prompt:
 ```
 You may ONLY use these tools: @cao-mcp-server, fs_read, fs_list
 Do NOT attempt to use: execute_bash, fs_write
@@ -351,7 +352,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 2. **Don't use `--yolo` in production.** It grants unrestricted access and skips all safety prompts.
 3. **Prefer hard-enforcement providers** (Claude Code, Kiro CLI, Copilot CLI) for sensitive workloads.
 4. **Review the confirmation prompt.** It shows exactly what tools are allowed and blocked before you proceed.
-5. **Kimi CLI and Codex use soft enforcement** — use these only for non-critical tasks.
+5. **Kimi CLI, MiniMax Code, and Codex use soft enforcement** — use these only for non-critical tasks.
 
 ## Known Limitations
 
@@ -359,7 +360,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 2. **`@cao-mcp-server` is server-level, not per-tool control.** Grok restricted profiles translate it to an allow rule for the configured CAO MCP server; other providers generally treat it as an intent marker. No provider currently blocks individual MCP tools: once the server is available, its `handoff`, `assign`, `send_message`, and `answer_user_prompt` tools are all available. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
 
-3. **Soft enforcement is best-effort.** Kimi CLI and Codex rely on system prompt instructions to restrict tools. The agent may ignore these restrictions. Do not rely on soft enforcement for security-critical workloads.
+3. **Soft enforcement is best-effort.** Kimi CLI, MiniMax Code, and Codex rely on prompt instructions to restrict tools. The agent may ignore these restrictions. Do not rely on soft enforcement for security-critical workloads.
 
 ## Example Profiles
 

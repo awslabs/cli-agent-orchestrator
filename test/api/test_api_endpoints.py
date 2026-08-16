@@ -136,6 +136,7 @@ class TestAgentProviders:
         assert "antigravity_cli" in names
         assert "omp" in names
         assert "grok_cli" in names
+        assert "minimax_code" in names
         for p in data:
             assert p["installed"] is True
 
@@ -168,6 +169,7 @@ class TestAgentProviders:
         assert providers_dict["copilot_cli"]["installed"] is False
         assert providers_dict["opencode_cli"]["installed"] is False
         assert providers_dict["grok_cli"]["installed"] is False
+        assert providers_dict["minimax_code"]["installed"] is False
 
     def test_list_providers_has_binary_field(self, client):
         """Each provider entry has correct binary name."""
@@ -185,6 +187,7 @@ class TestAgentProviders:
         assert providers_dict["antigravity_cli"]["binary"] == "agy"
         assert providers_dict["omp"]["binary"] == "omp"
         assert providers_dict["grok_cli"]["binary"] == "grok"
+        assert providers_dict["minimax_code"]["binary"] == "mcode"
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────

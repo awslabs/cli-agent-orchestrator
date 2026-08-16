@@ -72,6 +72,7 @@ Provider support for pass-through fields differs. Use the focused guides for
 [Kiro CLI](kiro-cli.md), [Claude Code](claude-code.md),
 [Codex CLI](codex-cli.md), [Antigravity CLI](antigravity-cli.md),
 [Hermes](hermes.md), [Kimi CLI](kimi-cli.md),
+[MiniMax Code](minimax-code.md),
 [GitHub Copilot CLI](copilot-cli.md), [OpenCode CLI](opencode-cli.md),
 [Cursor CLI](cursor-cli.md), and [Grok Build CLI](grok-cli.md) instead of
 relying on a duplicated compatibility catalog here.

@@ -173,6 +173,41 @@ def require_grok(require_cao_server: CaoServer):
             shutil.copy2(source, target)
 
 
+@pytest.fixture()
+def require_minimax_code(require_cao_server: CaoServer):
+    """Skip unless MiniMax Code is installed and has reusable local authentication."""
+    if not _cli_available("mcode"):
+        pytest.skip("MiniMax Code CLI not installed; see docs/minimax-code.md for installation")
+
+    configured = os.environ.get("MINIMAX_DATA_DIR", "").strip()
+    source_home = Path(configured).expanduser() if configured else Path.home() / ".minimax"
+    auth_names = ("config.yaml", "local-runtime.auth.json", "cli-auth")
+    if not any((source_home / name).exists() for name in auth_names):
+        pytest.skip("MiniMax Code is installed but not authenticated; run `mcode login`")
+
+    isolated_home = require_cao_server.home_dir / ".minimax"
+    isolated_home.mkdir(mode=0o700, exist_ok=True)
+    for name in ("config.yaml", "local-runtime.auth.json"):
+        source = source_home / name
+        target = isolated_home / name
+        if source.is_file() and not target.exists():
+            shutil.copy2(source, target)
+            target.chmod(0o600)
+    source_cli_auth = source_home / "cli-auth"
+    target_cli_auth = isolated_home / "cli-auth"
+    if source_cli_auth.is_dir() and not target_cli_auth.exists():
+        shutil.copytree(source_cli_auth, target_cli_auth)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    isolated_store = require_cao_server.home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    isolated_store.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for profile_name in ("analysis_supervisor", "data_analyst", "report_generator"):
+        source = repo_root / "examples" / "assign" / f"{profile_name}.md"
+        target = isolated_store / f"{profile_name}.md"
+        if not target.exists():
+            shutil.copy2(source, target)
+
+
 def create_terminal(
     provider: str,
     agent_profile: str,

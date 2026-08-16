@@ -251,6 +251,17 @@ class BaseProvider(ABC):
         return False
 
     @property
+    def assume_processing_on_dispatch(self) -> bool:
+        """Publish PROCESSING immediately when a task is dispatched.
+
+        Most CLIs repaint quickly enough for their first activity frame to
+        drive the transition. Full-screen TUIs that can remain visually
+        unchanged just after submission opt in so callers cannot observe the
+        previous turn's cached COMPLETED state as the new turn's result.
+        """
+        return False
+
+    @property
     def extraction_retries(self) -> int:
         """Number of extraction retries for transient TUI rendering issues.
 

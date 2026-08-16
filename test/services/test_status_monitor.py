@@ -181,6 +181,15 @@ class TestStickyLatching:
         m.feed(TerminalStatus.PROCESSING)  # post-completion eviction flap
         assert m.status() == TerminalStatus.COMPLETED
 
+    def test_dispatch_can_publish_processing_before_first_tui_redraw(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+
+        m.sm.notify_input_sent("t1", assume_processing=True)
+
+        assert m.status() == TerminalStatus.PROCESSING
+        assert m.sm._allow_processing_revert["t1"] is False
+
     def test_arm_survives_ready_to_ready_flap(self):
         """A large paste can evict the response markers BEFORE the agent
         starts working, flapping COMPLETED → IDLE. That flap must not consume
