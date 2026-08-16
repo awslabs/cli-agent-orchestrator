@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -268,6 +268,23 @@ def _require(flag: bool, detail: str) -> None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
 
+def _projected(operation: Dict[str, Any]) -> Dict[str, Any]:
+    """Answer with the full durable projection, not the bare operation row.
+
+    The executors return the operation row alone, which carries no members,
+    transitions, or derived provenance. Every caller of these routes — the
+    dashboard's outcome list, the CLI's renderer, an operator deciding whether
+    to retry — needs exactly those, and a caller that has to issue a second
+    GET to find out what its own write did will sometimes not bother.
+    """
+    try:
+        return cast(Dict[str, Any], cohort.get_operation(operation["operation_id"]))
+    except cohort.CohortJournalError:
+        # The write is already durable; a failed re-read must not turn a
+        # successful operation into an error the operator retries.
+        return operation
+
+
 def _operator(body: CohortBody, session_name: str) -> cohort_operations.OperatorRequest:
     try:
         return cohort_operations.OperatorRequest(
@@ -294,14 +311,16 @@ async def cohort_pause_safe(
     """
     request = _operator(body, session_name)
     try:
-        return await asyncio.to_thread(
-            cohort_operations.pause_safe,
-            request,
-            drain_receipt_digest=body.drain_receipt_digest,
-            member_results=[
-                cohort.MemberResult(operation_id=body.operation_id, **member.model_dump())
-                for member in body.members
-            ],
+        return _projected(
+            await asyncio.to_thread(
+                cohort_operations.pause_safe,
+                request,
+                drain_receipt_digest=body.drain_receipt_digest,
+                member_results=[
+                    cohort.MemberResult(operation_id=body.operation_id, **member.model_dump())
+                    for member in body.members
+                ],
+            )
         )
     except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
         raise _cohort_http(exc)
@@ -327,7 +346,7 @@ async def cohort_pause_force(
     )
     request = _operator(body, session_name)
     try:
-        return await asyncio.to_thread(cohort_operations.pause_force, request)
+        return _projected(await asyncio.to_thread(cohort_operations.pause_force, request))
     except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
         raise _cohort_http(exc)
 
@@ -351,10 +370,12 @@ async def cohort_stop_safe(
     )
     request = _operator(body, session_name)
     try:
-        return await asyncio.to_thread(
-            cohort_operations.stop_safe,
-            request,
-            drain_receipt_digest=body.drain_receipt_digest,
+        return _projected(
+            await asyncio.to_thread(
+                cohort_operations.stop_safe,
+                request,
+                drain_receipt_digest=body.drain_receipt_digest,
+            )
         )
     except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
         raise _cohort_http(exc)
@@ -384,7 +405,7 @@ async def cohort_stop_force(
     )
     request = _operator(body, session_name)
     try:
-        return await asyncio.to_thread(cohort_operations.stop_force, request)
+        return _projected(await asyncio.to_thread(cohort_operations.stop_force, request))
     except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
         raise _cohort_http(exc)
 
@@ -406,7 +427,7 @@ async def cohort_resume_paused(
     """
     request = _operator(body, session_name)
     try:
-        return await cohort_operations.resume_paused(request)
+        return _projected(await cohort_operations.resume_paused(request))
     except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
         raise _cohort_http(exc)
 
@@ -430,7 +451,34 @@ async def cohort_resume_start(
     """
     request = _operator(body, session_name)
     try:
-        return await cohort_operations.resume_and_start(request)
+        return _projected(await cohort_operations.resume_and_start(request))
+    except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
+        raise _cohort_http(exc)
+
+
+@router.post("/sessions/{session_name}/cohort/resume/retry")
+async def cohort_resume_retry(
+    session_name: str,
+    body: CohortBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Continue a Resume that stopped in ``reconciliation-required``.
+
+    The recovery path for the two ways a Resume stops short — a member whose
+    physical result was ambiguous, and a wake that did not land. Both leave
+    real state behind, so the repair finishes *this* operation rather than
+    starting a second one: no new boundary claim, no re-observed roster, no
+    second barrier release, and no re-restore of a member that already has a
+    decided outcome.
+
+    ``operation_id`` names the operation being continued rather than minting
+    one, and it is admin-scoped like every other Resume. Without this route an
+    operator's only escape from reconciliation was to force-Stop a fleet that
+    was, in most cases, already back and running.
+    """
+    request = _operator(body, session_name)
+    try:
+        return _projected(await cohort_operations.resume_retry(request))
     except (cohort.CohortJournalError, cohort_operations.CohortOperationError) as exc:
         raise _cohort_http(exc)
 

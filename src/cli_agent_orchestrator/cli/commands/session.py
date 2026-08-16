@@ -584,6 +584,20 @@ def _render_operation(record: dict) -> None:
                 f"  {item['terminal_id'] or '-':<12} {item['harness'] or '-':<14} "
                 f"{item['final_state']}"
             )
+    for retry in provenance.get("retries") or []:
+        click.echo(
+            f"\nretried by {retry['actor']} at {retry['created_at']} "
+            f"(receipt {str(retry.get('receipt_digest'))[:12]}…)"
+        )
+    if provenance.get("retryable"):
+        # Never let an unfinished operation read as a finished one. The
+        # reason and the exact retry command are printed together because an
+        # operator who cannot see how to continue reaches for force-Stop.
+        click.echo(f"\nNOT FINISHED: {provenance.get('reconciliation_reason') or record['state']}")
+        click.echo(
+            f"  continue it:  cao session cohort resume-retry "
+            f"{provenance.get('session_name')} --operation {record['operation_id']} --by <you>"
+        )
 
 
 @session.group(name="cohort")
@@ -726,6 +740,37 @@ def cohort_resume_start(session_name, initiated_by, reason, as_json):
     came back with one worker missing still starts, and still says so.
     """
     record = _cohort_post(session_name, "resume", "start", initiated_by=initiated_by, reason=reason)
+    click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)
+
+
+@session_cohort.command(name="resume-retry")
+@click.argument("session_name")
+@click.option(
+    "--operation",
+    "operation_id",
+    required=True,
+    help="The Resume operation to continue. `cao session cohort list` shows it.",
+)
+@click.option("--by", "initiated_by", required=True)
+@click.option("--reason", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def cohort_resume_retry(session_name, operation_id, initiated_by, reason, as_json):
+    """Continue a Resume that stopped needing reconciliation.
+
+    For the two ways a Resume stops short: a member whose result was
+    ambiguous, and a supervisor wake that did not land. Both leave panes that
+    already came back, so this finishes the same operation instead of starting
+    a second one — no member that already has a decided outcome is touched,
+    and the supervisor is not woken twice.
+    """
+    record = _cohort_post(
+        session_name,
+        "resume",
+        "retry",
+        operation_id=operation_id,
+        initiated_by=initiated_by,
+        reason=reason,
+    )
     click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)
 
 

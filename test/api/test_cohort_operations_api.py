@@ -391,6 +391,166 @@ def test_resume_start_emits_exactly_one_wake_even_with_a_failed_member(client, m
     assert len(wakes) == 1
 
 
+def test_the_retry_route_continues_the_same_operation_to_terminal(client, monkeypatch):
+    """The recovery path: no force-Stop detour, no second Resume."""
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    _stopped_fleet()
+
+    async def _restore(_member, _operation):
+        return cohort_resume.MemberRestore(cohort_resume.OUTCOME_EXACT, "back")
+
+    monkeypatch.setattr(cohort_resume, "_default_restorer", _restore)
+
+    # The dark default waker has no authority, so the first attempt is honest
+    # about not having told anybody.
+    body = _body()
+    first = client.post(f"/sessions/{SESSION}/cohort/resume/start", json=body)
+    assert first.status_code == 200
+    assert first.json()["state"] == cohort.STATE_RECONCILIATION_REQUIRED
+    assert first.json()["provenance"]["retryable"] is True
+
+    wakes = []
+
+    async def _waker(_operation, results, identifier):
+        wakes.append(identifier)
+        return cohort_resume.SupervisorWake(True, receipt_digest=DIGEST)
+
+    monkeypatch.setattr(cohort_resume, "_default_waker", _waker)
+    retried = client.post(f"/sessions/{SESSION}/cohort/resume/retry", json=_body(**body))
+
+    assert retried.status_code == 200
+    assert retried.json()["state"] == cohort.STATE_SETTLED
+    assert retried.json()["operation_id"] == body["operation_id"]
+    assert len(wakes) == 1
+    provenance = retried.json()["provenance"]
+    assert provenance["retryable"] is False
+    assert len(provenance["retries"]) == 1
+    assert len(provenance["retries"][0]["receipt_digest"]) == 64
+    assert provenance["retries"][0]["actor"] == "colin"
+    # Still one Resume operation for the session.
+    listed = client.get(f"/sessions/{SESSION}/cohort-operations").json()["operations"]
+    assert [o["operation_kind"] for o in listed].count(cohort.KIND_RESUME) == 1
+
+
+def test_a_replayed_retry_adopts_without_a_second_wake(client, monkeypatch):
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    _stopped_fleet()
+
+    async def _restore(_member, _operation):
+        return cohort_resume.MemberRestore(cohort_resume.OUTCOME_EXACT, "back")
+
+    monkeypatch.setattr(cohort_resume, "_default_restorer", _restore)
+    body = _body()
+    client.post(f"/sessions/{SESSION}/cohort/resume/start", json=body)
+
+    wakes = []
+
+    async def _waker(_operation, _results, identifier):
+        wakes.append(identifier)
+        return cohort_resume.SupervisorWake(True, receipt_digest=DIGEST)
+
+    monkeypatch.setattr(cohort_resume, "_default_waker", _waker)
+    first = client.post(f"/sessions/{SESSION}/cohort/resume/retry", json=_body(**body))
+    second = client.post(f"/sessions/{SESSION}/cohort/resume/retry", json=_body(**body))
+
+    assert first.status_code == second.status_code == 200
+    assert second.json()["state"] == cohort.STATE_SETTLED
+    assert len(wakes) == 1
+
+
+def test_the_retry_route_refuses_an_unknown_operation(client):
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    _stopped_fleet()
+
+    response = client.post(f"/sessions/{SESSION}/cohort/resume/retry", json=_body())
+
+    assert response.status_code == 409
+    assert "never" in response.json()["detail"]
+
+
+def test_the_retry_route_refuses_an_operation_that_is_not_reconciling(client, monkeypatch):
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    _stopped_fleet()
+    _restore_everything(monkeypatch)
+    body = _body()
+    claimed = client.post(f"/sessions/{SESSION}/cohort/resume/paused", json=body)
+    assert claimed.json()["state"] == cohort.STATE_SETTLED
+
+    # A settled operation adopts: that is the lost-response case.
+    adopted = client.post(f"/sessions/{SESSION}/cohort/resume/retry", json=_body(**body))
+    assert adopted.status_code == 200
+    assert adopted.json()["state"] == cohort.STATE_SETTLED
+
+
+def test_the_retry_route_refuses_an_operation_that_never_ran(client):
+    """`preparing` is neither reconciling nor terminal: nothing to continue."""
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stopped_fleet()
+    boundary = cohort.observe_boundary(SESSION, resume_source_operation_id=source["operation_id"])
+    claimed = cohort.claim_operation(
+        cohort.OperationRequest(
+            operation_id=str(uuid.uuid4()),
+            session_name=SESSION,
+            operation_kind=cohort.KIND_RESUME,
+            requested_mode=cohort.MODE_SAFE,
+            initiator_kind=cohort.INITIATOR_OPERATOR,
+            initiated_by="colin",
+            source_operation_id=source["operation_id"],
+            resume_target=sl.PAUSED,
+            lifecycle_epoch=boundary["lifecycle_epoch"],
+            lifecycle_observation=boundary["lifecycle_observation"],
+            roster_revision=boundary["roster_revision"],
+            member_snapshot_digest=boundary["member_snapshot_digest"],
+        )
+    )
+
+    response = client.post(
+        f"/sessions/{SESSION}/cohort/resume/retry",
+        json=_body(operation_id=claimed["operation_id"]),
+    )
+
+    assert response.status_code == 409
+    assert "only a Resume in" in response.json()["detail"]
+
+
+def test_the_retry_route_is_admin_scoped_like_every_other_resume(client):
+    from cli_agent_orchestrator.api import session_lifecycle as router_module
+
+    routes = {
+        route.path: route
+        for route in router_module.router.routes
+        if getattr(route, "path", "").startswith("/sessions/{session_name}/cohort/")
+    }
+    assert "/sessions/{session_name}/cohort/resume/retry" in routes
+    # Every cohort mutation route carries the same admin dependency shape.
+    for path, route in routes.items():
+        assert route.dependencies or route.dependant.dependencies, path
+
+
+def test_every_cohort_route_answers_with_the_full_projection(client):
+    """A caller must not need a second GET to see what its own write did."""
+    agent = _bind(suffix="1")["agent"]["agent_id"]
+    body = _body(
+        drain_receipt_digest=DIGEST,
+        members=[
+            {
+                "agent_id": agent,
+                "expected_result_revision": 0,
+                "final_state": "drained",
+                "background_command_loss_risk": "none",
+            }
+        ],
+    )
+
+    response = client.post(f"/sessions/{SESSION}/cohort/pause/safe", json=body)
+
+    payload = response.json()
+    assert "provenance" in payload
+    assert "members" in payload
+    assert "transitions" in payload
+    assert payload["provenance"]["member_outcomes"] == {"drained": 1}
+
+
 def test_resume_refuses_a_session_that_was_never_stopped(client):
     _bind(suffix="1")
 

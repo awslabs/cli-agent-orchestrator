@@ -148,6 +148,21 @@ export interface CohortProvenance {
   resume_target: string | null
   member_outcomes: Partial<Record<CohortMemberOutcome, number>>
   continuity: CohortContinuity[]
+  /** True while the operation is in `reconciliation-required` and can be continued. */
+  retryable: boolean
+  /** Every operator retry already performed, each with its opaque receipt. */
+  retries: CohortRetry[]
+  /** The durable reason the last attempt stopped short, if it did. */
+  reconciliation_reason: string | null
+}
+
+export interface CohortRetry {
+  transition_id: string
+  from_state_epoch: number
+  actor: string
+  reason: string | null
+  receipt_digest: string | null
+  created_at: string
 }
 
 export interface CohortOperation {
@@ -850,6 +865,19 @@ export const api = {
   // outcome is durable.
   cohortResumeStart: (name: string, operationId: string, initiatedBy: string, reason?: string) =>
     fetchJSON<CohortOperation>(`/sessions/${encodeURIComponent(name)}/cohort/resume/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      timeoutMs: 180000,
+      body: JSON.stringify({
+        operation_id: operationId, initiated_by: initiatedBy, reason: reason ?? null,
+      }),
+    }),
+  // Continues an EXISTING Resume out of `reconciliation-required`. The
+  // operation id names what to finish rather than minting a new one, which is
+  // what keeps this from being a second Resume: no new boundary, no second
+  // barrier release, no member re-restored that already has a decided outcome.
+  cohortResumeRetry: (name: string, operationId: string, initiatedBy: string, reason?: string) =>
+    fetchJSON<CohortOperation>(`/sessions/${encodeURIComponent(name)}/cohort/resume/retry`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       timeoutMs: 180000,

@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from 'react'
-import { AlertTriangle, Loader2, Pause, Play, Square } from 'lucide-react'
+import { AlertTriangle, Loader2, Pause, Play, RotateCw, Square } from 'lucide-react'
 import {
   api,
   CohortMemberOutcome,
@@ -63,7 +63,9 @@ export interface FleetControlsProps {
   onOperation?: (operation: CohortOperation) => void
 }
 
-type Action = 'pause-force' | 'stop-safe' | 'stop-force' | 'resume-paused' | 'resume-start'
+type Action =
+  | 'pause-force' | 'stop-safe' | 'stop-force'
+  | 'resume-paused' | 'resume-start' | 'resume-retry'
 
 export function outcomeSummary(provenance: CohortProvenance | undefined): {
   total: number
@@ -81,6 +83,26 @@ export function outcomeSummary(provenance: CohortProvenance | undefined): {
     if (!TERMINAL_OUTCOMES.has(state as CohortMemberOutcome)) undecided += n
   }
   return { total, lost, undecided }
+}
+
+/**
+ * Whether this operation actually delivered a supervisor wake.
+ *
+ * The dashboard may only say "the supervisor was told" where that is true,
+ * and there are two distinct ways for it to be false. An operation still in
+ * `reconciliation-required` may have stopped *because* the wake did not land —
+ * so a settled state is required, not merely a set of decided members. And a
+ * Resume-paused never wakes anybody at all by design, so its success must not
+ * borrow Resume-and-start's sentence.
+ *
+ * Reading it off the durable record rather than off which button was clicked
+ * keeps it correct for an operation loaded from the projection later.
+ */
+export function wakeWasDelivered(provenance: CohortProvenance | undefined): boolean {
+  if (!provenance) return false
+  if (provenance.operation_kind !== 'resume') return false
+  if (provenance.resume_target === 'paused') return false
+  return provenance.state === 'settled'
 }
 
 export function FleetControls({
@@ -116,6 +138,10 @@ export function FleetControls({
   }, [mint, onOperation])
 
   const summary = outcomeSummary(result?.provenance)
+  const settled = (result?.provenance?.state ?? result?.state) === 'settled'
+  const told = wakeWasDelivered(result?.provenance)
+  const needsReconciliation =
+    (result?.provenance?.state ?? result?.state) === 'reconciliation-required'
 
   return (
     <div className="flex flex-col gap-3" data-testid="fleet-controls">
@@ -210,18 +236,60 @@ export function FleetControls({
               ))}
             </ul>
           )}
-          {summary.lost > 0 && summary.undecided === 0 && (
+          {/* The success sentence is gated on the wake actually landing, not
+              on the members being decided. An operation that stopped because
+              its wake did not land has decided members and a supervisor that
+              was told nothing. */}
+          {settled && summary.lost > 0 && told && (
             <p className="mt-2 text-xs text-yellow-300">
               The fleet is running. {summary.lost} member
               {summary.lost === 1 ? '' : 's'} did not come back; the supervisor was told.
             </p>
           )}
-          {summary.undecided > 0 && (
-            <p className="mt-2 text-xs text-orange-300">
-              {summary.undecided} member{summary.undecided === 1 ? '' : 's'} have no decided
-              outcome yet — this operation needs reconciliation.
+          {settled && summary.lost > 0 && !told && (
+            <p className="mt-2 text-xs text-yellow-300">
+              The fleet is back and paused. {summary.lost} member
+              {summary.lost === 1 ? '' : 's'} did not come back. Nothing was sent — start it
+              when you are ready.
             </p>
           )}
+          {needsReconciliation && (
+            <div className="mt-2 space-y-2" data-testid="fleet-reconciliation">
+              <p className="text-xs text-orange-300">
+                This Resume did not finish
+                {result.provenance?.reconciliation_reason
+                  ? `: ${result.provenance.reconciliation_reason}.`
+                  : '.'}{' '}
+                {summary.undecided > 0
+                  ? `${summary.undecided} member${summary.undecided === 1 ? '' : 's'} have no
+                     decided outcome yet.`
+                  : 'Its members are decided, but the operation was not completed.'}
+              </p>
+              {summary.lost > 0 && (
+                <p className="text-xs text-gray-300">
+                  {summary.lost} member{summary.lost === 1 ? '' : 's'} did not come back. That
+                  is already decided and will not be retried.
+                </p>
+              )}
+              <button
+                type="button"
+                disabled={busy !== null}
+                onClick={() => run('resume-retry', () =>
+                  api.cohortResumeRetry(sessionName, result.operation_id, operatorName))}
+                className="inline-flex items-center gap-2 rounded-lg bg-orange-700 px-3 py-2 text-xs hover:bg-orange-600 disabled:opacity-50"
+              >
+                {busy === 'resume-retry'
+                  ? <Loader2 size={14} className="animate-spin" />
+                  : <RotateCw size={14} />}
+                Continue this Resume
+              </button>
+            </div>
+          )}
+          {(result.provenance?.retries ?? []).map(retry => (
+            <p key={retry.transition_id} className="mt-1 text-xs text-gray-400">
+              retried by {retry.actor} at {retry.created_at}
+            </p>
+          ))}
         </div>
       )}
     </div>

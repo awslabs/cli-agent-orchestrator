@@ -328,14 +328,9 @@ def _resume_claim(request: OperatorRequest, *, target: str) -> dict[str, Any]:
     )
 
 
-def _resume_request(request: OperatorRequest, operation: Mapping[str, Any]):
-    ids = _transition_ids(request.operation_id, "restore", "commit", "reconcile")
+def _resume_request(request: OperatorRequest) -> cohort_resume.ResumeRequest:
     return cohort_resume.ResumeRequest(
         operation_id=request.operation_id,
-        expected_state_epoch=int(operation["state_epoch"]),
-        restore_transition_id=ids["restore"],
-        commit_transition_id=ids["commit"],
-        reconciliation_transition_id=ids["reconcile"],
         actor=request.initiated_by,
         reason=request.reason,
     )
@@ -368,10 +363,11 @@ def _resume_target(request: OperatorRequest) -> str:
 
 async def resume_paused(request: OperatorRequest, **executor_kwargs: Any) -> dict[str, Any]:
     """Bring the stopped fleet's panes back and leave it paused. Zero input."""
-    operation = _adopted_resume(request) or _resume_claim(request, target=sl.PAUSED)
+    if _adopted_resume(request) is None:
+        _resume_claim(request, target=sl.PAUSED)
     try:
         return await cohort_resume.execute_resume_paused(
-            _resume_request(request, operation), **executor_kwargs
+            _resume_request(request), **executor_kwargs
         )
     except cohort.CohortJournalError as exc:
         raise _translated(exc) from exc
@@ -381,13 +377,47 @@ async def resume_paused(request: OperatorRequest, **executor_kwargs: Any) -> dic
 
 async def resume_and_start(request: OperatorRequest, **executor_kwargs: Any) -> dict[str, Any]:
     """Restore the stopped fleet and wake its supervisor exactly once."""
-    operation = _adopted_resume(request)
-    if operation is None:
-        operation = _resume_claim(request, target=_resume_target(request))
+    if _adopted_resume(request) is None:
+        _resume_claim(request, target=_resume_target(request))
     try:
         return await cohort_resume.execute_resume_and_start(
-            _resume_request(request, operation), **executor_kwargs
+            _resume_request(request), **executor_kwargs
         )
+    except cohort.CohortJournalError as exc:
+        raise _translated(exc) from exc
+    except cohort_resume.CohortResumeError as exc:
+        raise CohortOperationConflict(str(exc)) from exc
+
+
+async def resume_retry(request: OperatorRequest, **executor_kwargs: Any) -> dict[str, Any]:
+    """Continue an existing Resume that stopped in ``reconciliation-required``.
+
+    Requires the operation id, because that is the whole point: this repairs a
+    *named* operation rather than starting a new one. Claiming nothing means
+    the source cohort's membership, the released barrier, and the declared
+    lifecycle all stay exactly as the first attempt left them.
+    """
+    operation = _adopted_resume(request)
+    if operation is None:
+        raise CohortOperationConflict(
+            f"no Resume operation {request.operation_id} is recorded for session "
+            f"{request.session_name}; a retry continues an existing operation and never "
+            "starts one"
+        )
+    if operation["state"] not in {
+        cohort.STATE_RECONCILIATION_REQUIRED,
+        # A retry whose response was lost is re-sent against an operation that
+        # is now settled. That is the same question as before — "did mine
+        # land?" — and the durable answer is the honest reply, not a conflict
+        # that reads like the retry failed.
+        cohort.STATE_SETTLED,
+    }:
+        raise CohortOperationConflict(
+            f"cohort operation {request.operation_id} is {operation['state']!r}; only a Resume "
+            f"in {cohort.STATE_RECONCILIATION_REQUIRED!r} can be retried"
+        )
+    try:
+        return await cohort_resume.execute_resume_retry(_resume_request(request), **executor_kwargs)
     except cohort.CohortJournalError as exc:
         raise _translated(exc) from exc
     except cohort_resume.CohortResumeError as exc:

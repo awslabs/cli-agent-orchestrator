@@ -309,6 +309,7 @@ and does not infer task meaning from CAO's physical roster.
 | `POST /sessions/{name}/cohort/stop/force` | admin | reaps now, without waiting for provider I/O |
 | `POST /sessions/{name}/cohort/resume/paused` | admin | restores panes, **sends zero input** |
 | `POST /sessions/{name}/cohort/resume/start` | admin | restores panes, then wakes the supervisor exactly once |
+| `POST /sessions/{name}/cohort/resume/retry` | admin | continues *this* Resume out of `reconciliation-required` |
 
 A mode flag is something a client library defaults, a script sets once, and a
 retry carries forward. A different URL is not. `cao session cohort` mirrors the
@@ -348,6 +349,41 @@ pending, or a restore whose physical result was ambiguous) blocks the terminal
 commit. Fresh restore is never a silent fallback for a refused exact one:
 exact restoration is what makes the resumed transcript the same transcript, and
 a fresh authority must be supplied deliberately.
+
+**A Resume that stops short is continued, not restarted.** Two things leave an
+operation in `reconciliation-required`: a member whose physical result was
+ambiguous, and a wake that did not land. Both leave real state behind — panes
+that came back, a lifecycle already declared, a barrier already released — so
+the repair finishes the same operation. `resume/retry` claims no new boundary,
+re-observes no roster, releases no second barrier, and re-restores no member
+that already has a decided outcome; the wake id is the operation's, unchanged,
+so a wake delivered before is adopted rather than repeated. Without it the only
+escape was to force-Stop a fleet that was in most cases already running.
+
+Every transition identity is derived from `(operation_id, label, state_epoch)`
+rather than minted by the caller. Each attempt begins at a distinct epoch, so
+it gets distinct ids automatically, while a replay of the same attempt
+recomputes identical ids and adopts. The earlier caller-minted scheme made this
+a convention the caller had to honour, and it did not: a retry re-derived the
+*restore* id, whose stored payload differed, so every retry died on "already
+exists with different immutable request content".
+
+The retry carries an opaque receipt derived from the durable evidence — the
+state epoch and every member's recorded outcome — so it is reproducible under
+response loss rather than minted per call. `provenance.retries` exposes each
+retry with its receipt and actor, `provenance.retryable` says whether the
+operation can still be continued, and `provenance.reconciliation_reason`
+carries why it stopped. A surface that cannot tell "unfinished" from "finished"
+sends operators to the force-Stop button.
+
+**Only a delivered wake may be reported as one.** The dashboard says "the
+supervisor was told" exactly where `wakeWasDelivered` holds: a settled Resume
+whose target is not `paused`. Decided members are not sufficient evidence — an
+operation that stopped *because* its wake did not land has entirely decided
+members and a supervisor that knows nothing — and a Resume-paused wakes nobody
+by design, so it must not borrow the sentence. Reconciliation states render the
+retry control and the durable reason instead, alongside the decided failures,
+which are reported as decided and are never retried.
 
 **Rollback.** C4 adds no table and no column: it fills the
 `source_operation_id` / `resume_target` carriers C1 already reserved and reuses

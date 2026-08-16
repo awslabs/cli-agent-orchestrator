@@ -139,14 +139,7 @@ def _claim_resume(source, *, target: str = sl.WORKING):
 
 
 def _request(operation, **overrides):
-    base = dict(
-        operation_id=operation["operation_id"],
-        expected_state_epoch=int(operation["state_epoch"]),
-        restore_transition_id=str(uuid.uuid4()),
-        commit_transition_id=str(uuid.uuid4()),
-        reconciliation_transition_id=str(uuid.uuid4()),
-        actor="colin",
-    )
+    base = dict(operation_id=operation["operation_id"], actor="colin")
     base.update(overrides)
     return resume.ResumeRequest(**base)
 
@@ -373,6 +366,278 @@ def test_the_dark_default_waker_has_no_authority_and_says_so():
     wake = _run(resume._default_waker({}, [], "id"))
     assert wake.delivered is False
     assert "no supervisor reconciliation authority" in wake.detail
+
+
+# ---------------------------------------------------------------------------
+# retry: continuing the SAME operation out of reconciliation-required
+# ---------------------------------------------------------------------------
+
+
+def _flaky_restorer(first, then):
+    """Returns ``first`` on the first call per member, ``then`` after."""
+    seen: dict[str, int] = {}
+    calls: list[str] = []
+
+    async def _restore(member, _operation):
+        terminal = member["terminal_id"]
+        calls.append(terminal)
+        seen[terminal] = seen.get(terminal, 0) + 1
+        return first if seen[terminal] == 1 else then
+
+    return _restore, calls
+
+
+def test_an_ambiguous_restore_can_be_retried_to_a_settled_operation():
+    """The headline recovery: undecided, then decided, same operation."""
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stop_cohort()
+    operation = _claim_resume(source, target=sl.PAUSED)
+    restore, calls = _flaky_restorer(
+        resume.MemberRestore(resume.OUTCOME_UNDECIDED, "ambiguous"),
+        resume.MemberRestore(resume.OUTCOME_EXACT, "back on the retry"),
+    )
+
+    first = _run(resume.execute_resume_paused(_request(operation), restorer=restore))
+    assert first["state"] == cohort.STATE_RECONCILIATION_REQUIRED
+
+    retried = _run(resume.execute_resume_retry(_request(operation), restorer=restore))
+
+    assert retried["state"] == cohort.STATE_SETTLED
+    assert retried["operation_id"] == operation["operation_id"]
+    assert calls == ["term-1", "term-1"]
+    member = cohort.get_operation(operation["operation_id"])["members"][0]
+    assert member["final_state"] == cohort.FINAL_RESTORED_EXACT
+
+
+def test_a_missing_wake_is_recoverable_by_injecting_a_later_waker():
+    """No force-Stop detour: the same operation reaches terminal."""
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    _bind(suffix="2")
+    source = _stop_cohort()
+    operation = _claim_resume(source)
+    restore, calls = _restorer(
+        {
+            "term-1": resume.MemberRestore(resume.OUTCOME_EXACT),
+            "term-2": resume.MemberRestore(resume.OUTCOME_EXACT),
+        }
+    )
+
+    # The dark default waker has no authority, which is truthful.
+    first = _run(resume.execute_resume_and_start(_request(operation), restorer=restore))
+    assert first["state"] == cohort.STATE_RECONCILIATION_REQUIRED
+    assert len(calls) == 2
+
+    wakes = []
+
+    async def _later_waker(_operation, results, identifier):
+        wakes.append((identifier, sorted(r["final_state"] for r in results)))
+        return resume.SupervisorWake(True, receipt_digest=DIGEST)
+
+    retried = _run(
+        resume.execute_resume_retry(_request(operation), restorer=restore, waker=_later_waker)
+    )
+
+    assert retried["state"] == cohort.STATE_SETTLED
+    assert sl.describe(SESSION)["lifecycle"] == sl.WORKING
+    # Exactly one wake overall, and it saw every member outcome.
+    assert len(wakes) == 1
+    assert wakes[0][1] == ["restored-exact", "restored-exact"]
+    # And no member was restored a second time: no input replay.
+    assert calls == ["term-1", "term-2"]
+
+
+def test_a_retry_uses_a_distinct_transition_identity_from_the_restore():
+    """The bug this fixes: reusing the consumed restore id is a hard conflict."""
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stop_cohort()
+    operation = _claim_resume(source, target=sl.PAUSED)
+    restore, _calls = _flaky_restorer(
+        resume.MemberRestore(resume.OUTCOME_UNDECIDED, "ambiguous"),
+        resume.MemberRestore(resume.OUTCOME_EXACT),
+    )
+    _run(resume.execute_resume_paused(_request(operation), restorer=restore))
+    _run(resume.execute_resume_retry(_request(operation), restorer=restore))
+
+    record = cohort.get_operation(operation["operation_id"])
+    ids = [transition["transition_id"] for transition in record["transitions"]]
+    assert len(ids) == len(set(ids)), "every attempt must have its own identity"
+    restore_id = resume.attempt_transition_id(operation["operation_id"], "restore", 0)
+    retry_id = resume.attempt_transition_id(operation["operation_id"], "retry", 2)
+    assert restore_id != retry_id
+    assert {restore_id, retry_id} <= set(ids)
+
+
+def test_the_retry_carries_a_durable_opaque_receipt_naming_the_evidence():
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stop_cohort()
+    operation = _claim_resume(source, target=sl.PAUSED)
+    restore, _calls = _flaky_restorer(
+        resume.MemberRestore(resume.OUTCOME_UNDECIDED, "ambiguous"),
+        resume.MemberRestore(resume.OUTCOME_EXACT),
+    )
+    reconciled = _run(resume.execute_resume_paused(_request(operation), restorer=restore))
+    expected = resume.retry_receipt(cohort.get_operation(operation["operation_id"]))
+
+    _run(resume.execute_resume_retry(_request(operation), restorer=restore))
+
+    record = cohort.get_operation(operation["operation_id"])
+    retry = next(
+        transition
+        for transition in record["transitions"]
+        if transition["from_state"] == cohort.STATE_RECONCILIATION_REQUIRED
+    )
+    assert retry["receipt_digest"] == expected
+    assert len(retry["receipt_digest"]) == 64
+    assert retry["actor"] == "colin"
+    # Reproducible from the durable evidence, so a lost response recomputes it.
+    assert expected != resume.retry_receipt(reconciled | {"members": [], "state_epoch": 99})
+
+
+def test_a_retry_receipt_is_exposed_on_the_projection_with_who_retried():
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stop_cohort()
+    operation = _claim_resume(source, target=sl.PAUSED)
+    restore, _calls = _flaky_restorer(
+        resume.MemberRestore(resume.OUTCOME_UNDECIDED, "ambiguous"),
+        resume.MemberRestore(resume.OUTCOME_EXACT),
+    )
+    _run(resume.execute_resume_paused(_request(operation), restorer=restore))
+
+    reconciled = cohort.get_operation(operation["operation_id"])["provenance"]
+    assert reconciled["retryable"] is True
+    assert reconciled["retries"] == []
+    assert "no decided restore outcome" in reconciled["reconciliation_reason"]
+
+    _run(resume.execute_resume_retry(_request(operation), restorer=restore))
+
+    settled = cohort.get_operation(operation["operation_id"])["provenance"]
+    assert settled["retryable"] is False
+    assert len(settled["retries"]) == 1
+    assert settled["retries"][0]["actor"] == "colin"
+    assert len(settled["retries"][0]["receipt_digest"]) == 64
+
+
+def test_a_replayed_retry_adopts_the_durable_result_without_a_second_wake():
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stop_cohort()
+    operation = _claim_resume(source)
+    restore, calls = _restorer({"term-1": resume.MemberRestore(resume.OUTCOME_EXACT)})
+    wakes = []
+
+    async def _waker(_operation, _results, identifier):
+        wakes.append(identifier)
+        return resume.SupervisorWake(True, receipt_digest=DIGEST)
+
+    _run(resume.execute_resume_and_start(_request(operation), restorer=restore))
+    request = _request(operation)
+    first = _run(resume.execute_resume_retry(request, restorer=restore, waker=_waker))
+    second = _run(resume.execute_resume_retry(request, restorer=restore, waker=_waker))
+
+    assert first["state"] == second["state"] == cohort.STATE_SETTLED
+    assert len(wakes) == 1
+    assert calls == ["term-1"]
+
+
+def test_a_resent_resume_adopts_rather_than_silently_retrying():
+    """A re-sent Resume asks "did mine land?"; retry is a separate act."""
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stop_cohort()
+    operation = _claim_resume(source, target=sl.PAUSED)
+    restore, calls = _flaky_restorer(
+        resume.MemberRestore(resume.OUTCOME_UNDECIDED, "ambiguous"),
+        resume.MemberRestore(resume.OUTCOME_EXACT),
+    )
+    _run(resume.execute_resume_paused(_request(operation), restorer=restore))
+
+    again = _run(resume.execute_resume_paused(_request(operation), restorer=restore))
+
+    assert again["state"] == cohort.STATE_RECONCILIATION_REQUIRED
+    assert calls == ["term-1"], "a re-sent Resume must not re-attempt a member"
+
+
+def test_a_retry_before_any_attempt_is_refused():
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stop_cohort()
+    operation = _claim_resume(source, target=sl.PAUSED)
+
+    with pytest.raises(resume.CohortResumeConflict, match="nothing to retry"):
+        _run(resume.execute_resume_retry(_request(operation)))
+
+
+def test_a_retry_neither_re_releases_the_barrier_nor_changes_membership():
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    _bind(suffix="2")
+    source = _stop_cohort()
+    operation = _claim_resume(source, target=sl.PAUSED)
+    restore, _calls = _flaky_restorer(
+        resume.MemberRestore(resume.OUTCOME_UNDECIDED, "ambiguous"),
+        resume.MemberRestore(resume.OUTCOME_EXACT),
+    )
+    _run(resume.execute_resume_paused(_request(operation), restorer=restore))
+    before = oj.get_session_barrier(SESSION)
+    members_before = {
+        member["agent_id"] for member in cohort.get_operation(operation["operation_id"])["members"]
+    }
+
+    _run(resume.execute_resume_retry(_request(operation), restorer=restore))
+
+    after = oj.get_session_barrier(SESSION)
+    record = cohort.get_operation(operation["operation_id"])
+    # The barrier was released once, by the first attempt, and not touched again.
+    assert after["epoch"] == before["epoch"]
+    assert after["state"] == oj.BARRIER_OPEN
+    assert {member["agent_id"] for member in record["members"]} == members_before
+    assert record["source_operation_id"] == source["operation_id"]
+    # And exactly one Resume operation exists for the session.
+    resumes = [
+        item
+        for item in cohort.list_operations(SESSION)
+        if item["operation_kind"] == cohort.KIND_RESUME
+    ]
+    assert len(resumes) == 1
+
+
+def test_a_retry_cannot_settle_past_a_newly_claimed_stop_barrier():
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stop_cohort()
+    operation = _claim_resume(source, target=sl.PAUSED)
+    restore, _calls = _flaky_restorer(
+        resume.MemberRestore(resume.OUTCOME_UNDECIDED, "ambiguous"),
+        resume.MemberRestore(resume.OUTCOME_EXACT),
+    )
+    _run(resume.execute_resume_paused(_request(operation), restorer=restore))
+    oj.claim_session_barrier(SESSION, claimed_by=str(uuid.uuid4()), reason="a newer Stop")
+
+    with pytest.raises(cohort.CohortJournalConflict, match="reclaimed"):
+        _run(resume.execute_resume_retry(_request(operation), restorer=restore))
+
+
+def test_a_resume_paused_retry_still_sends_zero_input(monkeypatch):
+    from cli_agent_orchestrator.services import control_input_service
+
+    _bind(suffix="1", role=roster.ROLE_SUPERVISOR)
+    source = _stop_cohort()
+    operation = _claim_resume(source, target=sl.PAUSED)
+    restore, _calls = _flaky_restorer(
+        resume.MemberRestore(resume.OUTCOME_UNDECIDED, "ambiguous"),
+        resume.MemberRestore(resume.OUTCOME_EXACT),
+    )
+    _run(resume.execute_resume_paused(_request(operation), restorer=restore))
+
+    def _no_bytes(*_args, **_kwargs):
+        raise AssertionError("a Resume-paused retry must not deliver a byte")
+
+    monkeypatch.setattr(control_input_service, "deliver_control_input", _no_bytes)
+
+    def _no_wake(*_args, **_kwargs):
+        raise AssertionError("a Resume-paused retry must not wake the supervisor")
+
+    monkeypatch.setattr(resume, "_default_waker", _no_wake)
+
+    settled = _run(resume.execute_resume_retry(_request(operation), restorer=restore))
+
+    assert settled["state"] == cohort.STATE_SETTLED
+    assert sl.describe(SESSION)["lifecycle"] == sl.PAUSED
 
 
 # ---------------------------------------------------------------------------

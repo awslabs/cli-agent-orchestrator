@@ -278,6 +278,94 @@ def test_a_server_refusal_is_surfaced_with_its_detail():
     assert "not stopped" in result.output
 
 
+def test_a_reconciling_operation_is_never_rendered_as_finished():
+    record = _operation(
+        provenance={
+            "state": "reconciliation-required",
+            "retryable": True,
+            "reconciliation_reason": (
+                "the fleet was restored but its supervisor reconciliation wake did not land"
+            ),
+            "member_outcomes": {"restored-exact": 1, "failed": 1},
+        },
+        state="reconciliation-required",
+    )
+    with patch.object(session_cli.requests, "post", return_value=_response(record)):
+        result = CliRunner().invoke(
+            session_cli.session, ["cohort", "resume-start", SESSION, "--by", "colin"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "NOT FINISHED" in result.output
+    assert "wake did not land" in result.output
+    # And it prints the exact command that continues it, so nobody reaches
+    # for force-Stop to escape a fleet that is already back.
+    assert "cao session cohort resume-retry" in result.output
+    assert "--operation 11111111-1111-4111-8111-111111111111" in result.output
+    # The decided failure is still reported alongside.
+    assert "did not come back" in result.output
+
+
+def test_retry_names_the_operation_it_continues_and_mints_nothing():
+    posted = {}
+
+    def _post(url, json=None, **_kwargs):
+        posted["url"] = url
+        posted["json"] = json
+        return _response(_operation())
+
+    with patch.object(session_cli.requests, "post", side_effect=_post):
+        result = CliRunner().invoke(
+            session_cli.session,
+            [
+                "cohort",
+                "resume-retry",
+                SESSION,
+                "--operation",
+                "11111111-1111-4111-8111-111111111111",
+                "--by",
+                "colin",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert posted["url"].endswith(f"/sessions/{SESSION}/cohort/resume/retry")
+    assert posted["json"]["operation_id"] == "11111111-1111-4111-8111-111111111111"
+    assert posted["json"]["initiated_by"] == "colin"
+
+
+def test_retry_requires_the_operation_id():
+    result = CliRunner().invoke(
+        session_cli.session, ["cohort", "resume-retry", SESSION, "--by", "colin"]
+    )
+
+    assert result.exit_code != 0
+    assert "--operation" in result.output
+
+
+def test_a_completed_retry_is_shown_with_who_did_it():
+    record = _operation(
+        provenance={
+            "retries": [
+                {
+                    "transition_id": "t1",
+                    "from_state_epoch": 2,
+                    "actor": "colin",
+                    "reason": None,
+                    "receipt_digest": "ab" * 32,
+                    "created_at": "2026-08-15T01:00:00Z",
+                }
+            ],
+        }
+    )
+    with patch.object(session_cli.requests, "get", return_value=_response(record)):
+        result = CliRunner().invoke(session_cli.session, ["cohort", "show", record["operation_id"]])
+
+    assert result.exit_code == 0, result.output
+    assert "retried by colin" in result.output
+    assert "NOT FINISHED" not in result.output
+
+
 def test_resume_paused_help_promises_zero_input():
     result = CliRunner().invoke(session_cli.session, ["cohort", "resume-paused", "--help"])
 

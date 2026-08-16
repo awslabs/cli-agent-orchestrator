@@ -72,6 +72,7 @@ SCHEMA_VERSION = "cao-m3-cohort-resume-v1"
 #: across a lost response rather than only within one process.
 _MEMBER_NAMESPACE = uuid.UUID("03790000-c400-4c40-a7e3-000000000001")
 _WAKE_NAMESPACE = uuid.UUID("03790000-c400-4c40-a7e3-000000000002")
+_TRANSITION_NAMESPACE = uuid.UUID("03790000-c400-4c40-a7e3-000000000003")
 
 OUTCOME_EXACT = "exact"
 OUTCOME_FRESH = "fresh"
@@ -145,13 +146,25 @@ class SupervisorWake:
 
 @dataclass(frozen=True)
 class ResumeRequest:
+    """Who is resuming what. Every transition identity is derived, not passed.
+
+    An earlier shape had the caller mint a restore/commit/reconcile id per
+    request. That put a correctness rule — "an attempt may not reuse a
+    transition id a previous attempt already consumed" — in the caller's
+    hands, and the caller got it wrong: a retry re-derived the *same* restore
+    id from the operation id, whose payload differed from the one already
+    stored, so every retry died on "already exists with different immutable
+    request content" and the only way out of `reconciliation-required` was to
+    force-Stop the session and resume it again.
+
+    Deriving each id from ``(operation_id, label, state_epoch)`` makes the rule
+    structural instead. Each attempt starts at a distinct epoch, so it gets
+    distinct ids; a replay of the *same* attempt recomputes identical ids and
+    adopts.
+    """
+
     operation_id: str
-    expected_state_epoch: int
-    restore_transition_id: str
-    commit_transition_id: str
-    reconciliation_transition_id: str
     actor: str
-    retry_receipt_digest: Optional[str] = None
     reason: Optional[str] = None
 
 
@@ -175,6 +188,48 @@ def _receipt(operation_id: str, label: str, results: Sequence[Mapping[str, Any]]
             "operation_id": operation_id,
             "effect": label,
             "results": list(results),
+        }
+    )
+
+
+def attempt_transition_id(resume_operation_id: str, label: str, state_epoch: int) -> str:
+    """The transition id one attempt uses for one step.
+
+    Keyed by the state epoch the attempt starts from, which is exactly what
+    distinguishes attempts: entering `restoring` bumps the epoch, so the next
+    reconcile-then-retry cycle derives a fresh set. A lost response replays
+    the same epoch and therefore the same ids, which the journal adopts.
+    """
+    return str(uuid.uuid5(_TRANSITION_NAMESPACE, f"{resume_operation_id}:{label}:{state_epoch}"))
+
+
+def retry_receipt(operation: Mapping[str, Any]) -> str:
+    """The opaque receipt an operator retry carries into the journal.
+
+    Derived from the durable evidence the operator is acting on — the state
+    epoch and every member's recorded outcome — rather than minted, so it is
+    reproducible: a retry whose response was lost recomputes the identical
+    digest and adopts its own transition instead of being refused as a
+    different request. It is a reference to evidence, never a summary of it;
+    what the evidence *means* stays M3-D's.
+    """
+    return _digest(
+        {
+            "schema": SCHEMA_VERSION,
+            "effect": "resume-retry",
+            "operation_id": operation["operation_id"],
+            "state_epoch": int(operation["state_epoch"]),
+            "members": sorted(
+                (
+                    {
+                        "agent_id": member["agent_id"],
+                        "final_state": member["final_state"],
+                        "result_revision": int(member["result_revision"]),
+                    }
+                    for member in operation.get("members", ())
+                ),
+                key=lambda item: str(item["agent_id"]),
+            ),
         }
     )
 
@@ -343,54 +398,59 @@ def _record(operation_id: str, member: Mapping[str, Any], restore: MemberRestore
     )
 
 
-def _enter_restoring(request: ResumeRequest, operation: Mapping[str, Any]) -> dict[str, Any]:
-    state = operation["state"]
-    if state == cohort.STATE_PREPARING:
-        return cast(
-            dict[str, Any],
-            cohort.begin_resume_restore(
-                cohort.ResumeRestoreRequest(
-                    transition_id=request.restore_transition_id,
-                    operation_id=request.operation_id,
-                    expected_state_epoch=request.expected_state_epoch,
-                    actor=request.actor,
-                    reason=request.reason,
-                )
-            )["operation"],
-        )
-    if state == cohort.STATE_RECONCILIATION_REQUIRED:
-        if request.retry_receipt_digest is None:
-            raise CohortResumeConflict(
-                "an explicit Resume retry out of reconciliation-required needs a receipt digest "
-                "naming the evidence the operator acted on"
+def _begin_restore(request: ResumeRequest, operation: Mapping[str, Any]) -> dict[str, Any]:
+    """First attempt: release the Stop barrier and declare the target."""
+    return cast(
+        dict[str, Any],
+        cohort.begin_resume_restore(
+            cohort.ResumeRestoreRequest(
+                transition_id=attempt_transition_id(
+                    request.operation_id, "restore", int(operation["state_epoch"])
+                ),
+                operation_id=request.operation_id,
+                expected_state_epoch=int(operation["state_epoch"]),
+                actor=request.actor,
+                reason=request.reason,
             )
-        return cast(
-            dict[str, Any],
-            cohort.transition_operation(
-                cohort.TransitionRequest(
-                    transition_id=request.restore_transition_id,
-                    operation_id=request.operation_id,
-                    expected_state_epoch=request.expected_state_epoch,
-                    to_state=cohort.STATE_RESTORING,
-                    actor=request.actor,
-                    reason=request.reason,
-                    receipt_digest=request.retry_receipt_digest,
-                )
-            )["operation"],
-        )
-    if state == cohort.STATE_RESTORING:
-        return dict(operation)
-    raise CohortResumeConflict(f"Resume cannot execute from state {state!r}")
+        )["operation"],
+    )
+
+
+def _begin_retry(request: ResumeRequest, operation: Mapping[str, Any]) -> dict[str, Any]:
+    """A later attempt at the *same* operation, out of reconciliation.
+
+    Deliberately not a second Resume. The barrier is already open, the
+    lifecycle already declared, and the source cohort's membership already
+    fixed — none of that is touched again. Only members without a decided
+    outcome are re-attempted, so a retry replays no input into a pane that
+    already came back.
+    """
+    epoch = int(operation["state_epoch"])
+    return cast(
+        dict[str, Any],
+        cohort.transition_operation(
+            cohort.TransitionRequest(
+                transition_id=attempt_transition_id(request.operation_id, "retry", epoch),
+                operation_id=request.operation_id,
+                expected_state_epoch=epoch,
+                to_state=cohort.STATE_RESTORING,
+                actor=request.actor,
+                reason=request.reason or "operator retry after reconciliation",
+                receipt_digest=retry_receipt(operation),
+            )
+        )["operation"],
+    )
 
 
 def _reconcile(
     request: ResumeRequest, operation: Mapping[str, Any], receipt: str, reason: str
 ) -> dict[str, Any]:
+    epoch = int(operation["state_epoch"])
     transitioned = cohort.transition_operation(
         cohort.TransitionRequest(
-            transition_id=request.reconciliation_transition_id,
+            transition_id=attempt_transition_id(request.operation_id, "reconcile", epoch),
             operation_id=request.operation_id,
-            expected_state_epoch=int(operation["state_epoch"]),
+            expected_state_epoch=epoch,
             to_state=cohort.STATE_RECONCILIATION_REQUIRED,
             actor=request.actor,
             reason=reason,
@@ -407,6 +467,7 @@ async def _execute(
     surface: str,
     restorer: MemberRestorer,
     waker: Optional[SupervisorWaker],
+    retry: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(request, ResumeRequest):
         raise CohortResumeInvalid(f"request must be a ResumeRequest; got {type(request).__name__}")
@@ -420,19 +481,37 @@ async def _execute(
             f"{surface} restores to {sorted(expected_target)}; this operation targets "
             f"{operation['resume_target']!r}"
         )
-    if operation["state"] == cohort.STATE_SETTLED:
+
+    state = operation["state"]
+    if state == cohort.STATE_SETTLED:
         # Response-loss replay of a finished Resume. Returning the durable
         # answer is what stops a retry becoming a second wake.
         return operation
-    if operation["state"] == cohort.STATE_RECONCILIATION_REQUIRED and int(
-        operation["state_epoch"]
-    ) != int(request.expected_state_epoch):
-        # The caller is replaying the request that already produced this
-        # terminal-for-that-attempt answer. An explicit operator retry uses
-        # the current epoch, fresh transition ids, and a receipt.
-        return operation
-
-    _enter_restoring(request, operation)
+    if state == cohort.STATE_RECONCILIATION_REQUIRED:
+        if not retry:
+            # Idempotent adoption. A re-sent Resume is a caller asking "did
+            # mine land?", and the honest answer is the durable result — not a
+            # silent second attempt the operator never asked for. Continuing
+            # is an explicit, separately authenticated act.
+            return operation
+        operation = _begin_retry(request, operation)
+    elif state == cohort.STATE_PREPARING:
+        if retry:
+            raise CohortResumeConflict(
+                f"cohort operation {request.operation_id} has not been attempted yet; there is "
+                "nothing to retry"
+            )
+        operation = _begin_restore(request, operation)
+    elif state == cohort.STATE_RESTORING:
+        # A previous attempt died mid-restore. Continue it rather than
+        # starting a second operation.
+        if retry:
+            raise CohortResumeConflict(
+                f"cohort operation {request.operation_id} is already restoring; retry applies "
+                f"only to {cohort.STATE_RECONCILIATION_REQUIRED!r}"
+            )
+    else:
+        raise CohortResumeConflict(f"Resume cannot execute from state {state!r}")
 
     results: list[dict[str, Any]] = []
     undecided = False
@@ -500,7 +579,9 @@ async def _execute(
 
     committed = cohort.commit_terminal(
         cohort.TerminalCommitRequest(
-            transition_id=request.commit_transition_id,
+            transition_id=attempt_transition_id(
+                request.operation_id, "commit", int(current["state_epoch"])
+            ),
             operation_id=request.operation_id,
             expected_state_epoch=int(current["state_epoch"]),
             actor=request.actor,
@@ -549,4 +630,47 @@ async def execute_resume_and_start(
         surface="resume-and-start",
         restorer=restorer or _default_restorer,
         waker=waker or _default_waker,
+    )
+
+
+async def execute_resume_retry(
+    request: ResumeRequest,
+    *,
+    restorer: Optional[MemberRestorer] = None,
+    waker: Optional[SupervisorWaker] = None,
+) -> dict[str, Any]:
+    """Continue *this* Resume out of ``reconciliation-required``.
+
+    The recovery path for the two ways a Resume stops short: a member whose
+    physical result was ambiguous, and a wake that did not land. Both leave
+    real state behind — panes that came back, a lifecycle already declared, a
+    barrier already released — so the repair is to finish the operation, not
+    to start a second one.
+
+    What it deliberately does not do: claim a new boundary, re-observe the
+    roster, re-release the barrier, or re-restore a member that already has a
+    decided outcome. The wake id is the operation's, unchanged, so a wake that
+    was delivered before is adopted rather than repeated.
+
+    The target decides whether there is a wake at all, exactly as it does on
+    the first attempt: a Resume-paused retry stays strictly zero input.
+    """
+    operation = _operation(request.operation_id)
+    target = operation.get("resume_target")
+    if target == sl.PAUSED:
+        return await _execute(
+            request,
+            expected_target=frozenset({sl.PAUSED}),
+            surface="resume-paused",
+            restorer=restorer or _default_restorer,
+            waker=None,
+            retry=True,
+        )
+    return await _execute(
+        request,
+        expected_target=frozenset({sl.WORKING, sl.COMPLETE}),
+        surface="resume-and-start",
+        restorer=restorer or _default_restorer,
+        waker=waker or _default_waker,
+        retry=True,
     )

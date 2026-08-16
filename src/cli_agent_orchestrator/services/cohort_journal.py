@@ -2354,6 +2354,32 @@ def operation_provenance(record: dict[str, Any]) -> dict[str, Any]:
         "source_operation_id": record["source_operation_id"],
         "resume_target": record["resume_target"],
         "member_outcomes": outcomes,
+        # Whether an operator can still move this operation forward, and the
+        # receipted history of every time one already did. Surfaced because an
+        # operation stuck in reconciliation is useless if no reader can tell
+        # that it is *retryable* rather than finished.
+        "retryable": record["state"] == STATE_RECONCILIATION_REQUIRED,
+        "retries": [
+            {
+                "transition_id": transition["transition_id"],
+                "from_state_epoch": transition["from_state_epoch"],
+                "actor": transition["actor"],
+                "reason": transition["reason"],
+                "receipt_digest": transition["receipt_digest"],
+                "created_at": transition["created_at"],
+            }
+            for transition in transitions
+            if transition["from_state"] == STATE_RECONCILIATION_REQUIRED
+        ],
+        # Why it stopped short last time, straight from the durable reason.
+        "reconciliation_reason": next(
+            (
+                transition["reason"]
+                for transition in reversed(transitions)
+                if transition["to_state"] == STATE_RECONCILIATION_REQUIRED
+            ),
+            None,
+        ),
         # Continuity provenance: which stable agent kept which native session
         # across the operation. Stable agent, incarnation, and native lineage
         # stay three separate identities here on purpose.
