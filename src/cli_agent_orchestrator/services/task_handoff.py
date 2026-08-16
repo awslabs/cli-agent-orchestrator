@@ -77,7 +77,6 @@ STATE_PENDING = "pending"
 STATE_TRANSFERRED = "transferred"
 STATE_ROLLED_BACK = "rolled-back"
 STATES = frozenset({STATE_PENDING, STATE_TRANSFERRED, STATE_ROLLED_BACK})
-TERMINAL_STATES = frozenset({STATE_TRANSFERRED, STATE_ROLLED_BACK})
 
 #: Whether the one catch-up packet has been handed to the recipient yet.
 DELIVERY_PENDING = "pending"
