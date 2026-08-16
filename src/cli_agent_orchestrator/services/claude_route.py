@@ -26,7 +26,9 @@ from typing import Any, Optional
 from cli_agent_orchestrator.services.provider_contracts import (
     PROVIDER_CLAUDE,
     SUPPORTED_VERSIONS,
+    VERSION_ENFORCEMENT_OPEN,
     normalized_version,
+    version_enforcement_mode,
 )
 
 #: Exact Claude builds this probe accepts — never a range. Read from the
@@ -86,11 +88,18 @@ def attest_claude_route(
 
     banner = version_proc.stdout.strip()
     version = normalized_version(banner)
-    if version_proc.returncode != 0 or version not in SUPPORTED_CLAUDE_VERSIONS:
+    if version_proc.returncode != 0 or not version:
         raise ClaudeRouteProbeError(
-            f"unsupported Claude version {banner!r}; expected one of "
-            f"{list(SUPPORTED_CLAUDE_VERSIONS)!r}"
+            f"unsupported Claude version {banner!r}; expected a semver-shaped version"
         )
+    # Open enforcement: any semver-shaped version is accepted for launch identity.
+    # Strict enforcement: must be an exact proven build.
+    if version_enforcement_mode(PROVIDER_CLAUDE) != VERSION_ENFORCEMENT_OPEN:
+        if version not in SUPPORTED_CLAUDE_VERSIONS:
+            raise ClaudeRouteProbeError(
+                f"unsupported Claude version {banner!r}; expected one of "
+                f"{list(SUPPORTED_CLAUDE_VERSIONS)!r}"
+            )
 
     return {
         "probe_version": PROBE_VERSION,
