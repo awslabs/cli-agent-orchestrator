@@ -1495,6 +1495,75 @@ class SupervisorReconciliationWakeModel(Base):
     )
 
 
+class WaitMessageAdmissionModel(Base):
+    """One durable admission verdict for one wait message (M7 Stage 2, dark).
+
+    A row is the whole contract: which exact owner incarnation the message was
+    addressed to, the fixed-version canonical message bytes, whether admission
+    was granted or denied and why, and the receipt that binds all of it.
+
+    Two unique indexes carry the identity guarantees. ``operation_id`` makes a
+    retry a *replay*: the caller that died before reading its answer re-derives
+    the same admission id, re-reads the same verdict, and never gets a second,
+    differently-decided row. ``message_id`` makes a message single-use: the same
+    message cannot be smuggled into a second operation to earn a second
+    admission.
+
+    Denials are stored, not raised away. Re-deciding a denial against a roster
+    that has since moved would give one operation two answers, so the first
+    verdict is the durable one.
+
+    Nothing dispatches these rows. ``dispatch_state`` records that truthfully:
+    the capability that would deliver a wait message is disabled in this build,
+    so an admitted row is ``withheld`` and a denied row is ``refused``.
+    """
+
+    __tablename__ = "wait_message_admissions"
+
+    admission_id = Column(Text, primary_key=True)
+    schema_version = Column(Text, nullable=False)
+    message_schema_version = Column(Text, nullable=False)
+    operation_id = Column(Text, nullable=False)
+    message_id = Column(Text, nullable=False)
+    session_name = Column(Text, nullable=False)
+    # expiry | worker-wake | report | decision
+    message_kind = Column(Text, nullable=False)
+    # The exact owner identity as *claimed*. Required parts are NOT NULL: there
+    # is no system owner and no generation-less wait.
+    owner_agent_id = Column(Text, nullable=False)
+    owner_incarnation_id = Column(Text, nullable=False)
+    owner_terminal_id = Column(Text, nullable=False)
+    owner_generation = Column(Text, nullable=False)
+    # NULL is the truthful "not established" state for these, never a wildcard:
+    # admission compares them exactly, so NULL matches only NULL.
+    owner_lineage_id = Column(Text, nullable=True)
+    owner_native_session_id = Column(Text, nullable=True)
+    owner_restore_contract_id = Column(Text, nullable=True)
+    owner_restore_contract_digest = Column(Text, nullable=True)
+    owner_identity_digest = Column(Text, nullable=False)
+    #: Digest over the whole canonical request. A retry whose bytes differ is a
+    #: divergent replay and is refused rather than silently adopting.
+    request_digest = Column(Text, nullable=False)
+    message_digest = Column(Text, nullable=False)
+    message_json = Column(Text, nullable=False)
+    # admitted | denied
+    admission_state = Column(Text, nullable=False)
+    # withheld | refused — never "delivered": nothing consumes this table.
+    dispatch_state = Column(Text, nullable=False)
+    denial_reason = Column(Text, nullable=True)
+    detail = Column(Text, nullable=True)
+    receipt_digest = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        Index("ix_wait_message_admissions_operation", "operation_id", unique=True),
+        Index("ix_wait_message_admissions_message", "message_id", unique=True),
+        Index("ix_wait_message_admissions_session", "session_name"),
+        Index("ix_wait_message_admissions_owner", "owner_agent_id", "owner_generation"),
+    )
+
+
 class NativeStatusRepairEvidenceModel(Base):
     """One immutable bounded record of a native /status identity repair.
 
@@ -2080,6 +2149,7 @@ def init_db() -> None:
     _migrate_session_cohort_journal()
     _migrate_task_occurrences()
     _migrate_supervisor_drain()
+    _migrate_wait_message_admissions()
     _migrate_native_status_repair()
     _migrate_provider_recovery_episodes()
     _migrate_native_status_observation_attempt()
@@ -3130,6 +3200,74 @@ def _migrate_supervisor_drain() -> None:
             )
     except Exception as e:  # noqa: BLE001 - dark seam fails closed
         logger.warning(f"supervisor-drain migration failed: {e}")
+
+
+def _migrate_wait_message_admissions() -> None:
+    """Create the M7 Stage 2 wait-message admission table on older databases.
+
+    Additive, idempotent, and self-contained: it depends on no M3-C or M3-D
+    table and adds no column to one. Creating it admits nothing, delivers
+    nothing, wakes nobody, and attaches no consumer — a message only exists
+    once an owner asks for one to be admitted, and even then the capability
+    that would dispatch it is disabled.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS wait_message_admissions ("
+                "admission_id TEXT NOT NULL PRIMARY KEY, "
+                "schema_version TEXT NOT NULL, "
+                "message_schema_version TEXT NOT NULL, "
+                "operation_id TEXT NOT NULL, "
+                "message_id TEXT NOT NULL, "
+                "session_name TEXT NOT NULL, "
+                "message_kind TEXT NOT NULL, "
+                "owner_agent_id TEXT NOT NULL, "
+                "owner_incarnation_id TEXT NOT NULL, "
+                "owner_terminal_id TEXT NOT NULL, "
+                "owner_generation TEXT NOT NULL, "
+                "owner_lineage_id TEXT, "
+                "owner_native_session_id TEXT, "
+                "owner_restore_contract_id TEXT, "
+                "owner_restore_contract_digest TEXT, "
+                "owner_identity_digest TEXT NOT NULL, "
+                "request_digest TEXT NOT NULL, "
+                "message_digest TEXT NOT NULL, "
+                "message_json TEXT NOT NULL, "
+                "admission_state TEXT NOT NULL, "
+                "dispatch_state TEXT NOT NULL, "
+                "denial_reason TEXT, "
+                "detail TEXT, "
+                "receipt_digest TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            # One operation decides once; one message is admitted once. These
+            # two are the durable half of the replay contract — without them a
+            # retry could write a second, differently-decided row.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_wait_message_admissions_operation "
+                "ON wait_message_admissions(operation_id)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_wait_message_admissions_message "
+                "ON wait_message_admissions(message_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_wait_message_admissions_session "
+                "ON wait_message_admissions(session_name)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_wait_message_admissions_owner "
+                "ON wait_message_admissions(owner_agent_id, owner_generation)"
+            )
+    except Exception as e:  # noqa: BLE001 - dark seam fails closed
+        logger.warning(f"wait-message-admission migration failed: {e}")
 
 
 def _migrate_native_status_repair() -> None:
