@@ -171,6 +171,85 @@ def test_a_held_donor_may_still_record_a_boundary():
     assert occ.get_occurrence(donor["task_occurrence_id"])["revision"] == 1
 
 
+def test_a_concurrent_drain_never_reads_a_held_donor_as_parked(monkeypatch):
+    """The reason `handoff-pending` is not a `task_occurrences.state`.
+
+    Both halves are executed. First the shipped design: a held donor still has
+    an open round, so the drain's own observer refuses to call it parked.
+    Then the rejected design's observable condition -- no open occurrence while
+    a finalized one exists -- which is exactly what a third occurrence state
+    produces, and the observer turns that into positive `parked` carrying the
+    *previous* round's digests. Under Stop that is what authorizes teardown of
+    the pane the handback is keeping as rollback insurance.
+    """
+    from cli_agent_orchestrator.services import control_input_service as cis
+    from cli_agent_orchestrator.services import supervisor_drain as drain
+
+    class _Live:
+        terminal_generation = "gen-1"
+        pane_dead = False
+
+    monkeypatch.setattr(cis, "resolve_control_identity", lambda _tid: _Live())
+
+    donor_agent = str(uuid.uuid4())
+    recipient_agent = str(uuid.uuid4())
+
+    # A finished earlier round, whose digests are the stale ones at risk.
+    earlier = _open(donor_agent, round_index=0, suffix="1")
+    occ.record_boundary(
+        occ.BoundaryRecord(
+            task_occurrence_id=earlier["task_occurrence_id"],
+            expected_revision=0,
+            recorded_by="worker",
+            report_digest=_DIGEST_B,
+        )
+    )
+    occ.finalize_occurrence(
+        occ.FinalizeRequest(
+            task_occurrence_id=earlier["task_occurrence_id"],
+            expected_revision=1,
+            disposition=occ.DISPOSITION_REPORTED,
+            finalized_by="supervisor",
+        )
+    )
+    # The live round the handback is about.
+    live = _open(donor_agent, round_index=1, suffix="1")
+    handoff = _begin(live, recipient_agent)
+    assert handoff["state"] == th.STATE_PENDING
+
+    member = {
+        "agent_id": donor_agent,
+        "session_name": SESSION,
+        "terminal_id": "term-1",
+        "generation": "gen-1",
+    }
+
+    # Shipped design: the donor is held, and the drain still sees a live round.
+    shipped = drain._default_observer(member, "before")
+    assert shipped.state != drain.OBS_PARKED
+    assert shipped.quiescent is False
+    assert shipped.task_occurrence_id == live["task_occurrence_id"]
+    assert drain._classify(shipped, steered=True)[0] == drain.MEMBER_RECONCILIATION_REQUIRED
+
+    # Rejected design, simulated at exactly the seam a third state moves: an
+    # occurrence in `handoff-pending` is still stored, still un-finalized, and
+    # simply stops answering the one-open-round query. Nothing else changes.
+    with monkeypatch.context() as patched:
+        patched.setattr(occ, "open_occurrence_for_agent", lambda *_a, **_k: None)
+        rejected = drain._default_observer(member, "before")
+
+    assert rejected.state == drain.OBS_PARKED
+    assert rejected.quiescent is True
+    # Carrying the *earlier* round's digests -- the stale-evidence half.
+    assert rejected.task_occurrence_id == earlier["task_occurrence_id"]
+    assert rejected.report_digest == _DIGEST_B
+    member_state, _detail = drain._classify(rejected, steered=True)
+    assert member_state == drain.MEMBER_PARKED
+    # Terminal, so the drain settles complete and mints a spendable receipt;
+    # under Stop that is what announces teardown of the donor's pane.
+    assert member_state in drain.MEMBER_TERMINAL
+
+
 # ---------------------------------------------------------------------------
 # exactly one task authority at every boundary
 # ---------------------------------------------------------------------------
