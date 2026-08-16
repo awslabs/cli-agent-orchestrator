@@ -28,6 +28,14 @@ def _response(request_id, result):
 def test_zero_turn_bootstrap_capability_is_narrower_than_provider_capability():
     """0.147 has the bootstrap proof without changing the broad version table."""
     assert cnb.BOOTSTRAP_CAPABLE_VERSIONS == ("0.146.0", "0.147.0")
+    # One literal, two consumers: the bootstrap that mints the native id and
+    # the managed bind seam that accepts it read the same table object, so
+    # the two surfaces cannot drift back into disagreement — which is the
+    # reproduced failure where mint accepted 0.147.0 and bind refused it.
+    assert (
+        cnb.BOOTSTRAP_CAPABLE_VERSIONS
+        is provider_contracts.NATIVE_BIND_CAPABLE_VERSIONS[provider_contracts.PROVIDER_CODEX]
+    )
     assert cnb.is_bootstrap_capable_build("codex-cli 0.147.0") is True
     assert cnb.is_bootstrap_capable_build("codex-cli 0.148.0") is False
     assert (

@@ -62,3 +62,81 @@ def test_wire_provider_inherits_open_default_without_override(monkeypatch, wire_
 def test_unparseable_versions_remain_fail_closed(provider):
     with pytest.raises(pc.ProviderVersionDrift):
         pc.check_pinned_version(provider, "not-a-version")
+
+
+class TestNativeBindCapability:
+    """The narrow build capability the managed native bind seam consults.
+
+    Reproduced live: a real Codex CLI 0.147.0 managed native launch
+    completed the zero-turn bootstrap, exposed the exact provider session
+    identity, reported input_ready — and was refused at bind because the
+    seam consulted the broad ``SUPPORTED_VERSIONS`` table instead of the
+    capability the launch had actually proven.
+    """
+
+    def test_the_stage_proven_codex_builds_bind(self):
+        assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, "codex-cli 0.146.0")
+        assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0")
+
+    @pytest.mark.parametrize(
+        "banner", ["codex-cli 0.148.0", "codex-cli 0.147", "codex-cli unknown", ""]
+    )
+    def test_every_unproven_codex_build_fails_closed(self, banner):
+        assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, banner) is False
+
+    def test_an_absent_version_is_not_a_capability(self):
+        assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, None) is False
+        assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, 0.147) is False
+
+    def test_the_capability_disagrees_with_the_broad_table_in_both_directions(self):
+        """0.147.0 holds the narrow proof and not the broad one.
+
+        The disagreement is the design, so both directions are pinned:
+        the narrow table accepts a build the broad table refuses, and the
+        broad table itself is unchanged — this repair must not reach it.
+        """
+        assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is True
+        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
+        assert pc.SUPPORTED_VERSIONS[pc.PROVIDER_CODEX] == ("0.146.0",)
+        # And the shared builds keep both predicates.
+        assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
+        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
+
+    @pytest.mark.parametrize("provider", ["kimi", "claude", "muse"])
+    def test_other_providers_keep_exactly_their_broad_proven_set(self, provider):
+        """No provider's bind behaviour changed except Codex's.
+
+        Their native identity paths were verified with each accepted build,
+        so their cells are the broad tuples by reference: every broadly
+        proven build binds, nothing else does, and adding a build to the
+        broad table carries bind for them exactly as before.
+        """
+        assert pc.NATIVE_BIND_CAPABLE_VERSIONS[provider] == pc.SUPPORTED_VERSIONS[provider]
+        for build in pc.SUPPORTED_VERSIONS[provider]:
+            assert pc.is_native_bind_capable(provider, build) is True
+        assert pc.is_native_bind_capable(provider, "99.99.99") is False
+
+    def test_strict_enforcement_does_not_widen_the_seam(self, monkeypatch):
+        """The seam ignores the mode — and the opt-in pin still refuses 0.147.
+
+        The capability predicates answer a different question than launch
+        admission, so a strict override cannot widen bind; conversely the
+        strict override keeps refusing the unlisted build at the launch
+        boundary, exactly as before.
+        """
+        monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_CODEX", "strict")
+        assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is True
+        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
+        with pytest.raises(pc.ProviderVersionDrift):
+            pc.check_pinned_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0")
+
+    def test_advanced_resume_authority_still_refuses_the_narrowly_proven_build(self):
+        """Bind capability grants no advanced authority by implication.
+
+        Automated resume/recovery identity reads the broad table, so a
+        0.147.0 generation can be bound at launch yet still has no resume
+        identity until that surface is independently stage-verified.
+        """
+        status = pc.resume_status(pc.PROVIDER_CODEX, installed_version="codex-cli 0.147.0")
+        assert status.identity_available is False
+        assert status.authority_supported is False

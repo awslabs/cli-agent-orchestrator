@@ -46,7 +46,15 @@ MATERIALIZATION_METHOD = "thread/name/set"
 #: composer/control/force-pause and other advanced surfaces, so 0.147.0 stays
 #: out of the broad table until those are independently proven.  An
 #: authenticated visual TUI smoke remains an installed-E2E follow-up.
-BOOTSTRAP_CAPABLE_VERSIONS = ("0.146.0", "0.147.0")
+#:
+#: The canonical literal lives in
+#: ``provider_contracts.NATIVE_BIND_CAPABLE_VERSIONS`` — the managed bind
+#: seam accepts exactly these builds through that table — and this name is
+#: the same object, so the mint that produces a native id and the bind that
+#: accepts it cannot disagree about which builds are proven.
+BOOTSTRAP_CAPABLE_VERSIONS = provider_contracts.NATIVE_BIND_CAPABLE_VERSIONS[
+    provider_contracts.PROVIDER_CODEX
+]
 
 
 def is_bootstrap_capable_build(version_output: Optional[str]) -> bool:

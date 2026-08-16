@@ -256,6 +256,19 @@ class TestPerTerminalBlock:
         assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
         assert "image" not in block
 
+    def test_a_narrowly_bind_proven_codex_build_advertises_no_control_block(self):
+        """0.147.0 may bind a native session and still gets nothing here.
+
+        The native-bind capability table and these build-exact control
+        tables are independent: bootstrap/resume proof grants no steer,
+        operator-message, or image authority, which stays pinned to the
+        builds whose control surface was independently stage-verified.
+        """
+        block = provider_controls.controls_block_for(CODEX, "0.147.0")
+        assert block["steer_chords"] == []
+        assert "operator_message" not in block
+        assert "image" not in block
+
 
 class TestEvidence:
     """Every registry fact names its source pointer, so a reviewer can

@@ -1020,6 +1020,20 @@ class TestDefensiveGuards:
             cnc._post(operation_id="op-62", plan=plan, transport=recorder)
         assert recorder.calls == []
 
+    def test_a_narrowly_bind_proven_build_keeps_no_composer_authority(self):
+        """0.147.0 binds a native session and still cannot be typed into.
+
+        The native-bind capability and the composer/control tables are
+        independent proofs: a build stage-verified for the zero-turn
+        bootstrap/resume contract holds no composer-newline pin until its
+        control surface is separately verified, so a bound 0.147.0
+        generation refuses native control input exactly as before.
+        """
+        _attach()
+        plan = cnc.plan_composer_keystrokes("one\ntwo", provider_version="0.147.0")
+        assert plan["deliverable"] is False
+        assert plan["undeliverable_reason"] is not None
+
     def test_an_active_turn_id_that_is_not_a_string_is_refused(self):
         _attach()
         observation = dict(_idle())
