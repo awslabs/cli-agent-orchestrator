@@ -597,6 +597,32 @@ def test_turn_receipt_is_strict_revalidated_and_completion_binds_callback_row(
     assert replay["state"] == callback_recovery.STATE_COMPLETED
 
 
+def test_turn_receipt_revalidates_through_the_selected_contract_facade(
+    recovery_context, monkeypatch
+):
+    """The recovery consumer revalidates the exact receipt through the facade.
+
+    Monkeypatching the facade's ``validate_receipt`` is observed by
+    ``turn_receipt`` — a copy of the contract imported from anywhere else
+    would miss this seam.
+    """
+    from cli_agent_orchestrator.services import model_turn_receipt_contract as contract
+
+    admission = callback_recovery.admit(recovery_context)
+    expected = _record_turn(admission)
+    original = contract.validate_receipt
+    calls = []
+
+    def spy(payload, *, expected=None):
+        calls.append(payload)
+        return original(payload, expected=expected)
+
+    monkeypatch.setattr(contract, "validate_receipt", spy)
+
+    assert callback_recovery.turn_receipt(admission.operation["operation_key"]) == expected
+    assert calls, "turn_receipt must revalidate through the selected facade"
+
+
 def test_callback_lookup_returns_immutable_registration_receipt(recovery_context):
     admission = callback_recovery.admit(recovery_context)
     _record_turn(admission)
