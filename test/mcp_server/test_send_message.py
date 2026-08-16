@@ -15,10 +15,10 @@ class TestSendMessageSelfSendGuard:
     into an explicit error so the worker can pick the correct receiver.
     """
 
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_send_message_rejects_self_send(self, mock_inbox):
         """Sending to the caller's own CAO_TERMINAL_ID should be rejected."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
             result = _send_message_impl("badc0de1", "Done!")
@@ -28,10 +28,10 @@ class TestSendMessageSelfSendGuard:
         assert "own CAO_TERMINAL_ID" in result["error"]
         mock_inbox.assert_not_called()
 
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_send_message_allows_distinct_receiver(self, mock_inbox):
         """Sending to a different terminal should still go through."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_inbox.return_value = {"success": True}
 
@@ -41,11 +41,11 @@ class TestSendMessageSelfSendGuard:
         mock_inbox.assert_called_once()
         assert mock_inbox.call_args[0][0] == "c0ffee01"
 
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_send_message_no_guard_when_cao_terminal_id_unset(self, mock_inbox):
         """Without CAO_TERMINAL_ID the guard is inert — _send_to_inbox runs
         and surfaces its own error path."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_inbox.return_value = {"success": True}
 
@@ -58,11 +58,11 @@ class TestSendMessageSelfSendGuard:
 class TestSendMessageSenderIdInjection:
     """Tests for sender ID injection in _send_message_impl."""
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_send_message_appends_sender_id_when_injection_enabled(self, mock_inbox):
         """When injection is enabled, send_message should append sender ID suffix."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_inbox.return_value = {"success": True}
 
@@ -74,11 +74,11 @@ class TestSendMessageSenderIdInjection:
         assert "[Message from terminal deadbeef" in sent_message
         assert "Use send_message MCP tool for any follow-up work.]" in sent_message
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", False)
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_send_message_no_suffix_when_injection_disabled(self, mock_inbox):
         """When injection is disabled, send_message should pass the message unchanged."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_inbox.return_value = {"success": True}
 
@@ -88,12 +88,12 @@ class TestSendMessageSenderIdInjection:
         sent_message = mock_inbox.call_args[0][1]
         assert sent_message == "Here are the results"
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_send_message_no_suffix_when_cao_terminal_id_unset(self, mock_inbox):
         """When CAO_TERMINAL_ID is not set, no suffix is injected (issue #284) —
         'unknown' must never be presented as a routable terminal ID."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_inbox.return_value = {"success": True}
 
@@ -104,11 +104,11 @@ class TestSendMessageSenderIdInjection:
         assert sent_message == "Status update"
         assert "unknown" not in sent_message
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_send_message_suffix_is_appended_not_prepended(self, mock_inbox):
         """The sender ID should be a suffix, not a prefix."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_inbox.return_value = {"success": True}
         original = "Task complete. Here are the deliverables."
@@ -130,12 +130,12 @@ class TestSendMessageCallerDefault:
     taking the worker LLM out of the routing path entirely.
     """
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", False)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_omitted_receiver_routes_to_recorded_caller(self, mock_inbox, mock_requests):
         """No receiver_id + recorded caller → message goes to the caller."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_response = MagicMock()
         mock_response.json.return_value = {"id": "badc0de1", "caller_id": "c0ffee01"}
@@ -150,11 +150,11 @@ class TestSendMessageCallerDefault:
         assert mock_inbox.call_args[0][0] == "c0ffee01"
         assert result == {"success": True}
 
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_omitted_receiver_without_recorded_caller_errors(self, mock_inbox, mock_requests):
         """No receiver_id + NULL caller_id → clear error, nothing sent."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_response = MagicMock()
         mock_response.json.return_value = {"id": "badc0de1", "caller_id": None}
@@ -169,10 +169,10 @@ class TestSendMessageCallerDefault:
         assert "receiver_id" in result["error"]
         mock_inbox.assert_not_called()
 
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_omitted_receiver_without_terminal_id_errors(self, mock_inbox):
         """No receiver_id + no CAO_TERMINAL_ID → clear error, nothing sent."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         with patch.dict(os.environ, {}, clear=True):
             result = _send_message_impl(None, "Hello")
@@ -181,12 +181,12 @@ class TestSendMessageCallerDefault:
         assert "CAO_TERMINAL_ID not set" in result["error"]
         mock_inbox.assert_not_called()
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", False)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_explicit_receiver_skips_caller_lookup(self, mock_inbox, mock_requests):
         """An explicit receiver_id must be used as-is, no API lookup."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_inbox.return_value = {"success": True}
 
@@ -196,14 +196,14 @@ class TestSendMessageCallerDefault:
         mock_requests.get.assert_not_called()
         assert mock_inbox.call_args[0][0] == "explicit-recv"
 
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_omitted_receiver_own_terminal_lookup_404_errors_clearly(
         self, mock_inbox, mock_requests
     ):
         """Own terminal record gone (e.g. deleted) → actionable error, not a
         raw requests error string."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_requests.HTTPError = requests.HTTPError
         mock_response = MagicMock()
@@ -222,12 +222,12 @@ class TestSendMessageCallerDefault:
         assert "receiver_id" in result["error"]
         mock_inbox.assert_not_called()
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", False)
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_receiver_deleted_before_reply_errors_clearly(self, mock_inbox):
         """Recorded caller deleted before the reply lands → the API detail is
         surfaced so the agent knows the address is gone."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_response = MagicMock()
         mock_response.json.return_value = {"detail": "Terminal 'c0ffee01' not found"}
@@ -242,14 +242,14 @@ class TestSendMessageCallerDefault:
         assert "c0ffee01" in result["error"]
         assert "Terminal 'c0ffee01' not found" in result["error"]
 
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
     def test_self_referential_caller_still_rejected_by_own_id_guard(
         self, mock_inbox, mock_requests
     ):
         """A corrupted row recording the worker as its own caller must not
         bypass the issue #24 self-send guard."""
-        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
         mock_response = MagicMock()
         mock_response.json.return_value = {"id": "badc0de1", "caller_id": "badc0de1"}
