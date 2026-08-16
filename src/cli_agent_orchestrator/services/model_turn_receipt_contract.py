@@ -118,32 +118,26 @@ def build_receipt(
     return validate_receipt(payload)
 
 
-CONTRACT_SOURCE: str
-
 _canonical_contract: Any
 try:
     _canonical_contract = importlib.import_module("conductor_sentinel.model_turn_receipt_contract")
 except ModuleNotFoundError as exc:
     if exc.name != "conductor_sentinel":
-        # The top-level package is installed but its contract submodule (or an
-        # internal canonical dependency) is broken or missing. Propagate the
-        # failure rather than silently running a second implementation.
+        # Installed but broken (submodule or internal import missing): fail
+        # visibly rather than silently running the standalone implementation.
         raise
     _canonical_contract = None
 
 if _canonical_contract is not None:
-    # ── installed mode: swap the standalone definitions for the exact
-    # canonical objects (identity preserved; nothing is wrapped or copied). ──
     CONTRACT_SOURCE = "conductor-sentinel"
+    # Installed mode: swap the standalone definitions for the canonical
+    # objects themselves (identity preserved; nothing is wrapped or copied).
     SCHEMA = _canonical_contract.SCHEMA
     KIND_SUBMITTED = _canonical_contract.KIND_SUBMITTED
     SOURCE_PROVIDER_ADAPTER = _canonical_contract.SOURCE_PROVIDER_ADAPTER
     FIELDS = _canonical_contract.FIELDS
     TIMESTAMP_FIELDS = _canonical_contract.TIMESTAMP_FIELDS
     TIMESTAMP_VECTORS = _canonical_contract.TIMESTAMP_VECTORS
-    # The overridden name is type-bound to the standalone class; the canonical
-    # class must replace it as the exact same object, so silence that static
-    # reassignment check narrowly.
     ReceiptValidationError = _canonical_contract.ReceiptValidationError  # type: ignore[misc]
     message_digest = _canonical_contract.message_digest
     is_message_digest = _canonical_contract.is_message_digest
@@ -153,28 +147,8 @@ if _canonical_contract is not None:
     receipt_endpoint_path = _canonical_contract.receipt_endpoint_path
     validate_receipt = _canonical_contract.validate_receipt
     build_receipt = _canonical_contract.build_receipt
-    # Legacy fork aliases point at the canonical objects themselves.
+    # Legacy fork aliases point at the canonical objects.
     KIND = KIND_SUBMITTED
     SOURCE = SOURCE_PROVIDER_ADAPTER
-    __all__ = [
-        "SCHEMA",
-        "KIND_SUBMITTED",
-        "SOURCE_PROVIDER_ADAPTER",
-        "FIELDS",
-        "TIMESTAMP_FIELDS",
-        "TIMESTAMP_VECTORS",
-        "ReceiptValidationError",
-        "message_digest",
-        "is_message_digest",
-        "canonical_message_id",
-        "parse_rfc3339_utc",
-        "format_rfc3339_utc",
-        "receipt_endpoint_path",
-        "validate_receipt",
-        "build_receipt",
-        "KIND",
-        "SOURCE",
-        "CONTRACT_SOURCE",
-    ]
 else:
     CONTRACT_SOURCE = "standalone"

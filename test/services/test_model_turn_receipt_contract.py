@@ -10,10 +10,9 @@ from cli_agent_orchestrator.services import model_turn_receipt_contract as contr
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SRC_DIR = _REPO_ROOT / "src"
 
-#: Candidate checkouts hosting the pinned canonical contract module. The
-#: conductor definition pin is ``42af6fb2a4862211fcf1e1289ced44bb75b943c5``,
-#: and conductor origin/main ``924b38dc7`` has no intervening change to the
-#: module, so either checkout is an exact copy of the installed canonical.
+#: Optional local checkouts of the pinned canonical contract (definition pin
+#: ``42af6fb2a4862211fcf1e1289ced44bb75b943c5``). Only the real-module proof
+#: below consults these; every other proof is hermetic under ``tmp_path``.
 _CANONICAL_PLUGIN_CANDIDATES = (
     pathlib.Path(
         "/Users/colin/Projects/cao-conductor-worktrees/"
@@ -58,6 +57,78 @@ def _assert_isolated_ok(code: str, *, extra_paths: tuple[pathlib.Path, ...] = ()
     assert "OK" in result.stdout
     return result.stdout
 
+
+_CANONICAL_EXPORT_NAMES = (
+    "SCHEMA",
+    "KIND_SUBMITTED",
+    "SOURCE_PROVIDER_ADAPTER",
+    "FIELDS",
+    "TIMESTAMP_FIELDS",
+    "TIMESTAMP_VECTORS",
+    "ReceiptValidationError",
+    "message_digest",
+    "is_message_digest",
+    "canonical_message_id",
+    "parse_rfc3339_utc",
+    "format_rfc3339_utc",
+    "receipt_endpoint_path",
+    "validate_receipt",
+    "build_receipt",
+)
+
+_SYNTHETIC_CANONICAL_MODULE = """
+SCHEMA = object()
+KIND_SUBMITTED = object()
+SOURCE_PROVIDER_ADAPTER = object()
+FIELDS = object()
+TIMESTAMP_FIELDS = object()
+TIMESTAMP_VECTORS = object()
+ReceiptValidationError = object()
+message_digest = object()
+is_message_digest = object()
+canonical_message_id = object()
+parse_rfc3339_utc = object()
+format_rfc3339_utc = object()
+receipt_endpoint_path = object()
+validate_receipt = object()
+build_receipt = object()
+"""
+
+
+def _installed_success_probe(
+    names: tuple[str, ...] = _CANONICAL_EXPORT_NAMES,
+    *,
+    pinned_root: pathlib.Path | None = None,
+    extra_asserts: str = "",
+) -> str:
+    """A fresh-process probe: every export is the canonical object by ``is``,
+    and the legacy aliases resolve to the canonical constants."""
+    header = ""
+    if pinned_root is not None:
+        header = f"assert canonical.__file__.startswith({str(pinned_root)!r}), canonical.__file__\n"
+    return f"""
+import conductor_sentinel.model_turn_receipt_contract as canonical
+from cli_agent_orchestrator.services import model_turn_receipt_contract as facade
+
+{header}assert facade.CONTRACT_SOURCE == "conductor-sentinel", facade.CONTRACT_SOURCE
+for name in {names!r}:
+    assert getattr(facade, name) is getattr(canonical, name), name
+{extra_asserts}assert facade.KIND is facade.KIND_SUBMITTED
+assert facade.SOURCE is facade.SOURCE_PROVIDER_ADAPTER
+print("OK")
+"""
+
+
+#: The pinned real module's exact string facts and named vector keys.
+_PINNED_EXTRAS = (
+    'assert facade.SCHEMA == "cao-model-turn-receipt-v1"\n'
+    'assert facade.KIND_SUBMITTED == "submitted"\n'
+    'assert facade.SOURCE_PROVIDER_ADAPTER == "provider-adapter"\n'
+    "assert list(facade.TIMESTAMP_VECTORS) == [\n"
+    '    "same-second-nonzero-micros",\n'
+    '    "offset-to-utc-nonzero-micros",\n'
+    "]\n"
+)
 
 _STANDALONE_PROBE = """
 from datetime import datetime, timezone
@@ -129,110 +200,6 @@ else:
 """
 
 
-def _installed_mode_probe(canonical_root: pathlib.Path) -> str:
-    """Probe asserting exact object identity and values with the pinned module."""
-    return f"""
-import hashlib
-from datetime import datetime, timezone
-
-import conductor_sentinel.model_turn_receipt_contract as canonical
-from cli_agent_orchestrator.services import model_turn_receipt_contract as facade
-
-assert canonical.__file__.startswith({str(canonical_root)!r}), canonical.__file__
-assert facade.CONTRACT_SOURCE == "conductor-sentinel", facade.CONTRACT_SOURCE
-
-# exact object identity with the canonical module: no wrappers or copies
-assert facade.ReceiptValidationError is canonical.ReceiptValidationError
-assert facade.message_digest is canonical.message_digest
-assert facade.is_message_digest is canonical.is_message_digest
-assert facade.canonical_message_id is canonical.canonical_message_id
-assert facade.parse_rfc3339_utc is canonical.parse_rfc3339_utc
-assert facade.format_rfc3339_utc is canonical.format_rfc3339_utc
-assert facade.receipt_endpoint_path is canonical.receipt_endpoint_path
-assert facade.validate_receipt is canonical.validate_receipt
-assert facade.build_receipt is canonical.build_receipt
-assert facade.FIELDS is canonical.FIELDS
-assert facade.TIMESTAMP_FIELDS is canonical.TIMESTAMP_FIELDS
-assert facade.TIMESTAMP_VECTORS is canonical.TIMESTAMP_VECTORS
-
-# canonical values are exact
-assert facade.SCHEMA == canonical.SCHEMA == "cao-model-turn-receipt-v1"
-assert facade.KIND_SUBMITTED == canonical.KIND_SUBMITTED == "submitted"
-assert facade.SOURCE_PROVIDER_ADAPTER == canonical.SOURCE_PROVIDER_ADAPTER == "provider-adapter"
-
-# legacy fork aliases point at the canonical objects themselves
-assert facade.KIND is canonical.KIND_SUBMITTED
-assert facade.SOURCE is canonical.SOURCE_PROVIDER_ADAPTER
-
-# the named cross-repository timestamp vectors behave identically
-assert list(facade.TIMESTAMP_VECTORS) == [
-    "same-second-nonzero-micros",
-    "offset-to-utc-nonzero-micros",
-]
-for name, vector in canonical.TIMESTAMP_VECTORS.items():
-    assert facade.format_rfc3339_utc(vector["created"]) == vector["wire_created"]
-    assert facade.format_rfc3339_utc(vector["submitted"]) == vector["wire_submitted"]
-    assert facade.parse_rfc3339_utc(vector["wire_created"]) == vector["created"]
-    assert facade.parse_rfc3339_utc(vector["wire_submitted"]) == vector["submitted"]
-
-# the single digest helper and canonical id normalization
-assert facade.message_digest(b"ping") == hashlib.sha256(b"ping").hexdigest()
-assert facade.message_digest("ping") == hashlib.sha256(b"ping").hexdigest()
-assert facade.is_message_digest(facade.message_digest("ping"))
-assert not facade.is_message_digest("Q" + "a" * 63)
-assert facade.canonical_message_id(7) == "7"
-assert facade.canonical_message_id("7") == "7"
-assert (
-    facade.receipt_endpoint_path("deadbeef", 7)
-    == "/terminals/deadbeef/inbox/messages/7/turn-receipt"
-)
-
-# strict typed failures carry the canonical error surface
-try:
-    facade.validate_receipt({{}})
-except facade.ReceiptValidationError as exc:
-    assert exc.code == "missing-fields"
-else:
-    raise AssertionError("empty payload must fail strictly")
-try:
-    facade.build_receipt(
-        message_id=7,
-        message_sha256="bad",
-        message_created_at=datetime(2026, 7, 29, 14, 15, 16, 123456, tzinfo=timezone.utc),
-        sender_id="s",
-        sender_generation="sg",
-        receiver_id="r",
-        receiver_generation="rg",
-        provider="p",
-        provider_session_id="ps",
-        provider_turn_id="pt",
-        submitted_at=datetime(2026, 7, 29, 14, 15, 17, 123456, tzinfo=timezone.utc),
-    )
-except facade.ReceiptValidationError as exc:
-    assert exc.code == "digest-not-64-lowercase-hex"
-    assert exc.field == "message_sha256"
-else:
-    raise AssertionError("an invalid digest must fail strictly")
-
-# a valid receipt built through the facade round-trips through the facade
-receipt = facade.build_receipt(
-    message_id=7,
-    message_sha256="a" * 64,
-    message_created_at=datetime(2026, 7, 29, 14, 15, 16, 123456, tzinfo=timezone.utc),
-    sender_id="supervisor",
-    sender_generation="supervisor-generation",
-    receiver_id="worker",
-    receiver_generation="worker-generation",
-    provider="codex",
-    provider_session_id="session",
-    provider_turn_id="turn",
-    submitted_at=datetime(2026, 7, 29, 14, 15, 17, 654321, tzinfo=timezone.utc),
-)
-assert facade.validate_receipt(receipt) == receipt
-print("OK")
-"""
-
-
 def _receipt():
     return contract.build_receipt(
         message_id=7,
@@ -276,11 +243,22 @@ def test_standalone_selected_when_the_top_level_package_is_absent():
     _assert_isolated_ok(_STANDALONE_PROBE)
 
 
-def test_installed_mode_reexports_the_canonical_objects_exactly():
+def test_installed_success_is_hermetic_with_a_synthetic_canonical_package(tmp_path):
+    pkg = tmp_path / "conductor_sentinel"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "model_turn_receipt_contract.py").write_text(_SYNTHETIC_CANONICAL_MODULE)
+    _assert_isolated_ok(_installed_success_probe(), extra_paths=(tmp_path,))
+
+
+def test_installed_mode_reexports_the_pinned_canonical_objects_exactly():
     canonical_root = _pinned_canonical_plugin_dir()
     if canonical_root is None:
         pytest.skip("pinned conductor_sentinel source is not available on this machine")
-    _assert_isolated_ok(_installed_mode_probe(canonical_root), extra_paths=(canonical_root,))
+    _assert_isolated_ok(
+        _installed_success_probe(pinned_root=canonical_root, extra_asserts=_PINNED_EXTRAS),
+        extra_paths=(canonical_root,),
+    )
 
 
 def test_missing_contract_submodule_fails_visibly_not_fallback(tmp_path):
