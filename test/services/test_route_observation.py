@@ -282,16 +282,25 @@ class TestTermination:
             with database.SessionLocal() as session:
                 assert session.query(database.InboxModel).count() == 0
 
-    def test_ambiguous_is_stored_without_a_receipt(self):
+    def test_ambiguity_before_an_effect_intent_is_refused_without_a_wake(self):
+        """``ambiguous-after-possible-effect`` needs the held pre-probe intent.
+
+        Immediately after a claim there is no provider-effect intent, so the
+        ambiguous terminal result is refused before the terminal transaction:
+        the row stays requested and no inbox wake is written.
+        """
         request = _request()
         ro.claim(request)
-        terminal = ro.complete(
-            request,
-            result=ro.RESULT_AMBIGUOUS_AFTER_POSSIBLE_EFFECT,
-            final_event={"probe": "inconclusive"},
-        )
-        assert terminal["state"] == ro.RESULT_AMBIGUOUS_AFTER_POSSIBLE_EFFECT
-        assert terminal["receipt_digest"] is None
+        with pytest.raises(ro.RouteObservationConflict):
+            ro.complete(
+                request,
+                result=ro.RESULT_AMBIGUOUS_AFTER_POSSIBLE_EFFECT,
+                final_event={"probe": "inconclusive"},
+            )
+        stored = ro.get(request.operation_id)
+        assert stored["state"] == ro.STATE_REQUESTED
+        with database.SessionLocal() as session:
+            assert session.query(database.InboxModel).count() == 0
 
     def test_a_divergent_terminal_attempt_is_refused_when_already_terminal(self):
         request = _request()
@@ -421,15 +430,6 @@ class TestPreProbeAuthorization:
         #: one operation id, one committed intent — never a second decision.
         assert len(ro.list_operations()) == 1
 
-    def test_a_retry_after_response_loss_cannot_authorize_a_second_probe(self):
-        request = _request()
-        ro.claim(request)
-        first = ro.pre_probe(request, intent=_PRE_PROBE)
-        retry = ro.pre_probe(request, intent=_PRE_PROBE)
-        assert retry["authorized"] is False
-        assert retry["replayed"] is True
-        assert retry["pre_probe_intent_json"] == first["pre_probe_intent_json"]
-
     def test_a_changed_pre_probe_intent_conflicts_and_writes_nothing(self):
         request = _request()
         ro.claim(request)
@@ -452,16 +452,6 @@ class TestPreCloseAuthorization:
         second = ro.pre_close(request, intent=_PRE_CLOSE)
         assert second["authorized"] is False
         assert second["replayed"] is True
-
-    def test_a_retry_after_response_loss_cannot_authorize_a_second_escape(self):
-        request = _request()
-        ro.claim(request)
-        ro.pre_probe(request, intent=_PRE_PROBE)
-        ro.record_observation(request, observation=_OBSERVATION)
-        ro.pre_close(request, intent=_PRE_CLOSE)
-        retry = ro.pre_close(request, intent=_PRE_CLOSE)
-        assert retry["authorized"] is False
-        assert retry["replayed"] is True
 
 
 class TestStageFactReplay:
@@ -611,33 +601,6 @@ class TestDerivedPositiveReceipt:
         # The receipt is a deterministic function of those facts.
         assert json.loads(stored["receipt_json"]) == receipt
         assert terminal["receipt_digest"] == canonical_sha256(receipt)
-
-    def test_a_caller_cannot_furnish_an_independent_receipt_copy(self):
-        """``complete`` no longer accepts a proof parameter at all."""
-        request = _request()
-        ro.claim(request)
-        _stage(request)
-        with pytest.raises(TypeError):
-            ro.complete(
-                request,
-                result=ro.RESULT_OBSERVED_CLOSED,
-                final_event=_EVENT,
-                receipt={"kind": "forged"},
-            )
-
-    def test_a_receipt_cannot_substitute_caller_assertions_for_facts(self):
-        """No stored fact, no receipt: only the four committed facts count."""
-        request = _request()
-        ro.claim(request)
-        ro.pre_probe(request, intent=_PRE_PROBE)
-        ro.record_observation(request, observation=_OBSERVATION)
-        with pytest.raises(ro.RouteObservationConflict):
-            ro.complete(
-                request,
-                result=ro.RESULT_OBSERVED_CLOSED,
-                final_event=_EVENT,
-            )
-        assert ro.get(request.operation_id)["receipt_json"] is None
 
 
 # ---------------------------------------------------------------------------

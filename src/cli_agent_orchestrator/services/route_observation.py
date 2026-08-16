@@ -941,6 +941,12 @@ def _complete(
                 f"operation {request.operation_id} already committed an effect fact; "
                 f"{RESULT_ZERO_EFFECT_REFUSAL} is impossible after any effect intent"
             )
+    elif result == RESULT_AMBIGUOUS_AFTER_POSSIBLE_EFFECT:
+        if existing.pre_probe_intent_json is None:
+            raise RouteObservationConflict(
+                f"operation {request.operation_id} must commit the pre-probe intent "
+                f"before {RESULT_AMBIGUOUS_AFTER_POSSIBLE_EFFECT}"
+            )
     elif result == RESULT_OBSERVED_CLOSED:
         if not all(getattr(existing, field) is not None for field in STAGE_FACT_FIELDS):
             raise RouteObservationConflict(
