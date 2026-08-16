@@ -362,10 +362,18 @@ def test_an_undelivered_wake_reconciles_rather_than_settling():
     assert result["state"] == cohort.STATE_RECONCILIATION_REQUIRED
 
 
-def test_the_dark_default_waker_has_no_authority_and_says_so():
+def test_the_default_waker_delegates_to_m3d_and_never_raises():
+    """The seam M3-D fills, and the one thing it may never do.
+
+    A waker that raised would abort a Resume whose members are already
+    restored — the panes are back and the operation dies on the last step.
+    "I could not tell the supervisor" is an outcome the journal knows how to
+    record; a traceback is not. An operation with no id is the degenerate form
+    of that and must still answer.
+    """
     wake = _run(resume._default_waker({}, [], "id"))
     assert wake.delivered is False
-    assert "no supervisor reconciliation authority" in wake.detail
+    assert "no id to reconcile against" in wake.detail
 
 
 # ---------------------------------------------------------------------------

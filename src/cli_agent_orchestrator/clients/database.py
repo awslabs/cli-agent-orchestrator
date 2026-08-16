@@ -1251,6 +1251,250 @@ class SessionCohortTransitionModel(Base):
     )
 
 
+class TaskOccurrenceModel(Base):
+    """One durable task/round occurrence for one stable agent (cond-0380 M3-D).
+
+    The occurrence id is the *task* identity and is minted here. It is
+    deliberately not a terminal generation and not a provider-native
+    conversation id: both of those name a disposable physical effect, and a
+    stable agent outlives many of each. Binding a task to one of them is how a
+    resumed pane silently inherits a finished task, or how a finished task's
+    report gets attributed to the wrong round.
+
+    The exact effect-incarnation reference (``incarnation_id`` plus its
+    ``terminal_id``/``generation``) is carried *alongside* the occurrence so a
+    reader can say which physical effect produced the boundary evidence,
+    without that effect ever becoming the occurrence's identity.
+
+    ``current_*`` and ``finalized_*`` are separate column families on purpose.
+    A supervisor keeps updating an open occurrence's boundary and seed as the
+    round progresses; finalizing copies the accepted values into the write-once
+    family. Collapsing them would mean a late current update could rewrite what
+    a finished occurrence reported.
+
+    The partial unique index on ``agent_id WHERE state = 'open'`` is the one
+    task-execution authority: one stable agent has at most one open occurrence,
+    and a finalized occurrence can never be reopened by agent reuse.
+    """
+
+    __tablename__ = "task_occurrences"
+
+    task_occurrence_id = Column(Text, primary_key=True)
+    schema_version = Column(Text, nullable=False)
+    session_name = Column(Text, nullable=False)
+    agent_id = Column(Text, nullable=False)
+    round_index = Column(Integer, nullable=False)
+    # Opaque digest of the dispatch this occurrence answers. It is provenance,
+    # never a task body: no prompt, no instruction text, no environment value.
+    dispatch_digest = Column(Text, nullable=False)
+    dispatch_provenance_json = Column(Text, nullable=True)
+    # The exact effect-incarnation that is executing this occurrence.
+    incarnation_id = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    generation = Column(Text, nullable=True)
+    lineage_id = Column(Text, nullable=True)
+    native_session_id = Column(Text, nullable=True)
+
+    state = Column(Text, nullable=False)
+    current_boundary_digest = Column(Text, nullable=True)
+    current_report_digest = Column(Text, nullable=True)
+    current_checkpoint_digest = Column(Text, nullable=True)
+    current_provenance_json = Column(Text, nullable=True)
+    current_summary_seed_digest = Column(Text, nullable=True)
+    current_artifact_seed_digest = Column(Text, nullable=True)
+    current_seed_quality = Column(Text, nullable=False)
+    current_seed_json = Column(Text, nullable=True)
+
+    final_disposition = Column(Text, nullable=True)
+    finalized_boundary_digest = Column(Text, nullable=True)
+    finalized_report_digest = Column(Text, nullable=True)
+    finalized_checkpoint_digest = Column(Text, nullable=True)
+    finalized_provenance_json = Column(Text, nullable=True)
+    finalized_summary_seed_digest = Column(Text, nullable=True)
+    finalized_artifact_seed_digest = Column(Text, nullable=True)
+    finalized_seed_quality = Column(Text, nullable=True)
+    finalized_seed_json = Column(Text, nullable=True)
+    finalized_by = Column(Text, nullable=True)
+    finalized_at = Column(Text, nullable=True)
+
+    revision = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_task_occurrences_round",
+            "session_name",
+            "agent_id",
+            "round_index",
+            unique=True,
+        ),
+        Index(
+            "ix_task_occurrences_open_agent",
+            "agent_id",
+            unique=True,
+            sqlite_where=text("state = 'open'"),
+        ),
+        Index("ix_task_occurrences_session", "session_name"),
+        Index("ix_task_occurrences_incarnation", "incarnation_id"),
+    )
+
+
+class TaskOccurrenceExtensionModel(Base):
+    """One opaque, versioned extension attached to a task occurrence.
+
+    The carrier exists so a build that does not understand an extension still
+    *preserves* it. An unrecognised or nonfinal extension — including a future
+    build's completion claim — is retained verbatim and routed to the decider
+    that owns it. It is never interpreted here and never turned back into a
+    dispatch: redispatching an extension would replay work whose owner has not
+    decided it yet.
+    """
+
+    __tablename__ = "task_occurrence_extensions"
+
+    task_occurrence_id = Column(Text, primary_key=True)
+    extension_id = Column(Text, primary_key=True)
+    extension_kind = Column(Text, nullable=False)
+    extension_version = Column(Text, nullable=False)
+    decider = Column(Text, nullable=False)
+    payload_digest = Column(Text, nullable=False)
+    payload_json = Column(Text, nullable=False)
+    claims_final = Column(Integer, nullable=False, default=0, server_default="0")
+    recognized = Column(Integer, nullable=False, default=0, server_default="0")
+    routing_state = Column(Text, nullable=False)
+    routed_at = Column(Text, nullable=True)
+    routed_receipt = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (Index("ix_task_occurrence_extensions_decider", "decider", "routing_state"),)
+
+
+class SessionDrainReceiptModel(Base):
+    """One safe-drain coordination for one exact cohort boundary (M3-D).
+
+    A drain is the evidence a *safe* Pause or Stop consumes, so it binds the
+    same lifecycle epoch and roster revision the cohort claim will bind. The
+    receipt digest is only written when the drain is genuinely complete: a
+    timeout or an unproven boundary leaves the row pending or
+    reconciliation-required, which is what stops a safe surface from quietly
+    accepting a fleet that never reached a boundary.
+    """
+
+    __tablename__ = "session_drain_receipts"
+
+    drain_id = Column(Text, primary_key=True)
+    schema_version = Column(Text, nullable=False)
+    session_name = Column(Text, nullable=False)
+    intent = Column(Text, nullable=False)
+    lifecycle_epoch = Column(Integer, nullable=False)
+    lifecycle_observation = Column(Text, nullable=False)
+    roster_revision = Column(Text, nullable=False)
+    snapshot_digest = Column(Text, nullable=False)
+    request_digest = Column(Text, nullable=False)
+    state = Column(Text, nullable=False)
+    attempt = Column(Integer, nullable=False, default=0, server_default="0")
+    receipt_digest = Column(Text, nullable=True)
+    reconciliation_reason = Column(Text, nullable=True)
+    initiated_by = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_session_drain_receipts_slot",
+            "session_name",
+            "lifecycle_epoch",
+            "roster_revision",
+            "intent",
+            unique=True,
+        ),
+        Index("ix_session_drain_receipts_session", "session_name"),
+    )
+
+
+class SessionDrainMemberModel(Base):
+    """One worker's safe-drain state, steered at most once.
+
+    ``steer_control_id`` is derived from the drain and the agent rather than
+    minted per attempt, so a retry re-sends the *same* control id and the
+    delivery seam adopts it instead of steering a second time. A worker steered
+    twice is a worker told to stop twice, which is how a boundary report gets
+    duplicated or a turn gets cancelled after it already ended.
+    """
+
+    __tablename__ = "session_drain_members"
+
+    drain_id = Column(Text, primary_key=True)
+    agent_id = Column(Text, primary_key=True)
+    role = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=True)
+    generation = Column(Text, nullable=True)
+    incarnation_id = Column(Text, nullable=True)
+    observed_state = Column(Text, nullable=False)
+    steer_control_id = Column(Text, nullable=False)
+    steer_state = Column(Text, nullable=False)
+    task_occurrence_id = Column(Text, nullable=True)
+    boundary_digest = Column(Text, nullable=True)
+    report_digest = Column(Text, nullable=True)
+    checkpoint_digest = Column(Text, nullable=True)
+    teardown_request_id = Column(Text, nullable=True)
+    teardown_state = Column(Text, nullable=False)
+    member_state = Column(Text, nullable=False)
+    detail = Column(Text, nullable=True)
+    revision = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (Index("ix_session_drain_members_agent", "agent_id"),)
+
+
+class SupervisorReconciliationWakeModel(Base):
+    """The one supervisor reconciliation wake for one Resume (M3-D).
+
+    M3-C mints an opaque wake id per Resume operation and hands it here; this
+    row is what makes "exactly once" durable rather than per-process. The
+    unique index on ``source_operation_id`` is the whole guarantee: a retried
+    Resume adopts the recorded wake and its outcome instead of composing and
+    sending a second message.
+
+    ``message_json`` is the exact rendered content, kept so a re-send is
+    provably byte-identical and an operator can read what the supervisor was
+    actually told.
+    """
+
+    __tablename__ = "supervisor_reconciliation_wakes"
+
+    wake_id = Column(Text, primary_key=True)
+    schema_version = Column(Text, nullable=False)
+    session_name = Column(Text, nullable=False)
+    source_kind = Column(Text, nullable=False)
+    source_operation_id = Column(Text, nullable=False)
+    supervisor_agent_id = Column(Text, nullable=True)
+    terminal_id = Column(Text, nullable=True)
+    generation = Column(Text, nullable=True)
+    message_digest = Column(Text, nullable=False)
+    message_json = Column(Text, nullable=False)
+    control_id = Column(Text, nullable=False)
+    delivery_state = Column(Text, nullable=False)
+    outcome = Column(Text, nullable=True)
+    reason_code = Column(Text, nullable=True)
+    detail = Column(Text, nullable=True)
+    receipt_digest = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_supervisor_reconciliation_wakes_source",
+            "source_operation_id",
+            unique=True,
+        ),
+        Index("ix_supervisor_reconciliation_wakes_session", "session_name"),
+    )
+
+
 class NativeStatusRepairEvidenceModel(Base):
     """One immutable bounded record of a native /status identity repair.
 
@@ -1834,6 +2078,8 @@ def init_db() -> None:
     _migrate_restore_contracts()
     _migrate_operation_journal()
     _migrate_session_cohort_journal()
+    _migrate_task_occurrences()
+    _migrate_supervisor_drain()
     _migrate_native_status_repair()
     _migrate_provider_recovery_episodes()
     _migrate_native_status_observation_attempt()
@@ -2680,6 +2926,210 @@ def _migrate_session_cohort_journal() -> None:
             )
     except Exception as e:  # noqa: BLE001 - dark journal fails closed
         logger.warning(f"session-cohort journal migration failed: {e}")
+
+
+def _migrate_task_occurrences() -> None:
+    """Create the M3-D task-occurrence seam on older databases.
+
+    Additive and idempotent; fresh stores get the same schema through ORM
+    ``create_all``. Creating these tables performs no dispatch, no provider or
+    tmux effect, and does not finalize or reopen anything: an occurrence only
+    exists once an owner opens one.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS task_occurrences ("
+                "task_occurrence_id TEXT NOT NULL PRIMARY KEY, "
+                "schema_version TEXT NOT NULL, "
+                "session_name TEXT NOT NULL, "
+                "agent_id TEXT NOT NULL, "
+                "round_index INTEGER NOT NULL, "
+                "dispatch_digest TEXT NOT NULL, "
+                "dispatch_provenance_json TEXT, "
+                "incarnation_id TEXT NOT NULL, "
+                "terminal_id TEXT NOT NULL, "
+                "generation TEXT, "
+                "lineage_id TEXT, "
+                "native_session_id TEXT, "
+                "state TEXT NOT NULL, "
+                "current_boundary_digest TEXT, "
+                "current_report_digest TEXT, "
+                "current_checkpoint_digest TEXT, "
+                "current_provenance_json TEXT, "
+                "current_summary_seed_digest TEXT, "
+                "current_artifact_seed_digest TEXT, "
+                "current_seed_quality TEXT NOT NULL, "
+                "current_seed_json TEXT, "
+                "final_disposition TEXT, "
+                "finalized_boundary_digest TEXT, "
+                "finalized_report_digest TEXT, "
+                "finalized_checkpoint_digest TEXT, "
+                "finalized_provenance_json TEXT, "
+                "finalized_summary_seed_digest TEXT, "
+                "finalized_artifact_seed_digest TEXT, "
+                "finalized_seed_quality TEXT, "
+                "finalized_seed_json TEXT, "
+                "finalized_by TEXT, "
+                "finalized_at TEXT, "
+                "revision INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_task_occurrences_round "
+                "ON task_occurrences(session_name, agent_id, round_index)"
+            )
+            # One open occurrence per stable agent: the durable form of "one
+            # task execution authority". A finalized row is outside the index,
+            # so agent reuse opens a *new* occurrence and can never reopen a
+            # finished one.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_task_occurrences_open_agent "
+                "ON task_occurrences(agent_id) WHERE state = 'open'"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_task_occurrences_session "
+                "ON task_occurrences(session_name)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_task_occurrences_incarnation "
+                "ON task_occurrences(incarnation_id)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS task_occurrence_extensions ("
+                "task_occurrence_id TEXT NOT NULL, "
+                "extension_id TEXT NOT NULL, "
+                "extension_kind TEXT NOT NULL, "
+                "extension_version TEXT NOT NULL, "
+                "decider TEXT NOT NULL, "
+                "payload_digest TEXT NOT NULL, "
+                "payload_json TEXT NOT NULL, "
+                "claims_final INTEGER NOT NULL DEFAULT 0, "
+                "recognized INTEGER NOT NULL DEFAULT 0, "
+                "routing_state TEXT NOT NULL, "
+                "routed_at TEXT, "
+                "routed_receipt TEXT, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (task_occurrence_id, extension_id)"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_task_occurrence_extensions_decider "
+                "ON task_occurrence_extensions(decider, routing_state)"
+            )
+    except Exception as e:  # noqa: BLE001 - dark seam fails closed
+        logger.warning(f"task-occurrence migration failed: {e}")
+
+
+def _migrate_supervisor_drain() -> None:
+    """Create the M3-D safe-drain and supervisor-wake tables on older databases.
+
+    Additive and idempotent. Creating them steers no worker, requests no
+    teardown, and sends no supervisor input.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_drain_receipts ("
+                "drain_id TEXT NOT NULL PRIMARY KEY, "
+                "schema_version TEXT NOT NULL, "
+                "session_name TEXT NOT NULL, "
+                "intent TEXT NOT NULL, "
+                "lifecycle_epoch INTEGER NOT NULL, "
+                "lifecycle_observation TEXT NOT NULL, "
+                "roster_revision TEXT NOT NULL, "
+                "snapshot_digest TEXT NOT NULL, "
+                "request_digest TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "attempt INTEGER NOT NULL DEFAULT 0, "
+                "receipt_digest TEXT, "
+                "reconciliation_reason TEXT, "
+                "initiated_by TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_session_drain_receipts_slot "
+                "ON session_drain_receipts"
+                "(session_name, lifecycle_epoch, roster_revision, intent)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_session_drain_receipts_session "
+                "ON session_drain_receipts(session_name)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_drain_members ("
+                "drain_id TEXT NOT NULL, "
+                "agent_id TEXT NOT NULL, "
+                "role TEXT NOT NULL, "
+                "terminal_id TEXT, "
+                "generation TEXT, "
+                "incarnation_id TEXT, "
+                "observed_state TEXT NOT NULL, "
+                "steer_control_id TEXT NOT NULL, "
+                "steer_state TEXT NOT NULL, "
+                "task_occurrence_id TEXT, "
+                "boundary_digest TEXT, "
+                "report_digest TEXT, "
+                "checkpoint_digest TEXT, "
+                "teardown_request_id TEXT, "
+                "teardown_state TEXT NOT NULL, "
+                "member_state TEXT NOT NULL, "
+                "detail TEXT, "
+                "revision INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (drain_id, agent_id)"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_session_drain_members_agent "
+                "ON session_drain_members(agent_id)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS supervisor_reconciliation_wakes ("
+                "wake_id TEXT NOT NULL PRIMARY KEY, "
+                "schema_version TEXT NOT NULL, "
+                "session_name TEXT NOT NULL, "
+                "source_kind TEXT NOT NULL, "
+                "source_operation_id TEXT NOT NULL, "
+                "supervisor_agent_id TEXT, "
+                "terminal_id TEXT, "
+                "generation TEXT, "
+                "message_digest TEXT NOT NULL, "
+                "message_json TEXT NOT NULL, "
+                "control_id TEXT NOT NULL, "
+                "delivery_state TEXT NOT NULL, "
+                "outcome TEXT, "
+                "reason_code TEXT, "
+                "detail TEXT, "
+                "receipt_digest TEXT, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_supervisor_reconciliation_wakes_source "
+                "ON supervisor_reconciliation_wakes(source_operation_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_supervisor_reconciliation_wakes_session "
+                "ON supervisor_reconciliation_wakes(session_name)"
+            )
+    except Exception as e:  # noqa: BLE001 - dark seam fails closed
+        logger.warning(f"supervisor-drain migration failed: {e}")
 
 
 def _migrate_native_status_repair() -> None:

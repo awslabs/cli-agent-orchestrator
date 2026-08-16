@@ -10,9 +10,11 @@ row-preserving stop/archive collection described here are **implemented**
 (by this work). M3-C C1-C2 implements the cohort service described in §4.3, and
 C4 adds the **public operator surfaces** described in §4.4: separate safe/force
 Pause and Stop, operator-only Resume of a stopped session (paused, or paused
-and started), and the durable projection behind all of them. The legacy stop
-route still behaves exactly as documented in §4.0. Fire Marshal cutover remains
-deferred.
+and started), and the durable projection behind all of them. M3-D (§4.5) adds
+the task-occurrence seam, the safe drain that produces the receipt those safe
+surfaces spend, and the content and delivery of the supervisor reconciliation
+wake. The legacy stop route still behaves exactly as documented in §4.0. Fire
+Marshal cutover remains deferred.
 
 ---
 
@@ -314,10 +316,9 @@ and does not infer task meaning from CAO's physical roster.
 A mode flag is something a client library defaults, a script sets once, and a
 retry carries forward. A different URL is not. `cao session cohort` mirrors the
 split (`stop-safe` / `stop-force`), as does the dashboard, which renders force
-as its own button rather than a modifier. There is deliberately **no safe-Pause
-CLI command or dashboard button**: a safe Pause consumes evidence only M3-D can
-produce, and offering a button that quietly did a force Pause instead is the
-mislabelling the whole split exists to prevent.
+as its own button rather than a modifier. Safe Pause had no CLI command or
+dashboard button until M3-D existed to produce its evidence; §4.5 describes
+what it now takes to reach one, and why it is two steps rather than one.
 
 **Resume is the only thing that reopens a Stop barrier**, and only an operator
 performs it. `begin_resume_restore` is `begin_stop_teardown`'s mirror image: it
@@ -394,6 +395,146 @@ transitions and therefore cannot half-advance a Resume it does not understand.
 A released barrier is an ordinary `open` barrier, which an older build already
 handles correctly, and every release bumps the row epoch so a lost update stays
 detectable.
+
+### 4.5 M3-D: task occurrences, safe drain, and what a resumed supervisor is told
+
+M3-C's whole surface has one shape of hole in it: it knows which *panes* an
+operation touched and refuses to say what any of it meant. Safe Pause and safe
+Stop consume an "opaque M3-D receipt" that nothing produced, and Resume's single
+wake was delivered by a seam whose honest answer was "this fork has no
+supervisor-reconciliation authority". M3-D is that authority. It consumes M3-A's
+stable agents/incarnations and M3-C's cohort receipts as **opaque evidence**; it
+never creates a second physical roster and never reinterprets a fork effect.
+
+**A task occurrence is not a generation and not a conversation.** Both name a
+disposable physical effect, and a stable agent outlives many of each — an exact
+reincarnation deliberately keeps the *same* native conversation across a *new*
+generation. Keying a task on either is how a resumed pane silently inherits the
+previous round, or how a late report lands on the wrong one.
+`task_occurrences` therefore mints its own id and carries the exact
+effect-incarnation reference (`incarnation_id` + `terminal_id`/`generation`)
+alongside it, so a reader can still say which effect produced which evidence.
+
+Four properties are load-bearing:
+
+- **Stable-agent reuse never reopens a finalized occurrence.** A partial unique
+  index on `agent_id WHERE state = 'open'` makes one agent hold at most one open
+  occurrence, and a finalized row sits outside that index — so reuse opens a new
+  occurrence rather than reviving a closed one. That index is *partial* on
+  purpose: a full one would forbid an agent's second round entirely.
+- **Current and finalized are separate column families.** A supervisor keeps
+  revising an open round's boundary and seed; finalizing copies the accepted
+  values into a write-once family. Shared columns would let a late write — the
+  one a crashed-then-retried worker sends — rewrite what a finished round
+  reported.
+- **The seed states its own completeness.** `complete | truncated | empty` is
+  required, never derived. Only `complete` licenses a fresh successor unattended.
+  `truncated` is the dangerous one: it reads as context while missing the part
+  that mattered.
+- **Unknown extensions are preserved and routed, never interpreted or
+  redispatched.** An extension carries an opaque versioned payload and names its
+  decider. A future build's completion claim is stored verbatim, blocks
+  *reporting* the round complete, and goes to its decider — turning it back into
+  a dispatch would replay work nobody has ruled on.
+
+**Safe drain is what a safe Pause/Stop actually spends.** The drain snapshots the
+exact cohort boundary, steers each non-idle/non-parked worker **exactly once**
+(the control id is derived from the drain and the agent, so a retry adopts rather
+than typing a second steer), and requires **both** halves of a boundary: a report
+or checkpoint digest *and* positive idle/parked proof. Either alone is a guess —
+quiescence without evidence is a worker that stopped without saying where it got
+to, and a report from a still-running turn is the Codex false-pause. The
+supervisor drains **last**, only once every worker is decided; a supervisor that
+parks first cannot attribute what its workers do next. For a Stop, CAO's teardown
+is durably requested **before** the receipt exists and therefore before any Stop
+can consume it — so a pane that vanishes mid-Stop is a recorded intention rather
+than a lost pane to adjudicate.
+
+A drain that cannot prove a boundary stays `pending`/`reconciliation-required`
+with **no receipt**. It never degrades into a force operation: continuing is an
+explicit retry, and abandoning the boundary is M3-C's explicit, receipted
+safe-to-force promotion, whose receipt is derived from the stalled drain rather
+than minted.
+
+**A receipt is a reference, not a bearer token.** Spending one resolves it back
+to the drain that issued it and re-validates three things, because a drain
+proves a boundary the fleet reached *then*:
+
+- **the intent matches.** A Pause drain and a Stop drain prove different
+  things; only a Stop drain records CAO's teardown intent. A Pause receipt
+  spent as safe Stop would collect panes nobody announced, so it is refused —
+  as is a digest naming no drain at all.
+- **the boundary is still current.** The claim binds the *drained* lifecycle
+  epoch, roster revision and member snapshot rather than a fresh observation,
+  so `claim_operation` performs the compare-and-swap and a fleet that moved
+  loses the claim instead of committing on a stale classification.
+- **the fleet is still quiescent.** Opening a task occurrence touches no
+  stable-agent revision, so a supervisor dispatching another round is invisible
+  to boundary binding alone. Each member's recorded occurrence and boundary
+  digest are re-read at spend time; a new round, a different round, or a later
+  boundary on the drained one is intervening later work and the answer is a
+  fresh drain. Refusing is the entire behaviour — nothing promotes itself.
+
+That is why the safe surfaces are two steps. `cao session drain` runs the drain
+and prints the one spend command **matching its intent** — never both, because
+offering the other teaches a command the server refuses. The dashboard renders
+"Drain to a boundary" and only offers "Safe pause" once a spendable Pause
+receipt exists. Both name the **drain**, not a digest: the receipt and the
+per-member classification are then read from one durable row, where a
+hand-carried digest beside an edited member list would spend a real receipt on
+a claim it does not describe. `cohort/pause/safe` and `cohort/stop/safe` keep
+M3-C's shape for the component that produced the evidence itself.
+
+**The reconciliation wake.** M3-C guarantees exactly one wake per Resume and that
+it comes last; M3-D owns what it says and whether it landed. The message is
+rendered deterministically from the durable cohort record — including its
+truncation, so a replay is byte-identical — and lists what the supervisor cannot
+see for itself: exact-restored, fresh-fallback (with the completeness of the seed
+each fresh worker was given), interrupted, parked, failed, and unresumable. It is
+addressed to the supervisor's **current** incarnation, because an exact restore
+returns the same conversation on a new pane. One ledger row per source operation
+makes "exactly once" durable rather than per-process, and a delivered wake is
+never downgraded by a later attempt. A wake that did not land leaves M3-C's
+Resume in reconciliation, which is correct: the fleet is back and nobody has been
+told. Resume-paused sends **zero** input and claims no wake at all; starting a
+paused fleet later gets its own one-wake guarantee under a derived id.
+
+**Supervisor-owned worker acts.** Retiring a worker finalizes its round *before*
+the pane is collected — collecting first destroys the evidence at the moment
+somebody needs it. Worker resume is exact-only; a refused restore is `failed`,
+never a silent fresh relaunch, because the value of an exact resume is that the
+transcript is the same transcript. Lost-pane recovery has three outcomes and the
+third is the point: exact restoration, a fresh fallback **only** with the
+supervisor summary, digest-bound artifacts, and an explicit `complete` seed, or
+otherwise the worker stays **paused for reconciliation** — nothing launched, no
+input replayed, no instruction reconstructed. A visible gap is recoverable; a
+worker confidently doing the wrong thing is not.
+
+A fresh fallback **admits before it launches**. In the realistic lost-pane case
+the predecessor round is still *open*, because the thing that would have closed
+it is the pane that vanished — so admission resolves that round (`lost`,
+write-once) and retires the lost incarnation, and only a stable agent with no
+open round and no live pane may have one created for it. That ordering is what
+makes the retry safe: an agent that is live at admission time on an incarnation
+the predecessor round does not name is one a previous attempt already launched,
+so it is **adopted**, not launched again. Launching first and discovering the
+open round afterwards left a pane nobody pointed at, and a retry made another.
+
+**The reconciliation wake resends its claim, not a re-render.** The rendered
+message is a proposal: it is persisted the first time an operation claims a
+wake and ignored on every attempt after. Only the delivery *target* is
+re-resolved, because the supervisor's pane legitimately moves while its words
+do not. A resend under the same control id carrying different text would either
+be suppressed as a duplicate of a message nobody saw, or land as a second
+differently-worded version of the same wake — and the ledger would describe
+neither. What is stored is what was sent, which is the only reason "the
+supervisor was told X" is checkable.
+
+**Rollback.** M3-D adds five tables and **no column to any table an older build
+writes** — the cohort member carriers it fills (`task_occurrence_id`,
+`boundary_digest`, `report_digest`, `checkpoint_digest`) were reserved by C1.
+Rolling back leaves those rows simply unread, and an older build's own schema is
+byte-identical to what it had before.
 
 ---
 

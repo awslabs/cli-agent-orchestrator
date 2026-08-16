@@ -184,6 +184,151 @@ export interface CohortOperation {
   provenance?: CohortProvenance
 }
 
+// ---------------------------------------------------------------------------
+// Safe drain, task occurrences, supervisor wakes (M3-D)
+// ---------------------------------------------------------------------------
+
+/**
+ * How complete the summary/artifact seed a fresh successor would inherit is.
+ *
+ * `truncated` is the dangerous value and the reason this is a three-state
+ * vocabulary rather than a boolean: it reads as context while missing the part
+ * that mattered, so a fresh worker started on it continues confidently from
+ * the wrong place. Only `complete` is enough.
+ */
+export type SeedQuality = 'complete' | 'truncated' | 'empty'
+
+export type DrainIntent = 'pause' | 'stop'
+export type DrainState = 'pending' | 'complete' | 'reconciliation-required'
+export type DrainMemberState =
+  | 'pending'
+  | 'drained'
+  | 'already-idle'
+  | 'parked'
+  | 'reconciliation-required'
+
+export interface DrainMember {
+  drain_id: string
+  agent_id: string
+  role: 'supervisor' | 'worker'
+  terminal_id: string | null
+  observed_state: 'active' | 'idle' | 'parked' | 'exited' | 'unknown'
+  /** Derived from the drain and the agent, so a retry never steers twice. */
+  steer_control_id: string
+  steer_state: 'not-required' | 'sent' | 'refused' | 'unproven'
+  task_occurrence_id: string | null
+  boundary_digest: string | null
+  report_digest: string | null
+  checkpoint_digest: string | null
+  /** Stop only: CAO's teardown is announced before the pane disappears. */
+  teardown_state: 'not-required' | 'requested' | 'unproven'
+  member_state: DrainMemberState
+  detail: string | null
+  revision: number
+}
+
+export interface DrainProvenance {
+  drain_id: string
+  session_name: string
+  intent: DrainIntent
+  state: DrainState
+  attempt: number
+  member_outcomes: Partial<Record<DrainMemberState, number>>
+  undecided: string[]
+  steered: string[]
+  teardown_requested: string[]
+  /** Present only on a `complete` drain. An unfinished one has nothing to spend. */
+  receipt_digest: string | null
+  retryable: boolean
+  reconciliation_reason: string | null
+  /** Derived from the *stalled* drain; a drain never promotes itself. */
+  force_promotion_receipt: string | null
+}
+
+export interface SessionDrain {
+  drain_id: string
+  session_name: string
+  intent: DrainIntent
+  state: DrainState
+  attempt: number
+  lifecycle_epoch: number
+  roster_revision: string
+  receipt_digest: string | null
+  reconciliation_reason: string | null
+  initiated_by: string
+  created_at: string
+  updated_at: string
+  members?: DrainMember[]
+  provenance?: DrainProvenance
+}
+
+/**
+ * A task/round occurrence. Deliberately *not* keyed by terminal generation or
+ * native conversation: a stable agent outlives many of each, so binding a task
+ * to one of them is how a resumed pane inherits a finished round.
+ */
+export interface TaskOccurrence {
+  task_occurrence_id: string
+  session_name: string
+  agent_id: string
+  round_index: number
+  state: 'open' | 'finalized'
+  /** The exact effect that executed it, carried alongside — never as its id. */
+  incarnation_id: string
+  terminal_id: string
+  generation: string | null
+  current: TaskOccurrenceEvidence
+  finalized: TaskOccurrenceEvidence & {
+    disposition: 'reported' | 'abandoned' | 'superseded' | 'lost' | null
+    finalized_by: string | null
+    finalized_at: string | null
+  }
+  revision: number
+  extensions?: TaskOccurrenceExtension[]
+  seed_verdict?: SeedVerdict
+}
+
+export interface TaskOccurrenceEvidence {
+  boundary_digest: string | null
+  report_digest: string | null
+  checkpoint_digest: string | null
+  summary_seed_digest: string | null
+  artifact_seed_digest: string | null
+  seed_quality: SeedQuality | null
+}
+
+/** Opaque and versioned. An unrecognised kind is preserved, never interpreted. */
+export interface TaskOccurrenceExtension {
+  task_occurrence_id: string
+  extension_id: string
+  extension_kind: string
+  extension_version: string
+  decider: string
+  claims_final: boolean
+  recognized: boolean
+  routing_state: 'pending-decider' | 'routed'
+}
+
+export interface SeedVerdict {
+  family: 'current' | 'finalized'
+  quality: SeedQuality | null
+  sufficient_for_fresh_start: boolean
+  reason: string | null
+}
+
+export interface ReconciliationWake {
+  wake_id: string
+  session_name: string
+  source_kind: 'resume-and-start' | 'paused-to-working'
+  source_operation_id: string
+  delivery_state: 'claimed' | 'delivered' | 'undelivered'
+  reason_code: string | null
+  detail: string | null
+  receipt_digest: string | null
+  /** The exact text the supervisor was sent, so "it was told" is checkable. */
+  message: { text: string; counts: Record<string, number>; truncated: boolean } | null
+}
+
 export interface StopImpactWorker {
   terminal_id: string
   provider: string
@@ -885,6 +1030,67 @@ export const api = {
         operation_id: operationId, initiated_by: initiatedBy, reason: reason ?? null,
       }),
     }),
+
+  // Safe drain and its receipt (M3-D). `runSafeDrain` types into every
+  // non-idle worker's pane, which is why it is the only M3-D write here that
+  // is not a read: everything else in this block observes.
+  //
+  // `drainId` is caller-supplied for the same reason `operationId` is — a
+  // retried request is the *same* drain and adopts it rather than steering
+  // the whole fleet a second time.
+  runSafeDrain: (
+    name: string, drainId: string, intent: DrainIntent, initiatedBy: string, retry = false,
+  ) =>
+    fetchJSON<SessionDrain>(`/sessions/${encodeURIComponent(name)}/drain/safe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      timeoutMs: 180000,
+      body: JSON.stringify({
+        drain_id: drainId, intent, initiated_by: initiatedBy, retry,
+      }),
+    }),
+  getDrain: (drainId: string) =>
+    fetchJSON<SessionDrain & { provenance: DrainProvenance }>(
+      `/drains/${encodeURIComponent(drainId)}`),
+  listDrains: (name: string) =>
+    fetchJSON<{ drains: SessionDrain[]; count: number }>(
+      `/sessions/${encodeURIComponent(name)}/drains`),
+
+  // A safe Pause names the *drain*, never a digest. The receipt and the
+  // per-member classification are then read from one durable row: a client
+  // that carried a digest forward while editing the member list would spend a
+  // real receipt on a claim it does not describe.
+  cohortPauseSafeFromDrain: (
+    name: string, operationId: string, drainId: string, initiatedBy: string, reason?: string,
+  ) =>
+    fetchJSON<CohortOperation>(
+      `/sessions/${encodeURIComponent(name)}/cohort/pause/safe-drained`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        timeoutMs: 120000,
+        body: JSON.stringify({
+          operation_id: operationId, drain_id: drainId,
+          initiated_by: initiatedBy, reason: reason ?? null,
+        }),
+      }),
+
+  // Task occurrences. Read-only here: opening, finalizing, and extending a
+  // round belong to the components that own the work, not to a dashboard.
+  listTaskOccurrences: (name: string) =>
+    fetchJSON<{ occurrences: TaskOccurrence[]; count: number }>(
+      `/sessions/${encodeURIComponent(name)}/task-occurrences`),
+  getTaskOccurrence: (id: string) =>
+    fetchJSON<TaskOccurrence>(`/task-occurrences/${encodeURIComponent(id)}`),
+  getAgentOccurrenceHistory: (name: string, agentId: string) =>
+    fetchJSON<{ open: TaskOccurrence | null; finalized: TaskOccurrence[] }>(
+      `/sessions/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentId)}` +
+      '/task-occurrences'),
+
+  // What each resumed supervisor was actually told. The dashboard may only say
+  // "the supervisor was told" where a delivered wake says so.
+  listReconciliationWakes: (name: string) =>
+    fetchJSON<{ wakes: ReconciliationWake[]; count: number }>(
+      `/sessions/${encodeURIComponent(name)}/reconciliation-wakes`),
 
   // Conductor annotations (§9.5). The route takes no parameters — that is the
   // security property, not an omission — and never errors: an absent or
