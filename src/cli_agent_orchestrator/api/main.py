@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cli_agent_orchestrator.api.attachments import router as native_attachments_router
 from cli_agent_orchestrator.api.roster import router as roster_router
 from cli_agent_orchestrator.api.session_lifecycle import router as session_lifecycle_router
+from cli_agent_orchestrator.api.task_occurrence import router as task_occurrence_router
 from cli_agent_orchestrator.api.tracker import router as tracker_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -860,6 +861,10 @@ app.include_router(native_attachments_router)
 # /sessions/{name}/lifecycle resolve without inheriting their tmux-existence
 # guard — a stopped session has no tmux session, and that is the point.
 app.include_router(session_lifecycle_router)
+# Registered ahead of the app-level /sessions routes for the same reason: a
+# task occurrence outlives the pane that ran it, so its read routes must not
+# inherit a tmux-existence guard.
+app.include_router(task_occurrence_router)
 app.include_router(roster_router)
 
 

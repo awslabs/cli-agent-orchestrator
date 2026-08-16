@@ -608,10 +608,11 @@ def session_cohort():
     fleet and changes only the declared lifecycle. These commands act on every
     member of the cohort and record a durable operation you can read back.
 
-    There is deliberately no `pause-safe` here. A safe Pause consumes M3-D's
-    drain receipt and its per-member classification — evidence a human cannot
-    type at a prompt — so it is driven through the API by the component that
-    owns it. Everything a person can honestly decide has a command.
+    `pause-safe` takes a `--drain`, not a digest. A safe Pause consumes M3-D's
+    drain receipt *and* its per-member classification, and neither is
+    something a person can honestly type at a prompt — so the command names
+    the durable drain and the server reads both from it. Run `cao session
+    drain` first; it prints the exact command to spend the receipt.
     """
 
 
@@ -645,19 +646,37 @@ def cohort_pause_force(session_name, initiated_by, reason, yes, as_json):
 @click.argument("session_name")
 @click.option("--by", "initiated_by", required=True)
 @click.option(
+    "--drain",
+    "drain_id",
+    default=None,
+    help="The complete STOP drain whose receipt this Stop spends. `cao session drains` lists them.",
+)
+@click.option(
     "--drain-receipt",
-    required=True,
-    help="The opaque M3-D receipt proving the fleet reached a boundary.",
+    default=None,
+    help="The receipt of that stop drain, if you already hold the digest rather than the id.",
 )
 @click.option("--reason", default=None)
 @click.option("--yes", "-y", is_flag=True)
 @click.option("--json", "as_json", is_flag=True)
-def cohort_stop_safe(session_name, initiated_by, drain_receipt, reason, yes, as_json):
+def cohort_stop_safe(session_name, initiated_by, drain_id, drain_receipt, reason, yes, as_json):
     """Stop once the fleet has drained to a boundary.
 
-    Requires the drain receipt: a Stop with no proof the fleet reached a
-    boundary is a force Stop, and has to be asked for as one.
+    Requires a *stop* drain. A Pause drain proves workers reached a boundary;
+    only a Stop drain also records CAO's intent to collect each pane before it
+    disappears, so a Pause receipt is refused here rather than quietly
+    collecting panes nobody announced.
     """
+    if not drain_id and not drain_receipt:
+        raise click.ClickException(
+            "safe Stop spends a stop drain; pass --drain <id> (or --drain-receipt <digest>)"
+        )
+    if drain_id and not drain_receipt:
+        drain_receipt = _api_get(f"/drains/{quote(drain_id, safe='')}")["receipt_digest"]
+        if not drain_receipt:
+            raise click.ClickException(
+                f"drain {drain_id} has no receipt; it did not prove a boundary"
+            )
     _confirm_stop(session_name, yes)
     record = _cohort_post(
         session_name,
@@ -823,3 +842,301 @@ def cohort_show(operation_id, as_json):
         raise click.ClickException(f"{response.status_code}: {detail}")
     record = response.json()
     click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)
+
+
+# --------------------------------------------------------------------------
+# safe drain, occurrences, and reconciliation wakes (M3-D)
+# --------------------------------------------------------------------------
+#
+# `cao session cohort pause-safe` becomes reachable here for the first time.
+# It was deliberately absent while a safe Pause consumed evidence only M3-D
+# could produce and no human could type; now the drain produces that evidence
+# durably, so the command names a *drain* rather than asking an operator to
+# paste a digest and a per-member classification.
+
+
+def _api_get(path: str):
+    try:
+        response = requests.get(f"{API_BASE_URL}{path}")
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail") or ""
+        except Exception:  # noqa: BLE001 - a non-JSON body is still worth showing
+            detail = response.text.strip()
+        raise click.ClickException(f"{response.status_code}: {detail}")
+    return response.json()
+
+
+def _api_post(path: str, **payload):
+    try:
+        response = requests.post(f"{API_BASE_URL}{path}", json=payload)
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail") or ""
+        except Exception:  # noqa: BLE001
+            detail = response.text.strip()
+        raise click.ClickException(f"{response.status_code}: {detail}")
+    return response.json()
+
+
+_MEMBER_LABELS = {
+    "drained": "drained to a boundary",
+    "already-idle": "was already idle",
+    "parked": "parked",
+    "pending": "not attempted yet",
+    "reconciliation-required": "NO PROVEN BOUNDARY",
+}
+
+
+def _render_drain(record: dict) -> None:
+    provenance = record.get("provenance") or {}
+    click.echo(f"{record['intent']} drain  {record['state']}  (attempt {record['attempt']})")
+    click.echo(f"  drain           {record['drain_id']}")
+    click.echo(f"  lifecycle epoch {record['lifecycle_epoch']}")
+    click.echo(f"  roster revision {str(record['roster_revision'])[:12]}…")
+    for member in record.get("members") or []:
+        click.echo(
+            f"  {str(member['terminal_id'] or '-'):<12} {member['member_state']:<26} "
+            f"{_MEMBER_LABELS.get(member['member_state'], '')}"
+        )
+        if member["detail"]:
+            click.echo(f"      {member['detail']}")
+    if record["state"] == "complete":
+        # The receipt is the only thing a safe Pause/Stop can spend, so it is
+        # printed only when it exists. Showing the digest of an unfinished
+        # drain would hand an operator a token that cannot be spent.
+        #
+        # And only the command matching this drain's intent. A Pause drain
+        # steers workers to a boundary and announces no teardown; a Stop drain
+        # additionally records CAO's intent to collect each pane before it
+        # goes. Printing both invited an operator to spend a Pause receipt on a
+        # Stop — which the server now refuses, so offering it here would only
+        # be teaching a command that fails.
+        verb = "pause-safe" if record["intent"] == "pause" else "stop-safe"
+        click.echo(f"\nreceipt {record['receipt_digest']}")
+        click.echo(
+            f"  spend it:     cao session cohort {verb} "
+            f"{record['session_name']} --drain {record['drain_id']} --by <you>"
+        )
+        return
+    click.echo(f"\nNOT FINISHED: {record.get('reconciliation_reason') or record['state']}")
+    click.echo(
+        f"  continue it:  cao session drain {record['session_name']} "
+        f"--drain {record['drain_id']} --intent {record['intent']} --retry --by <you>"
+    )
+    click.echo(
+        "  or abandon the boundary deliberately with a force Pause/Stop; "
+        "a drain never promotes itself"
+    )
+
+
+@session.command(name="drain")
+@click.argument("session_name")
+@click.option("--by", "initiated_by", required=True, help="Who is asking. Recorded.")
+@click.option("--intent", type=click.Choice(["pause", "stop"]), default="pause")
+@click.option(
+    "--drain",
+    "drain_id",
+    default=None,
+    help="Reuse an existing drain id. Required with --retry; a retry continues that drain.",
+)
+@click.option(
+    "--retry",
+    is_flag=True,
+    help="Continue a drain that stopped needing reconciliation. Never re-steers a worker "
+    "that was already steered.",
+)
+@click.option("--json", "as_json", is_flag=True)
+def session_drain(session_name, initiated_by, intent, drain_id, retry, as_json):
+    """Steer every non-idle worker to its next safe boundary, exactly once.
+
+    Produces the durable receipt a safe Pause or Stop spends. A drain that
+    cannot prove a boundary stops in reconciliation with no receipt — it never
+    quietly becomes a force operation.
+    """
+    if retry and not drain_id:
+        raise click.ClickException("--retry continues a named drain; pass --drain <id>")
+    record = _api_post(
+        f"/sessions/{quote(session_name, safe='')}/drain/safe",
+        drain_id=drain_id or str(uuid.uuid4()),
+        intent=intent,
+        initiated_by=initiated_by,
+        retry=retry,
+    )
+    if as_json:
+        click.echo(json.dumps(record, indent=2))
+        return
+    _render_drain(_api_get(f"/drains/{quote(record['drain_id'], safe='')}"))
+
+
+@session.command(name="drains")
+@click.argument("session_name")
+@click.option("--json", "as_json", is_flag=True)
+def session_drains(session_name, as_json):
+    """Every safe drain recorded for this session."""
+    payload = _api_get(f"/sessions/{quote(session_name, safe='')}/drains")
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+        return
+    if not payload["drains"]:
+        click.echo("no drains recorded")
+        return
+    for record in payload["drains"]:
+        click.echo(
+            f"{record['drain_id']}  {record['intent']:<5} {record['state']:<24} "
+            f"attempt {record['attempt']}  {record['initiated_by']}"
+        )
+
+
+@session_cohort.command(name="pause-safe")
+@click.argument("session_name")
+@click.option("--by", "initiated_by", required=True)
+@click.option(
+    "--drain",
+    "drain_id",
+    required=True,
+    help="The complete drain whose receipt this Pause spends. `cao session drains` lists them.",
+)
+@click.option("--reason", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def cohort_pause_safe(session_name, initiated_by, drain_id, reason, as_json):
+    """Pause the fleet at a boundary a drain proved it reached.
+
+    Interrupts nothing. Names the drain rather than a digest so the receipt
+    and the per-member classification are read from the same durable row —
+    a digest typed alongside a hand-edited member list would spend a real
+    receipt on a claim it does not describe.
+    """
+    record = _api_post(
+        f"/sessions/{quote(session_name, safe='')}/cohort/pause/safe-drained",
+        operation_id=str(uuid.uuid4()),
+        drain_id=drain_id,
+        initiated_by=initiated_by,
+        reason=reason,
+    )
+    click.echo(json.dumps(record, indent=2)) if as_json else _render_operation(record)
+
+
+@session.group(name="occurrence")
+def session_occurrence():
+    """Durable task/round occurrences.
+
+    An occurrence is the *task* identity. It is deliberately not a terminal
+    generation and not a provider-native conversation: a stable agent outlives
+    many of each, so binding a task to one of them is how a resumed pane
+    inherits a finished round.
+    """
+
+
+@session_occurrence.command(name="list")
+@click.argument("session_name")
+@click.option("--agent", "agent_id", default=None)
+@click.option("--state", type=click.Choice(["open", "finalized"]), default=None)
+@click.option("--json", "as_json", is_flag=True)
+def occurrence_list(session_name, agent_id, state, as_json):
+    """Every occurrence recorded for this session."""
+    params = []
+    if agent_id:
+        params.append(f"agent_id={quote(agent_id, safe='')}")
+    if state:
+        params.append(f"state={state}")
+    query = ("?" + "&".join(params)) if params else ""
+    payload = _api_get(f"/sessions/{quote(session_name, safe='')}/task-occurrences{query}")
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+        return
+    if not payload["occurrences"]:
+        click.echo("no task occurrences recorded")
+        return
+    for record in payload["occurrences"]:
+        family = record["finalized"] if record["state"] == "finalized" else record["current"]
+        click.echo(
+            f"{record['task_occurrence_id']}  round {record['round_index']:<4} "
+            f"{record['state']:<10} seed={family['seed_quality']:<9} "
+            f"agent {record['agent_id'][:8]}  inc {record['incarnation_id']}"
+        )
+
+
+@session_occurrence.command(name="show")
+@click.argument("task_occurrence_id")
+@click.option("--json", "as_json", is_flag=True)
+def occurrence_show(task_occurrence_id, as_json):
+    """One occurrence, its extensions, and whether its seed is enough."""
+    record = _api_get(f"/task-occurrences/{quote(task_occurrence_id, safe='')}")
+    if as_json:
+        click.echo(json.dumps(record, indent=2))
+        return
+    click.echo(f"{record['task_occurrence_id']}  {record['state']}")
+    click.echo(f"  session         {record['session_name']}")
+    click.echo(f"  stable agent    {record['agent_id']}")
+    click.echo(f"  round           {record['round_index']}")
+    # Printed together and labelled, because the whole point of the seam is
+    # that the task id is not the effect id.
+    click.echo(
+        f"  effect          incarnation {record['incarnation_id']} "
+        f"terminal {record['terminal_id']} generation {record['generation']}"
+    )
+    verdict = record.get("seed_verdict") or {}
+    click.echo(f"  seed ({verdict.get('family')})    {verdict.get('quality')}")
+    if not verdict.get("sufficient_for_fresh_start"):
+        click.echo(f"      NOT enough for a fresh successor: {verdict.get('reason')}")
+    for extension in record.get("extensions") or []:
+        marker = "routed" if extension["routing_state"] == "routed" else "AWAITING DECIDER"
+        click.echo(
+            f"  extension       {extension['extension_id']} "
+            f"{extension['extension_kind']}@{extension['extension_version']} "
+            f"-> {extension['decider']} [{marker}]"
+        )
+
+
+@session_occurrence.command(name="pending-extensions")
+@click.argument("session_name")
+@click.option("--decider", default=None)
+@click.option("--json", "as_json", is_flag=True)
+def occurrence_pending_extensions(session_name, decider, as_json):
+    """Extensions still waiting on the decider that owns them.
+
+    An unrecognised extension — including a future build's completion claim —
+    is preserved and listed here rather than interpreted or redispatched.
+    """
+    query = f"?session_name={quote(session_name, safe='')}"
+    if decider:
+        query += f"&decider={quote(decider, safe='')}"
+    payload = _api_get(f"/task-occurrence-extensions/pending{query}")
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+        return
+    if not payload["extensions"]:
+        click.echo("no extensions are awaiting a decider")
+        return
+    for extension in payload["extensions"]:
+        claim = " (claims final)" if extension["claims_final"] else ""
+        click.echo(
+            f"{extension['task_occurrence_id']}  {extension['extension_id']:<20} "
+            f"{extension['extension_kind']}@{extension['extension_version']} "
+            f"-> {extension['decider']}{claim}"
+        )
+
+
+@session_cohort.command(name="wakes")
+@click.argument("session_name")
+@click.option("--json", "as_json", is_flag=True)
+def cohort_wakes(session_name, as_json):
+    """What each resumed supervisor was actually told, and whether it landed."""
+    payload = _api_get(f"/sessions/{quote(session_name, safe='')}/reconciliation-wakes")
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+        return
+    if not payload["wakes"]:
+        click.echo("no supervisor reconciliation wakes recorded")
+        return
+    for wake in payload["wakes"]:
+        click.echo(f"{wake['wake_id']}  {wake['source_kind']:<20} {wake['delivery_state']}")
+        click.echo(f"  resume      {wake['source_operation_id']}")
+        if wake["delivery_state"] != "delivered":
+            click.echo(f"  NOT TOLD    {wake['reason_code'] or wake['detail'] or 'undelivered'}")
+        click.echo(f"  message     {(wake.get('message') or {}).get('text', '')}")

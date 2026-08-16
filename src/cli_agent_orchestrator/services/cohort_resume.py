@@ -354,18 +354,27 @@ async def _default_restorer(
 async def _default_waker(
     operation: Mapping[str, Any], results: Sequence[Mapping[str, Any]], wake: str
 ) -> SupervisorWake:
-    """Dark M3-D seam: this fork has no supervisor-reconciliation authority.
+    """The M3-D seam, resolved at call time rather than imported at module load.
 
     M3-D owns what a resumption bump *says* and what the supervisor does with
-    it. Until it supplies the deliverer, the truthful answer is that the fleet
-    is back and nobody has been told — which is a reconciliation, not a
-    settled Resume, and is reported as exactly that.
+    it; this module owns only that there is exactly one and that it comes last.
+    The delegation is deliberately late and lazy: M3-D imports this module for
+    its ``SupervisorWaker``/``SupervisorWake`` contract, so binding it here at
+    import would be a cycle, and resolving it per call is what lets an owner
+    (or a test) replace this default and actually have it replaced.
+
+    A build without the M3-D authority keeps the original honest answer — the
+    fleet is back and nobody has been told, which is a reconciliation rather
+    than a settled Resume.
     """
-    del operation, results, wake
-    return SupervisorWake(
-        False,
-        detail="no supervisor reconciliation authority is available in this build",
-    )
+    try:
+        from cli_agent_orchestrator.services import supervisor_reconciliation
+    except ImportError:  # pragma: no cover - the module ships with this build
+        return SupervisorWake(
+            False,
+            detail="no supervisor reconciliation authority is available in this build",
+        )
+    return await supervisor_reconciliation.make_waker()(operation, results, wake)
 
 
 def _record(operation_id: str, member: Mapping[str, Any], restore: MemberRestore) -> dict[str, Any]:

@@ -95,11 +95,22 @@ def _claim(
     mode: str,
     resume_target: Optional[str] = None,
     source_operation_id: Optional[str] = None,
+    boundary: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
+    """Claim one boundary, optionally one that was observed earlier.
+
+    Passing ``boundary`` is how a safe operation binds the boundary its drain
+    proved rather than whatever is true now. ``claim_operation`` revalidates
+    those exact values against the live session inside its own transaction, so
+    a fleet that moved in between makes the claim fail rather than the
+    operation commit on a stale classification. Observing freshly here would
+    make that compare-and-swap trivially true and hide the staleness.
+    """
     try:
-        boundary = cohort.observe_boundary(
-            request.session_name, resume_source_operation_id=source_operation_id
-        )
+        if boundary is None:
+            boundary = cohort.observe_boundary(
+                request.session_name, resume_source_operation_id=source_operation_id
+            )
         return cohort.claim_operation(
             cohort.OperationRequest(
                 operation_id=request.operation_id,
@@ -149,14 +160,19 @@ def pause_safe(
     *,
     drain_receipt_digest: str,
     member_results: Sequence[cohort.MemberResult],
+    boundary: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Terminalize a Pause at a boundary M3-D proved the fleet reached.
 
     Safe Pause performs no interrupt. It consumes M3-D's opaque drain receipt
     and the member evidence M3-D classified; this path never inspects a pane
     or decides for itself that a worker is idle.
+
+    ``boundary`` is the drained one when the caller came through
+    ``pause_safe_from_drain``; the claim binds it so the journal refuses a
+    fleet that moved rather than pausing on a stale classification.
     """
-    operation = _claim(request, kind=cohort.KIND_PAUSE, mode=cohort.MODE_SAFE)
+    operation = _claim(request, kind=cohort.KIND_PAUSE, mode=cohort.MODE_SAFE, boundary=boundary)
     ids = _transition_ids(request.operation_id, "drain", "commit")
     if operation["state"] == cohort.STATE_PREPARING:
         try:
@@ -187,6 +203,74 @@ def pause_safe(
         raise _translated(exc) from exc
     except cohort_effects.CohortEffectsError as exc:
         raise CohortOperationConflict(str(exc)) from exc
+
+
+def _spendable_drain(
+    request: OperatorRequest, *, drain_id: Optional[str], receipt_digest: Optional[str], intent: str
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    """Resolve a drain and prove it still describes the fleet, or refuse.
+
+    One place, both surfaces. A named drain and a receipt digest are two ways
+    of pointing at the same durable row, and neither is evidence until it has
+    been re-validated against the live session — a receipt proves a boundary
+    the fleet reached *then*.
+
+    Returns the drain and the boundary it proved, which the caller binds into
+    its claim so the journal performs the compare-and-swap.
+    """
+    from cli_agent_orchestrator.services import supervisor_drain
+
+    try:
+        if drain_id is not None:
+            drain = supervisor_drain.get_drain(drain_id)
+        else:
+            drain = supervisor_drain.drain_for_receipt(
+                request.session_name, str(receipt_digest), intent=intent
+            )
+        boundary = supervisor_drain.assert_spendable(
+            drain, session_name=request.session_name, intent=intent
+        )
+    except supervisor_drain.SupervisorDrainInvalid as exc:
+        raise CohortOperationInvalid(str(exc)) from exc
+    except supervisor_drain.SupervisorDrainError as exc:
+        raise CohortOperationConflict(str(exc)) from exc
+    return drain, boundary
+
+
+def pause_safe_from_drain(request: OperatorRequest, *, drain_id: str) -> dict[str, Any]:
+    """Spend one complete M3-D drain receipt on a safe Pause.
+
+    The operator-facing shape of ``pause_safe``. It exists because the raw
+    call takes a receipt digest *and* a per-member classification, which is
+    evidence a human cannot type and a client should not be trusted to relay
+    faithfully — a caller that carried the digest forward while editing the
+    member list would spend a real receipt on a claim it does not describe.
+    Naming the drain instead means the server reads both from the same durable
+    row, and a drain that no longer describes the fleet is refused there.
+    """
+    from cli_agent_orchestrator.services import supervisor_drain
+
+    drain, boundary = _spendable_drain(
+        request, drain_id=drain_id, receipt_digest=None, intent=supervisor_drain.INTENT_PAUSE
+    )
+    # The claim binds the *drained* boundary, so the journal re-validates it
+    # atomically and a fleet that moved between the check above and here loses
+    # the claim rather than committing a Pause on a stale classification.
+    _claim(request, kind=cohort.KIND_PAUSE, mode=cohort.MODE_SAFE, boundary=boundary)
+    try:
+        member_results = supervisor_drain.cohort_member_results(
+            drain, request.operation_id, cohort_operation=cohort.get_operation(request.operation_id)
+        )
+    except supervisor_drain.SupervisorDrainError as exc:
+        raise CohortOperationConflict(str(exc)) from exc
+    except cohort.CohortJournalError as exc:
+        raise _translated(exc) from exc
+    return pause_safe(
+        request,
+        drain_receipt_digest=str(drain["receipt_digest"]),
+        member_results=member_results,
+        boundary=boundary,
+    )
 
 
 def pause_force(request: OperatorRequest, **executor_kwargs: Any) -> dict[str, Any]:
@@ -223,8 +307,9 @@ def _stop(
     mode: str,
     drain_receipt_digest: Optional[str],
     executor_kwargs: Mapping[str, Any],
+    boundary: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
-    operation = _claim(request, kind=cohort.KIND_STOP, mode=mode)
+    operation = _claim(request, kind=cohort.KIND_STOP, mode=mode, boundary=boundary)
     ids = _transition_ids(request.operation_id, "drain", "teardown", "commit", "reconcile")
     if mode == cohort.MODE_SAFE and operation["state"] == cohort.STATE_PREPARING:
         try:
@@ -261,19 +346,44 @@ def _stop(
 
 
 def stop_safe(
-    request: OperatorRequest, *, drain_receipt_digest: str, **executor_kwargs: Any
+    request: OperatorRequest,
+    *,
+    drain_receipt_digest: Optional[str] = None,
+    drain_id: Optional[str] = None,
+    **executor_kwargs: Any,
 ) -> dict[str, Any]:
-    """Stop only once M3-D has proved the fleet drained to a boundary."""
-    if not drain_receipt_digest:
+    """Stop only once M3-D has proved the fleet drained to a *Stop* boundary.
+
+    The digest is resolved back to the drain that issued it rather than taken
+    on trust. It was previously accepted as an opaque 64-hex string, which
+    made a Pause receipt — or any invented digest — sufficient evidence for a
+    safe Stop. The two drains prove different things: only a Stop drain
+    records CAO's intent to collect each pane *before* it disappears, so a
+    Pause receipt spent here would collect panes nobody announced.
+
+    ``drain_id`` names the same row directly and is the surface an operator
+    should use; the digest is kept for the callers that already hold one, and
+    is now exactly as truthful.
+    """
+    from cli_agent_orchestrator.services import supervisor_drain
+
+    if not drain_receipt_digest and not drain_id:
         raise CohortOperationInvalid(
-            "safe Stop requires M3-D's opaque drain receipt; a Stop with no proof the fleet "
-            "reached a boundary is a force Stop and must be asked for as one"
+            "safe Stop requires M3-D's drain receipt or the drain that issued it; a Stop with "
+            "no proof the fleet reached a boundary is a force Stop and must be asked for as one"
         )
+    drain, boundary = _spendable_drain(
+        request,
+        drain_id=drain_id,
+        receipt_digest=drain_receipt_digest,
+        intent=supervisor_drain.INTENT_STOP,
+    )
     return _stop(
         request,
         mode=cohort.MODE_SAFE,
-        drain_receipt_digest=drain_receipt_digest,
+        drain_receipt_digest=str(drain["receipt_digest"]),
         executor_kwargs=executor_kwargs,
+        boundary=boundary,
     )
 
 

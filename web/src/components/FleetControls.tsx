@@ -1,10 +1,12 @@
 import { useCallback, useMemo, useState } from 'react'
-import { AlertTriangle, Loader2, Pause, Play, RotateCw, Square } from 'lucide-react'
+import { AlertTriangle, Loader2, Pause, Play, RotateCw, ShieldCheck, Square } from 'lucide-react'
 import {
   api,
   CohortMemberOutcome,
   CohortOperation,
   CohortProvenance,
+  DrainIntent,
+  SessionDrain,
   SessionLifecycle,
 } from '../api'
 
@@ -25,10 +27,13 @@ import {
  *    would mean the only way to inspect a restored fleet is to have already
  *    started it.
  *
- * There is deliberately no safe-Pause button: a safe Pause consumes M3-D's
- * drain receipt and per-member classification, which is not something a
- * dashboard can produce. Offering a button that quietly did a *force* pause
- * instead is exactly the mislabelling this whole surface exists to prevent.
+ * 3. **Safe pause is two steps, not one.** M3-D's drain is what proves the
+ *    fleet reached a boundary, and it can honestly fail. So the drain is its
+ *    own button with its own visible result, and the Pause it licenses only
+ *    appears once a receipt exists. Collapsing them into one "Safe pause"
+ *    button would mean a drain that could not prove a boundary either becomes
+ *    a silent force pause or looks like a button that did nothing — and the
+ *    first of those is exactly the mislabelling this surface exists to prevent.
  */
 
 /** Terminal outcomes. A failed member settles; it does not hold the fleet. */
@@ -64,8 +69,30 @@ export interface FleetControlsProps {
 }
 
 type Action =
-  | 'pause-force' | 'stop-safe' | 'stop-force'
+  | 'drain' | 'pause-safe' | 'pause-force' | 'stop-safe' | 'stop-force'
   | 'resume-paused' | 'resume-start' | 'resume-retry'
+
+/**
+ * Whether this drain produced something a safe Pause can actually spend.
+ *
+ * Gating on the receipt rather than on the state string is deliberate: the
+ * receipt is the thing the Pause route consumes, so a surface that offered
+ * the button on any other signal would be offering a button that 409s.
+ *
+ * The intent is checked for the same reason. A Pause drain and a Stop drain
+ * prove different things — only a Stop drain records CAO's intent to collect
+ * each pane before it disappears — so a Stop receipt is not Pause evidence
+ * and the server refuses it. Offering the button anyway would just teach an
+ * operator a click that fails.
+ */
+export function drainIsSpendable(
+  drain: SessionDrain | null,
+  intent: DrainIntent = 'pause',
+): boolean {
+  return Boolean(
+    drain && drain.intent === intent && drain.state === 'complete' && drain.receipt_digest,
+  )
+}
 
 export function outcomeSummary(provenance: CohortProvenance | undefined): {
   total: number
@@ -115,6 +142,7 @@ export function FleetControls({
   const [busy, setBusy] = useState<Action | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<CohortOperation | null>(null)
+  const [drain, setDrain] = useState<SessionDrain | null>(null)
 
   const mint = useMemo(
     () => mintOperationId ?? (() => crypto.randomUUID()),
@@ -136,6 +164,22 @@ export function FleetControls({
       setBusy(null)
     }
   }, [mint, onOperation])
+
+  const runDrain = useCallback(async (retry: boolean) => {
+    setBusy('drain')
+    setError(null)
+    try {
+      // A retry continues the *named* drain; a first run mints one. Reusing
+      // the id is what stops a retry from steering the fleet a second time.
+      const id = retry && drain ? drain.drain_id : mint()
+      setDrain(await api.runSafeDrain(sessionName, id, 'pause', operatorName, retry))
+    } catch (e) {
+      const err = e as { detail?: string; message?: string }
+      setError(err.detail ?? err.message ?? 'the drain failed')
+    } finally {
+      setBusy(null)
+    }
+  }, [drain, mint, operatorName, sessionName])
 
   const summary = outcomeSummary(result?.provenance)
   const settled = (result?.provenance?.state ?? result?.state) === 'settled'
@@ -174,6 +218,30 @@ export function FleetControls({
             <button
               type="button"
               disabled={busy !== null}
+              onClick={() => runDrain(false)}
+              className="inline-flex items-center gap-2 rounded-lg bg-gray-700 px-3 py-2 text-sm hover:bg-gray-600 disabled:opacity-50"
+            >
+              {busy === 'drain' ? <Loader2 size={16} className="animate-spin" /> : <ShieldCheck size={16} />}
+              Drain to a boundary
+            </button>
+            {/* Only offered once a receipt exists. A safe Pause with nothing to
+                spend is a 409, and a button that 409s teaches operators to use
+                the force one instead. */}
+            {drainIsSpendable(drain) && (
+              <button
+                type="button"
+                disabled={busy !== null}
+                onClick={() => run('pause-safe', id =>
+                  api.cohortPauseSafeFromDrain(sessionName, id, drain!.drain_id, operatorName))}
+                className="inline-flex items-center gap-2 rounded-lg bg-emerald-700 px-3 py-2 text-sm hover:bg-emerald-600 disabled:opacity-50"
+              >
+                {busy === 'pause-safe' ? <Loader2 size={16} className="animate-spin" /> : <Pause size={16} />}
+                Safe pause
+              </button>
+            )}
+            <button
+              type="button"
+              disabled={busy !== null}
               onClick={() => run('pause-force', id =>
                 api.cohortPauseForce(sessionName, id, operatorName))}
               className="inline-flex items-center gap-2 rounded-lg bg-yellow-700 px-3 py-2 text-sm hover:bg-yellow-600 disabled:opacity-50"
@@ -202,6 +270,43 @@ export function FleetControls({
           Resume paused brings every pane back and sends nothing — no keystroke, no
           supervisor bump. Resume and start additionally wakes the supervisor once.
         </p>
+      )}
+
+      {drain && (
+        <div className="rounded-lg border border-gray-700/50 p-3 text-sm" data-testid="fleet-drain-result">
+          <div className="flex flex-wrap items-baseline gap-x-2">
+            <span className="font-medium">safe drain</span>
+            <span className="text-gray-300">{drain.state}</span>
+            <span className="text-gray-400">attempt {drain.attempt}</span>
+          </div>
+          {drainIsSpendable(drain) ? (
+            <p className="mt-1 text-xs text-emerald-300">
+              Every worker reached a boundary and recorded it. Safe pause is available.
+            </p>
+          ) : (
+            <div className="mt-1 space-y-2" data-testid="fleet-drain-unfinished">
+              {/* Never shows a receipt digest here: an unfinished drain has
+                  none, and implying otherwise hands the operator a token that
+                  cannot be spent. */}
+              <p className="text-xs text-orange-300">
+                This drain did not prove a boundary
+                {drain.reconciliation_reason ? `: ${drain.reconciliation_reason}.` : '.'}{' '}
+                Nothing was paused. A drain never becomes a force pause on its own.
+              </p>
+              <button
+                type="button"
+                disabled={busy !== null}
+                onClick={() => runDrain(true)}
+                className="inline-flex items-center gap-2 rounded-lg bg-orange-700 px-3 py-2 text-xs hover:bg-orange-600 disabled:opacity-50"
+              >
+                {busy === 'drain'
+                  ? <Loader2 size={14} className="animate-spin" />
+                  : <RotateCw size={14} />}
+                Continue this drain
+              </button>
+            </div>
+          )}
+        </div>
       )}
 
       {error && (

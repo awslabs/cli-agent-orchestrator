@@ -40,6 +40,11 @@ export default defineConfig({
       // not under /sessions, so it needs its own entry or the dashboard's
       // operation detail 404s under `npm run dev`.
       '/cohort-operations': { target: 'http://localhost:9889', changeOrigin: true },
+      // M3-D's two by-id reads, for the same reason: a drain and a task
+      // occurrence both outlive the session listing they were reached from, so
+      // they are addressed by their own id rather than under /sessions.
+      '/drains': { target: 'http://localhost:9889', changeOrigin: true },
+      '/task-occurrences': { target: 'http://localhost:9889', changeOrigin: true },
     },
   },
 })
