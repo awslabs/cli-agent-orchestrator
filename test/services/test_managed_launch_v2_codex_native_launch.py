@@ -245,9 +245,7 @@ async def test_launch_resumes_the_bootstrapped_thread_as_the_pane_process(
     admitted = await v2.admit_reserved(record["reservation_id"], admit)
 
     assert admitted["state"] == "admitted"
-    assert [event for event in keystrokes.events if event[0] == "key"] == [
-        ("key", "C-j")
-    ] * 97
+    assert [event for event in keystrokes.events if event[0] == "key"] == [("key", "C-j")] * 97
     assert keystrokes.events[-1] == ("enter", "")
 
 
