@@ -533,6 +533,48 @@ def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
     assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-4") is None
 
 
+def test_deliver_inbox_producer_builds_through_the_selected_facade(tmp_path, monkeypatch):
+    # P1-7 producer path: the strict receipt is minted by the selected facade
+    # contract, not by a copied builder. Monkeypatching the facade's
+    # ``build_receipt`` is observed by the bridge's admission path.
+    from cli_agent_orchestrator.services import companion_receipts
+    from cli_agent_orchestrator.services import model_turn_receipt_contract as contract
+
+    monkeypatch.setattr(companion_receipts, "COMPANION_DIR", tmp_path / "companion")
+    request, session = _codex_session(tmp_path, monkeypatch)
+    command = {
+        "op": "deliver",
+        "reservation_id": request["reservation_id"],
+        "terminal_id": request["terminal_id"],
+        "generation": request["generation"],
+        "message_id": "msg-1",
+        "message": "ping",
+        "message_sha256": hashlib.sha256(b"ping").hexdigest(),
+        "sender_id": "cafebabe",
+        "sender_generation": "supervisor-generation",
+        "message_created_at": "2026-07-30T12:00:00.000000Z",
+        "expected_provider": "codex",
+        "expected_provider_session_id": "thread_provider_opaque",
+        "expected_execution_mode": "acp",
+    }
+    original = contract.build_receipt
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(contract, "build_receipt", spy)
+
+    response = session.deliver_inbox(command)
+    assert response["provider_turn_id"] == "turn_provider_opaque"
+    assert calls and calls[0]["provider_turn_id"] == "turn_provider_opaque"
+    ack = companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-1")
+    assert ack["schema"] == "cao-model-turn-receipt-v1"
+    # the stored ack is a strict receipt under the selected facade
+    assert contract.validate_receipt(ack) == ack
+
+
 def test_parked_acp_inbox_refuses_before_provider_ack_or_receipt(tmp_path, monkeypatch):
     """A real M3/W13 receipt fences ACP inbox bytes, not just a mocked helper."""
     from cli_agent_orchestrator.services import companion_receipts

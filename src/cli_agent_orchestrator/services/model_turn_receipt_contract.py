@@ -1,7 +1,27 @@
-"""Strict v1 wire contract for provider model-turn receipts."""
+"""Strict v1 wire contract for provider model-turn receipts (single facade).
+
+This module is the fork's compatibility facade over the canonical
+``conductor_sentinel.model_turn_receipt_contract``:
+
+- When the installed ``conductor_sentinel`` distribution is present, the
+  canonical constants, exception class, functions, and named timestamp
+  vectors are re-exported here as the exact same objects — so the fork's
+  producer/consumer paths and the conductor's consumer run one definition
+  and can never silently drift.
+- When the top-level ``conductor_sentinel`` package is genuinely absent, the
+  standalone v1 implementation below provides the fork's historic behavior.
+- A broken installed package (its contract submodule missing, or any internal
+  canonical import failing) is NEVER a reason to fall back: those failures
+  propagate visibly instead.
+
+``CONTRACT_SOURCE`` is a static diagnostic discriminator whose only values are
+``"conductor-sentinel"`` and ``"standalone"``. It reports which contract was
+selected; it grants no authority and is never a gate or override.
+"""
 
 from __future__ import annotations
 
+import importlib
 import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -96,3 +116,39 @@ def build_receipt(
         "submitted_at": _timestamp(submitted_at),
     }
     return validate_receipt(payload)
+
+
+_canonical_contract: Any
+try:
+    _canonical_contract = importlib.import_module("conductor_sentinel.model_turn_receipt_contract")
+except ModuleNotFoundError as exc:
+    if exc.name != "conductor_sentinel":
+        # Installed but broken (submodule or internal import missing): fail
+        # visibly rather than silently running the standalone implementation.
+        raise
+    _canonical_contract = None
+
+if _canonical_contract is not None:
+    CONTRACT_SOURCE = "conductor-sentinel"
+    # Installed mode: swap the standalone definitions for the canonical
+    # objects themselves (identity preserved; nothing is wrapped or copied).
+    SCHEMA = _canonical_contract.SCHEMA
+    KIND_SUBMITTED = _canonical_contract.KIND_SUBMITTED
+    SOURCE_PROVIDER_ADAPTER = _canonical_contract.SOURCE_PROVIDER_ADAPTER
+    FIELDS = _canonical_contract.FIELDS
+    TIMESTAMP_FIELDS = _canonical_contract.TIMESTAMP_FIELDS
+    TIMESTAMP_VECTORS = _canonical_contract.TIMESTAMP_VECTORS
+    ReceiptValidationError = _canonical_contract.ReceiptValidationError  # type: ignore[misc]
+    message_digest = _canonical_contract.message_digest
+    is_message_digest = _canonical_contract.is_message_digest
+    canonical_message_id = _canonical_contract.canonical_message_id
+    parse_rfc3339_utc = _canonical_contract.parse_rfc3339_utc
+    format_rfc3339_utc = _canonical_contract.format_rfc3339_utc
+    receipt_endpoint_path = _canonical_contract.receipt_endpoint_path
+    validate_receipt = _canonical_contract.validate_receipt
+    build_receipt = _canonical_contract.build_receipt
+    # Legacy fork aliases point at the canonical objects.
+    KIND = KIND_SUBMITTED
+    SOURCE = SOURCE_PROVIDER_ADAPTER
+else:
+    CONTRACT_SOURCE = "standalone"

@@ -170,3 +170,41 @@ def test_strict_receipt_producer_never_resets_corrupt_storage(store):
             ack={**receipt, "message_id": "m2"},
         )
     assert path.read_bytes() == corrupt
+
+
+def test_strict_message_ack_resolves_the_selected_contract_facade(store, monkeypatch):
+    """P1-7: the strict writer and strict reader run through the facade.
+
+    Monkeypatching the facade's ``validate_receipt`` is observed by both the
+    strict writer and the strict reader — a copied or vendored contract would
+    miss this seam entirely.
+    """
+    from cli_agent_orchestrator.services import model_turn_receipt_contract as contract
+
+    receipt = contract.build_receipt(
+        message_id="m1",
+        message_sha256="a" * 64,
+        message_created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        sender_id="supervisor",
+        sender_generation="supervisor-generation",
+        receiver_id="term-1",
+        receiver_generation=GEN,
+        provider="codex",
+        provider_session_id="thread-1",
+        provider_turn_id="turn-1",
+        submitted_at=datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+    )
+    original = contract.validate_receipt
+    calls = []
+
+    def spy(payload, *, expected=None):
+        calls.append(payload)
+        return original(payload, expected=expected)
+
+    monkeypatch.setattr(contract, "validate_receipt", spy)
+
+    companion_receipts.record_message_ack("term-1", GEN, message_id="m1", ack=receipt)
+    assert len(calls) == 1  # the strict writer validated through the facade
+    strict = companion_receipts.get_strict_message_ack("term-1", GEN, "m1")
+    assert strict == receipt
+    assert len(calls) == 2  # the strict reader validated through the facade too
