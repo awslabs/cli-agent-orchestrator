@@ -140,12 +140,13 @@ policy **and** of the broad `SUPPORTED_VERSIONS` table:
   real forward-compatibility failure where a 0.147.0 native launch completed
   the bootstrap, exposed its exact session identity, reported `input_ready`,
   and was then refused at bind.
-- **Bind capability grants no advanced authority.** The narrow table is not a
-  step toward the broad one: a bound 0.147.0 generation still gets no
-  composer/control/steer authority (those tables stay pinned to their own
-  stage-verified builds), no resume/recovery identity, and no route-receipt
-  authority, until each surface is independently proven and the broad table
-  is updated through the full "Adding a proven build" procedure above.
+- **Bind capability grants no advanced authority by implication.** The narrow
+  table is not a step toward the broad one. Codex 0.147.0 has a separate
+  exact-build composer-newline proof (source inspection plus a disposable live
+  multiline canary), so managed assignment delivery may use that one surface.
+  It still gets no general control advertisement, steer/force-pause authority,
+  rendered-session proof, resume/recovery identity, or route-receipt authority
+  until each surface is independently proven.
 - **Unsupported builds do not retain exact-session capture.**  Do not
   configure, document, or operate a Codex launch as if an unproven semver
   could mint a resumable id; it cannot, by design.
@@ -181,14 +182,17 @@ These hold regardless of mode:
 
 * An unknown provider name raises `ProviderContractError`.
 * An unparseable version banner raises `ProviderVersionDrift`.
-* A version not in `SUPPORTED_VERSIONS` gets no native control, no
-  rendered-session proof, no steer/composer authority, no image authority,
-  no ACP resume identity, and no route-receipt authority.
+* A version not in `SUPPORTED_VERSIONS` gets no broad native-control authority,
+  rendered-session proof, steer authority, image authority, ACP resume
+  identity, or route-receipt authority. A narrowly proven feature may be
+  enabled only through its own exact-build table; Codex 0.147.0's composer
+  newline is the current example.
 * A version not in `NATIVE_BIND_CAPABLE_VERSIONS` cannot become a managed
   generation's bound native identity, whatever the launch mode admitted;
-  membership there grants bind/admission only — never any of the advanced
-  authorities above, which stay governed by `SUPPORTED_VERSIONS` and the
-  per-feature tables.
+  membership there grants bind only — never any other authority by itself.
+  Admission still consults the provider's per-feature composer table, and all
+  other advanced authorities stay governed by `SUPPORTED_VERSIONS` and their
+  own per-feature tables.
 * `IMAGE_PROVEN_BUILDS` stays pinned to the builds that actually demonstrated
   image delivery; adding a build to `SUPPORTED_VERSIONS` does not grant it
   image authority.

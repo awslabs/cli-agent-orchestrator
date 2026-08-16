@@ -633,10 +633,12 @@ def is_proven_version(provider: str, installed_version: str | None) -> bool:
 #: may legitimately disagree in either direction: Codex 0.147.0 holds
 #: the narrow native-bind proof (its zero-turn app-server
 #: bootstrap/resume exchange was stage-verified on the installed build)
-#: while the broad advanced surfaces — composer, native control,
-#: force-pause, resume authority — remain unproven, so the broad table
-#: still lists only 0.146.0 and every advanced gate keeps refusing
-#: 0.147.0 independently.
+#: while the broad advanced surfaces — force-pause, rendered identity,
+#: resume and route authority — remain unproven, so the broad table still
+#: lists only 0.146.0 and those gates keep refusing 0.147.0 independently.
+#: Its multiline composer is separately proven in the build-exact
+#: ``codex_native_control._PROVEN_COMPOSER_NEWLINE`` table; that narrower
+#: fact does not widen the broad table.
 #:
 #: Codex's cell is the same fact as
 #: ``codex_native_bootstrap.BOOTSTRAP_CAPABLE_VERSIONS``; the canonical

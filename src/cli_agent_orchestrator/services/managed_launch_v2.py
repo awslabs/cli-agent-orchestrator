@@ -2166,9 +2166,10 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
     # The capability question this seam asks is the NARROW native-bind one,
     # not the broad provider-version one: a build may be stage-proven for
     # the pre-turn identity/input contract bind binds against (Codex
-    # 0.147.0) while the broad advanced surfaces stay unproven, and a build
+    # 0.147.0) while unrelated advanced surfaces stay unproven, and a build
     # outside this table still fails closed here even when open launch
-    # policy admitted it.
+    # policy admitted it. Composer delivery is gated separately by the
+    # provider adapter's own exact-build table during admission.
     if not provider_contracts.is_native_bind_capable(
         _PINNED_PROVIDER[row.provider], receipt["provider_version"]
     ):
