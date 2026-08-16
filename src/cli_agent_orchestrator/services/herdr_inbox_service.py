@@ -615,9 +615,11 @@ class HerdrInboxService:
         """Handle pane.closed and workspace.closed events."""
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
-            delete_terminals_by_session,
             get_terminal_metadata,
+            list_terminals_by_session,
+        )
+        from cli_agent_orchestrator.services.terminal_service import (
+            delete_terminal as teardown_terminal,
         )
 
         if event_type == "pane.closed":
@@ -661,9 +663,12 @@ class HerdrInboxService:
             self._kiro_terminals.discard(terminal_id)
             self._working_since.pop(terminal_id, None)
 
-            # Delete DB record
+            # Route pane lifecycle through the normal teardown rather than a
+            # direct DB delete, so a Grok private home can return explicit
+            # deferred cleanup and retain its terminal row for retry.
             try:
-                delete_terminal(terminal_id)
+                if teardown_terminal(terminal_id) is False:
+                    logger.warning("pane.closed: cleanup deferred for terminal %s", terminal_id)
             except Exception as e:
                 logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")
 
@@ -696,13 +701,26 @@ class HerdrInboxService:
                 if not session_name:
                     return
 
-            # Delete all DB terminals for this session
-            try:
-                delete_terminals_by_session(session_name)
-            except Exception as e:
-                logger.warning(
-                    f"workspace.closed: failed to delete terminals for {session_name}: {e}"
-                )
+            # A workspace close is also a terminal lifecycle transition. Route
+            # every persisted terminal through the normal teardown rather than
+            # bulk-deleting rows, so Grok private homes receive their safe,
+            # retryable provider cleanup even when this inbox service was
+            # restored without an in-memory provider map.
+            from cli_agent_orchestrator.services.terminal_service import (
+                delete_terminal as teardown_terminal,
+            )
+
+            for terminal in list_terminals_by_session(session_name):
+                terminal_id = terminal["id"]
+                try:
+                    if teardown_terminal(terminal_id) is False:
+                        logger.warning(
+                            "workspace.closed: cleanup deferred for terminal %s", terminal_id
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "workspace.closed: failed to cleanup terminal %s: %s", terminal_id, e
+                    )
 
             # Prune maps for terminals belonging to this session. Match on each
             # terminal's DB session rather than a pane_id/workspace_id string

@@ -651,3 +651,35 @@ class TestAntigravityCliAssign:
     def test_assign_with_callback(self, require_antigravity):
         """Antigravity CLI full round-trip: worker completes → sends result → supervisor receives."""
         _run_assign_with_callback_test(provider="antigravity_cli")
+
+
+# ---------------------------------------------------------------------------
+# Grok Build CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGrokCliAssign:
+    """E2E assign tests for Grok using the examples/assign profiles."""
+
+    def test_assign_data_analyst(self, require_grok):
+        """Grok honors the data_analyst profile and analyzes the dataset."""
+        _run_assign_test(
+            provider="grok_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_grok):
+        """Grok honors the report_generator profile and emits report sections."""
+        _run_assign_test(
+            provider="grok_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_grok):
+        """A Grok worker sends its result back to the supervisor inbox."""
+        _run_assign_with_callback_test(provider="grok_cli")

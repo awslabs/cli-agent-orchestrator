@@ -1398,29 +1398,35 @@ class TestSendInput:
 
         mock_provider.mark_input_received.assert_called_once()
         mock_status_monitor.notify_input_sent.assert_called_once_with("test1234")
-        mock_status_monitor.clear_rolling_buffer.assert_called_once_with("test1234")
+        # The active provider receives the same explicit buffer-generation
+        # boundary, so stateful detectors never compare post-dispatch output
+        # with the discarded rolling buffer.
+        mock_status_monitor.clear_rolling_buffer.assert_called_once_with("test1234", mock_provider)
         # reset_buffer would wipe the arm — must NOT be called on send_input.
         mock_status_monitor.reset_buffer.assert_not_called()
 
-        # Ordering guard: the byte-buffer clear must run BEFORE send_keys, not
-        # after. send_keys includes a submit-delay sleep during which the agent
-        # can start emitting output; a post-send_keys clear would wipe that
-        # newly-emitted first chunk of the turn. Attach both calls to a shared
-        # manager so we can assert their relative order.
+        # Ordering guard: clear and the provider turn marker must both run
+        # BEFORE send_keys. send_keys includes a submit-delay sleep during
+        # which the agent can start emitting output; a post-send_keys clear or
+        # marker would parse that first chunk against stale state. Attach all
+        # three calls to a shared manager so we can assert their order.
         manager = MagicMock()
         manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_provider.mark_input_received, "mark_input")
         manager.attach_mock(mock_tmux.send_keys, "send_keys")
         # Re-run with the manager wired in to capture ordered calls.
         mock_status_monitor.reset_mock()
+        mock_provider.reset_mock()
         mock_tmux.reset_mock()
         manager.reset_mock()
         manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_provider.mark_input_received, "mark_input")
         manager.attach_mock(mock_tmux.send_keys, "send_keys")
         send_input("test1234", "hello again")
         ordered = [c[0] for c in manager.mock_calls]
-        assert ordered.index("clear") < ordered.index(
-            "send_keys"
-        ), f"clear_rolling_buffer must precede send_keys; got order {ordered}"
+        assert (
+            ordered.index("clear") < ordered.index("mark_input") < ordered.index("send_keys")
+        ), f"clear and mark_input must precede send_keys; got order {ordered}"
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
@@ -1827,6 +1833,33 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_delete_terminal_retains_metadata_when_grok_cleanup_is_deferred(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """A retryable Grok cleanup must not be reported as a successful delete."""
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider_manager.cleanup_provider.return_value = False
+
+        assert delete_terminal("test1234") is False
+        mock_db_delete.assert_not_called()
+        mock_provider_manager.cleanup_provider.assert_called_once_with("test1234")
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")

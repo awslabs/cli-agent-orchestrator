@@ -396,6 +396,21 @@ class TestValidateAgentProfileEndpoint:
         errors = [m for m in body["messages"] if m["severity"] == "error"]
         assert any(m["path"] == "engine" for m in errors)
 
+    def test_grok_native_workflows_opt_in_is_validated(self, client) -> None:
+        """The install/validate schema accepts the typed Grok opt-in."""
+        content = (
+            "---\n"
+            "name: grok-native\n"
+            "provider: grok_cli\n"
+            "grokNativeWorkflows: true\n"
+            "---\n\n"
+            "Body.\n"
+        )
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        assert response.json() == {"valid": True, "messages": []}
+
     def test_missing_required_name_is_an_error(self, client) -> None:
         """``name`` is the only required field; omitting it must invalidate."""
         content = "---\ndescription: no name here\n---\n\nBody.\n"
@@ -459,6 +474,14 @@ class TestAgentProfileSchemaEndpoint:
         assert schema["required"] == ["name"]
         assert schema["additionalProperties"] is False
         assert "engine" in schema["properties"]
+        assert schema["properties"]["grokNativeWorkflows"] == {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Grok Build only. Explicitly permits Grok-native subagents, "
+                "workflows, and /goal in this CAO terminal."
+            ),
+        }
 
     def test_is_not_shadowed_by_the_name_route(self, client) -> None:
         """Route ordering regression guard.

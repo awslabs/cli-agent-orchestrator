@@ -534,6 +534,16 @@ class TestDeleteTerminalEndpoint:
             assert response.json() == {"success": True}
             mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
 
+    def test_delete_terminal_deferred_cleanup_is_conflict(self, client):
+        """A retained Grok home is a failed delete, not HTTP 200."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = False
+
+            response = client.delete("/terminals/abcd1234")
+
+            assert response.status_code == 409
+            assert "cleanup deferred" in response.json()["detail"]
+
     def test_delete_terminal_not_found(self, client):
         """DELETE /terminals/{terminal_id} returns 404 for missing terminal."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:

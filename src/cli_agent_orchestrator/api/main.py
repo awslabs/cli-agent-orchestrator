@@ -111,6 +111,7 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_READ,
     SCOPE_WRITE,
     SCOPES_SUPPORTED,
+    _extract_bearer,
     extract_scopes_from_token,
     get_authorization_servers,
     get_current_scopes,
@@ -2568,6 +2569,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "opencode_cli": "opencode",
         "cursor_cli": "agent",
         "antigravity_cli": "agy",
+        "grok_cli": "grok",
     }
     result = []
     for provider, binary in provider_binaries.items():
@@ -2898,7 +2900,22 @@ async def delete_session(
         result = await asyncio.to_thread(
             session_service.delete_session, session_name, registry=get_plugin_registry(request)
         )
+        deleted = result.get("deleted") or []
+        errors = result.get("errors") or []
+        deferred = (isinstance(errors, list) and bool(errors)) or (
+            isinstance(deleted, (list, tuple)) and session_name not in deleted
+        )
+        if deferred:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"cleanup deferred for session '{session_name}'; "
+                    "retry delete after residual Grok processes exit"
+                ),
+            )
         return {"success": True, **result}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -5775,7 +5792,17 @@ async def delete_terminal(
             terminal_id,
             registry=get_plugin_registry(request),
         )
-        return {"success": success}
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"cleanup deferred for terminal '{terminal_id}'; "
+                    "retry delete after residual Grok processes exit"
+                ),
+            )
+        return {"success": True}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -5890,12 +5917,29 @@ async def get_inbox_messages_endpoint(
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
 
-    Security: This endpoint provides full PTY access with no bearer/token
-    authentication. It is intended for localhost-only use and is gated by two
-    checks before accept: the peer IP must be in ``WS_ALLOWED_CLIENTS`` and,
-    for browser callers, the ``Origin`` header must be in the trusted set
-    (CWE-1385 cross-site WebSocket hijacking guard). Do NOT expose the server
-    to untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
+    Security: This endpoint provides full PTY access (keystroke injection =
+    RCE) and is gated by three checks before accept:
+
+    * the peer IP must be in ``WS_ALLOWED_CLIENTS`` (loopback by default);
+    * for browser callers, the ``Origin`` header must be same-origin with the
+      request ``Host`` or in the trusted set (CWE-1385 cross-site WebSocket
+      hijacking guard);
+    * when the HTTP auth layer is enabled (``AUTH0_DOMAIN`` /
+      ``CAO_AUTH_JWKS_URI`` set — see :func:`is_auth_enabled`), the handshake
+      must carry a valid bearer token granting at least the ``cao:read``
+      scope.
+
+    Token scheme: browsers cannot set request headers on a WebSocket
+    handshake, so the token is accepted from either ``Authorization: Bearer
+    <token>`` (native clients) or a ``?token=<token>`` query parameter (the
+    bundled web viewer). The token is verified exactly like the HTTP layer —
+    RS256 signature, issuer, audience and expiry via the JWKS cache — and a
+    missing/invalid token or one lacking ``cao:read`` closes the handshake
+    with code 4401 before accept. This closes the bypass where widening
+    ``CAO_WS_ALLOWED_CLIENTS`` / ``CAO_WS_ALLOWED_ORIGINS`` for containers,
+    devcontainers or Codespaces exposed full PTY control with no credential.
+    Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
+    without authentication.
     """
     # Reject connections from clients outside the configured allowlist.
     # Defaults to loopback; operators running cao-server inside a container can
@@ -5938,6 +5982,42 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         )
         await websocket.close(code=4403, reason="WebSocket Origin not allowed")
         return
+
+    # When the HTTP auth layer is enabled, the WS handshake must also prove
+    # identity: browsers cannot set request headers on a WebSocket handshake,
+    # so the token is accepted from the Authorization header or a ``?token=``
+    # query parameter. The token is verified with the same JWKS/issuer/
+    # audience/expiry logic as the HTTP layer and must grant at least
+    # ``SCOPE_READ``. Default-off (auth disabled): no token is required and
+    # behavior is byte-for-byte unchanged.
+    if is_auth_enabled():
+        token = _extract_bearer(websocket.headers.get("authorization"))
+        if not token:
+            token = websocket.query_params.get("token")
+        if not token:
+            logger.warning(
+                "Rejected WebSocket attach for terminal %r: auth enabled, missing bearer token",
+                terminal_id,
+            )
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+        try:
+            scopes = extract_scopes_from_token(token)
+        except Exception:
+            logger.warning(
+                "Rejected WebSocket attach for terminal %r: auth enabled, invalid bearer token",
+                terminal_id,
+            )
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+        if SCOPE_READ not in scopes:
+            logger.warning(
+                "Rejected WebSocket attach for terminal %r: token lacks %r scope",
+                terminal_id,
+                SCOPE_READ,
+            )
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
 
     await websocket.accept()
 
