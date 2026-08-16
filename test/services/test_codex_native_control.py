@@ -1020,6 +1020,21 @@ class TestDefensiveGuards:
             cnc._post(operation_id="op-62", plan=plan, transport=recorder)
         assert recorder.calls == []
 
+    def test_0147_has_only_its_separately_proven_composer_authority(self):
+        """0.147.0 can carry the multiline task its native bind precedes."""
+        _attach()
+        plan = cnc.plan_composer_keystrokes("one\ntwo", provider_version="0.147.0")
+        assert plan["deliverable"] is True
+        assert plan["soft_newline_keystroke"] == "C-j"
+        assert plan["submit_settle_seconds"] == 0.2
+        assert plan["undeliverable_reason"] is None
+
+    def test_0148_does_not_inherit_0147_composer_authority(self):
+        _attach()
+        plan = cnc.plan_composer_keystrokes("one\ntwo", provider_version="0.148.0")
+        assert plan["deliverable"] is False
+        assert plan["soft_newline_keystroke"] is None
+
     def test_an_active_turn_id_that_is_not_a_string_is_refused(self):
         _attach()
         observation = dict(_idle())

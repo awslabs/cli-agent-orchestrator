@@ -104,10 +104,10 @@ For a provider temporarily held strict, only steps 1 and 2 are needed before
 the exact build can launch. Return it to open after the compatibility fix is
 merged and deployed.
 
-## Narrow capability tables: the ordinary Codex bootstrap exception
+## Narrow capability tables: the Codex native-bind exception
 
-The ordinary (unmanaged) Codex launch path captures its pre-task harness-native
-session id through a zero-turn app-server bootstrap (`thread/start` +
+The Codex launch paths capture their pre-task harness-native session id
+through a zero-turn app-server bootstrap (`thread/start` +
 `thread/name/set` with no `turn/*`) so the resumed TUI can guarantee an exact,
 resumable session before any task byte reaches the pane.  That guarantee is a
 capability claim about the installed build: the full exchange
@@ -115,30 +115,55 @@ capability claim about the installed build: the full exchange
 clean process exit`, canonical UUID, exact cwd/model/effort, one materialized
 rollout, fresh `thread/resume` adopting the same id) must have been
 stage-verified for the exact binary.  Builds proven for that contract are
-listed in `codex_native_bootstrap.BOOTSTRAP_CAPABLE_VERSIONS` — currently
-`0.146.0` and `0.147.0`.
+listed in `provider_contracts.NATIVE_BIND_CAPABLE_VERSIONS` — currently
+`0.146.0` and `0.147.0` — and `codex_native_bootstrap.BOOTSTRAP_CAPABLE_VERSIONS`
+is that same table's Codex cell, so the bootstrap that mints a native id and
+the managed bind seam that accepts it cannot disagree about which builds are
+proven.
 
 This is deliberately a NARROW exception table, independent of the launch-mode
-policy:
+policy **and** of the broad `SUPPORTED_VERSIONS` table:
 
 - **Open launch mode does NOT carry exact-session capture.** A build accepted
   at the launch identity boundary may still be unproven for the bootstrap
-  contract.  The ordinary Codex path keeps its fail-closed capability
-  boundary: an installed build outside `BOOTSTRAP_CAPABLE_VERSIONS` cannot
-  supply the pre-task identity contract, and the launch fails closed with a
-  typed refusal — zero provider initialization, zero task bytes — rather than
-  silently degrading to a launch that cannot resume its own session.
+  contract.  The Codex launch paths keep their fail-closed capability
+  boundary: an installed build outside the table cannot supply the pre-task
+  identity contract, and the launch fails closed with a typed refusal — zero
+  provider initialization, zero task bytes — rather than silently degrading
+  to a launch that cannot resume its own session.
+- **Native bind accepts exactly the proven builds, no more.** The managed-v2
+  bind seam (`managed_launch_v2._validate_readiness_for_bind`) asks its
+  version question through `provider_contracts.is_native_bind_capable`, so a
+  stage-proven build (0.147.0) binds while an unproven one (0.148.0) is
+  refused with zero task bytes even though open launch policy admitted it.
+  The seam must never consult the broad table instead: doing so reproduced a
+  real forward-compatibility failure where a 0.147.0 native launch completed
+  the bootstrap, exposed its exact session identity, reported `input_ready`,
+  and was then refused at bind.
+- **Bind capability grants no advanced authority by implication.** The narrow
+  table is not a step toward the broad one. Codex 0.147.0 has a separate
+  exact-build composer-newline proof (source inspection plus a disposable live
+  multiline canary), so managed assignment delivery may use that one surface.
+  It still gets no general control advertisement, steer/force-pause authority,
+  rendered-session proof, resume/recovery identity, or route-receipt authority
+  until each surface is independently proven.
 - **Unsupported builds do not retain exact-session capture.**  Do not
-  configure, document, or operate an ordinary Codex launch as if an unproven
-  semver could mint a resumable id; it cannot, by design.
+  configure, document, or operate a Codex launch as if an unproven semver
+  could mint a resumable id; it cannot, by design.
+
+For the other providers the native-bind cell is their `SUPPORTED_VERSIONS`
+tuple by reference — their native identity paths were verified with each
+accepted build — so their bind behaviour is exactly their broad proven set,
+and a future narrow exception for them is written as its own literal cell
+here rather than by narrowing the broad table.
 
 **Operator remediation:** install (or pin) a Codex build that is in
-`BOOTSTRAP_CAPABLE_VERSIONS`; if a newer build must serve the ordinary path,
+`NATIVE_BIND_CAPABLE_VERSIONS`; if a newer build must serve the launch path,
 stage-verify it against the exact bootstrap contract above, add it to the
 table, and re-verify the resumed-TUI surface before removing any version
-override.  While the installed build is unproven, ordinary Codex launches
-refuse fail-closed; the managed-v2 path (which pins its executable and
-resumes through `native_tui_launch`) is unaffected by this table.
+override.  While the installed build is unproven, Codex launches refuse
+fail-closed at the bootstrap, and a managed generation that somehow reached
+bind with an unproven build is refused there too.
 
 ## Muse profile-carrier exception
 
@@ -157,9 +182,17 @@ These hold regardless of mode:
 
 * An unknown provider name raises `ProviderContractError`.
 * An unparseable version banner raises `ProviderVersionDrift`.
-* A version not in `SUPPORTED_VERSIONS` gets no native control, no
-  rendered-session proof, no steer/composer authority, no image authority,
-  no ACP resume identity, and no route-receipt authority.
+* A version not in `SUPPORTED_VERSIONS` gets no broad native-control authority,
+  rendered-session proof, steer authority, image authority, ACP resume
+  identity, or route-receipt authority. A narrowly proven feature may be
+  enabled only through its own exact-build table; Codex 0.147.0's composer
+  newline is the current example.
+* A version not in `NATIVE_BIND_CAPABLE_VERSIONS` cannot become a managed
+  generation's bound native identity, whatever the launch mode admitted;
+  membership there grants bind only — never any other authority by itself.
+  Admission still consults the provider's per-feature composer table, and all
+  other advanced authorities stay governed by `SUPPORTED_VERSIONS` and their
+  own per-feature tables.
 * `IMAGE_PROVEN_BUILDS` stays pinned to the builds that actually demonstrated
   image delivery; adding a build to `SUPPORTED_VERSIONS` does not grant it
   image authority.

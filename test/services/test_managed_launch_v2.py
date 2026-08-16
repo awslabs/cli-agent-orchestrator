@@ -73,7 +73,7 @@ def _reserve_request(worktree, tmp_path, **changes):
     return ManagedLaunchV2ReserveRequest(**payload)
 
 
-def _ready_bridge_state(record, monkeypatch):
+def _ready_bridge_state(record, monkeypatch, **changes):
     # Each reservation mints its own provider-native session id, exactly as
     # a real launch does; the roster refuses one native id bound to
     # two live incarnations, so the shared fake id would make every second
@@ -96,6 +96,7 @@ def _ready_bridge_state(record, monkeypatch):
         "effort": "xhigh",
         "working_directory": record["working_directory"],
     }
+    receipt.update(changes)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
         lambda rid: {"state": "ready", "readiness": receipt},
@@ -282,6 +283,119 @@ def test_bind_receipt_unproven_version_refused(isolated_memory_db, worktree, tmp
     receipt["provider_version"] = "0.144.6"
     with pytest.raises(ManagedLaunchConflict, match="native readiness proof is unavailable"):
         v2.bind_native(record["reservation_id"], _bind_request(record))
+
+
+def test_bind_accepts_a_stage_proven_0147_native_readiness_receipt(
+    isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """The reproduced forward-compatibility failure: Codex CLI 0.147.0.
+
+    A real 0.147.0 managed native launch completed the zero-turn bootstrap
+    (the narrow build capability the launcher consults), exposed the exact
+    provider session identity, reported ``input_ready``, and was then
+    refused here — "native readiness proof is unavailable for this provider
+    build; stage-verify it before native bind" — because this seam
+    re-consulted the *broad* provider-version table, which 0.147.0 is
+    deliberately not in. The capability bind asks about is the narrow one
+    the launch already proved: pre-turn native identity plus the input
+    path. The broad table stays untouched, so every advanced gate that
+    independently reads it keeps refusing 0.147.0.
+    """
+    request = _reserve_request(worktree, tmp_path, execution_mode="native_tui")
+    record, _ = v2.reserve(request)
+    v2.claim_launch(record["reservation_id"])
+    receipt = _ready_bridge_state(
+        record,
+        monkeypatch,
+        provider_version="0.147.0",
+        provider_receipt_kind="codex-native-thread-start",
+    )
+    bound = v2.bind_native(record["reservation_id"], _bind_request(record))
+    assert bound["state"] == "bound"
+    assert bound["binding"]["native_session_id"] == receipt["provider_session_id"]
+
+
+def test_bind_accepts_the_long_proven_neighbor_at_the_native_seam(
+    isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """0.146.0 binds exactly as before: the new predicate widens nothing
+    that was already proven, it only stops the seam from consulting a
+    broader table than the launch path did."""
+    request = _reserve_request(worktree, tmp_path, execution_mode="native_tui")
+    record, _ = v2.reserve(request)
+    v2.claim_launch(record["reservation_id"])
+    _ready_bridge_state(
+        record,
+        monkeypatch,
+        provider_version="0.146.0",
+        provider_receipt_kind="codex-native-thread-start",
+    )
+    bound = v2.bind_native(record["reservation_id"], _bind_request(record))
+    assert bound["state"] == "bound"
+
+
+@pytest.mark.parametrize(
+    "provider_version",
+    [
+        # The next unproven build: open launch policy may admit it, bind may not.
+        "0.148.0",
+        # Not semver-shaped, so no normalized version exists to accept.
+        "codex-cli unknown-build",
+        # A two-part token is not a build this or any table ever named.
+        "0.147",
+    ],
+)
+def test_bind_refuses_every_unproven_build_at_the_native_seam(
+    isolated_memory_db, worktree, tmp_path, monkeypatch, provider_version
+):
+    request = _reserve_request(worktree, tmp_path, execution_mode="native_tui")
+    record, _ = v2.reserve(request)
+    v2.claim_launch(record["reservation_id"])
+    _ready_bridge_state(
+        record,
+        monkeypatch,
+        provider_version=provider_version,
+        provider_receipt_kind="codex-native-thread-start",
+    )
+    with pytest.raises(ManagedLaunchConflict, match="native readiness proof is unavailable"):
+        v2.bind_native(record["reservation_id"], _bind_request(record))
+    assert v2.get(record["reservation_id"])["state"] == "launching"
+
+
+@pytest.mark.parametrize(
+    "inconsistent",
+    [
+        # A receipt minted for a different reservation is not this bind's
+        # identity, whatever build it ran.
+        {"reservation_id": str(uuid.uuid4())},
+        # The input path was never observed ready.
+        {"model_input_ready": False},
+        # The receipt id and the provider session it names disagree.
+        {"receipt_id": "thr_someone_elses"},
+    ],
+)
+def test_bind_still_refuses_missing_or_inconsistent_readiness_identity(
+    isolated_memory_db, worktree, tmp_path, monkeypatch, inconsistent
+):
+    """The narrow version predicate loosens nothing else at this seam.
+
+    Each field below is refused on a 0.147.0 receipt — the exact build the
+    capability table now accepts — so the capability boundary cannot be
+    widened by a receipt that is incomplete or about another session.
+    """
+    request = _reserve_request(worktree, tmp_path, execution_mode="native_tui")
+    record, _ = v2.reserve(request)
+    v2.claim_launch(record["reservation_id"])
+    _ready_bridge_state(
+        record,
+        monkeypatch,
+        provider_version="0.147.0",
+        provider_receipt_kind="codex-native-thread-start",
+        **inconsistent,
+    )
+    with pytest.raises(ManagedLaunchConflict):
+        v2.bind_native(record["reservation_id"], _bind_request(record))
+    assert v2.get(record["reservation_id"])["state"] == "launching"
 
 
 def _admit_request(record, digest, **changes):

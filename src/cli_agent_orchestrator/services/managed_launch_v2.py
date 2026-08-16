@@ -31,9 +31,13 @@ build stage-verified for the exact resume contract
 This is a narrow capability table, not the launch-mode policy: an open
 launch-mode build outside the table cannot supply a resumable id and
 the reservation fails closed with zero task bytes rather than degrading
-to a session the TUI cannot resume.  The operator remedy is to install
-a bootstrap-capable build or stage-verify and add the new build to the
-table; unsupported builds never retain exact-session capture.
+to a session the TUI cannot resume.  The bind seam below asks the same
+capability question through ``provider_contracts.is_native_bind_capable``
+— whose Codex cell is that very table — so a build the bootstrap proved
+is exactly the build bind accepts, never a broader one.  The operator
+remedy is to install a bootstrap-capable build or stage-verify and add
+the new build to the table; unsupported builds never retain
+exact-session capture.
 """
 
 from __future__ import annotations
@@ -2159,7 +2163,14 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
             "readiness receipt is not bound to the exact v2 reservation: "
             + _canonical_json(mismatches)
         )
-    if not provider_contracts.is_proven_version(
+    # The capability question this seam asks is the NARROW native-bind one,
+    # not the broad provider-version one: a build may be stage-proven for
+    # the pre-turn identity/input contract bind binds against (Codex
+    # 0.147.0) while unrelated advanced surfaces stay unproven, and a build
+    # outside this table still fails closed here even when open launch
+    # policy admitted it. Composer delivery is gated separately by the
+    # provider adapter's own exact-build table during admission.
+    if not provider_contracts.is_native_bind_capable(
         _PINNED_PROVIDER[row.provider], receipt["provider_version"]
     ):
         raise ManagedLaunchConflict(

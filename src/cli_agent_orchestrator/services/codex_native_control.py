@@ -118,9 +118,12 @@ ENCODING_SOFT_NEWLINE = "soft-newline-lines-then-enter"
 #: two-key ``\`` + Return form is a text edit and a submit, not one
 #: keystroke.
 #:
-#: Codex 0.146.0 binds Ctrl-J to an editor newline.  Its paste-burst state
-#: retains Enter as a newline for 120 ms after a burst, so the submit settle
-#: is pinned above that observed source window.
+#: Codex 0.146.0 and 0.147.0 bind Ctrl-J to an editor newline.  Their
+#: paste-burst state retains Enter as a newline for 120 ms after a burst, so
+#: the submit settle is pinned above that observed source window.  The
+#: 0.147.0 fact was checked both against the exact rust-v0.147.0 source and
+#: in a disposable TUI canary: Ctrl-J left two lines in the composer with no
+#: turn, and a settled Enter submitted those lines as one message.
 _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
     "0.146.0": {
         "keystroke": "C-j",
@@ -136,6 +139,22 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
         # assertion nobody verified, and claiming a trim would invent one.
         # The plan below only states what the model received when the
         # answer does not depend on it.
+        "submit_normalization_proven": False,
+    },
+    "0.147.0": {
+        "keystroke": "C-j",
+        "submit_settle_seconds": 0.2,
+        "evidence": {
+            "source_ref": "openai/codex rust-v0.147.0 (3ed6f04f6bf8b7c46299d1cb1ff99c74ce21a51d)",
+            "composer_binding": (
+                "default EditorKeymap.insert_newline includes Ctrl-J; "
+                "submit Enter is dispatched first"
+            ),
+            "settle_source": "paste_burst PASTE_ENTER_SUPPRESS_WINDOW=120ms",
+            "live_canary": "isolated Codex 0.147.0 TUI multiline compose-and-submit, 2026-08-16",
+        },
+        # The canary proved exact multiline preservation for its bounded
+        # payload, not every possible leading/trailing-whitespace input.
         "submit_normalization_proven": False,
     },
 }

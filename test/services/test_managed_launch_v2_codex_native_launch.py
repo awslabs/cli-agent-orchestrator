@@ -14,13 +14,16 @@ import pytest
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.managed_launch_v2 import (
     PROTOCOL_VERSION_V2,
+    ManagedLaunchV2AdmitRequest,
+    ManagedLaunchV2BindRequest,
     ManagedLaunchV2ReserveRequest,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import codex_native_bootstrap as bootstrap
+from cli_agent_orchestrator.services import codex_native_control
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
-from cli_agent_orchestrator.services import native_attachment, native_pane_input
+from cli_agent_orchestrator.services import native_attachment, native_pane_input, native_tui_launch
 
 SESSION = "019fb17d-0c6d-7161-a408-6b1fa61c8f2d"
 MODEL = "gpt-5.6-sol"
@@ -87,7 +90,7 @@ async def test_launch_resumes_the_bootstrapped_thread_as_the_pane_process(
             "provider": "codex",
             "native_session_id": SESSION,
             "id_source": "app_server_thread_start",
-            "provider_version": "0.146.0",
+            "provider_version": "0.147.0",
             "binary_path": kwargs["codex_binary"],
             "binary_sha256": kwargs["binary_sha256"],
             "working_directory": kwargs["working_directory"],
@@ -133,7 +136,7 @@ async def test_launch_resumes_the_bootstrapped_thread_as_the_pane_process(
     monkeypatch.setattr(
         bridge,
         "provider_version_banner",
-        lambda *args, **kwargs: "codex-cli 0.146.0",
+        lambda *args, **kwargs: "codex-cli 0.147.0",
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.create_terminal",
@@ -146,7 +149,8 @@ async def test_launch_resumes_the_bootstrapped_thread_as_the_pane_process(
         lambda *args, **kwargs: TerminalStatus.IDLE,
     )
 
-    record, _ = v2.reserve(_request(worktree, tmp_path))
+    request = _request(worktree, tmp_path)
+    record, _ = v2.reserve(request)
     result = await v2.launch_reserved(record["reservation_id"])
 
     assert result["state"] == "launching", result["preflight_failure"]["detail"]
@@ -168,6 +172,81 @@ async def test_launch_resumes_the_bootstrapped_thread_as_the_pane_process(
     attachment = native_attachment.get("codex", SESSION)
     assert attachment["state"] == native_attachment.ATTACHED
     assert attachment["owner"]["execution_mode"] == "native_tui"
+
+    # Production-shaped closure of the exact campaign failure: bind the
+    # readiness receipt and admit a 98-line task through the native composer.
+    # The prior bind-only repair reached this point and then refused before
+    # any task byte because 0.147.0 had no composer-newline proof.
+    bound = v2.bind_native(
+        record["reservation_id"],
+        ManagedLaunchV2BindRequest(
+            protocol_version=PROTOCOL_VERSION_V2,
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            attempt_id=str(uuid.uuid4()),
+        ),
+    )
+
+    class AdmissionPane:
+        def observe(self):
+            return {
+                "pane_id": "%7",
+                "pid": 4242,
+                "start_marker": "Thu Jul 30 01:00:00 2026",
+                "argv": list(launched[-1]["managed_native_command"]),
+            }
+
+    class Keystrokes:
+        def __init__(self):
+            self.events = []
+
+        def send_literal(self, text):
+            self.events.append(("literal", text))
+            return len(text)
+
+        def send_key(self, key):
+            self.events.append(("key", key))
+
+        def send_enter(self):
+            self.events.append(("enter", ""))
+
+    keystrokes = Keystrokes()
+    monkeypatch.setattr(native_tui_launch, "TmuxNativePane", lambda *a, **k: AdmissionPane())
+    monkeypatch.setattr(
+        native_pane_input,
+        "observe_codex_turn_state",
+        lambda *args, **kwargs: TerminalStatus.IDLE,
+    )
+    monkeypatch.setattr(native_pane_input, "TmuxPaneInput", lambda pane_id: keystrokes)
+    monkeypatch.setattr(codex_native_control.time, "sleep", lambda seconds: None)
+
+    message = "\n".join(f"task line {index}" for index in range(1, 99))
+    admit = ManagedLaunchV2AdmitRequest(
+        protocol_version=PROTOCOL_VERSION_V2,
+        delivery_id=request.delivery_id,
+        message=message,
+        message_sha256=hashlib.sha256(message.encode()).hexdigest(),
+        sender_id="deadbeef",
+        orchestration_type="assign",
+        context={
+            "boot_id": "11111111-1111-4111-8111-111111111111",
+            "project": "test-project",
+            "task_id": request.task_id,
+            "run_id": request.run_id,
+            "task_sha256": "1" * 64,
+            "plan_sha256": "2" * 64,
+            "dossier_sha256": "3" * 64,
+            "lease_sha256": "4" * 64,
+            "command_packet_sha256": "5" * 64,
+            "source_chain_sha256": "6" * 64,
+        },
+        native_binding_digest=v2.native_binding_digest(bound),
+    )
+    admitted = await v2.admit_reserved(record["reservation_id"], admit)
+
+    assert admitted["state"] == "admitted"
+    assert [event for event in keystrokes.events if event[0] == "key"] == [("key", "C-j")] * 97
+    assert keystrokes.events[-1] == ("enter", "")
 
 
 def test_codex_native_profile_preserves_mcp_env_inheritance_and_timeout(tmp_path):
