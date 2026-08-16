@@ -291,10 +291,12 @@ def _assert_bound_evidence(row: Any, evidence: dict[str, Any]) -> None:
 _READINESS_RECEIPT_KINDS = {
     "codex": "codex-thread-start",
     "kimi_cli": "kimi-acp-session-new",
+    "claude_code": "claude-session-start",
 }
 _SUBMISSION_RECEIPT_KINDS = {
     "codex": "codex-turn-start",
     "kimi_cli": "kimi-session-update",
+    "claude_code": "claude-turn-start",
 }
 
 #: The providers *this* surface can prove readiness for, derived from the

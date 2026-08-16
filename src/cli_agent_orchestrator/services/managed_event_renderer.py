@@ -41,7 +41,39 @@ class ManagedEventRenderer:
             return self._render_acp_update(item.get("params"))
         if isinstance(method, str):
             return self._render_codex_or_unknown(method, item.get("params"))
+        item_type = item.get("type")
+        if isinstance(item_type, str):
+            return self._render_claude_event(item)
         return "[provider event]\n"
+
+    def _render_claude_event(self, item: dict[str, Any]) -> Optional[str]:
+        item_type = item.get("type")
+        if item_type == "assistant":
+            msg = item.get("message") if isinstance(item.get("message"), dict) else {}
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text" and isinstance(block.get("text"), str):
+                            parts.append(block["text"])
+                        elif block.get("type") == "tool_use":
+                            tool_id = str(block.get("id") or "tool")
+                            title = _label(block.get("name"), "tool")
+                            current = (title, "started")
+                            if self._tool_states.get(tool_id) != current:
+                                self._tool_states[tool_id] = current
+                                parts.append(f"\n[tool] {title} — started\n")
+                return "".join(parts) if parts else None
+            return None
+        if item_type == "result":
+            stop_reason = _label(item.get("stop_reason") or item.get("terminal_reason"), "completed")
+            return f"\n[turn completed] {stop_reason}\n"
+        if item_type in {"system", "user", "progress"}:
+            return None
+        return f"[provider event] {_label(item_type, 'update')}\n"
 
     def _render_acp_update(self, params: Any) -> Optional[str]:
         update = params.get("update") if isinstance(params, dict) else None

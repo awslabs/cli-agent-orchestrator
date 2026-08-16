@@ -20,6 +20,7 @@ import logging
 import os
 import pathlib
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -41,6 +42,7 @@ from cli_agent_orchestrator.providers.codex import (
 )
 from cli_agent_orchestrator.services import (
     actor_broker,
+    claude_native_readiness,
     companion_receipts,
     heartbeat_store,
     provider_contracts,
@@ -259,6 +261,21 @@ def _provider_route_environment(request: dict[str, Any]) -> dict[str, str]:
             **provider_contracts.kimi_update_suppression_env(),
             **provider_contracts.kimi_effort_env(effort),
         }
+    if request["provider"] == "claude_code":
+        env: dict[str, str] = {}
+        effort = request.get("effort")
+        if effort and provider_contracts.route_selects_effort(effort):
+            env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+        model = request.get("model")
+        if model:
+            env["ANTHROPIC_MODEL"] = model
+            if model.startswith("deepseek") or request.get("provider_route") == "deepseek":
+                env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "1000000"
+                env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "1000000"
+                env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+                env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+                env["API_TIMEOUT_MS"] = "3000000"
+        return env
     return {}
 
 
@@ -1604,6 +1621,7 @@ class _RpcProcess:
         *,
         env: Optional[dict[str, str]] = None,
         companion_identity: Optional[tuple[str, str]] = None,
+        provider: str = "managed",
     ):
         self.proc = subprocess.Popen(
             argv,
@@ -1627,9 +1645,12 @@ class _RpcProcess:
         self._notifications: list[dict[str, Any]] = []
         self._next_id = 1
         self._closed_error: Optional[str] = None
-        self._renderer = ManagedEventRenderer(provider="managed")
+        self._renderer = ManagedEventRenderer(provider=provider)
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    def send_json_message(self, value: dict[str, Any]) -> None:
+        self._send(value)
 
     def _send(self, value: dict[str, Any]) -> None:
         raw = json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -1869,6 +1890,8 @@ class _ProviderSession:
             readiness = self._initialize_codex()
         elif self.provider == "kimi_cli":
             readiness = self._initialize_kimi()
+        elif self.provider == "claude_code":
+            readiness = self._initialize_claude()
         else:
             raise BridgeError(f"unsupported managed provider {self.provider!r}")
         print(
@@ -2104,6 +2127,107 @@ class _ProviderSession:
         }
         return self.readiness
 
+    def _initialize_claude(self) -> dict[str, Any]:
+        claude_bin = self.request["provider_executable"]
+        version = self._version(claude_bin, provider_contracts.PROVIDER_CLAUDE)
+
+        env = _provider_child_environment(self.request)
+        is_deepseek = (
+            str(self.request.get("model", "")).startswith("deepseek")
+            or self.request.get("provider_route") == "deepseek"
+            or self.request.get("shim_route") == "deepseek"
+        )
+        if is_deepseek:
+            base_url = env.get("ANTHROPIC_BASE_URL", "")
+            if not base_url or "api.anthropic.com" in base_url:
+                raise BridgeError("DeepSeek managed launch requires ANTHROPIC_BASE_URL gateway configuration")
+            conflicts = [
+                k
+                for k in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+                if env.get(k)
+            ]
+            if conflicts:
+                raise BridgeError(f"conflicting cloud controls in DeepSeek environment: {', '.join(conflicts)}")
+
+        session_id = self.request.get("provider_session_id")
+        if session_id:
+            if not isinstance(session_id, str) or not re.fullmatch(
+                r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", session_id
+            ):
+                raise BridgeError("Claude managed launch requires a valid canonical UUID session id")
+        else:
+            session_id = str(uuid.uuid4())
+
+        hook_path = (
+            paths(self.request["reservation_id"], self.request)["root"]
+            / "claude-session-start.jsonl"
+        )
+        hook_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        hook_path.touch(mode=0o600, exist_ok=True)
+        settings = claude_native_readiness.hook_settings(hook_path)
+        settings_arg = claude_native_readiness.settings_argument(settings)
+
+        argv = [
+            claude_bin,
+            "-p",
+            "--session-id",
+            session_id,
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--replay-user-messages",
+            "--settings",
+            settings_arg,
+            "--model",
+            self.request["model"],
+            "--dangerously-skip-permissions",
+        ]
+        if provider_contracts.route_selects_effort(self.request["effort"]):
+            argv.extend(["--effort", self.request["effort"]])
+        if self.profile_material.get("system_prompt"):
+            argv.extend(["--append-system-prompt", self.profile_material["system_prompt"]])
+        if not self.profile_material.get("mcp_servers"):
+            argv.append("--strict-mcp-config")
+
+        argv = _launcher_argv(
+            paths(self.request["reservation_id"], self.request)["socket"],
+            binding_identity(self.request),
+            argv,
+        )
+
+        self.provider_io_started = True
+        self.rpc = _RpcProcess(
+            argv,
+            env=env,
+            companion_identity=self._companion_identity(),
+            provider="claude_code",
+        )
+
+        readiness_record = claude_native_readiness.await_session_start(
+            hook_path,
+            session_id,
+            timeout=provider_contracts.version_probe_timeout(self.provider) * 2,
+        )
+        self.provider_session_id = session_id
+        transcript = {
+            "session_id": session_id,
+            "model": self.request["model"],
+            "effort": self.request["effort"],
+            "readiness_record": readiness_record,
+        }
+        self.readiness = {
+            **self._base_receipt(),
+            "receipt_id": session_id,
+            "provider_session_id": session_id,
+            "provider_version": version,
+            "provider_receipt_kind": "claude-session-start",
+            "provider_transcript_sha256": _digest(transcript),
+            "model_input_ready": True,
+        }
+        return self.readiness
+
     def _submit_provider_turn(
         self, message: str, *, client_message_id: str, meta: dict[str, Any]
     ) -> tuple[str, str, dict[str, Any]]:
@@ -2112,6 +2236,60 @@ class _ProviderSession:
         own turn identity is the only submission proof — never paste success
         or enqueue (§20.2d(1))."""
         assert self.rpc is not None and self.provider_session_id is not None
+        if self.provider == "claude_code":
+            with self._active_prompt_lock:
+                if self._active_prompt_request_id is not None:
+                    raise SessionOperationRefused(
+                        "turn_busy",
+                        "the Claude Code session already has an active foreground turn; "
+                        "cancel it or wait for completion before sending another prompt",
+                    )
+            prompt_msg = {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": message,
+                },
+            }
+
+            def is_turn_accepted(item: dict[str, Any]) -> bool:
+                if item.get("session_id") != self.provider_session_id:
+                    return False
+                if item.get("type") in {"user", "system", "assistant", "result"}:
+                    return bool(item.get("uuid"))
+                return False
+
+            try:
+                start_index = self.rpc.notification_count()
+                self.rpc._send(prompt_msg)
+                first_update = self.rpc.wait_notification(
+                    is_turn_accepted,
+                    start_index=start_index,
+                    timeout=30.0,
+                )
+                turn_id = first_update.get("uuid")
+                if not isinstance(turn_id, str) or not turn_id:
+                    raise BridgeError("Claude Code turn omitted provider turn uuid")
+                with self._active_prompt_lock:
+                    self._active_prompt_request_id = 1
+                threading.Thread(
+                    target=self._watch_claude_prompt_completion,
+                    args=(self.provider_session_id, start_index),
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                raise SubmitUncertain(
+                    f"Claude Code session/prompt outcome uncertain after provider boundary: {exc}"
+                ) from exc
+
+            evidence = {
+                "method": "stream/user",
+                "request_sha256": _digest(prompt_msg),
+                "provider_turn_id": turn_id,
+                "first_provider_update": first_update,
+            }
+            self._turn_sequence += 1
+            return turn_id, "claude-turn-start", evidence
         if self.provider == "codex":
             params = {
                 "threadId": self.provider_session_id,
@@ -2212,6 +2390,24 @@ class _ProviderSession:
             with self._active_prompt_lock:
                 if self._active_prompt_request_id == request_id:
                     self._active_prompt_request_id = None
+
+    def _watch_claude_prompt_completion(self, session_id: str, start_index: int) -> None:
+        """Clear the active-turn guard only on the prompt's result event."""
+        assert self.rpc is not None
+        try:
+            result = self.rpc.wait_notification(
+                lambda item: item.get("type") == "result" and item.get("session_id") == session_id,
+                start_index=start_index,
+                timeout=30 * 24 * 60 * 60,
+            )
+            stop_reason = result.get("stop_reason") or result.get("terminal_reason")
+            if isinstance(stop_reason, str):
+                print(f"\n[turn completed] {stop_reason}\n", flush=True)
+        except Exception as exc:  # noqa: BLE001 - the control surface reports loss
+            print(f"\n[turn completion unavailable] {exc}\n", flush=True)
+        finally:
+            with self._active_prompt_lock:
+                self._active_prompt_request_id = None
 
     def _scan_companion_events(self) -> None:
         """§20.2f P1-10: record provider-native refusal receipts from the
@@ -2527,7 +2723,7 @@ class _ProviderSession:
         """Passively close accepted prompt/cancel controls after native turn end."""
         operation = journal.get(operation_id)
         if (
-            self.provider == "kimi_cli"
+            self.provider in {"kimi_cli", "claude_code"}
             and operation["state"] == CONTROL_ACCEPTED
             and operation["action"]
             in {
@@ -2564,28 +2760,20 @@ class _ProviderSession:
                 start_index=start_index,
                 timeout=30.0,
             )
-            journal.transition(
-                operation_id,
-                CONTROL_ACCEPTED,
-                evidence_digest=_digest(params),
-            )
-            result = self.rpc.wait_response(request_id, timeout=15 * 60)
+            result = self.rpc.wait_response(request_id, timeout=30 * 24 * 60 * 60)
             journal.transition(
                 operation_id,
                 CONTROL_COMPLETED,
                 result=result,
-                evidence_digest=_digest(result),
+                evidence_digest=_digest({"request": params, "response": result}),
             )
-        except Exception as exc:  # noqa: BLE001 - journal exact uncertainty
-            current = journal.get(operation_id)
-            if current["state"] in {CONTROL_SUBMITTED, CONTROL_ACCEPTED}:
-                with contextlib.suppress(Exception):
-                    journal.transition(
-                        operation_id,
-                        CONTROL_AMBIGUOUS,
-                        reason_code="compact_outcome_ambiguous",
-                        reason_detail=str(exc),
-                    )
+        except Exception as exc:  # noqa: BLE001 - the control surface reports loss
+            journal.transition(
+                operation_id,
+                CONTROL_AMBIGUOUS,
+                reason_code="compact_outcome_ambiguous",
+                reason_detail=str(exc),
+            )
         finally:
             with self._active_prompt_lock:
                 if self._active_prompt_request_id == request_id:
@@ -2686,6 +2874,34 @@ class _ProviderSession:
         if action == "cancel":
             with self._active_prompt_lock:
                 active_request = self._active_prompt_request_id
+            if self.provider == "claude_code":
+                if active_request is None:
+                    return self._refuse_control(
+                        journal,
+                        operation_id,
+                        "turn_not_active",
+                        "the Claude Code session has no active foreground turn to cancel",
+                    )
+                journal.transition(operation_id, CONTROL_SUBMITTED)
+                try:
+                    if self.rpc and self.rpc.proc and self.rpc.proc.poll() is None:
+                        self.rpc.proc.send_signal(signal.SIGINT)
+                except Exception as exc:
+                    return self._control_receipt(
+                        journal.transition(
+                            operation_id,
+                            CONTROL_AMBIGUOUS,
+                            reason_code="cancel_outcome_ambiguous",
+                            reason_detail=str(exc),
+                        )
+                    )
+                return self._control_receipt(
+                    journal.transition(
+                        operation_id,
+                        CONTROL_ACCEPTED,
+                        evidence_digest=_digest({"action": "cancel", "provider": "claude_code"}),
+                    )
+                )
             if self.provider == "kimi_cli":
                 if active_request is None:
                     return self._refuse_control(

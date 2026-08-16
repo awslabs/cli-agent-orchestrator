@@ -59,17 +59,15 @@ class TestReadinessProvidersIsDerivedFromItsAdapters:
         for provider in _capabilities()["readiness_providers"]:
             assert provider in managed_launch.READINESS_PROVIDERS
 
-    def test_claude_is_absent_because_v1_has_no_adapter_for_it(self):
-        """Able to fail in the direction that matters.
+    def test_claude_is_present_because_v1_has_an_authoritative_adapter_for_it(self):
+        """Able to attest readiness with an authoritative v1 adapter.
 
-        If someone adds ``claude_code`` to the published list without
-        adding a v1 readiness receipt kind, this fails — which is the
-        exact regression that would let a bridged Claude launch through a
-        gate and into a doomed reservation.
+        With the COND-0415 Claude Code ACP bridge adapter in place,
+        claude_code is an authoritative readiness provider in v1.
         """
         capabilities = _capabilities()
-        assert "claude_code" not in managed_launch._READINESS_RECEIPT_KINDS
-        assert "claude_code" not in capabilities["readiness_providers"]
+        assert "claude_code" in managed_launch._READINESS_RECEIPT_KINDS
+        assert "claude_code" in capabilities["readiness_providers"]
 
 
 class TestNativeReadinessIsPublishedWhereNativeCallersRead:
