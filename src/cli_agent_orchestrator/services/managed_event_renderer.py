@@ -69,7 +69,9 @@ class ManagedEventRenderer:
                 return "".join(parts) if parts else None
             return None
         if item_type == "result":
-            stop_reason = _label(item.get("stop_reason") or item.get("terminal_reason"), "completed")
+            stop_reason = _label(
+                item.get("stop_reason") or item.get("terminal_reason"), "completed"
+            )
             return f"\n[turn completed] {stop_reason}\n"
         if item_type in {"system", "user", "progress"}:
             return None

@@ -2140,21 +2140,31 @@ class _ProviderSession:
         if is_deepseek:
             base_url = env.get("ANTHROPIC_BASE_URL", "")
             if not base_url or "api.anthropic.com" in base_url:
-                raise BridgeError("DeepSeek managed launch requires ANTHROPIC_BASE_URL gateway configuration")
+                raise BridgeError(
+                    "DeepSeek managed launch requires ANTHROPIC_BASE_URL gateway configuration"
+                )
             conflicts = [
                 k
-                for k in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+                for k in (
+                    "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX",
+                    "CLAUDE_CODE_USE_FOUNDRY",
+                )
                 if env.get(k)
             ]
             if conflicts:
-                raise BridgeError(f"conflicting cloud controls in DeepSeek environment: {', '.join(conflicts)}")
+                raise BridgeError(
+                    f"conflicting cloud controls in DeepSeek environment: {', '.join(conflicts)}"
+                )
 
         session_id = self.request.get("provider_session_id")
         if session_id:
             if not isinstance(session_id, str) or not re.fullmatch(
                 r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", session_id
             ):
-                raise BridgeError("Claude managed launch requires a valid canonical UUID session id")
+                raise BridgeError(
+                    "Claude managed launch requires a valid canonical UUID session id"
+                )
         else:
             session_id = str(uuid.uuid4())
 

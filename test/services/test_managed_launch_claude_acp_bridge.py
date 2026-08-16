@@ -57,7 +57,9 @@ def _claude_request(
     return request
 
 
-def _admission(request: dict[str, Any], message: str = "implement COND-0415 repair") -> dict[str, Any]:
+def _admission(
+    request: dict[str, Any], message: str = "implement COND-0415 repair"
+) -> dict[str, Any]:
     return {
         "op": "admit",
         "reservation_id": request["reservation_id"],
@@ -113,24 +115,28 @@ class _FakeClaudeProcess:
     def send_signal(self, sig: int) -> None:
         if sig == signal.SIGINT:
             with self._condition:
-                self._notifications.append({
-                    "type": "result",
-                    "session_id": self.session_id,
-                    "uuid": "cancelled-turn",
-                    "result": "Turn interrupted by operator.",
-                    "stop_reason": "cancelled",
-                })
+                self._notifications.append(
+                    {
+                        "type": "result",
+                        "session_id": self.session_id,
+                        "uuid": "cancelled-turn",
+                        "result": "Turn interrupted by operator.",
+                        "stop_reason": "cancelled",
+                    }
+                )
                 self._condition.notify_all()
 
     def finish_turn(self, turn_uuid: str = "turn-uuid") -> None:
         with self._condition:
-            self._notifications.append({
-                "type": "result",
-                "session_id": self.session_id,
-                "uuid": turn_uuid,
-                "result": "Completed task.",
-                "stop_reason": "end_turn",
-            })
+            self._notifications.append(
+                {
+                    "type": "result",
+                    "session_id": self.session_id,
+                    "uuid": turn_uuid,
+                    "result": "Completed task.",
+                    "stop_reason": "end_turn",
+                }
+            )
             self._condition.notify_all()
 
     def _send(self, message: dict[str, Any]) -> None:
@@ -138,29 +144,35 @@ class _FakeClaudeProcess:
         if message.get("type") == "user":
             turn_uuid = f"turn-{uuid.uuid4()}"
             with self._condition:
-                self._notifications.append({
-                    "type": "user",
-                    "message": message.get("message"),
-                    "session_id": self.session_id,
-                    "uuid": turn_uuid,
-                })
-                self._notifications.append({
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "Starting implementation."}],
-                    },
-                    "session_id": self.session_id,
-                    "uuid": turn_uuid,
-                })
-                if self.auto_complete:
-                    self._notifications.append({
-                        "type": "result",
+                self._notifications.append(
+                    {
+                        "type": "user",
+                        "message": message.get("message"),
                         "session_id": self.session_id,
                         "uuid": turn_uuid,
-                        "result": "Completed task.",
-                        "stop_reason": "end_turn",
-                    })
+                    }
+                )
+                self._notifications.append(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Starting implementation."}],
+                        },
+                        "session_id": self.session_id,
+                        "uuid": turn_uuid,
+                    }
+                )
+                if self.auto_complete:
+                    self._notifications.append(
+                        {
+                            "type": "result",
+                            "session_id": self.session_id,
+                            "uuid": turn_uuid,
+                            "result": "Completed task.",
+                            "stop_reason": "end_turn",
+                        }
+                    )
                 self._condition.notify_all()
 
     def notification_count(self) -> int:
@@ -171,7 +183,9 @@ class _FakeClaudeProcess:
         with self._condition:
             return list(self._notifications[index:]), len(self._notifications)
 
-    def wait_notification(self, predicate: Any, *, start_index: int, timeout: float) -> dict[str, Any]:
+    def wait_notification(
+        self, predicate: Any, *, start_index: int, timeout: float
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         with self._condition:
             index = start_index
@@ -190,7 +204,9 @@ class _FakeClaudeProcess:
         self.closed = True
 
 
-def test_claude_acp_readiness_and_task_submission(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_claude_acp_readiness_and_task_submission(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     request = _claude_request(tmp_path)
     procs: list[_FakeClaudeProcess] = []
 
@@ -237,7 +253,9 @@ def test_claude_acp_readiness_and_task_submission(tmp_path: pathlib.Path, monkey
     assert procs[0].sent_messages[0]["type"] == "user"
 
 
-def test_deepseek_route_fails_closed_when_gateway_missing(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deepseek_route_fails_closed_when_gateway_missing(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     request = _claude_request(tmp_path, model="deepseek-v4-flash")
     # Empty env with no ANTHROPIC_BASE_URL
     monkeypatch.setattr(os, "environ", {})
@@ -251,7 +269,9 @@ def test_deepseek_route_fails_closed_when_gateway_missing(tmp_path: pathlib.Path
         session.initialize()
 
 
-def test_deepseek_route_fails_closed_on_conflicting_ambient_cloud_keys(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deepseek_route_fails_closed_on_conflicting_ambient_cloud_keys(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     request = _claude_request(tmp_path, model="deepseek-v4-flash")
     isolated_env = {
         "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
@@ -297,7 +317,9 @@ def test_claude_acp_renderer_formats_stream_json_events() -> None:
     assert "[turn completed] end_turn" in (renderer.render(result_event) or "")
 
 
-def test_claude_acp_session_operation_route_query(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_claude_acp_session_operation_route_query(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     request = _claude_request(tmp_path)
     isolated_env = {
         "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
@@ -349,7 +371,9 @@ def test_claude_acp_session_operation_route_query(tmp_path: pathlib.Path, monkey
     assert receipt["result"]["capabilities"]["route_query"] is True
 
 
-def test_claude_acp_session_operation_follow_up_and_cancel(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_claude_acp_session_operation_follow_up_and_cancel(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     request = _claude_request(tmp_path)
     procs: list[_FakeClaudeProcess] = []
 
@@ -458,8 +482,12 @@ def test_claude_acp_session_operation_follow_up_and_cancel(tmp_path: pathlib.Pat
     assert reconciled["state"] == bridge.CONTROL_COMPLETED
 
 
-def test_claude_acp_standard_claude_model_without_gateway(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    request = _claude_request(tmp_path, model="claude-3-7-sonnet-20250219", provider_route="anthropic")
+def test_claude_acp_standard_claude_model_without_gateway(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _claude_request(
+        tmp_path, model="claude-3-7-sonnet-20250219", provider_route="anthropic"
+    )
     # Standard Claude model with standard environment (no ANTHROPIC_BASE_URL required)
     isolated_env = {
         "ANTHROPIC_API_KEY": "sk-ant-test-key",
@@ -491,5 +519,3 @@ def test_claude_code_is_in_authoritative_readiness_and_submission_maps() -> None
     assert managed_launch._READINESS_RECEIPT_KINDS["claude_code"] == "claude-session-start"
     assert managed_launch._SUBMISSION_RECEIPT_KINDS["claude_code"] == "claude-turn-start"
     assert "claude_code" in managed_launch.READINESS_PROVIDERS
-
-
