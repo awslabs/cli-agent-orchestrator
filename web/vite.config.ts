@@ -36,6 +36,10 @@ export default defineConfig({
       // bundle (same origin) and is entirely dead under `npm run dev`, where
       // every tracker call 404s against the Vite dev server instead.
       '/tracker': { target: 'http://localhost:9889', changeOrigin: true },
+      // The fleet-operation read projection is the one cohort route that is
+      // not under /sessions, so it needs its own entry or the dashboard's
+      // operation detail 404s under `npm run dev`.
+      '/cohort-operations': { target: 'http://localhost:9889', changeOrigin: true },
     },
   },
 })

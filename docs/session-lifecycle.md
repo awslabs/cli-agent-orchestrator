@@ -7,14 +7,12 @@ because every declared state is a suppressor for the recovery path.
 
 Status: phased. The lifecycle storage, the HTTP/CLI routes, and the
 row-preserving stop/archive collection described here are **implemented**
-(by this work). M3-C C1-C2 also implements the **dark cohort service** described
-in §4.3: exact lifecycle/roster boundary claims, member snapshots, receipted
-state transitions, atomic Stop-barrier entry, paired terminal lifecycle commits,
-and read-only HTTP projections. Public safe/force Pause/Stop/Resume controls and
-physical effects remain deferred. The legacy stop route therefore behaves
-exactly as documented in §4.0. No public route invokes the C2 mutation seams;
-importing or reading the journal cannot claim a Stop barrier or touch a pane.
-Fire Marshal cutover also remains deferred.
+(by this work). M3-C C1-C2 implements the cohort service described in §4.3, and
+C4 adds the **public operator surfaces** described in §4.4: separate safe/force
+Pause and Stop, operator-only Resume of a stopped session (paused, or paused
+and started), and the durable projection behind all of them. The legacy stop
+route still behaves exactly as documented in §4.0. Fire Marshal cutover remains
+deferred.
 
 ---
 
@@ -298,6 +296,104 @@ Later M3-C slices consume this service to perform and reconcile each physical
 effect, then add operator-only partial Resume. M3-D remains the sole
 task-occurrence and supervisor-drain authority; C2 treats its receipt as opaque
 and does not infer task meaning from CAO's physical roster.
+
+### 4.4 Operator surfaces and Resume (C4)
+
+**Safe and force are separate surfaces, not a mode argument.** Six routes:
+
+| route | scope | what it does |
+|---|---|---|
+| `POST /sessions/{name}/cohort/pause/safe` | admin | consumes M3-D's drain receipt + member classification; interrupts nothing |
+| `POST /sessions/{name}/cohort/pause/force` | admin | interrupts every turn, workers before the supervisor |
+| `POST /sessions/{name}/cohort/stop/safe` | admin | stops once the fleet drained to a boundary |
+| `POST /sessions/{name}/cohort/stop/force` | admin | reaps now, without waiting for provider I/O |
+| `POST /sessions/{name}/cohort/resume/paused` | admin | restores panes, **sends zero input** |
+| `POST /sessions/{name}/cohort/resume/start` | admin | restores panes, then wakes the supervisor exactly once |
+| `POST /sessions/{name}/cohort/resume/retry` | admin | continues *this* Resume out of `reconciliation-required` |
+
+A mode flag is something a client library defaults, a script sets once, and a
+retry carries forward. A different URL is not. `cao session cohort` mirrors the
+split (`stop-safe` / `stop-force`), as does the dashboard, which renders force
+as its own button rather than a modifier. There is deliberately **no safe-Pause
+CLI command or dashboard button**: a safe Pause consumes evidence only M3-D can
+produce, and offering a button that quietly did a force Pause instead is the
+mislabelling the whole split exists to prevent.
+
+**Resume is the only thing that reopens a Stop barrier**, and only an operator
+performs it. `begin_resume_restore` is `begin_stop_teardown`'s mirror image: it
+releases the exact barrier the source Stop claimed and declares the recorded
+target in one transaction. The ordering matches Stop's for the same reason —
+Stop writes `stopped` before collecting a pane so a failure can never leave a
+collected fleet declared live; Resume writes the target before creating one, so
+a half-finished restore is a session declared live with missing panes (a
+divergence `session_lifecycle.divergence` surfaces) rather than a fleet running
+under a `stopped` row that refuses every effect it needs.
+
+**Resume paused sends nothing at all** — no keystroke, no inbox payload, no
+supervisor bump. It exists so an operator can look at a restored fleet before
+anything moves. Zero input is structural: `execute_resume_paused` has no waker
+parameter to set.
+
+**Resume and start emits exactly one opaque reconciliation wake**, after every
+member's outcome is durable and never before. The wake id is derived from the
+operation id, so a retried Resume reuses it and the delivering seam adopts
+rather than repeating. M3-D owns what the wake *means*; M3-C owns only that
+there is exactly one and that it comes last.
+
+**A partial restore settles.** `restored-exact`, `restored-fresh`, `failed` and
+`unresumable` are all terminal member outcomes. One worker that could not come
+back does not hold its restored siblings — or its supervisor — in
+`reconciliation-required`; the fleet starts, and the single wake describes every
+outcome including the failure. Only a genuinely *undecided* member (still
+pending, or a restore whose physical result was ambiguous) blocks the terminal
+commit. Fresh restore is never a silent fallback for a refused exact one:
+exact restoration is what makes the resumed transcript the same transcript, and
+a fresh authority must be supplied deliberately.
+
+**A Resume that stops short is continued, not restarted.** Two things leave an
+operation in `reconciliation-required`: a member whose physical result was
+ambiguous, and a wake that did not land. Both leave real state behind — panes
+that came back, a lifecycle already declared, a barrier already released — so
+the repair finishes the same operation. `resume/retry` claims no new boundary,
+re-observes no roster, releases no second barrier, and re-restores no member
+that already has a decided outcome; the wake id is the operation's, unchanged,
+so a wake delivered before is adopted rather than repeated. Without it the only
+escape was to force-Stop a fleet that was in most cases already running.
+
+Every transition identity is derived from `(operation_id, label, state_epoch)`
+rather than minted by the caller. Each attempt begins at a distinct epoch, so
+it gets distinct ids automatically, while a replay of the same attempt
+recomputes identical ids and adopts. The earlier caller-minted scheme made this
+a convention the caller had to honour, and it did not: a retry re-derived the
+*restore* id, whose stored payload differed, so every retry died on "already
+exists with different immutable request content".
+
+The retry carries an opaque receipt derived from the durable evidence — the
+state epoch and every member's recorded outcome — so it is reproducible under
+response loss rather than minted per call. `provenance.retries` exposes each
+retry with its receipt and actor, `provenance.retryable` says whether the
+operation can still be continued, and `provenance.reconciliation_reason`
+carries why it stopped. A surface that cannot tell "unfinished" from "finished"
+sends operators to the force-Stop button.
+
+**Only a delivered wake may be reported as one.** The dashboard says "the
+supervisor was told" exactly where `wakeWasDelivered` holds: a settled Resume
+whose target is not `paused`. Decided members are not sufficient evidence — an
+operation that stopped *because* its wake did not land has entirely decided
+members and a supervisor that knows nothing — and a Resume-paused wakes nobody
+by design, so it must not borrow the sentence. Reconciliation states render the
+retry control and the durable reason instead, alongside the decided failures,
+which are reported as decided and are never retried.
+
+**Rollback.** C4 adds no table and no column: it fills the
+`source_operation_id` / `resume_target` carriers C1 already reserved and reuses
+the barrier's existing `open` state. Rolling back to a build without Resume
+leaves readable rows — the projections are shape-compatible — and that build
+fails closed on them, because an unrecognised `operation_kind` has no allowed
+transitions and therefore cannot half-advance a Resume it does not understand.
+A released barrier is an ordinary `open` barrier, which an older build already
+handles correctly, and every release bumps the row epoch so a lost update stays
+detectable.
 
 ---
 
