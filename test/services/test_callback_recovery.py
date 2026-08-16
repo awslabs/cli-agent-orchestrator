@@ -1008,6 +1008,49 @@ def test_observed_terminal_retirement_treats_concurrent_absence_as_complete(
     )
 
 
+def test_observed_legacy_terminal_retirement_preserves_pane_fenced_authority(
+    monkeypatch,
+):
+    observed = {
+        "id": SOURCE,
+        "generation": None,
+        "pane_id": "%11",
+        "tmux_session": SESSION_NAME,
+    }
+    monkeypatch.setattr(
+        terminal_service,
+        "_get_terminal_metadata_any",
+        lambda _terminal_id: dict(observed),
+    )
+    monkeypatch.setattr(
+        callback_recovery,
+        "terminal_has_open_recovery",
+        lambda *_args, **_kwargs: False,
+    )
+    captured = {}
+
+    def delete_claimed(terminal_id, **kwargs):
+        captured.update(terminal_id=terminal_id, **kwargs)
+        return True
+
+    monkeypatch.setattr(
+        terminal_service,
+        "_delete_terminal_claimed",
+        delete_claimed,
+    )
+
+    assert terminal_service.retire_observed_terminal(
+        SOURCE,
+        expected_session=SESSION_NAME,
+        expected_pane_id="%11",
+        backend_already_closed=False,
+    )
+    assert captured["terminal_id"] == SOURCE
+    assert captured["expected_generation"] is None
+    assert captured["expected_session"] is None
+    assert captured["backend_already_closed"] is False
+
+
 def test_completed_replay_survives_prompt_inbox_retention(recovery_context):
     admission = callback_recovery.admit(recovery_context)
     _record_turn(admission)
