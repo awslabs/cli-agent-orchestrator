@@ -422,18 +422,29 @@ def provider_byte_admission(
     fence behavior.
 
     This is also where an M3-E handback suspends a stable agent's task
-    authority.  It is the narrowest point that covers every task-byte lane for
-    a live managed pane -- typed control input, native inbox payloads, and
-    operator messages all pass through here -- and the reservation record it
-    already reads carries the stable agent id, so the hold costs one indexed
-    row read and no extra round trip.
+    authority.  The hold is checked *before* every branch below, including the
+    unmanaged and legacy-managed early returns, and it resolves the agent from
+    the roster rather than from the reservation record.  Both are deliberate:
+    an exact-restored pane -- which is what a handback's recipient runs on by
+    construction, and what any recovered donor runs on permanently -- has no
+    managed-launch reservation, so a reservation-keyed hold placed after the
+    ``managed`` early return would be inert in precisely the flow it exists
+    for.  The roster knows that pane's stable agent; the reservation does not
+    exist to be asked.
 
     ``control_id`` is the recipient's one exemption: the derived id the
     catch-up packet is delivered under.  Without it the hold would refuse its
     own packet and no handback could complete.
     """
     from cli_agent_orchestrator.constants import COMPANION_DIR
-    from cli_agent_orchestrator.services import generation_fence
+    from cli_agent_orchestrator.services import generation_fence, task_handoff
+
+    # Decided before the locks and before the first byte, so the refusal
+    # carries the zero-bytes proof that makes it re-attemptable once the
+    # handoff settles.
+    held = task_handoff.hold_refusal_for_terminal(terminal_id, generation, control_id=control_id)
+    if held:
+        raise task_handoff.TaskHandoffHeld(held)
 
     # Raw/unmanaged control retains its pre-M3 nonblocking pane-lease
     # semantics. It has no managed generation authority and must not block a
@@ -474,15 +485,6 @@ def provider_byte_admission(
         raise generation_fence.FencedError(
             "managed provider-byte admission immutable generation binding changed"
         )
-    # Decided before the lock and before the first byte, so the refusal carries
-    # the zero-bytes proof that makes it re-attemptable once the handoff
-    # settles.  A reservation with no stable agent id predates the M3-A roster
-    # and cannot be party to a handback, so it is not held.
-    from cli_agent_orchestrator.services import task_handoff
-
-    held = task_handoff.hold_refusal(record.get("stable_agent_id"), control_id=control_id)
-    if held:
-        raise task_handoff.TaskHandoffHeld(held)
     with generation_fence.managed_admission_critical_section(
         COMPANION_DIR,
         terminal_id,

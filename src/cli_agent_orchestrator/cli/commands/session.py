@@ -1128,32 +1128,15 @@ def session_handoff():
 
     Deliberately has no verbs. A handback spans an exact resume and a packet
     delivery this CLI does not own, and a `cao session handoff start` would
-    imply an atomicity it cannot provide. These commands answer the two
-    questions an operator actually has: what is in flight, and why was my
-    steer refused.
+    imply an atomicity it cannot provide.
+
+    One command, because there is one question. A refused steer names its
+    handoff id verbatim, so the operator's loop is `refused steer -> read the
+    id -> handoff show <id>`. "What is in flight" needs a session name the
+    operator must already have, and nothing produces that question while no
+    conductor client can create a handoff; `GET /sessions/{s}/task-handoffs`
+    remains for when one does.
     """
-
-
-@session_handoff.command(name="list")
-@click.argument("session_name")
-@click.option("--state", type=click.Choice(["pending", "transferred", "rolled-back"]), default=None)
-@click.option("--json", "as_json", is_flag=True)
-def handoff_list(session_name, state, as_json):
-    """Every handback recorded for this session."""
-    query = f"?state={quote(state, safe='')}" if state else ""
-    records = _api_get(f"/sessions/{quote(session_name, safe='')}/task-handoffs{query}")
-    if as_json:
-        click.echo(json.dumps(records, indent=2))
-        return
-    if not records:
-        click.echo("no handbacks recorded")
-        return
-    for record in records:
-        click.echo(
-            f"{record['handoff_id']}  {record['state']:<12} "
-            f"{record['from_agent_id'][:8]} -> {record['to_agent_id'][:8]}  "
-            f"packet={record['delivery_state']}"
-        )
 
 
 @session_handoff.command(name="show")

@@ -1418,19 +1418,28 @@ class TaskOccurrenceHandoffModel(Base):
     from_incarnation_id = Column(Text, nullable=False)
     from_terminal_id = Column(Text, nullable=False)
     from_generation = Column(Text, nullable=True)
+    # The donor's occurrence revision at the instant the packet digest was
+    # taken. A transfer compares it: if the donor moved while held, the packet
+    # describes a round the recipient is not actually inheriting.
+    donor_revision = Column(Integer, nullable=False)
     # The catch-up packet is bytes the conductor owns; this is only its digest
     # and the derived control id that makes its delivery exactly-once.
     packet_digest = Column(Text, nullable=False)
     packet_control_id = Column(Text, nullable=False)
     quiescence_json = Column(Text, nullable=False)
     quiescence_digest = Column(Text, nullable=False)
-    rollback_predicate_json = Column(Text, nullable=False)
     delivery_state = Column(Text, nullable=False)
     delivery_outcome = Column(Text, nullable=True)
     delivery_receipt = Column(Text, nullable=True)
+    # Which recipient incarnation actually received the packet. The derived
+    # control id binds no terminal, and the control-input journal refuses to
+    # re-deliver it to a replacement pane, so a transfer to an incarnation that
+    # never read the packet would durably assert context it does not have.
+    to_incarnation_id = Column(Text, nullable=True)
+    to_terminal_id = Column(Text, nullable=True)
+    to_generation = Column(Text, nullable=True)
     successor_occurrence_id = Column(Text, nullable=True)
     state = Column(Text, nullable=False)
-    epoch = Column(Integer, nullable=False, default=0, server_default="0")
     receipt_digest = Column(Text, nullable=True)
     detail = Column(Text, nullable=True)
     initiated_by = Column(Text, nullable=False)
@@ -3285,17 +3294,19 @@ def _migrate_task_occurrence_handoffs() -> None:
                 "from_incarnation_id TEXT NOT NULL, "
                 "from_terminal_id TEXT NOT NULL, "
                 "from_generation TEXT, "
+                "donor_revision INTEGER NOT NULL, "
                 "packet_digest TEXT NOT NULL, "
                 "packet_control_id TEXT NOT NULL, "
                 "quiescence_json TEXT NOT NULL, "
                 "quiescence_digest TEXT NOT NULL, "
-                "rollback_predicate_json TEXT NOT NULL, "
                 "delivery_state TEXT NOT NULL, "
                 "delivery_outcome TEXT, "
                 "delivery_receipt TEXT, "
+                "to_incarnation_id TEXT, "
+                "to_terminal_id TEXT, "
+                "to_generation TEXT, "
                 "successor_occurrence_id TEXT, "
                 "state TEXT NOT NULL, "
-                "epoch INTEGER NOT NULL DEFAULT 0, "
                 "receipt_digest TEXT, "
                 "detail TEXT, "
                 "initiated_by TEXT NOT NULL, "

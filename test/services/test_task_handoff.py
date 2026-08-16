@@ -100,13 +100,13 @@ def _pair(*, donor_seed=None):
     return donor_agent, recipient_agent, donor
 
 
-def _deliver(handoff):
+def _deliver(handoff, suffix="2"):
     return th.record_packet_delivery(
         handoff["handoff_id"],
         delivered=True,
+        incarnation=_incarnation(suffix),
         outcome="accepted",
         receipt="receipt-1",
-        expected_epoch=handoff["epoch"],
     )
 
 
@@ -293,6 +293,84 @@ def test_a_settled_handoff_frees_both_agents_to_hand_back_again():
     assert again["handoff_id"] != first["handoff_id"]
 
 
+def test_one_agent_is_party_to_one_handoff_even_under_concurrent_begins(tmp_path, monkeypatch):
+    """The three partial unique indexes cannot express the per-agent invariant.
+
+    They forbid a second row per *slot*, and they are independent, so agent X
+    may legally appear once as donor and once as recipient. Only the
+    read-then-insert in `_begin_once` forbids it, and two deferred transactions
+    would both finish that read before either wrote. The write lock is what
+    makes the precondition hold.
+    """
+    import threading
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.clients import database
+
+    path = tmp_path / "concurrent.db"
+    engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+    database.Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(
+        database, "SessionLocal", sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    )
+
+    shared = str(uuid.uuid4())
+    donor_a, donor_b = str(uuid.uuid4()), str(uuid.uuid4())
+    round_a = _open(donor_a, suffix="1")
+    round_b = _open(donor_b, suffix="4")
+
+    start = threading.Barrier(2)
+    results: list[Any] = []
+
+    def _begin_pair(occurrence_record, to_agent, suffix):
+        start.wait(timeout=5)
+        try:
+            results.append(
+                th.begin_handoff(
+                    th.BeginRequest(
+                        handoff_id=str(uuid.uuid4()),
+                        session_name=SESSION,
+                        task_occurrence_id=occurrence_record["task_occurrence_id"],
+                        to_agent_id=to_agent,
+                        packet_digest=_PACKET,
+                        evidence=_evidence(suffix),
+                        initiated_by="supervisor",
+                    )
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - the refusal is the assertion
+            results.append(exc)
+
+    threads = [
+        # X becomes the recipient of one handoff...
+        threading.Thread(target=_begin_pair, args=(round_a, shared, "1")),
+        # ...while another would make it the donor of a second.
+        threading.Thread(target=_begin_pair, args=(round_b, shared, "4")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    accepted = [item for item in results if isinstance(item, dict)]
+    refused = [item for item in results if isinstance(item, Exception)]
+    assert len(accepted) == 1, results
+    assert len(refused) == 1, results
+    assert isinstance(refused[0], th.TaskHandoffConflict)
+
+    pending = [
+        item
+        for item in th.list_handoffs(SESSION, state=th.STATE_PENDING)
+        if shared in (item["from_agent_id"], item["to_agent_id"])
+    ]
+    assert len(pending) == 1
+    # And the hot path stays typed rather than raising MultipleResultsFound.
+    assert th.hold_refusal(shared) is not None
+    engine.dispose()
+
+
 def test_a_handoff_needs_two_different_agents():
     donor_agent, _recipient, donor = _pair()
     with pytest.raises(th.TaskHandoffInvalid, match="needs two different agents"):
@@ -386,8 +464,8 @@ def test_a_delivered_packet_is_never_delivered_twice():
         th.record_packet_delivery(
             handoff["handoff_id"],
             delivered=True,
+            incarnation=_incarnation("2"),
             outcome="different",
-            expected_epoch=delivered["epoch"],
         )
 
 
@@ -395,27 +473,48 @@ def test_an_identical_delivery_record_adopts_after_a_lost_response():
     donor_agent, recipient_agent, donor = _pair()
     handoff = _begin(donor, recipient_agent)
     first = _deliver(handoff)
-    replay = th.record_packet_delivery(
-        handoff["handoff_id"],
-        delivered=True,
-        outcome="accepted",
-        receipt="receipt-1",
-        expected_epoch=handoff["epoch"],
-    )
+    replay = _deliver(handoff)
     assert replay["adopted"] is True
-    assert replay["epoch"] == first["epoch"]
+    assert replay["to_incarnation_id"] == first["to_incarnation_id"]
 
 
-def test_a_refused_delivery_leaves_the_handoff_pending_and_rollbackable():
+def test_a_delivered_packet_records_which_incarnation_received_it():
+    # The derived control id binds no terminal, and the control-input journal
+    # refuses to re-deliver a known id to a replacement pane -- so "delivered"
+    # is only meaningful alongside "to whom".
     donor_agent, recipient_agent, donor = _pair()
     handoff = _begin(donor, recipient_agent)
-    refused = th.record_packet_delivery(
-        handoff["handoff_id"], delivered=False, outcome="pane-busy", expected_epoch=handoff["epoch"]
-    )
+    delivered = _deliver(handoff, suffix="2")
+    assert delivered["to_incarnation_id"] == "inc-2"
+    assert delivered["to_terminal_id"] == "term-2"
+    assert delivered["recipient_briefed"] is True
+
+    other = _begin(_open(str(uuid.uuid4()), suffix="7"), str(uuid.uuid4()), evidence=_evidence("7"))
+    with pytest.raises(th.TaskHandoffInvalid, match="must name the recipient incarnation"):
+        th.record_packet_delivery(other["handoff_id"], delivered=True)
+
+
+def test_a_packet_is_never_recorded_as_delivered_to_the_donor():
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    with pytest.raises(th.TaskHandoffConflict, match="donor's own incarnation"):
+        th.record_packet_delivery(
+            handoff["handoff_id"], delivered=True, incarnation=_incarnation("1")
+        )
+
+
+def test_a_refused_delivery_leaves_the_handoff_pending_and_retryable():
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    refused = th.record_packet_delivery(handoff["handoff_id"], delivered=False, outcome="pane-busy")
     assert refused["state"] == th.STATE_PENDING
     assert refused["delivery_state"] == th.DELIVERY_REFUSED
+    assert refused["recipient_briefed"] is False
+    # The packet never landed, so the lane stays open for a real delivery.
+    assert _deliver(handoff)["delivery_state"] == th.DELIVERY_DELIVERED
+
     rolled = th.rollback_handoff(
-        handoff["handoff_id"], rolled_back_by="supervisor", reason="packet refused"
+        handoff["handoff_id"], rolled_back_by="supervisor", reason="quota returned"
     )
     assert rolled["donor_restored"] is True
 
@@ -522,21 +621,15 @@ def test_the_donors_seed_is_carried_forward_verbatim():
 
 
 def test_a_stale_expected_revision_refuses_the_transfer_and_writes_nothing():
+    # The donor has not drifted; the caller simply named the wrong revision.
+    # M3-D's own CAS is what refuses, and it refuses before either write.
     donor_agent, recipient_agent, donor = _pair()
     handoff = _deliver(_begin(donor, recipient_agent))
-    occ.record_boundary(
-        occ.BoundaryRecord(
-            task_occurrence_id=donor["task_occurrence_id"],
-            expected_revision=0,
-            recorded_by="worker",
-            report_digest=_DIGEST_B,
-        )
-    )
     with pytest.raises(occ.TaskOccurrenceConflict):
         th.complete_handoff(
             handoff["handoff_id"],
             incarnation=_incarnation("2"),
-            expected_revision=0,
+            expected_revision=7,
             completed_by="supervisor",
         )
     # Atomic: the donor is still open and the recipient never gained a round.
@@ -554,14 +647,16 @@ def test_a_failure_between_the_two_occurrence_writes_leaves_neither(monkeypatch)
     handoff = _deliver(_begin(donor, recipient_agent))
 
     def _boom(*_args, **_kwargs):
-        raise occ.TaskOccurrenceUnavailable("the store went away mid-transfer")
+        # A non-retryable occurrence error, so this test stays about the
+        # transaction boundary rather than about the retry policy.
+        raise occ.TaskOccurrenceConflict("the recipient's round could not be opened")
 
     # Scoped, not `monkeypatch.undo()`: undo would also revert the
     # isolated-database fixture's own SessionLocal patch, and every assertion
     # below would then read the real store instead of this test's.
     with monkeypatch.context() as patched:
         patched.setattr(occ, "open_occurrence", _boom)
-        with pytest.raises(occ.TaskOccurrenceUnavailable):
+        with pytest.raises(occ.TaskOccurrenceConflict):
             th.complete_handoff(
                 handoff["handoff_id"],
                 incarnation=_incarnation("2"),
@@ -608,6 +703,121 @@ def test_the_transfer_refuses_the_donors_own_incarnation():
             expected_revision=0,
             completed_by="supervisor",
         )
+
+
+def test_a_transfer_refuses_an_incarnation_that_never_received_the_packet():
+    # The pane the packet reached died; recovery exact-resumed the recipient
+    # onto a new incarnation. The packet cannot follow -- the derived control
+    # id is stable across incarnations and the control-input journal refuses a
+    # known id whose target moved -- so transferring here would leave the sole
+    # task authority holding no context while the record asserts that it read
+    # the packet, with the donor already superseded and unrecoverable.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _deliver(_begin(donor, recipient_agent), suffix="2")
+
+    with pytest.raises(th.TaskHandoffConflict, match="cannot be re-delivered to a replacement"):
+        th.complete_handoff(
+            handoff["handoff_id"],
+            incarnation=_incarnation("5"),
+            expected_revision=0,
+            completed_by="supervisor",
+        )
+    assert occ.get_occurrence(donor["task_occurrence_id"])["state"] == occ.STATE_OPEN
+    assert occ.open_occurrence_for_agent(recipient_agent) is None
+
+    # The recorded way forward is a rollback and a new handoff, which yields a
+    # new derived control id and so a deliverable packet.
+    rolled = th.rollback_handoff(
+        handoff["handoff_id"], rolled_back_by="supervisor", reason="recipient pane died"
+    )
+    assert rolled["recipient_briefed"] is True
+    again = _deliver(_begin(donor, recipient_agent), suffix="5")
+    assert again["packet_control_id"] != handoff["packet_control_id"]
+    assert (
+        th.complete_handoff(
+            again["handoff_id"],
+            incarnation=_incarnation("5"),
+            expected_revision=0,
+            completed_by="supervisor",
+        )["state"]
+        == th.STATE_TRANSFERRED
+    )
+
+
+def test_a_donor_that_moved_while_held_refuses_the_transfer():
+    # The packet describes one exact revision. If something wrote to the donor
+    # after the digest was taken, the context the recipient read is not the
+    # round it is being given.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _deliver(_begin(donor, recipient_agent))
+    occ.record_boundary(
+        occ.BoundaryRecord(
+            task_occurrence_id=donor["task_occurrence_id"],
+            expected_revision=0,
+            recorded_by="worker",
+            report_digest=_DIGEST_B,
+        )
+    )
+    with pytest.raises(th.TaskHandoffConflict, match="no longer describes the round"):
+        th.complete_handoff(
+            handoff["handoff_id"],
+            incarnation=_incarnation("2"),
+            expected_revision=1,
+            completed_by="supervisor",
+        )
+    assert occ.get_occurrence(donor["task_occurrence_id"])["state"] == occ.STATE_OPEN
+    assert th.get_handoff(handoff["handoff_id"])["state"] == th.STATE_PENDING
+
+
+def test_a_replayed_transfer_naming_a_different_incarnation_conflicts():
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _deliver(_begin(donor, recipient_agent))
+    th.complete_handoff(
+        handoff["handoff_id"],
+        incarnation=_incarnation("2"),
+        expected_revision=0,
+        completed_by="supervisor",
+    )
+    with pytest.raises(th.TaskHandoffConflict, match="already transferred to incarnation"):
+        th.complete_handoff(
+            handoff["handoff_id"],
+            incarnation=_incarnation("6"),
+            expected_revision=0,
+            completed_by="supervisor",
+        )
+
+
+def test_a_recipient_that_already_holds_a_round_is_refused_before_it_is_held():
+    # Refusing here is free. Past this point the recipient's own unrelated
+    # round is suspended and the catch-up packet is typed into its context by
+    # the exemption -- and typed bytes are not reversible.
+    donor_agent, recipient_agent, donor = _pair()
+    busy = _open(recipient_agent, suffix="3")
+    with pytest.raises(th.TaskHandoffConflict, match="must be free to take the round"):
+        _begin(donor, recipient_agent)
+    assert th.hold_refusal(recipient_agent) is None
+    assert occ.get_occurrence(busy["task_occurrence_id"])["state"] == occ.STATE_OPEN
+
+
+def test_a_rollback_after_delivery_reports_that_the_recipient_was_briefed():
+    # The rollback still releases -- one that could refuse would leave both
+    # agents held -- but it is not the same outcome as releasing nobody, and
+    # the receipt has to be able to say so or the cancellation is never owed.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _deliver(_begin(donor, recipient_agent))
+    rolled = th.rollback_handoff(
+        handoff["handoff_id"], rolled_back_by="supervisor", reason="readiness proof failed"
+    )
+    assert rolled["state"] == th.STATE_ROLLED_BACK
+    assert rolled["recipient_briefed"] is True
+    assert rolled["donor_restored"] is True
+
+    unbriefed = _begin(donor, str(uuid.uuid4()))
+    quiet = th.rollback_handoff(
+        unbriefed["handoff_id"], rolled_back_by="supervisor", reason="changed my mind"
+    )
+    assert quiet["recipient_briefed"] is False
+    assert th.receipt_digest(rolled) != th.receipt_digest(quiet)
 
 
 def test_a_transferred_handoff_is_never_rolled_back():
@@ -822,14 +1032,11 @@ def test_a_changed_replay_of_begin_conflicts_rather_than_overwriting():
 def test_reads_and_listings_separate_pending_from_settled():
     donor_agent, recipient_agent, donor = _pair()
     handoff = _begin(donor, recipient_agent)
-    assert th.handoff_for_occurrence(donor["task_occurrence_id"])["handoff_id"] == (
-        handoff["handoff_id"]
-    )
     assert [item["handoff_id"] for item in th.list_handoffs(SESSION)] == [handoff["handoff_id"]]
     assert th.list_handoffs(SESSION, state=th.STATE_TRANSFERRED) == []
 
     th.rollback_handoff(handoff["handoff_id"], rolled_back_by="supervisor", reason="done")
-    assert th.handoff_for_occurrence(donor["task_occurrence_id"]) is None
+    assert th.list_handoffs(SESSION, state=th.STATE_PENDING) == []
     assert len(th.list_handoffs(SESSION, state=th.STATE_ROLLED_BACK)) == 1
 
 
@@ -849,8 +1056,11 @@ def test_the_capability_says_the_store_is_live_but_nothing_starts_a_handback():
     assert capability["store_installed"] is True
     assert capability["admission_hold_enforced"] is True
     assert capability["automatic_producer"] is False
-    assert capability["conductor_consumer_attached"] is False
     assert capability["schema_version"] == th.SCHEMA_VERSION
+    # No hand-maintained claim about the *other* repository: this module cannot
+    # observe whether a conductor client exists, and a field it must remember
+    # to edit when E2 lands is one that will publish a falsehood instead.
+    assert "conductor_consumer_attached" not in capability
 
 
 def test_a_receipt_records_whether_quiescence_was_proven():

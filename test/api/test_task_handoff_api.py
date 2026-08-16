@@ -71,10 +71,15 @@ def _pair(client):
     return donor_agent, recipient_agent, donor, begun.json()
 
 
-def _deliver(client, handoff):
+def _deliver(client, handoff, *, incarnation_id="inc-2", terminal_id="term-2"):
     return client.post(
         f"/task-handoffs/{handoff['handoff_id']}/packet-delivery",
-        json={"delivered": True, "expected_epoch": handoff["epoch"], "outcome": "accepted"},
+        json={
+            "delivered": True,
+            "outcome": "accepted",
+            "incarnation_id": incarnation_id,
+            "terminal_id": terminal_id,
+        },
     )
 
 
@@ -151,7 +156,6 @@ def test_the_capability_route_is_not_shadowed_by_the_handoff_id_route(client):
     response = client.get("/task-handoffs/capability")
     assert response.status_code == 200, response.text
     assert response.json()["automatic_producer"] is False
-    assert response.json()["conductor_consumer_attached"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -222,10 +226,67 @@ def test_unknown_body_fields_are_rejected_rather_than_ignored(client):
     assert client.post(f"/sessions/{SESSION}/task-handoffs", json=body).status_code == 422
 
 
-def test_a_stale_expected_epoch_refuses_the_delivery_record(client):
+def test_a_delivered_packet_must_name_the_incarnation_that_received_it(client):
     _donor_agent, _recipient, _donor, handoff = _pair(client)
     response = client.post(
         f"/task-handoffs/{handoff['handoff_id']}/packet-delivery",
-        json={"delivered": True, "expected_epoch": handoff["epoch"] + 5},
+        json={"delivered": True},
     )
-    assert response.status_code == 409
+    assert response.status_code == 400
+    assert "recipient incarnation" in response.json()["detail"]
+
+
+def test_the_transfer_route_accepts_no_native_session_id(client):
+    """M3-E carries none, and the route must not be the exception.
+
+    An ordinary field-name slip in the caller -- it holds both incarnations
+    when it builds this body -- would otherwise stamp the donor's native
+    session onto the recipient's occurrence, a durably false harness binding
+    that every later reader of that provenance would trust.
+    """
+    _donor_agent, recipient_agent, _donor, handoff = _pair(client)
+    _deliver(client, handoff)
+    body = {
+        "expected_revision": 0,
+        "completed_by": "supervisor",
+        "incarnation_id": "inc-2",
+        "terminal_id": "term-2",
+        "native_session_id": "native-of-the-donor",
+    }
+    assert (
+        client.post(f"/task-handoffs/{handoff['handoff_id']}/transfer", json=body).status_code
+        == 422
+    )
+
+    del body["native_session_id"]
+    transferred = client.post(f"/task-handoffs/{handoff['handoff_id']}/transfer", json=body)
+    assert transferred.status_code == 200, transferred.text
+    assert transferred.json()["successor_occurrence"]["native_session_id"] is None
+
+
+def test_every_route_declares_the_scope_its_effect_needs(client):
+    # A declaration pin rather than an end-to-end 403: the four mutating routes
+    # must never silently become readable, and losing a `_WRITE` default is a
+    # one-character edit no other test in this file would notice.
+    import inspect
+
+    from cli_agent_orchestrator.api import task_handoff as api
+
+    write_routes = {
+        api.begin_task_handoff,
+        api.record_task_handoff_delivery,
+        api.complete_task_handoff,
+        api.rollback_task_handoff,
+    }
+    read_routes = {
+        api.get_task_handoff,
+        api.list_task_handoffs,
+        api.get_agent_handoff_hold,
+        api.task_handoff_capability,
+    }
+    for endpoint in write_routes:
+        default = inspect.signature(endpoint).parameters["_scopes"].default
+        assert default is api._WRITE, endpoint.__name__
+    for endpoint in read_routes:
+        default = inspect.signature(endpoint).parameters["_scopes"].default
+        assert default is api._READ, endpoint.__name__

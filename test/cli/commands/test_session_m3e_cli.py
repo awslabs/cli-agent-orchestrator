@@ -84,20 +84,11 @@ class TestHandoffShow:
         assert "refuse ordinary task input" not in result.output
 
 
-class TestHandoffList:
-    def test_an_empty_session_says_so_rather_than_printing_nothing(self):
-        result = _invoke([], ["handoff", "list", SESSION])
-        assert result.exit_code == 0, result.output
-        assert "no handbacks recorded" in result.output
-
-    def test_each_row_names_both_sides_and_the_packet_state(self):
-        result = _invoke([_handoff()], ["handoff", "list", SESSION])
-        assert result.exit_code == 0, result.output
-        assert HANDOFF_ID in result.output
-        assert DONOR[:8] in result.output and RECIPIENT[:8] in result.output
-        assert "packet=pending" in result.output
-
-    def test_the_group_offers_no_verbs(self):
+class TestHandoffGroup:
+    def test_the_group_offers_no_verbs_and_one_question(self):
         # A `handoff start` would imply an atomicity this CLI cannot provide:
-        # a handback spans an exact resume and a packet delivery it does not own.
-        assert set(session_cli.session_handoff.commands) == {"list", "show"}
+        # a handback spans an exact resume and a packet delivery it does not
+        # own. And one read, not two: a refused steer names its handoff id
+        # verbatim, so the operator's loop is refusal -> id -> `show`. "What is
+        # in flight" needs a session name nothing currently makes them ask for.
+        assert set(session_cli.session_handoff.commands) == {"show"}

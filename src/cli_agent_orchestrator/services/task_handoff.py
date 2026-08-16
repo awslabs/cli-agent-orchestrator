@@ -224,7 +224,7 @@ def _normalise_session_name(value: Any) -> str:
     return name
 
 
-def _anchor_caller_transaction(db: Any) -> None:
+def _anchor_caller_transaction(db: Any, *, immediate: bool = False) -> None:
     """Give SQLite a real outer transaction before a savepoint.
 
     Same reason as M3-D's copy: SQLAlchemy's Session transaction is lazy on
@@ -233,22 +233,34 @@ def _anchor_caller_transaction(db: Any) -> None:
     undo this write. Load-bearing here beyond hygiene: ``complete_handoff``
     finalizes one occurrence and opens another inside one savepoint, and a
     RELEASE that committed would make a failure between them observable.
+
+    ``immediate`` takes SQLite's write lock up front. A deferred transaction
+    acquires it only at the first write, so two callers can both complete their
+    *reads* — including a uniqueness precondition — before either writes. That
+    is exactly how two concurrent ``begin_handoff`` calls could each observe no
+    pending handoff for one agent and both insert.
     """
     connection = db.connection()
     if connection.dialect.name != "sqlite":
         return
     driver_connection = connection.connection.driver_connection
     if not driver_connection.in_transaction:
-        connection.exec_driver_sql("BEGIN")
+        connection.exec_driver_sql("BEGIN IMMEDIATE" if immediate else "BEGIN")
 
 
-def _with_session(fn: Callable[[Any], _T], db: Any, *, unavailable: str) -> _T:
+def _with_session(
+    fn: Callable[[Any], _T], db: Any, *, unavailable: str, immediate: bool = False
+) -> _T:
     if db is not None:
         try:
-            _anchor_caller_transaction(db)
+            _anchor_caller_transaction(db, immediate=immediate)
             with db.begin_nested():
                 return fn(db)
-        except (TaskHandoffError, occurrence.TaskOccurrenceError):
+        except TaskHandoffError:
+            raise
+        except occurrence.TaskOccurrenceUnavailable as exc:
+            raise TaskHandoffUnavailable(f"{unavailable}: {exc}") from exc
+        except occurrence.TaskOccurrenceError:
             raise
         except (IntegrityError, OperationalError) as exc:
             raise TaskHandoffUnavailable(f"{unavailable}: {exc}") from exc
@@ -256,10 +268,20 @@ def _with_session(fn: Callable[[Any], _T], db: Any, *, unavailable: str) -> _T:
     for _attempt in range(5):
         try:
             with database.SessionLocal() as session:
+                _anchor_caller_transaction(session, immediate=immediate)
                 result = fn(session)
                 session.commit()
                 return result
-        except (TaskHandoffError, occurrence.TaskOccurrenceError):
+        except TaskHandoffError:
+            raise
+        except occurrence.TaskOccurrenceUnavailable as exc:
+            # Contention inside a nested occurrence call arrives typed as an
+            # occurrence error, so the generic clause below never sees it.
+            # Retrying here keeps routine SQLite contention from surfacing as a
+            # 503 on the one call that is hardest to re-drive.
+            last_error = exc
+            time.sleep(0.05)
+        except occurrence.TaskOccurrenceError:
             raise
         except (IntegrityError, OperationalError) as exc:
             last_error = exc
@@ -294,7 +316,7 @@ def successor_occurrence_id_for(handoff_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# quiescence evidence and the rollback predicate
+# quiescence evidence
 # ---------------------------------------------------------------------------
 
 
@@ -308,14 +330,14 @@ class QuiescenceEvidence:
     it watched cannot refuse a stale observation.
     """
 
+    incarnation_id: str
+    terminal_id: str
+    turn_state: str
     #: When the observation was made. Required, and never defaulted to "now":
     #: this payload is digested into the handoff's immutable content, so a
     #: service-invented timestamp would make a caller's response-loss retry
     #: hash differently and conflict with its own earlier effect. The caller
     #: watched the turn; it can say when.
-    incarnation_id: str
-    terminal_id: str
-    turn_state: str
     observed_at: str
     generation: Optional[str] = None
     known_child_effects: str = CHILD_EFFECTS_NONE_TRACKED
@@ -375,27 +397,10 @@ class QuiescenceEvidence:
         }
 
 
-def _rollback_predicate(*, task_occurrence_id: str, evidence: QuiescenceEvidence) -> dict[str, Any]:
-    """What must still hold for a rollback to restore a *usable* donor.
-
-    Deliberately does not pin the occurrence revision. The donor may record a
-    boundary while held — finishing an in-flight turn is exactly that — and a
-    predicate that treated an ordinary boundary write as drift would convert a
-    recoverable handoff into an unrecoverable one.
-
-    This is evidence, never a gate: ``rollback_handoff`` always releases the
-    holds and reports whether the predicate still held. A rollback that could
-    refuse would leave both workers held with no way forward, which is the one
-    outcome worse than an honest "the donor is gone; recover it".
-    """
-    return {
-        "schema": SCHEMA_VERSION,
-        "task_occurrence_id": task_occurrence_id,
-        "occurrence_state": occurrence.STATE_OPEN,
-        "incarnation_id": evidence.incarnation_id,
-        "terminal_id": evidence.terminal_id,
-        "generation": evidence.generation,
-    }
+# The conditions a rollback needs are re-derived at rollback time by
+# ``_donor_restoration`` from ``task_occurrence_id`` and ``from_incarnation_id``,
+# both first-class columns. A serialised copy of them would be a second
+# statement of the same facts that nothing reads and nothing keeps in step.
 
 
 # ---------------------------------------------------------------------------
@@ -414,17 +419,24 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "from_incarnation_id": row.from_incarnation_id,
         "from_terminal_id": row.from_terminal_id,
         "from_generation": row.from_generation,
+        "donor_revision": int(row.donor_revision or 0),
         "packet_digest": row.packet_digest,
         "packet_control_id": row.packet_control_id,
         "quiescence": _parse_json(row.quiescence_json),
         "quiescence_digest": row.quiescence_digest,
-        "rollback_predicate": _parse_json(row.rollback_predicate_json),
         "delivery_state": row.delivery_state,
         "delivery_outcome": row.delivery_outcome,
         "delivery_receipt": row.delivery_receipt,
+        "to_incarnation_id": row.to_incarnation_id,
+        "to_terminal_id": row.to_terminal_id,
+        "to_generation": row.to_generation,
+        # Derived, not stored: the recipient has been briefed exactly when the
+        # packet reached it. A rollback after that point releases a worker that
+        # already holds an instruction to continue the task, so every reader —
+        # and the receipt — has to be able to see it.
+        "recipient_briefed": row.delivery_state == DELIVERY_DELIVERED,
         "successor_occurrence_id": row.successor_occurrence_id,
         "state": row.state,
-        "epoch": int(row.epoch or 0),
         "receipt_digest": row.receipt_digest,
         "detail": row.detail,
         "initiated_by": row.initiated_by,
@@ -442,16 +454,33 @@ def _row_by_id(db: Any, handoff_id: str) -> Any:
     )
 
 
-def _pending_row_for_agent(db: Any, agent_id: str) -> Any:
-    return (
+def _pending_rows_for_agent(db: Any, agent_id: str) -> list[Any]:
+    """Every pending handoff naming this agent, oldest first.
+
+    Deliberately not ``one_or_none()``. The three partial unique indexes make
+    one row per *slot*, not one row per agent — an agent can legally appear
+    once as donor and once as recipient as far as SQLite is concerned, and this
+    query runs on the byte-admission hot path where an escaping
+    ``MultipleResultsFound`` would be an untyped 500 in a subsystem whose whole
+    contract is that every path produces a typed outcome. The precondition in
+    ``_begin_once`` is what prevents the second row; this read stays total.
+    """
+    rows: list[Any] = (
         db.query(database.TaskOccurrenceHandoffModel)
         .filter(
             database.TaskOccurrenceHandoffModel.state == STATE_PENDING,
             (database.TaskOccurrenceHandoffModel.from_agent_id == agent_id)
             | (database.TaskOccurrenceHandoffModel.to_agent_id == agent_id),
         )
-        .one_or_none()
+        .order_by(database.TaskOccurrenceHandoffModel.created_at)
+        .all()
     )
+    return rows
+
+
+def _pending_row_for_agent(db: Any, agent_id: str) -> Any:
+    rows = _pending_rows_for_agent(db, agent_id)
+    return rows[0] if rows else None
 
 
 def _pending_row_for_occurrence(db: Any, task_occurrence_id: str) -> Any:
@@ -483,6 +512,12 @@ def receipt_digest(record: Mapping[str, Any]) -> str:
             "packet_digest": record["packet_digest"],
             "quiescence_digest": record["quiescence_digest"],
             "delivery_state": record["delivery_state"],
+            # A rollback that released an already-briefed recipient is a
+            # materially different outcome from one that released nobody, and a
+            # receipt that could not tell them apart would let E2 skip the
+            # cancellation the first case requires.
+            "recipient_briefed": record.get("recipient_briefed", False),
+            "to_incarnation_id": record.get("to_incarnation_id"),
             "successor_occurrence_id": record.get("successor_occurrence_id"),
             "state": record["state"],
         }
@@ -597,9 +632,26 @@ def _begin_once(db: Any, request: BeginRequest) -> dict[str, Any]:
             "boundary before beginning a handback"
         )
 
+    # The recipient must be free to take a round. Checked here because here is
+    # the last point at which refusing is free: past this the recipient is
+    # held, its own unrelated round's input is refused as `handoff-held`, and
+    # the catch-up packet is typed into its context by the exemption. The
+    # conflict would otherwise surface only at transfer, after the resume and
+    # after the packet landed, and typed bytes are not reversible.
+    recipient_round = occurrence.open_occurrence_for_agent(request.to_agent_id, db=db)
+    if recipient_round is not None:
+        raise TaskHandoffConflict(
+            f"stable agent {request.to_agent_id} already holds open task occurrence "
+            f"{recipient_round['task_occurrence_id']} (round {recipient_round['round_index']}); "
+            "a handback recipient must be free to take the round"
+        )
+
     # Read-then-insert on the three pending slots. The partial unique indexes
-    # are the real enforcement; these produce the typed conflict that names
-    # which side is already busy instead of a bare integrity error.
+    # forbid a second row per *slot*, but they are independent, so nothing in
+    # the schema stops one agent being donor of one handoff and recipient of
+    # another. This read-then-insert is the only thing that does, which is why
+    # the surrounding transaction takes SQLite's write lock up front — two
+    # deferred transactions would both complete this read before either wrote.
     for agent_id, role in ((from_agent_id, ROLE_DONOR), (request.to_agent_id, ROLE_RECIPIENT)):
         held = _pending_row_for_agent(db, agent_id)
         if held is not None:
@@ -626,21 +678,20 @@ def _begin_once(db: Any, request: BeginRequest) -> dict[str, Any]:
         from_incarnation_id=request.evidence.incarnation_id,
         from_terminal_id=request.evidence.terminal_id,
         from_generation=request.evidence.generation,
+        # The revision the packet digest describes. A transfer compares it.
+        donor_revision=int(donor["revision"]),
         packet_digest=request.packet_digest,
         packet_control_id=packet_control_id_for(request.handoff_id, request.to_agent_id),
         quiescence_json=canonical_json(evidence_payload),
         quiescence_digest=digest(evidence_payload),
-        rollback_predicate_json=canonical_json(
-            _rollback_predicate(
-                task_occurrence_id=request.task_occurrence_id, evidence=request.evidence
-            )
-        ),
         delivery_state=DELIVERY_PENDING,
         delivery_outcome=None,
         delivery_receipt=None,
+        to_incarnation_id=None,
+        to_terminal_id=None,
+        to_generation=None,
         successor_occurrence_id=None,
         state=STATE_PENDING,
-        epoch=0,
         receipt_digest=None,
         detail=request.detail,
         initiated_by=request.initiated_by,
@@ -663,6 +714,10 @@ def begin_handoff(request: BeginRequest, db: Any = None) -> dict[str, Any]:
         lambda session: _begin_once(session, request),
         db,
         unavailable="concurrent handoff begins kept conflicting",
+        # The per-agent invariant is a read-then-insert that no index can
+        # express; the write lock is what makes it hold under two concurrent
+        # supervisor actions.
+        immediate=True,
     )
 
 
@@ -678,12 +733,17 @@ def _record_delivery_once(
     state: str,
     outcome: Optional[str],
     receipt: Optional[str],
-    expected_epoch: int,
+    incarnation: Optional[occurrence.EffectIncarnation],
 ) -> dict[str, Any]:
     row = _row_by_id(db, handoff_id)
     if row is None:
         raise TaskHandoffNotFound(f"handoff {handoff_id} is not recorded")
-    if row.delivery_state == state and row.delivery_outcome == outcome:
+    delivered_to = incarnation.incarnation_id if incarnation is not None else None
+    if (
+        row.delivery_state == state
+        and row.delivery_outcome == outcome
+        and row.to_incarnation_id == delivered_to
+    ):
         record = _row_dict(row)
         record["adopted"] = True
         return record
@@ -694,22 +754,38 @@ def _record_delivery_once(
         )
     if row.delivery_state == DELIVERY_DELIVERED:
         raise TaskHandoffConflict(
-            f"handoff {handoff_id} already delivered its packet under control "
-            f"{row.packet_control_id}; the packet is delivered exactly once"
+            f"handoff {handoff_id} already delivered its packet to incarnation "
+            f"{row.to_incarnation_id!r} under control {row.packet_control_id}; the packet is "
+            "delivered exactly once"
+        )
+    if state == DELIVERY_DELIVERED and incarnation is None:
+        raise TaskHandoffInvalid(
+            "a delivered packet must name the recipient incarnation that received it"
+        )
+    if incarnation is not None and incarnation.incarnation_id == row.from_incarnation_id:
+        raise TaskHandoffConflict(
+            f"handoff {handoff_id} would record its packet as delivered to the donor's own "
+            f"incarnation {row.from_incarnation_id!r}"
         )
     stamp = _now()
+    # The CAS is on the two states that actually gate this transition. A
+    # refused delivery stays retryable (the packet never landed); a delivered
+    # one is final, which is what makes "exactly once" a property of the row
+    # rather than of the caller remembering a counter.
     result = db.execute(
         sa_update(database.TaskOccurrenceHandoffModel)
         .where(
             database.TaskOccurrenceHandoffModel.handoff_id == handoff_id,
-            database.TaskOccurrenceHandoffModel.epoch == expected_epoch,
             database.TaskOccurrenceHandoffModel.state == STATE_PENDING,
+            database.TaskOccurrenceHandoffModel.delivery_state != DELIVERY_DELIVERED,
         )
         .values(
             delivery_state=state,
             delivery_outcome=outcome,
             delivery_receipt=receipt,
-            epoch=expected_epoch + 1,
+            to_incarnation_id=delivered_to,
+            to_terminal_id=incarnation.terminal_id if incarnation is not None else None,
+            to_generation=incarnation.generation if incarnation is not None else None,
             updated_at=stamp,
         )
     )
@@ -727,26 +803,33 @@ def record_packet_delivery(
     handoff_id: str,
     *,
     delivered: bool,
+    incarnation: Optional[occurrence.EffectIncarnation] = None,
     outcome: Optional[str] = None,
     receipt: Optional[str] = None,
-    expected_epoch: int,
     db: Any = None,
 ) -> dict[str, Any]:
-    """Bind the outcome of the one packet delivery.
+    """Bind the outcome of the one packet delivery, and to whom.
 
     The delivery itself happens through the ordinary control-input path under
     the derived ``packet_control_id``; this only records what that path
     answered. A refused delivery leaves the handoff pending and rollback-able,
     which is the point: the recipient never received context, so the donor is
     still the right worker.
+
+    ``incarnation`` is required for a delivered packet and is the reason this
+    call exists at all rather than a boolean flag. The derived control id binds
+    no terminal, and the control-input journal refuses to re-deliver a known
+    control id to a replacement pane, so the packet is unreachable to any
+    incarnation but the one that first received it. Recording which one that
+    was is what lets the transfer refuse a recipient that never read it.
     """
     handoff_id = _require_uuid(handoff_id, field_name="handoff_id")
     state = DELIVERY_DELIVERED if delivered else DELIVERY_REFUSED
     outcome = _optional_text(outcome, field_name="outcome")
     receipt = _optional_text(receipt, field_name="receipt")
-    if not isinstance(expected_epoch, int) or expected_epoch < 0:
+    if incarnation is not None and not isinstance(incarnation, occurrence.EffectIncarnation):
         raise TaskHandoffInvalid(
-            f"expected_epoch must be a non-negative int; got {expected_epoch!r}"
+            f"incarnation must be an EffectIncarnation; got {type(incarnation).__name__}"
         )
     return _with_session(
         lambda session: _record_delivery_once(
@@ -755,7 +838,7 @@ def record_packet_delivery(
             state=state,
             outcome=outcome,
             receipt=receipt,
-            expected_epoch=expected_epoch,
+            incarnation=incarnation,
         ),
         db,
         unavailable="concurrent packet-delivery records kept conflicting",
@@ -800,6 +883,14 @@ def _complete_once(
         raise TaskHandoffNotFound(f"handoff {handoff_id} is not recorded")
     successor_id = successor_occurrence_id_for(handoff_id)
     if row.state == STATE_TRANSFERRED and row.successor_occurrence_id == successor_id:
+        # A replay must agree with what actually happened. Adopting a retry
+        # that names a different incarnation would let a caller believe it
+        # transferred to a pane the transfer never touched.
+        if incarnation.incarnation_id != row.to_incarnation_id:
+            raise TaskHandoffConflict(
+                f"handoff {handoff_id} already transferred to incarnation "
+                f"{row.to_incarnation_id!r}; this replay names {incarnation.incarnation_id!r}"
+            )
         record = _row_dict(row)
         record["adopted"] = True
         record["successor_occurrence"] = occurrence.get_occurrence(successor_id, db=db)
@@ -819,12 +910,36 @@ def _complete_once(
             f"handoff {handoff_id} would transfer to the donor's own incarnation "
             f"{row.from_incarnation_id!r}; the recipient executes on its own pane"
         )
+    # The packet reached one exact incarnation and can never reach another: the
+    # derived control id is stable across incarnations, and the control-input
+    # journal refuses a known id whose target moved. Transferring to a
+    # replacement pane would leave the sole task authority holding no context
+    # while the record and the receipt both assert that it read the packet.
+    # A replaced recipient is a rollback and a new handoff, not a transfer.
+    if incarnation.incarnation_id != row.to_incarnation_id:
+        raise TaskHandoffConflict(
+            f"handoff {handoff_id} delivered its packet to incarnation "
+            f"{row.to_incarnation_id!r}, not {incarnation.incarnation_id!r}; the packet cannot "
+            "be re-delivered to a replacement pane, so roll this handoff back and begin a new "
+            "one rather than transferring to an incarnation that never read it"
+        )
 
     donor = occurrence.get_occurrence(row.task_occurrence_id, db=db)
     if donor["agent_id"] != row.from_agent_id:
         raise TaskHandoffConflict(
             f"task occurrence {row.task_occurrence_id} is held by {donor['agent_id']!r}, not the "
             f"handoff's donor {row.from_agent_id!r}"
+        )
+    # The packet describes the donor at one exact revision. If the donor moved
+    # while held, something wrote to it after the digest was taken, and the
+    # context the recipient read is not the round it is being given. Refusing
+    # is recoverable -- roll back and begin again with a fresh packet -- and
+    # transferring is not.
+    if int(donor["revision"]) != int(row.donor_revision or 0):
+        raise TaskHandoffConflict(
+            f"task occurrence {row.task_occurrence_id} moved from revision {row.donor_revision} "
+            f"to {donor['revision']} while held; the catch-up packet no longer describes the "
+            "round being transferred, so roll this handoff back and begin a new one"
         )
 
     # One transaction, two occurrence writes. Between them there is no state a
@@ -881,7 +996,6 @@ def _complete_once(
         .values(
             state=STATE_TRANSFERRED,
             successor_occurrence_id=successor_id,
-            epoch=int(row.epoch or 0) + 1,
             updated_at=stamp,
             settled_at=stamp,
         )
@@ -975,7 +1089,6 @@ def _rollback_once(db: Any, handoff_id: str, *, rolled_back_by: str, reason: str
         )
         .values(
             state=STATE_ROLLED_BACK,
-            epoch=int(row.epoch or 0) + 1,
             detail=detail[:MAX_DETAIL_LEN],
             updated_at=stamp,
             settled_at=stamp,
@@ -1042,6 +1155,14 @@ def rollback_handoff(
     There is nothing to compensate: a pending handoff never wrote to the task,
     so restoring the donor's authority and its managed input is this one
     compare-and-swap.
+
+    A rollback after the packet was delivered is still permitted, and still
+    should be — a rollback that could refuse would leave both agents held with
+    no forward path. But it is not the same outcome as one that released
+    nobody: the recipient has already been told, in its own context, that it is
+    taking over the task. ``recipient_briefed`` says so in the result and is
+    folded into the receipt, so the caller that owns the pane is obliged to
+    send the cancellation and a later reader can tell that it was owed.
     """
     handoff_id = _require_uuid(handoff_id, field_name="handoff_id")
     rolled_back_by = _require_text(rolled_back_by, field_name="rolled_back_by")
@@ -1098,16 +1219,21 @@ def hold_refusal(
     The recipient's exemption is exact: the one derived control id the packet
     is delivered under, and nothing else. Without it the hold would refuse its
     own packet and no handback could ever complete.
+
+    **Blast radius when the store cannot be read.** This fails closed, so a
+    persistently unreadable database refuses every managed steer, tell and
+    operator message in every session on the installation — including one where
+    no handoff has ever been created. That is deliberate (admitting bytes the
+    hold exists to refuse is the one outcome this seam must never produce, and
+    the neighbouring reservation read already refuses on the same grounds), but
+    it is a global failure mode introduced by a feature nothing invokes yet,
+    and an operator diagnosing a total input outage should find it named here.
     """
     if not agent_id:
         return None
     try:
         held = hold_for_agent(agent_id, db=db)
     except TaskHandoffError:
-        # An unreadable store must not silently admit bytes the hold exists to
-        # refuse, but it also must not brick every write in the installation.
-        # The caller sees a refusal it can retry; the store failure is the
-        # anomaly, not the input.
         return "the task-handoff store could not be read; task input is held until it can"
     if held is None:
         return None
@@ -1122,6 +1248,51 @@ def hold_refusal(
         f"stable agent {agent_id} is the recipient of pending handoff {held['handoff_id']}; "
         "only that handoff's catch-up packet is admitted until the transfer completes"
     )
+
+
+def hold_refusal_for_terminal(
+    terminal_id: Optional[str],
+    generation: Optional[str],
+    *,
+    control_id: Optional[str] = None,
+    db: Any = None,
+) -> Optional[str]:
+    """``hold_refusal``, resolved from the roster rather than a reservation.
+
+    This is the form the byte-admission path must use, and the reason is the
+    recipient. A handback resumes the recipient's own native session through
+    M3-B, and the exact executor deliberately allocates a terminal id it has
+    *proven absent* from the managed-launch reservation table — so the restored
+    pane is not "managed" at all. A hold keyed on a reservation would therefore
+    be inert for every recipient, which is to say inert in exactly the flow the
+    recipient-side hold exists for. The same is true of any donor that was ever
+    recovered, which is the ordinary steady state after a pane loss.
+
+    The roster is the one authority that knows both populations: a managed
+    launch binds its generation under the reservation's stable agent id, and an
+    exact reincarnation rebinds the pre-existing agent to the successor
+    incarnation. One indexed read answers for both.
+
+    A terminal with no roster incarnation is not held. That is not a bypass —
+    an agent with no incarnation cannot be a handoff party, because a handoff
+    names agents that hold or will hold a task occurrence.
+    """
+    if not terminal_id:
+        return None
+    from cli_agent_orchestrator.services import stable_agent_roster as roster
+
+    try:
+        incarnation = roster.get_incarnation_by_terminal(
+            str(terminal_id), generation if generation else None, db=db
+        )
+    except Exception:
+        # A roster that cannot name this pane's agent cannot prove it is
+        # unheld. Same posture as an unreadable handoff store, and the same
+        # blast radius caveat applies.
+        return "the stable-agent roster could not be read; task input is held until it can"
+    if not incarnation:
+        return None
+    return hold_refusal(incarnation.get("agent_id"), control_id=control_id, db=db)
 
 
 # ---------------------------------------------------------------------------
@@ -1139,17 +1310,6 @@ def get_handoff(handoff_id: str, db: Any = None) -> dict[str, Any]:
         return _row_dict(row)
 
     return _with_session(_read, db, unavailable="handoff could not be read")
-
-
-def handoff_for_occurrence(task_occurrence_id: str, db: Any = None) -> Optional[dict[str, Any]]:
-    """The pending handoff for one occurrence, if it is held."""
-    task_occurrence_id = _require_uuid(task_occurrence_id, field_name="task_occurrence_id")
-
-    def _read(session: Any) -> Optional[dict[str, Any]]:
-        row = _pending_row_for_occurrence(session, task_occurrence_id)
-        return _row_dict(row) if row is not None else None
-
-    return _with_session(_read, db, unavailable="occurrence handoff could not be read")
 
 
 def list_handoffs(
@@ -1195,7 +1355,6 @@ def capability() -> dict[str, Any]:
         "store_installed": True,
         "admission_hold_enforced": True,
         "automatic_producer": False,
-        "conductor_consumer_attached": False,
         "reason": _PRODUCER_REASON,
         "states": sorted(STATES),
         "delivery_states": sorted(DELIVERY_STATES),

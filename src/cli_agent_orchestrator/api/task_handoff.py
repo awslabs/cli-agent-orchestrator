@@ -98,9 +98,15 @@ class BeginHandoffBody(StrictBody):
 
 class DeliveryBody(StrictBody):
     delivered: bool
-    expected_epoch: int = Field(ge=0)
     outcome: Optional[str] = Field(default=None, max_length=512)
     receipt: Optional[str] = Field(default=None, max_length=512)
+    #: The recipient incarnation that received the packet. Required whenever
+    #: ``delivered`` is true: the packet is unreachable to any other
+    #: incarnation, so a transfer has to be able to refuse one that never read
+    #: it.
+    incarnation_id: Optional[str] = Field(default=None, max_length=512)
+    terminal_id: Optional[str] = Field(default=None, max_length=512)
+    generation: Optional[str] = Field(default=None, max_length=512)
 
 
 class CompleteHandoffBody(StrictBody):
@@ -110,11 +116,6 @@ class CompleteHandoffBody(StrictBody):
     terminal_id: str = Field(min_length=1, max_length=512)
     generation: Optional[str] = Field(default=None, max_length=512)
     lineage_id: Optional[str] = Field(default=None, max_length=512)
-    #: Present because an occurrence records the effect that executes it, not
-    #: because the handoff moves one. M3-E never reads it: the recipient's
-    #: native session was resumed exactly by M3-B, whose roster predicates
-    #: already refuse a cross-harness bind.
-    native_session_id: Optional[str] = Field(default=None, max_length=512)
 
 
 class RollbackHandoffBody(StrictBody):
@@ -182,14 +183,21 @@ async def record_task_handoff_delivery(
     The delivery itself goes through the ordinary control-input path under the
     derived ``packet_control_id``; this records what that path answered.
     """
+    incarnation = None
+    if body.incarnation_id and body.terminal_id:
+        incarnation = occurrence.EffectIncarnation(
+            incarnation_id=body.incarnation_id,
+            terminal_id=body.terminal_id,
+            generation=body.generation,
+        )
     try:
         return await asyncio.to_thread(
             handoff.record_packet_delivery,
             handoff_id,
             delivered=body.delivered,
+            incarnation=incarnation,
             outcome=body.outcome,
             receipt=body.receipt,
-            expected_epoch=body.expected_epoch,
         )
     except _ERRORS as exc:
         raise _http(exc)
@@ -210,12 +218,17 @@ async def complete_task_handoff(
         return await asyncio.to_thread(
             handoff.complete_handoff,
             handoff_id,
+            # No ``native_session_id``. A handback never moves a native
+            # conversation, and an unvalidated one here would let an ordinary
+            # field-name slip in the caller stamp the *donor's* native session
+            # onto the recipient's occurrence -- a durably false harness
+            # binding that every later reader of that provenance would trust.
+            # M3-B's roster predicates own that binding; nothing here needs it.
             incarnation=occurrence.EffectIncarnation(
                 incarnation_id=body.incarnation_id,
                 terminal_id=body.terminal_id,
                 generation=body.generation,
                 lineage_id=body.lineage_id,
-                native_session_id=body.native_session_id,
             ),
             expected_revision=body.expected_revision,
             completed_by=body.completed_by,

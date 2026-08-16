@@ -23,17 +23,19 @@ _HANDOFF_COLUMNS = {
     "from_incarnation_id",
     "from_terminal_id",
     "from_generation",
+    "donor_revision",
     "packet_digest",
     "packet_control_id",
     "quiescence_json",
     "quiescence_digest",
-    "rollback_predicate_json",
     "delivery_state",
     "delivery_outcome",
     "delivery_receipt",
+    "to_incarnation_id",
+    "to_terminal_id",
+    "to_generation",
     "successor_occurrence_id",
     "state",
-    "epoch",
     "receipt_digest",
     "detail",
     "initiated_by",
@@ -108,12 +110,31 @@ def test_the_three_pending_indexes_are_partial_in_both_schemas(tmp_path, monkeyp
 
 
 def test_migration_is_idempotent(tmp_path, monkeypatch):
+    """Re-running preserves rows, not merely the column set.
+
+    A migration that dropped and recreated the table would keep the columns
+    identical, so the row is what makes this test about idempotency rather
+    than about shape.
+    """
     path = _migrated_db(tmp_path, monkeypatch)
     from cli_agent_orchestrator.clients import database as db_module
+
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(
+            "INSERT INTO task_occurrence_handoffs (handoff_id, schema_version, session_name, "
+            "task_occurrence_id, from_agent_id, to_agent_id, from_incarnation_id, "
+            "from_terminal_id, donor_revision, packet_digest, packet_control_id, "
+            "quiescence_json, quiescence_digest, delivery_state, state, initiated_by, "
+            "created_at, updated_at) VALUES "
+            "('h1', 'v', 's', 'o', 'a', 'b', 'i', 't', 0, 'd', 'c', '{}', 'q', 'pending', "
+            "'pending', 'me', 'now', 'now')"
+        )
 
     db_module._migrate_task_occurrence_handoffs()
     with sqlite3.connect(str(path)) as conn:
         assert _columns(conn, "task_occurrence_handoffs") == _HANDOFF_COLUMNS
+        surviving = conn.execute("SELECT handoff_id FROM task_occurrence_handoffs").fetchall()
+    assert surviving == [("h1",)]
 
 
 def test_records_survive_a_restart(tmp_path, monkeypatch):
@@ -231,6 +252,48 @@ def test_rollback_to_a_build_without_m3e_leaves_the_occurrence_schema_untouched(
     assert occ.STATES == {occ.STATE_OPEN, occ.STATE_FINALIZED}
 
 
-def test_schema_versions_are_stamped_on_every_m3e_row():
-    """A row with no schema version is one a later build cannot interpret."""
+def test_schema_versions_are_stamped_on_every_m3e_row(tmp_path, monkeypatch):
+    """A row with no schema version is one a later build cannot interpret.
+
+    Asserted on a real row rather than on the constant: NOT NULL catches a
+    *missing* stamp, not a wrong one, so a `_begin_once` that wrote the
+    occurrence service's version would satisfy the schema and this test alike.
+    """
+    path = tmp_path / "stamp.db"
+    engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(
+        database, "SessionLocal", sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    )
+    donor_agent = str(uuid.uuid4())
+    occurrence_id = str(uuid.uuid4())
+    occ.open_occurrence(
+        occ.OpenRequest(
+            task_occurrence_id=occurrence_id,
+            session_name="cao-stamp",
+            agent_id=donor_agent,
+            round_index=0,
+            dispatch_digest="a" * 64,
+            incarnation=occ.EffectIncarnation(incarnation_id="inc-1", terminal_id="term-1"),
+        )
+    )
+    record = th.begin_handoff(
+        th.BeginRequest(
+            handoff_id=str(uuid.uuid4()),
+            session_name="cao-stamp",
+            task_occurrence_id=occurrence_id,
+            to_agent_id=str(uuid.uuid4()),
+            packet_digest="d" * 64,
+            evidence=th.QuiescenceEvidence(
+                incarnation_id="inc-1",
+                terminal_id="term-1",
+                turn_state=th.TURN_TERMINAL,
+                observed_at="2026-08-16T12:00:00Z",
+            ),
+            initiated_by="supervisor",
+        )
+    )
+    assert record["schema_version"] == th.SCHEMA_VERSION
     assert th.SCHEMA_VERSION.startswith("cao-m3e-")
+    assert record["schema_version"] != occ.SCHEMA_VERSION
+    engine.dispose()
