@@ -83,6 +83,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_CONTROL_ROUTE_ABSENT,
     REASON_COPY_MODE_ACTIVE,
     REASON_GENERATION_FENCED,
+    REASON_HANDOFF_HELD,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
     REASON_LINEAGE_UNPROVEN,
@@ -387,8 +388,30 @@ class ResolvedControlIdentity:
         return payload
 
 
+def _admission_refusal_reason(exc: BaseException) -> str:
+    """Which typed refusal a pre-byte admission failure carries.
+
+    The two are not interchangeable.  A generation fence is permanent and
+    instructs the caller to advance to a successor; an M3-E handoff hold is
+    reversible and applies to the generation the caller already has.  A caller
+    that read the hold as a fence would abandon a pane a pending handback is
+    keeping alive as its rollback insurance.
+    """
+    from cli_agent_orchestrator.services import task_handoff
+
+    if isinstance(exc, task_handoff.TaskHandoffHeld):
+        return REASON_HANDOFF_HELD
+    return REASON_GENERATION_FENCED
+
+
 @contextmanager
-def provider_byte_admission(resolved: ResolvedControlIdentity, terminal_id: str, generation: str):
+def provider_byte_admission(
+    resolved: ResolvedControlIdentity,
+    terminal_id: str,
+    generation: str,
+    *,
+    control_id: Optional[str] = None,
+):
     """Acquire the canonical managed byte-admission critical section.
 
     Managed native writers cannot use the generation lock alone: a successor
@@ -397,6 +420,17 @@ def provider_byte_admission(resolved: ResolvedControlIdentity, terminal_id: str,
     successor -> revalidate exact binding -> generation lock around the pane
     effect.  Legacy/unmanaged writers retain their existing generation-only
     fence behavior.
+
+    This is also where an M3-E handback suspends a stable agent's task
+    authority.  It is the narrowest point that covers every task-byte lane for
+    a live managed pane -- typed control input, native inbox payloads, and
+    operator messages all pass through here -- and the reservation record it
+    already reads carries the stable agent id, so the hold costs one indexed
+    row read and no extra round trip.
+
+    ``control_id`` is the recipient's one exemption: the derived id the
+    catch-up packet is delivered under.  Without it the hold would refuse its
+    own packet and no handback could complete.
     """
     from cli_agent_orchestrator.constants import COMPANION_DIR
     from cli_agent_orchestrator.services import generation_fence
@@ -440,6 +474,15 @@ def provider_byte_admission(resolved: ResolvedControlIdentity, terminal_id: str,
         raise generation_fence.FencedError(
             "managed provider-byte admission immutable generation binding changed"
         )
+    # Decided before the lock and before the first byte, so the refusal carries
+    # the zero-bytes proof that makes it re-attemptable once the handoff
+    # settles.  A reservation with no stable agent id predates the M3-A roster
+    # and cannot be party to a handback, so it is not held.
+    from cli_agent_orchestrator.services import task_handoff
+
+    held = task_handoff.hold_refusal(record.get("stable_agent_id"), control_id=control_id)
+    if held:
+        raise task_handoff.TaskHandoffHeld(held)
     with generation_fence.managed_admission_critical_section(
         COMPANION_DIR,
         terminal_id,
@@ -1950,12 +1993,16 @@ def deliver_control_input(
         # sequence controls.  The generation fence is intentionally outer to
         # the pane lease: it spans final identity/readiness, journal claim,
         # every literal chunk, and submit/chord without a check-then-write gap.
-        from cli_agent_orchestrator.services import cohort_journal, generation_fence
+        from cli_agent_orchestrator.services import cohort_journal, generation_fence, task_handoff
 
         assert binding.generation is not None
         with (
             cohort_journal.session_effect_admission(resolved.session_name),
-            provider_byte_admission(resolved, terminal_id, binding.generation),
+            # The one exemption an M3-E hold has: the derived control id a
+            # pending handback's catch-up packet is delivered under.
+            provider_byte_admission(
+                resolved, terminal_id, binding.generation, control_id=control_id
+            ),
         ):
             with pane_input_lease(resolved.pane_id, holder=holder, timeout=lease_timeout):
                 if normalized_events is not None:
@@ -2007,12 +2054,13 @@ def deliver_control_input(
             resolved=resolved,
             digest=digest,
         )
-    except generation_fence.FencedError as exc:
+    except (generation_fence.FencedError, task_handoff.TaskHandoffHeld) as exc:
+        admission_reason = _admission_refusal_reason(exc)
         if normalized_events is not None:
             return _record_sequence_refusal(
                 book,
                 control_id,
-                REASON_GENERATION_FENCED,
+                admission_reason,
                 str(exc),
                 events=normalized_events,
                 terminal_id=terminal_id,
@@ -2027,7 +2075,7 @@ def deliver_control_input(
         return _record_refusal(
             book,
             control_id,
-            REASON_GENERATION_FENCED,
+            admission_reason,
             str(exc),
             terminal_id=terminal_id,
             resolved=resolved,
@@ -4720,11 +4768,13 @@ def deliver_native_inbox_payload(
     client = _tmux_client()
     deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
     try:
-        from cli_agent_orchestrator.services import cohort_journal, generation_fence
+        from cli_agent_orchestrator.services import cohort_journal, generation_fence, task_handoff
 
         assert binding.generation is not None
         with (
             cohort_journal.session_effect_admission(resolved.session_name),
+            # No exemption: an inbox payload is ordinary task input, and the
+            # catch-up packet never arrives on this lane.
             provider_byte_admission(resolved, terminal_id, binding.generation),
             pane_input_lease(
                 resolved.pane_id, holder=f"inbox-payload:{terminal_id}", timeout=lease_timeout
@@ -4871,8 +4921,8 @@ def deliver_native_inbox_payload(
             )
     except cohort_journal.SessionEffectRefused as exc:
         return NativePayloadResult(REFUSED, REASON_SESSION_EFFECT_BARRIER, str(exc))
-    except generation_fence.FencedError as exc:
-        return NativePayloadResult(REFUSED, REASON_GENERATION_FENCED, str(exc))
+    except (generation_fence.FencedError, task_handoff.TaskHandoffHeld) as exc:
+        return NativePayloadResult(REFUSED, _admission_refusal_reason(exc), str(exc))
     except PaneBusyError as exc:
         return NativePayloadResult(
             REFUSED,

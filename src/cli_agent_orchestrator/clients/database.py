@@ -1371,6 +1371,96 @@ class TaskOccurrenceExtensionModel(Base):
     __table_args__ = (Index("ix_task_occurrence_extensions_decider", "decider", "routing_state"),)
 
 
+class TaskOccurrenceHandoffModel(Base):
+    """One reversible A -> B -> A worker handback (cond-0381 M3-E).
+
+    The handoff is its own record rather than a state on the occurrence, and
+    that placement is the load-bearing decision. ``task_occurrences.state``
+    stays ``open`` for the donor's whole life, because a third occurrence state
+    would drop the donor out of ``open_occurrence_for_agent`` — and a
+    concurrent safe drain reads *no open occurrence* as positive ``parked``,
+    records a previous round's stale digests into its receipt, and under Stop
+    tears down the very pane this milestone keeps alive as rollback insurance.
+
+    Because the occurrence is never touched while a handoff is pending,
+    rollback has nothing to undo: settling this row to ``rolled-back`` restores
+    the donor's authority and its managed input in one compare-and-swap.
+
+    Completing a handoff finalizes the donor occurrence ``superseded`` and
+    opens a *new* occurrence for the recipient in one transaction. The donor's
+    row is never rewritten: ``agent_id``, ``round_index`` and the incarnation
+    columns are the "immutable content" ``open_occurrence`` adopts a retry
+    against, two unique indexes are keyed on them, and two read-then-CAS
+    recovery paths finalize by occurrence id with no ``agent_id`` predicate.
+
+    There is deliberately **no ``native_session_id`` column**. A handback never
+    moves a native conversation: the recipient's own session is resumed exactly
+    by M3-B, whose roster predicates already refuse a cross-harness bind. A
+    native id recorded here would be a second, unenforced copy of a fact that
+    is only ever true of one side.
+
+    The three partial unique indexes are the durable form of "exactly one task
+    authority at every boundary": at most one pending handoff per occurrence,
+    per donor, and per recipient. A settled row leaves all three, so the same
+    pair may hand back again later.
+    """
+
+    __tablename__ = "task_occurrence_handoffs"
+
+    handoff_id = Column(Text, primary_key=True)
+    schema_version = Column(Text, nullable=False)
+    session_name = Column(Text, nullable=False)
+    task_occurrence_id = Column(Text, nullable=False)
+    from_agent_id = Column(Text, nullable=False)
+    to_agent_id = Column(Text, nullable=False)
+    # The donor's exact effect-incarnation at the moment quiescence was
+    # observed. Evidence, never identity: the occurrence still owns the task.
+    from_incarnation_id = Column(Text, nullable=False)
+    from_terminal_id = Column(Text, nullable=False)
+    from_generation = Column(Text, nullable=True)
+    # The catch-up packet is bytes the conductor owns; this is only its digest
+    # and the derived control id that makes its delivery exactly-once.
+    packet_digest = Column(Text, nullable=False)
+    packet_control_id = Column(Text, nullable=False)
+    quiescence_json = Column(Text, nullable=False)
+    quiescence_digest = Column(Text, nullable=False)
+    rollback_predicate_json = Column(Text, nullable=False)
+    delivery_state = Column(Text, nullable=False)
+    delivery_outcome = Column(Text, nullable=True)
+    delivery_receipt = Column(Text, nullable=True)
+    successor_occurrence_id = Column(Text, nullable=True)
+    state = Column(Text, nullable=False)
+    epoch = Column(Integer, nullable=False, default=0, server_default="0")
+    receipt_digest = Column(Text, nullable=True)
+    detail = Column(Text, nullable=True)
+    initiated_by = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+    settled_at = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_task_occurrence_handoffs_pending_occurrence",
+            "task_occurrence_id",
+            unique=True,
+            sqlite_where=text("state = 'pending'"),
+        ),
+        Index(
+            "ix_task_occurrence_handoffs_pending_donor",
+            "from_agent_id",
+            unique=True,
+            sqlite_where=text("state = 'pending'"),
+        ),
+        Index(
+            "ix_task_occurrence_handoffs_pending_recipient",
+            "to_agent_id",
+            unique=True,
+            sqlite_where=text("state = 'pending'"),
+        ),
+        Index("ix_task_occurrence_handoffs_session", "session_name"),
+    )
+
+
 class SessionDrainReceiptModel(Base):
     """One safe-drain coordination for one exact cohort boundary (M3-D).
 
@@ -2219,6 +2309,7 @@ def init_db() -> None:
     _migrate_operation_journal()
     _migrate_session_cohort_journal()
     _migrate_task_occurrences()
+    _migrate_task_occurrence_handoffs()
     _migrate_supervisor_drain()
     _migrate_wait_message_admissions()
     _migrate_native_status_repair()
@@ -3168,6 +3259,74 @@ def _migrate_task_occurrences() -> None:
             )
     except Exception as e:  # noqa: BLE001 - dark seam fails closed
         logger.warning(f"task-occurrence migration failed: {e}")
+
+
+def _migrate_task_occurrence_handoffs() -> None:
+    """Create the M3-E reversible-handback table on older databases.
+
+    Additive only. An older build that rolls back past M3-E keeps reading and
+    writing ``task_occurrences`` unchanged, because M3-E adds no column and no
+    state there; the handoff rows simply become an unread table.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS task_occurrence_handoffs ("
+                "handoff_id TEXT NOT NULL PRIMARY KEY, "
+                "schema_version TEXT NOT NULL, "
+                "session_name TEXT NOT NULL, "
+                "task_occurrence_id TEXT NOT NULL, "
+                "from_agent_id TEXT NOT NULL, "
+                "to_agent_id TEXT NOT NULL, "
+                "from_incarnation_id TEXT NOT NULL, "
+                "from_terminal_id TEXT NOT NULL, "
+                "from_generation TEXT, "
+                "packet_digest TEXT NOT NULL, "
+                "packet_control_id TEXT NOT NULL, "
+                "quiescence_json TEXT NOT NULL, "
+                "quiescence_digest TEXT NOT NULL, "
+                "rollback_predicate_json TEXT NOT NULL, "
+                "delivery_state TEXT NOT NULL, "
+                "delivery_outcome TEXT, "
+                "delivery_receipt TEXT, "
+                "successor_occurrence_id TEXT, "
+                "state TEXT NOT NULL, "
+                "epoch INTEGER NOT NULL DEFAULT 0, "
+                "receipt_digest TEXT, "
+                "detail TEXT, "
+                "initiated_by TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "settled_at TEXT"
+                ")"
+            )
+            # "Exactly one task authority at every boundary", durably: at most
+            # one pending handoff per occurrence, per donor and per recipient.
+            # A settled row leaves all three indexes, so the same pair may hand
+            # back again later.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_task_occurrence_handoffs_pending_occurrence "
+                "ON task_occurrence_handoffs(task_occurrence_id) WHERE state = 'pending'"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_task_occurrence_handoffs_pending_donor "
+                "ON task_occurrence_handoffs(from_agent_id) WHERE state = 'pending'"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_task_occurrence_handoffs_pending_recipient "
+                "ON task_occurrence_handoffs(to_agent_id) WHERE state = 'pending'"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_task_occurrence_handoffs_session "
+                "ON task_occurrence_handoffs(session_name)"
+            )
+    except Exception as e:  # noqa: BLE001 - dark seam fails closed
+        logger.warning(f"task-occurrence handoff migration failed: {e}")
 
 
 def _migrate_supervisor_drain() -> None:

@@ -78,6 +78,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     AMBIGUOUS,
     REASON_COPY_MODE_ACTIVE,
     REASON_GENERATION_FENCED,
+    REASON_HANDOFF_HELD,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
     REASON_LINEAGE_UNPROVEN,
@@ -138,6 +139,7 @@ _REASON_OUTCOMES: Dict[str, str] = {
     REASON_PANE_BUSY: REFUSED,
     REASON_COPY_MODE_ACTIVE: REFUSED,
     REASON_GENERATION_FENCED: REFUSED,
+    REASON_HANDOFF_HELD: REFUSED,
     REASON_WRITE_DEADLINE: REFUSED,
     REASON_PROVIDER_UNSUPPORTED: REFUSED,
     REASON_ILLEGAL_CONTROL_BYTES: REFUSED,
@@ -868,7 +870,7 @@ def submit_operator_message(
     client = control_input_service._tmux_client()
     deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
     try:
-        from cli_agent_orchestrator.services import generation_fence
+        from cli_agent_orchestrator.services import generation_fence, task_handoff
 
         # Hold the shared generation fence through the adapter's durable claim
         # and every literal/submit key.  The dashboard/operator lane otherwise
@@ -1074,8 +1076,13 @@ def submit_operator_message(
             ):
                 control_input_service._mark_native_kimi_dispatch(dispatch_key)
             return _outcome_for_record(operation_id, record, replayed=False, multiline="\n" in text)
-    except generation_fence.FencedError as exc:
-        return _result(operation_id, REFUSED, REASON_GENERATION_FENCED, str(exc))
+    except (generation_fence.FencedError, task_handoff.TaskHandoffHeld) as exc:
+        return _result(
+            operation_id,
+            REFUSED,
+            control_input_service._admission_refusal_reason(exc),
+            str(exc),
+        )
     except PaneBusyError as exc:
         return _result(
             operation_id,
