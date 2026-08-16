@@ -140,3 +140,84 @@ class TestNativeBindCapability:
         status = pc.resume_status(pc.PROVIDER_CODEX, installed_version="codex-cli 0.147.0")
         assert status.identity_available is False
         assert status.authority_supported is False
+
+
+class TestRouteAttestCapability:
+    """The narrow build set the zero-task trust/route-attestation seam uses.
+
+    Reproduced live: a Codex CLI 0.147.0 install re-arms the launch breaker
+    through ``managed-launch/attest-route`` — the app-server exchange is
+    the same initialize/config/read/thread-start(ephemeral)/no-turn surface
+    the native-bind seam stage-verified — but the route attestor refused it
+    with a single-version banner constant (409 "expected codex-cli
+    0.146.0, observed 0.147.0"). The repair follows the native-bind
+    design: a capability table in its own right inside
+    ``provider_contracts``, consulted independently of launch-enforcement
+    mode, never a casual widening of ``SUPPORTED_VERSIONS``.
+    """
+
+    def test_the_route_attestation_builds_are_capable(self):
+        assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, "codex-cli 0.146.0")
+        assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0")
+
+    @pytest.mark.parametrize(
+        "banner", ["codex-cli 0.148.0", "codex-cli 0.147", "codex-cli unknown", ""]
+    )
+    def test_every_unproven_codex_build_fails_closed(self, banner):
+        assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, banner) is False
+
+    def test_an_absent_version_is_not_a_capability(self):
+        assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, None) is False
+        assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, 0.147) is False
+
+    def test_the_capability_disagrees_with_the_broad_table_in_both_directions(self):
+        """0.147.0 holds the narrow attestation proof and not the broad one.
+
+        The route-attestation repair must not reach the broad table, so
+        both directions are pinned: the narrow table accepts a build the
+        broad table refuses, and ``SUPPORTED_VERSIONS`` itself is
+        unchanged.
+        """
+        assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is True
+        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
+        assert pc.SUPPORTED_VERSIONS[pc.PROVIDER_CODEX] == ("0.146.0",)
+        assert pc.NATIVE_BIND_CAPABLE_VERSIONS[pc.PROVIDER_CODEX] == ("0.146.0", "0.147.0")
+        # And the shared builds keep both predicates.
+        assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
+        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
+
+    @pytest.mark.parametrize("provider", ["kimi", "claude", "muse"])
+    def test_other_providers_keep_exactly_their_broad_proven_set(self, provider):
+        """No provider's route-attestation admission changed except Codex's.
+
+        Kimi's ACP and Claude's version-pinned route probes were verified
+        with each accepted build, so their cells are the broad tuples by
+        reference: every broadly proven build attests, nothing else does.
+        """
+        assert pc.ROUTE_ATTEST_CAPABLE_VERSIONS[provider] == pc.SUPPORTED_VERSIONS[provider]
+        for build in pc.SUPPORTED_VERSIONS[provider]:
+            assert pc.is_route_attest_capable(provider, build) is True
+        assert pc.is_route_attest_capable(provider, "99.99.99") is False
+
+    def test_strict_enforcement_does_not_widen_the_seam(self, monkeypatch):
+        """The predicate ignores the launch mode — exactly like native bind.
+
+        A strict override refuses the unlisted build at the launch
+        boundary while the narrow capability predicate keeps admitting the
+        stage-proven 0.147.0 attestation.
+        """
+        monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_CODEX", "strict")
+        assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is True
+        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
+        with pytest.raises(pc.ProviderVersionDrift):
+            pc.check_pinned_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0")
+
+    def test_resume_authority_still_refuses_the_attestation_proven_build(self):
+        """Attestation capability grants no advanced authority by implication.
+
+        Automated resume/recovery identity still reads the broad table, so
+        a 0.147.0 route attestation does not imply a resumable identity.
+        """
+        status = pc.resume_status(pc.PROVIDER_CODEX, installed_version="codex-cli 0.147.0")
+        assert status.identity_available is False
+        assert status.authority_supported is False

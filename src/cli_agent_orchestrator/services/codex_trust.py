@@ -15,8 +15,16 @@ from cli_agent_orchestrator.providers.codex import (
     _toml_override,
     render_trusted_project_override,
 )
+from cli_agent_orchestrator.services import provider_contracts
 
-SUPPORTED_CODEX_VERSION = "codex-cli 0.146.0"
+#: The zero-task trust/route-attestation capability set.  The canonical
+#: literal lives in ``provider_contracts.ROUTE_ATTEST_CAPABLE_VERSIONS`` —
+#: exactly as the native-bind seam's ``BOOTSTRAP_CAPABLE_VERSIONS`` does —
+#: so this attestor and the provider-contract capability table cannot drift
+#: about which builds are proven.
+ROUTE_ATTEST_CAPABLE_VERSIONS = provider_contracts.ROUTE_ATTEST_CAPABLE_VERSIONS[
+    provider_contracts.PROVIDER_CODEX
+]
 PROBE_VERSION = "codex-trust-route-v1"
 
 
@@ -177,9 +185,12 @@ def attest_trusted_project(
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CodexTrustProbeError(f"could not execute Codex version probe: {exc}") from exc
     version = version_proc.stdout.strip()
-    if version_proc.returncode != 0 or version != SUPPORTED_CODEX_VERSION:
+    if version_proc.returncode != 0 or not provider_contracts.is_route_attest_capable(
+        provider_contracts.PROVIDER_CODEX, version
+    ):
         raise CodexTrustProbeError(
-            f"unsupported Codex version {version!r}; expected {SUPPORTED_CODEX_VERSION!r}"
+            f"unsupported Codex version {version!r}; expected one of "
+            f"{list(ROUTE_ATTEST_CAPABLE_VERSIONS)!r}"
         )
 
     config_path = user_config_path or pathlib.Path(os.path.expanduser("~/.codex/config.toml"))
