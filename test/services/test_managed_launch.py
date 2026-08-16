@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import uuid
@@ -988,6 +989,97 @@ class TestRouteAttestationDispatchesByProvider:
         with pytest.raises(managed_launch.ManagedLaunchConflict):
             managed_launch.attest_route(
                 _attest_request(tmp_path, "claude_code", trusted_project_root=str(tmp_path))
+            )
+
+
+def _codex_app_server_stdout(root: str) -> str:
+    """A codex app-server exchange that echoes the attested route.
+
+    ``expected_model``/``expected_effort`` in the request are the failure
+    domain being attested; the mocked thread/start resolves to the same
+    values so the zero-turn route proof validates.  The exchange is the
+    exact one the route attestor sends: initialize, config/read, an
+    ephemeral thread/start, and never a turn/start.
+    """
+    responses = [
+        {"id": 1, "result": {"serverInfo": {"name": "codex"}}},
+        {
+            "id": 2,
+            "result": {
+                "config": {"projects": {root: {"trust_level": "trusted"}}},
+                "origins": {"projects": {root: {"trust_level": "sessionFlags"}}},
+                "layers": [],
+            },
+        },
+        {
+            "id": 3,
+            "result": {
+                "cwd": root,
+                "model": "claude-opus-5",
+                "modelProvider": "openai",
+                "reasoningEffort": "xhigh",
+                "thread": {"id": "thread-zero-turn"},
+            },
+        },
+    ]
+    return "".join(json.dumps(item) + "\n" for item in responses)
+
+
+class TestCodexRouteAttestationAdmitsTheStageProvenBuild:
+    """The public ``attest_route`` seam (the ``--attest-launch-domain`` path).
+
+    The launch breaker calls this endpoint to re-arm one launch attempt
+    after a failure.  A Codex CLI 0.147.0 install was refused here with
+    HTTP 409 ("expected codex-cli 0.146.0, observed codex-cli 0.147.0"),
+    leaving the breaker impossible to re-arm. The capability-scoped
+    admission makes 0.147.0 attest with the same zero-task, no-task-admitted
+    receipt while 0.148.0 still maps to the 409 conflict.
+    """
+
+    def _patch_codex_attestor(self, monkeypatch, banner: str, tmp_path):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.codex_trust.subprocess.run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=banner, stderr=""),
+        )
+
+        def fake_app_server(argv, requests, timeout):
+            return _codex_app_server_stdout(str(tmp_path.resolve())), "", -15
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.codex_trust._run_app_server_probe",
+            fake_app_server,
+        )
+
+    def test_codex_0147_attests_zero_tasks_at_the_public_seam(self, tmp_path, monkeypatch):
+        self._patch_codex_attestor(monkeypatch, "codex-cli 0.147.0\n", tmp_path)
+
+        receipt = managed_launch.attest_route(
+            _attest_request(tmp_path, "codex", trusted_project_root=str(tmp_path))
+        )
+
+        assert receipt["no_task_admitted"] is True
+        assert receipt["provider"] == "codex"
+        provider_receipt = receipt["provider_route_receipt"]
+        assert provider_receipt["codex_version"] == "codex-cli 0.147.0"
+        assert provider_receipt["no_turn_started"] is True
+        assert provider_receipt["trust_level"] == "trusted"
+        assert provider_receipt["config_origin"] == "sessionFlags"
+
+    def test_codex_0146_keeps_attesting_at_the_public_seam(self, tmp_path, monkeypatch):
+        self._patch_codex_attestor(monkeypatch, "codex-cli 0.146.0\n", tmp_path)
+
+        receipt = managed_launch.attest_route(
+            _attest_request(tmp_path, "codex", trusted_project_root=str(tmp_path))
+        )
+        assert receipt["no_task_admitted"] is True
+        assert receipt["provider_route_receipt"]["codex_version"] == "codex-cli 0.146.0"
+
+    def test_codex_0148_still_refuses_at_the_public_seam(self, tmp_path, monkeypatch):
+        self._patch_codex_attestor(monkeypatch, "codex-cli 0.148.0\n", tmp_path)
+
+        with pytest.raises(managed_launch.ManagedLaunchConflict, match="unsupported Codex version"):
+            managed_launch.attest_route(
+                _attest_request(tmp_path, "codex", trusted_project_root=str(tmp_path))
             )
 
 

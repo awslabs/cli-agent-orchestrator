@@ -685,6 +685,62 @@ def is_native_bind_capable(provider: str, installed_version: str | None) -> bool
     return bool(normalized and normalized in NATIVE_BIND_CAPABLE_VERSIONS[provider])
 
 
+#: The exact builds proven for the zero-task trust/route-attestation
+#: contract: the app-server ``initialize -> config/read(includeLayers) ->
+#: thread/start(ephemeral)`` exchange with NO ``turn/*`` that the route
+#: attestor runs to prove a failed route is healthy, plus the exact trust
+#: root (`config/read` resolving the canonical project as ``trusted`` from
+#: ``sessionFlags`` provenance) and a byte-identical protected user config
+#: afterward.
+#:
+#: This is a capability table in its own right, deliberately NOT a view of
+#: ``SUPPORTED_VERSIONS``, for the same reason the native-bind table is:
+#: the two answer different questions and may disagree.  Codex 0.147.0
+#: holds the narrow zero-task attestation proof — its app-server exchange
+#: and trust/provenance surface are the same zero-turn mechanics the
+#: native-bind seam stage-verified on the installed build, and a live
+#: 0.147.0 install reached this seam refusing only on the stale exact
+#: banner gate — while the broad advanced surfaces remain unproven, so
+#: ``SUPPORTED_VERSIONS`` still lists only 0.146.0 and native
+#: control/resume/route authority keep refusing 0.147.0 independently.
+#:
+#: Kimi, Claude, and Muse have no separate narrow proof: their route
+#: probes were verified as part of each accepted build's broad stage
+#: verification, so their cells are the broad tuples by reference.  A
+#: future build that must be attestation-gated more narrowly than the
+#: broad table is written here as its own literal tuple, never by
+#: weakening the broad one.
+ROUTE_ATTEST_CAPABLE_VERSIONS: dict[str, tuple[str, ...]] = {
+    PROVIDER_CODEX: ("0.146.0", "0.147.0"),
+    PROVIDER_KIMI: SUPPORTED_VERSIONS[PROVIDER_KIMI],
+    PROVIDER_CLAUDE: SUPPORTED_VERSIONS[PROVIDER_CLAUDE],
+    PROVIDER_MUSE: SUPPORTED_VERSIONS[PROVIDER_MUSE],
+}
+# The current pin must always be route-attestation capable — asserted for
+# the same reason the pin/SUPPORTED_VERSIONS agreement above is: the two
+# maps must not be able to silently drift apart.
+assert all(
+    PINNED_VERSIONS[provider] in versions
+    for provider, versions in ROUTE_ATTEST_CAPABLE_VERSIONS.items()
+)
+
+
+def is_route_attest_capable(provider: str, installed_version: str | None) -> bool:
+    """Return whether an exact build is proven for zero-task route attestation.
+
+    The acceptance authority for the route-attestation seam: a receipt
+    from a build outside this table cannot re-arm a launch breaker,
+    whatever the launch enforcement mode admits.  Independent of
+    :func:`is_proven_version` in both directions — a build may hold this
+    narrow proof without the broad one (Codex 0.147.0) — so neither
+    predicate may stand in for the other at a call site.
+    """
+    if provider not in ROUTE_ATTEST_CAPABLE_VERSIONS or not isinstance(installed_version, str):
+        return False
+    normalized = normalized_version(installed_version)
+    return bool(normalized and normalized in ROUTE_ATTEST_CAPABLE_VERSIONS[provider])
+
+
 def native_id_source(provider: str) -> str:
     source = NATIVE_ID_SOURCES.get(provider)
     if source is None:
