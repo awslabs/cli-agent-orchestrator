@@ -124,6 +124,16 @@ class _MigrationHarness:
         self.live_start_marker: Optional[str] = START_MARKER
         self.capture_errors: list[Exception] = []
         self.calls: list[str] = []
+        # cond-0427: model the composer, so a repair against a
+        # barrier-pinned provider crosses a real submit boundary here too.
+        self._composer: str = ""
+        self.composer_keeps_text: bool = False
+
+    #: Covers the widest ``composer_tail_rows`` in the barrier table.
+    _COMPOSER_ROWS = 5
+
+    def _composer_rows(self) -> list[str]:
+        return ["" for _ in range(self._COMPOSER_ROWS - 1)] + [f"> {self._composer}"]
 
     def turn_state(self, pane_id: str, **_kwargs: Any) -> TerminalStatus:
         self.calls.append("turn-state")
@@ -134,7 +144,7 @@ class _MigrationHarness:
         if self.capture_errors:
             raise self.capture_errors.pop(0)
         assert self.screens, "no scripted panel rows"
-        return list(self.screens[-1])
+        return list(self.screens[-1]) + self._composer_rows()
 
     def capture_screen_styled(self, pane_id: str, **_kwargs: Any) -> list[str]:
         self.calls.append("capture-styled")
@@ -157,9 +167,12 @@ class _MigrationHarness:
 
     def typed_literal(self, text: str) -> None:
         self.typed.append({"kind": "literal", "text": text})
+        self._composer = text
 
     def typed_enter(self) -> None:
         self.typed.append({"kind": "enter"})
+        if not self.composer_keeps_text:
+            self._composer = ""
 
     def typed_key(self, keystroke: str) -> None:
         self.typed.append({"kind": "key", "keystroke": keystroke})
@@ -1462,34 +1475,61 @@ class TestObservationJournalExactness:
     def test_failure_after_enter_journal_reports_submitted_not_zero_action(
         self, isolated_memory_db, harness, monkeypatch
     ):
-        """A successfully submitted /status followed by capture/parse loss is
+        """An OBSERVED /status submission followed by capture/parse loss is
         journaled as submitted with action count 1 — never a false
-        zero-action fact — and an exact retry sends nothing."""
-        _seed_legacy("claude_code")
-        _seed_roster("claude_code", generation=None)
-        harness.screens.append(claude_panel_rows())
-        harness.styled_screens.append(claude_composer_rows())
+        zero-action fact — and an exact retry sends nothing.
 
-        def _always_fail_capture(pane_id: str, **_kwargs: Any) -> list[str]:
-            raise RuntimeError("capture failed")
+        cond-0427: the submitted case is driven by a composer that actually
+        gives the text up, because that observation is what makes the
+        journal fact true.  A tmux return code cannot establish it: tmux
+        exits 0 whether or not the provider took the Enter.
+        """
+        _seed_legacy("kimi_cli")
+        _seed_roster("kimi_cli", generation=None)
+        harness.screens.append(
+            [
+                "╭────────────────────────────────────────────╮",
+                "│ >_ Kimi Code (v0.34.0)",
+                "│ Model: kimi-k2",
+                "│ Session session_4f5f46c7-b660-4f6f-a144-d2c6dceccf95",
+                "╰────────────────────────────────────────────╯",
+            ]
+        )
+        # The barrier must see the composer release the text, and only the
+        # later panel read may fail.  One post-submit capture is served so
+        # the submission is genuinely observed; every capture after that
+        # fails, which is the capture/parse loss this test is about.
+        real_capture = harness.capture_screen
+        served_after_submit = {"count": 0}
 
-        monkeypatch.setattr(npi, "capture_pane_screen", _always_fail_capture)
+        def _fail_after_observed_submission(pane_id: str, **kwargs: Any) -> list[str]:
+            submitted = harness._composer == "" and any(
+                entry["kind"] == "enter" for entry in harness.typed
+            )
+            if submitted:
+                served_after_submit["count"] += 1
+                if served_after_submit["count"] > 1:
+                    raise RuntimeError("capture failed")
+            return real_capture(pane_id, **kwargs)
+
+        monkeypatch.setattr(npi, "capture_pane_screen", _fail_after_observed_submission)
 
         op = _uuid()
         first = lim.nsr.repair_terminal_native_identity(
             terminal_id=TERMINAL_ID,
             generation=None,
-            provider_version=CLAUDE_VERSION,
+            provider_version="0.34.0",
             physical_occurrence=CALLBACK_TARGET,
             operation_id=op,
         )
         assert first["status"] == nsr.STATUS_REFUSED
         assert first["reason"] == "panel-unparsed"
+        assert served_after_submit["count"] > 1
 
         journal = lim.nsr.repair_observation_attempt(op)
         assert journal is not None
-        # The Enter succeeded: the observation WAS submitted.  The journal
-        # must not describe zero action.
+        # The composer gave /status up, so the action WAS submitted and the
+        # journal must not describe zero action.
         assert journal["status"] == nsr.OBSERVATION_SUBMITTED
         assert journal["status_action_count"] == 1
 
@@ -1501,7 +1541,7 @@ class TestObservationJournalExactness:
         second = lim.nsr.repair_terminal_native_identity(
             terminal_id=TERMINAL_ID,
             generation=None,
-            provider_version=CLAUDE_VERSION,
+            provider_version="0.34.0",
             physical_occurrence=CALLBACK_TARGET,
             operation_id=op,
         )

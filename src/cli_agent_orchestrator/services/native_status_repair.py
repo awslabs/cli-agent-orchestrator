@@ -4,8 +4,10 @@ A missing native session id is repairable metadata, not a reason to throw
 away the worker's conversation.  This is the bounded M3-A health
 operation: for one *currently live, rostered* terminal, prove the exact
 stored pane/session/window/process identity is live and the provider
-composer is idle, type literal ``/status`` and one Enter exactly once,
-parse only the *panel-attested branded* provider/build identity fields,
+composer is idle, type literal ``/status`` and *at most* one Enter — the
+Enter is withheld entirely where a pinned submission barrier cannot first
+prove the text reached the composer — parse only the *panel-attested
+branded* provider/build identity fields,
 persist the repaired identity atomically, and leave an exclusive
 ``NativeSessionAttachmentModel`` owner for the exact running pane.
 
@@ -1683,9 +1685,13 @@ def _evidence_by_operation(operation_id: str) -> Optional[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 OBSERVATION_ATTEMPTED = "attempted"
-#: The sole /status action was confirmed submitted (Enter succeeded).  A
-#: zero status-action count never means "no action occurred": the count
-#: becomes 1 at SUBMIT time, before any verdict exists.
+#: The sole /status action was submitted.  For a provider with a pinned
+#: submission barrier this means the composer was observed giving the
+#: control up after the one Enter; for a provider with no pinned composer
+#: it means only that the Enter was written, because no submission
+#: observation is possible there and none is claimed.  A zero
+#: status-action count never means "no action occurred": the count becomes
+#: 1 HERE, before any verdict exists.
 OBSERVATION_SUBMITTED = "submitted"
 OBSERVATION_OBSERVED = "observed"
 OBSERVATION_IDENTITY_STILL_MISSING = "identity-still-missing"
@@ -1735,7 +1741,7 @@ def _claim_observation_attempt(
 
 
 def _record_observation_submitted(operation_id: str) -> None:
-    """Confirm the sole /status action was submitted (Enter succeeded).
+    """Record that the sole /status action was submitted.
 
     Best-effort: the conservative no-resend rule holds even if this write
     fails (the attempt row still exists); a failure merely degrades the
@@ -2514,7 +2520,9 @@ def _repair_under_claims(
             composer_restored=prior.get("composer_restored"),
         )
 
-    # The one observation: literal /status and exactly one Enter.  The
+    # The one observation: literal /status and AT MOST one Enter — a pinned
+    # submission barrier withholds it entirely when the text is never proven
+    # to have reached the composer, so zero Enters is a legal outcome.  The
     # observation-attempt journal is the at-most-once barrier at the actual
     # byte seam: exactly one caller may claim the attempt; a loser observes
     # the journal and returns a typed outcome with zero bytes (never a
@@ -2557,16 +2565,62 @@ def _repair_under_claims(
             "verdict exists; an exact retry will not send /status again",
         )
     typed = npi.TmuxPaneInput(pane_id)
+    # cond-0427: a tmux return code proves byte delivery, never provider
+    # acceptance -- ``TmuxPaneInput`` says so itself and returns nothing for
+    # exactly that reason.  Where the provider's composer is pinned, the
+    # cond-0026 barrier turns "Enter was written" into "the composer gave the
+    # control up", and only that observation may record a submitted action.
+    barrier = npi.submission_barrier_for(provider)
     try:
         typed.send_literal(STATUS_COMMAND)
+        if barrier is not None and not npi.await_compose_visible(
+            pane_id,
+            STATUS_COMMAND,
+            barrier=barrier,
+            deadline_monotonic=observation_deadline,
+        ):
+            # The Enter is withheld, so zero Enters were sent.  The composer
+            # is deliberately not cleared: blind clearing is prohibited, and
+            # the attempt row already forbids an exact resend.
+            raise NativeStatusRepairConflict(
+                "submission-unproven",
+                f"the {STATUS_COMMAND} text never became visible in the composer, so "
+                "the submitting Enter was withheld; no status action was submitted",
+            )
         typed.send_enter()
+    except NativeStatusRepairConflict:
+        raise
     except Exception as exc:  # noqa: BLE001 - the write itself failed
         logger.warning("repair %s: /status write refused: %s", operation_id, exc)
         raise NativeStatusRepairConflict(
             "pane-unwritable", "the /status write was refused by tmux"
         ) from exc
-    # Enter succeeded: the sole status action is confirmed submitted.
-    _record_observation_submitted(operation_id)
+
+    if barrier is None:
+        # No pinned composer for this provider, so no submission observation
+        # is possible and none is claimed.  This records the attempted Enter
+        # under the existing conservative no-resend rule, unchanged.
+        _record_observation_submitted(operation_id)
+    else:
+        observed, _evidence_ref = npi.observe_submission(
+            pane_id,
+            STATUS_COMMAND,
+            barrier=barrier,
+            deadline_monotonic=observation_deadline,
+        )
+        if observed != npi.SUBMISSION_SUBMITTED:
+            # ``unsubmitted`` is the positive sighting that the composer kept
+            # the text; ``unknown`` is that nothing could be classified.
+            # Neither is submission, and neither is a parse failure -- naming
+            # this ``panel-unparsed`` would send a diagnosing operator to the
+            # parser instead of to the pane that never took the input.
+            raise NativeStatusRepairConflict(
+                "submission-unproven",
+                "exactly one Enter was sent but the composer did not give the "
+                f"{STATUS_COMMAND} up ({observed}); the status action is not proven "
+                "submitted and no further Enter will be sent",
+            )
+        _record_observation_submitted(operation_id)
 
     # From here the /status has been submitted.  For the Claude modal the
     # single Escape and the post-Escape composer proof run in a finally

@@ -222,6 +222,23 @@ class _RepairHarness:
         self.block: Optional[threading.Event] = None
         self.composer_proof_rows: Optional[list[str]] = None
         self.calls: list[str] = []
+        # cond-0427: the fake models a composer, because the submission
+        # barrier's whole job is to read one.  ``_composer`` holds whatever
+        # was typed and is given up on Enter, so a repair against a
+        # barrier-pinned provider observes a real submit boundary instead of
+        # a return code.  Set ``composer_keeps_text`` to model a pane that
+        # takes the bytes and never submits them.
+        self._composer: str = ""
+        self.composer_keeps_text: bool = False
+        self.composer_drops_literal: bool = False
+
+    #: Rows appended below every captured screen to render the composer.
+    #: Five covers the widest ``composer_tail_rows`` in the barrier table,
+    #: so the text lands inside the observed region for every provider.
+    _COMPOSER_ROWS = 5
+
+    def _composer_rows(self) -> list[str]:
+        return ["" for _ in range(self._COMPOSER_ROWS - 1)] + [f"> {self._composer}"]
 
     def turn_state(self, pane_id: str, **_kwargs: Any) -> TerminalStatus:
         self.calls.append("turn-state")
@@ -239,7 +256,7 @@ class _RepairHarness:
         if self.capture_errors:
             raise self.capture_errors.pop(0)
         assert self.screens, "no scripted panel rows"
-        return list(self.screens[-1])
+        return list(self.screens[-1]) + self._composer_rows()
 
     def capture_screen_styled(self, pane_id: str, **_kwargs: Any) -> list[str]:
         self.calls.append("capture-styled")
@@ -264,9 +281,13 @@ class _RepairHarness:
 
     def typed_literal(self, text: str) -> None:
         self.typed.append({"kind": "literal", "text": text})
+        if not self.composer_drops_literal:
+            self._composer = text
 
     def typed_enter(self) -> None:
         self.typed.append({"kind": "enter"})
+        if not self.composer_keeps_text:
+            self._composer = ""
 
     def typed_key(self, keystroke: str) -> None:
         if keystroke == "Escape":
@@ -3907,3 +3928,217 @@ def test_binding_drift_in_the_final_commit_window_refuses(isolated_memory_db, ha
     assert _terminal_row().v2_native_session_id is None
     assert _current_lineage()["native_session_id"] is None
     assert _evidence_rows() == []
+
+
+# ---------------------------------------------------------------------------
+# cond-0427: a submitted status action is observed, never inferred from tmux
+# ---------------------------------------------------------------------------
+
+
+def _attempt(operation_id: str) -> dict[str, Any]:
+    journal = nsr.repair_observation_attempt(operation_id)
+    assert journal is not None
+    return journal
+
+
+@pytest.fixture
+def fast_barrier(monkeypatch):
+    """Shrink the codex barrier's bounds without shortening its windows.
+
+    The sandbox pins the pane-ready timeout to 0.4s, which is shorter than
+    the real 3s/5s barrier bounds and would cut every observation window
+    short — turning a positive ``unsubmitted`` sighting into ``unknown``
+    and letting these tests pass for the wrong reason.  Here the barrier is
+    made small and the deadline large, so each window runs its full bound
+    and the classification under test is the real one.
+    """
+    monkeypatch.setattr(v2, "NATIVE_PANE_READY_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setitem(
+        npi._SUBMISSION_BARRIERS,
+        "codex",
+        npi.SubmissionBarrier(
+            compose_settle_seconds=0.2,
+            post_enter_seconds=0.2,
+            poll_interval_seconds=0.02,
+            composer_tail_rows=4,
+        ),
+    )
+
+
+def test_composer_keeping_status_refuses_submission_unproven(
+    isolated_memory_db, harness, fast_barrier
+):
+    """A pane that takes the bytes and never submits them is refused.
+
+    tmux exits 0 for both a submitted and an unsubmitted Enter, so the
+    barrier's positive ``unsubmitted`` sighting is the only thing that can
+    tell them apart.  Exactly one Enter is sent and no second is attempted.
+    """
+    harness.screens.append(codex_panel_rows())
+    harness.composer_keeps_text = True
+    _seed_all("codex")
+
+    op = _uuid()
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CODEX_VERSION,
+        operation_id=op,
+    )
+
+    assert outcome["status"] == nsr.STATUS_REFUSED
+    assert outcome["reason"] == "submission-unproven"
+    # Not ``panel-unparsed``: the panel was never the problem, and pointing a
+    # diagnosing operator at the parser would be a wrong answer.
+    #
+    # The window ran its full bound and ended on the POSITIVE sighting that
+    # the composer still held the text.  Asserting the classification keeps
+    # this test from passing on a deadline-cut ``unknown``, which would be a
+    # different fact reaching the same refusal.
+    assert "(unsubmitted)" in outcome["detail"]
+    assert _typed_bytes(harness) == [("literal", "/status"), ("enter", "")]
+
+    journal = _attempt(op)
+    assert journal["status"] == nsr.OBSERVATION_ATTEMPTED
+    assert journal["status_action_count"] == 0
+
+    assert _terminal_row().v2_native_session_id is None
+    assert _current_lineage()["native_session_id"] is None
+    assert _evidence_rows() == []
+
+
+def test_text_never_compose_visible_withholds_the_enter(isolated_memory_db, harness, fast_barrier):
+    """When the text never reaches the composer, the Enter is withheld.
+
+    Zero Enters is the point: submitting into a composer that was never
+    proven to hold ``/status`` is how a stray Enter becomes somebody's
+    prompt.  The composer is deliberately not cleared afterwards.
+    """
+    harness.screens.append(codex_panel_rows())
+    harness.composer_drops_literal = True
+    _seed_all("codex")
+
+    op = _uuid()
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CODEX_VERSION,
+        operation_id=op,
+    )
+
+    assert outcome["status"] == nsr.STATUS_REFUSED
+    assert outcome["reason"] == "submission-unproven"
+    assert _typed_bytes(harness) == [("literal", "/status")]
+    assert not any(entry["kind"] == "enter" for entry in harness.typed)
+
+    journal = _attempt(op)
+    assert journal["status"] == nsr.OBSERVATION_ATTEMPTED
+    assert journal["status_action_count"] == 0
+    assert _terminal_row().v2_native_session_id is None
+    assert _evidence_rows() == []
+
+
+def test_unproven_submission_is_not_retried_in_place(isolated_memory_db, harness, fast_barrier):
+    """An exact retry after an unproven submission never resends /status."""
+    harness.screens.append(codex_panel_rows())
+    harness.composer_keeps_text = True
+    _seed_all("codex")
+
+    op = _uuid()
+    first = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CODEX_VERSION,
+        operation_id=op,
+    )
+    assert first["reason"] == "submission-unproven"
+    sent_before = _typed_bytes(harness)
+
+    second = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CODEX_VERSION,
+        operation_id=op,
+    )
+    assert second["status"] == nsr.STATUS_REFUSED
+    assert second["reason"] == "observation-attempt-ambiguous"
+    assert _typed_bytes(harness) == sent_before
+
+
+def test_observed_submission_records_the_action(isolated_memory_db, harness):
+    """A composer that gives the text up is what records a submitted action."""
+    harness.screens.append(codex_panel_rows())
+    _seed_all("codex")
+
+    op = _uuid()
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CODEX_VERSION,
+        operation_id=op,
+    )
+
+    assert outcome["status"] == "repaired"
+    journal = _attempt(op)
+    assert journal["status"] == nsr.OBSERVATION_OBSERVED
+    assert journal["status_action_count"] == 1
+
+
+def test_provider_without_a_pinned_barrier_keeps_its_existing_behaviour(
+    isolated_memory_db, harness
+):
+    """Claude has no pinned composer, so no submission observation is run.
+
+    ``submission_barrier_for`` returning None means "not proven", never
+    "guess one": the legacy fused write stands and claims nothing extra.
+    """
+    assert npi.submission_barrier_for("claude_code") is None
+    harness.screens.append(claude_panel_rows())
+    harness.styled_screens.append(claude_composer_rows())
+    # The composer keeps the text; without a barrier nothing observes it,
+    # and the repair proceeds exactly as it did before cond-0427.
+    harness.composer_keeps_text = True
+    _seed_all("claude_code")
+
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CLAUDE_VERSION,
+        operation_id=_uuid(),
+    )
+
+    assert outcome["status"] == "repaired"
+    assert outcome["native_session_id"] == SESSION_ID
+
+
+def test_deadline_cut_observation_is_unknown_not_unsubmitted(isolated_memory_db, harness):
+    """A window cut by the deadline classifies ``unknown``, never ``unsubmitted``.
+
+    Deliberately runs WITHOUT the ``fast_barrier`` fixture: the sandbox pins
+    the pane-ready timeout well below the barrier's own bound, so the
+    post-Enter window is cut short and nothing about what the composer did
+    can be classified.  Both classifications refuse identically, which is
+    exactly why the distinction needs its own test -- collapsing them would
+    turn "we could not look" into the positive sighting "it did not submit",
+    and no assertion on the refusal reason alone would notice.
+    """
+    harness.screens.append(codex_panel_rows())
+    harness.composer_keeps_text = True
+    _seed_all("codex")
+
+    op = _uuid()
+    outcome = nsr.repair_terminal_native_identity(
+        terminal_id=TERMINAL_ID,
+        generation=GENERATION,
+        provider_version=CODEX_VERSION,
+        operation_id=op,
+    )
+
+    assert outcome["status"] == nsr.STATUS_REFUSED
+    assert outcome["reason"] == "submission-unproven"
+    assert "(unknown)" in outcome["detail"]
+    assert "(unsubmitted)" not in outcome["detail"]
+
+    journal = _attempt(op)
+    assert journal["status"] == nsr.OBSERVATION_ATTEMPTED
+    assert journal["status_action_count"] == 0
