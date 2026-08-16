@@ -44,6 +44,7 @@ from cli_agent_orchestrator.services import (
     actor_broker,
     claude_native_readiness,
     companion_receipts,
+    deepseek_acp_route,
     heartbeat_store,
     provider_contracts,
 )
@@ -67,6 +68,12 @@ from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 logger = logging.getLogger(__name__)
 
 BRIDGE_VERSION = "cao-native-provider-bridge-v1"
+#: The first-admission system/init wait bound for a Claude Code session.
+#: Generous for a real gateway cold start; a module-level name so tests can
+#: shrink it without touching the contract.
+_CLAUDE_INIT_TIMEOUT = 30.0
+#: The bound on the provider's replayed-user turn echo after submission.
+_CLAUDE_TURN_ACCEPT_TIMEOUT = 30.0
 BRIDGE_ROOT = CAO_HOME_DIR / "managed-provider-sessions"
 RENDEZVOUS_ROOT = pathlib.Path("/tmp") / f"cao-managed-bridge-{os.getuid()}"
 RENDEZVOUS_SCHEMA = "cao-managed-bridge-rendezvous-v1"
@@ -306,6 +313,37 @@ def _provider_child_environment(
         for name, value in verified.items():
             if name.startswith("CAO_CONDUCTOR_") or name == "ZDOTDIR":
                 env[name] = value
+        return env
+    if request.get("provider_route", "anthropic") == deepseek_acp_route.PROVIDER_ROUTE_DEEPSEEK:
+        # The DeepSeek ACP child gets the bounded conductor route environment
+        # derived from the reservation's route envelope — never ambient
+        # Anthropic/Claude credentials or a gateway pointer from the server.
+        # The wrapper claims the one-shot token inside the provider process
+        # and injects the gateway base URL itself; no credential value is
+        # copied into this map, so there is no ambient fallback to
+        # api.anthropic.com even if the wrapper misbehaves.
+        try:
+            envelope = deepseek_acp_route.validate_envelope(
+                provider=str(request.get("provider") or ""),
+                provider_route=request.get("provider_route", "anthropic"),
+                expected_model=str(request.get("model") or ""),
+                working_directory=str(request.get("working_directory") or ""),
+                provider_executable=str(request.get("provider_executable") or ""),
+                provider_executable_sha256=str(request.get("provider_executable_sha256") or ""),
+                envelope=request.get("route_envelope"),
+                check_files=False,
+            )
+        except deepseek_acp_route.DeepSeekRouteError as exc:
+            raise BridgeError(str(exc)) from exc
+        if envelope is None:
+            raise BridgeError("DeepSeek managed launch requires a route_envelope")
+        shim_dir = os.path.dirname(envelope["wrapper_executable"])
+        env = {name: os.environ[name] for name in _PROVIDER_ENV_ALLOWLIST if name in os.environ}
+        env["PATH"] = f"{shim_dir}:{_MINIMAL_PATH}"
+        env["CAO_CONDUCTOR_ROUTES"] = envelope["route_map_path"]
+        env["CAO_CONDUCTOR_SHIM_DIR"] = shim_dir
+        env["CAO_CONDUCTOR_REAL_CLAUDE"] = envelope["inner_executable"]
+        env.update(_provider_route_environment(request))
         return env
     return _provider_env(_provider_route_environment(request))
 
@@ -1023,6 +1061,22 @@ def _file_digest_or_absent(path: pathlib.Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except FileNotFoundError:
         return "absent"
+
+
+def _claude_native_tool_names(allowed_tools: list[str]) -> set[str]:
+    """Translate a resolved CAO tool posture into Claude Code native names.
+
+    A profile that grants a concrete CAO tool set (no ``*``) must reach the
+    Claude child as the exact native ``--allowedTools`` list — launching
+    without it would silently expose the unrestricted default tool set.
+    """
+    from cli_agent_orchestrator.utils.tool_mapping import TOOL_MAPPING
+
+    mapping = TOOL_MAPPING.get("claude_code") or {}
+    names: set[str] = set()
+    for tool in allowed_tools:
+        names.update(mapping.get(tool) or [])
+    return names
 
 
 def profile_digest(agent_profile: str) -> str:
@@ -1855,6 +1909,10 @@ class _ProviderSession:
         self.current_model = request["model"]
         self.current_effort = request["effort"]
         self._config_options: list[dict[str, Any]] = []
+        # The provider-authored system/init observation, captured and
+        # validated exactly once at the first admitted turn (Claude Code
+        # 2.1.x emits it only when the first real user message exists).
+        self._claude_init: Optional[dict[str, Any]] = None
         self.provider_io_started = False
         # Per-session provider-turn ordinal (1-based), incremented only on a
         # natively accepted turn; the route receipt's event_sequence.
@@ -2127,35 +2185,110 @@ class _ProviderSession:
         }
         return self.readiness
 
+    def _await_claude_init(self, *, timeout: float) -> dict[str, Any]:
+        """Return the provider's own system/init event, or fail closed.
+
+        Claude Code 2.1.x emits system/init only once the first real user
+        message is available — i.e. after the first task bytes have crossed
+        the provider boundary.  This is therefore a first-admission proof,
+        never a readiness one; callers that have already sent provider bytes
+        must translate its absence into ``SubmitUncertain``, never a clean
+        refusal that could be retried into a replay.
+        """
+        assert self.rpc is not None
+        try:
+            return self.rpc.wait_notification(
+                lambda item: item.get("type") == "system" and item.get("subtype") == "init",
+                start_index=0,
+                timeout=timeout,
+            )
+        except BridgeError as exc:
+            raise BridgeError(
+                f"Claude Code emitted no system/init evidence after the first "
+                f"provider turn began: {exc}"
+            ) from exc
+
+    def _validate_claude_init(self, init: dict[str, Any]) -> None:
+        """Require the provider-authored init to attest this exact turn.
+
+        The init event is the only provider observation of the model and
+        working directory the session actually resolved; a mismatch here
+        means the task crossed the provider boundary under the wrong route.
+        """
+        observed_session = init.get("session_id")
+        if observed_session != self.provider_session_id:
+            raise BridgeError(
+                "Claude Code system/init names a different provider session: "
+                f"{observed_session!r} (expected {self.provider_session_id!r})"
+            )
+        model = str(self.request["model"])
+        observed_model = init.get("model")
+        if (self.request.get("provider_route") or "anthropic") == (
+            deepseek_acp_route.PROVIDER_ROUTE_DEEPSEEK
+        ):
+            model_matches = deepseek_acp_route.observed_model_matches(model, observed_model)
+        else:
+            model_matches = observed_model == model
+        if not model_matches:
+            raise BridgeError(
+                "Claude Code system/init resolved the wrong model: "
+                f"{observed_model!r} (expected {model!r})"
+            )
+        observed_cwd = init.get("cwd")
+        if observed_cwd != self.request["working_directory"]:
+            raise BridgeError(
+                "Claude Code system/init resolved the wrong working directory: "
+                f"{observed_cwd!r} (expected {self.request['working_directory']!r})"
+            )
+
     def _initialize_claude(self) -> dict[str, Any]:
         claude_bin = self.request["provider_executable"]
+        route = self.request.get("provider_route") or "anthropic"
+        is_deepseek = route == deepseek_acp_route.PROVIDER_ROUTE_DEEPSEEK
+        model = str(self.request["model"])
+        if model.startswith("deepseek") != is_deepseek:
+            raise BridgeError(
+                "Claude managed launch model/provider_route mismatch: "
+                f"model={model!r} provider_route={route!r}"
+            )
+        envelope: Optional[dict[str, str]] = None
+        if is_deepseek:
+            # Topology proof before ANY provider I/O: wrapper/inner paths and
+            # digests, route-map/worktree identity, token present, and the
+            # consumed marker absent — a marker already on disk means this
+            # worktree's one-shot token was consumed by an earlier launch,
+            # and the replay is refused here with zero provider bytes.
+            try:
+                envelope = deepseek_acp_route.validate_envelope(
+                    provider=self.request["provider"],
+                    provider_route=route,
+                    expected_model=model,
+                    working_directory=self.request["working_directory"],
+                    provider_executable=self.request["provider_executable"],
+                    provider_executable_sha256=self.request["provider_executable_sha256"],
+                    envelope=self.request.get("route_envelope"),
+                    check_files=True,
+                )
+            except deepseek_acp_route.DeepSeekRouteError as exc:
+                raise BridgeError(str(exc)) from exc
+            if envelope is None:
+                raise BridgeError("DeepSeek managed launch requires a route_envelope")
+
+        # The version probe runs the pinned REAL Claude executable in the
+        # bounded child environment.  It must never claim the one-shot token:
+        # only the wrapper-launched provider session may do that.
         version = self._version(claude_bin, provider_contracts.PROVIDER_CLAUDE)
+        if is_deepseek and envelope is not None:
+            if not deepseek_acp_route.token_present(envelope["token_path"]) or (
+                os.path.lexists(envelope["consumed_marker_path"])
+            ):
+                raise BridgeError(
+                    "deepseek one-shot token was consumed before the provider "
+                    "session launch (version probe or foreign claim); refusing "
+                    "to start a provider that cannot claim the gateway token"
+                )
 
         env = _provider_child_environment(self.request)
-        is_deepseek = (
-            str(self.request.get("model", "")).startswith("deepseek")
-            or self.request.get("provider_route") == "deepseek"
-            or self.request.get("shim_route") == "deepseek"
-        )
-        if is_deepseek:
-            base_url = env.get("ANTHROPIC_BASE_URL", "")
-            if not base_url or "api.anthropic.com" in base_url:
-                raise BridgeError(
-                    "DeepSeek managed launch requires ANTHROPIC_BASE_URL gateway configuration"
-                )
-            conflicts = [
-                k
-                for k in (
-                    "CLAUDE_CODE_USE_BEDROCK",
-                    "CLAUDE_CODE_USE_VERTEX",
-                    "CLAUDE_CODE_USE_FOUNDRY",
-                )
-                if env.get(k)
-            ]
-            if conflicts:
-                raise BridgeError(
-                    f"conflicting cloud controls in DeepSeek environment: {', '.join(conflicts)}"
-                )
 
         session_id = self.request.get("provider_session_id")
         if session_id:
@@ -2177,8 +2310,12 @@ class _ProviderSession:
         settings = claude_native_readiness.hook_settings(hook_path)
         settings_arg = claude_native_readiness.settings_argument(settings)
 
+        # For DeepSeek the session launches the envelope-pinned WRAPPER
+        # exactly once; the wrapper claims the token and execs the inner
+        # (real) Claude binary.  The version probe above ran the inner
+        # binary directly and never invoked the wrapper.
         argv = [
-            claude_bin,
+            envelope["wrapper_executable"] if is_deepseek and envelope else claude_bin,
             "-p",
             "--session-id",
             session_id,
@@ -2192,8 +2329,24 @@ class _ProviderSession:
             settings_arg,
             "--model",
             self.request["model"],
-            "--dangerously-skip-permissions",
         ]
+        # The resolved profile permission/tool posture reaches the child
+        # instead of a blanket skip: a profile that explicitly grants "*"
+        # keeps the skip; a concrete profile tool set is translated to the
+        # exact native --allowedTools list, and a posture with no native
+        # tool at all fails closed rather than silently widening to the
+        # unrestricted default.
+        allowed = list(self.profile_material.get("allowed_tools") or [])
+        if "*" in allowed:
+            argv.append("--dangerously-skip-permissions")
+        else:
+            native_tools = _claude_native_tool_names(allowed)
+            if not native_tools:
+                raise BridgeError(
+                    "resolved profile tool posture has no Claude Code native "
+                    "tools; refusing to expose an unrestricted default tool set"
+                )
+            argv.extend(["--allowedTools", ",".join(sorted(native_tools))])
         if provider_contracts.route_selects_effort(self.request["effort"]):
             argv.extend(["--effort", self.request["effort"]])
         if self.profile_material.get("system_prompt"):
@@ -2215,11 +2368,36 @@ class _ProviderSession:
             provider="claude_code",
         )
 
+        # Readiness uses the SessionStart module's own refusal deadline, not
+        # the --version probe timeout: a cold Claude Code start (auth and
+        # workspace trust resolution) legitimately outlives a 5-second
+        # version probe, and the readiness module documents 90s as the
+        # "no hook arrived" refusal bound.
         readiness_record = claude_native_readiness.await_session_start(
             hook_path,
             session_id,
-            timeout=provider_contracts.version_probe_timeout(self.provider) * 2,
+            timeout=claude_native_readiness.READY_TIMEOUT_SECONDS,
         )
+        # Claude Code 2.1.x emits system/init only when the first real user
+        # message is available, so readiness cannot demand it without either
+        # spending a provider turn or inventing a synthetic trigger.  The
+        # readiness proof is therefore the exact SessionStart hook (session
+        # id already matched by the await) plus the hook's own cwd — and,
+        # for DeepSeek, the wrapper-consumed marker.  The provider-authored
+        # system/init observation is captured and validated at the first
+        # admission, before submission evidence is published.
+        observed_hook_cwd = readiness_record.get("cwd")
+        if observed_hook_cwd != self.request["working_directory"]:
+            raise BridgeError(
+                "Claude Code SessionStart hook resolved the wrong working "
+                f"directory: {observed_hook_cwd!r} (expected "
+                f"{self.request['working_directory']!r})"
+            )
+        if is_deepseek and envelope is not None:
+            if not deepseek_acp_route.consumed_marker_exists(envelope["consumed_marker_path"]):
+                raise BridgeError(
+                    "deepseek wrapper-consumed marker was not recorded before readiness"
+                )
         self.provider_session_id = session_id
         transcript = {
             "session_id": session_id,
@@ -2234,6 +2412,14 @@ class _ProviderSession:
             "provider_version": version,
             "provider_receipt_kind": "claude-session-start",
             "provider_transcript_sha256": _digest(transcript),
+            # The provider-authored readiness observation: the SessionStart
+            # hook named the exact session and its cwd — never a restatement
+            # of the request fields.
+            "session_start": {
+                "session_id": readiness_record.get("native_session_id"),
+                "cwd": observed_hook_cwd,
+                "hook_event": readiness_record.get("hook_event"),
+            },
             "model_input_ready": True,
         }
         return self.readiness
@@ -2262,20 +2448,31 @@ class _ProviderSession:
                 },
             }
 
-            def is_turn_accepted(item: dict[str, Any]) -> bool:
+            def is_replayed_user(item: dict[str, Any]) -> bool:
+                # The provider's own echo of the exact submitted bytes is the
+                # turn-acceptance proof: same session, same content, and the
+                # provider-minted turn uuid that binds this turn forever.
                 if item.get("session_id") != self.provider_session_id:
                     return False
-                if item.get("type") in {"user", "system", "assistant", "result"}:
-                    return bool(item.get("uuid"))
-                return False
+                if item.get("type") != "user":
+                    return False
+                echoed = item.get("message") or {}
+                return echoed.get("content") == message
 
             try:
                 start_index = self.rpc.notification_count()
                 self.rpc._send(prompt_msg)
+                # The task bytes have crossed the provider boundary.  Every
+                # failure below is SubmitUncertain — a clean refusal here
+                # would invite a retry that replays the same task.
+                if self._claude_init is None:
+                    init = self._await_claude_init(timeout=_CLAUDE_INIT_TIMEOUT)
+                    self._validate_claude_init(init)
+                    self._claude_init = init
                 first_update = self.rpc.wait_notification(
-                    is_turn_accepted,
+                    is_replayed_user,
                     start_index=start_index,
-                    timeout=30.0,
+                    timeout=_CLAUDE_TURN_ACCEPT_TIMEOUT,
                 )
                 turn_id = first_update.get("uuid")
                 if not isinstance(turn_id, str) or not turn_id:
@@ -2287,6 +2484,8 @@ class _ProviderSession:
                     args=(self.provider_session_id, start_index),
                     daemon=True,
                 ).start()
+            except SubmitUncertain:
+                raise
             except Exception as exc:
                 raise SubmitUncertain(
                     f"Claude Code session/prompt outcome uncertain after provider boundary: {exc}"
@@ -2297,6 +2496,11 @@ class _ProviderSession:
                 "request_sha256": _digest(prompt_msg),
                 "provider_turn_id": turn_id,
                 "first_provider_update": first_update,
+                # The provider-authored first-turn observation, captured
+                # before the replayed user event: init precedes the turn
+                # echo on the wire, so validating it here is validating it
+                # before the accepted turn begins.
+                "session_init": self._claude_init,
             }
             self._turn_sequence += 1
             return turn_id, "claude-turn-start", evidence

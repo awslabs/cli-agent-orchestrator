@@ -1,8 +1,20 @@
+"""Claude Code ACP bridge adapter: wrapper/inner route envelopes (COND-0415).
+
+The managed DeepSeek route never relies on ambient server credentials or
+PATH: the reservation pins the real Claude binary as ``provider_executable``
+(the version probe runs exactly it and must leave the one-shot token
+present), and the provider session launches the envelope-pinned wrapper
+exactly once under the bounded conductor route environment, so only that
+process claims the token and records the consumed marker.  Readiness is
+published only after the SessionStart hook (exact session proof) AND the
+provider's own system/init event attest the session, model, and working
+directory — and, for DeepSeek, after the wrapper-consumed marker exists.
+"""
+
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import pathlib
 import signal
 import threading
@@ -12,10 +24,58 @@ from typing import Any, Optional
 
 import pytest
 
-from cli_agent_orchestrator.services import managed_launch
+from cli_agent_orchestrator.services import deepseek_acp_route, managed_launch
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services import provider_contracts
 from cli_agent_orchestrator.services.managed_event_renderer import ManagedEventRenderer
+
+
+def _write_executable(path: pathlib.Path, body: str) -> str:
+    path.write_text(body)
+    path.chmod(0o755)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _deepseek_envelope(tmp_path: pathlib.Path, *, model: str = "deepseek-v4-flash") -> dict:
+    """A complete deepseek envelope plus its wrapper/inner/route-map/token files."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    wrapper = tmp_path / "shims" / "claude"
+    wrapper.parent.mkdir()
+    wrapper_digest = _write_executable(
+        wrapper, '#!/bin/sh\nexec "$CAO_CONDUCTOR_REAL_CLAUDE" "$@"\n'
+    )
+    inner = tmp_path / "real-claude"
+    inner_digest = _write_executable(inner, "#!/bin/sh\necho 'claude 2.1.233'\n")
+    token = tmp_path / "deepseek-token.txt"
+    token.write_text("sk-one-shot\n")
+    token.chmod(0o600)
+    marker = tmp_path / "deepseek-token.consumed"
+    route_map = tmp_path / "deepseek-routes.json"
+    route_map.write_text(
+        json.dumps(
+            {
+                "routes": {
+                    str(worktree): {
+                        "route": "deepseek",
+                        "model": model,
+                        "token_path": str(token),
+                        "consumed_path": str(marker),
+                    }
+                }
+            }
+        )
+    )
+    return {
+        "wrapper_executable": str(wrapper),
+        "wrapper_executable_sha256": wrapper_digest,
+        "inner_executable": str(inner),
+        "inner_executable_sha256": inner_digest,
+        "route_map_path": str(route_map),
+        "worktree_realpath": str(worktree),
+        "token_path": str(token),
+        "consumed_marker_path": str(marker),
+    }
 
 
 def _claude_request(
@@ -24,10 +84,18 @@ def _claude_request(
     model: str = "deepseek-v4-flash",
     effort: str = "high",
     provider_route: str = "deepseek",
+    envelope: Optional[dict] = None,
+    worktree: Optional[pathlib.Path] = None,
 ) -> dict[str, Any]:
-    executable = tmp_path / "claude"
-    executable.write_text("#!/bin/sh\necho 'claude 2.1.233'\n")
-    executable.chmod(0o755)
+    if provider_route == "deepseek":
+        envelope = envelope if envelope is not None else _deepseek_envelope(tmp_path, model=model)
+        executable = pathlib.Path(envelope["inner_executable"])
+        worktree = pathlib.Path(envelope["worktree_realpath"])
+    else:
+        executable = tmp_path / "claude"
+        executable.write_text("#!/bin/sh\necho 'claude 2.1.233'\n")
+        executable.chmod(0o755)
+        worktree = worktree or tmp_path
     request = {
         "bridge_version": bridge.BRIDGE_VERSION,
         "reservation_id": "11111111-1111-4111-8111-111111111111",
@@ -40,16 +108,18 @@ def _claude_request(
         "model": model,
         "effort": effort,
         "provider_route": provider_route,
-        "working_directory": str(tmp_path),
+        "working_directory": str(worktree),
         "provider_executable": str(executable),
         "provider_executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
     }
+    if provider_route == "deepseek":
+        request["route_envelope"] = envelope
     request["rendezvous_identity"] = {
         "project": "test-project",
         "task_id": "test-task",
         "terminal_id": request["terminal_id"],
         "terminal_generation": request["generation"],
-        "worktree_realpath": str(tmp_path),
+        "worktree_realpath": str(worktree),
         "repository": "test-repository",
         "head": "1" * 40,
         "actor": "cafebabe",
@@ -74,11 +144,11 @@ def _admission(
     }
 
 
-def _material() -> dict[str, Any]:
+def _material(allowed_tools: Optional[list[str]] = None) -> dict[str, Any]:
     return {
         "profile": object(),
         "profile_sha256": "a" * 64,
-        "allowed_tools": ["*"],
+        "allowed_tools": ["*"] if allowed_tools is None else allowed_tools,
         "system_prompt": "implement bounded repairs accurately",
         "mcp_servers": [],
     }
@@ -101,13 +171,36 @@ class _FakeClaudeProcess:
         self.closed = False
         self.proc = self
         self.auto_complete = True
+        self.echo_user = True
+        self.echo_content: Optional[str] = None
         self._condition = threading.Condition()
 
-        # Extract session_id from argv
+        # The bridge wraps the provider argv with the launcher shim
+        # (python -m provider_launcher --socket ... -- <provider argv>);
+        # the provider's own arguments start after the "--" separator.
+        self.provider_argv = argv[argv.index("--") + 1 :] if "--" in argv else argv
         self.session_id = "test-session-uuid"
-        for i, arg in enumerate(argv):
-            if arg == "--session-id" and i + 1 < len(argv):
-                self.session_id = argv[i + 1]
+        for i, arg in enumerate(self.provider_argv):
+            if arg == "--session-id" and i + 1 < len(self.provider_argv):
+                self.session_id = self.provider_argv[i + 1]
+
+        # The wrapper's claim side effect: consume the one-shot token and
+        # record the marker exactly once, as the real conductor shim does.
+        consume = env.pop("_fake_consume_envelope", None)
+        if consume:
+            token = pathlib.Path(consume["token_path"])
+            if token.exists():
+                token.unlink()
+            pathlib.Path(consume["consumed_marker_path"]).write_text("consumed\n")
+
+        # system/init is emitted only when the first real user message is
+        # available (Claude Code 2.1.x behavior), so the fake emits it at
+        # first _send, before the replayed user event.
+        init = env.pop("_fake_init_event", None)
+        if init is not None and init.get("session_id") == "__from_argv__":
+            init = {**init, "session_id": self.session_id}
+        self._init_event = init
+        self._init_emitted = False
 
     def poll(self) -> Optional[int]:
         return None if not self.closed else 0
@@ -144,25 +237,25 @@ class _FakeClaudeProcess:
         if message.get("type") == "user":
             turn_uuid = f"turn-{uuid.uuid4()}"
             with self._condition:
-                self._notifications.append(
-                    {
-                        "type": "user",
-                        "message": message.get("message"),
-                        "session_id": self.session_id,
-                        "uuid": turn_uuid,
-                    }
-                )
-                self._notifications.append(
-                    {
-                        "type": "assistant",
-                        "message": {
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": "Starting implementation."}],
-                        },
-                        "session_id": self.session_id,
-                        "uuid": turn_uuid,
-                    }
-                )
+                if self._init_event is not None and not self._init_emitted:
+                    self._init_emitted = True
+                    self._notifications.append(dict(self._init_event))
+                if self.echo_user:
+                    self._notifications.append(
+                        {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": (
+                                    self.echo_content
+                                    if self.echo_content is not None
+                                    else message.get("message", {}).get("content")
+                                ),
+                            },
+                            "session_id": self.session_id,
+                            "uuid": turn_uuid,
+                        }
+                    )
                 if self.auto_complete:
                     self._notifications.append(
                         {
@@ -204,89 +297,456 @@ class _FakeClaudeProcess:
         self.closed = True
 
 
-def test_claude_acp_readiness_and_task_submission(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    request = _claude_request(tmp_path)
-    procs: list[_FakeClaudeProcess] = []
+def _deepseek_env_setup(monkeypatch: pytest.MonkeyPatch, request: dict[str, Any]) -> dict[str, Any]:
+    """Bind a scrubbed bridge environment with an ambient Anthropic key present."""
+    import os
 
-    def fake_proc(*args: Any, **kwargs: Any) -> _FakeClaudeProcess:
-        proc = _FakeClaudeProcess(*args, **kwargs)
-        procs.append(proc)
-        return proc
-
-    isolated_env = {
-        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-        "ANTHROPIC_AUTH_TOKEN": "test-deepseek-token",
-    }
-    monkeypatch.setattr(os, "environ", isolated_env)
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            "HOME": str(pathlib.Path.home()),
+            "PATH": "/usr/bin:/bin",
+            "ANTHROPIC_API_KEY": "sk-ant-ambient-fallback",
+            "ANTHROPIC_AUTH_TOKEN": "ambient-token",
+            "CLAUDE_CODE_USE_BEDROCK": "",
+        },
+    )
     monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
     bridge._prune_bridge_environment("claude_code")
-    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
-    monkeypatch.setattr(bridge, "_RpcProcess", fake_proc)
-    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
+    return request
+
+
+def _session_start_hook(monkeypatch: pytest.MonkeyPatch, request: dict[str, Any]) -> None:
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.claude_native_readiness.await_session_start",
         lambda _path, session_id, **_kw: {
-            "session_id": session_id,
-            "hook_event_name": "SessionStart",
+            "schema": "cao-claude-native-readiness-v1",
+            "hook_event": "SessionStart",
+            "native_session_id": session_id,
             "source": "startup",
-            "cwd": str(tmp_path),
+            "cwd": request["working_directory"],
+            "model": request["model"],
+            "observed_session_ids": [session_id],
         },
     )
 
+
+def _init_event(
+    request: dict[str, Any],
+    *,
+    model: Optional[str] = None,
+    cwd: Optional[str] = None,
+    session_id: Optional[str] = None,
+    emitted: bool = True,
+) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    """The fake process env keys that make the fake emit a system/init event."""
+    if not emitted:
+        return None, {}
+    if session_id is None:
+        # The fake fills in the real session id from argv at construction.
+        session_id = "__from_argv__"
+    return {
+        "type": "system",
+        "subtype": "init",
+        "session_id": session_id,
+        "model": request["model"] if model is None else model,
+        "cwd": request["working_directory"] if cwd is None else cwd,
+        "tools": ["Bash", "Read"],
+    }, {}
+
+
+def _build_session(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model: str = "deepseek-v4-flash",
+    provider_route: str = "deepseek",
+    envelope: Optional[dict] = None,
+    allowed_tools: Optional[list[str]] = None,
+    init_event: Optional[dict[str, Any]] = None,
+    emit_init: bool = True,
+    consume: bool = True,
+    echo_user: bool = True,
+    echo_content: Optional[str] = None,
+    version_probe: Optional[str] = None,
+) -> tuple[bridge._ProviderSession, dict[str, Any], list[_FakeClaudeProcess]]:
+    request = _claude_request(
+        tmp_path, model=model, provider_route=provider_route, envelope=envelope
+    )
+    _deepseek_env_setup(monkeypatch, request)
+    monkeypatch.setattr(
+        bridge, "_profile_material", lambda *_: _material(allowed_tools=allowed_tools)
+    )
+    # The unit suite drives the uncertain paths deterministically; shrink
+    # the provider wait bounds so each negative case costs milliseconds.
+    monkeypatch.setattr(bridge, "_CLAUDE_INIT_TIMEOUT", 0.5)
+    monkeypatch.setattr(bridge, "_CLAUDE_TURN_ACCEPT_TIMEOUT", 0.5)
+    procs: list[_FakeClaudeProcess] = []
+
+    def fake_proc(*args: Any, **kwargs: Any) -> _FakeClaudeProcess:
+        env = dict(kwargs.get("env") or {})
+        if init_event is not None:
+            env["_fake_init_event"] = init_event
+        elif emit_init:
+            env["_fake_init_event"] = {
+                "type": "system",
+                "subtype": "init",
+                "session_id": "__from_argv__",
+                "model": request["model"],
+                "cwd": request["working_directory"],
+                "tools": ["Bash", "Read"],
+            }
+        if consume and provider_route == "deepseek":
+            env["_fake_consume_envelope"] = request["route_envelope"]
+        kwargs["env"] = env
+        proc = _FakeClaudeProcess(*args, **kwargs)
+        proc.echo_user = echo_user
+        proc.echo_content = echo_content
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(bridge, "_RpcProcess", fake_proc)
+    if version_probe is not None:
+        monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: version_probe)
+    _session_start_hook(monkeypatch, request)
     session = bridge._ProviderSession(request)
-    readiness = session.initialize()
-    submission = session.admit(_admission(request))
-
-    assert len(procs) == 1
-    assert readiness["provider_receipt_kind"] == "claude-session-start"
-    assert readiness["provider_session_id"] == session.provider_session_id
-    assert readiness["receipt_id"] == session.provider_session_id
-    assert readiness["model_input_ready"] is True
-
-    assert submission["provider_receipt_kind"] == "claude-turn-start"
-    assert submission["provider_session_id"] == readiness["provider_session_id"]
-    assert submission["provider_turn_id"] == submission["receipt_id"]
-    assert submission["provider_accepted"] is True
-    assert len(procs[0].sent_messages) == 1
-    assert procs[0].sent_messages[0]["type"] == "user"
+    return session, request, procs
 
 
-def test_deepseek_route_fails_closed_when_gateway_missing(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    request = _claude_request(tmp_path, model="deepseek-v4-flash")
-    # Empty env with no ANTHROPIC_BASE_URL
-    monkeypatch.setattr(os, "environ", {})
-    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
-    bridge._prune_bridge_environment("claude_code")
-    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
-    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
+class TestDeepSeekReadinessAndAdmission:
+    def test_envelope_launch_readiness_and_first_turn(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(tmp_path, monkeypatch)
+        readiness = session.initialize()
+        submission = session.admit(_admission(request))
 
-    session = bridge._ProviderSession(request)
-    with pytest.raises(bridge.BridgeError, match="DeepSeek .* ANTHROPIC_BASE_URL"):
+        assert len(procs) == 1
+        # The provider session launches the pinned wrapper exactly once.
+        assert procs[0].provider_argv[0] == request["route_envelope"]["wrapper_executable"]
+        # Readiness is the SessionStart hook (exact session + cwd proof)
+        # plus the wrapper-consumed marker — system/init is first-turn
+        # evidence on Claude Code 2.1.x, never a readiness claim.
+        assert readiness["provider_receipt_kind"] == "claude-session-start"
+        assert readiness["session_start"]["session_id"] == session.provider_session_id
+        assert readiness["session_start"]["cwd"] == request["working_directory"]
+        assert readiness["session_start"]["hook_event"] == "SessionStart"
+        assert "session_init" not in readiness
+        assert readiness["model_input_ready"] is True
+        # The wrapper-consumed marker is required before readiness.
+        assert deepseek_acp_route.consumed_marker_exists(
+            request["route_envelope"]["consumed_marker_path"]
+        )
+        # The one-shot token was claimed exactly once, by the session.
+        assert not pathlib.Path(request["route_envelope"]["token_path"]).exists()
+
+        assert submission["provider_receipt_kind"] == "claude-turn-start"
+        assert submission["provider_session_id"] == readiness["provider_session_id"]
+        assert submission["provider_turn_id"] == submission["receipt_id"]
+        assert submission["provider_accepted"] is True
+        assert len(procs[0].sent_messages) == 1
+        assert procs[0].sent_messages[0]["type"] == "user"
+        # The first admission captured and validated the provider-authored
+        # system/init before the replayed user event was accepted.
+        assert session._claude_init is not None
+        assert session._claude_init["model"] == "deepseek-v4-flash"
+        assert session._claude_init["cwd"] == request["working_directory"]
+        assert session._claude_init["session_id"] == session.provider_session_id
+
+    def test_provider_child_environment_is_bounded_conductor_route(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(tmp_path, monkeypatch)
         session.initialize()
+        env = procs[0].env
+        envelope = request["route_envelope"]
+        assert env["CAO_CONDUCTOR_ROUTES"] == envelope["route_map_path"]
+        assert env["CAO_CONDUCTOR_REAL_CLAUDE"] == envelope["inner_executable"]
+        assert env["CAO_CONDUCTOR_SHIM_DIR"] == str(
+            pathlib.Path(envelope["wrapper_executable"]).parent
+        )
+        assert env["PATH"].startswith(
+            str(pathlib.Path(envelope["wrapper_executable"]).parent) + ":"
+        )
+        # No ambient Anthropic fallback: credentials and gateway pointers
+        # never cross into the DeepSeek child environment.
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+        assert "ANTHROPIC_BASE_URL" not in env
+        assert env["ANTHROPIC_MODEL"] == "deepseek-v4-flash"
 
 
-def test_deepseek_route_fails_closed_on_conflicting_ambient_cloud_keys(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    request = _claude_request(tmp_path, model="deepseek-v4-flash")
-    isolated_env = {
-        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-        "ANTHROPIC_AUTH_TOKEN": "test-deepseek-token",
-        "CLAUDE_CODE_USE_BEDROCK": "1",
-    }
-    monkeypatch.setattr(os, "environ", isolated_env)
-    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
-    bridge._prune_bridge_environment("claude_code")
-    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
-    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
+class TestDeepSeekFailClosedBeforeProviderIO:
+    def test_missing_envelope_fails_closed_with_zero_processes(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        envelope = _deepseek_envelope(tmp_path)
+        request = _claude_request(tmp_path, provider_route="deepseek", envelope=envelope)
+        request.pop("route_envelope")
+        _deepseek_env_setup(monkeypatch, request)
+        monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+        monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
+        procs: list[_FakeClaudeProcess] = []
+        monkeypatch.setattr(
+            bridge, "_RpcProcess", lambda *a, **k: procs.append(_FakeClaudeProcess(*a, **k))
+        )
+        session = bridge._ProviderSession(request)
+        with pytest.raises(bridge.BridgeError, match="requires a route_envelope"):
+            session.initialize()
+        assert procs == []
+        # Zero task bytes: the token is untouched.
+        assert pathlib.Path(envelope["token_path"]).exists()
 
-    session = bridge._ProviderSession(request)
-    with pytest.raises(bridge.BridgeError, match="conflicting cloud controls"):
+    def test_drifted_wrapper_digest_fails_before_version_probe(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        envelope = _deepseek_envelope(tmp_path)
+        envelope["wrapper_executable_sha256"] = "0" * 64
+        request = _claude_request(tmp_path, envelope=envelope)
+        _deepseek_env_setup(monkeypatch, request)
+        monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+        called: list[str] = []
+        monkeypatch.setattr(
+            bridge._ProviderSession,
+            "_version",
+            lambda self, *_: called.append("version") or "claude 2.1.233",
+        )
+        session = bridge._ProviderSession(request)
+        with pytest.raises(bridge.BridgeError, match="wrapper_executable"):
+            session.initialize()
+        assert called == []
+
+    def test_marker_already_present_refuses_replay(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        envelope = _deepseek_envelope(tmp_path)
+        pathlib.Path(envelope["consumed_marker_path"]).write_text("consumed\n")
+        request = _claude_request(tmp_path, envelope=envelope)
+        _deepseek_env_setup(monkeypatch, request)
+        monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+        monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
+        procs: list[_FakeClaudeProcess] = []
+        monkeypatch.setattr(
+            bridge, "_RpcProcess", lambda *a, **k: procs.append(_FakeClaudeProcess(*a, **k))
+        )
+        session = bridge._ProviderSession(request)
+        with pytest.raises(bridge.BridgeError, match="consumed marker"):
+            session.initialize()
+        assert procs == []
+
+    def test_missing_token_fails_closed(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        envelope = _deepseek_envelope(tmp_path)
+        pathlib.Path(envelope["token_path"]).unlink()
+        request = _claude_request(tmp_path, envelope=envelope)
+        _deepseek_env_setup(monkeypatch, request)
+        monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+        monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
+        session = bridge._ProviderSession(request)
+        with pytest.raises(bridge.BridgeError, match="token"):
+            session.initialize()
+
+    def test_version_probe_consumed_token_fails_before_session_launch(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        envelope = _deepseek_envelope(tmp_path)
+        request = _claude_request(tmp_path, envelope=envelope)
+        _deepseek_env_setup(monkeypatch, request)
+        monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+
+        def consuming_probe(self: Any, *args: Any) -> str:
+            pathlib.Path(envelope["token_path"]).unlink()
+            return "claude 2.1.233"
+
+        monkeypatch.setattr(bridge._ProviderSession, "_version", consuming_probe)
+        procs: list[_FakeClaudeProcess] = []
+        monkeypatch.setattr(
+            bridge, "_RpcProcess", lambda *a, **k: procs.append(_FakeClaudeProcess(*a, **k))
+        )
+        session = bridge._ProviderSession(request)
+        with pytest.raises(bridge.BridgeError, match="version probe"):
+            session.initialize()
+        assert procs == []
+
+    def test_route_map_entry_must_match_reservation(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        envelope = _deepseek_envelope(tmp_path, model="deepseek-v4-pro")
+        request = _claude_request(tmp_path, model="deepseek-v4-flash", envelope=envelope)
+        _deepseek_env_setup(monkeypatch, request)
+        monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+        monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
+        session = bridge._ProviderSession(request)
+        with pytest.raises(bridge.BridgeError, match="route map model"):
+            session.initialize()
+
+
+class TestFirstTurnInitValidation:
+    def test_init_wrong_session_is_uncertain_after_boundary(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        init = {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "99999999-9999-4999-8999-999999999999",
+            "model": "deepseek-v4-flash",
+            "cwd": str(tmp_path),
+        }
+        session, request, procs = _build_session(tmp_path, monkeypatch, init_event=init)
+        init["cwd"] = request["working_directory"]
         session.initialize()
+        with pytest.raises(bridge.SubmitUncertain, match="different provider session"):
+            session.admit(_admission(request))
+        # The task bytes crossed the boundary exactly once; the outcome is
+        # ambiguous, never a clean refusal that invites a replay.
+        assert len(procs[0].sent_messages) == 1
+
+    def test_init_wrong_model_is_uncertain_after_boundary(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        init = {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "__from_argv__",
+            "model": "deepseek-v4-pro",
+            "cwd": None,
+        }
+        session, request, procs = _build_session(tmp_path, monkeypatch, init_event=init)
+        init["cwd"] = request["working_directory"]
+        session.initialize()
+        with pytest.raises(bridge.SubmitUncertain, match="wrong model"):
+            session.admit(_admission(request))
+        assert len(procs[0].sent_messages) == 1
+
+    def test_init_wrong_cwd_is_uncertain_after_boundary(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        init = {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "__from_argv__",
+            "model": "deepseek-v4-flash",
+            "cwd": "/some/other/worktree",
+        }
+        session, request, procs = _build_session(tmp_path, monkeypatch, init_event=init)
+        session.initialize()
+        with pytest.raises(bridge.SubmitUncertain, match="wrong working directory"):
+            session.admit(_admission(request))
+        assert len(procs[0].sent_messages) == 1
+
+    def test_missing_init_is_uncertain_after_boundary(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(tmp_path, monkeypatch, emit_init=False)
+        session.initialize()
+        with pytest.raises(bridge.SubmitUncertain, match="system/init"):
+            session.admit(_admission(request))
+        assert len(procs[0].sent_messages) == 1
+
+    def test_missing_replayed_user_event_is_uncertain_after_boundary(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(tmp_path, monkeypatch, echo_user=False)
+        session.initialize()
+        with pytest.raises(bridge.SubmitUncertain):
+            session.admit(_admission(request))
+        assert len(procs[0].sent_messages) == 1
+
+    def test_divergent_replayed_user_event_is_uncertain_after_boundary(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(
+            tmp_path, monkeypatch, echo_content="a different task text"
+        )
+        session.initialize()
+        with pytest.raises(bridge.SubmitUncertain):
+            session.admit(_admission(request))
+        assert len(procs[0].sent_messages) == 1
+
+    def test_uncertain_admission_never_retries_cleanly(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(tmp_path, monkeypatch, emit_init=False)
+        session.initialize()
+        for _ in range(2):
+            with pytest.raises(bridge.SubmitUncertain):
+                session.admit(_admission(request))
+        # Two sends crossed the boundary in this unit-level replay, and each
+        # was refused as uncertain — never as a clean submission.  The
+        # bridge-level delivery journal forbids the blind retry entirely.
+        assert len(procs[0].sent_messages) == 2
+
+    def test_marker_missing_after_session_start_is_refused_at_readiness(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(tmp_path, monkeypatch, consume=False)
+        with pytest.raises(bridge.BridgeError, match="wrapper-consumed marker"):
+            session.initialize()
+
+
+class TestAnthropicCompatibility:
+    def test_anthropic_route_keeps_real_binary_and_no_marker(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(
+            tmp_path,
+            monkeypatch,
+            model="claude-3-7-sonnet-20250219",
+            provider_route="anthropic",
+        )
+        readiness = session.initialize()
+        assert procs[0].provider_argv[0] == request["provider_executable"]
+        assert readiness["provider_receipt_kind"] == "claude-session-start"
+        assert readiness["session_start"]["cwd"] == request["working_directory"]
+        # Ordinary Anthropic ACP keeps its ambient credential path.
+        assert procs[0].env.get("ANTHROPIC_API_KEY") == "sk-ant-ambient-fallback"
+        # The first admission still captures and validates system/init for
+        # the exact session/model/cwd on the Anthropic route.
+        submission = session.admit(_admission(request))
+        assert submission["provider_receipt_kind"] == "claude-turn-start"
+        assert session._claude_init is not None
+        assert session._claude_init["model"] == "claude-3-7-sonnet-20250219"
+
+    def test_deepseek_model_on_anthropic_route_is_refused(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        request = _claude_request(tmp_path, model="deepseek-v4-flash", provider_route="anthropic")
+        _deepseek_env_setup(monkeypatch, request)
+        monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+        monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
+        session = bridge._ProviderSession(request)
+        with pytest.raises(bridge.BridgeError, match="deepseek"):
+            session.initialize()
+
+
+class TestProfilePermissionPosture:
+    def test_restricted_profile_passes_allowed_tools_and_no_skip(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(
+            tmp_path,
+            monkeypatch,
+            allowed_tools=["execute_bash", "fs_read"],
+        )
+        session.initialize()
+        argv = procs[0].argv
+        assert "--dangerously-skip-permissions" not in argv
+        allowed_index = argv.index("--allowedTools")
+        tools = set(argv[allowed_index + 1].split(","))
+        # execute_bash maps to the Bash family; fs_read maps to Read.
+        assert {"Bash", "BashOutput", "KillShell", "Read"} <= tools
+        assert "WebFetch" not in tools
+
+    def test_star_profile_keeps_explicit_skip_permissions(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session, request, procs = _build_session(tmp_path, monkeypatch, allowed_tools=["*"])
+        session.initialize()
+        argv = procs[0].argv
+        assert "--dangerously-skip-permissions" in argv
+        assert "--allowedTools" not in argv
 
 
 def test_claude_acp_renderer_formats_stream_json_events() -> None:
@@ -320,28 +780,7 @@ def test_claude_acp_renderer_formats_stream_json_events() -> None:
 def test_claude_acp_session_operation_route_query(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    request = _claude_request(tmp_path)
-    isolated_env = {
-        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-        "ANTHROPIC_AUTH_TOKEN": "test-deepseek-token",
-    }
-    monkeypatch.setattr(os, "environ", isolated_env)
-    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
-    bridge._prune_bridge_environment("claude_code")
-    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
-    monkeypatch.setattr(bridge, "_RpcProcess", _FakeClaudeProcess)
-    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.claude_native_readiness.await_session_start",
-        lambda _path, session_id, **_kw: {
-            "session_id": session_id,
-            "hook_event_name": "SessionStart",
-            "source": "startup",
-            "cwd": str(tmp_path),
-        },
-    )
-
-    session = bridge._ProviderSession(request)
+    session, request, procs = _build_session(tmp_path, monkeypatch)
     session.initialize()
 
     journal_path = tmp_path / "control-journal.json"
@@ -375,33 +814,29 @@ def test_claude_acp_session_operation_follow_up_and_cancel(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     request = _claude_request(tmp_path)
+    _deepseek_env_setup(monkeypatch, request)
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     procs: list[_FakeClaudeProcess] = []
 
     def fake_proc(*args: Any, **kwargs: Any) -> _FakeClaudeProcess:
+        env = dict(kwargs.get("env") or {})
+        env["_fake_init_event"] = {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "__from_argv__",
+            "model": request["model"],
+            "cwd": request["working_directory"],
+        }
+        env["_fake_consume_envelope"] = request["route_envelope"]
+        kwargs["env"] = env
         proc = _FakeClaudeProcess(*args, **kwargs)
-        proc.auto_complete = False  # Keep turn active until cancel/signal
+        proc.auto_complete = False  # keep the turn active until cancel
         procs.append(proc)
         return proc
 
-    isolated_env = {
-        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-        "ANTHROPIC_AUTH_TOKEN": "test-deepseek-token",
-    }
-    monkeypatch.setattr(os, "environ", isolated_env)
-    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
-    bridge._prune_bridge_environment("claude_code")
-    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     monkeypatch.setattr(bridge, "_RpcProcess", fake_proc)
     monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.claude_native_readiness.await_session_start",
-        lambda _path, session_id, **_kw: {
-            "session_id": session_id,
-            "hook_event_name": "SessionStart",
-            "source": "startup",
-            "cwd": str(tmp_path),
-        },
-    )
+    _session_start_hook(monkeypatch, request)
 
     session = bridge._ProviderSession(request)
     session.initialize()
@@ -432,7 +867,7 @@ def test_claude_acp_session_operation_follow_up_and_cancel(
     assert receipt["state"] == bridge.CONTROL_ACCEPTED
     assert receipt["provider_turn_id"] is not None
 
-    # Refuse second concurrent follow-up while turn is active
+    # Refuse second concurrent follow-up while the turn is active
     second_op_id = str(uuid.uuid4())
     second_op = journal.begin(
         operation_id=second_op_id,
@@ -455,7 +890,7 @@ def test_claude_acp_session_operation_follow_up_and_cancel(
     assert second_receipt["state"] == bridge.CONTROL_REFUSED
     assert second_receipt["reason_code"] == "turn_busy"
 
-    # Cancel while turn is active
+    # Cancel while the turn is active
     cancel_op_id = str(uuid.uuid4())
     cancel_op = journal.begin(
         operation_id=cancel_op_id,
@@ -476,42 +911,10 @@ def test_claude_acp_session_operation_follow_up_and_cancel(
     cancel_receipt = session.session_operation(cancel_command, journal)
     assert cancel_receipt["state"] == bridge.CONTROL_ACCEPTED
 
-    # Reconcile after cancel completes (clear active prompt lock)
+    # Reconcile after cancel completes (clear the active prompt lock)
     session._active_prompt_request_id = None
     reconciled = session.reconcile_session_operation(journal, cancel_op_id)
     assert reconciled["state"] == bridge.CONTROL_COMPLETED
-
-
-def test_claude_acp_standard_claude_model_without_gateway(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    request = _claude_request(
-        tmp_path, model="claude-3-7-sonnet-20250219", provider_route="anthropic"
-    )
-    # Standard Claude model with standard environment (no ANTHROPIC_BASE_URL required)
-    isolated_env = {
-        "ANTHROPIC_API_KEY": "sk-ant-test-key",
-    }
-    monkeypatch.setattr(os, "environ", isolated_env)
-    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
-    bridge._prune_bridge_environment("claude_code")
-    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
-    monkeypatch.setattr(bridge, "_RpcProcess", _FakeClaudeProcess)
-    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "claude 2.1.233")
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.claude_native_readiness.await_session_start",
-        lambda _path, session_id, **_kw: {
-            "session_id": session_id,
-            "hook_event_name": "SessionStart",
-            "source": "startup",
-            "cwd": str(tmp_path),
-        },
-    )
-
-    session = bridge._ProviderSession(request)
-    readiness = session.initialize()
-    assert readiness["provider_receipt_kind"] == "claude-session-start"
-    assert readiness["model"] == "claude-3-7-sonnet-20250219"
 
 
 def test_claude_code_is_in_authoritative_readiness_and_submission_maps() -> None:
