@@ -1107,14 +1107,10 @@ class TestDeleteTerminal:
 
     def test_delete_terminal_pane_requires_session(self, client):
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            response = client.delete(
-                "/terminals/abcd1234?expected_pane_id=%2511"
-            )
+            response = client.delete("/terminals/abcd1234?expected_pane_id=%2511")
 
         assert response.status_code == 400
-        assert response.json()["detail"] == (
-            "pane-fenced deletion requires expected_session"
-        )
+        assert response.json()["detail"] == ("pane-fenced deletion requires expected_session")
         mock_svc.retire_observed_terminal.assert_not_called()
         mock_svc.delete_terminal.assert_not_called()
 

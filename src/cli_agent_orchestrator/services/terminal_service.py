@@ -3597,8 +3597,11 @@ def retire_observed_terminal(
             # generation into the lower-level generic delete is deliberately
             # refused as ID-only destruction, so do not discard the stronger
             # pane-fenced proof by translating it into that weaker shape.
-            expected_session=(expected_session or observed.get("tmux_session"))
-            if generation is not None else None,
+            expected_session=(
+                (expected_session or observed.get("tmux_session"))
+                if generation is not None
+                else None
+            ),
             backend_already_closed=backend_already_closed,
             unregister_inbox=unregister_inbox,
         )
