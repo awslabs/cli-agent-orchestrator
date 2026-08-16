@@ -196,6 +196,12 @@ _REPAIR_REFUSED_HTTP: dict[str, int] = {
     "persistence-failed": status.HTTP_503_SERVICE_UNAVAILABLE,
     "attachment-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
     "attachment-reconcile": status.HTTP_409_CONFLICT,
+    # cond-0427.  Listed explicitly rather than left to the 409 default, so
+    # the choice is reviewable: 409 and deliberately NOT 503.  The operation
+    # is at-most-once under one operation id, and an exact retry answers
+    # ``observation-attempt-ambiguous`` rather than re-sending /status, so a
+    # 503 would invite a retry this endpoint will never honour.
+    "submission-unproven": status.HTTP_409_CONFLICT,
 }
 
 
