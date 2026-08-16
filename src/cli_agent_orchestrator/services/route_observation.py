@@ -115,7 +115,6 @@ MAX_VERSION_LEN = 96
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:%/-]{0,127}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
-_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._/+:()-]{0,95}$")
 
 
 class RouteObservationError(RuntimeError):
@@ -183,12 +182,11 @@ def _require_identifier(value: Any, *, field: str) -> str:
 
 
 def _require_version(value: Any, *, field: str) -> str:
+    """A bounded, nonempty provider version banner."""
     if not isinstance(value, str) or not value:
         raise RouteObservationInvalid(f"{field} must be a non-empty string; got {value!r}")
     if len(value) > MAX_VERSION_LEN:
         raise RouteObservationInvalid(f"{field} must be at most {MAX_VERSION_LEN} characters")
-    if _VERSION_RE.fullmatch(value) is None:
-        raise RouteObservationInvalid(f"{field} is not a well-formed version; got {value!r}")
     return value
 
 
@@ -434,24 +432,25 @@ def _with_session(fn: Callable[[Any], _T], db: Any, *, unavailable: str) -> _T:
 
     Pass an open Session via ``db`` to make the write part of the caller's own
     transaction (a savepoint plus the caller's commit/rollback bind the rows
-    atomically). Otherwise one fresh session is opened, written, and committed.
-    Retries are bounded because SQLite serialises writers.
+    atomically). The caller-owned path uses exactly one savepoint: the same
+    transaction cannot obtain a fresh snapshot of a concurrently won terminal
+    transition, so a write race there is surfaced rather than re-run.
+    Otherwise a fresh session is opened, written, and committed, and SQLite
+    writer/lock races are bounded by a small retry loop.
     """
     if db is not None:
         _anchor_caller_transaction(db)
-        last_error: Optional[BaseException] = None
-        for _attempt in range(_MAX_WRITE_ATTEMPTS):
-            try:
-                with db.begin_nested():
-                    return fn(db)
-            except _TerminalReplay:
-                continue
-            except RouteObservationError:
-                raise
-            except (IntegrityError, OperationalError) as exc:
-                last_error = exc
-                continue
-        raise RouteObservationUnavailable(f"{unavailable}: {last_error}")
+        try:
+            with db.begin_nested():
+                return fn(db)
+        except _TerminalReplay as exc:
+            raise RouteObservationConflict(
+                f"{exc}; re-read the operation outside this transaction"
+            ) from exc
+        except RouteObservationError:
+            raise
+        except (IntegrityError, OperationalError) as exc:
+            raise RouteObservationUnavailable(f"{unavailable}: {str(exc).splitlines()[0]}") from exc
 
     last_error = None
     for _attempt in range(_MAX_WRITE_ATTEMPTS):
@@ -485,12 +484,6 @@ def _row(request: RouteObservationRequest, *, state: str, created_at: str) -> An
         requester_terminal_id=request.requester_terminal_id,
         requester_generation=request.requester_generation,
         state=state,
-        detail=None,
-        final_event_json=None,
-        final_event_digest=None,
-        receipt_json=None,
-        receipt_digest=None,
-        inbox_message_id=None,
         created_at=created_at,
         updated_at=created_at,
     )
@@ -546,8 +539,7 @@ def _claim(db: Any, request: RouteObservationRequest) -> dict[str, Any]:
         if existing.request_digest != request.request_digest():
             raise RouteObservationConflict(
                 f"operation {request.operation_id} already holds a different request "
-                f"(stored digest {existing.request_digest}); a divergent replay is refused — "
-                "mint a new operation id for a different operation"
+                f"(digest {existing.request_digest})"
             )
         record = _row_dict(existing)
         record["replayed"] = True
@@ -571,10 +563,8 @@ def _losing_refusal(
 ) -> dict[str, Any]:
     """A different operation id on an owned tuple becomes an immutable refusal.
 
-    Inserted terminal (outside the active-owner partial index), it journals its
-    own exact binding, keeps the winning id only as non-authoritative detail,
-    mints no receipt, and still claims its own requester's deterministic wake.
-    A later replay under its own id re-reads the same refusal.
+    Inserted terminal (outside the active-owner index), it keeps the winning id
+    only as non-authoritative detail and still claims its own requester's wake.
     """
     now = _now()
     refusal_event = build_canonical(
@@ -590,33 +580,61 @@ def _losing_refusal(
     inbox_id = _add_wake_claim(
         db, request, result=RESULT_ZERO_EFFECT_REFUSAL, event_digest=event_digest
     )
-    row = database.RouteObservationOperationModel(
-        operation_id=request.operation_id,
-        schema_version=SCHEMA_VERSION,
-        request_digest=request.request_digest(),
-        target_terminal_id=request.target_terminal_id,
-        target_generation=request.target_generation,
-        native_session_id=request.native_session_id,
-        provider=request.provider,
-        provider_version=request.provider_version,
-        provider_artifact_sha256=request.provider_artifact_sha256,
-        requester_terminal_id=request.requester_terminal_id,
-        requester_generation=request.requester_generation,
-        state=RESULT_ZERO_EFFECT_REFUSAL,
-        detail=winning_operation_id,
-        final_event_json=encode_canonical(refusal_event).decode("utf-8"),
-        final_event_digest=event_digest,
-        receipt_json=None,
-        receipt_digest=None,
-        inbox_message_id=inbox_id,
-        created_at=now,
-        updated_at=now,
-    )
+    row = _row(request, state=RESULT_ZERO_EFFECT_REFUSAL, created_at=now)
+    row.detail = winning_operation_id
+    row.final_event_json = encode_canonical(refusal_event).decode("utf-8")
+    row.final_event_digest = event_digest
+    row.inbox_message_id = inbox_id
+    row.updated_at = now
     db.add(row)
     db.flush()
     record = _row_dict(row)
     record["replayed"] = False
     return record
+
+
+def _require_binding_receipt(
+    receipt: Any,
+    request: RouteObservationRequest,
+    *,
+    event_digest: str,
+) -> Mapping[str, Any]:
+    """A positive receipt must re-state the exact operation/request binding.
+
+    Every published binding field is compared byte-for-byte to the operation's
+    own truth before any write; a missing or divergent field is refused.
+    """
+    bound = _require_mapping(receipt, field="receipt")
+    if bound.get("schema") != RECEIPT_SCHEMA:
+        raise RouteObservationInvalid(f"receipt schema must be {RECEIPT_SCHEMA!r}")
+    if bound.get("kind") != RESULT_OBSERVED_CLOSED:
+        raise RouteObservationInvalid(f"receipt kind must be {RESULT_OBSERVED_CLOSED!r}")
+    truth = {
+        "operation_id": request.operation_id,
+        "request_digest": request.request_digest(),
+        "requester_terminal_id": request.requester_terminal_id,
+        "requester_generation": request.requester_generation,
+        "target_terminal_id": request.target_terminal_id,
+        "target_generation": request.target_generation,
+        "native_session_id": request.native_session_id,
+        "provider": request.provider,
+        "provider_version": request.provider_version,
+        "provider_artifact_sha256": request.provider_artifact_sha256,
+        "final_event_digest": event_digest,
+    }
+    for field, expected in truth.items():
+        if bound.get(field) != expected:
+            raise RouteObservationInvalid(f"receipt {field} must be {expected!r}")
+    observation = bound.get("observation")
+    if not isinstance(observation, Mapping) or not observation:
+        raise RouteObservationInvalid("receipt observation must be a nonempty mapping")
+    close_proof = bound.get("close_proof")
+    if not isinstance(close_proof, Mapping) or not close_proof:
+        raise RouteObservationInvalid("receipt close_proof must be a nonempty mapping")
+    committed_at = bound.get("committed_at")
+    if not isinstance(committed_at, str) or not committed_at:
+        raise RouteObservationInvalid("receipt committed_at must be a nonempty string")
+    return bound
 
 
 def complete(
@@ -655,21 +673,13 @@ def complete(
     if result == RESULT_OBSERVED_CLOSED:
         if receipt is None:
             raise RouteObservationInvalid(
-                f"{RESULT_OBSERVED_CLOSED} is the only case that mints the positive receipt; "
-                "a positive receipt is required"
+                f"result {RESULT_OBSERVED_CLOSED} requires the positive receipt"
             )
-        receipt = _require_mapping(receipt, field="receipt")
-        if receipt.get("schema") != RECEIPT_SCHEMA or receipt.get("kind") != RESULT_OBSERVED_CLOSED:
-            raise RouteObservationInvalid(
-                f"a positive receipt must name schema {RECEIPT_SCHEMA!r} and kind "
-                f"{RESULT_OBSERVED_CLOSED!r}; got {receipt!r}"
-            )
+        receipt = _require_binding_receipt(receipt, request, event_digest=event_digest)
         receipt_json = encode_canonical(receipt).decode("utf-8")
         receipt_digest = canonical_sha256(receipt)
     elif receipt is not None:
-        raise RouteObservationInvalid(
-            f"result {result!r} is not positive and rejects a positive receipt"
-        )
+        raise RouteObservationInvalid(f"result {result!r} rejects a positive receipt")
 
     return _with_session(
         lambda session: _complete(
@@ -698,25 +708,25 @@ def _complete(
 ) -> dict[str, Any]:
     existing = _by_operation(db, request.operation_id)
     if existing is None:
-        raise RouteObservationConflict(
-            f"no claimed operation {request.operation_id}; a lost claim response is "
-            "recovered by re-issuing the claim (it replays) before completing"
-        )
+        raise RouteObservationConflict(f"no claimed operation {request.operation_id}")
     if existing.request_digest != request.request_digest():
         raise RouteObservationConflict(
-            f"operation {request.operation_id} holds a different request than this "
-            "completion; a divergent replay is refused"
+            f"operation {request.operation_id} holds a different request; a divergent "
+            "replay is refused"
         )
     if _is_terminal(existing.state):
+        if result != existing.state:
+            raise RouteObservationConflict(
+                f"operation {request.operation_id} is already {existing.state}, not {result}"
+            )
         if existing.final_event_digest != event_digest:
             raise RouteObservationConflict(
                 f"operation {request.operation_id} already terminalized with a different "
-                "final event; a divergent terminal attempt is refused"
+                "final event"
             )
         if existing.receipt_digest != receipt_digest:
             raise RouteObservationConflict(
-                f"operation {request.operation_id} already terminalized with a different "
-                "receipt; a divergent terminal attempt is refused"
+                f"operation {request.operation_id} already terminalized with a different receipt"
             )
         record = _row_dict(existing)
         record["replayed"] = True
@@ -735,7 +745,6 @@ def _complete(
         .update(
             {
                 "state": result,
-                "detail": None,
                 "final_event_json": event_json,
                 "final_event_digest": event_digest,
                 "receipt_json": receipt_json,
@@ -747,9 +756,7 @@ def _complete(
         )
     )
     if updated != 1:
-        raise _TerminalReplay(
-            f"operation {request.operation_id} was terminalized concurrently; re-reading it"
-        )
+        raise _TerminalReplay(f"operation {request.operation_id} was terminalized concurrently")
     db.refresh(existing)
     record = _row_dict(existing)
     record["replayed"] = False

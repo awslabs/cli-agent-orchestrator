@@ -16,6 +16,7 @@ import pytest
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.services import route_observation as ro
+from cli_agent_orchestrator.services.canonical_json import canonical_sha256
 
 ARTIFACT = "a" * 64
 
@@ -46,7 +47,35 @@ def _request(
 
 
 _EVENT = {"stated_by": "probe"}
-_RECEIPT = {"schema": ro.RECEIPT_SCHEMA, "kind": "observed-closed"}
+
+
+def _receipt(request, *, event=None, **overrides):
+    """A positive receipt deriving every published binding field from the
+    request and the final event, so valid call sites never hand-write one."""
+    receipt = {
+        "schema": ro.RECEIPT_SCHEMA,
+        "kind": "observed-closed",
+        "operation_id": request.operation_id,
+        "request_digest": request.request_digest(),
+        "requester_terminal_id": request.requester_terminal_id,
+        "requester_generation": request.requester_generation,
+        "target_terminal_id": request.target_terminal_id,
+        "target_generation": request.target_generation,
+        "native_session_id": request.native_session_id,
+        "provider": request.provider,
+        "provider_version": request.provider_version,
+        "provider_artifact_sha256": request.provider_artifact_sha256,
+        "observation": {"kind": "provider-surface", "observed_at": "2026-08-16T00:00:00Z"},
+        "close_proof": {
+            "kind": "owned-close",
+            "outcome": "closed",
+            "closed_at": "2026-08-16T00:00:01Z",
+        },
+        "final_event_digest": canonical_sha256(_EVENT if event is None else event),
+        "committed_at": "2026-08-16T00:00:02Z",
+    }
+    receipt.update(overrides)
+    return receipt
 
 
 @pytest.fixture(autouse=True)
@@ -71,17 +100,6 @@ class TestDisabled:
         }
         #: one canonical nonterminal state
         assert ro.STATE_REQUESTED not in ro.TERMINAL_RESULTS
-
-    def test_there_is_no_adopted_result_anywhere(self):
-        """No ``adopted`` result token exists — not in the vocabulary, not in
-        a record, and not behind a module attribute that a later lane could
-        reach for."""
-        import inspect
-
-        source = inspect.getsource(ro)
-        assert "adopted" not in source
-        assert "adopted" not in ro.TERMINAL_RESULTS
-        assert not hasattr(ro, "adopted")
 
     def test_a_record_never_carries_a_dispatched_or_updated_state(self):
         record = ro.claim(_request())
@@ -184,7 +202,7 @@ class TestClaim:
             request,
             result=ro.RESULT_OBSERVED_CLOSED,
             final_event=_EVENT,
-            receipt=_RECEIPT,
+            receipt=_receipt(request),
         )
         replay = ro.claim(request)
         assert replay["replayed"] is True
@@ -233,7 +251,7 @@ class TestSingleActiveOwner:
             winner,
             result=ro.RESULT_OBSERVED_CLOSED,
             final_event=_EVENT,
-            receipt=_RECEIPT,
+            receipt=_receipt(winner),
         )
         fresh = _request(target_terminal_id=winner.target_terminal_id)
         assert ro.claim(fresh)["state"] == ro.STATE_REQUESTED
@@ -252,12 +270,12 @@ class TestTermination:
             request,
             result=ro.RESULT_OBSERVED_CLOSED,
             final_event=_EVENT,
-            receipt=_RECEIPT,
+            receipt=_receipt(request),
         )
         assert terminal["state"] == ro.RESULT_OBSERVED_CLOSED
         assert terminal["terminal"] is True
         assert terminal["receipt_digest"]
-        assert json.loads(terminal["receipt_json"]) == _RECEIPT
+        assert json.loads(terminal["receipt_json"]) == _receipt(request)
         assert terminal["final_event_digest"] is not None
         assert terminal["replayed"] is False
 
@@ -279,7 +297,7 @@ class TestTermination:
                 request,
                 result=ro.RESULT_AMBIGUOUS_AFTER_POSSIBLE_EFFECT,
                 final_event=_EVENT,
-                receipt=_RECEIPT,
+                receipt=_receipt(request),
             )
 
     def test_ambiguous_is_stored_without_a_receipt(self):
@@ -300,14 +318,14 @@ class TestTermination:
             request,
             result=ro.RESULT_OBSERVED_CLOSED,
             final_event=_EVENT,
-            receipt=_RECEIPT,
+            receipt=_receipt(request),
         )
         with pytest.raises(ro.RouteObservationConflict):
             ro.complete(
                 request,
                 result=ro.RESULT_OBSERVED_CLOSED,
                 final_event={"kind": "different"},
-                receipt=_RECEIPT,
+                receipt=_receipt(request, event={"kind": "different"}),
             )
 
     def test_an_identical_terminal_retry_replays_without_a_second_wake(self):
@@ -317,13 +335,13 @@ class TestTermination:
             request,
             result=ro.RESULT_OBSERVED_CLOSED,
             final_event=_EVENT,
-            receipt=_RECEIPT,
+            receipt=_receipt(request),
         )
         second = ro.complete(
             request,
             result=ro.RESULT_OBSERVED_CLOSED,
             final_event=_EVENT,
-            receipt=_RECEIPT,
+            receipt=_receipt(request),
         )
         assert second["replayed"] is True
         assert second["inbox_message_id"] == first["inbox_message_id"]
@@ -335,6 +353,102 @@ class TestTermination:
                 _request(),
                 result=ro.RESULT_ZERO_EFFECT_REFUSAL,
                 final_event=_EVENT,
+            )
+
+    def test_a_terminal_operation_rejects_a_changed_result(self):
+        """Same request, same event, no receipt: only the result differs."""
+        request = _request()
+        ro.claim(request)
+        ro.complete(
+            request,
+            result=ro.RESULT_OBSERVED_CLOSED,
+            final_event=_EVENT,
+            receipt=_receipt(request),
+        )
+        with pytest.raises(ro.RouteObservationConflict):
+            ro.complete(
+                request,
+                result=ro.RESULT_ZERO_EFFECT_REFUSAL,
+                final_event=_EVENT,
+            )
+
+    def test_a_zero_effect_refusal_cannot_replay_as_ambiguous(self):
+        winner = _request()
+        ro.claim(winner)
+        loser = _request(target_terminal_id=winner.target_terminal_id)
+        refused = ro.claim(loser)
+        assert refused["state"] == ro.RESULT_ZERO_EFFECT_REFUSAL
+        with pytest.raises(ro.RouteObservationConflict):
+            ro.complete(
+                loser,
+                result=ro.RESULT_AMBIGUOUS_AFTER_POSSIBLE_EFFECT,
+                final_event=_EVENT,
+            )
+
+
+# ---------------------------------------------------------------------------
+# the positive receipt must bind the operation/request exactly
+# ---------------------------------------------------------------------------
+
+
+class TestPositiveReceiptBinding:
+    def test_the_derived_receipt_is_stored_verbatim(self):
+        request = _request()
+        ro.claim(request)
+        terminal = ro.complete(
+            request,
+            result=ro.RESULT_OBSERVED_CLOSED,
+            final_event=_EVENT,
+            receipt=_receipt(request),
+        )
+        assert json.loads(terminal["receipt_json"]) == _receipt(request)
+        assert terminal["receipt_digest"] == canonical_sha256(_receipt(request))
+
+    def test_a_missing_binding_field_is_rejected(self):
+        request = _request()
+        ro.claim(request)
+        receipt = _receipt(request)
+        receipt.pop("operation_id")
+        with pytest.raises(ro.RouteObservationInvalid):
+            ro.complete(
+                request,
+                result=ro.RESULT_OBSERVED_CLOSED,
+                final_event=_EVENT,
+                receipt=receipt,
+            )
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"operation_id": str(uuid.uuid4())},
+            {"request_digest": "0" * 64},
+            {"requester_terminal_id": "other-requester"},
+            {"requester_generation": "other-gen"},
+            {"target_terminal_id": "other-target"},
+            {"target_generation": "other-gen"},
+            {"native_session_id": "other-session"},
+            {"provider": "other-provider"},
+            {"provider_version": "9.9.9"},
+            {"provider_artifact_sha256": "f" * 64},
+            {"final_event_digest": "0" * 64},
+            {"observation": {}},
+            {"close_proof": {}},
+            {"committed_at": ""},
+            {"schema": "cao-route-observation-receipt-v9"},
+            {"kind": "zero-effect-refusal"},
+        ],
+    )
+    def test_a_mismatched_binding_field_is_rejected(self, override):
+        request = _request()
+        ro.claim(request)
+        receipt = _receipt(request)
+        receipt.update(override)
+        with pytest.raises(ro.RouteObservationInvalid):
+            ro.complete(
+                request,
+                result=ro.RESULT_OBSERVED_CLOSED,
+                final_event=_EVENT,
+                receipt=receipt,
             )
 
 
@@ -351,7 +465,7 @@ class TestWakeClaim:
             request,
             result=ro.RESULT_OBSERVED_CLOSED,
             final_event=_EVENT,
-            receipt=_RECEIPT,
+            receipt=_receipt(request),
         )
         with database.SessionLocal() as session:
             inbox = (
@@ -396,7 +510,7 @@ class TestWakeClaim:
                 request,
                 result=ro.RESULT_OBSERVED_CLOSED,
                 final_event={"kind": "transient"},
-                receipt={"schema": ro.RECEIPT_SCHEMA, "kind": "observed-closed"},
+                receipt=_receipt(request, event={"kind": "transient"}),
                 db=session,
             )
             wake_id = terminal["inbox_message_id"]

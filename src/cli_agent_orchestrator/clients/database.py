@@ -1718,27 +1718,13 @@ class NativeStatusObservationAttemptModel(Base):
 
 
 class RouteObservationOperationModel(Base):
-    """One at-most-once dark route observe/close/result operation (COND-0230 M10).
+    """One dark route observe/close/result operation (COND-0230 M10).
 
-    A row journals one operation id bound to the exact target tuple (target
-    terminal id + generation, native session id, provider, provider version,
-    provider artifact SHA-256) and the exact requester (requester terminal id +
-    generation). The request digest makes a retry a *replay*: the caller that
-    died before reading the answer re-reads the same record, and a retry whose
-    canonical bytes differ is refused before any mutation.
-
-    The partial unique index on the target tuple ``WHERE state = 'requested'``
-    is the one active-owner authority: at most one nonterminal operation owns an
-    exact target tuple. A different operation id that loses ownership is itself
-    stored as an immutable ``zero-effect-refusal`` (terminal, outside the
-    index), with the winning id kept only as non-authoritative ``detail``.
-
-    Terminalization is write-once in one transaction: the closed-vocabulary
-    state, the canonical final event and its digest, the optional positive
-    receipt, and the deterministic wake claim row in ``inbox`` (whose id is
-    stored on this row) commit together or not at all. No event/receipt/wake
-    table exists; the terminal vocabulary is exactly ``observed-closed``,
-    ``zero-effect-refusal``, ``ambiguous-after-possible-effect``.
+    Journals one operation id bound to the exact target tuple and exact
+    requester. The partial unique index on the target tuple
+    ``WHERE state = 'requested'`` enforces one nonterminal owner. The terminal
+    fields (closed-vocabulary state, canonical final event, optional positive
+    receipt, inbox wake-claim id) are written once, in one atomic transaction.
     """
 
     __tablename__ = "route_observation_operations"

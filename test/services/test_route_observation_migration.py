@@ -21,6 +21,7 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.services import route_observation as ro
+from cli_agent_orchestrator.services.canonical_json import canonical_sha256
 
 _RO_COLUMNS = {
     "operation_id",
@@ -225,11 +226,29 @@ def _restart_cycle(path, monkeypatch):
             database, "SessionLocal", sessionmaker(autocommit=False, autoflush=False, bind=engine)
         )
         ro.claim(request)
+        event = {"kind": "restart-probe"}
         written = ro.complete(
             request,
             result=ro.RESULT_OBSERVED_CLOSED,
-            final_event={"kind": "restart-probe"},
-            receipt={"schema": ro.RECEIPT_SCHEMA, "kind": "observed-closed"},
+            final_event=event,
+            receipt={
+                "schema": ro.RECEIPT_SCHEMA,
+                "kind": "observed-closed",
+                "operation_id": request.operation_id,
+                "request_digest": request.request_digest(),
+                "requester_terminal_id": request.requester_terminal_id,
+                "requester_generation": request.requester_generation,
+                "target_terminal_id": request.target_terminal_id,
+                "target_generation": request.target_generation,
+                "native_session_id": request.native_session_id,
+                "provider": request.provider,
+                "provider_version": request.provider_version,
+                "provider_artifact_sha256": request.provider_artifact_sha256,
+                "observation": {"kind": "provider-surface", "observed_at": "restart"},
+                "close_proof": {"kind": "owned-close", "outcome": "closed"},
+                "final_event_digest": canonical_sha256(event),
+                "committed_at": "2026-08-16T00:00:00Z",
+            },
         )
 
     with _engine(path) as engine:
