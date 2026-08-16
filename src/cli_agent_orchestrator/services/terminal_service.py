@@ -35,6 +35,7 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
+    list_terminals_by_session,
     list_siblings_by_group_prefix,
     update_last_active,
     update_terminal_group,
@@ -168,6 +169,85 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
 }
+
+
+def recover_persisted_terminal_output_streams() -> int:
+    """Reattach FIFO/status monitoring to tmux terminals surviving a restart.
+
+    Terminal rows and tmux panes intentionally outlive the CAO API process. On
+    restart, however, the old process's FIFO readers disappear and tmux keeps
+    forwarding to their now-unread FIFO paths.  Re-arm each live, persisted
+    pane, then seed status from a read-only rendered snapshot so InboxService
+    can deliver messages already waiting for an idle supervisor.
+
+    Returns the number of panes successfully recovered. Missing/stale database
+    rows are expected and skipped; this function must never prevent server
+    startup or send input to an existing agent.
+    """
+    backend = get_backend()
+    if backend.supports_event_inbox():
+        return 0
+
+    recovered = 0
+    try:
+        sessions = backend.list_sessions()
+    except Exception as exc:
+        logger.warning("Cannot enumerate persisted terminal streams at startup: %s", exc)
+        return 0
+
+    for session in sessions:
+        session_name = session.get("id")
+        if not session_name:
+            continue
+        try:
+            terminals = list_terminals_by_session(session_name)
+        except Exception as exc:
+            logger.warning("Cannot list persisted terminals for %s: %s", session_name, exc)
+            continue
+
+        for terminal in terminals:
+            terminal_id = terminal["id"]
+            window_name = terminal["tmux_window"]
+            try:
+                # This doubles as a non-mutating liveness check for a stale DB
+                # row whose tmux window was already removed.
+                snapshot = backend.get_history(
+                    session_name, window_name, tail_lines=PIPE_LIVENESS_TAIL_LINES
+                )
+            except Exception as exc:
+                logger.info(
+                    "Skipping persisted terminal %s: pane %s:%s is unavailable (%s)",
+                    terminal_id,
+                    session_name,
+                    window_name,
+                    exc,
+                )
+                continue
+
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+            def _probe_pane(s=session_name, w=window_name) -> str:
+                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                get_backend().stop_pipe_pane(s, w)
+                get_backend().pipe_pane(s, w, p)
+
+            try:
+                fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+                # pipe-pane has one destination.  Stop first: ``pipe-pane -o``
+                # would otherwise toggle an inherited stale target off.
+                _rearm_pipe()
+                status_monitor.seed_from_snapshot(terminal_id, snapshot)
+                recovered += 1
+            except Exception as exc:
+                # The terminal itself is untouched; a later restart or manual
+                # send can retry recovery. Leave the process up for healthy panes.
+                logger.warning("Failed to recover output stream for %s: %s", terminal_id, exc)
+
+    if recovered:
+        logger.info("Recovered output/status streams for %d persisted terminal(s)", recovered)
+    return recovered
 
 
 async def create_terminal(

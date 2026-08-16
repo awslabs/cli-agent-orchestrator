@@ -506,6 +506,27 @@ class StatusMonitor:
             if provider is not None:
                 provider.notify_status_buffer_reset(epoch)
 
+    def seed_from_snapshot(self, terminal_id: str, output: str) -> TerminalStatus:
+        """Prime status from a rendered pane snapshot after server recovery.
+
+        A tmux pane survives a ``cao-server`` restart, but its old pipe-pane
+        target points at the previous process's FIFO reader.  Reattaching the
+        pipe only observes *future* output, so a terminal already waiting at an
+        input prompt would otherwise remain UNKNOWN indefinitely.  Seed the
+        rolling buffer from ``capture-pane`` once, then run the ordinary
+        provider detector and publish the resulting state.  This is deliberately
+        not an input action: it never writes to the terminal.
+        """
+        state_buffer_max = get_server_settings()["state_buffer_max"]
+        with self._lock:
+            self._buffers[terminal_id] = output[-state_buffer_max:]
+            # A persisted terminal is quiescent at recovery time.  Do not let a
+            # prior process's debounce state suppress its first real status.
+            self._bursting[terminal_id] = False
+        detected = self._detect_status(terminal_id, output[-state_buffer_max:])
+        self._apply_detection(terminal_id, detected)
+        return detected
+
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""
         provider = provider_manager.get_provider(terminal_id)
