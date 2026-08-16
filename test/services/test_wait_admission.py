@@ -106,25 +106,20 @@ class TestDisabledCapability:
         assert block["recovery_authority"] is False
         assert block["action_authority"] is False
         assert block["completion_authority"] is False
-        # The M7 plan's C and D gates are untouched by Stage 2.
-        assert block["stage_c_enabled"] is False
-        assert block["stage_d_enabled"] is False
 
-    def test_every_effect_verb_is_advertised_off(self):
-        effects = wa.capability()["effects"]
-        assert set(effects) == set(wa.EFFECT_OPERATIONS)
-        assert not any(effects.values())
+    def test_the_block_names_no_verb_and_no_future_stage_gate(self):
+        """A disabled capability needs no taxonomy of what it would enable.
 
-    @pytest.mark.parametrize("operation", sorted(wa.EFFECT_OPERATIONS))
-    def test_requesting_any_effect_is_refused_by_name(self, operation):
-        with pytest.raises(wa.WaitAdmissionDisabled) as excinfo:
-            wa.require_capability(operation)
-        assert operation in str(excinfo.value)
-        assert wa.CAPABILITY_NAME in str(excinfo.value)
-
-    def test_an_unknown_effect_verb_is_a_programming_error_not_a_silent_pass(self):
-        with pytest.raises(wa.WaitAdmissionInvalid):
-            wa.require_capability("teleport")
+        Nothing in this build calls an effect verb, so a published verb list
+        and a gate for it were vocabulary about a surface that does not exist.
+        ``enabled: False`` plus the explicit no-authority fields already say
+        everything true about this slice.
+        """
+        block = wa.capability()
+        for absent in ("effects", "stage_c_enabled", "stage_d_enabled"):
+            assert absent not in block, absent
+        for absent in ("EFFECT_OPERATIONS", "require_capability", "WaitAdmissionDisabled"):
+            assert not hasattr(wa, absent), absent
 
     def test_the_denial_vocabulary_is_published_and_closed(self):
         assert wa.capability()["denial_reasons"] == sorted(wa.DENIAL_REASONS)
@@ -225,10 +220,27 @@ class TestExactOwnership:
         record = wa.admit(_request(_owner_from(bound)))
         assert record["admission_state"] == wa.STATE_ADMITTED
         assert record["denial_reason"] is None
-        assert record["dispatch_state"] == wa.DISPATCH_WITHHELD
         assert record["receipt_digest"]
         assert record["adopted"] is False
         assert record["owner"]["generation"] == bound["incarnation"]["generation"]
+
+    def test_a_row_carries_no_dispatch_state_and_never_changes_after_it_is_written(self):
+        """The verdict is the whole record; there is no second state to track.
+
+        A ``dispatch_state`` column would have been a pure function of
+        ``admission_state`` for as long as nothing dispatches — a second
+        spelling of the same fact, and one a future consumer would have to
+        keep in sync with the first. Same for ``updated_at``: the row is
+        written once and never updated, so a mutation timestamp could only
+        ever repeat ``created_at``.
+        """
+        bound = _bind(suffix="1")
+        record = wa.admit(_request(_owner_from(bound)))
+        assert "dispatch_state" not in record
+        assert "updated_at" not in record
+        assert set(database.WaitMessageAdmissionModel.__table__.c.keys()).isdisjoint(
+            {"dispatch_state", "updated_at"}
+        )
 
     def test_an_unknown_agent_is_denied(self):
         owner = wa.WaitOwner(
@@ -597,6 +609,64 @@ class TestReplay:
         assert wa.receipt_digest_for(moved) != record["receipt_digest"]
 
 
+class TestCallerOwnedTransaction:
+    """The ``db=`` seam: an owner composing an admission with its own write.
+
+    The cooperative failure it protects is a torn pair. An owner that decides
+    "this wait is interrupted" has two things to make durable — its own record
+    and this admission — and if the admission commits on its own connection
+    while the owner's transaction later rolls back, the store keeps an
+    admission for a decision that was never taken. Accepting the caller's
+    Session and writing inside a savepoint makes the pair atomic: the caller's
+    rollback takes the admission with it.
+    """
+
+    def test_the_callers_rollback_takes_the_admission_with_it(self):
+        bound = _bind(suffix="1")
+        request = _request(_owner_from(bound))
+        with database.SessionLocal() as session:
+            record = wa.admit(request, db=session)
+            assert record["admission_state"] == wa.STATE_ADMITTED
+            # Visible inside the caller's own transaction before it decides.
+            assert wa.get_admission(request.operation_id, db=session) is not None
+            session.rollback()
+        assert wa.get_admission(request.operation_id) is None
+        assert wa.list_admissions(SESSION) == []
+
+    def test_the_callers_commit_makes_the_admission_durable(self):
+        bound = _bind(suffix="1")
+        request = _request(_owner_from(bound))
+        with database.SessionLocal() as session:
+            record = wa.admit(request, db=session)
+            session.commit()
+        assert wa.get_admission(request.operation_id)["receipt_digest"] == record["receipt_digest"]
+
+    def test_a_replay_inside_the_callers_transaction_still_adopts(self):
+        bound = _bind(suffix="1")
+        request = _request(_owner_from(bound))
+        with database.SessionLocal() as session:
+            first = wa.admit(request, db=session)
+            second = wa.admit(request, db=session)
+            session.commit()
+        assert first["adopted"] is False
+        assert second["adopted"] is True
+        assert second["admission_id"] == first["admission_id"]
+
+    def test_the_savepoint_does_not_swallow_the_callers_earlier_work(self):
+        """A nested write must not commit the caller's outer transaction."""
+        bound = _bind(suffix="1")
+        request = _request(_owner_from(bound))
+        with database.SessionLocal() as session:
+            session.add(
+                database.WaitMessageAdmissionModel(
+                    **_bare_row(operation_id=str(uuid.uuid4()), message_id=str(uuid.uuid4()))
+                )
+            )
+            wa.admit(request, db=session)
+            session.rollback()
+        assert wa.list_admissions() == []
+
+
 class TestReads:
     def test_an_admission_is_readable_by_operation_and_by_message(self):
         bound = _bind(suffix="1")
@@ -661,6 +731,17 @@ class TestNoConsumerNoEffects:
         }
         assert changed == {"wait_message_admissions": (0, 1)}
 
+    def test_ownership_is_resolved_through_the_public_roster_seam(self):
+        """No private roster helper: a supported read, or none.
+
+        ``get_incarnation_by_terminal`` already refuses an ambiguous
+        terminal-only lookup, so borrowing the underscore-prefixed version of
+        it bought nothing and coupled M7 to a private signature.
+        """
+        source = (_cao_source_root() / "services" / "wait_admission.py").read_text()
+        assert "roster._" not in source
+        assert "roster.get_incarnation_by_terminal" in source
+
     def test_the_module_exposes_no_delivery_entry_point(self):
         for forbidden in (
             "deliver",
@@ -679,6 +760,36 @@ def _cao_source_root():
     import cli_agent_orchestrator
 
     return pathlib.Path(cli_agent_orchestrator.__file__).parent
+
+
+def _bare_row(*, operation_id, message_id):
+    """A minimally valid admission row, for transaction-shape tests only."""
+    return {
+        "admission_id": str(uuid.uuid4()),
+        "schema_version": wa.SCHEMA_VERSION,
+        "message_schema_version": wa.MESSAGE_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "message_id": message_id,
+        "session_name": SESSION,
+        "message_kind": wa.KIND_REPORT,
+        "owner_agent_id": str(uuid.uuid4()),
+        "owner_incarnation_id": "inc-bare",
+        "owner_terminal_id": "term-bare",
+        "owner_generation": str(uuid.uuid4()),
+        "owner_lineage_id": None,
+        "owner_native_session_id": None,
+        "owner_restore_contract_id": None,
+        "owner_restore_contract_digest": None,
+        "owner_identity_digest": "1" * 64,
+        "request_digest": "2" * 64,
+        "message_digest": "3" * 64,
+        "message_json": "{}",
+        "admission_state": wa.STATE_DENIED,
+        "denial_reason": wa.DENY_OWNER_UNKNOWN,
+        "detail": None,
+        "receipt_digest": "4" * 64,
+        "created_at": "2026-08-16T00:00:00Z",
+    }
 
 
 def _table_counts():

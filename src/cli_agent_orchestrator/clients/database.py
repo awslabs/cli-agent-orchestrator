@@ -1513,9 +1513,10 @@ class WaitMessageAdmissionModel(Base):
     that has since moved would give one operation two answers, so the first
     verdict is the durable one.
 
-    Nothing dispatches these rows. ``dispatch_state`` records that truthfully:
-    the capability that would deliver a wait message is disabled in this build,
-    so an admitted row is ``withheld`` and a denied row is ``refused``.
+    Write-once: a row is inserted with its verdict and never updated, so there
+    is no ``updated_at`` that could differ from ``created_at`` and no second
+    status column tracking what became of it. Nothing dispatches these rows —
+    the capability that would deliver a wait message is disabled in this build.
     """
 
     __tablename__ = "wait_message_admissions"
@@ -1548,19 +1549,17 @@ class WaitMessageAdmissionModel(Base):
     message_json = Column(Text, nullable=False)
     # admitted | denied
     admission_state = Column(Text, nullable=False)
-    # withheld | refused — never "delivered": nothing consumes this table.
-    dispatch_state = Column(Text, nullable=False)
     denial_reason = Column(Text, nullable=True)
     detail = Column(Text, nullable=True)
     receipt_digest = Column(Text, nullable=False)
     created_at = Column(Text, nullable=False)
-    updated_at = Column(Text, nullable=False)
 
+    #: Exactly the three reads this contract performs: by operation (replay),
+    #: by message (single use), and by session (listing).
     __table_args__ = (
         Index("ix_wait_message_admissions_operation", "operation_id", unique=True),
         Index("ix_wait_message_admissions_message", "message_id", unique=True),
         Index("ix_wait_message_admissions_session", "session_name"),
-        Index("ix_wait_message_admissions_owner", "owner_agent_id", "owner_generation"),
     )
 
 
@@ -3212,11 +3211,14 @@ def _migrate_wait_message_admissions() -> None:
     that would dispatch it is disabled.
     """
     import sqlite3
+    from contextlib import closing
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
+    # ``closing`` because ``with sqlite3.connect(...)`` only ends the
+    # transaction — the connection itself would stay open until the GC ran it.
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS wait_message_admissions ("
                 "admission_id TEXT NOT NULL PRIMARY KEY, "
@@ -3239,12 +3241,10 @@ def _migrate_wait_message_admissions() -> None:
                 "message_digest TEXT NOT NULL, "
                 "message_json TEXT NOT NULL, "
                 "admission_state TEXT NOT NULL, "
-                "dispatch_state TEXT NOT NULL, "
                 "denial_reason TEXT, "
                 "detail TEXT, "
                 "receipt_digest TEXT NOT NULL, "
-                "created_at TEXT NOT NULL, "
-                "updated_at TEXT NOT NULL"
+                "created_at TEXT NOT NULL"
                 ")"
             )
             # One operation decides once; one message is admitted once. These
@@ -3261,10 +3261,6 @@ def _migrate_wait_message_admissions() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_wait_message_admissions_session "
                 "ON wait_message_admissions(session_name)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS ix_wait_message_admissions_owner "
-                "ON wait_message_admissions(owner_agent_id, owner_generation)"
             )
     except Exception as e:  # noqa: BLE001 - dark seam fails closed
         logger.warning(f"wait-message-admission migration failed: {e}")

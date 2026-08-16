@@ -78,12 +78,6 @@ MESSAGE_KINDS = frozenset({KIND_EXPIRY, KIND_WORKER_WAKE, KIND_REPORT, KIND_DECI
 STATE_ADMITTED = "admitted"
 STATE_DENIED = "denied"
 
-#: An admitted message that nothing is allowed to dispatch, and a denied one
-#: that never became eligible. There is deliberately no "delivered" value: this
-#: build has nothing that could write it.
-DISPATCH_WITHHELD = "withheld"
-DISPATCH_REFUSED = "refused"
-
 DENY_OWNER_UNKNOWN = "owner-unknown"
 DENY_OWNER_RETIRED = "owner-retired"
 DENY_OWNER_AMBIGUOUS = "owner-ambiguous"
@@ -100,12 +94,6 @@ DENIAL_REASONS = frozenset(
         DENY_IDENTITY_MISMATCH,
     }
 )
-
-#: The verbs a later stage would enable. Naming them here is what makes the
-#: capability *visibly* disabled rather than merely absent: a caller that
-#: reaches for one gets a typed refusal that says which verb and which
-#: capability, instead of an AttributeError it might paper over.
-EFFECT_OPERATIONS = frozenset({"deliver", "suppress", "expire", "interrupt", "publish-surface"})
 
 #: Words that name a non-agent. A wait belongs to a real incarnation or to
 #: nobody; there is no house account these could stand for.
@@ -162,12 +150,6 @@ class WaitAdmissionUnavailable(WaitAdmissionError):
     code = "wait-admission-unavailable"
 
 
-class WaitAdmissionDisabled(WaitAdmissionError):
-    """An effect was requested while the wait capability is disabled."""
-
-    code = "wait-admission-disabled"
-
-
 # ---------------------------------------------------------------------------
 # the capability, and the fact that it is off
 # ---------------------------------------------------------------------------
@@ -184,7 +166,13 @@ def capability() -> dict[str, Any]:
 
     Published as a block rather than inferred from absence, so an operator or
     a later stage reads one truthful record instead of concluding "no endpoint
-    exists, therefore it must be off".
+    exists, therefore it must be off". The four authority fields are the ones
+    worth stating explicitly, because each is a thing M7 will eventually hold
+    and does not hold yet.
+
+    No verb taxonomy and no future-stage gates: enumerating what a later stage
+    might enable would be vocabulary describing a surface that does not exist,
+    and it cannot be kept honest by any test in this build.
     """
     return {
         "schema_version": CAPABILITY_SCHEMA_VERSION,
@@ -195,36 +183,13 @@ def capability() -> dict[str, Any]:
         "reason": _DISABLED_REASON,
         "message_kinds": sorted(MESSAGE_KINDS),
         "denial_reasons": sorted(DENIAL_REASONS),
-        "effects": {operation: False for operation in sorted(EFFECT_OPERATIONS)},
         "consumer_attached": False,
         "stop_interruptor_attached": False,
         "public_surface": False,
         "recovery_authority": False,
         "action_authority": False,
         "completion_authority": False,
-        # The M7 plan's C and D gates. Stage 2 defines neither and turns on
-        # neither; they are published so "still false" is checkable rather
-        # than assumed.
-        "stage_c_enabled": False,
-        "stage_d_enabled": False,
     }
-
-
-def require_capability(operation: str) -> None:
-    """Refuse any effect verb, by name, while the capability is disabled.
-
-    An unknown verb raises ``WaitAdmissionInvalid`` instead of falling through
-    to a refusal: a typo must not read as "correctly gated".
-    """
-    if operation not in EFFECT_OPERATIONS:
-        raise WaitAdmissionInvalid(
-            f"{operation!r} is not a wait-message effect; "
-            f"known effects are {sorted(EFFECT_OPERATIONS)}"
-        )
-    raise WaitAdmissionDisabled(
-        f"the {CAPABILITY_NAME} capability is disabled: {operation!r} is refused. "
-        f"{_DISABLED_REASON}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +502,6 @@ def receipt_digest_for(record: Mapping[str, Any]) -> str:
                 ("message_digest", record["message_digest"]),
                 ("admission_state", record["admission_state"]),
                 ("denial_reason", record.get("denial_reason")),
-                ("dispatch_state", record["dispatch_state"]),
             )
         )
     )
@@ -585,9 +549,11 @@ def _verify_owner(db: Any, owner: WaitOwner) -> _Verdict:
 
     # Ambiguity before identity: if the terminal id resolves to more than one
     # live incarnation, no comparison below can be trusted to mean what it
-    # looks like.
+    # looks like. The public terminal-only read already refuses that case
+    # rather than picking a historical row, so this borrows its judgement
+    # instead of re-deriving one.
     try:
-        roster._live_incarnation_by_terminal(db, owner.terminal_id)
+        roster.get_incarnation_by_terminal(owner.terminal_id, db=db)
     except roster.StableAgentConflict as exc:
         return _Verdict(DENY_OWNER_AMBIGUOUS, str(exc))
 
@@ -706,12 +672,10 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "message_digest": row.message_digest,
         "message_json": row.message_json,
         "admission_state": row.admission_state,
-        "dispatch_state": row.dispatch_state,
         "denial_reason": row.denial_reason,
         "detail": row.detail,
         "receipt_digest": row.receipt_digest,
         "created_at": row.created_at,
-        "updated_at": row.updated_at,
     }
 
 
@@ -783,18 +747,15 @@ def _admit_once(db: Any, request: AdmissionRequest) -> dict[str, Any]:
         )
 
     verdict = _verify_owner(db, request.owner)
-    admitted = verdict.denial_reason is None
     envelope = request.envelope()
-    stamp = _now()
     record = {
         "admission_id": admission_id,
         "operation_id": request.operation_id,
         "message_id": request.message.message_id,
         "owner_identity_digest": request.owner.identity_digest(),
         "message_digest": envelope_digest(envelope),
-        "admission_state": STATE_ADMITTED if admitted else STATE_DENIED,
+        "admission_state": STATE_ADMITTED if verdict.denial_reason is None else STATE_DENIED,
         "denial_reason": verdict.denial_reason,
-        "dispatch_state": DISPATCH_WITHHELD if admitted else DISPATCH_REFUSED,
     }
     row = database.WaitMessageAdmissionModel(
         admission_id=admission_id,
@@ -817,12 +778,10 @@ def _admit_once(db: Any, request: AdmissionRequest) -> dict[str, Any]:
         message_digest=record["message_digest"],
         message_json=envelope_bytes(envelope).decode("utf-8"),
         admission_state=record["admission_state"],
-        dispatch_state=record["dispatch_state"],
         denial_reason=verdict.denial_reason,
         detail=(verdict.detail or None) and verdict.detail[:MAX_DETAIL_LEN],
         receipt_digest=receipt_digest_for(record),
-        created_at=stamp,
-        updated_at=stamp,
+        created_at=_now(),
     )
     db.add(row)
     db.flush()
@@ -835,13 +794,18 @@ def admit(request: AdmissionRequest, db: Any = None) -> dict[str, Any]:
     """Record the one admission verdict for one operation's wait message.
 
     Returns the durable record with ``adopted`` set when this call replayed an
-    existing one. Nothing is delivered, suppressed, expired, or interrupted:
-    an admitted row is ``withheld`` because the capability that would dispatch
-    it is off.
+    existing one. Recording a verdict is the whole effect: nothing is
+    delivered, suppressed, expired, or interrupted, because the capability
+    that would dispatch a wait message is off.
 
     Malformed input and divergent replays raise; an owner that does not match
     the roster is a durable *denial*, not an exception, so the refusal is
     replayable and carries a receipt of its own.
+
+    ``db`` — pass an open Session to make the admission part of the caller's
+    own transaction. The write happens in a savepoint, so the caller's
+    rollback removes it: an owner that records a decision and this admission
+    together never keeps one without the other.
     """
     if not isinstance(request, AdmissionRequest):
         raise WaitAdmissionInvalid(

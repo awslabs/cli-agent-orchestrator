@@ -7,8 +7,11 @@ that has never heard of M7 reads exactly the schema it had before.
 
 from __future__ import annotations
 
+import contextlib
+import gc
 import sqlite3
 import uuid
+import warnings
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -38,13 +41,37 @@ _ADMISSION_COLUMNS = {
     "message_digest",
     "message_json",
     "admission_state",
-    "dispatch_state",
     "denial_reason",
     "detail",
     "receipt_digest",
     "created_at",
-    "updated_at",
 }
+
+
+@contextlib.contextmanager
+def _sqlite(path):
+    """A sqlite3 connection that is actually closed on exit.
+
+    ``with sqlite3.connect(...)`` only ends the *transaction*; the connection
+    itself stays open and is finalized later by the GC, which is where the
+    ``unclosed database`` ResourceWarnings in this module came from.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
+def _orm_store(path):
+    """An engine bound as ``SessionLocal``, disposed on exit."""
+    engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+    try:
+        yield engine
+    finally:
+        engine.dispose()
 
 
 def _columns(conn, table):
@@ -58,7 +85,7 @@ def _indexes(conn, table):
 def _migrated_db(tmp_path, monkeypatch):
     """A pre-M7 store brought forward by the additive migration alone."""
     path = tmp_path / "legacy.db"
-    with sqlite3.connect(str(path)) as conn:
+    with _sqlite(path) as conn:
         conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY)")
     from cli_agent_orchestrator import constants
     from cli_agent_orchestrator.clients import database as db_module
@@ -69,29 +96,47 @@ def _migrated_db(tmp_path, monkeypatch):
     return path
 
 
+def _orm_schema(path):
+    """Build the ORM schema at ``path`` and dispose the engine."""
+    engine = create_engine(f"sqlite:///{path}")
+    try:
+        Base.metadata.create_all(bind=engine)
+    finally:
+        engine.dispose()
+    return path
+
+
 def test_migration_matches_the_orm_schema_column_for_column(tmp_path, monkeypatch):
     path = _migrated_db(tmp_path, monkeypatch)
-    with sqlite3.connect(str(path)) as conn:
+    with _sqlite(path) as conn:
         assert _columns(conn, "wait_message_admissions") == _ADMISSION_COLUMNS
 
-    orm_path = tmp_path / "orm.db"
-    engine = create_engine(f"sqlite:///{orm_path}")
-    Base.metadata.create_all(bind=engine)
-    engine.dispose()
-    with sqlite3.connect(str(orm_path)) as conn:
+    with _sqlite(_orm_schema(tmp_path / "orm.db")) as conn:
         assert _columns(conn, "wait_message_admissions") == _ADMISSION_COLUMNS
+
+
+def test_the_row_is_write_once_with_no_dispatch_state_and_no_updated_at(tmp_path, monkeypatch):
+    """Two columns were removed because neither could ever carry new information.
+
+    ``dispatch_state`` was a pure projection of ``admission_state`` while
+    nothing dispatches, and ``updated_at`` could only ever equal
+    ``created_at`` on a row that is written once and never modified.
+    """
+    path = _migrated_db(tmp_path, monkeypatch)
+    for store in (path, _orm_schema(tmp_path / "orm.db")):
+        with _sqlite(store) as conn:
+            columns = _columns(conn, "wait_message_admissions")
+        assert "dispatch_state" not in columns
+        assert "updated_at" not in columns
+        assert "created_at" in columns
 
 
 def test_operation_and_message_identity_are_unique_in_both_schemas(tmp_path, monkeypatch):
     """Durable identity is what makes a retry a replay instead of a second effect."""
     path = _migrated_db(tmp_path, monkeypatch)
-    orm_path = tmp_path / "orm.db"
-    engine = create_engine(f"sqlite:///{orm_path}")
-    Base.metadata.create_all(bind=engine)
-    engine.dispose()
 
-    for store in (path, orm_path):
-        with sqlite3.connect(str(store)) as conn:
+    for store in (path, _orm_schema(tmp_path / "orm.db")):
+        with _sqlite(store) as conn:
             names = _indexes(conn, "wait_message_admissions")
             assert "ix_wait_message_admissions_operation" in names
             assert "ix_wait_message_admissions_message" in names
@@ -104,13 +149,33 @@ def test_operation_and_message_identity_are_unique_in_both_schemas(tmp_path, mon
             assert "ix_wait_message_admissions_message" in unique
 
 
+def test_the_only_indexes_are_the_ones_a_query_path_uses(tmp_path, monkeypatch):
+    """The owner index served no read this module performs.
+
+    ``(owner_agent_id, owner_generation)`` was indexed for a by-owner lookup
+    that does not exist: every read here goes by operation, by message, or by
+    session. An index nothing queries is write cost and a false hint about
+    which reads are supported.
+    """
+    path = _migrated_db(tmp_path, monkeypatch)
+    for store in (path, _orm_schema(tmp_path / "orm.db")):
+        with _sqlite(store) as conn:
+            names = _indexes(conn, "wait_message_admissions")
+        assert "ix_wait_message_admissions_owner" not in names
+        assert {
+            "ix_wait_message_admissions_operation",
+            "ix_wait_message_admissions_message",
+            "ix_wait_message_admissions_session",
+        } <= names
+
+
 def test_migration_is_idempotent(tmp_path, monkeypatch):
     path = _migrated_db(tmp_path, monkeypatch)
     from cli_agent_orchestrator.clients import database as db_module
 
     db_module._migrate_wait_message_admissions()
     db_module._migrate_wait_message_admissions()
-    with sqlite3.connect(str(path)) as conn:
+    with _sqlite(path) as conn:
         assert _columns(conn, "wait_message_admissions") == _ADMISSION_COLUMNS
 
 
@@ -128,13 +193,12 @@ def test_init_db_runs_the_wait_admission_migration(tmp_path, monkeypatch):
     assert called == ["m7"]
 
 
-def test_records_survive_a_restart(tmp_path, monkeypatch):
-    path = tmp_path / "restart.db"
-    engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
-    Base.metadata.create_all(bind=engine)
-    monkeypatch.setattr(
-        database, "SessionLocal", sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    )
+def _restart_cycle(path, monkeypatch):
+    """Admit on one engine, then read the row back on a fresh one.
+
+    Both engines are disposed before the function returns; the second one is
+    what makes this a restart rather than a cache hit.
+    """
     operation_id = str(uuid.uuid4())
     owner = wa.WaitOwner(
         agent_id=str(uuid.uuid4()),
@@ -142,34 +206,62 @@ def test_records_survive_a_restart(tmp_path, monkeypatch):
         terminal_id="term-restart",
         generation=str(uuid.uuid4()),
     )
-    first = wa.admit(
-        wa.AdmissionRequest(
-            operation_id=operation_id,
-            session_name="cao-restart",
-            owner=owner,
-            message=wa.WaitMessage(
-                message_id=str(uuid.uuid4()),
-                kind=wa.KIND_EXPIRY,
-                reason_code="deadline-passed",
-            ),
+    with _orm_store(path) as engine:
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(
+            database, "SessionLocal", sessionmaker(autocommit=False, autoflush=False, bind=engine)
         )
-    )
-    engine.dispose()
+        written = wa.admit(
+            wa.AdmissionRequest(
+                operation_id=operation_id,
+                session_name="cao-restart",
+                owner=owner,
+                message=wa.WaitMessage(
+                    message_id=str(uuid.uuid4()),
+                    kind=wa.KIND_EXPIRY,
+                    reason_code="deadline-passed",
+                ),
+            )
+        )
 
-    engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
-    monkeypatch.setattr(
-        database, "SessionLocal", sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    )
-    record = wa.get_admission(operation_id)
-    assert record["receipt_digest"] == first["receipt_digest"]
-    assert record["dispatch_state"] == wa.DISPATCH_REFUSED
-    engine.dispose()
+    with _orm_store(path) as engine:
+        monkeypatch.setattr(
+            database, "SessionLocal", sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        )
+        reread = wa.get_admission(operation_id)
+    return written, reread
+
+
+def test_records_survive_a_restart(tmp_path, monkeypatch):
+    written, reread = _restart_cycle(tmp_path / "restart.db", monkeypatch)
+    assert reread["receipt_digest"] == written["receipt_digest"]
+    assert reread["admission_state"] == wa.STATE_DENIED
+    assert reread["denial_reason"] == wa.DENY_OWNER_UNKNOWN
+    assert reread["created_at"] == written["created_at"]
+
+
+def test_the_restart_path_leaks_no_sqlite_connections(tmp_path, monkeypatch):
+    """Every connection this module opens is closed before the test ends.
+
+    Asserted here rather than by a global warning filter: a suite-wide
+    ``-W error`` would also fail on unrelated modules' garbage, and silencing
+    it would hide a real leak in this one. Collecting inside the block pins
+    the finalizers to objects this test created.
+    """
+    gc.collect()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        _restart_cycle(tmp_path / "leak.db", monkeypatch)
+        _migrated_db(tmp_path, monkeypatch)
+        gc.collect()
+    leaked = [str(entry.message) for entry in caught if entry.category is ResourceWarning]
+    assert leaked == []
 
 
 def test_rollback_to_a_build_without_m7_leaves_the_older_schema_untouched(tmp_path, monkeypatch):
     """Additive means additive: no M3-D or M3-C table gains a column here."""
     path = _migrated_db(tmp_path, monkeypatch)
-    with sqlite3.connect(str(path)) as conn:
+    with _sqlite(path) as conn:
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
