@@ -1717,6 +1717,69 @@ class NativeStatusObservationAttemptModel(Base):
     updated_at = Column(Text, nullable=False)
 
 
+class RouteObservationOperationModel(Base):
+    """One dark route observe/close/result operation (COND-0230 M10).
+
+    Journals one operation id bound to the exact target tuple and exact
+    requester. The partial unique index on the target tuple
+    ``WHERE state = 'requested'`` enforces one nonterminal owner. The terminal
+    fields (closed-vocabulary state, canonical final event, optional positive
+    receipt, inbox wake-claim id) are written once, in one atomic transaction.
+    """
+
+    __tablename__ = "route_observation_operations"
+
+    operation_id = Column(Text, primary_key=True)
+    schema_version = Column(Text, nullable=False)
+    #: Digest over the whole canonical request; divergent replay is refused.
+    request_digest = Column(Text, nullable=False)
+    # Exact target tuple (every part NOT NULL so the partial unique index is
+    # a full exact-tuple key rather than a NULL-wildcard).
+    target_terminal_id = Column(Text, nullable=False)
+    target_generation = Column(Text, nullable=False)
+    native_session_id = Column(Text, nullable=False)
+    provider = Column(Text, nullable=False)
+    provider_version = Column(Text, nullable=False)
+    provider_artifact_sha256 = Column(Text, nullable=False)
+    # Exact requester.
+    requester_terminal_id = Column(Text, nullable=False)
+    requester_generation = Column(Text, nullable=False)
+    # requested | observed-closed | zero-effect-refusal |
+    # ambiguous-after-possible-effect
+    state = Column(Text, nullable=False)
+    # Non-authoritative detail about the terminal resolution: for a
+    # zero-effect-refusal this holds the winning operation id, never a
+    # requirement to act on it.
+    detail = Column(Text, nullable=True)
+    # Terminal fields; NULL while the operation is nonterminal (requested).
+    final_event_json = Column(Text, nullable=True)
+    final_event_digest = Column(Text, nullable=True)
+    receipt_json = Column(Text, nullable=True)
+    receipt_digest = Column(Text, nullable=True)
+    # The wake claim's inbox row id, stored in the same terminal transaction.
+    inbox_message_id = Column(Integer, nullable=True)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+    #: Exactly the read paths this operation performs: by operation id
+    #: (replay), by active target tuple (single nonterminal owner), and by
+    #: listing. ``inbox_message_id`` is deliberately not unique: no read
+    #: queries by it, and each operation mints its own inbox row.
+    __table_args__ = (
+        Index(
+            "ix_route_observation_operations_active_target",
+            "target_terminal_id",
+            "target_generation",
+            "native_session_id",
+            "provider",
+            "provider_version",
+            "provider_artifact_sha256",
+            unique=True,
+            sqlite_where=text("state = 'requested'"),
+        ),
+    )
+
+
 class ProviderCanaryReceiptModel(Base):
     """One installed live-repair canary receipt (cond-0377D read seam).
 
@@ -2154,6 +2217,7 @@ def init_db() -> None:
     _migrate_native_status_observation_attempt()
     _migrate_legacy_identity_migration()
     _migrate_provider_canary_receipts()
+    _migrate_route_observation_operations()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -3476,6 +3540,66 @@ def _migrate_native_status_observation_attempt() -> None:
             )
     except Exception as e:  # noqa: BLE001 - the migration path fails closed
         logger.warning(f"native status observation attempt migration failed: {e}")
+
+
+def _migrate_route_observation_operations() -> None:
+    """Create the COND-0230 M10 route-observation operation store on older
+    databases.  ``Base.metadata.create_all`` covers fresh databases via
+    ``RouteObservationOperationModel``; this idempotent step covers databases
+    created before the dark operation existed.  Additive: an old binary
+    ignores the table.  The partial unique index is one active-owner
+    authority and adds no speculative reads.
+    """
+    import sqlite3
+    from contextlib import closing
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        # ``closing`` because ``with sqlite3.connect(...)`` only ends the
+        # transaction — the connection itself stays open until the GC closes it.
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
+            if (
+                conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = "
+                    "'route_observation_operations'"
+                ).fetchone()
+                is None
+            ):
+                conn.execute(
+                    "CREATE TABLE route_observation_operations ("
+                    "operation_id TEXT NOT NULL PRIMARY KEY, "
+                    "schema_version TEXT NOT NULL, "
+                    "request_digest TEXT NOT NULL, "
+                    "target_terminal_id TEXT NOT NULL, "
+                    "target_generation TEXT NOT NULL, "
+                    "native_session_id TEXT NOT NULL, "
+                    "provider TEXT NOT NULL, "
+                    "provider_version TEXT NOT NULL, "
+                    "provider_artifact_sha256 TEXT NOT NULL, "
+                    "requester_terminal_id TEXT NOT NULL, "
+                    "requester_generation TEXT NOT NULL, "
+                    "state TEXT NOT NULL, "
+                    "detail TEXT, "
+                    "final_event_json TEXT, "
+                    "final_event_digest TEXT, "
+                    "receipt_json TEXT, "
+                    "receipt_digest TEXT, "
+                    "inbox_message_id INTEGER, "
+                    "created_at TEXT NOT NULL, "
+                    "updated_at TEXT NOT NULL"
+                    ")"
+                )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_route_observation_operations_active_target "
+                "ON route_observation_operations("
+                "target_terminal_id, target_generation, native_session_id, "
+                "provider, provider_version, provider_artifact_sha256"
+                ") WHERE state = 'requested'"
+            )
+    except Exception as e:  # noqa: BLE001 - the migration path fails closed
+        logger.warning(f"route observation operation migration failed: {e}")
 
 
 def _migrate_session_lifecycle() -> None:
