@@ -466,6 +466,37 @@ def test_a_stale_expected_revision_refuses_the_transfer_and_writes_nothing():
     assert th.get_handoff(handoff["handoff_id"])["state"] == th.STATE_PENDING
 
 
+def test_a_failure_between_the_two_occurrence_writes_leaves_neither(monkeypatch):
+    # The atomicity claim, exercised where it actually matters: the donor is
+    # already finalized when the recipient's open fails. A gap here would be
+    # zero task authority with no record of who should hold it -- and the
+    # drain would then read the donor as parked and tear its pane down.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _deliver(_begin(donor, recipient_agent))
+
+    def _boom(*_args, **_kwargs):
+        raise occ.TaskOccurrenceUnavailable("the store went away mid-transfer")
+
+    # Scoped, not `monkeypatch.undo()`: undo would also revert the
+    # isolated-database fixture's own SessionLocal patch, and every assertion
+    # below would then read the real store instead of this test's.
+    with monkeypatch.context() as patched:
+        patched.setattr(occ, "open_occurrence", _boom)
+        with pytest.raises(occ.TaskOccurrenceUnavailable):
+            th.complete_handoff(
+                handoff["handoff_id"],
+                incarnation=_incarnation("2"),
+                expected_revision=0,
+                completed_by="supervisor",
+            )
+
+    assert occ.get_occurrence(donor["task_occurrence_id"])["state"] == occ.STATE_OPEN
+    assert occ.open_occurrence_for_agent(donor_agent) is not None
+    assert occ.open_occurrence_for_agent(recipient_agent) is None
+    # Still pending, so the supervisor can retry or roll back.
+    assert th.get_handoff(handoff["handoff_id"])["state"] == th.STATE_PENDING
+
+
 def test_a_replayed_transfer_adopts_rather_than_opening_a_second_round():
     donor_agent, recipient_agent, donor = _pair()
     handoff = _deliver(_begin(donor, recipient_agent))
