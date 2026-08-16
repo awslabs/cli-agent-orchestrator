@@ -234,11 +234,18 @@ def _anchor_caller_transaction(db: Any, *, immediate: bool = False) -> None:
     finalizes one occurrence and opens another inside one savepoint, and a
     RELEASE that committed would make a failure between them observable.
 
-    ``immediate`` takes SQLite's write lock up front. A deferred transaction
-    acquires it only at the first write, so two callers can both complete their
-    *reads* — including a uniqueness precondition — before either writes. That
-    is exactly how two concurrent ``begin_handoff`` calls could each observe no
-    pending handoff for one agent and both insert.
+    ``immediate`` takes SQLite's write lock up front, so a read-then-insert
+    precondition is evaluated under the same lock that will commit it.
+
+    Honest scope: this is **not** what makes the per-agent handoff invariant
+    hold, and a mutation removing it does not break it — verified, including
+    under a forced read/read/write/write interleave. SQLite serialises writers
+    regardless, and the owns-session branch below retries the *whole* function
+    on contention, which re-runs the precondition against committed state.
+    What ``immediate`` changes is the caller-supplied-session path, which has
+    no retry: without it the loser reads stale, fails at INSERT, and surfaces
+    an ambiguous ``TaskHandoffUnavailable`` instead of the precondition
+    conflict that names which agent is already party to a handoff.
     """
     connection = db.connection()
     if connection.dialect.name != "sqlite":
@@ -715,8 +722,9 @@ def begin_handoff(request: BeginRequest, db: Any = None) -> dict[str, Any]:
         db,
         unavailable="concurrent handoff begins kept conflicting",
         # The per-agent invariant is a read-then-insert that no index can
-        # express; the write lock is what makes it hold under two concurrent
-        # supervisor actions.
+        # express. Taking the write lock up front evaluates it under the lock
+        # that commits it; see ``_anchor_caller_transaction`` for what that does
+        # and does not buy.
         immediate=True,
     )
 

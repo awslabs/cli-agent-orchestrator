@@ -297,10 +297,17 @@ def test_one_agent_is_party_to_one_handoff_even_under_concurrent_begins(tmp_path
     """The three partial unique indexes cannot express the per-agent invariant.
 
     They forbid a second row per *slot*, and they are independent, so agent X
-    may legally appear once as donor and once as recipient. Only the
-    read-then-insert in `_begin_once` forbids it, and two deferred transactions
-    would both finish that read before either wrote. The write lock is what
-    makes the precondition hold.
+    may legally appear once as donor and once as recipient with no index
+    objecting. This proves the outcome under real concurrency: one accepted,
+    one typed refusal, one pending row, and a hot path that stays typed rather
+    than raising `MultipleResultsFound`.
+
+    What it does **not** isolate is `BEGIN IMMEDIATE`. Removing the write lock
+    leaves this green, including under a forced read/read/write/write
+    interleave -- SQLite serialises writers anyway and `_with_session` retries
+    the whole function against committed state. The lock earns its place on the
+    caller-supplied-session path, which has no retry; that path has no test
+    here because nothing composes a handoff into a caller's transaction yet.
     """
     import threading
 
@@ -817,7 +824,14 @@ def test_a_rollback_after_delivery_reports_that_the_recipient_was_briefed():
         unbriefed["handoff_id"], rolled_back_by="supervisor", reason="changed my mind"
     )
     assert quiet["recipient_briefed"] is False
-    assert th.receipt_digest(rolled) != th.receipt_digest(quiet)
+
+    # The receipt must turn on *this* field and not merely on the delivery
+    # state and recipient incarnation that happen to travel with it -- a
+    # comparison between two whole records would pass even if the receipt were
+    # blind to briefing, which is the thing E2 reads to know a cancellation is
+    # owed.
+    assert th.receipt_digest(rolled) != th.receipt_digest({**rolled, "recipient_briefed": False})
+    assert th.receipt_digest(quiet) != th.receipt_digest({**quiet, "recipient_briefed": True})
 
 
 def test_a_transferred_handoff_is_never_rolled_back():
