@@ -293,21 +293,27 @@ def test_a_settled_handoff_frees_both_agents_to_hand_back_again():
     assert again["handoff_id"] != first["handoff_id"]
 
 
-def test_one_agent_is_party_to_one_handoff_even_under_concurrent_begins(tmp_path, monkeypatch):
-    """The three partial unique indexes cannot express the per-agent invariant.
+def test_two_concurrent_begins_naming_one_recipient_leave_one_pending_row(tmp_path, monkeypatch):
+    """Two concurrent begins naming one agent as **recipient** of both.
 
-    They forbid a second row per *slot*, and they are independent, so agent X
-    may legally appear once as donor and once as recipient with no index
-    objecting. This proves the outcome under real concurrency: one accepted,
-    one typed refusal, one pending row, and a hot path that stays typed rather
-    than raising `MultipleResultsFound`.
+    Precisely what this covers, because an earlier docstring here claimed more
+    than the body does: both threads pass the same `to_agent`, so this is a
+    collision on the *recipient slot*, which
+    `ix_task_occurrence_handoffs_pending_recipient` forbids outright. The
+    second INSERT raises `IntegrityError`, `_with_session` retries the whole
+    function, and the retry meets the precondition against committed state.
+    What it proves is the outcome: one accepted, one typed refusal, one pending
+    row, and a hot path that stays typed rather than raising
+    `MultipleResultsFound`.
 
-    What it does **not** isolate is `BEGIN IMMEDIATE`. Removing the write lock
-    leaves this green, including under a forced read/read/write/write
-    interleave -- SQLite serialises writers anyway and `_with_session` retries
-    the whole function against committed state. The lock earns its place on the
-    caller-supplied-session path, which has no retry; that path has no test
-    here because nothing composes a handoff into a caller's transaction yet.
+    The **cross-slot** case -- one agent as donor of one handoff and recipient
+    of another -- is the one no index expresses, and it is *not* exercised
+    here. It is guarded by the recipient-must-be-free precondition plus the
+    anchored read-then-insert in `_begin_once`, not by any index and not by the
+    retry (nothing raises, so nothing retries). A forced interleave of that
+    case ended safe with the write lock both on and off, so there is no
+    discriminating test to write; see `_anchor_caller_transaction` for what is
+    argued from measurement rather than from a failing test.
     """
     import threading
 
@@ -350,10 +356,11 @@ def test_one_agent_is_party_to_one_handoff_even_under_concurrent_begins(tmp_path
         except Exception as exc:  # noqa: BLE001 - the refusal is the assertion
             results.append(exc)
 
+    # Two different donors, both naming the same recipient: one recipient slot,
+    # two claimants. `shared` holds no occurrence anywhere in this test, so it
+    # is never a donor and this is not the cross-slot case.
     threads = [
-        # X becomes the recipient of one handoff...
         threading.Thread(target=_begin_pair, args=(round_a, shared, "1")),
-        # ...while another would make it the donor of a second.
         threading.Thread(target=_begin_pair, args=(round_b, shared, "4")),
     ]
     for thread in threads:
