@@ -21,7 +21,6 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.services import route_observation as ro
-from cli_agent_orchestrator.services.canonical_json import canonical_sha256
 
 _RO_COLUMNS = {
     "operation_id",
@@ -37,6 +36,10 @@ _RO_COLUMNS = {
     "requester_generation",
     "state",
     "detail",
+    "pre_probe_intent_json",
+    "observation_json",
+    "pre_close_intent_json",
+    "close_proof_json",
     "final_event_json",
     "final_event_digest",
     "receipt_json",
@@ -77,6 +80,107 @@ def _migrated_db(tmp_path, monkeypatch):
     from cli_agent_orchestrator import constants
     from cli_agent_orchestrator.clients import database as db_module
 
+    monkeypatch.setattr(constants, "DATABASE_FILE", path)
+    monkeypatch.setattr(db_module, "DATABASE_URL", f"sqlite:///{path}")
+    db_module._migrate_route_observation_operations()
+    return path
+
+
+def _m10a_db(tmp_path, monkeypatch):
+    """An installed M10-A store (no stage facts) with live rows to upgrade."""
+    from cli_agent_orchestrator import constants
+    from cli_agent_orchestrator.clients import database as db_module
+
+    path = tmp_path / "m10a.db"
+    with _sqlite(path) as conn:
+        conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO terminals (id) VALUES ('kept-row')")
+        conn.execute(
+            "CREATE TABLE route_observation_operations ("
+            "operation_id TEXT NOT NULL PRIMARY KEY, "
+            "schema_version TEXT NOT NULL, "
+            "request_digest TEXT NOT NULL, "
+            "target_terminal_id TEXT NOT NULL, "
+            "target_generation TEXT NOT NULL, "
+            "native_session_id TEXT NOT NULL, "
+            "provider TEXT NOT NULL, "
+            "provider_version TEXT NOT NULL, "
+            "provider_artifact_sha256 TEXT NOT NULL, "
+            "requester_terminal_id TEXT NOT NULL, "
+            "requester_generation TEXT NOT NULL, "
+            "state TEXT NOT NULL, "
+            "detail TEXT, "
+            "final_event_json TEXT, "
+            "final_event_digest TEXT, "
+            "receipt_json TEXT, "
+            "receipt_digest TEXT, "
+            "inbox_message_id INTEGER, "
+            "created_at TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL"
+            ")"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX ix_route_observation_operations_active_target "
+            "ON route_observation_operations("
+            "target_terminal_id, target_generation, native_session_id, "
+            "provider, provider_version, provider_artifact_sha256"
+            ") WHERE state = 'requested'"
+        )
+        conn.execute(
+            "INSERT INTO route_observation_operations ("
+            "operation_id, schema_version, request_digest, "
+            "target_terminal_id, target_generation, native_session_id, "
+            "provider, provider_version, provider_artifact_sha256, "
+            "requester_terminal_id, requester_generation, "
+            "state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "op-requested",
+                "cao-m10-route-observation-op-v1",
+                "c" * 64,
+                "term-m10a",
+                "gen-m10a",
+                "sess-m10a",
+                "codex",
+                "0.147.0",
+                "f" * 64,
+                "term-requester",
+                "gen-requester",
+                "requested",
+                "2026-08-16T00:00:00Z",
+                "2026-08-16T00:00:00Z",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO route_observation_operations ("
+            "operation_id, schema_version, request_digest, "
+            "target_terminal_id, target_generation, native_session_id, "
+            "provider, provider_version, provider_artifact_sha256, "
+            "requester_terminal_id, requester_generation, "
+            "state, final_event_json, final_event_digest, "
+            "receipt_json, receipt_digest, inbox_message_id, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "op-closed",
+                "v1",
+                "e" * 64,
+                "term-old",
+                "gen-old",
+                "sess-old",
+                "codex",
+                "0.147.0",
+                "d" * 64,
+                "term-requester",
+                "gen-requester",
+                "observed-closed",
+                '{"kind": "legacy"}\n',
+                "11" * 32,
+                '{"kind": "legacy-receipt"}\n',
+                "22" * 32,
+                7,
+                "2026-08-16T00:00:01Z",
+                "2026-08-16T00:00:01Z",
+            ),
+        )
     monkeypatch.setattr(constants, "DATABASE_FILE", path)
     monkeypatch.setattr(db_module, "DATABASE_URL", f"sqlite:///{path}")
     db_module._migrate_route_observation_operations()
@@ -188,6 +292,55 @@ def test_migration_is_idempotent_and_preserves_existing_rows(tmp_path, monkeypat
         assert conn.execute("SELECT id FROM terminals").fetchall() == [("kept-row",)]
 
 
+def test_m10_upgrade_adds_the_stage_facts_and_preserves_rows(tmp_path, monkeypatch):
+    """An installed M10-A store upgrades in place: new NULL facts, old bytes intact."""
+    path = _m10a_db(tmp_path, monkeypatch)
+    with _sqlite(path) as conn:
+        assert _columns(conn, "route_observation_operations") == _RO_COLUMNS
+        requested = conn.execute(
+            "SELECT request_digest, state FROM route_observation_operations "
+            "WHERE operation_id = 'op-requested'"
+        ).fetchone()
+        assert requested == ("c" * 64, "requested")
+        closed = conn.execute(
+            "SELECT state, final_event_digest, receipt_json, receipt_digest, inbox_message_id "
+            "FROM route_observation_operations WHERE operation_id = 'op-closed'"
+        ).fetchone()
+        assert closed == (
+            "observed-closed",
+            "11" * 32,
+            '{"kind": "legacy-receipt"}\n',
+            "22" * 32,
+            7,
+        )
+        #: every existing row migrated with all four stage facts NULL.
+        for row in conn.execute(
+            "SELECT pre_probe_intent_json, observation_json, pre_close_intent_json, "
+            "close_proof_json FROM route_observation_operations"
+        ):
+            assert row == (None, None, None, None)
+
+
+def test_m10_upgrade_is_idempotent_and_preserves_the_unrelated_table(tmp_path, monkeypatch):
+    path = _m10a_db(tmp_path, monkeypatch)
+    from cli_agent_orchestrator.clients import database as db_module
+
+    db_module._migrate_route_observation_operations()
+    db_module._migrate_route_observation_operations()
+    with _sqlite(path) as conn:
+        assert _columns(conn, "route_observation_operations") == _RO_COLUMNS
+        assert conn.execute("SELECT id FROM terminals").fetchall() == [("kept-row",)]
+
+
+def test_m10_upgrade_matches_fresh_orm_schema(tmp_path, monkeypatch):
+    """The upgraded M10-A store and a fresh ORM store share one column set."""
+    path = _m10a_db(tmp_path, monkeypatch)
+    with _sqlite(path) as conn:
+        assert _columns(conn, "route_observation_operations") == _RO_COLUMNS
+    with _sqlite(_orm_schema(tmp_path / "orm.db")) as conn:
+        assert _columns(conn, "route_observation_operations") == _RO_COLUMNS
+
+
 def test_init_db_runs_the_route_observation_migration(tmp_path, monkeypatch):
     called: list[str] = []
     from cli_agent_orchestrator.clients import database as db_module
@@ -218,7 +371,8 @@ def test_the_rollback_route_leaves_every_other_table_untouched(tmp_path, monkeyp
 
 
 def _restart_cycle(path, monkeypatch):
-    """Claim + terminalize on one engine, re-read on a fresh engine."""
+    """Claim + the four ordered stage gates + terminalize on one engine, re-read
+    on a fresh engine."""
     request = _request()
     with _engine(path) as engine:
         Base.metadata.create_all(bind=engine)
@@ -226,29 +380,17 @@ def _restart_cycle(path, monkeypatch):
             database, "SessionLocal", sessionmaker(autocommit=False, autoflush=False, bind=engine)
         )
         ro.claim(request)
+        ro.pre_probe(request, intent={"kind": "pre-probe-intent", "surface": "restart"})
+        ro.record_observation(
+            request, observation={"kind": "provider-surface", "observed_at": "restart"}
+        )
+        ro.pre_close(request, intent={"kind": "pre-close-intent", "close": "escape"})
+        ro.record_close_proof(request, proof={"kind": "owned-close", "outcome": "closed"})
         event = {"kind": "restart-probe"}
         written = ro.complete(
             request,
             result=ro.RESULT_OBSERVED_CLOSED,
             final_event=event,
-            receipt={
-                "schema": ro.RECEIPT_SCHEMA,
-                "kind": "observed-closed",
-                "operation_id": request.operation_id,
-                "request_digest": request.request_digest(),
-                "requester_terminal_id": request.requester_terminal_id,
-                "requester_generation": request.requester_generation,
-                "target_terminal_id": request.target_terminal_id,
-                "target_generation": request.target_generation,
-                "native_session_id": request.native_session_id,
-                "provider": request.provider,
-                "provider_version": request.provider_version,
-                "provider_artifact_sha256": request.provider_artifact_sha256,
-                "observation": {"kind": "provider-surface", "observed_at": "restart"},
-                "close_proof": {"kind": "owned-close", "outcome": "closed"},
-                "final_event_digest": canonical_sha256(event),
-                "committed_at": "2026-08-16T00:00:00Z",
-            },
         )
 
     with _engine(path) as engine:
@@ -291,6 +433,10 @@ def test_records_survive_a_restart(tmp_path, monkeypatch):
     assert reread["receipt_digest"] == written["receipt_digest"]
     assert reread["inbox_message_id"] == written["inbox_message_id"]
     assert reread["created_at"] == written["created_at"]
+    #: the four stage facts and the derived receipt survive the restart too.
+    for field in ro.STAGE_FACT_FIELDS:
+        assert reread[field] == written[field]
+    assert reread["receipt_json"] == written["receipt_json"]
 
 
 def test_the_restart_path_leaks_no_sqlite_connections(tmp_path, monkeypatch):

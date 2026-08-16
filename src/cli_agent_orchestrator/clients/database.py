@@ -1751,6 +1751,15 @@ class RouteObservationOperationModel(Base):
     # zero-effect-refusal this holds the winning operation id, never a
     # requirement to act on it.
     detail = Column(Text, nullable=True)
+    # The ordered provider-effect stage facts (COND-0230 M10-C). Each is one
+    # bounded canonical JSON object on this same row; NULL until its stage is
+    # durably committed. Progress is derived from nullability and ordering:
+    # pre-probe intent -> provider-surface observation -> pre-close intent ->
+    # owned close proof. No second row, table, phase, or state authority.
+    pre_probe_intent_json = Column(Text, nullable=True)
+    observation_json = Column(Text, nullable=True)
+    pre_close_intent_json = Column(Text, nullable=True)
+    close_proof_json = Column(Text, nullable=True)
     # Terminal fields; NULL while the operation is nonterminal (requested).
     final_event_json = Column(Text, nullable=True)
     final_event_digest = Column(Text, nullable=True)
@@ -3544,16 +3553,27 @@ def _migrate_native_status_observation_attempt() -> None:
 
 def _migrate_route_observation_operations() -> None:
     """Create the COND-0230 M10 route-observation operation store on older
-    databases.  ``Base.metadata.create_all`` covers fresh databases via
+    databases and add the dark provider-effect stage facts to an installed
+    M10-A store.  ``Base.metadata.create_all`` covers fresh databases via
     ``RouteObservationOperationModel``; this idempotent step covers databases
-    created before the dark operation existed.  Additive: an old binary
-    ignores the table.  The partial unique index is one active-owner
-    authority and adds no speculative reads.
+    created before the dark operation existed (full ``CREATE TABLE``) and
+    databases upgraded from the M10-A publication (``ALTER TABLE ADD COLUMN``
+    for the four nullable stage facts, leaving existing rows NULL).  The
+    partial unique index is one active-owner authority and adds no speculative
+    reads or new indexes.
     """
     import sqlite3
     from contextlib import closing
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    #: The four stage facts introduced by M10-C, in ordering order.
+    stage_columns = (
+        "pre_probe_intent_json",
+        "observation_json",
+        "pre_close_intent_json",
+        "close_proof_json",
+    )
 
     try:
         # ``closing`` because ``with sqlite3.connect(...)`` only ends the
@@ -3581,6 +3601,10 @@ def _migrate_route_observation_operations() -> None:
                     "requester_generation TEXT NOT NULL, "
                     "state TEXT NOT NULL, "
                     "detail TEXT, "
+                    "pre_probe_intent_json TEXT, "
+                    "observation_json TEXT, "
+                    "pre_close_intent_json TEXT, "
+                    "close_proof_json TEXT, "
                     "final_event_json TEXT, "
                     "final_event_digest TEXT, "
                     "receipt_json TEXT, "
@@ -3590,6 +3614,18 @@ def _migrate_route_observation_operations() -> None:
                     "updated_at TEXT NOT NULL"
                     ")"
                 )
+            else:
+                #: An installed M10-A store predates the stage facts; add the
+                #: four nullable columns and leave existing rows all-NULL.
+                existing = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(route_observation_operations)")
+                }
+                for column in stage_columns:
+                    if column not in existing:
+                        conn.execute(
+                            f"ALTER TABLE route_observation_operations ADD COLUMN {column} TEXT"
+                        )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "ix_route_observation_operations_active_target "
