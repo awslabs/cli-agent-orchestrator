@@ -54,6 +54,7 @@ def _begin_body(occurrence_id, to_agent_id, **overrides):
         "packet_digest": PACKET,
         "evidence": _evidence(),
         "initiated_by": "supervisor",
+        "expected_donor_revision": 0,
     }
     body.update(overrides)
     return body
@@ -192,6 +193,36 @@ def test_a_transfer_without_a_delivered_packet_is_409(client):
     assert "catch-up packet" in response.json()["detail"]
 
 
+def test_a_begin_names_the_donor_revision_its_packet_digest_describes(client):
+    # cond-0439. The packet is digested before begin; if the donor moved in the
+    # window, begin must refuse rather than anchor `donor_revision` at a
+    # revision the packet never described. The caller's recovery is ordinary:
+    # re-observe and retry with a fresh packet.
+    donor_agent = str(uuid.uuid4())
+    donor = _open_occurrence(donor_agent)
+    occ.record_boundary(
+        occ.BoundaryRecord(
+            task_occurrence_id=donor["task_occurrence_id"],
+            expected_revision=0,
+            recorded_by="worker",
+            report_digest=DIGEST_A,
+        )
+    )
+    stale = client.post(
+        f"/sessions/{SESSION}/task-handoffs",
+        json=_begin_body(donor["task_occurrence_id"], str(uuid.uuid4()), expected_donor_revision=0),
+    )
+    assert stale.status_code == 409, stale.text
+    assert "packet digest describes" in stale.json()["detail"]
+
+    fresh = client.post(
+        f"/sessions/{SESSION}/task-handoffs",
+        json=_begin_body(donor["task_occurrence_id"], str(uuid.uuid4()), expected_donor_revision=1),
+    )
+    assert fresh.status_code == 200, fresh.text
+    assert fresh.json()["donor_revision"] == 1
+
+
 def test_an_active_turn_is_409_rather_than_a_silent_handback(client):
     donor_agent = str(uuid.uuid4())
     donor = _open_occurrence(donor_agent)
@@ -210,8 +241,19 @@ def test_an_active_turn_is_409_rather_than_a_silent_handback(client):
 def test_unknown_body_fields_are_rejected_rather_than_ignored(client):
     donor_agent = str(uuid.uuid4())
     donor = _open_occurrence(donor_agent)
+    # cond-0439 note: this test used to pin that `expected_revision` on a begin
+    # body was 422 -- which also pinned that a caller had NO way to pin the
+    # revision its packet digest describes. `expected_donor_revision` is now a
+    # first-class, required field (see the CAS test below), so the strict-body
+    # pin moves to a genuinely unknown field: a dropped `expected_epoch` would
+    # still turn a compare-and-swap into last-write-wins.
     body = _begin_body(donor["task_occurrence_id"], str(uuid.uuid4()))
-    body["expected_revision"] = 0
+    body["expected_epoch"] = 0
+    assert client.post(f"/sessions/{SESSION}/task-handoffs", json=body).status_code == 422
+
+    # The new CAS field is required: dropping it must not default to "unchecked".
+    body = _begin_body(donor["task_occurrence_id"], str(uuid.uuid4()))
+    del body["expected_donor_revision"]
     assert client.post(f"/sessions/{SESSION}/task-handoffs", json=body).status_code == 422
 
     # A dropped observed_at would let the server invent one, which would make a

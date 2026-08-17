@@ -1390,7 +1390,10 @@ class TaskOccurrenceHandoffModel(Base):
 
     Because the occurrence is never touched while a handoff is pending,
     rollback has nothing to undo: settling this row to ``rolled-back`` restores
-    the donor's authority and its managed input in one compare-and-swap.
+    the donor's authority and its managed input in one compare-and-swap. A row
+    settled ``failed`` is the same shape of release — the transfer found the
+    recipient holding an unrelated round and settled itself rather than
+    wedging both holds (cond-0440).
 
     Completing a handoff finalizes the donor occurrence ``superseded`` and
     opens a *new* occurrence for the recipient in one transaction. The donor's

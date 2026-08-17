@@ -78,7 +78,15 @@ def _evidence(suffix="1", *, turn_state=th.TURN_TERMINAL, observed_at=_OBSERVED_
     )
 
 
-def _begin(donor_occurrence, to_agent_id, *, handoff_id=None, suffix="1", evidence=None):
+def _begin(
+    donor_occurrence,
+    to_agent_id,
+    *,
+    handoff_id=None,
+    suffix="1",
+    evidence=None,
+    expected_donor_revision=None,
+):
     return th.begin_handoff(
         th.BeginRequest(
             handoff_id=handoff_id or str(uuid.uuid4()),
@@ -88,6 +96,11 @@ def _begin(donor_occurrence, to_agent_id, *, handoff_id=None, suffix="1", eviden
             packet_digest=_PACKET,
             evidence=evidence or _evidence(suffix),
             initiated_by="supervisor",
+            expected_donor_revision=(
+                donor_occurrence["revision"]
+                if expected_donor_revision is None
+                else expected_donor_revision
+            ),
         )
     )
 
@@ -116,6 +129,30 @@ def _occurrence_row(task_occurrence_id):
     record.pop("extensions", None)
     record.pop("seed_verdict", None)
     return record
+
+
+def _bind_roster(agent_id, *, suffix, generation=None):
+    """A real roster incarnation, the way any live worker has one."""
+    from cli_agent_orchestrator.services import stable_agent_roster as roster
+
+    return roster.bind_generation(
+        roster.BindingContract(
+            agent_id=agent_id,
+            session_name=SESSION,
+            role=roster.ROLE_WORKER,
+            profile_family="developer",
+            harness="claude_code",
+            native_session_id=f"native-{suffix}",
+            acquisition_method="chosen_session_id",
+            terminal_id=f"term-{suffix}",
+            generation=generation or f"gen-{suffix}",
+            pane_id=f"%{suffix}",
+            pane_pid=6000 + int(suffix),
+            process_identity={"pid": 6000 + int(suffix), "start_marker": f"marker-{suffix}"},
+            execution_mode="native_tui",
+            admitted=True,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +317,7 @@ def test_a_donor_is_party_to_one_handoff_at_a_time():
                 packet_digest=_PACKET,
                 evidence=_evidence("9"),
                 initiated_by="supervisor",
+                expected_donor_revision=0,
             )
         )
 
@@ -350,6 +388,7 @@ def test_two_concurrent_begins_naming_one_recipient_leave_one_pending_row(tmp_pa
                         packet_digest=_PACKET,
                         evidence=_evidence(suffix),
                         initiated_by="supervisor",
+                        expected_donor_revision=0,
                     )
                 )
             )
@@ -403,6 +442,108 @@ def test_a_finalized_occurrence_is_never_handed_back():
     )
     with pytest.raises(th.TaskHandoffConflict, match="only an open occurrence"):
         _begin(donor, recipient_agent)
+
+
+# ---------------------------------------------------------------------------
+# the revision the packet digest describes (cond-0439)
+# ---------------------------------------------------------------------------
+
+
+def test_begin_refuses_a_donor_that_moved_since_the_packet_was_digested():
+    # The packet digest is taken BEFORE begin. If a still-admitted boundary
+    # write moves the donor in the observe-then-begin window, anchoring
+    # `donor_revision` at begin time records a revision the packet never
+    # described -- and the transfer check then passes a stale packet.
+    donor_agent, recipient_agent, donor = _pair()
+    # The supervisor digests the packet describing revision 0, then the donor's
+    # in-flight turn records another boundary before begin lands.
+    occ.record_boundary(
+        occ.BoundaryRecord(
+            task_occurrence_id=donor["task_occurrence_id"],
+            expected_revision=0,
+            recorded_by="worker",
+            report_digest=_DIGEST_B,
+        )
+    )
+    with pytest.raises(th.TaskHandoffConflict, match="packet digest describes"):
+        _begin(donor, recipient_agent, expected_donor_revision=0)
+    # Nothing is held: the caller re-observes and retries with a fresh packet.
+    assert th.hold_refusal(donor_agent) is None
+    assert th.list_handoffs(SESSION, state=th.STATE_PENDING) == []
+
+
+def test_begin_pins_the_donor_revision_the_packet_digest_describes():
+    # Companion pin, not the gate: this passes even with the begin-time CAS
+    # deleted. The sibling that discriminates the CAS is
+    # test_begin_refuses_a_donor_that_moved_since_the_packet_was_digested;
+    # this pins the recorded value the transfer check later compares against.
+    donor_agent, recipient_agent, donor = _pair()
+    occ.record_boundary(
+        occ.BoundaryRecord(
+            task_occurrence_id=donor["task_occurrence_id"],
+            expected_revision=0,
+            recorded_by="worker",
+            report_digest=_DIGEST_B,
+        )
+    )
+    handoff = _begin(donor, recipient_agent, expected_donor_revision=1)
+    assert handoff["donor_revision"] == 1
+
+
+def test_a_replayed_begin_adopts_against_the_recorded_revision_not_the_live_one():
+    # A caller that lost the begin response retries the identical request. The
+    # donor may have moved since the first attempt recorded; the retry adopts
+    # the recorded effect rather than re-running the CAS against live state.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff_id = str(uuid.uuid4())
+    first = _begin(donor, recipient_agent, handoff_id=handoff_id, expected_donor_revision=0)
+    assert first["adopted"] is False
+    occ.record_boundary(
+        occ.BoundaryRecord(
+            task_occurrence_id=donor["task_occurrence_id"],
+            expected_revision=0,
+            recorded_by="worker",
+            report_digest=_DIGEST_B,
+        )
+    )
+    replay = _begin(donor, recipient_agent, handoff_id=handoff_id, expected_donor_revision=0)
+    assert replay["adopted"] is True
+    assert replay["donor_revision"] == 0
+    # A retry naming a different expected revision is not the same request.
+    with pytest.raises(th.TaskHandoffConflict, match="different immutable content"):
+        _begin(donor, recipient_agent, handoff_id=handoff_id, expected_donor_revision=1)
+
+
+def test_begin_refuses_a_caller_session_already_in_a_transaction():
+    # cond-0439-batch P3-b. `begin_handoff` anchors BEGIN IMMEDIATE so the
+    # read-then-insert precondition holds the write lock while it reads. A
+    # caller-supplied session already inside a transaction silently downgrades
+    # that to the deferred lock the caller already holds -- an invisible
+    # weakening, so it is refused rather than allowed to proceed.
+    from cli_agent_orchestrator.clients import database
+
+    donor_agent, recipient_agent, donor = _pair()
+    session = database.SessionLocal()
+    try:
+        session.connection().exec_driver_sql("BEGIN")
+        with pytest.raises(th.TaskHandoffInvalid, match="already inside a transaction"):
+            th.begin_handoff(
+                th.BeginRequest(
+                    handoff_id=str(uuid.uuid4()),
+                    session_name=SESSION,
+                    task_occurrence_id=donor["task_occurrence_id"],
+                    to_agent_id=recipient_agent,
+                    packet_digest=_PACKET,
+                    evidence=_evidence("1"),
+                    initiated_by="supervisor",
+                    expected_donor_revision=0,
+                ),
+                db=session,
+            )
+    finally:
+        session.close()
+    # The refusal wrote nothing.
+    assert th.list_handoffs(SESSION, state=th.STATE_PENDING) == []
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +672,171 @@ def test_a_refused_delivery_leaves_the_handoff_pending_and_retryable():
         handoff["handoff_id"], rolled_back_by="supervisor", reason="quota returned"
     )
     assert rolled["donor_restored"] is True
+
+
+def test_a_replayed_delivery_with_a_different_receipt_conflicts():
+    # P3-a. The adopt comparison must cover everything the first call recorded.
+    # A replay that agrees on state, outcome and incarnation but carries a
+    # different delivery receipt is not the same delivery, and silently
+    # adopting it would let a caller believe its own receipt was stored.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    _deliver(handoff)
+    with pytest.raises(th.TaskHandoffConflict, match="delivered exactly once"):
+        th.record_packet_delivery(
+            handoff["handoff_id"],
+            delivered=True,
+            incarnation=_incarnation("2"),
+            outcome="accepted",
+            receipt="receipt-2",
+        )
+    # An identical replay still adopts.
+    assert _deliver(handoff)["adopted"] is True
+
+
+# ---------------------------------------------------------------------------
+# the delivered-to incarnation, checked against the roster (cond-0441)
+# ---------------------------------------------------------------------------
+
+
+def test_a_delivery_to_a_pane_the_roster_binds_to_another_agent_is_refused():
+    # The supervisor's roster view is stale: it believes term-9 is the
+    # recipient's pane, but the roster -- the one authority -- binds that pane
+    # to a different worker. Recording the delivery would stamp the recipient's
+    # successor occurrence with another worker's pane, and the finalize-by-
+    # occurrence-id recovery paths would then act on the wrong physical worker.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    _bind_roster(str(uuid.uuid4()), suffix="9")
+    with pytest.raises(th.TaskHandoffConflict, match="not the handoff's recipient"):
+        th.record_packet_delivery(
+            handoff["handoff_id"], delivered=True, incarnation=_incarnation("9")
+        )
+    # The refusal wrote nothing: the handoff stays pending and rollback-able.
+    record = th.get_handoff(handoff["handoff_id"])
+    assert record["delivery_state"] == th.DELIVERY_PENDING
+    assert record["recipient_briefed"] is False
+    rolled = th.rollback_handoff(
+        handoff["handoff_id"], rolled_back_by="supervisor", reason="delivered to the wrong pane"
+    )
+    assert rolled["donor_restored"] is True
+
+
+def test_a_stale_incarnation_assertion_is_corrected_to_the_rosters_binding():
+    # The packet went to the recipient's pane; the supervisor only misnamed the
+    # incarnation. The roster binds that exact terminal and generation, so its
+    # identity is the physical truth -- record it rather than refusing a
+    # delivery that genuinely reached the recipient.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    binding = _bind_roster(recipient_agent, suffix="2")
+    roster_incarnation = binding["incarnation"]["incarnation_id"]
+    assert roster_incarnation != "inc-2"
+
+    delivered = _deliver(handoff)  # asserts the stale incarnation id "inc-2"
+    assert delivered["to_incarnation_id"] == roster_incarnation
+    assert delivered["to_terminal_id"] == "term-2"
+
+    # And the transfer names what the roster -- and now the record -- says.
+    result = th.complete_handoff(
+        handoff["handoff_id"],
+        incarnation=occ.EffectIncarnation(
+            incarnation_id=roster_incarnation, terminal_id="term-2", generation="gen-2"
+        ),
+        expected_revision=0,
+        completed_by="supervisor",
+    )
+    assert result["state"] == th.STATE_TRANSFERRED
+    assert result["successor_occurrence"]["incarnation_id"] == roster_incarnation
+
+
+def test_a_roster_silent_delivery_is_recorded_as_caller_asserted():
+    # Companion pin, not the gate: this passes even with the roster
+    # resolution deleted entirely. The siblings that discriminate the
+    # mechanism are test_a_delivery_to_a_pane_the_roster_binds_to_another_agent_is_refused
+    # and the two live-fallback tests below.
+    #
+    # Deliberate posture, matching the admission hold's: a terminal with no
+    # live roster incarnation under ANY generation is not refused. An agent
+    # with no incarnation cannot be a handoff party in a real flow, and a
+    # pane the roster cannot vouch for is indistinguishable from the ordinary
+    # lost-pane state the system already recovers. The record says what the
+    # caller asserted; it does not claim roster proof.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    delivered = _deliver(handoff)
+    assert delivered["to_incarnation_id"] == "inc-2"
+    assert delivered["delivery_state"] == th.DELIVERY_DELIVERED
+
+
+def test_a_delivery_naming_a_generation_the_roster_binds_elsewhere_is_refused():
+    # cond-0441 F1 face A. The supervisor's view is one staleness hop deeper
+    # than a misnamed incarnation: the roster live-binds term-9 to another
+    # worker under gen-9, while the stale assertion names (term-9, gen-1) for
+    # the recipient. The exact lookup finds no gen-1 row, but that is not
+    # silence -- the roster positively vouches for the pane under another
+    # generation, and the live binding says it is not the recipient's.
+    # Recording would stamp the successor occurrence with another worker's
+    # live pane, and the finalize-by-occurrence-id recovery paths would act
+    # on the wrong physical worker.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    _bind_roster(str(uuid.uuid4()), suffix="9")
+    with pytest.raises(th.TaskHandoffConflict, match="not the handoff's recipient"):
+        th.record_packet_delivery(
+            handoff["handoff_id"],
+            delivered=True,
+            incarnation=occ.EffectIncarnation(
+                incarnation_id="inc-stale", terminal_id="term-9", generation="gen-1"
+            ),
+        )
+    # The refusal wrote nothing: the handoff stays pending and rollback-able.
+    record = th.get_handoff(handoff["handoff_id"])
+    assert record["delivery_state"] == th.DELIVERY_PENDING
+    assert record["recipient_briefed"] is False
+
+
+def test_a_delivery_naming_a_retired_incarnation_is_corrected_to_the_live_binding():
+    # cond-0441 F1 face B. The recipient was bound at (term-2, gen-1) when
+    # the supervisor read its roster view, then ordinary recovery rebound it
+    # to (term-2, gen-2) mid-window; the gen-1 row remains as retired
+    # history. The stale assertion names the retired row, which matches the
+    # recipient by agent and id -- but a retired incarnation read no packet
+    # (the roster's own assert_admission_ready refuses that same pair), and
+    # the bytes could only have landed on the live gen-2 pane. Record the
+    # live binding rather than a conclusion the check never established.
+    from cli_agent_orchestrator.services import stable_agent_roster as roster
+
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    retired = _bind_roster(recipient_agent, suffix="2", generation="gen-1")
+    retired_incarnation = retired["incarnation"]["incarnation_id"]
+    roster.retire_incarnation(terminal_id="term-2", generation="gen-1", reason="rebound")
+    live = _bind_roster(recipient_agent, suffix="2", generation="gen-2")
+    live_incarnation = live["incarnation"]["incarnation_id"]
+
+    delivered = th.record_packet_delivery(
+        handoff["handoff_id"],
+        delivered=True,
+        incarnation=occ.EffectIncarnation(
+            incarnation_id=retired_incarnation, terminal_id="term-2", generation="gen-1"
+        ),
+    )
+    assert delivered["to_incarnation_id"] == live_incarnation
+    assert delivered["to_terminal_id"] == "term-2"
+    assert delivered["to_generation"] == "gen-2"
+
+    # And the transfer names what the roster -- and now the record -- says.
+    result = th.complete_handoff(
+        handoff["handoff_id"],
+        incarnation=occ.EffectIncarnation(
+            incarnation_id=live_incarnation, terminal_id="term-2", generation="gen-2"
+        ),
+        expected_revision=0,
+        completed_by="supervisor",
+    )
+    assert result["state"] == th.STATE_TRANSFERRED
+    assert result["successor_occurrence"]["incarnation_id"] == live_incarnation
 
 
 def test_a_transfer_without_a_delivered_packet_is_refused():
@@ -813,6 +1119,73 @@ def test_a_recipient_that_already_holds_a_round_is_refused_before_it_is_held():
     assert occ.get_occurrence(busy["task_occurrence_id"])["state"] == occ.STATE_OPEN
 
 
+def test_a_recipient_dispatched_mid_window_settles_failed_and_releases_both_holds():
+    # cond-0440. The begin-time recipient-is-free check cannot hold for the
+    # whole window: opening an occurrence is a store operation that consults no
+    # handoff state, and refusing that dispatch would fail an unrelated command
+    # for a reason its caller did not cause and cannot clear. What must not
+    # happen is the wedge -- transfer refused, both agents still held, the
+    # recipient already briefed, recovery only by hand. So the transfer settles
+    # the handoff as failed instead: the donor is never finalized, both holds
+    # release, and recipient_briefed keeps the cancellation owed. Two task
+    # authorities -- the invariant -- is still never created.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _deliver(_begin(donor, recipient_agent))
+    # An ordinary, unrelated dispatch opens a round for the recipient
+    # mid-window. This is legal and takes no lock the handoff holds.
+    dispatched = _open(recipient_agent, suffix="3")
+
+    result = th.complete_handoff(
+        handoff["handoff_id"],
+        incarnation=_incarnation("2"),
+        expected_revision=0,
+        completed_by="supervisor",
+    )
+    assert result["state"] == th.STATE_FAILED
+    assert result["adopted"] is False
+    assert result["recipient_briefed"] is True
+    assert result["donor_restored"] is True
+    assert dispatched["task_occurrence_id"] in result["detail"]
+
+    # Nobody transferred: the donor was never finalized, and the recipient's
+    # unrelated round is untouched -- it was never the problem.
+    assert occ.get_occurrence(donor["task_occurrence_id"])["state"] == occ.STATE_OPEN
+    assert (
+        occ.open_occurrence_for_agent(donor_agent)["task_occurrence_id"]
+        == donor["task_occurrence_id"]
+    )
+    assert occ.get_occurrence(dispatched["task_occurrence_id"])["state"] == occ.STATE_OPEN
+
+    # The wedge is gone: both holds released, both agents steerable again.
+    assert th.hold_refusal(donor_agent) is None
+    assert th.hold_refusal(recipient_agent) is None
+
+    settled = th.get_handoff(handoff["handoff_id"])
+    assert settled["state"] == th.STATE_FAILED
+    assert settled["receipt_digest"]
+    assert settled["settled_at"] is not None
+
+    # A response-loss replay adopts the settled failure rather than raising
+    # "only a pending handoff transfers".
+    replay = th.complete_handoff(
+        handoff["handoff_id"],
+        incarnation=_incarnation("2"),
+        expected_revision=0,
+        completed_by="supervisor",
+    )
+    assert replay["adopted"] is True
+    assert replay["state"] == th.STATE_FAILED
+
+    # Rollback is no longer the exit -- the handoff is already settled.
+    with pytest.raises(th.TaskHandoffConflict, match="settled as failed"):
+        th.rollback_handoff(handoff["handoff_id"], rolled_back_by="supervisor", reason="too late")
+
+    # And both agents may hand back again: the failed row left the pending
+    # slots, exactly as a settled row does.
+    again = _begin(donor, str(uuid.uuid4()))
+    assert again["state"] == th.STATE_PENDING
+
+
 def test_a_rollback_after_delivery_reports_that_the_recipient_was_briefed():
     # The rollback still releases -- one that could refuse would leave both
     # agents held -- but it is not the same outcome as releasing nobody, and
@@ -1046,6 +1419,7 @@ def test_a_changed_replay_of_begin_conflicts_rather_than_overwriting():
                 packet_digest=_DIGEST_B,
                 evidence=_evidence("1"),
                 initiated_by="supervisor",
+                expected_donor_revision=0,
             )
         )
 

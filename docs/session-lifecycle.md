@@ -626,11 +626,12 @@ operator who restores a backup predating the table while a handback is pending
 loses the pending row with the old file, and the probe then admits while the
 recipient still holds a packet asserting it is taking over. That needs operator
 error compounded with a pending handoff; the duplicate authority lasts only
-until settlement, where `complete_handoff` fails typed and rollback is the
-exit; and refusing every installation whose only fault is that M3-E has not
-run on it yet would cost every steer, tell and operator message in exchange
-for protecting nothing. So input is admitted — and the admission logs a
-warning, because a decision this rests on should never be invisible.
+until settlement, where `complete_handoff` settles the handoff as `failed`
+typed — the donor is never finalized and the holds release; and refusing every
+installation whose only fault is that M3-E has not run on it yet would cost
+every steer, tell and operator message in exchange for protecting nothing. So
+input is admitted — and the admission logs a warning, because a decision this
+rests on should never be invisible.
 
 A table that exists but cannot be answered is genuinely unknown: a pending row
 may be sitting in it, and admitting to a held donor invalidates the packet
@@ -655,26 +656,50 @@ construction, so a hold there would be dead code. That reason is pinned by a
 test rather than left as prose, because an implementer who later makes that
 column caller-supplied or reusable would open the lane silently.
 
-**The packet is bound to the incarnation that received it.** The derived control
-id binds no terminal, and the control-input journal refuses to re-deliver a
-known control id whose target moved — so the packet is unreachable to any
-incarnation but the first one that got it. Recording which one that was is what
-lets a transfer refuse a replacement pane. Without it, a recipient whose pane
-died between delivery and transfer would become the sole task authority holding
-no context, while the record and the receipt both asserted that it had read the
+**The packet is bound to the incarnation that received it, and the roster
+decides whose that is.** The derived control id binds no terminal, and the
+control-input journal refuses to re-deliver a known control id whose target
+moved — so the packet is unreachable to any incarnation but the first one that
+got it. Recording which one that was is what lets a transfer refuse a
+replacement pane. The recorded incarnation is not taken on the caller's word:
+the supervisor's roster view can be stale, so `record_packet_delivery` resolves
+the pane through the stable-agent roster. A pane the roster binds to *another*
+agent is refused — recording it would stamp the successor occurrence with a
+foreign pane, and the recovery paths that finalize by occurrence id would act
+on the wrong physical worker. A pane the roster binds to the recipient under a
+different incarnation id is corrected to the roster's binding — the packet
+genuinely reached the recipient; only the caller's name for it was stale. A
+pane the roster cannot place is accepted as caller-asserted, the same posture
+the admission hold takes. Without the binding, a recipient whose pane died
+between delivery and transfer would become the sole task authority holding no
+context, while the record and the receipt both asserted that it had read the
 packet, with the donor already `superseded` and the rollback gone. A replaced
 recipient is a rollback and a new handoff — which yields a new derived control
 id, and so a deliverable packet — never a transfer.
 
-**A donor that moved while held refuses the transfer.** The packet describes one
-exact occurrence revision, snapshotted when the handback began. If something
-wrote to the donor afterwards, the context the recipient read is not the round
-it is being given. Refusing is recoverable; transferring is not.
+**A donor that moved while held refuses the transfer, and a donor that moved
+before the hold refuses the begin.** The packet describes one exact occurrence
+revision, and the caller pins it: `expected_donor_revision` is a required
+compare-and-swap on begin, because the packet digest is taken *before* begin
+and a boundary write that lands in that window would otherwise be anchored
+into `donor_revision` as if the packet described it. A moved donor at begin is
+refused with the donor untouched — the caller re-observes and rebuilds the
+packet. If something wrote to the donor afterwards, while held, the transfer
+refuses: the context the recipient read is not the round it is being given.
+Refusing is recoverable; transferring is not.
 
 **A recipient must be free to take the round.** Checked at the beginning,
-because that is the last point at which refusing is free: past it the
-recipient's own unrelated round is suspended and the catch-up packet is typed
-into its context by the exemption, and typed bytes are not reversible.
+because that is the cheapest point to refuse: past it the recipient's own
+unrelated round is suspended and the catch-up packet is typed into its context
+by the exemption, and typed bytes are not reversible. The check cannot hold
+for the whole window — opening an occurrence is a store operation that
+consults no handoff state, and refusing ordinary dispatch would fail an
+unrelated command for a reason its caller did not cause and cannot clear. So
+if the recipient took an unrelated round mid-window, `complete_handoff`
+settles the handoff as `failed` rather than wedging pending forever: the
+donor is never finalized, both holds release, and `recipient_briefed` keeps
+the owed cancellation visible. Two task authorities — the invariant the seam
+exists to hold — are never created.
 
 **A rollback after delivery still releases, and says so.** One that could refuse
 would leave both agents held with no forward path. But releasing an already

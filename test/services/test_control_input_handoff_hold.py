@@ -165,6 +165,7 @@ def _held_pair(*, donor_suffix="1", recipient_suffix="2"):
                 observed_at=_OBSERVED_AT,
             ),
             initiated_by="supervisor",
+            expected_donor_revision=0,
         )
     )
     return donor_agent, recipient_agent, handoff

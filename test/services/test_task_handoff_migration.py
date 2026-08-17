@@ -415,6 +415,7 @@ def test_records_survive_a_restart(tmp_path, monkeypatch):
                 observed_at="2026-08-16T12:00:00Z",
             ),
             initiated_by="supervisor",
+            expected_donor_revision=0,
         )
     )
     engine.dispose()
@@ -534,6 +535,7 @@ def test_schema_versions_are_stamped_on_every_m3e_row(tmp_path, monkeypatch):
                 observed_at="2026-08-16T12:00:00Z",
             ),
             initiated_by="supervisor",
+            expected_donor_revision=0,
         )
     )
     assert record["schema_version"] == th.SCHEMA_VERSION
