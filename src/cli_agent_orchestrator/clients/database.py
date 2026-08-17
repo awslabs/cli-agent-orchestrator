@@ -24,8 +24,10 @@ from sqlalchemy import (
     create_engine,
     text,
 )
+from sqlalchemy.dialects.sqlite import dialect as _sqlite_dialect
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.schema import CreateColumn
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -34,6 +36,10 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 logger = logging.getLogger(__name__)
 
 Base: Any = declarative_base()
+
+#: Renders one ORM column the way ``create_all`` would, for the raw-sqlite3
+#: migrations that reconcile an existing table against its model.
+_SQLITE_DDL_DIALECT = _sqlite_dialect()
 
 
 class TerminalModel(Base):
@@ -2925,6 +2931,65 @@ def _add_columns_if_missing(
         conn.execute(statement)
 
 
+def _sqlite_add_column_spec(column: Any) -> Optional[str]:
+    """The ``ALTER TABLE ADD COLUMN`` spec for one ORM column, or ``None``.
+
+    SQLite appends a column only when the rows already stored have a determined
+    value for it — nullable (they get NULL) or NOT NULL with a constant default
+    — and it appends neither a PRIMARY KEY nor a UNIQUE column at all.  Anything
+    else needs a table rebuild, so this returns ``None`` rather than inventing a
+    value or silently dropping the constraint.
+
+    The spec itself is rendered by SQLAlchemy's own DDL compiler, so the column
+    an in-place store gains is the column the model declares, quoting and
+    default rendering included.
+    """
+    if column.primary_key or column.unique:
+        return None
+    if not column.nullable and column.server_default is None:
+        return None
+    return str(CreateColumn(column).compile(dialect=_SQLITE_DDL_DIALECT)).strip()
+
+
+def _reconcile_columns_from_model(conn: Any, model: Any) -> None:
+    """Add every column ``model`` declares that its existing table lacks.
+
+    ``CREATE TABLE IF NOT EXISTS`` is a silent no-op against a table that
+    already exists: it compares no shapes and raises nothing.  A store created
+    at an older shape therefore keeps that shape forever, and a later ORM read
+    of the missing column raises — which, behind a fail-closed gate, refuses
+    work that has nothing to do with the new column.
+
+    The reconciled set is derived from the model rather than hand-copied beside
+    it, so there is no second list to forget.  Additive and idempotent: a rerun
+    finds nothing missing, and existing rows keep their bytes (the appended
+    column reads NULL, or its declared default).
+
+    A table this store has not created yet is left alone — ``create_all`` and
+    the migration's own ``CREATE TABLE`` own that shape.  A column SQLite
+    cannot append raises, naming it: the migration would otherwise report
+    success while leaving the store a column short.
+    """
+    table = model.__tablename__
+    present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if not present:
+        return
+    specs = {
+        column.name: _sqlite_add_column_spec(column)
+        for column in model.__table__.columns
+        if column.name not in present
+    }
+    blocked = sorted(name for name, spec in specs.items() if spec is None)
+    if blocked:
+        raise RuntimeError(
+            f"{table} on this store is missing {blocked}, which SQLite cannot "
+            "ADD COLUMN to a populated table. Make the column nullable, give it "
+            "a server_default, or rebuild the table explicitly."
+        )
+    for name, spec in specs.items():
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {spec}")
+
+
 def _migrate_operation_journal() -> None:
     """Create the operation-journal tables on older databases.
 
@@ -3270,8 +3335,54 @@ def _migrate_task_occurrences() -> None:
         logger.warning(f"task-occurrence migration failed: {e}")
 
 
+#: The shape a store that has never carried the table is created at.  Kept
+#: byte-compatible with ``TaskOccurrenceHandoffModel`` so the migration-only
+#: path and ``Base.metadata.create_all`` yield one schema; a store that already
+#: has the table is brought to the model's shape by the reconcile below, which
+#: ``CREATE TABLE IF NOT EXISTS`` cannot do.
+_TASK_OCCURRENCE_HANDOFFS_DDL = (
+    "CREATE TABLE IF NOT EXISTS task_occurrence_handoffs ("
+    "handoff_id TEXT NOT NULL PRIMARY KEY, "
+    "schema_version TEXT NOT NULL, "
+    "session_name TEXT NOT NULL, "
+    "task_occurrence_id TEXT NOT NULL, "
+    "from_agent_id TEXT NOT NULL, "
+    "to_agent_id TEXT NOT NULL, "
+    "from_incarnation_id TEXT NOT NULL, "
+    "from_terminal_id TEXT NOT NULL, "
+    "from_generation TEXT, "
+    "donor_revision INTEGER NOT NULL, "
+    "packet_digest TEXT NOT NULL, "
+    "packet_control_id TEXT NOT NULL, "
+    "quiescence_json TEXT NOT NULL, "
+    "quiescence_digest TEXT NOT NULL, "
+    "delivery_state TEXT NOT NULL, "
+    "delivery_outcome TEXT, "
+    "delivery_receipt TEXT, "
+    "to_incarnation_id TEXT, "
+    "to_terminal_id TEXT, "
+    "to_generation TEXT, "
+    "successor_occurrence_id TEXT, "
+    "state TEXT NOT NULL, "
+    "receipt_digest TEXT, "
+    "detail TEXT, "
+    "initiated_by TEXT NOT NULL, "
+    "created_at TEXT NOT NULL, "
+    "updated_at TEXT NOT NULL, "
+    "settled_at TEXT"
+    ")"
+)
+
+
 def _migrate_task_occurrence_handoffs() -> None:
-    """Create the M3-E reversible-handback table on older databases.
+    """Bring the M3-E reversible-handback table to the model's shape.
+
+    Two populations. A store that predates the table gets it from the DDL
+    above. A store that already carries it at an older shape gets the columns
+    it lacks from ``_reconcile_columns_from_model`` — ``CREATE TABLE IF NOT
+    EXISTS`` is a no-op there, and leaving the shape stale would break the
+    fail-closed hold at ``task_handoff.hold_refusal`` for every managed write
+    on that installation, not only for handoff parties.
 
     Additive only. An older build that rolls back past M3-E keeps reading and
     writing ``task_occurrences`` unchanged, because M3-E adds no column and no
@@ -3283,38 +3394,8 @@ def _migrate_task_occurrence_handoffs() -> None:
 
     try:
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS task_occurrence_handoffs ("
-                "handoff_id TEXT NOT NULL PRIMARY KEY, "
-                "schema_version TEXT NOT NULL, "
-                "session_name TEXT NOT NULL, "
-                "task_occurrence_id TEXT NOT NULL, "
-                "from_agent_id TEXT NOT NULL, "
-                "to_agent_id TEXT NOT NULL, "
-                "from_incarnation_id TEXT NOT NULL, "
-                "from_terminal_id TEXT NOT NULL, "
-                "from_generation TEXT, "
-                "donor_revision INTEGER NOT NULL, "
-                "packet_digest TEXT NOT NULL, "
-                "packet_control_id TEXT NOT NULL, "
-                "quiescence_json TEXT NOT NULL, "
-                "quiescence_digest TEXT NOT NULL, "
-                "delivery_state TEXT NOT NULL, "
-                "delivery_outcome TEXT, "
-                "delivery_receipt TEXT, "
-                "to_incarnation_id TEXT, "
-                "to_terminal_id TEXT, "
-                "to_generation TEXT, "
-                "successor_occurrence_id TEXT, "
-                "state TEXT NOT NULL, "
-                "receipt_digest TEXT, "
-                "detail TEXT, "
-                "initiated_by TEXT NOT NULL, "
-                "created_at TEXT NOT NULL, "
-                "updated_at TEXT NOT NULL, "
-                "settled_at TEXT"
-                ")"
-            )
+            conn.execute(_TASK_OCCURRENCE_HANDOFFS_DDL)
+            _reconcile_columns_from_model(conn, TaskOccurrenceHandoffModel)
             # "Exactly one task authority at every boundary", durably: at most
             # one pending handoff per occurrence, per donor and per recipient.
             # A settled row leaves all three indexes, so the same pair may hand
