@@ -2765,10 +2765,15 @@ fn focus_marked(content: &str, focused: bool) -> String {
 /// screen. A focus state whose region forgot to mark its line would scroll to the wrong place — and
 /// that bug existed (three picker states rendered no marker at all), so this reads the one signal
 /// that is also the operator's.
+///
+/// The optional section keeps its focused header marker while expanded, but its active field also
+/// carries a marker after arrow-key navigation. The field follows the header in rendered order, so
+/// the last marker takes precedence and keeps the edited field in the viewport. When the cursor is
+/// outside the optional range, the header remains the sole marker and therefore the anchor.
 fn focused_line_index(lines: &[Line<'_>]) -> Option<usize> {
     lines
         .iter()
-        .position(|line| line_text(line).starts_with('>'))
+        .rposition(|line| line_text(line).starts_with('>'))
 }
 
 /// One [`Line`]'s plain text, spans concatenated.
@@ -7799,6 +7804,49 @@ mod tests {
                  disguise this assertion is written to strip off. Screen:\n{drawn}"
             );
         }
+    }
+
+    /// **The focused last optional field remains visible at the 80x24 floor.**
+    ///
+    /// The optional header stays marked while the section has focus, so the viewport must prefer
+    /// the active field's marker once arrow-key navigation enters the expanded section.
+    #[test]
+    fn the_last_optional_field_is_drawn_at_the_minimum_supported_size() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, MIN_COLS, MIN_ROWS);
+
+        assert!(shell.on_key(KeyCode::Enter), "reveal every fold");
+        while shell.focus() != Focus::OptionalSection {
+            assert!(shell.on_key(KeyCode::Tab));
+        }
+
+        let last_optional = shell
+            .flow()
+            .fields()
+            .last()
+            .expect("the launch form has optional fields")
+            .name;
+        let optional_count = shell.flow().fields().len() - shell.flow().guided_field_count();
+        for _ in 0..optional_count {
+            assert!(shell.on_key(KeyCode::Down));
+        }
+
+        let optional = joined(&shell.render().optional_section, "\n");
+        assert!(
+            optional
+                .lines()
+                .any(|line| line.starts_with('>') && line.contains(last_optional)),
+            "the last optional field must carry the active marker after Down navigation. \
+             Optional section:\n{optional}"
+        );
+
+        let drawn = screen(&shell, MIN_COLS, MIN_ROWS);
+        assert!(
+            drawn.contains(last_optional),
+            "the marked last optional field {last_optional:?} must be DRAWN at \
+             {MIN_COLS}x{MIN_ROWS}, not merely present in the frame. Screen:\n{drawn}"
+        );
     }
 
     /// **A scrolled column says so, so a partial form never reads as the whole form.**
