@@ -35,9 +35,20 @@ which is observably identical to the pre-extension shape.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+
+from cli_agent_orchestrator.services.workflow_errors import ReplayDivergenceError
+
+logger = logging.getLogger(__name__)
+
+# Database paths whose journal migrators have already run in THIS process (issue #583).
+# Keyed on PATH, not a boolean: five test modules repoint DATABASE_FILE to a temporary
+# path mid-process, and a boolean would leave them on a schema-less database (BR-4).
+# Holds paths only — never row data, connections or credentials (SR-2).
+_MIGRATED_PATHS: set[str] = set()
 
 
 @dataclass
@@ -68,6 +79,12 @@ class StepRow:
     error: Optional[str]
     updated_at: str
     call_fingerprint: Optional[str] = None
+    # issue #583, journal-step-lifecycle (BR-15): the read half of the column
+    # ``result-envelope`` (unit 2) added to the schema and deliberately stopped at.
+    # Additive and defaulted, so every existing construction site stays valid; both
+    # consumers project explicitly by field name (api/main.py, workflow_service.py),
+    # so no response body and no rebuilt record changes shape.
+    result_json: Optional[str] = None
 
 
 @dataclass
@@ -100,16 +117,56 @@ def _connect() -> sqlite3.Connection:
     read/write here never races ``init_db()`` — a process that never went
     through the FastAPI lifespan (e.g. a test that instantiates the app
     without entering it as a context manager) still finds its schema.
+
+    Two properties are added by ``journal-connection-posture`` (issue #583,
+    NFR-4). The function's name, signature, return type and callers are
+    otherwise unchanged (BR-7):
+
+    - **The migrators run at most once per database path per process** (BR-3),
+      guarded by :data:`_MIGRATED_PATHS`. The path is read INSIDE this function
+      on every call — never captured at import and never cached beside the set
+      (BR-5) — so a process that repoints ``DATABASE_FILE`` mid-run still
+      migrates the new path on its next call (BR-4). The path is recorded ONLY
+      after both migrators return (BR-6): each swallows and logs its own
+      failure at debug level, so caching a raise would turn one transient
+      fault into a process that talks to a schema-less database forever.
+    - **Every connection carries ``busy_timeout``** (BR-1/BR-2). It is a
+      per-connection setting rather than a database property, so it cannot be
+      memoised alongside the migration state and is set on each new connection.
+      At the current value this pragma is a runtime NO-OP: CPython's
+      ``sqlite3.connect()`` already applies a 5000 ms busy timeout via its
+      ``timeout=5.0`` default, which it implements with
+      ``sqlite3_busy_timeout``. It is set explicitly anyway for two reasons —
+      the value gets a single named home that can be revised without editing
+      this module, and the guarantee survives a future caller passing
+      ``timeout=0`` or a change to that stdlib default. It does NOT widen the
+      contention window; the per-call cost this function actually removes is
+      the migrator DDL above. WAL — which *is* a database-level property,
+      shared with every other CAO subsystem using this file — is deliberately
+      NOT set here (BR-8, ADR-583-10).
+
+    The timeout is interpolated from the module-level constant and from nothing
+    else (SR-1): SQLite accepts no bound parameter for ``PRAGMA busy_timeout``,
+    so this is this module's one interpolated statement and its source must
+    stay a trusted constant.
     """
     from cli_agent_orchestrator.clients.database import (
         _migrate_workflow_run,
         _migrate_workflow_run_step,
     )
-    from cli_agent_orchestrator.constants import DATABASE_FILE
+    from cli_agent_orchestrator.constants import (
+        DATABASE_FILE,
+        WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS,
+    )
 
-    _migrate_workflow_run()
-    _migrate_workflow_run_step()
-    return sqlite3.connect(str(DATABASE_FILE))
+    path = str(DATABASE_FILE)  # read at call time, never cached (BR-5)
+    if path not in _MIGRATED_PATHS:
+        _migrate_workflow_run()
+        _migrate_workflow_run_step()
+        _MIGRATED_PATHS.add(path)  # only after BOTH migrators return (BR-6)
+    conn = sqlite3.connect(path)
+    conn.execute(f"PRAGMA busy_timeout = {WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS}")
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +373,152 @@ def settle_run_state_if_running(run_id: str, state: str, finished_at: Optional[s
 
 
 # ---------------------------------------------------------------------------
+# recovery-decision-intake additions (issue #583, unit 12) — FR-7's escape hatch.
+# A human's decision at a halted step, carried into a resume as a STATE TRANSITION
+# on the existing row: no schema change, and the run's evidence survives the
+# decision instead of being deleted by it (BR-8, ADR-583-8).
+# ---------------------------------------------------------------------------
+# The decision -> state map. BARE STRING LITERALS on both sides, matching how this
+# module already spells state values (``lookup_replay``, ``begin_step``,
+# ``settle_run_state_if_running``) — the module takes no module-level ``models``
+# dependency for a vocabulary it only writes (unit 6's BR-12/TD-4 precedent).
+# ``test_recovery_decision_intake.py`` pins the KEYS against ``RecoveryDecision``
+# and the VALUES against ``StepState`` from its own imports, so a rename or a third
+# member on either side fails loudly instead of drifting.
+_DECISION_STATES: Dict[str, str] = {
+    "rerun": "rerun_authorized",  # -> gate rule 1 -> EXECUTE (BR-2)
+    "skip": "replay_authorized",  # -> gate rule 7 excluded -> rule 8 -> REPLAY (BR-3)
+}
+
+
+def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> None:
+    """Apply a human's per-step recovery decisions to one run's rows (FR-7, BR-1..BR-10).
+
+    The escape hatch for a halt: the replay gate can return ``DECISION_REQUIRED``,
+    and this is the only thing that resolves one. Called on the resume path BEFORE
+    the script is spawned (BR-7) — the gate reads journal rows, so a decision applied
+    after the spawn would be invisible to the step it was meant to resolve.
+
+    **THE ORDER OF OPERATIONS IS THE REQUIREMENT, NOT AN IMPLEMENTATION CHOICE**
+    (SR-2/SR-3/SR-6, RL-1). Read, then validate the WHOLE map, then write inside ONE
+    transaction, then log:
+
+    1. read this run's existing step rows (:func:`get_steps`);
+    2. validate EVERY entry — nothing is written yet;
+    3. one ``with _connect() as conn:`` block, N single-row UPDATEs of ``state``;
+    4. AFTER the commit, one warning per decision.
+
+    **Why validate-then-write rather than iterate-and-write** (SR-2, the one threat
+    this unit introduces). This function takes a MAP, so a typo in the third entry
+    would otherwise leave the first two already transitioned while the operator sees
+    their resume REJECTED — ``step-a`` would hold durable consent to re-execute a
+    side-effecting step, granted by a command that reported failure. BR-9 makes
+    consent one-shot so it cannot outlive its ATTEMPT; this ordering stops it
+    outliving its own REJECTION.
+
+    **Why one transaction as WELL as up-front validation** (SR-3/TD-4). The two guard
+    different failures and neither is redundant: validation catches operator error at
+    the boundary, the transaction catches a database failure part-way through the
+    writes. ``with _connect() as conn:`` commits on clean exit and rolls back on an
+    exception, which is sufficient — deliberately NOT the ``BEGIN IMMEDIATE`` unit
+    6's TD-2a considered, because this is a single-writer, human-initiated path and
+    not a two-process race (concurrent resumes of the SAME run are rejected upstream
+    with 409 before this function is reached, SC-3).
+
+    **Only ``state`` moves** (BR-8/SR-9/RL-4). ``attempts``, ``result_json``,
+    ``output_json``, ``error``, ``call_fingerprint`` and ``updated_at`` are untouched,
+    so the record of what actually happened outlives the decision about what to do
+    next — which is what makes a halt diagnosable afterwards (FR-12).
+
+    **It never silently no-ops** (BR-6/RL-2/INV-3). An unknown ``step_id`` or an
+    unknown decision value raises, because a swallowed typo would let the run halt
+    again at the same step with no signal that the decision never landed — and the
+    operator would re-issue the same typo indefinitely, concluding the halt mechanism
+    is broken. An EMPTY map is not that case: no decision was supplied, so it returns
+    without reading, writing or logging.
+
+    **The log line is the one place this module logs, and its position is a rule**
+    (SR-6/TD-6). Its neighbours deliberately leave logging to the caller — a caller
+    knows more about a no-op than the primitive does. This function is different: it
+    is the subsystem's only permission grant, so the grant itself is the evidence and
+    only this function holds it. The line goes AFTER the commit and on the success
+    path ONLY: logging before the commit would record a decision that then rolled
+    back, and a log claiming consent was granted when it was not is worse than no log
+    at all. A rejection needs no line — it already surfaces as a 400 to the operator
+    who caused it. Identifiers only: ``run_id``, ``step_id``, the decision and the
+    state it wrote — never a fingerprint, an envelope or any step content (SR-5).
+
+    A durable, queryable record of *which operator authorised this, and when* is a
+    known gap: neither existing log fits (``event_log_service`` is an in-process ring
+    buffer; ``audit_log`` is the MEMORY audit log and short-circuits when memory is
+    disabled), and a durable workflow event log is the parked #505 work. Recorded as
+    an accepted residual in this unit's ``security-requirements.md`` rather than
+    papered over; when #505 lands, this line is where the decision joins the timeline.
+
+    Args:
+        run_id: the run being resumed. Its rows are the only ones touched.
+        decisions: ``step_id`` -> decision, where a value is a ``RecoveryDecision``
+            member or the equivalent string. Annotated ``str`` because
+            ``RecoveryDecision`` IS a ``(str, Enum)`` and the boundary hands raw JSON
+            strings: :func:`parse_decision` is the single validation point for both
+            forms (BR-10), so no surface can accept a value another rejects.
+
+    Raises:
+        ValueError: if any ``step_id`` is absent from this run, or any value is not a
+            recovery decision. The message names the offending ``step_id`` and
+            carries identifiers only (SR-4/SR-5). Raised BEFORE any write, so the
+            rows are untouched; the resume route's existing bare-``ValueError`` arm
+            maps it to 400 — correct, because a mistyped ``step_id`` is a client
+            error and a 500 would tell the operator to file a bug instead of fixing a
+            typo.
+        sqlite3.Error: propagated unchanged from the read or the transaction, like
+            every other helper here (BR-3's posture). A failed transaction has
+            written nothing and produced no log line.
+    """
+    # Function-local import of the LIGHT models module, exactly as
+    # ``settle_run_state_if_running`` imports ``RunState``: no module-level ``models``
+    # edge, and no import cost for the many callers that never decide anything.
+    from cli_agent_orchestrator.models.workflow_runtime import parse_decision
+
+    if not decisions:
+        return  # no decision supplied is not a decision that failed
+
+    # 1. The run's own rows are the bound on N (SC-1): a caller cannot enlarge the
+    # write set by inventing ids, because step 2 rejects the whole map instead.
+    known = {row.step_id for row in get_steps(run_id)}
+
+    # 2. VALIDATE THE WHOLE MAP FIRST. Nothing below this loop writes, and nothing
+    # above it does either — the resolved states are collected and only then applied.
+    resolved: Dict[str, Tuple[str, str]] = {}  # step_id -> (decision value, new state)
+    for step_id, value in decisions.items():
+        if step_id not in known:
+            raise ValueError(f"run '{run_id}' has no step '{step_id}'; no decision was applied")
+        try:
+            decision = parse_decision(value)
+        except ValueError as e:
+            raise ValueError(f"step '{step_id}': {e}; no decision was applied") from e
+        resolved[step_id] = (decision.value, _DECISION_STATES[decision.value])
+
+    # 3. ONE transaction. ``state`` and nothing else (BR-8).
+    with _connect() as conn:
+        for step_id, (_decision, state) in resolved.items():
+            conn.execute(
+                "UPDATE workflow_run_step SET state = ? WHERE run_id = ? AND step_id = ?",
+                (state, run_id, step_id),
+            )
+
+    # 4. AFTER the commit, success path only (SR-6). Identifiers only (SR-5).
+    for step_id, (decision_value, state) in resolved.items():
+        logger.warning(
+            "journal: run '%s' step '%s': recovery decision '%s' applied (state -> %s)",
+            run_id,
+            step_id,
+            decision_value,
+            state,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Reads (rebuild + resume read path, business-logic-model §2/§3).
 # ---------------------------------------------------------------------------
 def get_run(run_id: str) -> Optional[RunRow]:
@@ -348,11 +551,17 @@ def get_run(run_id: str) -> Optional[RunRow]:
 
 
 def get_steps(run_id: str) -> List[StepRow]:
-    """Return all ``workflow_run_step`` rows for ``run_id`` (E2)."""
+    """Return all ``workflow_run_step`` rows for ``run_id`` (E2).
+
+    ``result_json`` is appended to the SELECT list by ``journal-step-lifecycle``
+    (issue #583, BR-15) so the envelope ``settle_step`` writes is readable. The
+    column order is append-only because the construction below indexes
+    positionally.
+    """
     with _connect() as conn:
         rows = conn.execute(
             "SELECT run_id, step_id, state, attempts, output_json, error, updated_at, "
-            "call_fingerprint "
+            "call_fingerprint, result_json "
             "FROM workflow_run_step WHERE run_id = ?",
             (run_id,),
         ).fetchall()
@@ -366,6 +575,7 @@ def get_steps(run_id: str) -> List[StepRow]:
             error=r[5],
             updated_at=r[6],
             call_fingerprint=r[7],
+            result_json=r[8],
         )
         for r in rows
     ]
@@ -376,11 +586,17 @@ def get_step(run_id: str, step_id: str) -> Optional[StepRow]:
 
     U3 addition: the read primitive ``lookup_replay`` (A2) is built on. Returns
     ``None`` when the row is absent — a script call that has never arrived.
+
+    ``result_json`` is appended to the SELECT list by ``journal-step-lifecycle``
+    (issue #583, BR-15): without it ``settle_step`` would write a column no reader
+    returns, and the replay gate could not reject a settled row for an absent
+    envelope it has no way to see (FR-4 guard 2, unit 7). The column order is
+    append-only because the construction below indexes positionally.
     """
     with _connect() as conn:
         row = conn.execute(
             "SELECT run_id, step_id, state, attempts, output_json, error, updated_at, "
-            "call_fingerprint "
+            "call_fingerprint, result_json "
             "FROM workflow_run_step WHERE run_id = ? AND step_id = ?",
             (run_id, step_id),
         ).fetchone()
@@ -395,6 +611,7 @@ def get_step(run_id: str, step_id: str) -> Optional[StepRow]:
         error=row[5],
         updated_at=row[6],
         call_fingerprint=row[7],
+        result_json=row[8],
     )
 
 
@@ -476,8 +693,7 @@ def append_step(
     future caller of the reserved ``lookup_replay`` primitive has a stable value
     to compare. The
     completion transition (RUNNING -> COMPLETED/FAILED) reuses the base
-    ``update_step`` UNCHANGED (INV-1); this function is the sole write path for
-    ``call_fingerprint`` (VR-4).
+    ``update_step`` UNCHANGED (INV-1).
 
     ``ON CONFLICT ... DO UPDATE`` upserts ``state``/``updated_at`` only — a
     re-executed tail step (e.g. a second resume attempt over the same call)
@@ -486,6 +702,23 @@ def append_step(
     from the ``DO UPDATE`` clause so it stays stable across attempts (VR-4) —
     the fingerprint recorded at the FIRST arrival of this ``(run_id, step_id)``
     is the one ``lookup_replay`` compares against on every subsequent attempt.
+
+    **This function is no longer the only writer of ``call_fingerprint``**
+    (corrected by ``journal-step-lifecycle``, issue #583, BR-11 — the VR-4
+    exclusivity claim this docstring used to make became false the moment
+    :func:`begin_step` landed beside it, and is removed here rather than left to
+    contradict the code in the same module). The two writers own two regimes,
+    and the split is the point:
+
+    - **this function — the YAML tier**: the fingerprint is fixed at the FIRST
+      arrival of a ``(run_id, step_id)`` and never moves, because the column is
+      excluded from the ``DO UPDATE`` above.
+    - **:func:`begin_step` — the script tier**: the fingerprint is RE-BASELINED
+      on conflict whenever the prior row is not ``completed`` (BR-7), so a step
+      re-dispatched after a failure or a human rerun decision records the
+      fingerprint of the call actually about to run. A ``completed`` row's
+      fingerprint is preserved, which is the same stability this function
+      provides unconditionally.
     """
     with _connect() as conn:
         conn.execute(
@@ -497,6 +730,184 @@ def append_step(
             "state = excluded.state, updated_at = excluded.updated_at",
             (run_id, step_id, state, updated_at, call_fingerprint),
         )
+
+
+# ---------------------------------------------------------------------------
+# journal-step-lifecycle additions (issue #583, unit 6) — the script tier's
+# single durable write split into a BEGIN and a SETTLE, so that a settled row and
+# an absent result can no longer coexist (FR-4 guard 1, ADR-583-4). Additive:
+# every helper above keeps its signature, behaviour and callers (BR-10), and
+# nothing in production calls either function until ``settlement-rewire``
+# (unit 8) rewires ``record_step_completion``.
+# ---------------------------------------------------------------------------
+def begin_step(run_id: str, step_id: str, updated_at: str, call_fingerprint: str) -> None:
+    """Write the durable RUNNING row for a script call, carrying its fingerprint (A).
+
+    The first half of the split write. Called at terminal creation, BEFORE the
+    call executes, so a crash in the execution window leaves the row ``running``
+    — a state ``lookup_replay``'s existing partial guard already rejects — rather
+    than ``completed`` with no result.
+
+    ``attempts`` is absent from the ``DO UPDATE`` clause (BR-8). This function
+    never moves the count; :func:`settle_step` owns it. A second ``begin_step``
+    on a step already settled three times must not reset it to 0.
+
+    **Why ``call_fingerprint`` is written conditionally.** :func:`append_step`
+    excludes the column from its conflict clause outright, which fixes the
+    fingerprint at first arrival forever. That is right for the YAML tier and
+    wrong for the script tier: a step re-dispatched after a failure — or after a
+    human authorises a rerun — would keep a fingerprint recorded against a call
+    that is not the one about to run (possibly under a superseded hashing
+    scheme), and every later resume would halt again on the same step. The
+    ``CASE`` therefore re-baselines the fingerprint while the prior row is not
+    terminal, and preserves it once the row is ``completed`` — a completed row's
+    fingerprint is the one recorded against a real result, which is exactly what
+    ``lookup_replay`` must keep comparing against (BR-7, INV-3).
+
+    **The condition is an open negative — ``!= 'completed'`` — and must stay
+    one.** Rewriting it as an allowlist of the states known today would silently
+    stop re-baselining the moment ``recovery-decision-intake`` (unit 12) adds
+    ``rerun_authorized``, reinstating the permanent-halt bug the rule exists to
+    kill. A test pins that an arbitrary unknown state value still re-baselines.
+
+    ``'running'`` is a bare string literal, matching how this module already
+    spells state values (``lookup_replay``, ``settle_run_state_if_running``);
+    the module gains no ``models`` dependency for one literal (BR-12, TD-4). A
+    test pins the literal equal to ``StepState.RUNNING.value`` from the test
+    file's own import, so a rename on either side fails loudly.
+
+    Raises ``sqlite3.Error`` on a DB failure and swallows nothing (BR-3): the
+    best-effort posture belongs to the caller (``record_step_completion``), so a
+    journal failure degrades resumability and never fails a running step (INV-4).
+    """
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run_step "
+            "(run_id, step_id, state, attempts, output_json, error, updated_at, "
+            " call_fingerprint) "
+            "VALUES (?, ?, 'running', 0, NULL, NULL, ?, ?) "
+            "ON CONFLICT(run_id, step_id) DO UPDATE SET "
+            "state = excluded.state, "
+            "updated_at = excluded.updated_at, "
+            "call_fingerprint = CASE "
+            "WHEN workflow_run_step.state != 'completed' "
+            "THEN excluded.call_fingerprint "
+            "ELSE workflow_run_step.call_fingerprint END",
+            (run_id, step_id, updated_at, call_fingerprint),
+        )
+
+
+def settle_step(
+    run_id: str,
+    step_id: str,
+    state: str,
+    updated_at: str,
+    result_json: Optional[str],
+    output_json: Optional[str],
+    error: Optional[str],
+) -> bool:
+    """Settle a script call's row — state, count, envelope, output, error — atomically (B).
+
+    The second half of the split write, and the whole of FR-4 guard 1: ``state``,
+    ``attempts``, ``result_json``, ``output_json`` and ``error`` land in ONE
+    statement on ONE connection, so there is no window in which the row reads
+    settled and carries no result (BR-1, INV-1). A failure writes nothing and
+    leaves the row as :func:`begin_step` set it — ``running``, which is not
+    settled (BR-2). Atomic means never half-written, not never-failing.
+
+    Returns ``True`` when a row already existed and ``False`` when this settle
+    created it — the no-begin rescue path below. The caller logs that
+    distinction (BR-13, TD-2); this function emits no log line, exactly as
+    :func:`settle_run_state_if_running` leaves its own no-op to the caller,
+    "because a silent no-op is indistinguishable from a broken guard when
+    reading logs after an incident". A single ``INSERT ... ON CONFLICT DO
+    UPDATE`` cannot report which branch it took (``cursor.rowcount`` is 1 either
+    way), so the branch is detected by a primary-key ``SELECT`` on the same
+    connection, immediately before the upsert. ``RETURNING`` would detect it in
+    one statement but appears nowhere in ``src/`` and needs SQLite 3.35+, which
+    is not verified at the project's CI floor (TD-2).
+
+    **The scope of that detection, stated precisely rather than overclaimed.**
+    The ``SELECT`` and the upsert share one connection and one ``with`` block,
+    but NOT one transaction: with the stdlib's legacy transaction control
+    (``isolation_level=""``) an implicit ``BEGIN`` fires at the first DML
+    statement, so a plain ``SELECT`` runs in autocommit and opens no read
+    transaction — verified on CPython 3.12.9 / SQLite 3.47.1, where a second
+    connection can insert the same key between the two statements without
+    blocking. So the returned ``bool`` is an accurate report of what this process
+    saw a moment before its write, and it can under-report (``False`` while
+    another process created the row in that gap, leaving this statement to take
+    the conflict path). It never mis-reports ``True``: nothing in ``src/`` deletes
+    a ``workflow_run_step`` row.
+
+    That residual is bounded and deliberate. **BR-1 does not depend on it** — the
+    settle itself is one statement and stays atomic whatever the read said — and
+    the value feeds a diagnostic warning, not a control-flow decision, so the
+    worst case is one missing log line in a race between two processes settling
+    the SAME step. Making it exact would need an explicit ``BEGIN IMMEDIATE``
+    around both statements, which no other helper in this module takes and which
+    would widen the write lock across a read for a log line.
+
+    **It is an UPSERT, not an UPDATE** (BR-4). The no-prior-row case is live
+    today — ``script_runner.record_step_completion`` already defends against a
+    terminal-created callback that never fired — and a bare ``UPDATE`` there
+    would affect 0 rows and discard the settled result silently. That is strictly
+    worse than the half-written row guard 1 prevents: the replay gate can reject
+    a settled row with no envelope, but it cannot reject a row that does not
+    exist.
+
+    **``attempts`` is owned by the SQL and is not a parameter** (BR-5, BR-6):
+    ``1`` on the INSERT path, ``existing + 1`` on conflict, so the durable count
+    means *total settles ever recorded for this step* and never moves backwards.
+    The caller's in-process counter restarts at 0 after a resume, so a
+    caller-supplied count would drag a row reading 3 back to 1 — untruthful
+    under FR-12. ``component-methods.md`` specifies an ``attempts`` argument;
+    it is dropped here on the human's ruling (TD-3), because an argument that is
+    accepted and ignored reads as authoritative. Unit 8's call site passes none.
+
+    **``call_fingerprint`` is never written here** (BR-9). On the conflict path
+    the column keeps whatever :func:`begin_step` recorded; on the INSERT path it
+    stays ``NULL``, so a row rescued from the no-begin path has *absent*
+    provenance. That is the intended outcome, not a gap — absent provenance
+    routes to a halt rather than a replay match, which makes the rescued result
+    durably visible to a human (INV-5).
+
+    **This function sanitises nothing** (BR-14, SR-2). ``result_json``,
+    ``output_json`` and ``error`` are persisted as received; it pulls in neither
+    unit 2's envelope builder nor its redaction gate, and no security logic lives
+    inside a persistence primitive. The caller owns redacting AND bounding both
+    remaining content columns, and ``settlement-rewire`` (unit 8) is where that
+    is assigned. Until unit 8 lands, a settled row carries a redacted, bounded
+    envelope beside a raw, unbounded ``error`` and ``output_json`` — pre-existing
+    behaviour that ``update_step`` already has and this function does not
+    worsen, recorded as an accepted residual risk in this unit's
+    ``security-requirements.md`` SR-3/SR-4 rather than left implicit.
+
+    Raises ``sqlite3.Error`` on a DB failure and swallows nothing (BR-3).
+    """
+    with _connect() as conn:
+        existed = (
+            conn.execute(
+                "SELECT 1 FROM workflow_run_step WHERE run_id = ? AND step_id = ?",
+                (run_id, step_id),
+            ).fetchone()
+            is not None
+        )
+        conn.execute(
+            "INSERT INTO workflow_run_step "
+            "(run_id, step_id, state, attempts, output_json, error, updated_at, "
+            " result_json) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id, step_id) DO UPDATE SET "
+            "state = excluded.state, "
+            "attempts = workflow_run_step.attempts + 1, "
+            "output_json = excluded.output_json, "
+            "error = excluded.error, "
+            "updated_at = excluded.updated_at, "
+            "result_json = excluded.result_json",
+            (run_id, step_id, state, output_json, error, updated_at, result_json),
+        )
+    return existed
 
 
 def lookup_replay(run_id: str, step_id: str, call_fingerprint: str) -> Optional[StepRow]:
@@ -514,19 +925,28 @@ def lookup_replay(run_id: str, step_id: str, call_fingerprint: str) -> Optional[
       (the script changed between runs at the same key; resume cannot honor the
       replay contract, so it fails loudly rather than silently re-executing)
 
-    Imported lazily from ``workflow_service`` to avoid a circular import
-    (``workflow_service`` already imports this module).
+    ``ReplayDivergenceError`` is imported at MODULE level from the ``workflow_errors``
+    leaf (issue #583, ADR-583-9, BR-3). It used to be imported here, inside this
+    function, from ``workflow_service`` purely to dodge a circular import — that module
+    imports this one. The leaf imports nothing, so both sides can bind the name at
+    module level and the cycle edge is removed rather than deferred to call time.
+    ``workflow_service`` re-exports the name, so its old import path still resolves.
     """
-    from cli_agent_orchestrator.services.workflow_service import ReplayDivergenceError
-
     row = get_step(run_id, step_id)
     if row is None:
         return None
     if row.state != "completed":
         return None
     if row.call_fingerprint != call_fingerprint:
+        # Keyword-only per the moved class's signature (issue #583, TD-3). The message's
+        # content is unchanged: ``run_id``, ``step_id`` and the fixed phrase — identifiers
+        # only, never the two fingerprints (SR-1). ``step_id`` now reaches the rendered
+        # string through the structured field, which is what puts it in ``str(exc)``.
         raise ReplayDivergenceError(
-            f"run '{run_id}' step '{step_id}': call fingerprint diverged on replay "
-            "(the script changed between runs at the same key)"
+            step_id=step_id,
+            reason=(
+                f"call fingerprint diverged on replay for run '{run_id}' "
+                "(the script changed between runs at the same key)"
+            ),
         )
     return row

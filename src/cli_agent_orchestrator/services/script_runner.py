@@ -29,17 +29,17 @@ FAILURE/timeout/cancel is NEVER an exception — it returns a FAILED/CANCELLED
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
+    WORKFLOW_JOURNAL_RESULT_MAX_BYTES,
     WORKFLOW_SCRIPT_LOG_CAP,
     WORKFLOW_SCRIPT_SCRATCH_DIR,
     WORKFLOW_SCRIPT_TERM_GRACE,
@@ -53,7 +53,9 @@ from cli_agent_orchestrator.models.workflow_runtime import (
 )
 from cli_agent_orchestrator.services import terminal_service, workflow_journal
 from cli_agent_orchestrator.services.script_lint import lint_script
+from cli_agent_orchestrator.services.secret_gate import redact_secrets
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part, step_output_store
+from cli_agent_orchestrator.services.step_result import build_envelope, serialise_envelope
 from cli_agent_orchestrator.services.workflow_service import (
     ResumeCorruptError,
     ResumeNotAllowedError,
@@ -389,16 +391,37 @@ async def _reconcile_orphans(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 def make_step_terminal_recorder(
     env_vars: Optional[Dict[str, str]],
-) -> Optional[Callable[[str], None]]:
-    """Build the ``on_terminal_created`` callback for a script-tier run-step call.
+) -> Optional[Callable[[str, str], None]]:
+    """Build the ``on_step_terminal_ready`` callback for a script-tier run-step call.
 
     Returns ``None`` (no-op) unless the call carries both ``CAO_WORKFLOW_RUN_ID``
     and ``CAO_WORKFLOW_STEP_ID`` AND that run is a live ``ScriptRunRecord`` in the
     registry — i.e. only genuine script run-step calls record a terminal for the
-    sweep. The returned callback records the created ``terminal_id`` into the
-    shared record's ``step_states[step_id]`` at creation time (BR-31), creating a
-    RUNNING ``StepRunState`` if the key is not yet present so a mid-flight call is
-    visible even before its first journal write.
+    sweep, so YAML and handoff callers are wholly unaffected and reach no journal
+    write and no redaction at all (BR-9/SR-9).
+
+    The returned callback takes ``(terminal_id, call_fingerprint)`` and does three
+    things, in order, for the terminal this step will run on — whether
+    ``run_agent_step`` made it or reused one (issue #583, unit
+    ``settlement-rewire`` BR-3):
+
+    1. records ``terminal_id`` into the shared record's ``step_states[step_id]``
+       (BR-31, unchanged), seeding a RUNNING ``StepRunState`` if the key is not
+       yet present so a mid-flight call is visible even before its first journal
+       write;
+    2. PUBLISHES ``call_fingerprint`` onto that same ``StepRunState`` (BR-2). The
+       value is computed by ``run_agent_step`` in the one window
+       ``step-fingerprint``'s BR-5 permits and cannot be published there:
+       ``workflow_service`` — which owns ``StepRunState`` and ``run_registry`` —
+       imports ``run_agent_step``, so the reverse import would be circular. It
+       therefore arrives as this callback's second argument;
+    3. writes the durable RUNNING row via ``workflow_journal.begin_step``, so a
+       crash in the execution window leaves the row ``running`` rather than
+       absent (FR-4 guard 1 / INV-2).
+
+    The journal write is BEST-EFFORT (BR-10/INV-4): ``begin_step`` raises and this
+    caller catches, because failing to record a RUNNING row degrades resumability
+    and must never fail a step that is about to run.
     """
     if not env_vars:
         return None
@@ -410,7 +433,7 @@ def make_step_terminal_recorder(
     if not isinstance(record, ScriptRunRecord):
         return None
 
-    def _record(terminal_id: str) -> None:
+    def _record(terminal_id: str, call_fingerprint: str) -> None:
         from cli_agent_orchestrator.models.workflow import StepState
 
         st = record.step_states.get(step_id)
@@ -418,32 +441,204 @@ def make_step_terminal_recorder(
             st = StepRunState(step_id=step_id, state=StepState.RUNNING)
             record.step_states[step_id] = st
         st.terminal_id = terminal_id
+        # BR-2: in-memory publication. The durable column is begin_step's to write.
+        st.call_fingerprint = call_fingerprint
+
+        try:
+            workflow_journal.begin_step(run_id, step_id, _now(), call_fingerprint)
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — journal write is best-effort; resumability degraded only (INV-4)
+            # The fingerprint is NEVER echoed into this line (SR-7) — a digest in a
+            # log is noise, and the habit of logging "the value that failed" is what
+            # would eventually put a prompt there.
+            logger.warning(
+                "journal: script step '%s/%s': failed to write the running row "
+                "(resumability degraded): %s",
+                run_id,
+                step_id,
+                e,
+            )
 
     return _record
 
 
 # ---------------------------------------------------------------------------
+# Settle-time sanitisation of the two free-content columns (issue #583, unit
+# ``settlement-rewire`` SR-1..SR-6). ``settle_step`` persists what it is given and
+# ``build_envelope`` sanitises ``last_message`` only, so ``error`` and
+# ``output_json`` arrive raw and unbounded — and ``error`` is where a provider's
+# failure text lands, the likeliest place in the system for a credential to appear
+# verbatim. THE TWO COLUMNS GET DELIBERATELY DIFFERENT TREATMENT (TD-6), because
+# they are two kinds of thing: ``error`` is free text where truncation is harmless,
+# ``output_json`` is a document both readers ``json.loads`` (``api/main.py``'s
+# ``_json_or_none`` and ``workflow_service``'s ``_record_from_json``).
+#
+# Both transformations are LOSSY BUT TOTAL (SR-6): neither raises, so a verbose
+# agent cannot fail a run by talking too much and a settle never strands a step
+# that already succeeded.
+# ---------------------------------------------------------------------------
+_ERROR_TRUNCATION_MARKER = (
+    "[... error truncated: {dropped} leading bytes dropped; showing tail ...]\n"
+)
+"""Prepended to a truncated ``error`` (SR-3).
+
+``error`` has no ``truncated`` flag column — ``StepResultEnvelope`` carries one for
+``result_json``, this column carries nothing — so a truncation would otherwise be
+invisible. Tail-first truncation makes that actively misleading: the stored text
+begins mid-traceback with no ``Traceback (most recent call last):`` header, so a
+human sees something that looks MALFORMED rather than TRUNCATED and debugs the
+wrong thing. Redaction needs no such marker: ``[REDACTED:<name>]`` is already
+inline and announces itself.
+"""
+
+
+def _sanitise_error(error: Optional[str]) -> Optional[str]:
+    """Redact, then bound tail-first, then mark. TOTAL — never raises (SR-1/SR-2/SR-3).
+
+    THE ORDER IS A SECURITY REQUIREMENT, not an implementation preference
+    (``result-envelope`` SR-1). Bounding first would show the redactor only the kept
+    region, so a credential in the dropped head would never be seen — and a
+    credential STRADDLING the boundary would be cut in half, defeating the pattern
+    match while persisting the surviving fragment. A partial credential is not safe
+    for being partial: an AWS key prefix or a PEM header is itself a signal.
+
+    THE KEPT REGION IS THE TAIL, deliberately diverging from ``build_envelope``,
+    which keeps the PREFIX of ``last_message`` (SR-2). Not an inconsistency —
+    different data. A message's meaning is front-loaded; a Python traceback's is
+    back-loaded, with the innermost frames and the actual exception last, so
+    truncating a traceback head-first keeps the least useful end. This is also why
+    no second byte constant was introduced (TD-2): the problem with 32 KiB for a
+    traceback was never the size, it was the direction.
+
+    THE MARKER IS SIZED INTO THE BOUND, NOT ADDED AFTER IT (SR-3) — otherwise the
+    rule enforcing the cap is what breaks it. The marker names the dropped byte
+    count, so its own length is not a constant and ``cap - len(marker)`` is
+    circular. Resolved by reserving the marker's length AT ITS UPPER BOUND (the
+    count rendered as the whole input's byte length): the real dropped count can
+    never exceed that, so it can never render wider, and
+    ``len(marker) + len(kept) <= cap`` holds by construction.
+    """
+    if error is None:
+        return None
+
+    # 1. REDACT FIRST — the whole text, before anything is dropped.
+    text, _fired = redact_secrets(error)
+    # ``fired`` is deliberately discarded: redaction cascades, so a later pattern can
+    # match an earlier ``[REDACTED:<name>]`` marker and the name would be evidence
+    # that looks precise and is not (unit 2's SR-4). The inline markers are the record.
+
+    cap = WORKFLOW_JOURNAL_RESULT_MAX_BYTES
+    encoded = text.encode("utf-8")
+    total = len(encoded)
+    if total <= cap:
+        # Inclusive boundary: text of exactly the bound is NOT truncated, matching
+        # ``build_envelope``. No marker, because nothing was dropped.
+        return text
+
+    # 2. BOUND, keeping the TAIL, with the marker's worst-case length reserved.
+    reserve = len(_ERROR_TRUNCATION_MARKER.format(dropped=total).encode("utf-8"))
+    keep = cap - reserve
+    if keep <= 0:
+        # Unreachable at the shipped 32 KiB cap (the marker is ~70 bytes) and kept
+        # anyway, because a future edit LOWERING the cap is exactly how this becomes
+        # reachable — and the one thing that must not happen then is the marker
+        # itself breaching the cap it exists to advertise.
+        return (
+            _ERROR_TRUNCATION_MARKER.format(dropped=total)
+            .encode("utf-8")[:cap]
+            .decode("utf-8", errors="ignore")
+        )
+    # Slicing the UTF-8 encoding can split a multi-byte character at the head of the
+    # kept region; ``errors="ignore"`` drops that partial sequence rather than
+    # raising or emitting U+FFFD (``build_envelope``'s precedent).
+    tail = encoded[total - keep :].decode("utf-8", errors="ignore")
+
+    # 3. MARK, with the EXACT dropped count — measured after the decode, so a partial
+    # character the decode discarded is counted as dropped rather than as kept.
+    dropped = total - len(tail.encode("utf-8"))
+    return _ERROR_TRUNCATION_MARKER.format(dropped=dropped) + tail
+
+
+def _redact_json_leaves(node: Any) -> Any:
+    """Recursively ``redact_secrets`` every string inside a parsed JSON document (SR-4).
+
+    Dict KEYS are redacted alongside values. A credential is as capable of landing in
+    a key as in a value, and INV-5 admits no unredacted credential; the accepted cost
+    is that two keys differing only inside a redacted span collapse into one, which
+    loses a member but cannot produce an invalid document. Non-string scalars pass
+    through untouched — there is nothing in an ``int`` for a pattern to match.
+    """
+    if isinstance(node, str):
+        redacted, _fired = redact_secrets(node)
+        return redacted
+    if isinstance(node, dict):
+        return {_redact_json_leaves(k): _redact_json_leaves(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_redact_json_leaves(v) for v in node]
+    return node
+
+
+def _output_placeholder(reason: str, byte_length: int) -> str:
+    """A small, VALID JSON document standing in for an ``output_json`` that was dropped.
+
+    Used for both SR-5 (the re-serialised document exceeds the cap) and SR-4's
+    unparseable input. Truncating a JSON document at a byte offset almost always
+    invalidates it, and both readers parse this column — so the failure would surface
+    at READ time, far from the write that caused it. A valid replacement recording the
+    drop is the only action consistent with "correct by construction", and it is
+    deliberately NOT a prefix of the original.
+    """
+    return json.dumps(
+        {
+            "cao_output_dropped": reason,
+            "original_bytes": byte_length,
+            "detail": (
+                "the step's structured output was not persisted; see the run's "
+                "result envelope and error for what the step reported"
+            ),
+        },
+        separators=(",", ":"),
+    )
+
+
+def _sanitise_output_json(output_json: Optional[str]) -> Optional[str]:
+    """Parse, redact each leaf string, re-serialise. TOTAL — never raises (SR-4/SR-5).
+
+    NEVER A TEXT-LEVEL REDACTION. A ``redact_secrets`` run over the serialised
+    document can match ACROSS a structural boundary — a value, its closing quote, part
+    of the next key — and corrupt it. Parsing first makes the transformation correct by
+    construction: redaction cannot break structure it never sees.
+
+    An input that does not parse was never a valid document, so its shape is unknown
+    and guessing at it is exactly what this function refuses to do — it stores the
+    placeholder instead. An over-cap re-serialisation likewise becomes a placeholder
+    rather than a truncation (SR-5).
+    """
+    if output_json is None:
+        return None
+    raw_bytes = len(output_json.encode("utf-8"))
+    try:
+        document = json.loads(output_json)
+    except Exception:  # noqa: BLE001 — totality is the contract (SR-6); see the docstring
+        return _output_placeholder("unparseable", raw_bytes)
+    try:
+        serialised = json.dumps(_redact_json_leaves(document), separators=(",", ":"))
+    except Exception:  # noqa: BLE001 — a value the walk cannot re-serialise (or a depth
+        # limit) must still settle the step, so it degrades to the same placeholder.
+        return _output_placeholder("unserialisable", raw_bytes)
+    encoded_length = len(serialised.encode("utf-8"))
+    if encoded_length > WORKFLOW_JOURNAL_RESULT_MAX_BYTES:
+        return _output_placeholder("oversize", encoded_length)
+    return serialised
+
+
+# ---------------------------------------------------------------------------
 # Per-step completion transition — wired into the server-side run-step path
 # ---------------------------------------------------------------------------
-def _step_call_fingerprint(provider: str, agent: str, prompt: str) -> str:
-    """``sha256(provider || agent || prompt)`` for the journal step row (ADR-5).
-
-    The stable call identity consumed by U3's reserved ``lookup_replay`` primitive.
-    Runtime replay is not currently wired into the run-step route, but preserving
-    this identity keeps the journal compatible with that future integration.
-    NUL-separated so distinct field boundaries cannot collide (``a|b`` vs ``ab|``).
-    """
-    joined = "\x00".join((provider, agent, prompt))
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
-
-
 def record_step_completion(
     env_vars: Optional[Dict[str, str]],
-    *,
-    provider: str,
-    agent: str,
-    prompt: str,
-) -> Optional[Callable[[Optional[str], Optional[str]], None]]:
+) -> Optional[Callable[[Optional[str], Optional[str], Optional[str]], None]]:
     """Build the RUNNING->COMPLETED/FAILED transition for a script-tier step.
 
     Mirrors ``make_step_terminal_recorder``'s guard exactly (BR-31 pattern):
@@ -451,11 +646,11 @@ def record_step_completion(
     and ``CAO_WORKFLOW_STEP_ID`` AND that run is a live ``ScriptRunRecord`` in the
     registry — so YAML/handoff callers are wholly unaffected.
 
-    The BR-31 recorder seeds a step ``RUNNING`` at terminal creation but nothing
-    ever transitions it, so a completed script run reports every step frozen at
-    ``running``/``attempts=0``/``output=null``. The returned callback settles the
-    step at the end of a run-step call, matching the YAML tier's per-step
-    transition (``workflow_service._run_step``):
+    The terminal-ready recorder seeds a step ``RUNNING`` when its terminal appears
+    but nothing ever transitions it, so a completed script run would report every
+    step frozen at ``running``/``attempts=0``/``output=null``. The returned callback
+    settles the step at the end of a run-step call, matching the YAML tier's
+    per-step transition (``workflow_service._run_step``):
 
     - success -> ``COMPLETED`` (or ``COMPLETED_UNVALIDATED`` when the worker's
       structured output is present but failed schema validation — the same
@@ -464,11 +659,38 @@ def record_step_completion(
     - ``StepExecutionError`` (a crashed/timed-out step) -> ``FAILED`` with the
       error string recorded.
 
-    The transition is written through to the durable journal best-effort
-    (``append_step`` — U3's sole ``call_fingerprint`` write path). This preserves
-    status history and the data needed by the reserved replay primitive; current
-    resumes still execute every ``run_step`` call again. A journal failure only
-    degrades durable status; it never fails the step (INV-4).
+    THE CALLBACK TAKES ``(terminal_id, error, last_message)``. ``last_message`` is
+    the step's raw text result, needed for the durable result envelope: a settled
+    row with no envelope is precisely what FR-4 guard 1 exists to prevent, and an
+    envelope built without the step's own output would satisfy the guard's letter
+    while making every future replay serve an empty result. It is ``None`` on every
+    failure arm, where the step produced no message — a FAILED step still gets an
+    envelope (unit 2 BR-1), because envelope ABSENCE must keep meaning *a crash
+    between the writes* and never *the step failed*.
+
+    ``provider``/``agent``/``prompt`` WERE PARAMETERS AND ARE GONE (TD-5). They
+    existed only to compute the call fingerprint here, and the fingerprint no longer
+    comes from here: ``run_agent_step`` computes it in the one window BR-5 permits
+    and the terminal-ready hook publishes it onto ``StepRunState``. An inert
+    parameter that reads as authoritative is the trap this issue has already hit
+    twice (``diverged_fields``, ``attempts``), so they are dropped rather than kept
+    and ignored.
+
+    ONE DURABLE WRITE (BR-6). The former ``append_step`` + ``update_step`` pair is
+    replaced by a single ``settle_step``, so state, count, envelope, output and
+    error land in one statement and no window exists in which the row reads settled
+    and carries no result (ADR-583-4). No ``attempts`` argument is passed — the
+    count is SQL-owned and the parameter does not exist (unit 6 BR-5/BR-6).
+
+    ``error`` and ``output_json`` are REDACTED AND BOUNDED here, by
+    :func:`_sanitise_error` and :func:`_sanitise_output_json` (SR-1..SR-6). Unit 6
+    assigned that debt to this unit: ``settle_step`` persists what it is given and
+    ``build_envelope`` sanitises ``last_message`` only, so until this call site
+    existed a settled row carried a redacted, bounded envelope beside a raw,
+    unbounded ``error``.
+
+    A journal failure only degrades durable status; it never fails the step
+    (INV-4/BR-10).
     """
     if not env_vars:
         return None
@@ -480,13 +702,15 @@ def record_step_completion(
     if not isinstance(record, ScriptRunRecord):
         return None
 
-    fingerprint = _step_call_fingerprint(provider, agent, prompt)
-
-    def _settle(terminal_id: Optional[str], error: Optional[str]) -> None:
+    def _settle(
+        terminal_id: Optional[str],
+        error: Optional[str],
+        last_message: Optional[str],
+    ) -> None:
         st = record.step_states.get(step_id)
         if st is None:
-            # No prior RUNNING seed (e.g. the terminal-created callback never
-            # fired) — create the state so the transition is still recorded.
+            # No prior RUNNING seed (e.g. the terminal-ready callback never fired) —
+            # create the state so the transition is still recorded.
             st = StepRunState(step_id=step_id, state=StepState.RUNNING)
             record.step_states[step_id] = st
         if terminal_id is not None:
@@ -509,26 +733,50 @@ def record_step_completion(
                 st.state = StepState.COMPLETED
             st.error = None
 
-        # Best-effort durable write-through so status reads and the reserved
-        # lookup_replay primitive see the settled row WITH its attempts/output/error,
-        # not just its state. Two writes, matching the U3 contract: (1)
-        # append_step establishes the row + the stable call_fingerprint (its sole
-        # writer, VR-4 — excluded from DO UPDATE so it is fixed at first arrival);
-        # (2) update_step fills attempts/output_json/error, which append_step
-        # hardcodes to 0/NULL/NULL. Never raises into the step (INV-4).
+        # ONE best-effort durable write (BR-6): state, attempts, envelope, output and
+        # error settle atomically, so the row can never read settled with no result.
+        # Never raises into the step (INV-4).
+        #
+        # The in-memory ``st.error`` above stays RAW on purpose — it is process-local
+        # and already surfaced by the existing status read. Sanitisation belongs at
+        # the persistence boundary, which is the durable copy this unit is
+        # accountable for (INV-5 is a persistence invariant).
         now = _now()
-        output_json = json.dumps(st.output.output) if st.output is not None else None
         try:
-            workflow_journal.append_step(run_id, step_id, st.state.value, now, fingerprint)
-            workflow_journal.update_step(
+            raw_output_json = json.dumps(st.output.output) if st.output is not None else None
+        except Exception:  # noqa: BLE001 — an unserialisable output must still settle (SR-6)
+            raw_output_json = None
+            logger.warning(
+                "journal: script step '%s/%s': structured output could not be serialised "
+                "and was not persisted",
+                run_id,
+                step_id,
+            )
+        try:
+            existed = workflow_journal.settle_step(
                 run_id=run_id,
                 step_id=step_id,
                 state=st.state.value,
-                attempts=st.attempts,
                 updated_at=now,
-                output_json=output_json,
-                error=st.error,
+                result_json=serialise_envelope(
+                    build_envelope(last_message or "", st.state.value, st.terminal_id)
+                ),
+                output_json=_sanitise_output_json(raw_output_json),
+                error=_sanitise_error(st.error),
             )
+            if not existed:
+                # AN OBSERVATION, NEVER A CONCLUSION (BR-7/SR-8, unit 6 TD-2a). The
+                # bool is ASYMMETRIC: ``settle_step``'s pre-upsert SELECT shares no
+                # transaction with its upsert, so in a two-process race ``False`` can
+                # be reported while the row did exist. A conclusion-shaped message
+                # ("the terminal-ready callback never fired") would send a human
+                # hunting a callback bug that did not happen, and misleading evidence
+                # is worse than none. Two identifiers only.
+                logger.warning(
+                    "journal: script step '%s/%s': no prior row observed at settle",
+                    run_id,
+                    step_id,
+                )
         except (
             Exception
         ) as e:  # noqa: BLE001 — journal write is best-effort; resumability degraded only (INV-4)
@@ -800,8 +1048,11 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     row or subprocess (BR-1); (1) journal the run row (tier=script, gen=1) +
     register the live record; (2) spawn with the constructed env (INV-2); (3) drain
     both pipes concurrently while awaiting exit under the wall-clock bound; (4)
-    interpret the exit + sentinel scan. Only the lint gate raises — a run
-    failure/timeout returns a FAILED result.
+    interpret the exit + sentinel scan. Only the lint gate raises, and it raises
+    exactly one type — ``ScriptLintError`` — while a run failure/timeout returns a
+    FAILED result instead. Naming the type matters: it is the only exception a
+    caller of this function must handle, so an ``except Exception`` here would be
+    both too broad and a silent way to swallow it.
     """
     # --- Step -1: validate the run_id key BEFORE any journal/registry/path use
     # (shared validator, mirrors base start_run at workflow_service.py:713). A
@@ -905,7 +1156,9 @@ async def run_script_workflow_prepared(
 # ---------------------------------------------------------------------------
 # A2 — resume_script_run (S2 flow, M3, US-C1/C2)
 # ---------------------------------------------------------------------------
-async def resume_script_run(run_id: str) -> WorkflowRunResult:
+async def resume_script_run(
+    run_id: str, decisions: Optional[Mapping[str, str]] = None
+) -> WorkflowRunResult:
     """Resume a crashed/failed/cancelled script run from its journal (A2, S2).
 
     Admission is DELEGATED entirely to U3 (Q8=A, BR-27): U4 open-codes no inline
@@ -925,6 +1178,27 @@ async def resume_script_run(run_id: str) -> WorkflowRunResult:
     re-spawn with ``CAO_WORKFLOW_RESUME=1``; drive as A1; delete the temp file in
     a ``finally`` after reap. Generation fencing is active; U3's replay lookup
     remains a reserved journal primitive and is not wired into this drive.
+
+    ``decisions`` (issue #583, ``recovery-decision-intake``) carries the human's
+    per-step answers to a halt — ``step_id`` -> ``rerun``|``skip`` — and is applied
+    inside this function on purpose, between admission and the spawn:
+
+    * **BEFORE the spawn** (BR-7), because the replay gate reads journal rows, so a
+      decision applied after the spawn would be invisible to the step it was meant
+      to resolve.
+    * **AFTER admission, and after this resume has claimed the drive** (SC-3, and the
+      SR-2 threat class it belongs to). A decision is durable consent to re-execute a
+      side-effecting step, so it must never be written by a resume that then reports
+      failure. Applied at the ROUTE instead, a second concurrent resume of the same
+      run would write its consent, hit gate 2 here and return 409 — leaving that
+      consent live under the FIRST resume's drive. Applying it after
+      ``_active_drives.add`` closes that window, because gate 2 has already run and
+      the claim is held.
+
+    ``None``/empty is the ordinary resume and behaves exactly as before — no read, no
+    write, no log line. A caller that supplies decisions gets a ``ValueError`` for an
+    unknown ``step_id`` or value (BR-6), which the resume route's existing
+    bare-``ValueError`` arm maps to 400.
     """
     from cli_agent_orchestrator.services.workflow_service import update_run_generation
 
@@ -969,6 +1243,14 @@ async def resume_script_run(run_id: str) -> WorkflowRunResult:
                 raise ValueError("spec_snapshot.source is not a string")
         except (ValueError, TypeError, KeyError) as e:
             raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
+
+        # --- The human's recovery decisions (issue #583, FR-7). NOT a gate: admission
+        # is over, this resume holds the drive claim, and nothing has been spawned yet.
+        # That position is the requirement — see the docstring. A ValueError here
+        # aborts the resume having written nothing (the whole map is validated first),
+        # and the ``finally`` below still releases the claim.
+        if decisions:
+            await asyncio.to_thread(workflow_journal.apply_decisions, run_id, decisions)
 
         # Unit A (FR-A6, ADR-3, REL-A1): re-deliver the RESOLVED inputs journaled
         # at the original run VERBATIM — read row.inputs_json and hand it to

@@ -638,11 +638,28 @@ WORKFLOW_MAX_SPEC_BYTES = 256 * 1024
 WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH = 8
 WORKFLOW_MAX_INPUTS = 64
 
+# SQLite busy-timeout for journal connections, in milliseconds (issue #583, NFR-4).
+# Journal writes are single-row upserts in one short transaction, so the realistic
+# contention window is milliseconds; 5000 gives ~3 orders of magnitude of headroom, which
+# makes "database is locked" mean a genuinely stuck writer rather than ordinary collision.
+# Per-connection (unlike WAL, which is per-database and deliberately out of scope,
+# ADR-583-10).
+WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS = 5000
+
 # Max size (bytes) of the compact-JSON resolved inputs map delivered to a script
 # run via the CAO_WORKFLOW_INPUTS spawn-env key. Enforced at the run route, on
 # the RESOLVED map, BEFORE any journal write or registry registration (ADR-5) —
 # never inside _build_env. An oversized payload is rejected as ValueError -> 400.
 WORKFLOW_INPUTS_MAX_BYTES = 32768
+
+# Byte bound on the persisted step result text (issue #583, NFR-1 / TD-2). Applied to
+# ``last_message`` AFTER redaction (never before — SR-1), on the UTF-8 encoding rather
+# than the character count, because the bound is a storage limit. Matches
+# WORKFLOW_INPUTS_MAX_BYTES rather than inventing a fourth magnitude: being slightly
+# tight is VISIBLE (``truncated=True`` on the envelope) and cheap to revise from a named
+# constant, while being loose accumulates SILENTLY in a shared database that has no
+# eviction for this column.
+WORKFLOW_JOURNAL_RESULT_MAX_BYTES = 32768
 
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every

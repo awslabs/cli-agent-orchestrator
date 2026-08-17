@@ -780,6 +780,22 @@ def _migrate_workflow_run_step() -> None:
     indistinguishable from its pre-extension form (INV-1/INV-2); ``append_step``
     is the sole write path for the column (``update_step`` stays untouched — the
     fingerprint is set once, at the RUNNING insert).
+
+    ``result-envelope`` (issue #583, BR-7) additively appends ONE column,
+    ``result_json``, through the same ``PRAGMA table_info`` gate — the serialised
+    ``StepResultEnvelope`` that replay returns (FR-1). ONE column and not three
+    typed ones precisely because this body is wrapped in ``except Exception`` ->
+    ``logger.debug``, so a failed migration is SILENT: three statements would
+    triple the chance of a partial, silent migration. ``DEFAULT NULL`` means every
+    pre-#583 row reads as "envelope absent" (BR-10), which is safe rather than a
+    gap — such a row's fingerprint is legacy-scheme or NULL, so FR-6 already keeps
+    it off the replay path and the two guards agree instead of disagreeing.
+
+    Because the failure is silent, the column's existence is VERIFIED rather than
+    assumed (BR-8): see ``test/services/test_step_result.py`` for the
+    ``PRAGMA table_info`` assertion on a fresh database. A silent failure would
+    otherwise surface far away as every settle losing its envelope, which the
+    replay gate would read as crash-window rows and halt on.
     """
     import sqlite3
 
@@ -805,6 +821,11 @@ def _migrate_workflow_run_step() -> None:
                     "ALTER TABLE workflow_run_step ADD COLUMN call_fingerprint TEXT DEFAULT NULL"
                 )
                 logger.info("Migration: added call_fingerprint column to workflow_run_step")
+            if "result_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN result_json TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added result_json column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
 

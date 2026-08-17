@@ -92,16 +92,22 @@ def test_workflow_run_step_columns(patched_db):
         "error",
         "updated_at",
         "call_fingerprint",
+        "result_json",
     }
     # Composite PRIMARY KEY (run_id, step_id): both carry pk>0.
     assert cols["run_id"][5] > 0
     assert cols["step_id"][5] > 0
-    # reprompted / terminal_id are deliberately NOT journaled (F3).
+    # reprompted / terminal_id are deliberately NOT journaled (F3). NB ``terminal_id`` IS
+    # carried inside the #583 ``result_json`` envelope; the COLUMN still does not exist.
     assert "reprompted" not in cols
     assert "terminal_id" not in cols
     # U3 additive column (E2): defaults to NULL (INV-2). PRAGMA table_info reports
     # the literal default expression as the string "NULL", not Python None.
     assert cols["call_fingerprint"][4] == "NULL"
+    # result-envelope additive column (issue #583, BR-7/BR-10): one TEXT column defaulting
+    # to NULL, so every pre-#583 row reads as "envelope absent".
+    assert cols["result_json"][4] == "NULL"
+    assert cols["result_json"][2] == "TEXT"
 
 
 def test_migrations_are_idempotent(patched_db):

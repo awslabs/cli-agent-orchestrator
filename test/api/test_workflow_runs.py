@@ -1684,7 +1684,13 @@ def test_completed_run_result_has_no_failure_envelope(client, read_surface_db):
 def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
     """U9-T7 (EF-5): the envelope is a presentation projection — U9 introduces NO
     migration. The ``workflow_run_step`` column set is unchanged after a failed run's
-    result is assembled (the envelope never writes a column)."""
+    result is assembled (the envelope never writes a column).
+
+    NB the FAILURE envelope of U9 (a presentation projection, no column) is a different
+    thing from the #583 step RESULT envelope, which is persisted and did add exactly one
+    column, ``result_json``. That column appears in the expected set below because the
+    migrator creates it; this test's teeth are unchanged — assembling the U9 failure
+    envelope must still add nothing of its own."""
     _seed_run(
         "nocol",
         RunState.FAILED.value,
@@ -1706,6 +1712,7 @@ def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
         "error",
         "updated_at",
         "call_fingerprint",
+        "result_json",  # issue #583, result-envelope (BR-7) — not U9's
     }
 
 
