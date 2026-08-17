@@ -1,12 +1,14 @@
-"""M3-E ORM/migration parity, restart persistence, and rollback compatibility."""
+"""M3-E ORM/migration parity, column evolution, restart persistence, rollback."""
 
 from __future__ import annotations
 
 import sqlite3
 import uuid
 
-from sqlalchemy import create_engine
+from sqlalchemy import Integer, create_engine
+from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.schema import CreateColumn
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import Base
@@ -49,6 +51,43 @@ _PARTIAL_INDEXES = {
     "ix_task_occurrence_handoffs_pending_donor",
     "ix_task_occurrence_handoffs_pending_recipient",
 }
+
+#: Frozen. The columns M3-E shipped that SQLite cannot ``ALTER TABLE ADD`` —
+#: the primary key and every NOT NULL column with no default — which is to say
+#: exactly the columns any store carrying this table already has.
+#:
+#: **Never add a name here.** This set is what makes "added after M3-E"
+#: checkable: a column added to the model later is absent from an upgraded
+#: store, so the migration has to be able to ALTER it in, and a name added here
+#: would silently license the one shape the migration cannot repair.
+_M3E_UNADDABLE_COLUMNS = frozenset(
+    {
+        "handoff_id",
+        "schema_version",
+        "session_name",
+        "task_occurrence_id",
+        "from_agent_id",
+        "to_agent_id",
+        "from_incarnation_id",
+        "from_terminal_id",
+        "donor_revision",
+        "packet_digest",
+        "packet_control_id",
+        "quiescence_json",
+        "quiescence_digest",
+        "delivery_state",
+        "state",
+        "initiated_by",
+        "created_at",
+        "updated_at",
+    }
+)
+
+_MODEL = database.TaskOccurrenceHandoffModel
+
+
+def _model_columns():
+    return {column.name for column in _MODEL.__table__.columns}
 
 
 def _columns(conn, table):
@@ -135,6 +174,210 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         assert _columns(conn, "task_occurrence_handoffs") == _HANDOFF_COLUMNS
         surviving = conn.execute("SELECT handoff_id FROM task_occurrence_handoffs").fetchall()
     assert surviving == [("h1",)]
+
+
+# ---------------------------------------------------------------------------
+# column evolution on a store that already carries the table (cond-0433)
+# ---------------------------------------------------------------------------
+
+
+def _create_at_shape(conn, names):
+    """Create the handoff table carrying only ``names``, typed from the model."""
+    specs = [
+        str(CreateColumn(column).compile(dialect=sqlite_dialect()))
+        for column in _MODEL.__table__.columns
+        if column.name in names
+    ]
+    conn.execute(
+        f"CREATE TABLE {_MODEL.__tablename__} ({', '.join(specs)}, PRIMARY KEY (handoff_id))"
+    )
+
+
+def _row_at_shape(names):
+    """One row filling every column ``names`` requires, typed from the model."""
+    return {
+        column.name: (7 if isinstance(column.type, Integer) else f"{column.name}-original")
+        for column in _MODEL.__table__.columns
+        if column.name in names and not column.nullable
+    }
+
+
+def _store_at_older_shape(tmp_path, monkeypatch, names):
+    """A store carrying the handoff table at ``names``, with one row in it."""
+    path = tmp_path / "older-shape.db"
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY)")
+        _create_at_shape(conn, names)
+        row = _row_at_shape(names)
+        conn.execute(
+            f"INSERT INTO {_MODEL.__tablename__} ({', '.join(row)}) "
+            f"VALUES ({', '.join('?' for _ in row)})",
+            tuple(row.values()),
+        )
+    from cli_agent_orchestrator import constants
+
+    monkeypatch.setattr(constants, "DATABASE_FILE", path)
+    monkeypatch.setattr(database, "DATABASE_URL", f"sqlite:///{path}")
+    return path, row
+
+
+def test_a_store_that_already_has_the_table_gains_the_columns_it_lacks(tmp_path, monkeypatch):
+    """The defect this closes: ``CREATE TABLE IF NOT EXISTS`` is a silent no-op
+    against an existing table, so a store created at an older shape kept that
+    shape forever — and the hold at ``task_handoff.hold_refusal`` is fail-closed
+    on every managed write, so one missing column refuses every steer, tell and
+    operator message on that installation, handoff party or not.
+
+    The older shape here is the minimal legal one: the primary key and the NOT
+    NULL columns, which are the only ones SQLite could never append later.
+    """
+    path, row = _store_at_older_shape(tmp_path, monkeypatch, _M3E_UNADDABLE_COLUMNS)
+    with sqlite3.connect(str(path)) as conn:
+        assert _columns(conn, "task_occurrence_handoffs") == set(_M3E_UNADDABLE_COLUMNS)
+
+    database._migrate_task_occurrence_handoffs()
+
+    with sqlite3.connect(str(path)) as conn:
+        present = _columns(conn, "task_occurrence_handoffs")
+        missing = _model_columns() - present
+        assert not missing, (
+            "the migration left an existing store short of "
+            f"{sorted(missing)}; every managed write on it would be refused as "
+            "handoff-held"
+        )
+        assert _PARTIAL_INDEXES <= _indexes(conn, "task_occurrence_handoffs")
+        stored = dict(
+            zip(
+                [d[0] for d in conn.execute("SELECT * FROM task_occurrence_handoffs").description],
+                conn.execute("SELECT * FROM task_occurrence_handoffs").fetchone(),
+            )
+        )
+    # The pre-existing row keeps its bytes, and every appended nullable column
+    # reads NULL rather than a fabricated value.
+    assert {name: stored[name] for name in row} == row
+    appended = present - set(row)
+    assert appended
+    assert all(
+        stored[column.name] is None
+        for column in _MODEL.__table__.columns
+        if column.name in appended and column.nullable
+    )
+
+
+def test_reconciling_an_older_shape_store_is_idempotent(tmp_path, monkeypatch):
+    """A rerun adds nothing and rewrites nothing.
+
+    Asserted on the row as well as the shape: a migration that dropped and
+    rebuilt the table would keep the columns identical and lose the row.
+    """
+    path, row = _store_at_older_shape(tmp_path, monkeypatch, _M3E_UNADDABLE_COLUMNS)
+    database._migrate_task_occurrence_handoffs()
+    with sqlite3.connect(str(path)) as conn:
+        first = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'task_occurrence_handoffs'"
+        ).fetchone()[0]
+
+    database._migrate_task_occurrence_handoffs()
+
+    with sqlite3.connect(str(path)) as conn:
+        assert (
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'task_occurrence_handoffs'"
+            ).fetchone()[0]
+            == first
+        )
+        surviving = conn.execute("SELECT handoff_id FROM task_occurrence_handoffs").fetchall()
+    assert surviving == [(row["handoff_id"],)]
+
+
+def test_a_blocked_column_is_logged_at_error_with_its_consequence(tmp_path, monkeypatch, caplog):
+    """init_db() deliberately continues past an unappendable column.
+
+    A typed refusal beats a dead installation, so the migration swallows the
+    reconcile's raise. But that leaves the store a column short, and the
+    fail-closed hold then refuses every managed write on it as undecidable —
+    a degraded installation, not a routine event. It has to be logged at
+    error with the column named and the consequence spelled out; a routine
+    warning is how the one installation that hits this gets missed.
+    """
+    import logging
+
+    # A store whose handoff table lacks ``donor_revision`` — NOT NULL with no
+    # default, so SQLite cannot ALTER it in and the reconcile must raise.
+    _store_at_older_shape(tmp_path, monkeypatch, set(_M3E_UNADDABLE_COLUMNS) - {"donor_revision"})
+
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.clients.database"):
+        database._migrate_task_occurrence_handoffs()  # must not raise
+
+    blocked = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        and "donor_revision" in record.message
+        and "column short" in record.message
+    ]
+    assert blocked, (
+        "an unappendable column left the store a column short without an "
+        "error-level trace naming it and its consequence; captured: "
+        f"{[(r.levelname, r.message) for r in caplog.records]}"
+    )
+
+
+def test_no_column_added_after_m3e_is_beyond_alter_table():
+    """The gate on a *future* column, which is what makes the repair a gate.
+
+    A column added to ``TaskOccurrenceHandoffModel`` is absent from every store
+    that already carries the table, so the migration has to be able to ALTER it
+    in. SQLite only appends a column whose value for the stored rows is
+    determined — nullable, or NOT NULL with a constant default — and appends no
+    PRIMARY KEY or UNIQUE column at all. A new column outside that set cannot
+    reach an upgraded store, and the fail-closed hold turns that into a total
+    loss of managed input there, so it must be caught here rather than in
+    production.
+
+    The check runs in both directions, because the frozen set is a
+    hand-maintained literal. A *relaxing* drift — an existing NOT NULL column
+    flipped to nullable, or given a server_default — leaves the name in the
+    frozen set while the model's addability moves on, and a name-set
+    difference in one direction stays empty and passes. Asserting the
+    (name, addability) pairs forces the drift to be named here, whichever
+    side of the line it moves.
+    """
+    unaddable = {
+        column.name
+        for column in _MODEL.__table__.columns
+        if database._sqlite_add_column_spec(column) is None
+    }
+    added_later = sorted(unaddable - _M3E_UNADDABLE_COLUMNS)
+    assert not added_later, (
+        f"{added_later} cannot be added to a store that already has "
+        "task_occurrence_handoffs. Make the column nullable, give it a "
+        "server_default, or rebuild the table explicitly — do not widen "
+        "_M3E_UNADDABLE_COLUMNS."
+    )
+    relaxed = sorted(_M3E_UNADDABLE_COLUMNS - unaddable)
+    assert not relaxed, (
+        f"{relaxed} shipped with M3-E as unappendable but the model now lets "
+        "SQLite ALTER them in — a nullability or server_default change on an "
+        "existing column. If that change is deliberate, remove the name from "
+        "_M3E_UNADDABLE_COLUMNS; do not leave it frozen over a shape the model "
+        "no longer has."
+    )
+
+
+def test_the_raw_ddl_declares_every_column_the_model_does(tmp_path):
+    """The migration's own ``CREATE TABLE`` is the shape a store that predates
+    the table is created at, so it and the model must not drift apart."""
+    path = tmp_path / "raw-ddl.db"
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(database._TASK_OCCURRENCE_HANDOFFS_DDL)
+        declared = _columns(conn, "task_occurrence_handoffs")
+    model = _model_columns()
+    assert declared == model, (
+        "_TASK_OCCURRENCE_HANDOFFS_DDL and TaskOccurrenceHandoffModel disagree: "
+        f"declared only by the model={sorted(model - declared)}, "
+        f"declared only by the DDL={sorted(declared - model)}"
+    )
 
 
 def test_records_survive_a_restart(tmp_path, monkeypatch):

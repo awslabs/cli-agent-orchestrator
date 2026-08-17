@@ -84,6 +84,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_COPY_MODE_ACTIVE,
     REASON_GENERATION_FENCED,
     REASON_HANDOFF_HELD,
+    REASON_HANDOFF_HOLD_UNDECIDABLE,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
     REASON_LINEAGE_UNPROVEN,
@@ -391,14 +392,22 @@ class ResolvedControlIdentity:
 def _admission_refusal_reason(exc: BaseException) -> str:
     """Which typed refusal a pre-byte admission failure carries.
 
-    The two are not interchangeable.  A generation fence is permanent and
+    The three are not interchangeable.  A generation fence is permanent and
     instructs the caller to advance to a successor; an M3-E handoff hold is
     reversible and applies to the generation the caller already has.  A caller
     that read the hold as a fence would abandon a pane a pending handback is
     keeping alive as its rollback insurance.
+
+    The undecidable case is checked first because it is a *subclass* of the
+    hold: it refuses on the same pre-byte terms, but it reports that the store
+    could not answer rather than that a handback is pending.  Ordering these
+    the other way would put every unreadable store back under ``handoff-held``
+    and send the operator hunting a handback nothing ever observed.
     """
     from cli_agent_orchestrator.services import task_handoff
 
+    if isinstance(exc, task_handoff.TaskHandoffHoldUndecidable):
+        return REASON_HANDOFF_HOLD_UNDECIDABLE
     if isinstance(exc, task_handoff.TaskHandoffHeld):
         return REASON_HANDOFF_HELD
     return REASON_GENERATION_FENCED
@@ -441,7 +450,10 @@ def provider_byte_admission(
 
     # Decided before the locks and before the first byte, so the refusal
     # carries the zero-bytes proof that makes it re-attemptable once the
-    # handoff settles.
+    # handoff settles.  A store that cannot answer the hold question raises
+    # ``TaskHandoffHoldUndecidable`` from inside this call instead of returning
+    # a sentence: it refuses on the same pre-byte terms but carries its own
+    # reason, so an outage is never reported as a handback nothing observed.
     held = task_handoff.hold_refusal_for_terminal(terminal_id, generation, control_id=control_id)
     if held:
         raise task_handoff.TaskHandoffHeld(held)
