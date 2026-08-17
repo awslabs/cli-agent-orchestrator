@@ -45,9 +45,11 @@ _STATUS_LINE_PATTERN = re.compile(
 _ERROR_PATTERN = re.compile(r"^\s*Error:\s+No model selected\.\s*$", re.MULTILINE)
 # The bottom OMP title frame is present in the captured idle/completed viewport.
 _READY_FRAME_PATTERN = re.compile(r"^╰─.*─╯\s*$", re.MULTILINE)
-_WAITING_COMPANION_PATTERN = re.compile(r"(?:❯\s*Approve|up/down navigate)")
-_ERROR_COMPANION_PATTERN = re.compile(r"Use /login,")
-_WORKING_COMPANION_PATTERN = re.compile(r"[\u2800-\u28ff]\s+(?:Working|Running)\b")
+_WORKING_LIVE_FRAME_TAIL_PATTERN = re.compile(r"\s*╭── OMP session [^\n]*╮\s*\n╰─[^\n]*─╯\s*\Z")
+_ERROR_LIVE_FRAME_TAIL_PATTERN = re.compile(
+    r"\s*Use /login,[^\n]*\nThen use /model[^\n]*\n"
+    r"\s*╭── OMP session [^\n]*╮\s*\n╰─[^\n]*─╯\s*\Z"
+)
 
 # OMP 17.2.10 renders user turns on the terminal's page background and begins
 # assistant text by resetting that background. Keep this boundary in the raw
@@ -209,7 +211,8 @@ class OmpProvider(BaseProvider):
     def _has_later_ready_frame(
         clean: str,
         marker_start: int,
-        companion_pattern: Optional[re.Pattern] = None,
+        marker_end: int,
+        live_frame_tail_pattern: Optional[re.Pattern] = None,
     ) -> bool:
         if any(
             match.start() > marker_start
@@ -218,13 +221,20 @@ class OmpProvider(BaseProvider):
         ):
             return True
 
-        if not any(match.start() > marker_start for match in _READY_FRAME_PATTERN.finditer(clean)):
+        ready_frames = [
+            match for match in _READY_FRAME_PATTERN.finditer(clean) if match.start() > marker_start
+        ]
+        if not ready_frames:
             return False
 
-        if companion_pattern is None:
-            return True
-        line_start = clean.rfind("\n", 0, marker_start) + 1
-        return companion_pattern.search(clean, line_start) is None
+        # The captured live working/error viewports include one title footer.
+        # Preserve a marker only when the entire remaining tail is that known
+        # frame; extra output means the append-only raw buffer advanced.
+        return not (
+            len(ready_frames) == 1
+            and live_frame_tail_pattern is not None
+            and live_frame_tail_pattern.fullmatch(clean[marker_end:])
+        )
 
     def _get_status_from_clean(self, clean: str) -> TerminalStatus:
         if self._initialized and self.shell_baseline:
@@ -237,17 +247,19 @@ class OmpProvider(BaseProvider):
         if not clean.strip():
             return TerminalStatus.UNKNOWN
         candidates = []
-        for pattern, status, companion_pattern in (
-            (_WAITING_PATTERN, TerminalStatus.WAITING_USER_ANSWER, _WAITING_COMPANION_PATTERN),
-            (_ERROR_PATTERN, TerminalStatus.ERROR, _ERROR_COMPANION_PATTERN),
-            (_WORKING_PATTERN, TerminalStatus.PROCESSING, _WORKING_COMPANION_PATTERN),
+        for pattern, status, live_frame_tail_pattern in (
+            (_WAITING_PATTERN, TerminalStatus.WAITING_USER_ANSWER, None),
+            (_ERROR_PATTERN, TerminalStatus.ERROR, _ERROR_LIVE_FRAME_TAIL_PATTERN),
+            (_WORKING_PATTERN, TerminalStatus.PROCESSING, _WORKING_LIVE_FRAME_TAIL_PATTERN),
         ):
             matches = list(pattern.finditer(clean))
             if not matches:
                 continue
-            marker_start = matches[-1].start()
-            if not self._has_later_ready_frame(clean, marker_start, companion_pattern):
-                candidates.append((marker_start, status))
+            marker = matches[-1]
+            if not self._has_later_ready_frame(
+                clean, marker.start(), marker.end(), live_frame_tail_pattern
+            ):
+                candidates.append((marker.start(), status))
 
         if candidates:
             return max(candidates, key=lambda candidate: candidate[0])[1]

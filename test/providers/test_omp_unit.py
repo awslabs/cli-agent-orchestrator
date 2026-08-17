@@ -135,18 +135,19 @@ def test_later_ready_frame_makes_active_marker_stale_without_status_line(marker)
 
 
 @pytest.mark.parametrize(
-    ("fixture", "expected"),
-    [
-        ("omp_processing.txt", TerminalStatus.PROCESSING),
-        ("omp_processing.raw.txt", TerminalStatus.PROCESSING),
-        ("omp_waiting.txt", TerminalStatus.WAITING_USER_ANSWER),
-        ("omp_error.txt", TerminalStatus.ERROR),
-    ],
+    "fixture",
+    ["omp_processing.raw.txt", "omp_waiting.txt", "omp_error.txt"],
 )
-def test_live_fixture_companions_survive_a_later_ready_frame(fixture, expected):
-    output = load_fixture(fixture) + "\n╰─ ready ─╯\n"
+def test_completed_transcript_retires_stale_raw_markers(fixture):
+    provider = make_provider()
+    provider.mark_input_received()
+    output = load_fixture(fixture) + "\n" + load_fixture("omp_completed.txt")
 
-    assert make_provider().get_status(output) == expected
+    assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+
+def test_live_model_error_companion_survives_its_ready_footer():
+    assert make_provider().get_status(load_fixture("omp_error.txt")) == TerminalStatus.ERROR
 
 
 @pytest.mark.parametrize(
