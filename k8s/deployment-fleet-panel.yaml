@@ -33,12 +33,16 @@ spec:
             # Mount the fleet config as a volume (ConfigMap)
             - name: CAO_FLEET_CONFIG
               value: "/config/fleet.json"
-            # Optional: set a shared token for panel auth
-            # - name: CAO_PANEL_TOKEN
-            #   valueFrom:
-            #     secretKeyRef:
-            #       name: cao-panel-secret
-            #       key: token
+            # Shared token for panel auth — REQUIRED. The panel can drive every
+            # CAO node (command execution), so it must not be reachable
+            # unauthenticated. Create the secret before deploying:
+            #   kubectl -n cao-cluster create secret generic cao-panel-secret \
+            #     --from-literal=token="$(openssl rand -hex 32)"
+            - name: CAO_PANEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-panel-secret
+                  key: token
           resources:
             requests:
               cpu: 100m
@@ -67,7 +71,11 @@ spec:
           configMap:
             name: cao-fleet-config
 ---
-# Service for the fleet panel (LoadBalancer for external access)
+# Service for the fleet panel. ClusterIP only — the panel fronts an
+# unauthenticated-by-default command-execution surface (the CAO nodes), so it
+# is never exposed directly to the internet. Reach it via
+#   kubectl -n cao-cluster port-forward svc/cao-fleet-panel 9888:9888
+# or put an authenticating Ingress/ALB in front.
 apiVersion: v1
 kind: Service
 metadata:
@@ -77,7 +85,7 @@ metadata:
     app.kubernetes.io/name: cao-fleet-panel
     app.kubernetes.io/part-of: cao-fleet
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app.kubernetes.io/name: cao-fleet-panel
   ports:

@@ -355,6 +355,21 @@ API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 # Default timeout (seconds) for HTTP calls to the CAO API server.
 MCP_REQUEST_TIMEOUT = 30
 
+# Cross-node placement + callback routing (one-agent-per-pod topology).
+# Defined here — not in mcp_server/server.py — because BOTH the MCP client
+# (which injects/reads them for routing) and terminal_service (which reads the
+# persisted session env to notify a cross-node supervisor of a deferred-init
+# failure) need the names, and services must not import from mcp_server.
+#
+#   ADVERTISED_URL_ENV        set on a SUPERVISOR node: base URL at which peers
+#                             (worker pods) can reach this node's cao-server.
+#   CALLBACK_URL_ENV /        injected by the supervisor into a REMOTE worker
+#   CALLBACK_TERMINAL_ID_ENV  terminal's env at creation: the supervisor
+#                             node's advertised URL + supervisor terminal ID.
+ADVERTISED_URL_ENV = "CAO_ADVERTISED_URL"
+CALLBACK_URL_ENV = "CAO_CALLBACK_URL"
+CALLBACK_TERMINAL_ID_ENV = "CAO_CALLBACK_TERMINAL_ID"
+
 
 # Operators can extend network allowlists via the env vars handled below.
 # Same comma-separated pattern as ``CAO_PROFILE_ALLOWED_HOSTS`` in install_service.
