@@ -72,77 +72,139 @@ def load_profile_schema() -> dict:
 
 
 # Structural ceilings, applied before anything else walks or validates a
-# document. Both sit far above real input: the largest bundled profile's
-# frontmatter expands to 23 values and nests 3 deep, which these clear by ~870x
-# and ~21x respectively.
-_MAX_EXPANDED_VALUES = 20_000
+# document. The byte ceiling is in *rendered* bytes, the unit the step downstream
+# costs in, and is set against the 256 KB cap both write routes put on ``content``:
+# a document with no aliasing renders to roughly its own size, so 1 MB is ~3.8x
+# the largest request that can arrive. Measured against real input, the largest
+# bundled profile's frontmatter renders to 485 bytes and nests 3 deep, clearing
+# these by ~2060x and ~21x.
+_MAX_RENDERED_BYTES = 1_000_000
 _MAX_DEPTH = 64
+
+# Ceiling on a single schema finding's text. Only jsonschema's own messages need
+# it: everything this module authors is a fixed sentence plus a path.
+_MAX_FINDING_CHARS = 2_000
+
+
+def _capped(message: str) -> str:
+    """Bound one schema finding's text before it reaches a response body.
+
+    A backstop, not the fix. jsonschema interpolates the offending instance into
+    the message inside ``iter_errors``, so the allocation has already happened by
+    the time this sees the string; :func:`_structural_bound_finding` is what
+    prevents it. This bounds two things that guard does not. A document within the
+    rendering ceiling can still trip errors on several fields, each rendering its
+    own subtree, so the total response is a small multiple of the ceiling rather
+    than the ceiling. And it is a second line of defence on a function that has now
+    twice bounded the wrong dimension, first depth and then value occurrences.
+    """
+    if len(message) <= _MAX_FINDING_CHARS:
+        return message
+    return f"{message[:_MAX_FINDING_CHARS]}... (message truncated, {len(message)} chars)"
 
 
 def _structural_bound_finding(metadata: object) -> Optional["ValidationMessage"]:
-    """Reject a document too large to hand to the rest of the validator.
+    """Reject a document the rest of the validator cannot safely be handed.
 
-    Size here is the number of values a *fully expanded* rendering would contain,
-    not the number of distinct objects the parser produced. The two diverge
-    without limit: ``yaml.safe_load`` resolves every alias to another reference to
-    the *same* object, so N chained anchors that each reference the previous one
-    twice give ~N distinct objects whose expansion is 2**N values, out of a
-    sub-kilobyte body.
+    Three ways a document fails here: it renders too large, it nests too deep, or
+    it contains a cycle.
 
-    That expansion, not the parsed size, is what the steps downstream pay for:
-
-    - jsonschema builds every error message eagerly, interpolating ``repr`` of the
-      offending instance. A 651-byte document with 20 anchor levels that trips one
-      ``type`` error produced a single 25 MB message here, doubling per added
-      level, so ~26 levels reaches gigabytes. Allocation is the ceiling there, not
-      CPU, and no amount of care in this module's own traversal avoids it.
-    - the key walk below visits each distinct container once, so it is already
-      linear in the parsed structure. It is bounded here only in the sense that it
-      is *reached* on documents this function accepted.
+    **Why bytes.** The cost this guard exists to bound is ``repr(instance)``:
+    jsonschema builds every error message eagerly, interpolating a rendering of the
+    offending instance. ``yaml.safe_load`` resolves each alias to another reference
+    to the *same* object, so a document's rendered size is unbounded by its own
+    byte count in two separate ways. Chained anchors multiply *structure*: 20
+    levels that each reference the previous one twice took a 651-byte body to a
+    25 MB message. Aliasing one large scalar multiplies *content*: a 250,055-byte
+    body holding a 190,000-character scalar referenced 15,000 times renders to
+    2.85 GB. An earlier version of this function counted value *occurrences*, which
+    caught the first and missed the second, since every scalar counted as 1
+    regardless of length. Counting the bytes each occurrence renders covers both,
+    because it is the same unit the downstream step pays in.
 
     Both land on ``POST /agents/profiles/validate`` in particular: it is
-    scope-exempt, so it answers without credentials even when OAuth is
-    configured, and it is declared ``async``, so work on its thread delays every
-    other request rather than only the caller's own.
+    scope-exempt, so it answers without credentials even when OAuth is configured,
+    and it is declared ``async``, so work on its thread delays every other request
+    rather than only the caller's own.
 
-    Counted with memoization on ``id()``, which keeps the count itself linear in
-    distinct objects, and capped so an enormous document costs no more to reject
-    than one sitting just under the ceiling. Comparing identity is sound here
-    because every value stays reachable from ``metadata`` throughout, so nothing
-    can be collected and no id recycled midway. A container reached again while
-    still being counted is a cycle and contributes 1.
+    **Why cycles are rejected rather than counted.** A cycle has no finite
+    rendering, so any finite number this function returned for one would be a
+    fiction. It is also unusable downstream: ``model_dump_json`` raises
+    ``PydanticSerializationError: Circular reference detected`` when the Kiro
+    materialization path writes the profile out, so accepting one persists a
+    document the runtime cannot use. In-progress identities are therefore tracked
+    separately from completed ones: revisiting a container that is still being
+    measured is a back-edge, while revisiting a finished one is ordinary sharing
+    and stays memoized.
+
+    **Why memoization is sound.** Identity is compared rather than value because
+    every object stays reachable from ``metadata`` for the duration, so nothing can
+    be collected and no id recycled midway. Scalars are memoized too, so a large
+    shared scalar is rendered once even when referenced thousands of times, which
+    keeps this function's own allocation bounded by the source document while still
+    charging its bytes at every reference.
 
     Returns:
-        An error finding naming the ceiling that was exceeded, or ``None`` when
-        the document is within both.
+        An error finding naming what was exceeded, or ``None`` when the document is
+        within all three bounds.
     """
     memo: dict[int, int] = {}
-    ceiling = _MAX_EXPANDED_VALUES + 1
-    too_deep = False
+    in_progress: set[int] = set()
+    ceiling = _MAX_RENDERED_BYTES + 1
+    exceeded: Optional[str] = None
 
-    def expanded(value: object, depth: int) -> int:
-        nonlocal too_deep
-        if not isinstance(value, (dict, list)):
-            return 1
-        if depth > _MAX_DEPTH:
-            too_deep = True
-            return 1
+    def rendered(value: object, depth: int) -> int:
+        nonlocal exceeded
+        if exceeded is not None:
+            return 0
+
         identity = id(value)
-        if identity in memo:
-            return memo[identity]
-        memo[identity] = 1  # Cycle guard, in force while this container counts.
-        total = 1
-        for child in value.values() if isinstance(value, dict) else value:
-            total += expanded(child, depth + 1)
+
+        if not isinstance(value, (dict, list)):
+            cached = memo.get(identity)
+            if cached is None:
+                cached = len(repr(value))
+                memo[identity] = cached
+            return cached
+
+        if depth > _MAX_DEPTH:
+            exceeded = "depth"
+            return 0
+        if identity in in_progress:
+            exceeded = "cycle"
+            return 0
+        completed = memo.get(identity)
+        if completed is not None:
+            return completed
+
+        in_progress.add(identity)
+        total = 2  # The enclosing braces or brackets.
+        children = value.items() if isinstance(value, dict) else enumerate(value)
+        for key, child in children:
+            # ``'key': `` for a mapping, ``, `` between entries either way. The
+            # index of a sequence entry is not rendered, so it costs nothing.
+            total += (len(repr(key)) + 2) if isinstance(value, dict) else 0
+            total += 2 + rendered(child, depth + 1)
+            if exceeded is not None:
+                break
             if total >= ceiling:
                 total = ceiling
                 break
+        in_progress.discard(identity)
+
         memo[identity] = total
         return total
 
-    size = expanded(metadata, 0)
+    size = rendered(metadata, 0)
 
-    if too_deep:
+    if exceeded == "cycle":
+        return ValidationMessage(
+            "error",
+            "Frontmatter contains a circular YAML alias, so it has no finite "
+            "rendering and cannot be serialized by the providers that consume it. "
+            "Remove the self-reference.",
+        )
+    if exceeded == "depth":
         return ValidationMessage(
             "error",
             f"Frontmatter nests more than {_MAX_DEPTH} levels deep, past what this "
@@ -151,9 +213,10 @@ def _structural_bound_finding(metadata: object) -> Optional["ValidationMessage"]
     if size >= ceiling:
         return ValidationMessage(
             "error",
-            f"Frontmatter expands to more than {_MAX_EXPANDED_VALUES} values, past "
+            f"Frontmatter renders to more than {_MAX_RENDERED_BYTES} bytes, past "
             f"what this validator will inspect. If it uses YAML anchors, note that "
-            f"each alias expands in full. Simplify the document.",
+            f"every alias renders its target again in full, so a small document can "
+            f"exceed this. Simplify the document.",
         )
     return None
 
@@ -279,12 +342,12 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
             )
 
     # 2. Structural ceilings, before anything traverses or validates the
-    #    document.
+    #    document: rendered size, nesting depth, and cycles.
     #
     #    Returning here rather than continuing is the whole point of the check.
     #    Step 3 is linear in distinct containers, but step 4 hands the document
-    #    to jsonschema, which interpolates ``repr`` of an offending instance into
-    #    every error message it builds -- so on an alias-amplified document,
+    #    to jsonschema, which interpolates a rendering of an offending instance
+    #    into every error message it builds -- so on an alias-amplified document,
     #    reporting the ceiling and then running the remaining steps anyway would
     #    pay the exact cost the ceiling exists to avoid.
     structural = _structural_bound_finding(metadata)
@@ -309,7 +372,7 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
     validator = Draft202012Validator(load_profile_schema())
     for error in sorted(validator.iter_errors(metadata), key=lambda e: [str(p) for p in e.path]):
         path = ".".join(str(p) for p in error.absolute_path) or "(root)"
-        messages.append(ValidationMessage("error", error.message, path))
+        messages.append(ValidationMessage("error", _capped(error.message), path))
 
     # 5. allowedTools vocabulary check (advisory, not blocking).
     #

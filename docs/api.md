@@ -87,18 +87,26 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   validates clean and persists, then fails to load, since the model requires
   string keys. Note YAML also auto-types an unquoted date, so `2026-01-01:` is a
   date key rather than a string; quote such keys.
-- That key check walks the parsed document, and a document is rejected up front if
-  it is too large to inspect, because YAML anchors make a document's value graph
-  arbitrarily larger than its bytes: each alias resolves to another reference to
-  the same object, so chained anchors give a sub-kilobyte body an exponential
-  expansion. Two ceilings, both far above real input, which for the largest
-  bundled profile is 23 expanded values nested 3 deep: a document may expand to at
-  most 20,000 values (~870x) and nest at most 64 levels (~21x). Exceeding either
-  is itself an error, and nothing further runs, since the later steps are what
-  such a document is expensive in. Within the ceilings, containers already visited
-  are skipped, so each offending key is reported once, at the first path that
-  reaches it. Note that differs from the schema step, which does not memoize and
-  so reports a shared invalid value once per referencing path.
+- A document is rejected up front if it cannot safely be handed to the steps that
+  follow, on any of three grounds: how large it renders, how deeply it nests, or
+  whether it contains a cycle. The reason is that YAML anchors decouple a
+  document's rendered size from its byte count, and the schema step interpolates a
+  rendering of an offending value into every error message it builds. Chained
+  anchors multiply structure, and aliasing one large scalar multiplies content, so
+  a request under the 256 KB `content` cap can render to gigabytes either way. The
+  ceilings are therefore in *rendered bytes*, the unit that cost is paid in: at
+  most 1 MB, about 3.8x the largest request that can arrive and ~2060x the largest
+  bundled profile's 485 bytes, and at most 64 levels of nesting (~21x). Exceeding
+  either is itself an error and nothing further runs, since the later steps are
+  what such a document is expensive in. A cycle is rejected rather than measured:
+  it has no finite rendering, and the providers that consume a profile cannot
+  serialize one, so accepting it would persist a document the runtime cannot
+  install. Individual schema findings are also length-capped before they reach a
+  response, which bounds the case where several fields each render a subtree.
+- Within those bounds, containers already visited are skipped, so each offending
+  mapping key is reported once, at the first path that reaches it. Note that
+  differs from the schema step, which does not memoize and so reports a shared
+  invalid value once per referencing path.
 - An `mcpServers` entry must define either `command`, for a server CAO launches,
   or `url`, for a remote one whose `type` names its transport. The schema
   previously required `command` unconditionally, which made the write routes

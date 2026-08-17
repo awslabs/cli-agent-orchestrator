@@ -990,7 +990,7 @@ class TestValidateEndpointResistsAliasAmplification:
         assert response.status_code == 200
         body = response.json()
         assert body["valid"] is False
-        assert any("expands to more than" in m["message"] for m in body["messages"])
+        assert any("renders to more than" in m["message"] for m in body["messages"])
         assert (
             len(response.content) < 2000
         ), f"a {len(content)}-byte body produced a {len(response.content)}-byte response"
@@ -1012,6 +1012,54 @@ class TestValidateEndpointResistsAliasAmplification:
             assert (
                 len(response.content) < 2000
             ), f"{levels} levels produced a {len(response.content)}-byte response"
+
+    @pytest.mark.parametrize(
+        "scalar_length, alias_count",
+        [(2_048, 5_000), (190_000, 15_000)],
+        ids=["2KB scalar x5000", "190KB scalar x15000"],
+    )
+    def test_an_aliased_scalar_cannot_amplify_the_response(
+        self, client, scalar_length, alias_count
+    ) -> None:
+        """A big scalar referenced many times must not become a big response.
+
+        The round-4 ceiling counted value occurrences, so a scalar contributed 1
+        however long it was. @haofeif's two cases: the smaller returned a
+        10,260,109-byte response from a 22 KB request, and the larger sat under the
+        256 KB content cap while the one jsonschema instance rendering had a 2.85 GB
+        lower bound. The ceiling now counts rendered bytes, the unit that cost is
+        actually paid in.
+        """
+        scalar = "x" * scalar_length
+        aliases = ", ".join(["*s"] * alias_count)
+        content = (
+            f"---\nname: t\ndescription: d\nhooks:\n  s: &s {scalar}\n"
+            f"toolsSettings: [{aliases}]\n---\n\nB.\n"
+        )
+
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is False
+        assert len(response.content) < 2000, (
+            f"a {len(content)}-byte request produced a " f"{len(response.content)}-byte response"
+        )
+
+    def test_a_cyclic_profile_is_not_persisted(self, client, write_store) -> None:
+        """The write gate must not accept a profile the runtime cannot materialize.
+
+        Reported by @haofeif on the round-4 head, where this returned 201 and wrote
+        the file. Installing it then failed in the Kiro path, because
+        ``model_dump_json`` refuses a circular reference. Same failure mode as the
+        non-string key rule: valid enough to parse, unusable once written.
+        """
+        content = "---\nname: cyc\ndescription: cyclic\ntoolsSettings: &c {self: *c}\n---\n\nB.\n"
+
+        response = client.post("/agents/profiles", json={"name": "cyc", "content": content})
+
+        assert response.status_code == 400
+        assert not (write_store / "cyc.md").exists()
+        assert any("circular" in e["message"] for e in response.json()["detail"]["errors"])
 
     def test_a_profile_using_anchors_normally_is_still_valid(self, client) -> None:
         """The ceiling is on expansion, not on anchors."""

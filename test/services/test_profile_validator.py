@@ -13,6 +13,7 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.profile_validator import (
+    _MAX_RENDERED_BYTES,
     ValidationMessage,
     load_profile_schema,
     validate_frontmatter,
@@ -381,7 +382,7 @@ class TestAliasAmplificationIsBounded:
         errors = [f for f in findings if f.severity == "error"]
 
         assert len(errors) == 1
-        assert "expands to more than" in errors[0].message
+        assert "renders to more than" in errors[0].message
 
     def test_the_rejection_does_not_grow_with_the_bomb(self) -> None:
         """Rejecting must not itself render the document.
@@ -402,13 +403,126 @@ class TestAliasAmplificationIsBounded:
                 f"the offending instance is being rendered"
             )
 
-    def test_a_self_referential_document_is_accepted(self) -> None:
-        """An anchor containing itself is a cycle, and expands to almost nothing."""
+    CYCLIC = "---\nname: cyc\ndescription: cyclic\ntoolsSettings: &c {self: *c}\n---\n\nB.\n"
+
+    def test_a_cyclic_document_is_rejected(self) -> None:
+        """A cycle is not merely small, it is unrenderable.
+
+        The first version of this guard gave a back-edge a provisional size of 1,
+        which made a cycle look finite, and an earlier revision of this test
+        asserted the resulting document was *valid*. Reported by @haofeif.
+        """
+        findings = validate_profile_text(self.CYCLIC)
+        errors = [f for f in findings if f.severity == "error"]
+
+        assert len(errors) == 1
+        assert "circular" in errors[0].message
+
+    @pytest.mark.parametrize(
+        "frontmatter",
+        [
+            "hooks:\n  a: &a {b: {c: {d: *a}}}",
+            "hooks: &a [*a]",
+            "hooks: &a [{inner: *a}]",
+        ],
+        ids=["indirect through mappings", "sequence self-reference", "sequence to mapping"],
+    )
+    def test_a_cycle_is_rejected_whatever_shape_it_takes(self, frontmatter: str) -> None:
+        """The back-edge need not be a top-level self-reference in a mapping.
+
+        Only the mapping form was reported. Tracking in-progress identities catches
+        any of these, and pinning the shapes keeps a later refactor from narrowing
+        the check to the one case that was raised.
+        """
+        document = f"---\nname: c\ndescription: d\n{frontmatter}\n---\n\nB.\n"
+
+        errors = [f for f in validate_profile_text(document) if f.severity == "error"]
+
+        assert len(errors) == 1
+        assert "circular" in errors[0].message
+
+    def test_merge_keys_cannot_amplify_either(self) -> None:
+        """``<<`` is a second alias mechanism, and renders its target in each copy.
+
+        Not reported, found while probing the fix. A merge key copies the target's
+        entries into the merging mapping, so the values are shared but rendered
+        again per copy, which is the same content multiplication as an aliased
+        scalar reached by a different route.
+        """
+        blob = "y" * 60_000
+        copies = "\n".join(f"  d{index}: {{<<: *s}}" for index in range(3_000))
         document = (
-            "---\nname: cyc\ndescription: A profile.\ntoolsSettings: &c {self: *c}\n---\n\nB.\n"
+            f"---\nname: t\ndescription: d\nhooks:\n  s: &s {{k: {blob}}}\n"
+            f"{copies}\n---\n\nB.\n"
         )
 
-        assert validate_profile_text(document) == []
+        errors = [f for f in validate_profile_text(document) if f.severity == "error"]
+
+        assert len(errors) == 1
+        assert "renders to more than" in errors[0].message
+
+    def test_ordinary_merge_keys_still_pass(self) -> None:
+        """``<<`` is also a normal YAML convenience and must not be rejected."""
+        document = (
+            "---\nname: t\ndescription: d\nhooks:\n  base: &b {timeout: 30}\n"
+            "  a: {<<: *b}\n  b: {<<: *b}\n---\n\nB.\n"
+        )
+
+        assert [f for f in validate_profile_text(document) if f.severity == "error"] == []
+
+    def test_the_rejected_cycle_is_indeed_unusable(self) -> None:
+        """Anchors the reason for rejecting, so the rule is not arbitrary.
+
+        A cyclic profile parses, so nothing before this guard objects, but the Kiro
+        materialization path serializes ``toolsSettings`` and Pydantic refuses. The
+        write gate accepting it would persist a profile the runtime cannot install,
+        which is the same failure mode the non-string key rule exists for.
+        """
+        import pytest as _pytest
+
+        from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+        from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
+
+        profile = parse_agent_profile_text(self.CYCLIC, "cyc")
+        config = KiroAgentConfig(
+            name="cyc", description="cyclic", toolsSettings=profile.toolsSettings
+        )
+
+        with _pytest.raises(Exception) as excinfo:
+            config.model_dump_json(indent=2, exclude_none=True)
+
+        assert "Circular reference" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "scalar_length, alias_count",
+        [(2_048, 5_000), (190_000, 15_000)],
+        ids=["2KB scalar x5000", "190KB scalar x15000"],
+    )
+    def test_an_aliased_scalar_cannot_amplify_the_response(
+        self, scalar_length: int, alias_count: int
+    ) -> None:
+        """Counting occurrences missed this; counting rendered bytes catches it.
+
+        Every scalar used to contribute 1 regardless of length, so a single large
+        scalar referenced thousands of times passed the ceiling while the one
+        jsonschema instance rendering ran to megabytes, and at the larger size to a
+        2.85 GB lower bound from a request under the 256 KB cap. Both cases here are
+        @haofeif's, and the assertion is on the response size rather than a clock.
+        """
+        scalar = "x" * scalar_length
+        aliases = ", ".join(["*s"] * alias_count)
+        document = (
+            f"---\nname: t\ndescription: d\nhooks:\n  s: &s {scalar}\n"
+            f"toolsSettings: [{aliases}]\n---\n\nB.\n"
+        )
+
+        findings = validate_profile_text(document)
+
+        assert len(findings) == 1
+        assert "renders to more than" in findings[0].message
+        assert len(findings[0].message) < 1000, (
+            f"a {len(document)}-byte request produced a " f"{len(findings[0].message)}-char message"
+        )
 
     def test_a_bad_key_in_a_shared_subtree_is_reported_exactly_once(self) -> None:
         """Deterministic proof of the memoization, with no reliance on a clock.
@@ -446,22 +560,42 @@ class TestAliasAmplificationIsBounded:
 
         Reporting nothing would present an uninspected document as clean, which is
         the failure mode of the depth cap this replaced: it returned an empty list.
+
+        The oversized case is a document that is simply large rather than aliased,
+        which is why it has to exceed a megabyte to trip the ceiling. Over HTTP the
+        256 KB cap on ``content`` gets there first, so the reachable caller for this
+        branch is ``cao profile validate`` on a local file, which has no such cap.
         """
         deep: dict = {"name": "deep", "description": "A profile."}
         node = deep
         for _ in range(70):
             node["toolsSettings"] = {}
             node = node["toolsSettings"]
-        wide = {
-            "name": "wide",
+        oversized = {
+            "name": "big",
             "description": "A profile.",
-            "toolsSettings": {f"k{index}": index for index in range(25_000)},
+            "toolsSettings": {"blob": "x" * (_MAX_RENDERED_BYTES + 1)},
         }
 
-        for metadata, expected in ((deep, "nests more than"), (wide, "expands to more than")):
+        for metadata, expected in ((deep, "nests more than"), (oversized, "renders to more")):
             errors = [f for f in validate_frontmatter(metadata) if f.severity == "error"]
             assert len(errors) == 1
             assert expected in errors[0].message
+
+    def test_a_large_but_unaliased_document_still_passes(self) -> None:
+        """The ceiling is on rendering, so size alone below it must not reject.
+
+        Guards against tightening the bound into something that rejects ordinary
+        large profiles, which is the opposite failure from the one above.
+        """
+        metadata = {
+            "name": "big",
+            "description": "A profile.",
+            "toolsSettings": {f"k{index}": "v" * 20 for index in range(2_000)},
+        }
+        assert len(repr(metadata)) > 50_000  # genuinely large, still under the ceiling
+
+        assert [f for f in validate_frontmatter(metadata) if f.severity == "error"] == []
 
 
 class TestMcpServerTransports:
