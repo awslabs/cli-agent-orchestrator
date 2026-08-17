@@ -93,6 +93,10 @@ class BeginHandoffBody(StrictBody):
     packet_digest: str = Field(min_length=64, max_length=64)
     evidence: QuiescenceBody
     initiated_by: str = Field(min_length=1, max_length=512)
+    #: The donor revision the packet digest describes. Required: the digest is
+    #: taken before begin, and a caller that cannot pin the revision has no way
+    #: to keep a stale packet from passing the transfer check (cond-0439).
+    expected_donor_revision: int = Field(ge=0)
     detail: Optional[str] = Field(default=None, max_length=2000)
 
 
@@ -165,6 +169,7 @@ async def begin_task_handoff(
                 packet_digest=body.packet_digest,
                 evidence=_evidence(body.evidence),
                 initiated_by=body.initiated_by,
+                expected_donor_revision=body.expected_donor_revision,
                 detail=body.detail,
             ),
         )
