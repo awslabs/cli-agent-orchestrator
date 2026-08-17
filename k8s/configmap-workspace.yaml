@@ -1,0 +1,33 @@
+# Workspace configuration shared by the supervisor and ALL worker pods
+# (consumed via envFrom). Git is the workspace transport: every pod clones
+# the listed repos to the same in-pod path, agents share work by pushing
+# branches — no cross-pod volume mounts.
+#
+# Repos are RUNTIME DATA, not baked into the pod spec:
+#   - switch or add repos by editing CAO_WORKSPACE_REPOS here, then
+#       kubectl -n cao-cluster rollout restart deploy/cao-supervisor statefulset/cao-worker
+#   - or skip the redeploy entirely: agents have git + fleet credentials
+#     (see secret-git-credentials.example.yaml) and can clone any repo the
+#     token reaches, mid-task, under ~/workspace. The list below is only a
+#     warm cache cloned at pod startup.
+#
+# With exactly ONE repo listed, cao-server starts inside it and delegated
+# agents inherit it as their working directory automatically. With multiple
+# repos, the server starts at ~/workspace and the supervisor selects a repo
+# per assignment via the working_directory parameter
+# (CAO_ENABLE_WORKING_DIRECTORY=true is set on all pods).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cao-workspace-config
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+data:
+  # Whitespace/comma-separated HTTPS clone URLs. Empty = no pre-clone;
+  # agents start in an empty ~/workspace and clone on demand.
+  # Example:
+  #   CAO_WORKSPACE_REPOS: "https://github.com/your-org/service-a.git https://github.com/your-org/service-b.git"
+  CAO_WORKSPACE_REPOS: ""
+  # Git host the fleet token (if any) applies to.
+  CAO_GIT_HOST: "github.com"
