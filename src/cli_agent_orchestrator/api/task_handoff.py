@@ -218,6 +218,12 @@ async def complete_task_handoff(
 
     One transaction. A crash between the two writes leaves the handoff pending
     and still rollback-able rather than leaving the task with no owner.
+
+    One refusal does not raise: if an unrelated dispatch opened a round for
+    the recipient while the handoff was pending, this returns 200 with
+    ``state='failed'`` — nothing transferred, both holds released, and the
+    record's ``recipient_briefed`` says whether the caller owes the recipient
+    a cancellation (cond-0440).
     """
     try:
         return await asyncio.to_thread(

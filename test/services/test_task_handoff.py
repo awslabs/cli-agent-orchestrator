@@ -131,7 +131,7 @@ def _occurrence_row(task_occurrence_id):
     return record
 
 
-def _bind_roster(agent_id, *, suffix):
+def _bind_roster(agent_id, *, suffix, generation=None):
     """A real roster incarnation, the way any live worker has one."""
     from cli_agent_orchestrator.services import stable_agent_roster as roster
 
@@ -145,7 +145,7 @@ def _bind_roster(agent_id, *, suffix):
             native_session_id=f"native-{suffix}",
             acquisition_method="chosen_session_id",
             terminal_id=f"term-{suffix}",
-            generation=f"gen-{suffix}",
+            generation=generation or f"gen-{suffix}",
             pane_id=f"%{suffix}",
             pane_pid=6000 + int(suffix),
             process_identity={"pid": 6000 + int(suffix), "start_marker": f"marker-{suffix}"},
@@ -473,6 +473,10 @@ def test_begin_refuses_a_donor_that_moved_since_the_packet_was_digested():
 
 
 def test_begin_pins_the_donor_revision_the_packet_digest_describes():
+    # Companion pin, not the gate: this passes even with the begin-time CAS
+    # deleted. The sibling that discriminates the CAS is
+    # test_begin_refuses_a_donor_that_moved_since_the_packet_was_digested;
+    # this pins the recorded value the transfer check later compares against.
     donor_agent, recipient_agent, donor = _pair()
     occ.record_boundary(
         occ.BoundaryRecord(
@@ -747,17 +751,92 @@ def test_a_stale_incarnation_assertion_is_corrected_to_the_rosters_binding():
 
 
 def test_a_roster_silent_delivery_is_recorded_as_caller_asserted():
+    # Companion pin, not the gate: this passes even with the roster
+    # resolution deleted entirely. The siblings that discriminate the
+    # mechanism are test_a_delivery_to_a_pane_the_roster_binds_to_another_agent_is_refused
+    # and the two live-fallback tests below.
+    #
     # Deliberate posture, matching the admission hold's: a terminal with no
-    # roster incarnation is not refused. An agent with no incarnation cannot be
-    # a handoff party in a real flow, and a pane the roster cannot vouch for is
-    # indistinguishable from the ordinary lost-pane state the system already
-    # recovers. The record says what the caller asserted; it does not claim
-    # roster proof.
+    # live roster incarnation under ANY generation is not refused. An agent
+    # with no incarnation cannot be a handoff party in a real flow, and a
+    # pane the roster cannot vouch for is indistinguishable from the ordinary
+    # lost-pane state the system already recovers. The record says what the
+    # caller asserted; it does not claim roster proof.
     donor_agent, recipient_agent, donor = _pair()
     handoff = _begin(donor, recipient_agent)
     delivered = _deliver(handoff)
     assert delivered["to_incarnation_id"] == "inc-2"
     assert delivered["delivery_state"] == th.DELIVERY_DELIVERED
+
+
+def test_a_delivery_naming_a_generation_the_roster_binds_elsewhere_is_refused():
+    # cond-0441 F1 face A. The supervisor's view is one staleness hop deeper
+    # than a misnamed incarnation: the roster live-binds term-9 to another
+    # worker under gen-9, while the stale assertion names (term-9, gen-1) for
+    # the recipient. The exact lookup finds no gen-1 row, but that is not
+    # silence -- the roster positively vouches for the pane under another
+    # generation, and the live binding says it is not the recipient's.
+    # Recording would stamp the successor occurrence with another worker's
+    # live pane, and the finalize-by-occurrence-id recovery paths would act
+    # on the wrong physical worker.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    _bind_roster(str(uuid.uuid4()), suffix="9")
+    with pytest.raises(th.TaskHandoffConflict, match="not the handoff's recipient"):
+        th.record_packet_delivery(
+            handoff["handoff_id"],
+            delivered=True,
+            incarnation=occ.EffectIncarnation(
+                incarnation_id="inc-stale", terminal_id="term-9", generation="gen-1"
+            ),
+        )
+    # The refusal wrote nothing: the handoff stays pending and rollback-able.
+    record = th.get_handoff(handoff["handoff_id"])
+    assert record["delivery_state"] == th.DELIVERY_PENDING
+    assert record["recipient_briefed"] is False
+
+
+def test_a_delivery_naming_a_retired_incarnation_is_corrected_to_the_live_binding():
+    # cond-0441 F1 face B. The recipient was bound at (term-2, gen-1) when
+    # the supervisor read its roster view, then ordinary recovery rebound it
+    # to (term-2, gen-2) mid-window; the gen-1 row remains as retired
+    # history. The stale assertion names the retired row, which matches the
+    # recipient by agent and id -- but a retired incarnation read no packet
+    # (the roster's own assert_admission_ready refuses that same pair), and
+    # the bytes could only have landed on the live gen-2 pane. Record the
+    # live binding rather than a conclusion the check never established.
+    from cli_agent_orchestrator.services import stable_agent_roster as roster
+
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    retired = _bind_roster(recipient_agent, suffix="2", generation="gen-1")
+    retired_incarnation = retired["incarnation"]["incarnation_id"]
+    roster.retire_incarnation(terminal_id="term-2", generation="gen-1", reason="rebound")
+    live = _bind_roster(recipient_agent, suffix="2", generation="gen-2")
+    live_incarnation = live["incarnation"]["incarnation_id"]
+
+    delivered = th.record_packet_delivery(
+        handoff["handoff_id"],
+        delivered=True,
+        incarnation=occ.EffectIncarnation(
+            incarnation_id=retired_incarnation, terminal_id="term-2", generation="gen-1"
+        ),
+    )
+    assert delivered["to_incarnation_id"] == live_incarnation
+    assert delivered["to_terminal_id"] == "term-2"
+    assert delivered["to_generation"] == "gen-2"
+
+    # And the transfer names what the roster -- and now the record -- says.
+    result = th.complete_handoff(
+        handoff["handoff_id"],
+        incarnation=occ.EffectIncarnation(
+            incarnation_id=live_incarnation, terminal_id="term-2", generation="gen-2"
+        ),
+        expected_revision=0,
+        completed_by="supervisor",
+    )
+    assert result["state"] == th.STATE_TRANSFERRED
+    assert result["successor_occurrence"]["incarnation_id"] == live_incarnation
 
 
 def test_a_transfer_without_a_delivered_packet_is_refused():

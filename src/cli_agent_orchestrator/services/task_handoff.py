@@ -860,6 +860,16 @@ def _roster_resolve_delivery_incarnation(
       be a handoff party in a real flow, and a pane no roster vouches for is
       indistinguishable from the ordinary lost-pane state recovery already
       handles.
+
+    "Silent" is judged against the pane's *live* binding, never against the
+    caller's asserted generation alone. Terminal reuse across generations is
+    designed-for, so the exact lookup keyed on a stale generation either
+    misses the live row entirely — while the roster positively binds that
+    same pane to someone under another generation — or hits a *retired*
+    history row, which vouches for nothing: a retired incarnation read no
+    packet, and the roster's own ``assert_admission_ready`` refuses that
+    same pair. Both cases fall through to the unique live incarnation of the
+    terminal; only a pane with no live roster incarnation at all is silent.
     """
     from cli_agent_orchestrator.services import stable_agent_roster as roster
 
@@ -867,6 +877,19 @@ def _roster_resolve_delivery_incarnation(
         bound = roster.get_incarnation_by_terminal(
             incarnation.terminal_id, incarnation.generation, db=db
         )
+        live_fallback = False
+        if bound is not None and bound["disposition"] == roster.INCARNATION_RETIRED:
+            # History, not evidence: the retired row can match the stale
+            # assertion's agent and name exactly, but a dead incarnation read
+            # no packet. Treat the exact lookup as silent and let the live
+            # binding decide below.
+            bound = None
+        if bound is None:
+            # The caller's asserted generation is not bound. That is silence
+            # only if no generation is: a pane the roster positively binds
+            # under another generation must still be checked.
+            bound = roster.get_incarnation_by_terminal(incarnation.terminal_id, db=db)
+            live_fallback = True
     except roster.StableAgentConflict as exc:
         raise TaskHandoffConflict(
             f"the roster cannot name a unique incarnation for terminal "
@@ -883,9 +906,11 @@ def _roster_resolve_delivery_incarnation(
             "handoff back — transferring would stamp the recipient's occurrence with a pane "
             "that is not its own"
         )
-    if bound["incarnation_id"] != incarnation.incarnation_id:
+    if live_fallback or bound["incarnation_id"] != incarnation.incarnation_id:
         # Correct rather than refuse: the packet reached the recipient's pane,
-        # and the roster owns what that pane's incarnation is called.
+        # and the roster owns what that pane's incarnation is called. On the
+        # live fallback nothing about the caller's assertion was verified —
+        # not even the generation — so record the live binding wholesale.
         return occurrence.EffectIncarnation(
             incarnation_id=bound["incarnation_id"],
             terminal_id=bound["terminal_id"],
