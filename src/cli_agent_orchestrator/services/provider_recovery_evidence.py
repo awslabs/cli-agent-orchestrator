@@ -52,6 +52,23 @@ _CONNECTION_CLOSED = re.compile(
     rf"^\s*{_GLYPH}API Error: Connection closed mid-response\. "
     r"The response above may be incomplete\.\s*$"
 )
+# Claude Code 2.1.233 reworded the same line to "Connection lost".  The
+# 2.1.224 wording is absent from that build's bundle, so matching only it
+# leaves the detector blind on any current install; both are kept because a
+# worker may be running either build.  Distinct pattern ids keep the durable
+# occurrence fingerprint stable and record which build's text was seen.
+_CONNECTION_LOST = re.compile(
+    rf"^\s*{_GLYPH}API Error: Connection lost mid-response\. "
+    r"The response above may be incomplete\.\s*$"
+)
+_MID_RESPONSE_TERMINALS = (
+    # (expression, pattern, provenance) -- the two wordings do NOT share
+    # provenance.  The closed wording was captured on a live pane here; the lost
+    # wording is read out of the 2.1.233 bundle and has never been seen render.
+    # The journal must not report the second as observed.
+    (_CONNECTION_CLOSED, "claude.connection-closed-mid-response", "locally observed"),
+    (_CONNECTION_LOST, "claude.connection-lost-mid-response", "read from the shipped bundle"),
+)
 _RETRY_BANNER = re.compile(
     rf"^\s*{_GLYPH}API error\s*[·-]\s*Retrying in\s+\S+\s*[·-]\s*" r"attempt\s+\d+/\d+\s*$",
     re.IGNORECASE,
@@ -193,20 +210,21 @@ def detect(provider: str, screen_lines: Optional[Sequence[str]]) -> Optional[Rec
         # above a later successful response and a new composer.
         candidates = _tail_candidates(rows[:composer_top])
         for candidate in candidates:
-            if _CONNECTION_CLOSED.fullmatch(candidate):
-                return _match(
-                    pattern="claude.connection-closed-mid-response",
-                    turn_state=TURN_TERMINAL,
-                    recovery_action=ACTION_NUDGE,
-                    status=TerminalStatus.ERROR,
-                    confidence="high",
-                    reason=(
-                        "locally observed Claude connection-closed terminal line "
-                        "ended at the boxed idle composer"
-                    ),
-                    raw_text=candidate,
-                    idle_composer=True,
-                )
+            for expression, pattern, provenance in _MID_RESPONSE_TERMINALS:
+                if expression.fullmatch(candidate):
+                    return _match(
+                        pattern=pattern,
+                        turn_state=TURN_TERMINAL,
+                        recovery_action=ACTION_NUDGE,
+                        status=TerminalStatus.ERROR,
+                        confidence="high",
+                        reason=(
+                            f"Claude mid-response terminal line ({provenance}) "
+                            "ended at the boxed idle composer"
+                        ),
+                        raw_text=candidate,
+                        idle_composer=True,
+                    )
         candidates = [str(rows[composer_top - 1]).strip()] if composer_top else []
     else:
         candidates = [str(line).strip() for line in reversed(rows[-25:])]

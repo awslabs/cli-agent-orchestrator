@@ -67,6 +67,51 @@ def test_only_proven_connection_closed_match_executes_nudge_contract():
     assert matched.status.value == "error"
 
 
+def test_the_2_1_233_connection_lost_wording_matches_the_same_contract():
+    """2.1.233 reworded "closed" to "lost"; anchoring only on the old text
+    leaves the detector blind on every current install."""
+    matched = recovery.detect(
+        "claude_code",
+        [
+            "✻ Crunched for 7m 21s",
+            "API Error: Connection lost mid-response. The response above may be incomplete.",
+            BOX,
+            "❯",
+            BOX,
+        ],
+    )
+
+    assert matched is not None
+    assert matched.pattern == "claude.connection-lost-mid-response"
+    assert matched.turn_state == "terminal"
+    assert matched.recovery_action == "nudge"
+    assert matched.confidence == "high"
+    assert matched.status.value == "error"
+
+
+def test_the_two_mid_response_wordings_keep_distinct_occurrence_identity():
+    """Same condition, different build text.  Distinct fingerprints keep an
+    upgrade from reading as a recurrence of the pre-upgrade occurrence."""
+    closed = recovery.detect("claude_code", CONNECTION_CLOSED)
+    lost = recovery.detect(
+        "claude_code",
+        [
+            "API Error: Connection lost mid-response. The response above may be incomplete.",
+            BOX,
+            "❯",
+            BOX,
+        ],
+    )
+
+    assert closed is not None and lost is not None
+    # Assert the pattern ids, not just that both matched: the generic
+    # API-error fallback also returns a match with a different fingerprint,
+    # so identity alone passes even when the "lost" wording is unrecognised.
+    assert closed.pattern == "claude.connection-closed-mid-response"
+    assert lost.pattern == "claude.connection-lost-mid-response"
+    assert closed.fingerprint != lost.fingerprint
+
+
 def test_connection_closed_match_survives_one_viewport_line_wrap():
     matched = recovery.detect(
         "claude_code",
