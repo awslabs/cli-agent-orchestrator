@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cli_agent_orchestrator.api.attachments import router as native_attachments_router
 from cli_agent_orchestrator.api.roster import router as roster_router
 from cli_agent_orchestrator.api.session_lifecycle import router as session_lifecycle_router
+from cli_agent_orchestrator.api.task_handoff import router as task_handoff_router
 from cli_agent_orchestrator.api.task_occurrence import router as task_occurrence_router
 from cli_agent_orchestrator.api.tracker import router as tracker_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
@@ -865,6 +866,9 @@ app.include_router(session_lifecycle_router)
 # task occurrence outlives the pane that ran it, so its read routes must not
 # inherit a tmux-existence guard.
 app.include_router(task_occurrence_router)
+# Same placement, same reason: a handoff outlives the panes it coordinated, and
+# its reads are the diagnostic answer to "why was my steer refused".
+app.include_router(task_handoff_router)
 app.include_router(roster_router)
 
 

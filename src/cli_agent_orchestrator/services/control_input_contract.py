@@ -224,6 +224,14 @@ REASON_GENERATION_FENCED = "generation-fenced"
 # not wake the stopped campaign.  Unlike a generation fence this applies to
 # every current cohort member at once and is released only by operator Resume.
 REASON_SESSION_EFFECT_BARRIER = "session-effect-barrier"
+# An M3-E handback is pending for this stable agent, so its task authority is
+# suspended.  Deliberately distinct from a generation fence, which it would
+# otherwise be mistaken for: a fence is permanent and tells the caller to
+# advance to a successor, while this is a *reversible* hold on the exact
+# generation the caller already has.  A caller that read this as a fence would
+# abandon a pane the handoff is keeping alive as rollback insurance.  Decided
+# before the first provider byte, so it carries the zero-bytes proof.
+REASON_HANDOFF_HELD = "handoff-held"
 
 # Every reason is bound to the one outcome it can honestly carry.
 #
@@ -263,6 +271,7 @@ REASON_OUTCOMES: "dict[str, str]" = {
     REASON_COMPOSER_NONEMPTY: REFUSED,
     REASON_GENERATION_FENCED: REFUSED,
     REASON_SESSION_EFFECT_BARRIER: REFUSED,
+    REASON_HANDOFF_HELD: REFUSED,
     REASON_WRITE_DEADLINE: REFUSED,
     REASON_CONTROL_ROUTE_ABSENT: UNSUPPORTED,
     REASON_PROTOCOL_MISMATCH: UNSUPPORTED,

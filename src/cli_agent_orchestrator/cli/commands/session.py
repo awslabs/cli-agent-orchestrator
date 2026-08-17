@@ -1122,6 +1122,54 @@ def occurrence_pending_extensions(session_name, decider, as_json):
         )
 
 
+@session.group(name="handoff")
+def session_handoff():
+    """Reversible A -> B -> A worker handbacks (read-only).
+
+    Deliberately has no verbs. A handback spans an exact resume and a packet
+    delivery this CLI does not own, and a `cao session handoff start` would
+    imply an atomicity it cannot provide.
+
+    One command, because there is one question. A refused steer names its
+    handoff id verbatim, so the operator's loop is `refused steer -> read the
+    id -> handoff show <id>`. "What is in flight" needs a session name the
+    operator must already have, and nothing produces that question while no
+    conductor client can create a handoff; `GET /sessions/{s}/task-handoffs`
+    remains for when one does.
+    """
+
+
+@session_handoff.command(name="show")
+@click.argument("handoff_id")
+@click.option("--json", "as_json", is_flag=True)
+def handoff_show(handoff_id, as_json):
+    """One handback, its quiescence evidence, and what it is holding."""
+    record = _api_get(f"/task-handoffs/{quote(handoff_id, safe='')}")
+    if as_json:
+        click.echo(json.dumps(record, indent=2))
+        return
+    click.echo(f"{record['handoff_id']}  {record['state']}")
+    click.echo(f"  session         {record['session_name']}")
+    click.echo(f"  occurrence      {record['task_occurrence_id']}")
+    click.echo(f"  donor           {record['from_agent_id']} (inc {record['from_incarnation_id']})")
+    click.echo(f"  recipient       {record['to_agent_id']}")
+    click.echo(f"  packet          {record['delivery_state']} via {record['packet_control_id']}")
+    quiescence = record.get("quiescence") or {}
+    # Printed with its proof status because an unproven turn is accepted: not
+    # every installed provider runs a heartbeat producer, and a receipt that
+    # read as proof would be the wrong record of what was actually observed.
+    proof = "proven" if quiescence.get("turn_proven") else "UNPROVEN"
+    click.echo(f"  turn            {quiescence.get('turn_state')} ({proof})")
+    click.echo(f"  child effects   {quiescence.get('known_child_effects')}")
+    if record["state"] == "pending":
+        click.echo(
+            "  holding         both agents refuse ordinary task input; only the packet "
+            "control id reaches the recipient"
+        )
+    if record.get("successor_occurrence_id"):
+        click.echo(f"  transferred to  {record['successor_occurrence_id']}")
+
+
 @session_cohort.command(name="wakes")
 @click.argument("session_name")
 @click.option("--json", "as_json", is_flag=True)

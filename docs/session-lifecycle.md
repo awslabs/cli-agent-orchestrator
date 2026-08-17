@@ -536,6 +536,171 @@ writes** — the cohort member carriers it fills (`task_occurrence_id`,
 Rolling back leaves those rows simply unread, and an older build's own schema is
 byte-identical to what it had before.
 
+### 4.6 M3-E: handing a task back to the worker that had it
+
+A provider handoff moves a task from worker A to worker B without destroying A's
+native conversation. When quota or capability later makes A preferable again,
+the supervisor hands the task **back**: it steers B to a safe boundary, resumes
+A's original native session exactly, delivers a catch-up packet describing what
+B did while A was dormant, and transfers the task. The packet catches A up; it
+does not replace A's own history, which is the entire reason for resuming rather
+than starting a successor.
+
+A handback has four boundaries and each one is a separate durable step, because
+each one is a point where the supervisor can still change its mind: begin,
+deliver the packet, transfer, or roll back.
+
+**The held window is its own row, not a state on the occurrence.** This is the
+load-bearing placement. `task_occurrences.state` stays `open` for the donor's
+whole life. A third state would take the donor's row out of
+`open_occurrence_for_agent`, and the safe drain reads *no open occurrence* as
+positive `parked` — so a drain running concurrently with a handback would record
+the donor's **previous** round's digests as a proven boundary, fold them into
+its receipt, and under Stop announce teardown for the very pane the handback is
+keeping alive as its rollback insurance. `_later_work_refusals` could not catch
+it either: its only "moved" signal is a different open id on the *same* agent,
+and a donor in that state has no open id at all.
+
+**Rollback restores the donor by having changed nothing.** Because a pending
+handoff never writes to the task, restoring the donor's authority and its
+managed input is one compare-and-swap on the handoff row. There is no
+compensating write to get wrong and no window in which a half-undone transfer is
+visible. Rollback also **always releases**: it reports whether the donor is
+still a usable worker, but it never refuses, because a rollback that could
+refuse would leave both agents held with no forward path — worse than an honest
+"the donor is gone; recover it".
+
+**A transfer mints a new occurrence; it never rewrites the donor's row.**
+`agent_id`, `round_index` and the incarnation columns are the immutable content
+`open_occurrence` adopts a response-loss retry against, two unique indexes are
+keyed on them, and both `retire_worker_pane` and `admit_fresh_successor` read by
+agent and then finalize by occurrence id with **no `agent_id` predicate** — so a
+moved row lets one worker's teardown finalize another worker's live round.
+Completing a handback finalizes the donor `superseded` and opens a fresh
+occurrence for the recipient **in one transaction**, exactly as lost-pane
+recovery already does for a successor. A crash between the two writes leaves the
+handoff pending and still rollback-able rather than leaving the task unowned.
+The recipient's round index is its own next one, derived rather than accepted:
+`ix_task_occurrences_round` is not partial, so a *finalized* round of the
+recipient's own past occupies the slot just as much as a live one.
+
+**Exactly one authority, enforced by the database.** Three partial unique
+indexes — one pending handoff per occurrence, per donor, and per recipient. A
+settled row leaves all three, so the same pair may hand back again later.
+
+**Both sides are held, for different reasons.** The donor is held because the
+packet describes a state it must stop changing: a steer landing after the digest
+was taken means the packet the recipient reads is already wrong. The recipient
+is held because the supervisor's roster view can be stale — it believes that
+agent dormant — and task input arriving before the packet has the recipient
+acting on context it does not have, for a round it does not yet hold. The
+recipient's exemption is exact: the one derived control id the packet is
+delivered under, and nothing else.
+
+The hold sits at the top of `provider_byte_admission`, **before** the unmanaged
+and legacy-managed early returns, and it resolves its agent from the **roster**
+rather than from a managed-launch reservation. Both are load-bearing, and the
+reason is the recipient. A handback resumes the recipient's own native session
+through M3-B, whose exact executor deliberately allocates a terminal id it has
+*proven absent* from the reservation table — so the restored pane is not
+"managed" at all. A reservation-keyed hold placed after the `managed` early
+return would therefore be inert for every recipient, and for every donor that
+was ever recovered, which is the ordinary steady state after a pane loss. The
+roster knows both populations: a managed launch binds its generation under the
+reservation's stable agent, and an exact reincarnation rebinds the pre-existing
+agent to the successor incarnation.
+
+A terminal with no roster incarnation is not held, and that is not a bypass: an
+agent with no incarnation cannot be a handoff party, because a handoff names
+agents that hold or will hold a task occurrence.
+
+The refusal is reported as its own reason (`handoff-held`) rather than as a
+generation fence. The distinction matters operationally: a fence is permanent
+and tells the caller to advance to a successor generation, while this hold is
+reversible and applies to the generation the caller already has. A caller that
+read one as the other would abandon the pane the handback is preserving.
+
+**The managed-launch admit lane carries no hold, and needs none.** A v2
+reservation mints a fresh random `stable_agent_id` at reserve time, taking no
+caller input and offering no reuse path, while a handoff always names an agent
+that holds or will hold an occurrence. The two populations are disjoint by
+construction, so a hold there would be dead code. That reason is pinned by a
+test rather than left as prose, because an implementer who later makes that
+column caller-supplied or reusable would open the lane silently.
+
+**The packet is bound to the incarnation that received it.** The derived control
+id binds no terminal, and the control-input journal refuses to re-deliver a
+known control id whose target moved — so the packet is unreachable to any
+incarnation but the first one that got it. Recording which one that was is what
+lets a transfer refuse a replacement pane. Without it, a recipient whose pane
+died between delivery and transfer would become the sole task authority holding
+no context, while the record and the receipt both asserted that it had read the
+packet, with the donor already `superseded` and the rollback gone. A replaced
+recipient is a rollback and a new handoff — which yields a new derived control
+id, and so a deliverable packet — never a transfer.
+
+**A donor that moved while held refuses the transfer.** The packet describes one
+exact occurrence revision, snapshotted when the handback began. If something
+wrote to the donor afterwards, the context the recipient read is not the round
+it is being given. Refusing is recoverable; transferring is not.
+
+**A recipient must be free to take the round.** Checked at the beginning,
+because that is the last point at which refusing is free: past it the
+recipient's own unrelated round is suspended and the catch-up packet is typed
+into its context by the exemption, and typed bytes are not reversible.
+
+**A rollback after delivery still releases, and says so.** One that could refuse
+would leave both agents held with no forward path. But releasing an already
+briefed recipient is not the same outcome as releasing nobody — that worker
+holds a live instruction to continue the task — so `recipient_briefed` rides in
+the result and in the receipt, and the caller that owns the pane is obliged to
+send the cancellation.
+
+**What is deliberately absent.** No native session id is recorded anywhere in a
+handoff, and the transfer route accepts none either. A handback never moves a
+native conversation between workers — the recipient's own session is resumed
+exactly by M3-B, whose roster predicates already refuse a cross-harness bind —
+so a copy here would be a second, unenforced statement of a fact true of only
+one side, and an ordinary field-name slip in a caller that holds both
+incarnations would stamp the donor's native session onto the recipient's
+occurrence. There is also no proof that the donor left no running child
+processes, because nothing in this system tracks them and the containment
+surface that would prove their absence fails closed permanently; the evidence
+records that none are *tracked* rather than claiming an absence nobody observed.
+
+**Quiescence is proven where it can be and honest where it cannot.** A donor
+with an `active` managed turn is refused outright. An `unknown` turn is accepted
+and recorded as unproven, because not every installed provider runs a heartbeat
+producer and refusing would forbid handback on exactly the routes that most need
+it. Every read surface and the settled receipt carry the value, so a handback
+taken on unproven quiescence is visible rather than silently equivalent to one
+that was observed.
+
+**Nothing starts a handback on its own.** It is one explicit supervisor
+decision; no detector, recovery ladder, or lifecycle transition begins one, and
+no conductor client calls these routes. `GET /task-handoffs/capability`
+publishes that as a block rather than leaving it to be inferred from the routes'
+existence. `cao session handoff show` is read-only and answers the question an
+operator actually has: a refused steer names its handoff id verbatim, so the
+loop is refusal → id → `show`.
+
+**Two halves, and only one of them is dark.** Nothing outside tests can *create*
+a handoff — there is no conductor client and the CLI has no verbs — so no
+refusal can fire on a running installation today. But the *enforcement* half is
+live: every managed control-input, native-inbox and operator-message write now
+performs one indexed single-row read against `task_occurrence_handoffs`. On an
+installation with no handoffs that is one index miss returning `None`.
+
+**Rollback.** M3-E adds one table and changes **nothing** M3-D owns: no column
+on `task_occurrences`, no new occurrence state, no new disposition. Rolling back
+to a pre-M3-E binary leaves the handoff rows unread and an older build's schema
+and reading of every existing row byte-identical to what they were.
+
+The in-place kill switch is **not** the router registration: removing the two
+`api/main.py` lines removes the routes and leaves the hold on all three write
+paths. The switch is the hold call at the top of
+`control_input_service.provider_byte_admission`.
+
 ---
 
 ## 5. Waiting, and why it is not yet safe
