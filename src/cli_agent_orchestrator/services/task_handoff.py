@@ -158,6 +158,25 @@ class TaskHandoffHeld(TaskHandoffError):
     code = "task-handoff-held"
 
 
+class TaskHandoffHoldUndecidable(TaskHandoffHeld):
+    """The hold question could not be answered, so input is refused unread.
+
+    A subclass of ``TaskHandoffHeld`` because it refuses on the same terms —
+    decided before the first provider byte, carrying the same zero-bytes proof,
+    re-attemptable once the store answers — and because every admission caller
+    already catches that type. Making it a sibling would have turned this into
+    an untyped 500 on the one path whose whole contract is a typed outcome.
+
+    It carries its own reason code because the two say different things. A hold
+    asserts a handback *is* pending for this agent; this asserts only that the
+    store could not say. An operator told the former goes looking for a
+    handback that does not exist, while the actual cause is a store that cannot
+    answer — which is the diagnosis trap this type exists to close.
+    """
+
+    code = "task-handoff-hold-undecidable"
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1220,6 +1239,32 @@ def hold_for_agent(agent_id: str, db: Any = None) -> Optional[dict[str, Any]]:
     return _with_session(_read, db, unavailable="handoff hold could not be read")
 
 
+def _handoff_store_present(db: Any = None) -> bool:
+    """Whether this store carries the handback table at all.
+
+    Asked only after a read has already failed, so it costs nothing on the
+    admission hot path. Probing ``sqlite_master`` rather than matching the
+    exception's text: the answer is the fact the decision turns on, and a
+    message string is not a contract.
+
+    A probe that itself fails answers ``True``. That is the safe direction — an
+    unanswerable probe is not evidence the table is absent, and treating it as
+    such would admit bytes on exactly the evidence this seam refuses to guess
+    from.
+    """
+    from sqlalchemy import text as sa_text
+
+    statement = sa_text("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :name")
+    name = {"name": database.TaskOccurrenceHandoffModel.__tablename__}
+    try:
+        if db is not None:
+            return db.execute(statement, name).first() is not None
+        with database.SessionLocal() as session:
+            return session.execute(statement, name).first() is not None
+    except Exception:  # noqa: BLE001 - an unanswerable probe proves no absence
+        return True
+
+
 def hold_refusal(
     agent_id: Optional[str], *, control_id: Optional[str] = None, db: Any = None
 ) -> Optional[str]:
@@ -1239,21 +1284,37 @@ def hold_refusal(
     is delivered under, and nothing else. Without it the hold would refuse its
     own packet and no handback could ever complete.
 
-    **Blast radius when the store cannot be read.** This fails closed, so a
-    persistently unreadable database refuses every managed steer, tell and
-    operator message in every session on the installation — including one where
-    no handoff has ever been created. That is deliberate (admitting bytes the
-    hold exists to refuse is the one outcome this seam must never produce, and
-    the neighbouring reservation read already refuses on the same grounds), but
-    it is a global failure mode introduced by a feature nothing invokes yet,
-    and an operator diagnosing a total input outage should find it named here.
+    **When the store cannot be read.** A pending handoff is a *row* in
+    ``task_occurrence_handoffs``, so what the failure means depends on whether
+    that table exists.
+
+    No table means no rows, which means no pending handoff — a proof, not a
+    guess. ``begin_handoff`` writes that table, so it cannot have succeeded
+    against a store that lacks it, and there is no suspended authority to
+    protect. Refusing there would cost an operator every steer, tell and
+    operator message on an installation whose only fault is that M3-E has not
+    run on it yet, in exchange for protecting nothing. So it admits.
+
+    A table that exists but cannot be answered is genuinely unknown: a pending
+    row may be sitting in it. Admitting to a held donor invalidates the packet
+    digest its recipient is about to act on, and admitting to a held recipient
+    has it act on context it does not have. Both are the corrupted-state
+    transition this hold exists to prevent, so that case still fails closed —
+    but it raises ``TaskHandoffHoldUndecidable`` rather than reporting a
+    handback that nothing observed.
     """
     if not agent_id:
         return None
     try:
         held = hold_for_agent(agent_id, db=db)
-    except TaskHandoffError:
-        return "the task-handoff store could not be read; task input is held until it can"
+    except TaskHandoffError as exc:
+        if not _handoff_store_present(db=db):
+            return None
+        raise TaskHandoffHoldUndecidable(
+            "the task-handoff store carries the handback table but could not answer whether "
+            f"stable agent {agent_id} is party to a pending handback, so task input is refused "
+            f"unread until it can: {exc}"
+        ) from exc
     if held is None:
         return None
     if held["role"] == ROLE_RECIPIENT and control_id and control_id == held["packet_control_id"]:
@@ -1295,6 +1356,13 @@ def hold_refusal_for_terminal(
     A terminal with no roster incarnation is not held. That is not a bypass —
     an agent with no incarnation cannot be a handoff party, because a handoff
     names agents that hold or will hold a task occurrence.
+
+    A roster that *raises* is the one case with no honest answer at all: it
+    leaves the pane's agent unnamed, so the hold question cannot even be asked,
+    let alone answered "no". That still fails closed, and unlike a missing
+    handback table it is not a small fault being amplified — every managed
+    lane reads the roster, so a store that cannot answer it is already broken.
+    It is refused as undecidable rather than as a pending handback.
     """
     if not terminal_id:
         return None
@@ -1304,11 +1372,11 @@ def hold_refusal_for_terminal(
         incarnation = roster.get_incarnation_by_terminal(
             str(terminal_id), generation if generation else None, db=db
         )
-    except Exception:
-        # A roster that cannot name this pane's agent cannot prove it is
-        # unheld. Same posture as an unreadable handoff store, and the same
-        # blast radius caveat applies.
-        return "the stable-agent roster could not be read; task input is held until it can"
+    except Exception as exc:
+        raise TaskHandoffHoldUndecidable(
+            "the stable-agent roster could not name the agent on this pane, so whether it is "
+            f"party to a pending handback is undecidable and task input is refused unread: {exc}"
+        ) from exc
     if not incarnation:
         return None
     return hold_refusal(incarnation.get("agent_id"), control_id=control_id, db=db)

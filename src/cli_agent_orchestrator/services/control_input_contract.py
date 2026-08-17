@@ -232,6 +232,15 @@ REASON_SESSION_EFFECT_BARRIER = "session-effect-barrier"
 # abandon a pane the handoff is keeping alive as rollback insurance.  Decided
 # before the first provider byte, so it carries the zero-bytes proof.
 REASON_HANDOFF_HELD = "handoff-held"
+# The handoff hold could not be decided: the store carries the table but could
+# not answer whether this agent is party to a pending handback.  Deliberately
+# NOT ``handoff-held``, which asserts a handback *is* pending and sends an
+# operator looking for one that does not exist.  A store that cannot answer the
+# question is not a store reporting an answer.  Still refused and still decided
+# before the first provider byte — a pending row may exist, and admitting bytes
+# to a held donor invalidates the packet digest its recipient will act on —
+# but the reason says what is actually true.
+REASON_HANDOFF_HOLD_UNDECIDABLE = "handoff-hold-undecidable"
 
 # Every reason is bound to the one outcome it can honestly carry.
 #
@@ -272,6 +281,7 @@ REASON_OUTCOMES: "dict[str, str]" = {
     REASON_GENERATION_FENCED: REFUSED,
     REASON_SESSION_EFFECT_BARRIER: REFUSED,
     REASON_HANDOFF_HELD: REFUSED,
+    REASON_HANDOFF_HOLD_UNDECIDABLE: REFUSED,
     REASON_WRITE_DEADLINE: REFUSED,
     REASON_CONTROL_ROUTE_ABSENT: UNSUPPORTED,
     REASON_PROTOCOL_MISMATCH: UNSUPPORTED,

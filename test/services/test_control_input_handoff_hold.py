@@ -22,6 +22,7 @@ import contextlib
 import uuid
 
 import pytest
+from sqlalchemy import text
 
 from cli_agent_orchestrator.services import control_input_contract as contract
 from cli_agent_orchestrator.services import control_input_service as cis
@@ -290,25 +291,116 @@ def test_a_hold_is_reported_as_its_own_reason_not_as_a_generation_fence():
     assert contract.REFUSED in contract.REATTEMPTABLE_OUTCOMES
 
 
-def test_an_unreadable_handoff_store_holds_rather_than_admitting(monkeypatch):
-    # The store failing is the anomaly, not the input. Admitting bytes the hold
-    # exists to refuse is the one outcome this seam must never produce, and the
-    # neighbouring reservation read already refuses on the same grounds.
+def test_an_unreadable_handback_table_refuses_as_undecidable_not_as_a_pending_handback(
+    monkeypatch,
+):
+    """The table is there and could not be answered, so a pending row may exist.
+
+    Still refused — admitting bytes to a held donor invalidates the packet
+    digest its recipient is about to act on — but refused as undecidable. The
+    reason code is the diagnosis an operator acts on, and ``handoff-held``
+    would send them hunting a handback that nothing ever observed.
+    """
+
     def _boom(*_args, **_kwargs):
         raise th.TaskHandoffUnavailable("store is gone")
 
     monkeypatch.setattr(th, "hold_for_agent", _boom)
-    assert "could not be read" in th.hold_refusal(str(uuid.uuid4()))
+    with pytest.raises(th.TaskHandoffHoldUndecidable) as raised:
+        th.hold_refusal(str(uuid.uuid4()))
+    assert "could not answer" in str(raised.value)
+    assert cis._admission_refusal_reason(raised.value) == contract.REASON_HANDOFF_HOLD_UNDECIDABLE
 
 
-def test_an_unreadable_roster_holds_rather_than_admitting(monkeypatch):
+def test_an_unreadable_roster_refuses_as_undecidable_not_as_a_pending_handback(monkeypatch):
+    """A roster that raises leaves the pane's agent unnamed.
+
+    That is the one case with no honest answer at all: the hold question cannot
+    be asked, let alone answered "no". It stays fail-closed — and unlike a
+    missing handback table it is not a small fault being amplified, since every
+    managed lane reads the roster — but it is not a pending handback either.
+    """
     from cli_agent_orchestrator.services import stable_agent_roster
 
     def _boom(*_args, **_kwargs):
         raise RuntimeError("roster is gone")
 
     monkeypatch.setattr(stable_agent_roster, "get_incarnation_by_terminal", _boom)
-    assert "roster could not be read" in th.hold_refusal_for_terminal("term-1", "gen-1")
+    with pytest.raises(th.TaskHandoffHoldUndecidable) as raised:
+        th.hold_refusal_for_terminal("term-1", "gen-1")
+    assert "could not name the agent" in str(raised.value)
+    assert cis._admission_refusal_reason(raised.value) == contract.REASON_HANDOFF_HOLD_UNDECIDABLE
+
+
+def test_a_store_with_no_handback_table_admits_instead_of_refusing_every_write(_db):
+    """The operator's own live store, and the brittleness this closes.
+
+    A pending handoff is a *row* in ``task_occurrence_handoffs``. No table means
+    no rows, so no agent on this installation can be party to a handback —
+    ``begin_handoff`` writes that table and could not have succeeded. Refusing
+    here would cost every steer, tell and operator message in every session on
+    a store whose only fault is that M3-E has not run on it yet, and protect
+    nothing at all.
+    """
+    agent_id = str(uuid.uuid4())
+    _bind(agent_id, suffix="1")
+    with _db.begin() as conn:
+        conn.execute(text("DROP TABLE task_occurrence_handoffs"))
+
+    assert th.hold_refusal(agent_id) is None
+    assert th.hold_refusal_for_terminal("term-1", "gen-1") is None
+    # And the whole admission path still lets the operator steer that agent.
+    assert _admit(_resolved(suffix="1", reservation_id=None)) is True
+
+
+def test_a_shape_drifted_handback_table_is_undecidable_rather_than_handoff_held(_db):
+    """cond-0433's own failure mode, end to end and unmocked.
+
+    A table at a shape the ORM cannot read makes every hold query raise. Before
+    this repair that surfaced as ``handoff-held`` on every managed write on the
+    installation, asserting a handback was pending for agents party to none.
+    """
+    agent_id = str(uuid.uuid4())
+    _bind(agent_id, suffix="1")
+    with _db.begin() as conn:
+        conn.execute(text("DROP TABLE task_occurrence_handoffs"))
+        conn.execute(
+            text(
+                "CREATE TABLE task_occurrence_handoffs ("
+                "handoff_id TEXT NOT NULL PRIMARY KEY, state TEXT NOT NULL, "
+                "from_agent_id TEXT, to_agent_id TEXT)"
+            )
+        )
+
+    with pytest.raises(th.TaskHandoffHoldUndecidable) as raised:
+        th.hold_refusal(agent_id)
+    reason = cis._admission_refusal_reason(raised.value)
+    assert reason == contract.REASON_HANDOFF_HOLD_UNDECIDABLE
+    assert reason != contract.REASON_HANDOFF_HELD
+    # The refusal still reaches the caller through the admission seam, typed,
+    # rather than escaping as an untyped failure on a lane whose whole contract
+    # is that every path produces a typed outcome.
+    with pytest.raises(th.TaskHandoffHeld):
+        _admit(_resolved(suffix="1", reservation_id=None))
+
+
+def test_the_undecidable_reason_is_a_first_class_refusal_in_both_vocabularies():
+    """It has to be, or an operator message carrying it raises on construction.
+
+    ``OperatorMessageOutcome`` validates its reason against its own map, so a
+    reason present in the control contract but missing there would turn a
+    refusal into an unhandled ``ValueError`` — a worse outage than the
+    misdiagnosis this reason exists to fix.
+    """
+    from cli_agent_orchestrator.services import operator_message_service as oms
+
+    assert contract.REASON_HANDOFF_HOLD_UNDECIDABLE != contract.REASON_HANDOFF_HELD
+    assert contract.outcome_for_reason(contract.REASON_HANDOFF_HOLD_UNDECIDABLE) == contract.REFUSED
+    assert contract.REFUSED in contract.REATTEMPTABLE_OUTCOMES
+    assert oms._REASON_OUTCOMES[contract.REASON_HANDOFF_HOLD_UNDECIDABLE] == contract.REFUSED
+    # A subclass of the hold, so every existing admission caller still catches
+    # it; a sibling would have escaped as an untyped 500.
+    assert issubclass(th.TaskHandoffHoldUndecidable, th.TaskHandoffHeld)
 
 
 # ---------------------------------------------------------------------------
