@@ -530,11 +530,18 @@ class TestSubmitSettle:
 
         assert _no_real_settle == [2.0]
 
-    def test_an_unpinned_single_line_settles_for_nothing(self, _no_real_settle):
+    def test_an_unpinned_single_line_settles_at_the_proven_floor(self, _no_real_settle):
+        """A missing pin never selects the zero the Ink renderer swallows.
+
+        The floor is the longest proven interval for this provider —
+        waiting longer than a build needs costs latency, while the zero
+        the fallback used to select is exactly the timing documented to
+        leave the message sitting unsubmitted with no error.
+        """
         _attach()
         _queue("op-23", transport=Recorder(), provider_version=None)
 
-        assert _no_real_settle == []
+        assert _no_real_settle == [2.0]
 
 
 class TestPostedIsNotAccepted:
@@ -1006,6 +1013,27 @@ class TestDefensiveGuards:
         with pytest.raises(cnc.NativeControlInvalid, match="undeliverable plan"):
             cnc._post(operation_id="op-62", plan=plan, transport=recorder)
         assert recorder.calls == []
+
+    def test_an_unproven_build_gets_the_floor_settle_marked_unproven(self):
+        """A floor is not evidence, and the plan must say so.
+
+        ``2.0`` on an unproven build is the longest proven interval for
+        this provider selected as a floor, not a measurement of this
+        build — a receipt that cannot tell the two apart would let a
+        fallback masquerade as proof.
+        """
+        _attach()
+        plan = cnc.plan_composer_keystrokes("one line only", provider_version="9.9.9")
+        assert plan["deliverable"] is True
+        assert plan["submit_settle_seconds"] == 2.0
+        assert plan["submit_settle_proven"] is False
+        assert plan["composer_evidence"] is None
+
+    def test_a_proven_build_marks_its_settle_proven(self):
+        _attach()
+        plan = cnc.plan_composer_keystrokes("one line only", provider_version=PINNED)
+        assert plan["submit_settle_seconds"] == 2.0
+        assert plan["submit_settle_proven"] is True
 
     def test_an_active_turn_id_that_is_not_a_string_is_refused(self):
         _attach()

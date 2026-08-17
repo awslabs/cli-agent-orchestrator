@@ -116,6 +116,18 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
     },
 }
 
+#: The settle an unproven build waits before its Enter. A missing pin
+#: selects the safe end of the observed range — the longest proven
+#: interval for this provider — which for Muse is ``0.0``: zero is this
+#: provider's *proven* value, not a null placeholder, because no Enter
+#: swallow has been observed on the build that was read. If a future
+#: proven build ever requires a settle, this floor rises with the table.
+#: The plan marks the value with ``submit_settle_proven: False`` so a
+#: receipt reader can tell this floor from a measurement.
+_SUBMIT_SETTLE_FLOOR_SECONDS = max(
+    float(entry["submit_settle_seconds"]) for entry in _PROVEN_COMPOSER_NEWLINE.values()
+)
+
 
 class NativeControlError(RuntimeError):
     """Base class for every Muse native control failure."""
@@ -284,7 +296,15 @@ def plan_composer_keystrokes(
         "trailing_terminator": terminator,
         "provider_version": provider_version,
         "soft_newline_keystroke": None if pin is None else pin["keystroke"],
-        "submit_settle_seconds": 0.0 if pin is None else float(pin["submit_settle_seconds"]),
+        "submit_settle_seconds": (
+            _SUBMIT_SETTLE_FLOOR_SECONDS if pin is None else float(pin["submit_settle_seconds"])
+        ),
+        # A floor is not a measurement. False names "the longest proven
+        # interval for this provider, because nothing is proven for this
+        # build"; True names "proven on this exact build". The value
+        # alone cannot say which, and a receipt that read a floor as
+        # evidence would be asserting something nobody observed.
+        "submit_settle_proven": pin is not None,
         "composer_evidence": None if pin is None else pin["evidence"],
         "final_enter": True,
         "deliverable": undeliverable is None,

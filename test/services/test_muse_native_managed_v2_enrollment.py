@@ -1491,6 +1491,33 @@ def test_muse_planner_plans_a_multiline_task_with_the_pinned_c_j():
     assert plan["final_enter"] is True
 
 
+def test_muse_planner_floors_an_unproven_build_at_the_proven_settle():
+    """An unproven Muse build gets the floor, marked as a floor.
+
+    Muse's longest proven settle is ``0.0`` — zero is this provider's
+    *proven* value, not a null placeholder — so the floor changes no
+    timing here. What the plan must still distinguish is provenance:
+    the value on an unproven build is a floor, not a measurement.
+    """
+    plan = muse_native_control.plan_composer_keystrokes(
+        "one line only",
+        provider_version="9.9.9",
+    )
+    assert plan["deliverable"] is True
+    assert plan["submit_settle_seconds"] == 0.0
+    assert plan["submit_settle_proven"] is False
+    assert plan["composer_evidence"] is None
+
+
+def test_muse_planner_marks_a_proven_builds_settle_proven():
+    plan = muse_native_control.plan_composer_keystrokes(
+        "one line only",
+        provider_version="0.1.0",
+    )
+    assert plan["submit_settle_seconds"] == 0.0
+    assert plan["submit_settle_proven"] is True
+
+
 @pytest.mark.asyncio
 async def test_muse_admission_delivers_a_multiline_task_exactly_once(
     isolated_memory_db, worktree, tmp_path, muse_harness

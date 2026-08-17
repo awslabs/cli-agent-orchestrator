@@ -152,6 +152,19 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
     },
 }
 
+#: The settle an unproven build waits before its Enter. A missing pin
+#: selects the safe end of the observed range — the longest proven
+#: interval for this provider — never the null value: ``0.0`` is exactly
+#: the timing the Ink note above documents as swallowing an Enter, so a
+#: zero fallback would leave an unproven build's message sitting in the
+#: prompt box unsubmitted, with no error. Waiting longer than a build
+#: needs costs latency; waiting shorter loses the message silently. The
+#: plan marks the value with ``submit_settle_proven: False`` so a
+#: receipt reader can tell this floor from a measurement.
+_SUBMIT_SETTLE_FLOOR_SECONDS = max(
+    float(entry["submit_settle_seconds"]) for entry in _PROVEN_COMPOSER_NEWLINE.values()
+)
+
 #: Whitespace as JavaScript's own ``String.prototype.trim`` defines it.
 #: Used only to decide whether a payload is *invariant* under trimming —
 #: if it is, then whether Claude trims or not cannot change what the model
@@ -353,7 +366,15 @@ def plan_composer_keystrokes(
         "trailing_terminator": terminator,
         "provider_version": provider_version,
         "soft_newline_keystroke": None if pin is None else pin["keystroke"],
-        "submit_settle_seconds": 0.0 if pin is None else float(pin["submit_settle_seconds"]),
+        "submit_settle_seconds": (
+            _SUBMIT_SETTLE_FLOOR_SECONDS if pin is None else float(pin["submit_settle_seconds"])
+        ),
+        # A floor is not a measurement. False names "the longest proven
+        # interval for this provider, because nothing is proven for this
+        # build"; True names "proven on this exact build". The value
+        # alone cannot say which, and a receipt that read a floor as
+        # evidence would be asserting something nobody observed.
+        "submit_settle_proven": pin is not None,
         "composer_evidence": None if pin is None else pin["evidence"],
         "final_enter": True,
         "deliverable": undeliverable is None,

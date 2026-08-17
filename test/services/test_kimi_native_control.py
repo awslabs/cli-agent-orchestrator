@@ -1376,6 +1376,27 @@ def test_an_absent_provider_version_refuses_multiline_but_still_sends_one_line()
     assert multi.calls == []
 
 
+def test_an_unproven_build_gets_the_floor_settle_marked_unproven():
+    """A floor is not evidence, and the plan must say so.
+
+    ``0.25`` on an unproven build is the longest proven interval for
+    this provider selected as a floor, not a measurement of this
+    build — a receipt that cannot tell the two apart would let a
+    fallback masquerade as proof.
+    """
+    plan = knc.plan_composer_keystrokes("one line only", provider_version="9.9.9")
+    assert plan["deliverable"] is True
+    assert plan["submit_settle_seconds"] == 0.25
+    assert plan["submit_settle_proven"] is False
+    assert plan["composer_evidence"] is None
+
+
+def test_a_proven_build_marks_its_settle_proven():
+    plan = knc.plan_composer_keystrokes("one line only", provider_version=PINNED)
+    assert plan["submit_settle_seconds"] == 0.25
+    assert plan["submit_settle_proven"] is True
+
+
 def test_a_payload_that_is_only_a_terminator_has_no_content_to_send():
     _attach()
     transport = Recorder()
