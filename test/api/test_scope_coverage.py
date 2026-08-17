@@ -120,14 +120,134 @@ def test_admin_token_admitted_on_admin_route(client, auth_on):
     assert resp.status_code != 403
 
 
+# ---------------------------------------------------------------------------
+# PR 526 review — SHOULD-FIX: the diagnostics bundle must be scope-gated.
+#
+# GET /workflows/runs/{id}/diagnostics returns the run's `inputs` (its raw
+# inputs_json, passed through sanitize_output — which is transport hygiene, NOT
+# secret redaction, so a credential passed as a workflow input comes back
+# verbatim) plus capture-gated output excerpts. It had NO require_any_scope
+# dependency, so with auth enabled ANY valid token could export it.
+# ---------------------------------------------------------------------------
+def test_diagnostics_route_is_scope_gated():
+    """The wiring guard: the diagnostics route carries a require_any_scope dep."""
+    routes = [
+        r for r in app.routes if getattr(r, "path", None) == "/workflows/runs/{run_id}/diagnostics"
+    ]
+    assert routes, "diagnostics route not found in the route table"
+    for route in routes:
+        assert _has_scope_dependency(route), "diagnostics route lost its scope gate"
+
+
+def test_unscoped_token_forbidden_on_diagnostics(client, auth_on):
+    """A token carrying NO recognized scope is 403'd on the diagnostics export."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
+    resp = client.get("/workflows/runs/r1/diagnostics")
+    assert resp.status_code == 403
+
+
+def test_read_token_admitted_on_diagnostics(client, auth_on):
+    """A cao:read token passes the dependency (404 for an unknown run, not 403)."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.get("/workflows/runs/r1/diagnostics")
+    assert resp.status_code != 403
+
+
+# ---------------------------------------------------------------------------
+# PR 526 human review — BLOCKING: every payload-bearing run READ route must be
+# scope-gated, not just /diagnostics.
+#
+# The review's point: GET /workflows/runs/{run_id} (inspect) returns every step's
+# full `output_json` and `error` text — strictly MORE payload than /diagnostics,
+# whose excerpts are capture-gated — and GET .../events and GET .../compare carry
+# error_kind / reason / validation_result / output_ref and terminal-offset
+# coordinates. All three shipped with no require_any_scope dependency while
+# /diagnostics was deliberately gated, so the most payload-bearing read route
+# escaped the PR's own scope model.
+#
+# Table-driven (not one test per route) so a future run read route added without
+# a gate fails here. The expected paths are hard-coded literals rather than
+# derived from the route table — a fixture sourced from the value under test
+# would stay green if a route were renamed or dropped.
+#
+# SCOPE OF THIS CLAIM (PR #526 review fix cycle 1): this list is the set of
+# payload-bearing read routes #504 OWNS, not an exhaustive inventory of every
+# route that can return captured content. Specifically it does NOT include
+# ``GET /terminals/{id}/output`` — that route predates #504 and the wider
+# ``/terminals/*`` surface is uniformly ungated, so gating one pre-existing member
+# of it is a separate, deliberate decision about that whole surface rather than
+# part of this PR. ``GET /terminals/{id}/output/range`` IS included: #504 added it.
+# Do not read a passing run here as "every content-returning route is gated."
+# ---------------------------------------------------------------------------
+_GATED_RUN_READ_ROUTES = [
+    "/workflows/runs/{run_id}",
+    "/workflows/runs/{run_id}/events",
+    "/workflows/runs/{run_id}/compare",
+    "/workflows/runs/{run_id}/diagnostics",
+    "/terminals/{terminal_id}/output/range",
+]
+
+
+def _get_routes_for_path(path: str):
+    """Every GET route registered at exactly ``path``."""
+    return [
+        r
+        for r in app.routes
+        if getattr(r, "path", None) == path and "GET" in (getattr(r, "methods", None) or set())
+    ]
+
+
+@pytest.mark.parametrize("path", _GATED_RUN_READ_ROUTES)
+def test_payload_bearing_run_read_route_is_scope_gated(path):
+    """Each payload-bearing run read route carries a require_any_scope dependency."""
+    routes = _get_routes_for_path(path)
+    assert routes, f"GET {path} not found in the route table"
+    for route in routes:
+        assert _has_scope_dependency(route), f"GET {path} is missing its scope gate"
+
+
+@pytest.mark.parametrize("url", ["/workflows/runs/r1", "/workflows/runs/r1/events"])
+def test_unscoped_token_forbidden_on_run_read_routes(client, auth_on, url):
+    """A token carrying NO recognized scope is 403'd on inspect and events."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
+    resp = client.get(url)
+    assert resp.status_code == 403
+
+
+def test_unscoped_token_forbidden_on_compare(client, auth_on):
+    """A token carrying NO recognized scope is 403'd on compare.
+
+    Separate from the parametrized pair because ``?against=`` is required: without
+    it FastAPI would 422 on validation and never reach the scope dependency, so
+    the 403 would prove nothing about the gate.
+    """
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
+    resp = client.get("/workflows/runs/r1/compare", params={"against": "r2"})
+    assert resp.status_code == 403
+
+
+@pytest.mark.parametrize("url", ["/workflows/runs/r1", "/workflows/runs/r1/events"])
+def test_read_token_admitted_on_run_read_routes(client, auth_on, url):
+    """A cao:read token passes the gate on inspect and events (404/200, never 403)."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.get(url)
+    assert resp.status_code != 403
+
+
 # --------------------------------------------------------------------------- #
 # PR #525 review — the two NEW #505 run-read routes carry a read-scope gate.
 #
-# Scoped deliberately to the two routes issue #505 ADDED. The three pre-existing
-# sibling reads (``GET /workflows``, ``GET /workflows/{name}``,
-# ``GET /workflows/runs/{run_id}``) are equally ungated and are left alone: gating
-# them would change the auth posture of shipped routes and could break an existing
-# unauthenticated reader, which is a bigger risk than the residual asymmetry.
+# Scoped deliberately to the two routes issue #505 ADDED. The two pre-existing
+# sibling reads (``GET /workflows``, ``GET /workflows/{name}``) are equally ungated
+# and are left alone: gating them would change the auth posture of shipped routes
+# and could break an existing unauthenticated reader, which is a bigger risk than
+# the residual asymmetry.
+#
+# INTEGRATION NOTE (#504 merge): ``GET /workflows/runs/{run_id}`` was listed here
+# as a third ungated sibling. It is NO LONGER ungated — issue #504 enriched that
+# handler in place to the payload-bearing ``RunInspection`` shape and gated it with
+# ``require_any_scope(READ, WRITE, ADMIN)``. Its gate is asserted above, in the
+# PR 526 block (``test_read_token_admitted_on_run_read_routes``).
 # --------------------------------------------------------------------------- #
 _NEW_505_READ_ROUTES = [
     ("GET", "/workflows/runs"),

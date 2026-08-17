@@ -107,6 +107,22 @@ class TestDeleteTerminal:
         assert result["success"] is True
         assert "t1" in result["message"]
 
+    def test_deferred_cleanup_returns_retryable_failure(self):
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:
+            mock_delete.return_value.raise_for_status.return_value = None
+            mock_delete.return_value.json.return_value = {"success": False}
+            result = delete_terminal("t1")
+        assert result["success"] is False
+        assert "retry" in result["message"]
+
+    def test_deferred_cleanup_conflict_status_returns_retryable_failure(self):
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:
+            mock_delete.return_value.status_code = 409
+            result = delete_terminal("t1")
+        assert result["success"] is False
+        assert "retry" in result["message"]
+        mock_delete.return_value.raise_for_status.assert_not_called()
+
     def test_not_found_returns_false(self):
         with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:
             http_err = requests.HTTPError()

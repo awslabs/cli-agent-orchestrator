@@ -81,6 +81,7 @@ class TestTerminalOperations:
         mock_terminal.tmux_window = "window-0"
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
+        mock_terminal.working_directory = "/workspace/project"
         mock_terminal.allowed_tools = None
         mock_terminal.group = None
         mock_terminal.metadata_json = None
@@ -97,6 +98,7 @@ class TestTerminalOperations:
         assert result["id"] == "test123"
         assert result["group"] is None
         assert result["metadata"] is None
+        assert result["working_directory"] == "/workspace/project"
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_not_found(self, mock_session_class):
@@ -212,6 +214,7 @@ class TestTerminalOperations:
         mock_terminal.tmux_window = "window-0"
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
+        mock_terminal.working_directory = "/workspace/project"
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -223,6 +226,7 @@ class TestTerminalOperations:
 
         assert len(result) == 1
         assert result[0]["id"] == "test123"
+        assert result[0]["working_directory"] == "/workspace/project"
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_list_pending_receiver_ids_by_provider(self, mock_session_class):
@@ -1415,10 +1419,10 @@ class TestInitDb:
 
 
 class TestTerminalsSchemaMigration:
-    """Tests for the terminals-table column-add migration (caller_id, issue #284)."""
+    """Tests for terminals-table additive column migrations."""
 
-    def test_caller_id_column_added_to_legacy_table(self, tmp_path, monkeypatch):
-        """A pre-#284 terminals table gains the caller_id column."""
+    def test_missing_terminal_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
+        """A legacy terminals table gains nullable metadata columns."""
         import sqlite3
 
         from cli_agent_orchestrator.clients import database as db_mod
@@ -1447,9 +1451,10 @@ class TestTerminalsSchemaMigration:
 
         with sqlite3.connect(str(db_file)) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
-            rows = conn.execute("SELECT id, caller_id FROM terminals").fetchall()
+            rows = conn.execute("SELECT id, caller_id, working_directory FROM terminals").fetchall()
         assert "caller_id" in columns
-        assert rows == [("abc12345", None)], "existing rows must get NULL caller_id"
+        assert "working_directory" in columns
+        assert rows == [("abc12345", None, None)], "existing rows must get NULL metadata values"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
         """Running the migration twice must not fail or duplicate columns."""
@@ -1477,6 +1482,7 @@ class TestTerminalsSchemaMigration:
         with sqlite3.connect(str(db_file)) as conn:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("caller_id") == 1
+        assert columns.count("working_directory") == 1
         assert columns.count("allowed_tools") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
@@ -1650,13 +1656,13 @@ class TestTerminalsSchemaMigration:
         assert columns.count("metadata") == 1
 
 
-class TestCallerIdRoundTrip:
-    """caller_id must round-trip create→read (issue #284): a write path that
-    persists it and a read path that drops it would silently break callback
-    routing for every worker."""
+class TestTerminalMetadataRoundTrip:
+    """Terminal metadata used by orchestration surfaces must round-trip."""
 
-    def test_caller_id_round_trips_through_real_db(self, tmp_path, monkeypatch):
-        """create_terminal persists caller_id; get_terminal_metadata returns it."""
+    def test_caller_id_and_working_directory_round_trip_through_real_db(
+        self, tmp_path, monkeypatch
+    ):
+        """create_terminal persists ownership metadata; reads return it."""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
 
@@ -1667,16 +1673,24 @@ class TestCallerIdRoundTrip:
         monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
         created = create_terminal(
-            "abc12345", "cao-s", "w-0", "kiro_cli", "developer", caller_id="def67890"
+            "abc12345",
+            "cao-s",
+            "w-0",
+            "kiro_cli",
+            "developer",
+            caller_id="def67890",
+            working_directory="/workspace/project",
         )
         assert created["caller_id"] == "def67890"
+        assert created["working_directory"] == "/workspace/project"
 
         fetched = get_terminal_metadata("abc12345")
         assert fetched is not None
         assert fetched["caller_id"] == "def67890"
+        assert fetched["working_directory"] == "/workspace/project"
 
-    def test_caller_id_defaults_to_none(self, tmp_path, monkeypatch):
-        """Operator-launched terminals (no caller) round-trip NULL."""
+    def test_nullable_metadata_defaults_to_none(self, tmp_path, monkeypatch):
+        """Operator-launched terminals without optional metadata round-trip NULL."""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
 
@@ -1688,10 +1702,12 @@ class TestCallerIdRoundTrip:
 
         created = create_terminal("abc12345", "cao-s", "w-0", "kiro_cli")
         assert created["caller_id"] is None
+        assert created["working_directory"] is None
 
         fetched = get_terminal_metadata("abc12345")
         assert fetched is not None
         assert fetched["caller_id"] is None
+        assert fetched["working_directory"] is None
 
 
 class TestProjectAliasMigration:

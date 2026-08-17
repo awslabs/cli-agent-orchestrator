@@ -39,6 +39,7 @@ class TerminalModel(Base):
     tmux_window = Column(String, nullable=False)  # "window-name"
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
@@ -307,6 +308,8 @@ def init_db() -> None:
     _migrate_workflow_run_indexes()
     _migrate_workflow_run_step()
     _migrate_workflow_outcome_indexes()
+    _migrate_workflow_run_event()
+    _migrate_workflow_run_seq()
     # Appended LAST (issue #511). Disjoint from the workflow_run* tables that
     # #504 also migrates, so registry order is immaterial — never reorder the
     # entries above.
@@ -781,21 +784,36 @@ def _migrate_workflow_run_step() -> None:
     is the sole write path for the column (``update_step`` stays untouched — the
     fingerprint is set once, at the RUNNING insert).
 
-    ``result-envelope`` (issue #583, BR-7) additively appends ONE column,
-    ``result_json``, through the same ``PRAGMA table_info`` gate — the serialised
-    ``StepResultEnvelope`` that replay returns (FR-1). ONE column and not three
-    typed ones precisely because this body is wrapped in ``except Exception`` ->
-    ``logger.debug``, so a failed migration is SILENT: three statements would
-    triple the chance of a partial, silent migration. ``DEFAULT NULL`` means every
-    pre-#583 row reads as "envelope absent" (BR-10), which is safe rather than a
-    gap — such a row's fingerprint is legacy-scheme or NULL, so FR-6 already keeps
-    it off the replay path and the two guards agree instead of disagreeing.
+    U1 (issue #504, event-log substrate) additively appends three nullable
+    columns via the same PRAGMA-gated ``ALTER TABLE ADD COLUMN`` idiom:
+    ``terminal_id`` (associated terminal), ``reprompted`` (reprompt flag), and
+    ``error_kind`` (structured error kind). All default to ``NULL`` so a
+    pre-U1 row reads back observably identical to its pre-extension form
+    (additive-only, C-1/C-4). ``workflow_run`` itself is untouched.
+
+    ``result-envelope`` (issue #583, BR-7) then additively appends ONE column,
+    ``result_json``, through the same gate — the serialised ``StepResultEnvelope``
+    that replay returns (FR-1). ``DEFAULT NULL`` means every pre-#583 row reads as
+    "envelope absent" (BR-10), which is safe rather than a gap: such a row's
+    fingerprint is legacy-scheme or NULL, so FR-6 already keeps it off the replay
+    path and the two guards agree instead of disagreeing.
 
     Because the failure is silent, the column's existence is VERIFIED rather than
     assumed (BR-8): see ``test/services/test_step_result.py`` for the
     ``PRAGMA table_info`` assertion on a fresh database. A silent failure would
     otherwise surface far away as every settle losing its envelope, which the
     replay gate would read as crash-window rows and halt on.
+
+    MERGE NOTE (2026-08-17, #583 x #504). #583's original rationale for adding ONE
+    column rather than three read: "three statements would triple the chance of a
+    partial, silent migration", because this body is wrapped in
+    ``except Exception`` -> ``logger.debug``. **That argument is overtaken by the
+    merge** — #504 independently added three columns to the same silently-failing
+    block, so the combined body now issues FOUR guarded ``ALTER`` statements, not
+    one. The risk #583 minimised is materially larger than either change assumed
+    alone. #583's mitigation (assert the column exists on a fresh database) is
+    therefore MORE load-bearing after this merge, and #504's three columns have no
+    equivalent assertion. Flagged rather than silently reconciled.
     """
     import sqlite3
 
@@ -821,6 +839,21 @@ def _migrate_workflow_run_step() -> None:
                     "ALTER TABLE workflow_run_step ADD COLUMN call_fingerprint TEXT DEFAULT NULL"
                 )
                 logger.info("Migration: added call_fingerprint column to workflow_run_step")
+            if "terminal_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN terminal_id TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added terminal_id column to workflow_run_step")
+            if "reprompted" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN reprompted INTEGER DEFAULT NULL"
+                )
+                logger.info("Migration: added reprompted column to workflow_run_step")
+            if "error_kind" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN error_kind TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added error_kind column to workflow_run_step")
             if "result_json" not in columns:
                 conn.execute(
                     "ALTER TABLE workflow_run_step ADD COLUMN result_json TEXT DEFAULT NULL"
@@ -855,6 +888,90 @@ def _migrate_workflow_outcome_indexes() -> None:
             )
     except Exception as e:
         logger.debug(f"workflow_outcomes index migration skipped: {e}")
+
+
+def _migrate_workflow_run_event() -> None:
+    """Create the durable append-only ``workflow_run_event`` table if missing (issue #504, U1).
+
+    The event log root: one row per emitted workflow domain event, keyed by the
+    composite ``(run_id, seq)`` PRIMARY KEY (ADR-1, domain-entities). Per
+    NFR-DUR-1 this table is the authoritative, append-only, versioned record of
+    workflow execution — rows are inserted and never updated or reordered; ``seq``
+    (a per-run monotonically increasing sequence) is the SOLE ordering authority,
+    ``ts`` is display/duration only (BR-5). ``run_id``, ``seq``, ``event_type``,
+    ``event_schema_version`` (FR-1.1) and ``ts`` are NOT NULL; the remaining
+    columns are nullable and populated where applicable. ``iteration`` and
+    ``which_guard_fired`` are RESERVED for a later deterministic-loops feature
+    (FR-1.5) and stay NULL in the MVP.
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``), zero-arg and self-connecting —
+    mirrors ``_migrate_workflow_run`` (C-1/C-4, additive-only). Failure is logged
+    at debug and never propagated: a missing table is recoverable, the next
+    best-effort append retries the path.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_run_event ("
+                "run_id TEXT NOT NULL, "
+                "seq INTEGER NOT NULL, "
+                "event_type TEXT NOT NULL, "
+                "event_schema_version INTEGER NOT NULL, "
+                "ts TEXT NOT NULL, "
+                "step_id TEXT, "
+                "attempt INTEGER, "
+                "state TEXT, "
+                "elapsed_ms INTEGER, "
+                "provider TEXT, "
+                "agent_profile TEXT, "
+                "engine TEXT, "
+                "terminal_id TEXT, "
+                "terminal_offset_start INTEGER, "
+                "terminal_offset_len INTEGER, "
+                "error_kind TEXT, "
+                "reason TEXT, "
+                "validation_result TEXT, "
+                "output_ref TEXT, "
+                "iteration INTEGER, "
+                "which_guard_fired TEXT, "
+                "PRIMARY KEY (run_id, seq)"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        logger.debug(f"workflow_run_event migration skipped: {e}")
+
+
+def _migrate_workflow_run_seq() -> None:
+    """Create the durable ``workflow_run_seq`` high-water table if missing (issue #504, U1).
+
+    One row per run: ``high_water`` records the highest per-run ``seq`` ever
+    ALLOCATED (best-effort persisted before the matching event append), so a
+    rebuild can resume strictly above any allocated slot even when its append was
+    swallowed (BR-3). ``high_water`` advances monotonically (BR-11) and is NOT
+    NULL; ``run_id`` is the PRIMARY KEY.
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``), zero-arg and self-connecting —
+    same additive-only posture as ``_migrate_workflow_run_event``. Failure is
+    logged at debug and never propagated.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_run_seq ("
+                "run_id TEXT PRIMARY KEY, "
+                "high_water INTEGER NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        logger.debug(f"workflow_run_seq migration skipped: {e}")
 
 
 def _migrate_workflow_run_indexes() -> None:
@@ -928,6 +1045,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute('ALTER TABLE terminals ADD COLUMN "metadata" TEXT')
             conn.commit()
             logger.info("Migration: added metadata column to terminals table")
+        if "working_directory" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
+            conn.commit()
+            logger.info("Migration: added working_directory column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -945,6 +1066,7 @@ def create_terminal(
     engine: Optional[str] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    working_directory: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -956,6 +1078,7 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            working_directory=working_directory,
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
@@ -971,6 +1094,7 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
@@ -1007,6 +1131,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
@@ -1175,6 +1300,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "last_active": t.last_active,
             }
@@ -1215,6 +1341,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "last_active": t.last_active,
             }

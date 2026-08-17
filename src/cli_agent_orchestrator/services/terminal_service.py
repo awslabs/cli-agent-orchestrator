@@ -34,6 +34,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
+    delete_terminals_by_session,
     get_terminal_metadata,
     list_siblings_by_group_prefix,
     update_last_active,
@@ -51,7 +52,11 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    Terminal,
+    TerminalInputBlockedError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
     PostCreateTerminalEvent,
@@ -76,7 +81,9 @@ from cli_agent_orchestrator.services.session_env import (
     set_session_env,
 )
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -87,6 +94,15 @@ from cli_agent_orchestrator.utils.terminal import (
 
 logger = logging.getLogger(__name__)
 
+# Upper bound (bytes) on a single offset-ranged read of a terminal log
+# (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
+# caller (playback fetching output around a selected event) can never trigger
+# an unbounded read of a large log file. 1 MiB is a defensible ceiling: it is
+# far larger than any realistic per-event output window (the rolling
+# STATE_BUFFER_MAX is only 8 KiB) yet bounds the worst-case allocation and
+# response size to a fixed, predictable amount regardless of on-disk log size.
+TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
+
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
@@ -96,10 +112,6 @@ _memory_injected_lock = threading.Lock()
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
-
-
-class TerminalInputBlockedError(Exception):
-    """Raised when orchestrated input would answer an active interactive prompt."""
 
 
 def inject_memory_context(first_message: str, terminal_id: str) -> str:
@@ -148,6 +160,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.GROK_CLI.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native
@@ -157,6 +170,16 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
 }
+
+
+def _resolve_working_directory(working_directory: Optional[str]) -> str:
+    """Resolve launch cwd exactly as the tmux backend does before creation."""
+    return resolve_and_validate_path(
+        working_directory if working_directory is not None else os.getcwd(),
+        allow_create=False,
+        allow_file=False,
+        description="Working directory",
+    )
 
 
 async def create_terminal(
@@ -337,6 +360,13 @@ async def create_terminal(
                 worktree_service.create_worktree, worktree_repo_root, terminal_id
             )
 
+        # Resolve AFTER the worktree block, not before: when `use_worktree` is set
+        # the block above REPLACES `working_directory` with the new worktree path,
+        # so resolving earlier would both launch tmux in the pre-worktree directory
+        # (defeating the isolation #100 provides) and persist that stale path as the
+        # terminal's working_directory. This is the effective launch cwd either way.
+        resolved_working_directory = _resolve_working_directory(working_directory)
+
         # Step 2: Create tmux session or window
         if new_session:
             # Ensure session name has the CAO prefix for identification
@@ -356,10 +386,11 @@ async def create_terminal(
                 session_name,
                 window_name,
                 terminal_id,
-                working_directory,
+                resolved_working_directory,
                 extra_env=env_vars,
             )
             session_created = True  # only set after successful creation
+            delete_terminals_by_session(session_name)
 
             # Persist forwarded env only after the tmux session actually
             # exists; the failure path below clears it if a later step
@@ -378,7 +409,7 @@ async def create_terminal(
                 session_name,
                 window_name,
                 terminal_id,
-                working_directory,
+                resolved_working_directory,
                 extra_env={**get_session_env(session_name), **(env_vars or {})},
             )
             window_created = True  # only set after successful creation
@@ -401,7 +432,7 @@ async def create_terminal(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
                 f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
                 f"requests {allowed_tools}. Treat this worker as unrestricted; for "
-                f"enforced restrictions use claude_code, kiro_cli, or "
+                f"enforced restrictions use claude_code, grok_cli, kiro_cli, or "
                 f"copilot_cli."
             )
 
@@ -418,6 +449,7 @@ async def create_terminal(
             engine=resolved_engine.value if resolved_engine is not None else None,
             group=group,
             metadata=metadata,
+            working_directory=resolved_working_directory,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -561,22 +593,11 @@ async def create_terminal(
                 status_monitor.clear_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        try:
-            if terminal_id is not None:
-                provider_manager.cleanup_provider(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
         # Roll back the DB terminal row so a failed create does not leave an
         # orphan record: the stale row would still be listed for the session
         # and report UNKNOWN status even though nothing is running. Idempotent
         # (DELETE ... WHERE id = ?), so it is a no-op when the failure happened
         # before the row was written. Runs regardless of session_created so a
-        # pre-existing session keeps its live terminals but loses the dead row.
-        try:
-            if terminal_id is not None:
-                db_delete_terminal(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
                 get_backend().kill_session(session_name)
@@ -604,7 +625,35 @@ async def create_terminal(
                 get_backend().kill_window(session_name, window_name)
             except Exception:
                 pass  # Ignore cleanup errors
-        if worktree_repo_root is not None:
+        # The process-owning tmux session/window must be stopped before a
+        # provider releases private on-disk state.  In particular Grok can
+        # have an updater still writing $GROK_HOME while its initialization
+        # fails; its cleanup verifies that no such process remains.
+        cleanup_complete = True
+        try:
+            if terminal_id is not None:
+                cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
+        except Exception:
+            # Preserve the existing rollback contract for an unexpected
+            # provider-manager failure. Only an explicit False is a Grok
+            # cleanup deferral with enough information to retry safely.
+            cleanup_complete = True
+        # Do not erase the only retry handle before Grok has safely released
+        # its private home.  The original create error is still raised below;
+        # retaining this row makes the failed terminal discoverable and its
+        # deletion retryable rather than leaking credentials/config forever.
+        if cleanup_complete:
+            try:
+                if terminal_id is not None:
+                    db_delete_terminal(terminal_id)
+            except Exception:
+                pass  # Ignore cleanup errors
+        elif terminal_id is not None:
+            logger.warning(
+                "Create rollback deferred Grok cleanup for %s; retaining terminal metadata for retry",
+                terminal_id,
+            )
+        if worktree_repo_root is not None and terminal_id is not None:
             # A worktree WAS created (Step 1b succeeded) before some later step
             # failed -- roll it back too, same best-effort posture as everything
             # else in this block. Without this, a provider-init timeout (or any
@@ -859,14 +908,28 @@ def _schedule_deferred_init(
                 update_terminal_shell_command(terminal_id, shell_command)
             if initial_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
-                # not this MCP server. But the deferred path is used only via
-                # /assign, and _assign_impl on the MCP-server side already
-                # embedded the callback instructions into initial_message.
+                # not this MCP server; _assign_impl on the MCP-server side already
+                # embedded the callback instructions into initial_message. The
+                # deferred path is also reached from POST /sessions?initial_message=
+                # (session_service.create_session), which has no supervisor and no
+                # orchestration_type requirement on its caller.
                 # We still pass sender_id=caller_id if present in DB metadata
                 # so plugin events see it.
                 metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
                 if metadata:
                     caller_id = metadata.get("caller_id")
+                # Round-3 review fix (call-me-ram): a raw POST /sessions caller that
+                # supplies initial_message with no orchestration_type previously sailed
+                # straight past send_input's WAITING_USER_ANSWER guard entirely -- the
+                # guard only fires for OrchestrationType.ASSIGN/HANDOFF, so an unstated
+                # type meant no protection at all against pasting the initial task into
+                # a live choice prompt. Every call that reaches THIS function is by
+                # construction an unattended initial-task delivery (never an interactive
+                # human answer -- those go through answer_user_prompt's own separate
+                # /terminals/{id}/input call, which never routes through
+                # _schedule_deferred_init), so defaulting an unstated orchestration_type
+                # to ASSIGN here is always correct and cannot affect answer_user_prompt.
+                effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
                 await asyncio.to_thread(
@@ -875,7 +938,7 @@ def _schedule_deferred_init(
                     initial_message,
                     registry=registry,
                     sender_id=caller_id,
-                    orchestration_type=orchestration_type,
+                    orchestration_type=effective_orchestration_type,
                 )
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
@@ -886,7 +949,10 @@ def _schedule_deferred_init(
                     initial_message,
                     registry,
                     caller_id,
-                    orchestration_type,
+                    # Same guard-eligible default as the initial send_input above --
+                    # a resubmit is still an unattended initial-task delivery, so it
+                    # must not silently drop back to the unguarded original type.
+                    effective_orchestration_type,
                     provider=provider_instance,
                 )
                 if not started:
@@ -924,8 +990,10 @@ def _schedule_deferred_init(
                 _notify_caller_of_deferred_failure,
                 terminal_id,
                 f"Worker {terminal_id} is waiting on an interactive prompt; the "
-                f"assigned task has not been delivered yet. Use answer_user_prompt "
-                f"to unblock it, then it will receive the task.",
+                f"assigned task has not been delivered. Use answer_user_prompt to "
+                f"clear the prompt, then re-send the task yourself (e.g. via "
+                f"send_message) -- it is not automatically re-delivered once the "
+                f"prompt is answered.",
                 registry,
                 delete_worker=False,
             )
@@ -1181,7 +1249,19 @@ def send_input(
         # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
         # arm set by notify_input_sent above; reset_buffer would wipe the arm and
         # latch-block the IDLE→PROCESSING transition for the whole turn.
-        status_monitor.clear_rolling_buffer(terminal_id)
+        # Give stateful providers the same explicit generation boundary as the
+        # rolling byte buffer.  Grok uses this to distinguish a new,
+        # byte-identical completion from a retained completion screen.
+        status_monitor.clear_rolling_buffer(terminal_id, provider)
+
+        # Mark the provider before send_keys rather than after it.  send_keys
+        # includes the provider-specific submit delay, during which a fast CLI
+        # can already emit its first processing and completion frames.  Those
+        # frames must be parsed as belonging to this turn, not as a stale
+        # post-clear redraw.  StatusMonitor has already armed and cleared the
+        # same dispatch boundary above.
+        if provider:
+            provider.mark_input_received()
 
         get_backend().send_keys(
             metadata["tmux_session"],
@@ -1191,13 +1271,6 @@ def send_input(
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
-
-        # Notify the provider that external input was received.
-        # This allows providers to adjust status
-        # detection — specifically to stop reporting IDLE for the post-init
-        # state and resume normal COMPLETED detection after a real task.
-        if provider:
-            provider.mark_input_received()
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
@@ -1463,6 +1536,91 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
+def read_output_range(terminal_id: str, offset: int, length: int) -> str:
+    """Read a byte range from a terminal's append-only on-disk log (U5 / #504).
+
+    This is a SEPARATE read path from ``get_output``: that function returns the
+    bounded rolling buffer / tmux tail, whereas this reads an exact byte window
+    from ``TERMINAL_LOG_DIR / f"{terminal_id}.log"`` — the append-only,
+    monotonic file LogWriter maintains (BR-1). Playback (FR-4.3 / FR-7.3) uses
+    the ``terminal_offset_start`` / ``terminal_offset_len`` an event carries to
+    fetch exactly the output produced around that event, without copying the
+    log into the journal (BR-3).
+
+    Args:
+        terminal_id: The terminal whose log to read. Validated against the
+            workflow name/id charset before it is joined into the log path, so
+            a value containing ``/`` / ``..`` / a NUL can never escape
+            ``TERMINAL_LOG_DIR`` (path-traversal defense; reuses
+            ``_validate_key_part``).
+        offset: Byte offset to seek to. Must be ``>= 0``. An offset at or beyond
+            EOF is not an error — the read simply returns the available tail
+            (empty string when nothing follows the offset) so playback degrades
+            gracefully (BR-4).
+        length: Maximum number of bytes to read. Clamped to
+            ``TERMINAL_RANGE_MAX_LENGTH`` (BR-2) to bound the read.
+
+    Returns:
+        The decoded slice, ``bytes.decode("utf-8", errors="replace")`` so a
+        range that starts or ends mid-multibyte-sequence never raises (BR-5,
+        matching LogWriter's write encoding). Returns ``""`` for a valid
+        terminal whose log does not exist yet (nothing has been logged) — a
+        missing log is NOT a playback-breaking error (BR-4).
+
+    Raises:
+        ValueError: ``terminal_id`` fails id validation, or ``offset`` is
+            negative. Translated to a 400 at the request boundary.
+        OSError: A genuine file I/O failure (e.g. a permission error, or the
+            path exists but is unreadable). Surfaced to the caller, NOT
+            swallowed into an empty string — "nothing logged yet" (return "")
+            and "the read failed" (raise) are deliberately distinct outcomes
+            (BR-4 / construction error-handling guardrail).
+    """
+    # Path-traversal defense: reject any id that is not a plain key BEFORE it is
+    # joined into the log path. Reuses the workflow key/id validator so the
+    # charset rule is defined once (rejects "/", "..", ".", NUL, whitespace).
+    _validate_key_part(terminal_id, "terminal_id")
+
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0, got {offset}")
+
+    # Clamp the read window (BR-2). A non-positive length reads nothing rather
+    # than raising — the route enforces length >= 1, so this is defense in depth.
+    capped_length = max(0, min(length, TERMINAL_RANGE_MAX_LENGTH))
+
+    log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(offset)  # seeking past EOF is legal; the read below yields b""
+            data = f.read(capped_length)
+    except FileNotFoundError:
+        # Valid terminal that has not logged anything yet (or whose log has been
+        # cleaned up): an empty range, never an error (BR-4).
+        logger.debug(
+            "read_output_range: no log file for terminal %s (offset=%d, length=%d) — "
+            "returning empty range",
+            terminal_id,
+            offset,
+            capped_length,
+        )
+        return ""
+    except OSError as e:
+        # A genuine I/O failure (permission, etc.) is NOT the same as "nothing
+        # logged" — surface it rather than masking a real fault as empty output.
+        logger.error(
+            "read_output_range: I/O error reading log for terminal %s "
+            "(offset=%d, length=%d): %s",
+            terminal_id,
+            offset,
+            capped_length,
+            e,
+        )
+        raise
+
+    return data.decode("utf-8", errors="replace")
+
+
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window."""
     try:
@@ -1573,8 +1731,15 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 if worktree_terminal_id == terminal_id:
                     worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
-        # Cleanup provider state and database record
-        provider_manager.cleanup_provider(terminal_id)
+        # Grok cleanup can be deferred when a private-home owner cannot yet be
+        # inspected/stopped.  Keep both the provider mapping and DB metadata so
+        # a subsequent DELETE can retry; reporting success here would turn a
+        # temporary process race into a permanent private-home leak.
+        if provider_manager.cleanup_provider(terminal_id) is False:
+            logger.warning(
+                "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
+            )
+            return False
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
         # Drop any per-curator dispatch lock so the registry doesn't grow

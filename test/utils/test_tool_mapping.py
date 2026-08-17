@@ -4,6 +4,7 @@ import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
     format_tool_summary,
+    get_allowed_tools,
     get_disallowed_tools,
     resolve_allowed_tools,
 )
@@ -174,6 +175,72 @@ class TestClaudeCodeWebFetch:
         assert get_disallowed_tools("copilot_cli", ["web_fetch", "fs_read"]) == sorted(
             {"shell", "write", "list", "grep"}
         )
+
+
+class TestGrokCliToolMapping:
+    """Grok restrictions use native deny rules, not prompt enforcement."""
+
+    def test_supervisor_blocks_execution_write_and_network(self):
+        disallowed = get_disallowed_tools("grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"])
+
+        assert "Bash" in disallowed
+        assert "Edit" in disallowed
+        assert "Write" in disallowed
+        assert "NotebookEdit" in disallowed
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
+        assert "Read" not in disallowed
+        assert "Grep" not in disallowed
+        assert "Glob" not in disallowed
+
+    def test_reviewer_keeps_read_and_search_only(self):
+        disallowed = get_disallowed_tools(
+            "grok_cli", ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]
+        )
+
+        assert "Read" not in disallowed
+        assert "NotebookRead" not in disallowed
+        assert "Grep" not in disallowed
+        assert "Glob" not in disallowed
+        assert {"Bash", "Edit", "Write", "NotebookEdit"}.issubset(disallowed)
+
+    def test_developer_mapping_allows_every_category(self):
+        assert (
+            get_disallowed_tools(
+                "grok_cli",
+                ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+            )
+            == []
+        )
+
+    def test_unrestricted_star_emits_no_deny_rules(self):
+        assert get_disallowed_tools("grok_cli", ["*"]) == []
+
+    def test_restricted_allowlist_returns_only_explicit_native_capabilities(self):
+        assert get_allowed_tools("grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"]) == [
+            "Glob",
+            "Grep",
+            "NotebookRead",
+            "Read",
+        ]
+        assert "Bash" not in get_allowed_tools(
+            "grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"]
+        )
+
+    def test_wildcard_allowlist_returns_all_native_capabilities(self):
+        assert set(get_allowed_tools("grok_cli", ["*"])) == set(
+            get_allowed_tools("grok_cli", ["fs_*", "execute_bash", "web_fetch"])
+        )
+
+    def test_each_category_remains_independently_governed(self):
+        bash_only = get_disallowed_tools("grok_cli", ["execute_bash"])
+        assert "Bash" not in bash_only
+        assert {"Read", "Edit", "Grep", "WebFetch", "WebSearch"}.issubset(bash_only)
+
+        web_only = get_disallowed_tools("grok_cli", ["web_fetch"])
+        assert "WebFetch" not in web_only
+        assert "WebSearch" not in web_only
+        assert {"Bash", "Read", "Edit", "Grep"}.issubset(web_only)
 
 
 class TestFormatToolSummary:

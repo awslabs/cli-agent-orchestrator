@@ -22,6 +22,7 @@ Session Lifecycle:
 import logging
 from typing import Any, Dict, List, Optional
 
+from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
@@ -112,11 +113,70 @@ async def create_session(
     return terminal
 
 
+def _enrich_session_ownership(
+    backend: TerminalBackend, session_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Add best-effort ownership metadata from the session's first known terminal."""
+    enriched = dict(session_data)
+    enriched.setdefault("working_directory", None)
+    enriched.setdefault("agent_profile", None)
+
+    # `... or ""` (not `.get("id", "")`): an explicit id=None must collapse to
+    # "" too, matching the sibling guard in list_sessions. `.get("id", "")`
+    # would yield the truthy string "None" and try to enrich a bogus session.
+    session_name = enriched.get("id") or ""
+    if not session_name:
+        return enriched
+
+    try:
+        terminals = list_terminals_by_session(session_name)
+    except Exception as e:
+        logger.warning(f"Failed to load terminal metadata for {session_name}: {e}")
+        terminals = []
+
+    ownership_terminal: Dict[str, Any] = {}
+    for terminal in terminals:
+        if terminal.get("agent_profile") or terminal.get("working_directory"):
+            ownership_terminal = terminal
+            break
+
+    if not ownership_terminal:
+        for terminal in terminals:
+            if terminal.get("tmux_window"):
+                ownership_terminal = terminal
+                break
+
+    if ownership_terminal:
+        enriched["agent_profile"] = ownership_terminal.get("agent_profile")
+        persisted_working_directory = ownership_terminal.get("working_directory")
+        if persisted_working_directory:
+            enriched["working_directory"] = persisted_working_directory
+        elif ownership_terminal.get("tmux_window"):
+            try:
+                enriched["working_directory"] = backend.get_pane_working_directory(
+                    session_name, ownership_terminal["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to resolve working directory for {session_name}: {e}")
+
+    return enriched
+
+
 def list_sessions() -> List[Dict]:
     """List all sessions from tmux."""
     try:
-        tmux_sessions = get_backend().list_sessions()
-        return [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        backend = get_backend()
+        tmux_sessions = backend.list_sessions()
+        return [
+            _enrich_session_ownership(backend, s)
+            for s in tmux_sessions
+            # Use .get() rather than s["id"]: a backend that returns a session
+            # dict without an "id" key must not blank the entire list (KeyError
+            # in this comprehension is swallowed by the outer except and returns
+            # []). Shipped backends always populate "id"; this hardens against a
+            # future backend that does not.
+            if (s.get("id") or "").startswith(SESSION_PREFIX)
+        ]
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
         return []
@@ -169,9 +229,17 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
 
         # Clean up each terminal (snapshot, kill window, FIFO reader,
         # status buffer, provider, DB) via the event-driven teardown path.
+        cleanup_complete = True
         for terminal in terminals:
             try:
-                terminal_service.delete_terminal(terminal["id"], registry=registry)
+                if terminal_service.delete_terminal(terminal["id"], registry=registry) is False:
+                    cleanup_complete = False
+                    result["errors"].append(
+                        {
+                            "terminal_id": terminal["id"],
+                            "error": "cleanup deferred; retry delete_session",
+                        }
+                    )
             except Exception as e:
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
@@ -183,8 +251,13 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         # even when no vars were forwarded — the helper is a no-op then.
         clear_session_env(session_name)
 
-        result["deleted"].append(session_name)
-        logger.info(f"Deleted session: {session_name}")
+        if cleanup_complete:
+            result["deleted"].append(session_name)
+            logger.info(f"Deleted session: {session_name}")
+        else:
+            logger.warning(
+                "Session %s backend was removed but terminal cleanup is deferred", session_name
+            )
         dispatch_plugin_event(
             registry,
             "post_kill_session",

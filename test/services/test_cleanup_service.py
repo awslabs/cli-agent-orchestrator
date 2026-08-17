@@ -37,6 +37,34 @@ class TestCleanupOldData:
         assert mock_db.query.called
         assert mock_db.commit.called
 
+    @patch("cli_agent_orchestrator.services.cleanup_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
+    @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
+    def test_cleanup_old_data_retains_grok_row_when_provider_cleanup_is_deferred(
+        self, mock_log_dir, mock_terminal_log_dir, mock_session_local, mock_provider_manager
+    ):
+        """Retention cleanup keeps the only retry handle for a private Grok home."""
+        mock_db = MagicMock()
+        mock_session_local.return_value.__enter__.return_value = mock_db
+        old_terminal = MagicMock(id="retained-grok", provider="grok_cli")
+        old_terminal_query = MagicMock()
+        terminal_delete_query = MagicMock()
+        inbox_query = MagicMock()
+        mock_db.query.side_effect = [old_terminal_query, terminal_delete_query, inbox_query]
+        old_terminal_query.filter.return_value.all.return_value = [old_terminal]
+        terminal_delete_query.filter.return_value.filter.return_value.delete.return_value = 0
+        inbox_query.filter.return_value.delete.return_value = 0
+        mock_provider_manager.cleanup_provider.return_value = False
+        mock_log_dir.exists.return_value = False
+        mock_terminal_log_dir.exists.return_value = False
+
+        cleanup_old_data()
+
+        mock_provider_manager.cleanup_provider.assert_called_once_with("retained-grok")
+        terminal_delete_query.filter.return_value.filter.assert_called_once()
+
     @patch("cli_agent_orchestrator.services.cleanup_service.status_monitor")
     @patch("cli_agent_orchestrator.services.cleanup_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")

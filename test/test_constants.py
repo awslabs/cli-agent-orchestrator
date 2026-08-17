@@ -698,3 +698,17 @@ class TestOpenCodeProviderType:
         from cli_agent_orchestrator.models.provider import ProviderType
 
         assert hasattr(ProviderType, "OPENCODE_CLI")
+
+
+class TestGrokCliProviderType:
+    """Tests for the official xAI Grok Build provider registration."""
+
+    def test_grok_cli_enum_value(self):
+        from cli_agent_orchestrator.models.provider import ProviderType
+
+        assert ProviderType.GROK_CLI.value == "grok_cli"
+
+    def test_grok_cli_in_providers_list(self):
+        from cli_agent_orchestrator.constants import PROVIDERS
+
+        assert "grok_cli" in PROVIDERS

@@ -144,13 +144,43 @@ than calling these routes directly.
   the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
   `events` appears only on a build that serves the events route, so treat it as optional.
 - `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`).
-- `GET /workflows/runs/{run_id}` returns a point-in-time status snapshot.
+- `GET /workflows/runs/{run_id}` **inspects** a run: run metadata, current state, and
+  each step's durable projection — including the step's full `output_json` and
+  `error` text. ⚠️ This is the most payload-bearing read on the surface, and the
+  output it returns is **not** gated by `workflow_journal_capture_output`; see the
+  retention note in [Configuration](configuration.md#memory-memory). It is a
+  superset of the older status-snapshot shape, so callers reading only
+  `state`/`current_step_id`/`steps[].{id,state,attempts}` are unaffected.
 - `GET /workflows/runs/{run_id}/result` returns the complete retained result. It is
   assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
   run — not only a finished one. No run-level `output` field is returned (run-level output
   is not journaled); per-step outputs are on `steps[].output`.
 - `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
   `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
+- `GET /workflows/runs/{run_id}/events` returns the run's ordered event timeline with
+  any **declared** gaps. One content-negotiated path, two arms: send
+  `Accept: text/event-stream` (or `?stream=true`) for a live SSE follow, otherwise a
+  JSON page. `?after_seq=` is the replay cursor and must be `>= 0`; on the SSE arm it
+  takes precedence over `Last-Event-ID`. A gap is data the server declares when an
+  append was lost — never inferred by the client from seq numbering.
+- `GET /workflows/runs/{run_id}/compare?against={other_run_id}` reports per-step
+  differences between two runs. Outputs are compared at the reference level, never by
+  diffing payloads. An unknown id on **either** side is a 404, not a partial compare.
+- `GET /workflows/runs/{run_id}/diagnostics` returns a troubleshooting bundle: spec
+  identifier + content hash, sanitized inputs, the event timeline with declared gaps,
+  step outcomes, provider/agent/engine environment, and terminal/artifact references.
+  Output excerpts appear only when `workflow_journal_capture_output` is on;
+  `capture_enabled` in the body declares which posture produced the bundle.
+- `DELETE /workflows/runs/{run_id}` removes a run and all its retained data (run row,
+  steps, events, seq high-water) in one cascade. Requires a write or admin scope.
+  A **running** run returns 409 — cancel it first; an already-absent run returns 204.
+- `GET /terminals/{id}/output/range?start=&length=` reads a byte-exact window of a
+  terminal's append-only log, for correlating a step with the terminal output it
+  produced. `length` is capped server-side.
+
+All five reads above (inspect, events, compare, diagnostics, and the run list)
+require a `cao:read`, `cao:write`, or `cao:admin` scope **when authentication is
+enabled**. With `CAO_AUTH_ENABLED` unset — the default — that check is inert.
 
 See [Workflows](workflows.md).
 

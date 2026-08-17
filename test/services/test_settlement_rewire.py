@@ -552,6 +552,11 @@ def test_append_step_and_update_step_keep_their_signatures_and_yaml_callers():
         "updated_at",
         "call_fingerprint",
     ]
+    # MERGE NOTE (2026-08-17, #583 x #504): ``error_kind`` is #504's addition to
+    # ``update_step``, NOT this change's — ``git diff 135e7ff..949eab1`` shows #583 never
+    # touched this signature. The guard keeps its full force: it still proves #583 left
+    # ``append_step``/``update_step`` alone, so the expected list is brought up to current
+    # reality rather than the assertion being relaxed.
     assert list(inspect.signature(workflow_journal.update_step).parameters) == [
         "run_id",
         "step_id",
@@ -560,6 +565,7 @@ def test_append_step_and_update_step_keep_their_signatures_and_yaml_callers():
         "updated_at",
         "output_json",
         "error",
+        "error_kind",
     ]
     assert "update_step" in _journal_calls_in(workflow_service)
 

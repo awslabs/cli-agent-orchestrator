@@ -60,6 +60,12 @@ class StatusMonitor:
         # be consumed by a decision taken against stale state.
         self._lock = threading.RLock()
         self._buffers: Dict[str, str] = {}
+        # Monotonic per-terminal byte-buffer generation.  A provider that
+        # remembers positions across get_status() calls needs an explicit reset
+        # boundary when send_input discards the old rolling buffer; content
+        # overlap alone cannot distinguish a fresh, byte-identical turn from a
+        # stale screen redraw.
+        self._buffer_epochs: Dict[str, int] = {}
         self._last_status: Dict[str, TerminalStatus] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
@@ -476,7 +482,7 @@ class StatusMonitor:
         with self._lock:
             self._allow_processing_revert[terminal_id] = True
 
-    def clear_rolling_buffer(self, terminal_id: str) -> None:
+    def clear_rolling_buffer(self, terminal_id: str, provider=None) -> None:
         """Clear ONLY the rolling byte buffer for a terminal — preserves
         ``_last_status`` and ``_allow_processing_revert``.
 
@@ -486,9 +492,19 @@ class StatusMonitor:
         rendered its processing indicator. Unlike ``reset_buffer``, this does
         NOT wipe the sticky-latch state, so the arm set by ``notify_input_sent``
         survives and the subsequent IDLE→PROCESSING transition is honored.
+
+        When the active provider is supplied, it is synchronously notified of
+        the new monotonically increasing byte-buffer epoch while this monitor's
+        lock is held.  That makes the boundary atomic with respect to the
+        output-consumer thread, which otherwise could parse the fresh first
+        chunk against state from the discarded buffer.
         """
         with self._lock:
             self._buffers[terminal_id] = ""
+            epoch = self._buffer_epochs.get(terminal_id, 0) + 1
+            self._buffer_epochs[terminal_id] = epoch
+            if provider is not None:
+                provider.notify_status_buffer_reset(epoch)
 
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""
@@ -506,6 +522,7 @@ class StatusMonitor:
         """Free buffer and status for a deleted terminal."""
         with self._lock:
             self._buffers.pop(terminal_id, None)
+            self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)

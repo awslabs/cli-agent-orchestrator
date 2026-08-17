@@ -1,0 +1,9 @@
+     ❯ Summarize the repository.
+
+    ⠦ Waiting for response… 0.7s                         0.8s [stop]
+
+  ╭────────────────╮
+  │ ❯              │
+  ╰── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Esc:cancel  │  Ctrl+x:shortcuts

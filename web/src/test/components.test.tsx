@@ -148,7 +148,7 @@ describe('FALLBACK_PROVIDERS', () => {
   })
 
   it('includes all known providers', () => {
-    const expected = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli']
+    const expected = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli', 'grok_cli']
     for (const p of expected) {
       expect(FALLBACK_PROVIDERS).toContain(p)
     }
@@ -178,5 +178,6 @@ describe('FALLBACK_PROVIDERS', () => {
     const effective = noProviders.length > 0 ? noProviders : FALLBACK_PROVIDERS.map(n => ({ name: n, binary: '', installed: true }))
     const names = effective.map(p => p.name)
     expect(names).toContain('opencode_cli')
+    expect(names).toContain('grok_cli')
   })
 })
