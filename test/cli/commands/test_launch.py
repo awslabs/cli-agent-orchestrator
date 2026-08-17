@@ -6,7 +6,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs, launch
+from cli_agent_orchestrator.cli.commands.launch import (
+    _HEADLESS_TASK_TIMEOUT,
+    _READINESS_WAIT_TIMEOUT,
+    _parse_env_pairs,
+    launch,
+)
 
 # ── Backend auto-detection (issue #308) ──────────────────────────────
 
@@ -156,14 +161,20 @@ def test_launch_passes_explicit_kiro_engine():
 
 
 def test_launch_headless_message_sends_to_terminal():
-    """Test headless mode with message waits for IDLE then sends and polls for output."""
+    """Headless+message hands MESSAGE to the server in the create body, then polls.
+
+    Regression guard for caom-7it: the CLI used to create the session and then
+    issue a SEPARATE ``POST /terminals/{id}/input``. When provider init outlived
+    the client's read timeout on ``POST /sessions``, that second request never
+    happened and MESSAGE was silently dropped. There must be exactly ONE POST,
+    carrying ``initial_message``.
+    """
     runner = CliRunner()
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
-        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -196,9 +207,15 @@ def test_launch_headless_message_sends_to_terminal():
 
         assert result.exit_code == 0
         assert "task done" in result.output
-        mock_wait.assert_called_once()
-        # Two POST calls: create session + send message
-        assert mock_post.call_count == 2
+        # ONE POST: create session, with MESSAGE in the body. No follow-up
+        # /terminals/{id}/input — the server delivers it off the deferred-init
+        # path and re-submits if the TUI swallowed it.
+        assert mock_post.call_count == 1
+        assert mock_post.call_args.kwargs["json"]["initial_message"] == "do something"
+        assert "/input" not in str(mock_post.call_args)
+        # No client-side readiness gate either: the create response returns
+        # before init finishes (status UNKNOWN), and poll_until_done handles it.
+        mock_wait.assert_not_called()
 
 
 def test_launch_invalid_provider():
@@ -536,12 +553,20 @@ def test_launch_builtin_profile_resolves_role_defaults():
         assert "@cao-mcp-server" in params["allowed_tools"]
 
 
-def test_launch_headless_message_conductor_not_ready():
-    """Test headless+message raises when conductor does not become ready."""
+def test_launch_headless_message_does_not_gate_delivery_on_client_readiness():
+    """Headless+message must not abort just because the CLI never saw IDLE.
+
+    The old flow waited for IDLE client-side and raised "did not become ready"
+    before sending — a launch that hit that branch dropped MESSAGE outright even
+    though the terminal was alive and would have accepted it moments later. The
+    server now owns readiness, so a never-IDLE reading from the CLI's own poll
+    helper is irrelevant: MESSAGE is already in the create body.
+    """
     runner = CliRunner()
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -551,6 +576,14 @@ def test_launch_headless_message_conductor_not_ready():
         }
         mock_post.return_value.raise_for_status.return_value = None
         mock_wait.return_value = False
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "task done"}
+        mock_get.side_effect = [poll_resp, output_resp]
 
         result = runner.invoke(
             launch,
@@ -563,8 +596,9 @@ def test_launch_headless_message_conductor_not_ready():
             ],
         )
 
-        assert result.exit_code != 0
-        assert "did not become ready" in result.output
+        assert result.exit_code == 0
+        assert "did not become ready" not in result.output
+        assert mock_post.call_args.kwargs["json"]["initial_message"] == "do something"
 
 
 def test_launch_headless_message_poll_error_status():
@@ -575,7 +609,6 @@ def test_launch_headless_message_poll_error_status():
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
-        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -613,7 +646,6 @@ def test_launch_headless_message_poll_processing_then_completed():
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
-        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -1002,3 +1034,221 @@ def test_minimax_code_requires_workspace_access_confirmation():
     )
 
     assert "mcode" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+
+
+# ── Server-side initial_message delivery (caom-7it) ────────────────────
+
+
+def _create_session_response():
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "session_name": "test-session",
+        "id": "test-terminal-id",
+        "name": "test-terminal",
+    }
+    return resp
+
+
+def test_launch_create_call_keeps_mcp_request_timeout():
+    """``POST /sessions`` stays on the ordinary ``mcp_request_timeout``.
+
+    Widening this instead of moving delivery server-side was the wrong fix: it
+    raises requests' CONNECT timeout as well (``timeout=`` is a single scalar,
+    so a dead server takes minutes to report), and it only helps callers that
+    happen to be this CLI. With ``initial_message`` in the body the server
+    returns before init even starts, so no widening is needed at all.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {"mcp_request_timeout": 30}
+        mock_post.return_value = _create_session_response()
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "task done"}
+        mock_get.side_effect = [poll_resp, output_resp]
+
+        result = runner.invoke(
+            launch, ["--agents", "test-agent", "--headless", "--yolo", "do something"]
+        )
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["timeout"] == 30
+        # The /output read is an ordinary request too.
+        assert mock_get.call_args_list[-1].kwargs["timeout"] == 30
+
+
+def test_launch_headless_message_travels_in_body_not_query_string():
+    """MESSAGE must not land in the URL: prompts are large (414 risk) and are
+    routinely captured verbatim in HTTP access logs and traces. Same reason
+    ``--env`` values were moved into the body in issue #248."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+    ):
+        mock_post.return_value = _create_session_response()
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": ""}
+        mock_get.side_effect = [poll_resp, output_resp]
+
+        result = runner.invoke(
+            launch, ["--agents", "test-agent", "--headless", "--yolo", "secret prompt"]
+        )
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["json"]["initial_message"] == "secret prompt"
+        assert "message" not in mock_post.call_args.kwargs["params"]
+        assert "secret prompt" not in str(mock_post.call_args.kwargs["params"])
+
+
+def test_launch_headless_message_shares_body_with_forwarded_env():
+    """``initial_message`` and ``env_vars`` are both body fields on
+    ``CreateSessionBody`` — passing both must not drop either."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+    ):
+        mock_post.return_value = _create_session_response()
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": ""}
+        mock_get.side_effect = [poll_resp, output_resp]
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--headless",
+                "--yolo",
+                "--env",
+                "AWS_PROFILE=dev",
+                "do something",
+            ],
+        )
+
+        assert result.exit_code == 0
+        body = mock_post.call_args.kwargs["json"]
+        assert body["initial_message"] == "do something"
+        assert body["env_vars"] == {"AWS_PROFILE": "dev"}
+
+
+def test_launch_async_returns_without_sending_input():
+    """``--async`` reports and returns. It must not fall back to a client-side
+    send, and it must not wait for IDLE first — the server delivers MESSAGE
+    once init completes."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.poll_until_done") as mock_poll,
+    ):
+        mock_post.return_value = _create_session_response()
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--headless", "--async", "--yolo", "do something"],
+        )
+
+        assert result.exit_code == 0
+        assert "Running in background" in result.output
+        assert mock_post.call_count == 1
+        assert mock_post.call_args.kwargs["json"]["initial_message"] == "do something"
+        mock_wait.assert_not_called()
+        mock_poll.assert_not_called()
+        mock_get.assert_not_called()
+
+
+def test_launch_headless_no_message_omits_initial_message():
+    """A headless launch with no MESSAGE must not put the terminal on the
+    deferred-init path — it has nothing to deliver, and deferring would report
+    UNKNOWN instead of IDLE to a caller that expects a ready terminal."""
+    runner = CliRunner()
+
+    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+        mock_post.return_value = _create_session_response()
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--headless", "--yolo"])
+
+        assert result.exit_code == 0
+        assert "json" not in mock_post.call_args.kwargs
+
+
+def test_launch_non_headless_does_not_defer_init():
+    """The attach path never sent MESSAGE and must not start now.
+
+    Deferring init here would leave the pre-attach readiness poll racing the
+    agent's first turn: the terminal reports UNKNOWN until init finishes and
+    then goes straight to PROCESSING, so the wait for IDLE would usually expire
+    and print a spurious "did not reach idle" warning before attaching.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value = _create_session_response()
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo", "do something"])
+
+        assert result.exit_code == 0
+        assert "json" not in mock_post.call_args.kwargs
+        assert mock_post.call_count == 1
+
+
+def test_launch_headless_poll_budget_covers_server_side_init():
+    """The wait budget must cover init as well as the task.
+
+    Init used to happen in a separate readiness poll BEFORE the client-side
+    send; it now runs inside this wait, so charging the task's own 300s for it
+    would silently shrink how long an agent gets to finish.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.poll_until_done") as mock_poll,
+    ):
+        mock_post.return_value = _create_session_response()
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "task done"}
+        mock_get.return_value = output_resp
+
+        result = runner.invoke(
+            launch, ["--agents", "test-agent", "--headless", "--yolo", "do something"]
+        )
+
+        assert result.exit_code == 0
+        mock_poll.assert_called_once_with(
+            "test-terminal-id", timeout=_READINESS_WAIT_TIMEOUT + _HEADLESS_TASK_TIMEOUT
+        )

@@ -1,7 +1,6 @@
 """Launch command for CLI Agent Orchestrator CLI."""
 
 import os
-import time
 
 import click
 import requests
@@ -52,6 +51,16 @@ _FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
     }
 )
 _FORWARDED_ENV_MAX_VALUE_BYTES = 2048
+
+# How long the CLI allows for server-side provider init: the pre-attach
+# readiness poll on the non-headless path, and the init allowance folded into
+# the headless wait (where init now runs inside ``poll_until_done``'s window
+# rather than in a separate poll before a client-side send).
+_READINESS_WAIT_TIMEOUT = 120
+
+# How long the agent gets to finish MESSAGE on the headless non-async path,
+# on top of ``_READINESS_WAIT_TIMEOUT``.
+_HEADLESS_TASK_TIMEOUT = 300
 
 
 def _parse_env_pairs(pairs):
@@ -311,13 +320,45 @@ def launch(
         if resume_session_id:
             params["resume_session_id"] = resume_session_id
 
+        # Hand MESSAGE to the server rather than sending it ourselves.
+        # ``initial_message`` on ``POST /sessions`` puts the initial terminal on
+        # the existing deferred-init path (``session_service.create_session`` ->
+        # ``create_terminal(defer_init=True)``): the server responds as soon as
+        # the terminal record exists, then finishes provider init, delivers the
+        # message, and confirms/re-submits if the TUI swallowed it.
+        #
+        # The CLI used to create the session and then issue a SEPARATE
+        # ``POST /terminals/{id}/input``. Because ``POST /sessions`` ran the
+        # provider's full ``initialize()`` inline, a slow cold start outlived
+        # the client's read timeout: ``requests`` raised ``ReadTimeout``,
+        # ``launch`` reported "Failed to connect to cao-server", and that second
+        # request never happened — MESSAGE was silently dropped even though the
+        # session, the terminal and a healthy idle TUI all existed server-side,
+        # and nothing retried because from the server's point of view the launch
+        # had succeeded. Server-side delivery closes the window for every
+        # provider at once; ``cao launch`` was the last client still doing its
+        # own create-then-send (mcp_server and ops_mcp_server already pass
+        # ``initial_message``).
+        #
+        # Headless only: that is the path that used to send MESSAGE. A
+        # non-headless launch attaches instead and has never delivered MESSAGE,
+        # and deferring init there would make the pre-attach readiness poll
+        # below race the agent's first turn.
+        server_delivers_message = bool(message) and headless
+
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.
-        # See issue #248.
-        request_timeout = get_server_settings()["mcp_request_timeout"]
-        post_kwargs: dict = {"params": params, "timeout": request_timeout}
+        # MESSAGE rides in the body for the same reason, plus URL-length. See
+        # issue #248 and ``CreateSessionBody``.
+        settings = get_server_settings()
+        post_kwargs: dict = {"params": params, "timeout": settings["mcp_request_timeout"]}
+        body: dict = {}
         if forwarded_env:
-            post_kwargs["json"] = {"env_vars": forwarded_env}
+            body["env_vars"] = forwarded_env
+        if server_delivers_message:
+            body["initial_message"] = message
+        if body:
+            post_kwargs["json"] = body
 
         response = requests.post(url, **post_kwargs)
         response.raise_for_status()
@@ -341,44 +382,41 @@ def launch(
             ready = wait_until_terminal_status(
                 terminal["id"],
                 {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
+                timeout=_READINESS_WAIT_TIMEOUT,
             )
             if not ready:
                 click.echo(
                     click.style(
-                        f"  Warning: {terminal['id']} did not reach idle within 120s — "
-                        "attaching anyway; input may be unreliable until init completes.",
+                        f"  Warning: {terminal['id']} did not reach idle within "
+                        f"{_READINESS_WAIT_TIMEOUT}s — attaching anyway; input may be "
+                        "unreliable until init completes.",
                         fg="yellow",
                     )
                 )
             get_backend().attach_session(terminal["session_name"])
         elif message:
-            ready = wait_until_terminal_status(
-                terminal["id"],
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
-            )
-            if not ready:
-                raise click.ClickException(
-                    f"Conductor {terminal['id']} did not become ready within 120s"
-                )
-            request_timeout = get_server_settings()["mcp_request_timeout"]
-            response = requests.post(
-                f"{API_BASE_URL}/terminals/{terminal['id']}/input",
-                params={"message": message},
-                timeout=request_timeout,
-            )
-            response.raise_for_status()
-            time.sleep(3)
+            # Nothing to send: the server took MESSAGE in the create body above
+            # and owns init, delivery and re-submission. There is also nothing
+            # left to wait for before delivery — waiting for IDLE here is what
+            # used to gate a send that no longer happens.
             if is_async:
-                click.echo(f"Message sent to {terminal['name']}. Running in background.")
+                click.echo(
+                    f"Message accepted for {terminal['name']}; the server delivers it "
+                    "once provider init completes. Running in background."
+                )
                 return
-            poll_until_done(terminal["id"], timeout=300)
-            request_timeout = get_server_settings()["mcp_request_timeout"]
+            # Provider init now happens inside this wait instead of in a
+            # separate readiness poll before the send, so the budget covers
+            # both. A deferred terminal reports UNKNOWN until init finishes,
+            # which ``poll_until_done`` deliberately does not count as "started"
+            # — it returns only once the agent has been observed working.
+            poll_until_done(
+                terminal["id"], timeout=_READINESS_WAIT_TIMEOUT + _HEADLESS_TASK_TIMEOUT
+            )
             output_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
-                timeout=request_timeout,
+                timeout=settings["mcp_request_timeout"],
             )
             output_resp.raise_for_status()
             output = output_resp.json().get("output", "")
