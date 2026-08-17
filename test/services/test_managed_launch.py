@@ -1049,6 +1049,22 @@ class TestCodexRouteAttestationAdmitsTheStageProvenBuild:
             "cli_agent_orchestrator.services.codex_trust._run_app_server_probe",
             fake_app_server,
         )
+        # The public seam digests ~/.codex/config.toml before and after the
+        # probe to prove the probe never mutates it. The operator's real file
+        # is an undeclared input: absent in CI (digests as "absent"), but a
+        # dotfile-managed symlink on some dev machines, which the digester
+        # rightly refuses. Point both reads at a fixture file so the
+        # before/after integrity comparison still runs against real content.
+        from cli_agent_orchestrator.services import codex_trust
+
+        fixture_config = tmp_path / "codex-config.toml"
+        fixture_config.write_text('model = "gpt-5"\n')
+        real_digest = codex_trust._digest_or_absent
+        monkeypatch.setattr(
+            codex_trust,
+            "_digest_or_absent",
+            lambda path: real_digest(fixture_config),
+        )
 
     def test_codex_0147_attests_zero_tasks_at_the_public_seam(self, tmp_path, monkeypatch):
         self._patch_codex_attestor(monkeypatch, "codex-cli 0.147.0\n", tmp_path)

@@ -963,6 +963,11 @@ def test_bridge_hard_crash_leaves_durable_declarations():
         env["CAO_BRIDGE_TEST_BASE"] = str(base)
         for var in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
             env.pop(var, None)
+        # The child must resolve its state root from the shimmed HOME above —
+        # the assertions below look under base/.aws/cli-agent-orchestrator —
+        # so an inherited CAO_STATE_ROOT (the suite-level test injection
+        # included, see test/conftest.py) must not reach it.
+        env.pop("CAO_STATE_ROOT", None)
         child = textwrap.dedent("""
             import os
             import sys

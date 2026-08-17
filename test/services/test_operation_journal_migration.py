@@ -27,6 +27,12 @@ from cli_agent_orchestrator.services import restore_contract as rc
 from cli_agent_orchestrator.services import session_lifecycle as sl
 from cli_agent_orchestrator.services import stable_agent_roster as roster
 
+# Canonical-by-construction fixture paths — see test_restore_contract.py.
+# A literal naming a real operator path fails the contract validator's
+# canonical-realpath check on any machine where a component is a symlink.
+_WORKTREE = "/cao-test-fixture/worktree"
+_PROFILE_CONFIG = "/cao-test-fixture/profile/settings.json"
+
 _OPERATION_INDEXES = {
     "ix_reincarnation_operations_slot",
     "ix_reincarnation_operations_session",
@@ -133,12 +139,12 @@ def _contract_for(bind: dict[str, dict]):
         execution_mode="native_tui",
         model=rc.ContractFact.present("claude-sonnet-4-5"),
         effort=rc.ContractFact.present("high"),
-        working_directory="/Users/colin/Projects/cao",
-        trusted_project_root="/Users/colin/Projects/cao",
+        working_directory=_WORKTREE,
+        trusted_project_root=_WORKTREE,
         executable=rc.ContractFact.present({"path": "/usr/local/bin/claude", "sha256": "a" * 64}),
         profile_material=rc.ContractFact.present(
             {
-                "profile_config_path": "/Users/colin/.claude/settings.json",
+                "profile_config_path": _PROFILE_CONFIG,
                 "profile_config_sha256": "b" * 64,
             }
         ),

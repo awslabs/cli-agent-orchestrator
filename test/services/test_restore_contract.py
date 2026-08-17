@@ -49,6 +49,16 @@ from cli_agent_orchestrator.services import stable_agent_roster as roster
 _DIGEST64 = "a" * 64
 _NATIVE_ID = "11111111-2222-4333-8444-555555555555"
 
+# Canonical-by-construction fixture paths. The contract validator requires
+# canonical absolute paths (no '.', '..', or symlink aliasing, checked with
+# os.path.realpath), so a literal naming a real operator path — the previous
+# data used /Users/colin/... — fails on any machine where a component is a
+# symlink (a dotfile-managed ~/.claude is one). These names exist on no real
+# machine, so realpath returns them byte-identical everywhere.
+_WORKTREE = "/cao-test-fixture/worktree"
+_ALT_WORKTREE = "/cao-test-fixture/other"
+_PROFILE_CONFIG = "/cao-test-fixture/profile/settings.json"
+
 
 def _fact(value):
     return rc.ContractFact.present(value)
@@ -90,12 +100,12 @@ def _contract_for(bind, **changes):
         "execution_mode": bind["incarnation"]["execution_mode"],
         "model": _fact("claude-sonnet-4-5"),
         "effort": _fact("high"),
-        "working_directory": "/Users/colin/Projects/cao",
-        "trusted_project_root": "/Users/colin/Projects/cao",
+        "working_directory": _WORKTREE,
+        "trusted_project_root": _WORKTREE,
         "executable": _fact({"path": "/usr/local/bin/claude", "sha256": _DIGEST64}),
         "profile_material": _fact(
             {
-                "profile_config_path": "/Users/colin/.claude/settings.json",
+                "profile_config_path": _PROFILE_CONFIG,
                 "profile_config_sha256": "b" * 64,
             }
         ),
@@ -127,12 +137,12 @@ def _detached_contract(**changes):
         "execution_mode": "native_tui",
         "model": _fact("claude-sonnet-4-5"),
         "effort": _fact("high"),
-        "working_directory": "/Users/colin/Projects/cao",
-        "trusted_project_root": "/Users/colin/Projects/cao",
+        "working_directory": _WORKTREE,
+        "trusted_project_root": _WORKTREE,
         "executable": _fact({"path": "/usr/local/bin/claude", "sha256": _DIGEST64}),
         "profile_material": _fact(
             {
-                "profile_config_path": "/Users/colin/.claude/settings.json",
+                "profile_config_path": _PROFILE_CONFIG,
                 "profile_config_sha256": "b" * 64,
             }
         ),
@@ -283,7 +293,7 @@ def test_changed_content_for_same_source_incarnation_conflicts(isolated_memory_d
     bind, contract = _bound_worker()
     original = rc.publish_contract(contract)
     with pytest.raises(rc.RestoreContractConflict):
-        rc.publish_contract(_contract_for(bind, working_directory="/Users/colin/Projects/other"))
+        rc.publish_contract(_contract_for(bind, working_directory=_ALT_WORKTREE))
     contracts = rc.list_contracts()
     assert len(contracts) == 1
     assert contracts[0]["contract_digest"] == original["contract_digest"]
@@ -334,7 +344,7 @@ def test_canonical_payload_digest_is_deterministic(isolated_memory_db):
     c1 = _detached_contract(
         profile_material=_fact(
             {
-                "profile_config_path": "/Users/colin/.claude/settings.json",
+                "profile_config_path": _PROFILE_CONFIG,
                 "profile_config_sha256": "b" * 64,
             }
         ),
@@ -344,7 +354,7 @@ def test_canonical_payload_digest_is_deterministic(isolated_memory_db):
         profile_material=_fact(
             {
                 "profile_config_sha256": "b" * 64,
-                "profile_config_path": "/Users/colin/.claude/settings.json",
+                "profile_config_path": _PROFILE_CONFIG,
             }
         ),
         route_provenance={"provider_route": "anthropic"},
@@ -503,7 +513,7 @@ def test_mutating_caller_input_dict_does_not_change_contract(isolated_memory_db)
     the contract or its deterministic digest — the validated facts are fresh
     snapshots, never aliases of the caller's input."""
     profile = {
-        "profile_config_path": "/Users/colin/.claude/settings.json",
+        "profile_config_path": _PROFILE_CONFIG,
         "profile_config_sha256": "b" * 64,
     }
     contract = _detached_contract(profile_material=_fact(profile))
@@ -697,7 +707,7 @@ def test_transition_refuses_stored_digest_divergence(isolated_memory_db):
     parsed = json.loads(
         _read_stored_payload(isolated_memory_db, contract.terminal_id, contract.generation)
     )
-    parsed["working_directory"] = "/Users/colin/Projects/other"
+    parsed["working_directory"] = _ALT_WORKTREE
     _corrupt_contract_json_keep_digest(
         isolated_memory_db,
         contract.terminal_id,
@@ -769,11 +779,11 @@ def test_contract_refuses_dot_and_parent_path_aliases(isolated_memory_db):
     """Noncanonical absolute paths ('./' and '..' aliases) are refused rather
     than silently normalized — the exact canonical path is the immutable fact."""
     with pytest.raises(rc.RestoreContractInvalid):
-        _detached_contract(working_directory="/Users/colin/Projects/./cao")
+        _detached_contract(working_directory="/cao-test-fixture/./worktree")
     with pytest.raises(rc.RestoreContractInvalid):
-        _detached_contract(working_directory="/Users/colin/Projects/cao/..")
+        _detached_contract(working_directory="/cao-test-fixture/worktree/..")
     with pytest.raises(rc.RestoreContractInvalid):
-        _detached_contract(trusted_project_root="/Users/colin/Projects/./cao")
+        _detached_contract(trusted_project_root="/cao-test-fixture/./worktree")
     with pytest.raises(rc.RestoreContractInvalid):
         _detached_contract(
             executable=_fact({"path": "/usr/local/./bin/claude", "sha256": _DIGEST64})
@@ -782,7 +792,7 @@ def test_contract_refuses_dot_and_parent_path_aliases(isolated_memory_db):
         _detached_contract(
             profile_material=_fact(
                 {
-                    "profile_config_path": "/Users/colin/.claude/./settings.json",
+                    "profile_config_path": "/cao-test-fixture/profile/./settings.json",
                     "profile_config_sha256": "b" * 64,
                 }
             )
@@ -805,10 +815,10 @@ def test_contract_refuses_symlink_path_alias(isolated_memory_db, tmp_path):
 def test_canonical_real_path_accepted(isolated_memory_db):
     """A canonical real path is the positive case and is accepted."""
     contract = _detached_contract(
-        working_directory="/Users/colin/Projects/cao",
-        trusted_project_root="/Users/colin/Projects/cao",
+        working_directory=_WORKTREE,
+        trusted_project_root=_WORKTREE,
     )
-    assert contract.working_directory == "/Users/colin/Projects/cao"
+    assert contract.working_directory == _WORKTREE
 
 
 def test_executable_refuses_unknown_keys(isolated_memory_db):
@@ -870,10 +880,7 @@ def test_persisted_contract_stores_references_and_digests_only(isolated_memory_d
     assert "super-secret" not in raw
     parsed = json.loads(raw)
     assert parsed["profile_material"]["state"] == "present"
-    assert (
-        parsed["profile_material"]["value"]["profile_config_path"]
-        == "/Users/colin/.claude/settings.json"
-    )
+    assert parsed["profile_material"]["value"]["profile_config_path"] == _PROFILE_CONFIG
     assert parsed["profile_material"]["value"]["profile_config_sha256"] == "b" * 64
 
 
@@ -1386,7 +1393,7 @@ def test_concurrent_differing_publishers_one_winner_typed_conflict(file_db, monk
     yield exactly one winner plus a typed RestoreContractConflict — never
     RestoreContractUnavailable."""
     bind, contract = _bound_worker()
-    alt = _contract_for(bind, working_directory="/Users/colin/Projects/other")
+    alt = _contract_for(bind, working_directory=_ALT_WORKTREE)
     assert alt.digest() != contract.digest()
     barrier = threading.Barrier(2)
     monkeypatch.setattr(rc, "_now", _gate_first_call(rc._now, barrier))

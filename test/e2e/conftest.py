@@ -13,6 +13,7 @@ module top.
 Run with: uv run pytest -m e2e test/e2e/ -v
 """
 
+import os
 import shutil
 import time
 from test.fixtures.cao_server import CaoServer, _patch_api_base_url_for_e2e
@@ -21,6 +22,27 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+
+
+# Live e2e tests spawn real provider CLIs and CAO children (e.g. the
+# registration helpers) and assert on state resolved under a shimmed HOME.
+# The suite-level CAO_STATE_ROOT injection in test/conftest.py (cond-0464)
+# would silently relocate that state into the scratch root, so when a live
+# e2e test is actually going to run, subprocesses get the ambient
+# environment back. The gate inspects the selected items: this conftest is
+# also imported during combined collections where every e2e test is
+# deselected (-m 'not e2e'), and a few modules in this directory carry no
+# e2e mark at all — un-injecting for those would strip the isolation from
+# the non-e2e tests later in the session that still rely on it. Only the
+# injected value is removed — an operator-exported CAO_STATE_ROOT is left
+# alone.
+@pytest.fixture(scope="session", autouse=True)
+def _ambient_state_root_for_live_children(request):
+    if any(item.get_closest_marker("e2e") for item in request.session.items):
+        injected = os.environ.pop("_CAO_PYTEST_INJECTED_STATE_ROOT", None)
+        if injected is not None and os.environ.get("CAO_STATE_ROOT") == injected:
+            os.environ.pop("CAO_STATE_ROOT", None)
+    yield
 
 
 @pytest.fixture(scope="session", autouse=True)

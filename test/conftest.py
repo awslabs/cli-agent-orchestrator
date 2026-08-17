@@ -13,13 +13,51 @@ Also exposes shared security fixtures (RSA keys, JWKS stub,
 that need to exercise the Auth0 paths.
 """
 
+import atexit
 import os
 import pathlib
+import shutil
+import tempfile
 import time
 from typing import Any, Dict
 from unittest.mock import patch
 
 import pytest
+
+# --- Suite-wide state isolation (cond-0464) --------------------------------
+# ``constants.py`` resolves ``CAO_HOME_DIR`` — and binds the import-time
+# database engine — from ``CAO_STATE_ROOT`` while it is being imported, and
+# ``settings_service`` reads ``settings.json`` beneath it. Left unset, the
+# whole suite reads the OPERATOR's live ``settings.json``: an undeclared,
+# machine-dependent input. An operator with ``memory.enabled=false`` sees
+# ~400 ``MemoryDisabledError`` failures that hosted CI — whose clean
+# environment has no operator settings to read — never sees, so a local
+# total was comparable to nothing. Point the knob at a per-session scratch
+# directory *before anything imports cli_agent_orchestrator* (this module's
+# body runs ahead of the ``pytest_plugins`` imports below and of every test
+# module), so the suite runs on the documented defaults — the same clean
+# environment CI provides. An explicitly exported ``CAO_STATE_ROOT`` is
+# honoured: that one is a declared input.
+_TEST_STATE_ROOT_MARKER = "_CAO_PYTEST_INJECTED_STATE_ROOT"
+if "CAO_STATE_ROOT" not in os.environ:
+    _TEST_STATE_ROOT = tempfile.mkdtemp(prefix="cao-pytest-state-")
+    os.environ["CAO_STATE_ROOT"] = _TEST_STATE_ROOT
+    # Marker so test/e2e/conftest.py can hand live e2e runs back the ambient
+    # environment they had before this injection, without ever removing an
+    # operator-exported value.
+    os.environ[_TEST_STATE_ROOT_MARKER] = _TEST_STATE_ROOT
+    atexit.register(shutil.rmtree, _TEST_STATE_ROOT, True)
+
+    # A fresh state root also means a fresh, schema-less database. Before the
+    # injection, tests that use the process-default engine quietly relied on
+    # the operator's already-migrated live database — and a full-suite run
+    # relied on an API test booting the app (and its ``init_db``) before
+    # test/services ran. Initialize the schema here, the same way the server
+    # lifespan does, so any subset of the suite is self-sufficient.
+    from cli_agent_orchestrator.clients import database as _test_database
+
+    _test_database.init_db()
+
 
 # Make the `mock_cli` test-fixture binary discoverable for the pytest
 # session so MockCliProvider can `shlex.join(["mock_cli", ...])` without
@@ -126,6 +164,26 @@ def mock_jwks(rsa_keys):
 
     with patch("cli_agent_orchestrator.security.auth.requests.get", return_value=_Resp()):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_environment():
+    """Restore ``os.environ`` after every test.
+
+    The managed-provider bridge scrubs the process-wide environment for the
+    bridge's lifetime (``_scope_direct_serve_environment``) and restores it
+    only when ``_serve`` returns. Several tests run that accept loop in a
+    daemon thread that outlives the test, so the scrubbed environment —
+    without the suite's ``CAO_STATE_ROOT`` isolation, among everything else
+    — used to leak into every later test's subprocesses (cond-0464).
+    monkeypatch only undoes changes it made itself; this is the backstop for
+    changes no fixture owns. Snapshot at setup so a session-scoped fixture's
+    deliberate change (e.g. the e2e state-root un-injection) is preserved.
+    """
+    snapshot = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(snapshot)
 
 
 @pytest.fixture(autouse=True)
