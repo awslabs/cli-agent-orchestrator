@@ -126,10 +126,52 @@ UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
 UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
 STARTUP_PROMPT_BOTTOM_LINES = 15
 STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
-# Codex's boxed command-approval modal, e.g.
+# Codex's runtime approval prompt as actually rendered by codex-cli 0.147.0,
+# verified against a live tmux capture (test/providers/fixtures/
+# codex_approval_modal_raw.txt):
+#
+#     Would you like to run the following command?
+#
+#     Environment: local
+#
+#     $ mkdir -p /private/tmp/codex-work-567
+#
+#   › 1. Yes, proceed (y)
+#     2. Yes, and don't ask again for commands that start with `mkdir -p ...` (p)
+#     3. No, and tell Codex what to do differently (esc)
+#
+#     Press enter to confirm or esc to cancel
+#
+# It is NOT a box-drawn modal and carries no "[a] Accept"/"[d] Decline" keys: it
+# is a numbered menu with a `›` selection cursor, structurally identical to the
+# trust-v2, login, and update dialogs above -- hence the same question+footer
+# corroboration shape. The three question variants are the exec, apply_patch, and
+# permission-escalation approvals; all three block the TUI on a keystroke, and all
+# three are present in the 0.147.0 binary's string table.
+#
+# Left un-anchored to the `›` cursor line on purpose: the cursor moves between the
+# numbered options as the operator arrows around, so the question and the footer
+# are the only two positionally stable rows.
+APPROVAL_PROMPT_PATTERN = (
+    r"Would you like to (?:run the following command"
+    r"|make the following edits"
+    r"|grant these permissions)\?"
+)
+APPROVAL_PROMPT_FOOTER = r"Press enter to confirm"
+
+# Codex's boxed command-approval modal:
 #   ╭─ Command Approval Required ─╮
 #   │ [a] Accept  [d] Decline     │
 #   ╰─────────────────────────────╯
+# WARNING: this copy is NOT emitted by codex-cli 0.147.0. `strings` over the
+# vendored native binary finds zero occurrences of "Command Approval Required",
+# "] Accept", or "] Decline" -- the live prompt is APPROVAL_PROMPT_PATTERN above.
+# The two patterns are kept because this copy predates the numbered menu and is
+# already load-bearing in STARTUP_BLOCKING_INPUT_PATTERN below, so dropping them
+# would silently un-guard whichever older Codex builds still render it. Treat
+# _has_approval_modal_in_bottom as legacy/defensive: APPROVAL_PROMPT_PATTERN is
+# what fires on current Codex.
+#
 # Split into header and choice-key halves because the two paths that consume
 # them need different strictness. The startup path (_has_startup_idle_composer)
 # uses the permissive OR below as a NEGATIVE gate — any one token vetoes
@@ -163,7 +205,7 @@ MODAL_FRAME_CHARS = "─│╭╮╰╯├┤━┃┏┓┗┛┣┫═║╔�
 MODAL_FRAME_GLYPHS = frozenset(MODAL_FRAME_CHARS) - frozenset(" \t")
 STARTUP_BLOCKING_INPUT_PATTERN = (
     rf"(?:{APPROVAL_MODAL_HEADER_PATTERN}|{APPROVAL_MODAL_CHOICE_PATTERN}|"
-    rf"{TRUST_PROMPT_FOOTER})"
+    rf"{APPROVAL_PROMPT_PATTERN}|{APPROVAL_PROMPT_FOOTER}|{TRUST_PROMPT_FOOTER})"
 )
 STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
@@ -345,76 +387,135 @@ def _modal_line_content(line: str) -> Optional[str]:
     return content
 
 
-def _has_active_spinner(lines: list) -> bool:
-    """Return True when any of ``lines`` carries Codex's live progress spinner."""
-    return any(re.search(TUI_PROGRESS_PATTERN, line) for line in lines)
+def _is_frame_padding(line: str) -> bool:
+    """Return True when ``line`` carries nothing but frame glyphs and padding.
+
+    True of a box's top/bottom rule ("╰────╯"), of an empty interior row
+    ("│      │"), and of a blank line (space is in ``MODAL_FRAME_CHARS``).
+    """
+    return not line.strip(MODAL_FRAME_CHARS)
+
+
+def _is_chrome_only(line: str) -> bool:
+    """Return True when ``line`` is frame or TUI chrome rather than content.
+
+    The union of what may legitimately sit BELOW a live modal: the box's own
+    closing rule and interior padding, blank filler, the empty composer line
+    ("›" with nothing typed), and the status-bar footer. Anything else -- a
+    prose bullet, a spinner, a typed draft -- is content, which means the
+    modal is no longer the bottom of the pane.
+
+    The empty-composer and footer cases are matched explicitly rather than
+    folded into :func:`_is_frame_padding` because neither ``›`` nor the footer
+    text reduces to empty under ``MODAL_FRAME_CHARS``.
+    """
+    if _is_frame_padding(line):
+        return True
+    if re.fullmatch(rf"\s*{IDLE_PROMPT_PATTERN}\s*", line):
+        return True
+    return re.search(TUI_FOOTER_PATTERN, line) is not None
+
+
+def _is_transcript_marker(line: str) -> bool:
+    """Return True when ``line`` opens a new transcript cell (``›`` user / ``•`` bullet).
+
+    Used as the upward bound on the header search: Codex draws the modal as ONE
+    cell, so a user line or an assistant bullet is a hard boundary that the box
+    cannot span. This replaces a fixed line count, which could not express
+    "same box" and therefore failed open on a modal taller than the window.
+    """
+    return bool(
+        re.match(USER_PREFIX_PATTERN, line, re.IGNORECASE)
+        or re.match(ASSISTANT_PREFIX_PATTERN, line, re.IGNORECASE)
+    )
 
 
 def _has_approval_modal_in_bottom(clean_output: str) -> bool:
     """Return True when Codex's boxed command-approval modal is active at the bottom.
 
-    Bottom-anchored and doubly corroborated for the same reason as trust-v2 and
-    the update dialog: the copy can appear in scrollback from an already-answered
-    turn, or inside the model's own prose ("I hit Command Approval Required with
-    [a] Accept / [d] Decline"). Five independent guards separate the live modal
-    from those look-alikes:
+    NOTE: this detects the LEGACY "Command Approval Required" / "[a] Accept"
+    modal, which codex-cli 0.147.0 does not render — see
+    APPROVAL_MODAL_HEADER_PATTERN's comment and
+    :func:`_has_approval_prompt_in_bottom` for the copy that is live today.
 
-    1. **Region.** Only the bottom ``STARTUP_PROMPT_BOTTOM_LINES`` are searched.
-       As the pane scrolls the header leaves the region before the choice keys
-       do, so guard 2 fails first and an answered modal cannot stay latched.
-       This assumes the modal is at most that tall — true whenever the box is
-       the bottom of the pane, which is how Codex renders it.
-    2. **Corroboration.** Both the header AND a choice key must be present, in
-       that vertical order — the modal always renders header-above-keys.
-    3. **Line structure.** Each half must own its line: after reduction, the
-       header line is *exactly* the header text and the choice line *starts*
-       with a choice key. Prose embeds the phrases mid-sentence, so it fails
-       this even when it names both halves.
-    4. **Left-margin position.** Each half must sit at the box's left margin
-       rather than under a prose indent — see :func:`_modal_line_content`. This
-       is what separates a live modal from a quoted transcript, which satisfies
-       guards 1-3.
-    5. **No spinner below the choice line.** An ANSWERED modal whose work has
-       resumed but not yet scrolled the box out of the region still satisfies
-       guards 1-4, and reporting WAITING there withholds work from a pane that
-       is actively running. A live modal blocks execution, so nothing can be
-       spinning *below* it; a resumed one renders "• Working (Ns • esc to
-       interrupt)" there. Guard 1 eventually clears this case on its own, so
-       this closes a transient window rather than a permanent misread.
+    Anchored BOTTOM-UP on the last choice line, because the thing being tested
+    is an invariant about the bottom of the pane, not about a region of it: a
+    live modal blocks the TUI, so it must BE the bottom, with only frame rows
+    and footer chrome after it. Four guards:
 
-       Scoped to lines strictly BELOW the choice line, not the whole region:
-       with ``--no-alt-screen`` a spinner from earlier in the same turn can
-       survive in scrollback ABOVE the box, and a region-wide test would then
-       suppress a genuinely live modal.
+    1. **Anchor.** The LAST line that reduces to a choice key. Taking the last
+       rather than the first is what lets an already-answered modal sitting in
+       scrollback above a live one be ignored instead of vetoing it.
+    2. **Nothing but chrome below the anchor.** See :func:`_is_chrome_only`.
+       This subsumes the older spinner test (a spinner is not chrome) and also
+       rejects a modal transcript the model quoted mid-reply, since the reply
+       continues below the quote. It replaces "footer must NOT appear below",
+       which would have false-negatived every real modal: with
+       ``--no-alt-screen`` the footer renders at the bottom regardless.
+    3. **Corroborating header above the anchor,** found by walking up and
+       stopping at the first :func:`_is_transcript_marker` — the box is one
+       transcript cell, so the header must be inside it. No fixed window, so an
+       arbitrarily tall modal still resolves; previously a >15-line modal lost
+       its header and failed open to COMPLETED.
+    4. **Line structure and left-margin position.** Each half must own its line
+       (header an exact match, choice line a prefix match) and sit at the box's
+       margin rather than under a prose indent — see :func:`_modal_line_content`.
 
-    Deliberately does NOT key on whether the idle composer/footer appears below
-    the box, even though a live modal blocks input: get_status's own TUI-progress
-    comment records that with ``--no-alt-screen`` the footer is rendered at the
-    bottom *even while processing*, so "footer below" is likely true of real
-    modals too and would false-negative every one of them. The spinner in guard 5
-    is a narrower signal — it means work is actually executing, which a live
-    modal precludes.
+    Known residual: a framed modal quote that ENDS a reply, with only the empty
+    composer and footer after it, satisfies all four guards and reads as live.
+    Distinguishing it needs semantics this detector does not have; it costs a
+    spurious WAITING_USER_ANSWER (work withheld) rather than a COMPLETED (work
+    pasted into a blocked pane), which is the safe direction to be wrong in.
     """
-    bottom_lines = clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:]
+    lines = clean_output.splitlines()
 
-    header_idx = None
-    for index, line in enumerate(bottom_lines):
+    choice_idx = None
+    for index in range(len(lines) - 1, -1, -1):
+        content = _modal_line_content(lines[index])
+        if content is not None and re.match(APPROVAL_MODAL_CHOICE_PATTERN, content, re.IGNORECASE):
+            choice_idx = index
+            break
+    if choice_idx is None:
+        return False
+
+    if not all(_is_chrome_only(line) for line in lines[choice_idx + 1 :]):
+        return False
+
+    for index in range(choice_idx - 1, -1, -1):
+        line = lines[index]
         content = _modal_line_content(line)
         if content is not None and re.fullmatch(
             APPROVAL_MODAL_HEADER_PATTERN, content, re.IGNORECASE
         ):
-            header_idx = index
-            break
-    if header_idx is None:
-        return False
-
-    # Choice keys render on a later line than the header, never above it.
-    for offset, line in enumerate(bottom_lines[header_idx + 1 :]):
-        content = _modal_line_content(line)
-        if content is not None and re.match(APPROVAL_MODAL_CHOICE_PATTERN, content, re.IGNORECASE):
-            choice_idx = header_idx + 1 + offset
-            return not _has_active_spinner(bottom_lines[choice_idx + 1 :])
+            return True
+        if _is_transcript_marker(line):
+            return False
     return False
+
+
+def _has_approval_prompt_in_bottom(clean_output: str) -> bool:
+    """Return True when Codex's runtime approval prompt is active at the bottom.
+
+    This is the prompt codex-cli 0.147.0 actually renders (verified against a
+    live capture; see APPROVAL_PROMPT_PATTERN). Corroborates the question with
+    its footer inside the bottom region, exactly like the trust-v2, login, and
+    update dialogs — the prompt is a numbered menu of the same shape, so the
+    same guard against the copy surviving in scrollback applies.
+
+    BLANK LINES ARE DROPPED before the region is taken. The prompt is ~10 rows
+    of question, command preview, and options separated by blank filler, and
+    ``tmux capture-pane`` pads the pane to its full height with empty rows, so a
+    raw 15-line tail can land entirely inside the padding and see neither half.
+    Compacting first is what :meth:`CodexProvider.get_status_from_screen`
+    already does to the pyte viewport, so this makes the buffer path agree with
+    the screen path rather than inventing a second rule.
+    """
+    rows = [line for line in clean_output.splitlines() if line.strip()]
+    bottom = "\n".join(rows[-STARTUP_PROMPT_BOTTOM_LINES:])
+    return (
+        re.search(APPROVAL_PROMPT_PATTERN, bottom) is not None
+        and re.search(APPROVAL_PROMPT_FOOTER, bottom) is not None
+    )
 
 
 def _has_startup_idle_composer(clean_output: str) -> bool:
@@ -1052,6 +1153,22 @@ class CodexProvider(BaseProvider):
         # merely quotes the copy is excluded structurally instead — see
         # _has_approval_modal_in_bottom.
         if _has_approval_modal_in_bottom(clean_output):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # Runtime approval prompt as codex-cli 0.147.0 actually renders it -- a
+        # numbered menu, not the boxed modal above. This is the check that fires on
+        # a current-Codex approval; without it a live prompt classified as IDLE
+        # (verified against the live capture in
+        # test/providers/fixtures/codex_approval_modal_raw.txt), because the
+        # prompt's own "› 1. Yes, proceed (y)" cursor line is both the last
+        # USER_PREFIX_PATTERN match and an idle-prompt match, so the classification
+        # below saw a user message with no reply after it. IDLE is as dangerous as
+        # COMPLETED here: both tell the conductor the pane is free.
+        #
+        # Placed after the legacy modal check and before the idle classification,
+        # for the same reason: the composer and status bar keep rendering while the
+        # prompt is up, so the idle-prompt check cannot see the block.
+        if _has_approval_prompt_in_bottom(clean_output):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.

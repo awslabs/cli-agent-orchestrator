@@ -15,6 +15,7 @@ from cli_agent_orchestrator.providers.codex import (
     ProviderError,
     _find_response_marker,
     _has_approval_modal_in_bottom,
+    _has_approval_prompt_in_bottom,
     _has_startup_idle_composer,
     _toml_override,
     _toml_scalar,
@@ -2968,6 +2969,297 @@ class TestCodexProviderApprovalModal:
             "  gpt-5.6-sol medium · Context 100% left\n"
             "╭─ Command Approval Required ─╮\n"
             "│ [a] Accept  [d] Decline     │\n"
+        )
+
+    def test_modal_taller_than_bottom_region_is_still_waiting(self):
+        """A modal taller than STARTUP_PROMPT_BOTTOM_LINES must not fail open.
+
+        The first implementation searched only the bottom 15 lines for BOTH
+        halves, so a box with a long command preview pushed its header out of
+        the window, dropped the corroboration guard, and returned COMPLETED —
+        the exact "pane is free" misreport this class exists to prevent.
+        Anchoring bottom-up on the choice line and walking up to the enclosing
+        transcript cell removes the height ceiling.
+        """
+        preview = "".join(f"│ arg-{n:02d}={'x' * 30}   │\n" for n in range(20))
+        output = (
+            "› run the deploy script\n"
+            "• I'll run the deploy script now.\n"
+            "╭─ Command Approval Required ─╮\n" + preview + "│ [a] Accept  [d] Decline     │\n"
+            "╰─────────────────────────────╯\n"
+        )
+
+        assert _has_approval_modal_in_bottom(output)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_answered_modal_above_live_modal_does_not_veto_the_live_one(self):
+        """An answered modal above a live one must not suppress the live one.
+
+        Top-down anchoring found the FIRST header and paired it with the FIRST
+        choice line below it, then judged liveness from THAT box. The spinner
+        left in scrollback by the first command's execution sits below the first
+        choice line, so the answered box vetoed the whole detector and the live
+        box below was never considered — get_status fell through to PROCESSING.
+        Anchoring on the LAST choice line makes the live modal the subject.
+
+        The surviving spinner is the same --no-alt-screen artefact that
+        test_get_status_live_modal_with_stale_spinner_above_is_waiting relies on.
+        """
+        output = (
+            "› run both deploy scripts\n"
+            "╭─ Command Approval Required ─╮\n"
+            "│ [a] Accept  [d] Decline     │\n"
+            "╰─────────────────────────────╯\n"
+            "• Accepted — running ./scripts/deploy-a.sh.\n"
+            "• Working (12s • esc to interrupt)\n"
+            "• deploy-a.sh finished. deploy-b.sh needs approval.\n"
+            "╭─ Command Approval Required ─╮\n"
+            "│ [a] Accept  [d] Decline     │\n"
+            "╰─────────────────────────────╯\n"
+        )
+
+        assert _has_approval_modal_in_bottom(output)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_framed_quote_mid_reply_is_not_waiting(self):
+        """A framed modal quote the reply CONTINUES past must not latch WAITING.
+
+        Harder than the indented plain-text quote: the model reproduces the box
+        glyphs too, so the left-margin guard passes (the leading run contains
+        frame chrome, not just spaces) and the old detector latched
+        WAITING_USER_ANSWER for as long as the reply stayed on screen — work
+        withheld from an idle pane indefinitely.
+
+        The discriminator is positional: a live modal IS the bottom of the pane,
+        so only frame rows and footer chrome may follow it. Here the reply's own
+        closing sentence follows, which no live modal can have below it.
+        """
+        output = (
+            "› why did the earlier run stall?\n"
+            "• The terminal showed:\n"
+            "    ╭─ Command Approval Required ─╮\n"
+            "    │ [a] Accept  [d] Decline     │\n"
+            "    ╰─────────────────────────────╯\n"
+            "  so the pane was blocked on approval.\n"
+            "› \n"
+            "  ? for shortcuts                     88% context left\n"
+        )
+
+        assert not _has_approval_modal_in_bottom(output)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_typed_draft_below_modal_is_not_waiting(self):
+        """Text typed into the composer below the box means the box is not the bottom.
+
+        Control for _is_chrome_only's composer case: the EMPTY composer is
+        chrome, a composer holding a draft is content.
+        """
+        assert not _has_approval_modal_in_bottom(
+            "╭─ Command Approval Required ─╮\n"
+            "│ [a] Accept  [d] Decline     │\n"
+            "╰─────────────────────────────╯\n"
+            "› and now do the other thing\n"
+        )
+
+    def test_framed_quote_ending_a_reply_is_a_known_false_positive(self):
+        """Documents the one accepted misread: a framed quote that ENDS the reply.
+
+        With only the empty composer and status bar after it, the quote is
+        positionally indistinguishable from a live modal — separating them needs
+        semantics this detector does not have. Asserted rather than left
+        undocumented so the behaviour is a recorded trade, not a surprise.
+
+        Costs a spurious WAITING_USER_ANSWER (work withheld from an idle pane)
+        rather than a COMPLETED (work pasted into a hard-blocked pane), which is
+        the safe direction for this detector to be wrong in.
+        """
+        output = (
+            "› why did the earlier run stall?\n"
+            "• The terminal showed:\n"
+            "    ╭─ Command Approval Required ─╮\n"
+            "    │ [a] Accept  [d] Decline     │\n"
+            "    ╰─────────────────────────────╯\n"
+            "› \n"
+            "  ? for shortcuts                     88% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+
+class TestCodexProviderApprovalPromptLive:
+    """Tests for the approval prompt codex-cli 0.147.0 ACTUALLY renders.
+
+    The boxed "Command Approval Required" / "[a] Accept" modal that
+    TestCodexProviderApprovalModal covers is not emitted by 0.147.0 at all --
+    ``strings`` over the vendored native binary finds zero occurrences of that
+    copy. The live prompt is a numbered menu (see the fixture below), so without
+    APPROVAL_PROMPT_PATTERN a pane hard-blocked on a real approval classified as
+    IDLE: the prompt's own "› 1. Yes, proceed (y)" cursor line is simultaneously
+    the last USER_PREFIX_PATTERN match and an idle-prompt match, so get_status
+    saw a user message with no reply after it.
+    """
+
+    def test_get_status_live_capture_is_waiting(self):
+        """Regression against a real captured approval prompt.
+
+        Fixture is an unedited ``tmux capture-pane -p`` of codex-cli 0.147.0
+        parked on an exec approval, produced by launching
+        ``codex -a untrusted -s read-only --no-alt-screen`` and asking it to run
+        ``mkdir -p``. Before APPROVAL_PROMPT_PATTERN this returned IDLE.
+        """
+        output = load_fixture("codex_approval_modal_raw.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_from_screen_live_capture_is_waiting(self):
+        """The pyte-composited screen path must agree with the buffer path.
+
+        supports_screen_detection is True for this provider, so the screen path
+        is what StatusMonitor actually calls in production.
+        """
+        output = load_fixture("codex_approval_modal_raw.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert (
+            provider.get_status_from_screen(output.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    def test_get_status_live_capture_edits_approval_is_waiting(self):
+        """Regression against a real captured apply_patch approval.
+
+        Second unedited capture from the same live session, parked on
+        "Would you like to make the following edits?" after being asked to edit a
+        file under ``-s read-only``. Corroborates that the variants share one
+        prompt shape and footer rather than being three unrelated screens.
+        Returns IDLE without APPROVAL_PROMPT_PATTERN, same as the exec capture.
+        """
+        output = load_fixture("codex_approval_edits_raw.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status_from_screen(output.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    def test_capture_pane_trailing_padding_does_not_hide_the_prompt(self):
+        """Blank padding rows must not push the question out of the bottom region.
+
+        ``tmux capture-pane`` pads to the full pane height, and the prompt is
+        ~10 rows tall, so a raw 15-line tail can land entirely inside the
+        padding. This is the concrete reason _has_approval_prompt_in_bottom
+        compacts blank lines before taking the region.
+        """
+        prompt = (
+            "  Would you like to run the following command?\n"
+            "\n"
+            "  Environment: local\n"
+            "\n"
+            "  $ mkdir -p /tmp/subdir\n"
+            "\n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. No, and tell Codex what to do differently (esc)\n"
+            "\n"
+            "  Press enter to confirm or esc to cancel\n"
+        )
+
+        assert _has_approval_prompt_in_bottom(prompt + "\n" * 20)
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Would you like to run the following command?",
+            "Would you like to make the following edits?",
+            "Would you like to grant these permissions?",
+        ],
+    )
+    def test_all_three_approval_variants_are_waiting(self, question):
+        """exec, apply_patch, and permission-escalation approvals all block the TUI.
+
+        All three strings are present in the 0.147.0 binary and all three park
+        the pane on the same numbered menu.
+        """
+        output = (
+            "› do the thing\n"
+            "• Working on it.\n"
+            f"  {question}\n"
+            "\n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. No, and tell Codex what to do differently (esc)\n"
+            "\n"
+            "  Press enter to confirm or esc to cancel\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_question_without_footer_is_not_waiting(self):
+        """Corroboration guard: the question alone does not classify as WAITING."""
+        assert not _has_approval_prompt_in_bottom(
+            "› why did it stall?\n"
+            "• Codex asked 'Would you like to run the following command?' and waited.\n"
+            "› \n"
+            "  ? for shortcuts                     88% context left\n"
+        )
+
+    def test_footer_without_question_is_not_waiting(self):
+        """Corroboration guard: the footer alone does not classify as WAITING.
+
+        "Press enter to confirm" also appears under non-approval prompts, so on
+        its own it is not evidence of an approval.
+        """
+        assert not _has_approval_prompt_in_bottom(
+            "  Name this session\n  Press enter to confirm or esc to cancel\n"
+        )
+
+    def test_answered_prompt_scrolled_out_is_not_waiting(self):
+        """Once the prompt scrolls out of the region it must stop latching."""
+        output = (
+            "  Would you like to run the following command?\n"
+            "  $ mkdir -p /tmp/subdir\n"
+            "› 1. Yes, proceed (y)\n"
+            "  Press enter to confirm or esc to cancel\n"
+            + "".join(f"• step {n} done.\n" for n in range(16))
+            + "› \n"
+            "  ? for shortcuts                     88% context left\n"
+        )
+
+        assert not _has_approval_prompt_in_bottom(output)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_startup_path_vetoes_readiness_on_the_live_prompt(self):
+        """The startup readiness veto must know the copy Codex actually emits.
+
+        STARTUP_BLOCKING_INPUT_PATTERN only carried the legacy modal's copy, so
+        a pane parked on a real approval during initialize() could be read as an
+        idle composer and declared ready.
+        """
+        assert not _has_startup_idle_composer(
+            "› Write tests for @filename\n"
+            "  gpt-5.6-sol medium · Context 100% left\n"
+            "  Would you like to run the following command?\n"
+            "› 1. Yes, proceed (y)\n"
+            "  Press enter to confirm or esc to cancel\n"
         )
 
 
