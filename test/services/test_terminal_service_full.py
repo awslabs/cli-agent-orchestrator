@@ -1,5 +1,6 @@
 """Full tests for terminal service."""
 
+import os
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,11 +20,14 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
 
 class TestCreateTerminal:
     """Tests for create_terminal function."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -46,6 +50,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """Test creating terminal with new session."""
         mock_gen_id.return_value = "test1234"
@@ -65,6 +70,7 @@ class TestCreateTerminal:
         mock_provider.initialize.assert_called_once()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -89,6 +95,7 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
         mock_schedule_deferred_init,
+        mock_delete_terminals_by_session,
     ):
         """The real terminal layer sends the model to provider construction and
         the first task to the established deferred-init scheduler."""
@@ -127,6 +134,7 @@ class TestCreateTerminal:
         )
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -151,6 +159,7 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
         mock_resolve_allowed,
+        mock_delete_terminals_by_session,
     ):
         """Profile-derived restrictions should be persisted and used at launch."""
         mock_gen_id.return_value = "test1234"
@@ -182,10 +191,12 @@ class TestCreateTerminal:
             engine="v2",
             group=None,
             metadata=None,
+            working_directory=os.path.realpath(os.getcwd()),
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -208,6 +219,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """Regression: PR #501 review -- `model=model or (profile.model if
         profile else None)` in create_terminal is the line the entire
@@ -240,6 +252,7 @@ class TestCreateTerminal:
         )
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -262,6 +275,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """The other half of the same precedence line: with no explicit
         override, the profile's own model still reaches provider creation
@@ -286,6 +300,7 @@ class TestCreateTerminal:
         )
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -308,6 +323,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """caller_id reaches the database row and the returned Terminal (issue #284)."""
         mock_gen_id.return_value = "test1234"
@@ -369,13 +385,20 @@ class TestCreateTerminal:
         mock_tmux.create_window.assert_called_once()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     async def test_create_terminal_session_not_found(
-        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window, mock_tmux
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_delete,
     ):
         """Test creating terminal when session not found."""
         mock_gen_id.return_value = "test1234"
@@ -388,13 +411,20 @@ class TestCreateTerminal:
             await create_terminal("kiro_cli", "developer", session_name="cao-nonexistent")
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     async def test_create_terminal_session_already_exists(
-        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window, mock_tmux
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_delete,
     ):
         """Test creating terminal when session already exists."""
         mock_gen_id.return_value = "test1234"
@@ -409,6 +439,7 @@ class TestCreateTerminal:
             )
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -435,6 +466,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """Providers that consume runtime prompts should receive the global skill catalog."""
         mock_gen_id.return_value = "test1234"
@@ -476,6 +508,7 @@ class TestCreateTerminal:
         )
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -502,6 +535,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """Providers should receive an empty skill prompt when no skills are installed."""
         mock_gen_id.return_value = "test1234"
@@ -530,6 +564,7 @@ class TestCreateTerminal:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["kiro_cli", "copilot_cli"])
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -556,6 +591,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
         provider_name,
     ):
         """Kiro, Q, and Copilot should receive skill_prompt=None."""
@@ -588,6 +624,7 @@ class TestCreateTerminal:
         assert mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"] is None
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -614,6 +651,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """build_skill_catalog() is called exactly once for runtime-prompt providers."""
         mock_gen_id.return_value = "test1234"
@@ -639,6 +677,7 @@ class TestCreateTerminal:
         mock_build_skill_catalog.assert_called_once_with(["ads-*"])
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -665,6 +704,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """A `skills: []` deny-all profile threads the empty list through verbatim.
         It must NOT be coerced to None — that would leak the full catalog to an
@@ -692,6 +732,7 @@ class TestCreateTerminal:
         mock_build_skill_catalog.assert_called_once_with([])
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -718,6 +759,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """A runtime-prompt provider with no profile in the CAO store builds the
         catalog unfiltered (None). The `profile is None` guard must hold — no
@@ -741,6 +783,7 @@ class TestCreateTerminal:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["opencode_cli", "kiro_cli", "copilot_cli"])
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -767,6 +810,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
         provider_name,
     ):
         """build_skill_catalog() is never called for providers that deliver skills natively or
@@ -789,6 +833,7 @@ class TestCreateTerminal:
         mock_build_skill_catalog.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -813,6 +858,7 @@ class TestCreateTerminal:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """Terminal creation succeeds when agent profile is not in CAO store (e.g. JSON-only profiles)."""
         mock_gen_id.return_value = "test1234"
@@ -869,6 +915,7 @@ class TestCreateTerminalWorktree:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        tmp_path,
     ):
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -880,24 +927,39 @@ class TestCreateTerminalWorktree:
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        # Both directories are real: create_terminal validates the EFFECTIVE launch
+        # cwd (post-worktree-override) before handing it to tmux. Using a real
+        # SOURCE dir too is deliberate -- it means the assertions below fail on the
+        # override semantics rather than on a synthetic path being rejected first,
+        # so this test still catches a regression that resolves the cwd before the
+        # worktree block instead of after it.
+        source_dir = tmp_path / "some" / "subdir"
+        source_dir.mkdir(parents=True)
+        worktree_dir = tmp_path / "worktrees" / "test1234"
+        worktree_dir.mkdir(parents=True)
         mock_worktree_service.find_repo_root.return_value = "/repo"
-        mock_worktree_service.create_worktree.return_value = "/repo/.cao/worktrees/test1234"
+        mock_worktree_service.create_worktree.return_value = str(worktree_dir)
 
         result = await create_terminal(
             "kiro_cli",
             "developer",
             session_name="cao-existing",
-            working_directory="/repo/some/subdir",
+            working_directory=str(source_dir),
             use_worktree=True,
         )
 
         assert result.id == "test1234"
-        mock_worktree_service.find_repo_root.assert_called_once_with("/repo/some/subdir")
+        mock_worktree_service.find_repo_root.assert_called_once_with(str(source_dir))
         mock_worktree_service.create_worktree.assert_called_once_with("/repo", "test1234")
         # The worktree path -- NOT the originally-given working_directory -- is
         # what actually reaches the tmux window (create_window's 4th positional
         # arg, per its own call site in terminal_service.py).
-        assert mock_tmux.create_window.call_args.args[3] == "/repo/.cao/worktrees/test1234"
+        assert mock_tmux.create_window.call_args.args[3] == os.path.realpath(worktree_dir)
+        # ...and is also what gets persisted as the terminal's working_directory,
+        # so list_sessions ownership metadata points at the isolated checkout.
+        assert mock_db_create.call_args.kwargs["working_directory"] == os.path.realpath(
+            worktree_dir
+        )
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -993,6 +1055,7 @@ class TestCreateTerminalWorktree:
         mock_fifo_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        tmp_path,
     ):
         """The worktree WAS created before provider.initialize() failed later --
         the failure-cleanup path must roll it back too, or a provider-init
@@ -1008,8 +1071,12 @@ class TestCreateTerminalWorktree:
         mock_provider.initialize.side_effect = TimeoutError("provider init timed out")
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        # Real directory so the effective-cwd validation passes and the failure
+        # under test is the provider-init timeout this test is actually about.
+        worktree_dir = tmp_path / "worktrees" / "test1234"
+        worktree_dir.mkdir(parents=True)
         mock_worktree_service.find_repo_root.return_value = "/repo"
-        mock_worktree_service.create_worktree.return_value = "/repo/.cao/worktrees/test1234"
+        mock_worktree_service.create_worktree.return_value = str(worktree_dir)
 
         with pytest.raises(TimeoutError):
             await create_terminal(
@@ -1208,6 +1275,7 @@ class TestCreateTerminalEnvVars:
         assert extra_env == {"SESSION_VAR": "from-session"}
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.set_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -1232,6 +1300,7 @@ class TestCreateTerminalEnvVars:
         mock_fifo_manager,
         mock_status_monitor,
         mock_set_session_env,
+        mock_delete_terminals_by_session,
     ):
         """new_session=True is untouched by #408: env_vars go verbatim to
         create_session's extra_env and are persisted via set_session_env."""
@@ -1336,12 +1405,23 @@ class TestGetWorkingDirectory:
 class TestSendInput:
     """Tests for send_input function."""
 
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_send_input_success(self, mock_get_metadata, mock_tmux, mock_pm, mock_update):
+    def test_send_input_success(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
+    ):
         """Test sending input successfully."""
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
@@ -1363,13 +1443,20 @@ class TestSendInput:
         )
         mock_update.assert_called_once_with("test1234")
 
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_clears_rolling_buffer_preserving_arm(
-        self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
     ):
         """send_input clears the byte buffer AFTER arming the sticky latch.
 
@@ -1385,6 +1472,7 @@ class TestSendInput:
         placeholders from the pre-task buffer combining with input_received=
         True to trigger a false COMPLETED (the handoff-worker-killed-in-8s bug).
         """
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
@@ -1476,15 +1564,23 @@ class TestSendInput:
         mock_tmux.send_keys.assert_not_called()
         mock_update.assert_not_called()
 
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_allows_manual_answer_when_provider_waits_for_user_answer(
-        self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
     ):
         """Manual input can still answer clarify/approval prompts."""
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",

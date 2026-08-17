@@ -34,6 +34,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
+    delete_terminals_by_session,
     get_terminal_metadata,
     list_siblings_by_group_prefix,
     update_last_active,
@@ -82,6 +83,7 @@ from cli_agent_orchestrator.services.session_env import (
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -168,6 +170,16 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
 }
+
+
+def _resolve_working_directory(working_directory: Optional[str]) -> str:
+    """Resolve launch cwd exactly as the tmux backend does before creation."""
+    return resolve_and_validate_path(
+        working_directory if working_directory is not None else os.getcwd(),
+        allow_create=False,
+        allow_file=False,
+        description="Working directory",
+    )
 
 
 async def create_terminal(
@@ -348,6 +360,13 @@ async def create_terminal(
                 worktree_service.create_worktree, worktree_repo_root, terminal_id
             )
 
+        # Resolve AFTER the worktree block, not before: when `use_worktree` is set
+        # the block above REPLACES `working_directory` with the new worktree path,
+        # so resolving earlier would both launch tmux in the pre-worktree directory
+        # (defeating the isolation #100 provides) and persist that stale path as the
+        # terminal's working_directory. This is the effective launch cwd either way.
+        resolved_working_directory = _resolve_working_directory(working_directory)
+
         # Step 2: Create tmux session or window
         if new_session:
             # Ensure session name has the CAO prefix for identification
@@ -367,10 +386,11 @@ async def create_terminal(
                 session_name,
                 window_name,
                 terminal_id,
-                working_directory,
+                resolved_working_directory,
                 extra_env=env_vars,
             )
             session_created = True  # only set after successful creation
+            delete_terminals_by_session(session_name)
 
             # Persist forwarded env only after the tmux session actually
             # exists; the failure path below clears it if a later step
@@ -389,7 +409,7 @@ async def create_terminal(
                 session_name,
                 window_name,
                 terminal_id,
-                working_directory,
+                resolved_working_directory,
                 extra_env={**get_session_env(session_name), **(env_vars or {})},
             )
             window_created = True  # only set after successful creation
@@ -429,6 +449,7 @@ async def create_terminal(
             engine=resolved_engine.value if resolved_engine is not None else None,
             group=group,
             metadata=metadata,
+            working_directory=resolved_working_directory,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
