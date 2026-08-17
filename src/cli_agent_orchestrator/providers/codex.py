@@ -644,6 +644,18 @@ class CodexProvider(BaseProvider):
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Dismiss startup prompts that block readiness.
 
+        Every backend call here (get_history/send_keys/send_special_key) is a
+        blocking subprocess exec, and this loop makes one per second for up to
+        ``timeout`` seconds. cao-server runs a SINGLE event loop, so leaving
+        them loop-side froze every other concurrent request — including every
+        other terminal's own init — for the duration. They are offloaded to
+        threads for the same reason claude_code's startup handler was in #451
+        and kimi_cli/antigravity_cli/copilot_cli's were in #494. Codex is not
+        the last such gap — kiro_cli, opencode_cli and cursor_cli still make
+        loop-side backend calls in ``initialize()`` — but it is the slowest
+        init of the group, so a concurrent fan-out of codex launches is where
+        the self-inflicted queueing showed up first.
+
         Handles two classes of blocking dialog in a single poll loop:
 
         1. Workspace trust prompt (two variants):
@@ -661,7 +673,9 @@ class CodexProvider(BaseProvider):
         trust_dismissed = False
         update_dismissed = False
         while time.time() - start_time < timeout:
-            output = get_backend().get_history(self.session_name, self.window_name)
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
             if not output:
                 await asyncio.sleep(1.0)
                 continue
@@ -673,7 +687,9 @@ class CodexProvider(BaseProvider):
 
                 logger.info("Codex workspace trust prompt (v1) detected, auto-accepting")
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 trust_dismissed = True
                 await asyncio.sleep(1.0)
                 continue
@@ -689,7 +705,9 @@ class CodexProvider(BaseProvider):
 
                 logger.info("Codex workspace trust prompt (v2) detected, auto-accepting")
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 trust_dismissed = True
                 await asyncio.sleep(1.0)
                 continue
@@ -701,10 +719,18 @@ class CodexProvider(BaseProvider):
                     "Codex update-available dialog detected, selecting " "'Skip until next version'"
                 )
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_keys(self.session_name, self.window_name, "3", enter_count=0)
+                await asyncio.to_thread(
+                    get_backend().send_keys,
+                    self.session_name,
+                    self.window_name,
+                    "3",
+                    enter_count=0,
+                )
                 # TUI rendering latency: '3' highlights the menu item, Enter confirms.
                 await asyncio.sleep(0.3)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 update_dismissed = True
                 await asyncio.sleep(1.0)
                 continue
@@ -729,7 +755,9 @@ class CodexProvider(BaseProvider):
 
         pane_tail = ""
         try:
-            output = get_backend().get_history(self.session_name, self.window_name)
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
             if output:
                 pane_tail = "\n".join(output.splitlines()[-10:])
         except Exception:
@@ -750,8 +778,10 @@ class CodexProvider(BaseProvider):
 
         # Capture the shell process name before launching codex — used later to
         # detect when codex has exited and the pane is back to a bare shell.
-        self.shell_baseline = get_backend().get_pane_current_command(
-            self.session_name, self.window_name
+        # Offloaded like the rest of this method's backend calls (#451): each is
+        # a blocking subprocess exec on cao-server's single shared event loop.
+        self.shell_baseline = await asyncio.to_thread(
+            get_backend().get_pane_current_command, self.session_name, self.window_name
         )
 
         # Send a warm-up command before launching codex.
@@ -761,7 +791,9 @@ class CodexProvider(BaseProvider):
         # external input that must be allowed to drive PROCESSING transitions
         # past any previously-latched ready state.
         status_monitor.notify_input_sent(self.terminal_id)
-        get_backend().send_keys(self.session_name, self.window_name, "echo ready")
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, "echo ready"
+        )
         await asyncio.sleep(2.0)
 
         # Build command with flags and agent profile (developer_instructions).
@@ -771,10 +803,21 @@ class CodexProvider(BaseProvider):
         #   caused by the shell_snapshot subprocess inheriting stdin.
         command = self._build_codex_command()
         status_monitor.notify_input_sent(self.terminal_id)
-        get_backend().send_keys(self.session_name, self.window_name, command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
-        # Handle workspace trust prompt if it appears (new/untrusted directories)
-        await self._handle_trust_prompt(timeout=20.0)
+        # Handle workspace trust prompt if it appears (new/untrusted directories).
+        # Timeout comes from settings — matching kimi_cli / antigravity_cli /
+        # claude_code, which all read ``startup_prompt_handler_timeout`` — so an
+        # operator on a slow or containerized host can widen it. The hard-coded
+        # 20.0 could not be raised without a code change, and a cold start that
+        # renders its first frame later than that falls through to "startup
+        # prompt handler timed out" and has to be rescued by the
+        # wait_until_status below.
+        await self._handle_trust_prompt(
+            timeout=float(get_server_settings()["startup_prompt_handler_timeout"])
+        )
 
         # WAITING_USER_ANSWER is included here specifically for the first-run login/auth
         # menu (see LOGIN_MENU_PATTERN's own comment) — an account with no credentials
@@ -795,10 +838,13 @@ class CodexProvider(BaseProvider):
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
+            timeout=float(init_timeout),
             polling_interval=1.0,
         ):
-            raise TimeoutError("Codex initialization timed out after 60 seconds")
+            # Interpolated, not the old hard-coded "60 seconds": the bound is
+            # ``provider_init_timeout``, so an operator who changed it was told
+            # a number the code never used.
+            raise TimeoutError(f"Codex initialization timed out after {init_timeout}s")
 
         self._initialized = True
         return True
