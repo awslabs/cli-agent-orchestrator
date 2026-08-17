@@ -194,6 +194,12 @@ def _subprocess_env(
         env.pop(leaked, None)
     for ambient in AMBIENT_SERVER_VARS:
         env.pop(ambient, None)
+    # The subprocess's state root is the fixture's HOME shim below, never an
+    # inherited CAO_STATE_ROOT (the suite-level test injection included —
+    # see test/conftest.py): this fixture computes and asserts paths under
+    # ``home_dir / ".aws" / "cli-agent-orchestrator"``. A test that wants a
+    # relocated root passes it explicitly via ``extra``.
+    env.pop("CAO_STATE_ROOT", None)
 
     env.update(
         {

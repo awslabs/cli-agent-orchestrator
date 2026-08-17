@@ -60,6 +60,12 @@ _NATIVE_ID = "11111111-2222-4333-8444-555555555555"
 _CELL_REF = "claude_code:anthropic:native_tui"
 _CELL_DIGEST = "c" * 64
 
+# Canonical-by-construction fixture paths — see test_restore_contract.py.
+# A literal naming a real operator path fails the contract validator's
+# canonical-realpath check on any machine where a component is a symlink.
+_WORKTREE = "/cao-test-fixture/worktree"
+_PROFILE_CONFIG = "/cao-test-fixture/profile/settings.json"
+
 
 def _fact(value):
     return rc.ContractFact.present(value)
@@ -101,12 +107,12 @@ def _contract_for(bind, **changes):
         "execution_mode": bind["incarnation"]["execution_mode"],
         "model": _fact("claude-sonnet-4-5"),
         "effort": _fact("high"),
-        "working_directory": "/Users/colin/Projects/cao",
-        "trusted_project_root": "/Users/colin/Projects/cao",
+        "working_directory": _WORKTREE,
+        "trusted_project_root": _WORKTREE,
         "executable": _fact({"path": "/usr/local/bin/claude", "sha256": _DIGEST64}),
         "profile_material": _fact(
             {
-                "profile_config_path": "/Users/colin/.claude/settings.json",
+                "profile_config_path": _PROFILE_CONFIG,
                 "profile_config_sha256": "b" * 64,
             }
         ),
