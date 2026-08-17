@@ -1,5 +1,9 @@
-# Supervisor Deployment — single replica running code_supervisor profile.
-# The supervisor delegates work to worker pods via their stable DNS names.
+# Supervisor Deployment — the single "server" pod of the one-agent-per-pod
+# topology. It runs the code_supervisor agent and delegates work to worker
+# pods (each capped at one agent via CAO_MAX_TERMINALS=1) by passing their
+# stable DNS names as the assign/handoff `target_host` parameter.
+# CAO_ADVERTISED_URL tells remote workers how to reach this pod so their
+# send_message callbacks route back cross-pod.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,6 +14,9 @@ metadata:
     app.kubernetes.io/part-of: cao-fleet
 spec:
   replicas: 1
+  # The PVC below is ReadWriteOnce; never run two supervisor pods against it.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: cao-supervisor
@@ -33,9 +40,19 @@ spec:
               value: "9889"
             - name: CAO_ALLOWED_HOSTS
               value: "cao-supervisor,cao-supervisor.cao-cluster.svc.cluster.local,localhost"
+            # Peer-reachable base URL of THIS node, injected into remote
+            # workers as CAO_CALLBACK_URL so their results route back here.
+            # Required for assign with target_host.
+            - name: CAO_ADVERTISED_URL
+              value: "http://cao-supervisor.cao-cluster.svc.cluster.local:9889"
             # Supervisor installs the code_supervisor profile
             - name: CAO_INSTALL_PROFILES
               value: "code_supervisor:mock_cli"
+            # Deliberately NO CAO_MAX_TERMINALS here: the supervisor pod is
+            # uncapped so its own terminal plus any sidecars can coexist. In
+            # this topology delegated workers should not land here either way —
+            # assign/handoff calls from the supervisor should always carry
+            # target_host=<worker pod> so agents run on the capped worker pods.
           resources:
             requests:
               cpu: 250m
@@ -66,9 +83,27 @@ spec:
               mountPath: /home/cao/.cao
       volumes:
         - name: cao-state
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: cao-supervisor-state
 ---
-# ClusterIP Service for the supervisor (fleet panel connects to this)
+# Persistent state for the supervisor (SQLite DB, logs, installed profiles).
+# Survives pod restarts/rescheduling, unlike the emptyDir it replaces.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cao-supervisor-state
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-supervisor
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# ClusterIP Service for the supervisor (fleet panel and worker callbacks
+# connect to this)
 apiVersion: v1
 kind: Service
 metadata:

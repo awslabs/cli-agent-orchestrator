@@ -1,5 +1,5 @@
 # Headless Service — gives each worker pod a stable DNS name:
-#   cao-worker-{0..N-1}.cao-workers.cao.svc.cluster.local
+#   cao-worker-{0..N-1}.cao-workers.cao-cluster.svc.cluster.local
 # This is required because sessions are pinned to the pod that spawned them;
 # the supervisor must address each worker by name, not through a load balancer.
 apiVersion: v1

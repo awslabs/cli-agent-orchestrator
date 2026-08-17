@@ -284,6 +284,42 @@ def get_server_settings() -> Dict[str, Any]:
     return dict(result)
 
 
+def get_max_terminals() -> Optional[int]:
+    """Max live terminals this node will host, or None for unlimited.
+
+    Precedence: ``CAO_MAX_TERMINALS`` env var > ``server.max_terminals`` in
+    settings.json > None (unlimited — the pre-cap default, so existing
+    deployments are unaffected).
+
+    Used by ``terminal_service.create_terminal`` to reject creation when the
+    node is full. The one-agent-per-pod Kubernetes topology sets
+    ``CAO_MAX_TERMINALS=1`` on worker pods so each pod hosts exactly one agent.
+
+    Not folded into ``_SERVER_DEFAULTS`` because that table's validation forces
+    every key to a positive int default; this setting's default is "absent"
+    (unlimited), which that machinery cannot represent. Invalid or non-positive
+    values are ignored with a warning (unlimited) rather than treated as 0,
+    which would brick all terminal creation on a typo.
+    """
+    raw = os.environ.get("CAO_MAX_TERMINALS")
+    source = "CAO_MAX_TERMINALS"
+    if raw is None or raw.strip() == "":
+        saved = _load().get("server", {})
+        raw = saved.get("max_terminals") if isinstance(saved, dict) else None
+        source = "server.max_terminals"
+        if raw is None:
+            return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Ignoring invalid {source}={raw!r} (expected int); terminals unlimited")
+        return None
+    if value <= 0:
+        logger.warning(f"Ignoring non-positive {source}={value}; terminals unlimited")
+        return None
+    return value
+
+
 def get_memory_settings() -> Dict[str, Any]:
     """Get memory-related settings.
 

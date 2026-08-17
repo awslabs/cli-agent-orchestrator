@@ -27,6 +27,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import requests
+
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
@@ -36,6 +38,7 @@ from cli_agent_orchestrator.clients.database import delete_terminal as db_delete
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_session,
     get_terminal_metadata,
+    list_all_terminals,
     list_siblings_by_group_prefix,
     update_last_active,
     update_terminal_group,
@@ -43,6 +46,8 @@ from cli_agent_orchestrator.clients.database import (
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.constants import (
+    CALLBACK_TERMINAL_ID_ENV,
+    CALLBACK_URL_ENV,
     FIFO_DIR,
     PIPE_LIVENESS_TAIL_LINES,
     SESSION_PREFIX,
@@ -55,6 +60,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     Terminal,
     TerminalInputBlockedError,
+    TerminalLimitError,
     TerminalStatus,
 )
 from cli_agent_orchestrator.plugins import (
@@ -82,6 +88,7 @@ from cli_agent_orchestrator.services.session_env import (
     set_session_env,
 )
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -104,6 +111,12 @@ logger = logging.getLogger(__name__)
 # STATE_BUFFER_MAX is only 8 KiB) yet bounds the worst-case allocation and
 # response size to a fixed, predictable amount regardless of on-disk log size.
 TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
+
+# Timeout (seconds) for the cross-node deferred-failure notification POST to a
+# remote supervisor's inbox. Runs on a worker thread, so a slow peer only
+# delays this one notification — but still bounded so a black-holed node can't
+# pin the thread.
+CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
@@ -428,8 +441,26 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        TerminalLimitError: If the node's live-terminal cap (CAO_MAX_TERMINALS /
+            server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
+    # Per-node terminal cap (one-agent-per-pod k8s topology; worker pods set
+    # CAO_MAX_TERMINALS=1). Checked FIRST, before any resource (worktree, tmux
+    # window, DB row, provider process) is allocated, so a full node rejects
+    # cleanly with nothing to roll back. Best-effort under concurrency: two
+    # simultaneous creates can both pass the check (no cross-request lock),
+    # which is acceptable for the cap's placement-guard purpose.
+    max_terminals = get_max_terminals()
+    if max_terminals is not None:
+        live_count = len(list_all_terminals())
+        if live_count >= max_terminals:
+            raise TerminalLimitError(
+                f"Terminal limit reached: this node already has {live_count} live "
+                f"terminal(s) and CAO_MAX_TERMINALS/server.max_terminals is "
+                f"{max_terminals}. Delete a terminal or target a different node."
+            )
+
     terminal_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
@@ -977,6 +1008,40 @@ async def create_terminal(
         raise
 
 
+def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str) -> bool:
+    """Deliver a deferred-init failure to a CROSS-NODE supervisor, if one is recorded.
+
+    A worker created remotely (assign with ``target_host``) has no local
+    ``caller_id`` row — its supervisor's terminal lives on ANOTHER node. The
+    creating supervisor injected ``CAO_CALLBACK_URL`` / ``CAO_CALLBACK_TERMINAL_ID``
+    into the session env at creation time (persisted via ``set_session_env``),
+    so read them back and POST the failure straight to the supervisor node's
+    inbox endpoint. Best-effort; returns True only when the remote POST
+    succeeded. Note the session-env store is process-local — after a cao-server
+    restart the route is gone and this degrades to the log-only path.
+    """
+    try:
+        session_env = get_session_env(session_name)
+        callback_url = (session_env.get(CALLBACK_URL_ENV) or "").rstrip("/")
+        callback_terminal_id = session_env.get(CALLBACK_TERMINAL_ID_ENV)
+        if not callback_url or not callback_terminal_id:
+            return False
+        response = requests.post(
+            f"{callback_url}/terminals/{callback_terminal_id}/inbox/messages",
+            params={"sender_id": terminal_id, "message": message},
+            timeout=CROSS_NODE_NOTIFY_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        logger.warning(
+            "Deferred-init failure notify: cross-node delivery for worker %s failed: %s",
+            terminal_id,
+            exc,
+        )
+        return False
+
+
 def _notify_caller_of_deferred_failure(
     terminal_id: str,
     message: str,
@@ -989,15 +1054,21 @@ def _notify_caller_of_deferred_failure(
     Runs in a worker thread (blocking DB + tmux I/O). The supervisor is the
     worker's ``caller_id``; we enqueue a PENDING inbox message to it so the
     failure surfaces as the supervisor's next input instead of leaving it to
-    wait forever on a callback that will never come. Every step is best-effort
-    and independently guarded — a failure to notify must not prevent teardown,
+    wait forever on a callback that will never come. When there is no LOCAL
+    caller row, the worker may have been created by a CROSS-NODE supervisor
+    (assign with ``target_host``) — in that case the failure is POSTed to the
+    supervisor node recorded in the session's callback env (see
+    ``_notify_cross_node_caller``). Every step is best-effort and
+    independently guarded — a failure to notify must not prevent teardown,
     and a failure to tear down must not crash the background task.
     """
     caller_id = None
+    session_name = None
     try:
         metadata = get_terminal_metadata(terminal_id)
         if metadata:
             caller_id = metadata.get("caller_id")
+            session_name = metadata.get("tmux_session")
     except Exception as exc:  # noqa: BLE001 — notification is best-effort
         logger.warning(
             "Deferred-init failure notify: could not read metadata for %s: %s",
@@ -1016,6 +1087,8 @@ def _notify_caller_of_deferred_failure(
                 terminal_id,
                 exc,
             )
+    elif session_name and _notify_cross_node_caller(terminal_id, session_name, message):
+        pass  # delivered to the cross-node supervisor's inbox
     else:
         logger.warning(
             "Deferred-init failure for %s has no caller_id to notify; failure is " "log-only.",

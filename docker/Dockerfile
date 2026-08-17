@@ -1,8 +1,13 @@
 # CAO node image — one container = one CAO node (cao-server + tmux + agents).
 #
 # Both the supervisor pod and worker pods run this same image; they differ only
-# in env/config (installed agent profiles, MCP config). See docs/fleet-coordinator.md
-# for the cross-node architecture this image is a building block of.
+# in env/config. In the k8s one-agent-per-pod topology (see k8s/):
+#   - the single SUPERVISOR pod runs the code_supervisor agent and delegates
+#     work to worker pods via the assign/handoff `target_host` parameter;
+#   - each WORKER pod hosts exactly one agent (CAO_MAX_TERMINALS=1) and
+#     rejects further placements, so pods stay one-agent-sized.
+# See docs/fleet-coordinator.md for the cross-node architecture this image is
+# a building block of.
 #
 # Build (from repo root):
 #   docker build -t cao-node:dev -f docker/Dockerfile .
