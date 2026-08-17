@@ -184,8 +184,11 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
       await api.deleteTerminal(pendingClose.id)
       if (liveTerminal?.id === pendingClose.id) setLiveTerminal(null)
       showSnackbar({ type: 'success', message: `Terminal ${pendingClose.id} closed` })
-    } catch {
-      showSnackbar({ type: 'error', message: `Failed to close terminal` })
+    } catch (e: any) {
+      showSnackbar({
+        type: 'error',
+        message: e.detail || e.message || `Failed to close terminal`,
+      })
     }
     setClosingTerminal(null)
     setPendingClose(null)

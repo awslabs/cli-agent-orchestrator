@@ -65,14 +65,16 @@ portable and make profile listings useful.
 - `codexProfile` (string): named Codex configuration profile.
 - `codexConfig` (object): inline Codex configuration overrides.
 - `hermesProfile` (string): Hermes profile wrapper command.
+- `grokNativeWorkflows` (boolean): explicit Grok Build-native worker/workflow
+  opt-in; defaults to `false`.
 
 Provider support for pass-through fields differs. Use the focused guides for
 [Kiro CLI](kiro-cli.md), [Claude Code](claude-code.md),
 [Codex CLI](codex-cli.md), [Antigravity CLI](antigravity-cli.md),
 [Hermes](hermes.md), [Kimi CLI](kimi-cli.md),
-[GitHub Copilot CLI](copilot-cli.md), [OpenCode CLI](opencode-cli.md), and
-[Cursor CLI](cursor-cli.md) instead of relying on a duplicated compatibility
-catalog here.
+[GitHub Copilot CLI](copilot-cli.md), [OpenCode CLI](opencode-cli.md),
+[Cursor CLI](cursor-cli.md), and [Grok Build CLI](grok-cli.md) instead of
+relying on a duplicated compatibility catalog here.
 
 ## Tool restrictions
 

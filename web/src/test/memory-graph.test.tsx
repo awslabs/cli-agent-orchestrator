@@ -149,6 +149,7 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
         status,
         statusText: status === 200 ? 'OK' : 'Error',
         json: () => Promise.resolve(body),
+        text: () => Promise.resolve(JSON.stringify(body)),
       })
     })
   }
@@ -512,12 +513,13 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
           status: 200,
           statusText: 'OK',
           json: () => Promise.resolve(PROJECT_GRAPH),
+          text: () => Promise.resolve(JSON.stringify(PROJECT_GRAPH)),
         }))
       }
       if (u.startsWith('/graph/memory?scope=global')) {
-        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH) })
+        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH), text: () => Promise.resolve(JSON.stringify(GRAPH)) })
       }
-      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES) })
+      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES), text: () => Promise.resolve(JSON.stringify(MEMORIES)) })
     })
 
     render(<MemoryPanel />)
@@ -571,12 +573,13 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
           status: 500,
           statusText: 'Server Error',
           json: () => Promise.resolve({ detail: 'boom' }),
+          text: () => Promise.resolve(JSON.stringify({ detail: 'boom' })),
         }))
       }
       if (u.startsWith('/graph/memory?scope=global')) {
-        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH) })
+        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH), text: () => Promise.resolve(JSON.stringify(GRAPH)) })
       }
-      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES) })
+      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES), text: () => Promise.resolve(JSON.stringify(MEMORIES)) })
     })
 
     render(<MemoryPanel />)
@@ -628,12 +631,13 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
           status: 200,
           statusText: 'OK',
           json: () => Promise.resolve(GRAPH),
+          text: () => Promise.resolve(JSON.stringify(GRAPH)),
         }))
       }
       if (u.startsWith('/graph/memory?scope=global')) {
         return globalGate
       }
-      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES) })
+      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES), text: () => Promise.resolve(JSON.stringify(MEMORIES)) })
     })
 
     render(<MemoryPanel />)

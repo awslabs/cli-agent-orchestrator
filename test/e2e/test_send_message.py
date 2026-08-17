@@ -306,3 +306,17 @@ class TestAntigravityCliSendMessage:
 class TestOmpSendMessage:
     def test_send_message_to_inbox(self, require_omp):
         _run_send_message_test(provider="omp", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Grok Build CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGrokCliSendMessage:
+    """E2E inbox delivery test for the official xAI Grok Build CLI."""
+
+    def test_send_message_to_inbox(self, require_grok):
+        """Deliver an inbox message to an idle Grok terminal and process it."""
+        _run_send_message_test(provider="grok_cli", agent_profile="developer")

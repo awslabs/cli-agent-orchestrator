@@ -986,3 +986,11 @@ def test_launch_omp_requires_workspace_confirmation():
     assert "launching on omp" in result.output
     assert "Proceed?" in result.output
     mock_post.assert_called_once()
+
+
+def test_grok_cli_requires_workspace_access_confirmation():
+    from cli_agent_orchestrator.cli.commands.launch import (
+        PROVIDERS_REQUIRING_WORKSPACE_ACCESS,
+    )
+
+    assert "grok_cli" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS

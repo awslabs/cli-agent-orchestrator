@@ -92,6 +92,11 @@
       "type": "string",
       "minLength": 1
     },
+    "grokNativeWorkflows": {
+      "type": "boolean",
+      "default": false,
+      "description": "Grok Build only. Explicitly permits Grok-native subagents, workflows, and /goal in this CAO terminal."
+    },
     "skills": {
       "type": "array",
       "items": {"type": "string"}
