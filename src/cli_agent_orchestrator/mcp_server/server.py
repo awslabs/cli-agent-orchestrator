@@ -24,6 +24,7 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck
 from cli_agent_orchestrator.services.memory_service import (
@@ -271,9 +272,9 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
-        if engine is not None:
+        if provider == ProviderType.KIRO_CLI.value and engine is not None:
             params["engine"] = engine
-        if model is not None:
+        if provider != ProviderType.MINIMAX_CODE.value and model and model.strip():
             params["model"] = model
         if use_worktree:
             params["use_worktree"] = "true"
@@ -321,9 +322,9 @@ def _create_terminal(
         }
         if working_directory:
             params["working_directory"] = working_directory
-        if engine is not None:
+        if provider == ProviderType.KIRO_CLI.value and engine is not None:
             params["engine"] = engine
-        if model is not None:
+        if provider != ProviderType.MINIMAX_CODE.value and model and model.strip():
             params["model"] = model
 
         json_body = None
@@ -795,9 +796,9 @@ async def _handoff_impl(
             payload["allowed_tools"] = ctx.allowed_tools
         if working_directory:
             payload["working_directory"] = working_directory
-        if engine is not None:
+        if provider == ProviderType.KIRO_CLI.value and engine is not None:
             payload["engine"] = engine
-        if model:
+        if provider != ProviderType.MINIMAX_CODE.value and model and model.strip():
             payload["model"] = model
 
         # Allow the full step time plus the server-side ready-wait (up to 120s)
