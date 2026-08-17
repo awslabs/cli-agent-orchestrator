@@ -852,6 +852,108 @@ def test_a_transfer_without_a_delivered_packet_is_refused():
 
 
 # ---------------------------------------------------------------------------
+# the successor's stamp resolves from the handoff row (cond-0478)
+# ---------------------------------------------------------------------------
+
+
+def test_the_successors_full_triple_comes_from_the_row_not_the_callers_body():
+    # cond-0441 roster-corrects the delivery and records the corrected triple
+    # on the row; the transfer's incarnation CAS proves only the id. A caller
+    # whose body still carries the pre-correction generation must not stamp it
+    # onto the successor occurrence.
+    from cli_agent_orchestrator.services import stable_agent_roster as roster
+
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    retired = _bind_roster(recipient_agent, suffix="2", generation="gen-1")
+    retired_incarnation = retired["incarnation"]["incarnation_id"]
+    roster.retire_incarnation(terminal_id="term-2", generation="gen-1", reason="rebound")
+    live = _bind_roster(recipient_agent, suffix="2", generation="gen-2")
+    live_incarnation = live["incarnation"]["incarnation_id"]
+    delivered = th.record_packet_delivery(
+        handoff["handoff_id"],
+        delivered=True,
+        incarnation=occ.EffectIncarnation(
+            incarnation_id=retired_incarnation, terminal_id="term-2", generation="gen-1"
+        ),
+    )
+    assert delivered["to_generation"] == "gen-2"
+
+    result = th.complete_handoff(
+        handoff["handoff_id"],
+        # The CAS-passing caller still asserts the pre-rebind generation.
+        incarnation=occ.EffectIncarnation(
+            incarnation_id=live_incarnation, terminal_id="term-2", generation="gen-1"
+        ),
+        expected_revision=0,
+        completed_by="supervisor",
+    )
+    successor = result["successor_occurrence"]
+    record = th.get_handoff(handoff["handoff_id"])
+    assert successor["incarnation_id"] == record["to_incarnation_id"] == live_incarnation
+    assert successor["terminal_id"] == record["to_terminal_id"] == "term-2"
+    assert successor["generation"] == record["to_generation"] == "gen-2"
+
+
+def test_a_caller_naming_a_foreign_live_pane_does_not_stamp_it_on_the_successor():
+    # The caller's incarnation id matches the row, but its terminal and
+    # generation name another worker's live pane. The row's roster-verified
+    # copy wins; stamping the foreign pane would send the
+    # finalize-by-occurrence-id recovery paths to a pane that is not the
+    # recipient's.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _deliver(_begin(donor, recipient_agent))  # row: inc-2 / term-2 / gen-2
+    foreign = _bind_roster(str(uuid.uuid4()), suffix="9")
+    assert foreign["incarnation"]["terminal_id"] == "term-9"
+
+    result = th.complete_handoff(
+        handoff["handoff_id"],
+        incarnation=occ.EffectIncarnation(
+            incarnation_id="inc-2", terminal_id="term-9", generation="gen-9"
+        ),
+        expected_revision=0,
+        completed_by="supervisor",
+    )
+    successor = result["successor_occurrence"]
+    record = th.get_handoff(handoff["handoff_id"])
+    assert successor["incarnation_id"] == record["to_incarnation_id"] == "inc-2"
+    assert successor["terminal_id"] == record["to_terminal_id"] == "term-2"
+    assert successor["generation"] == record["to_generation"] == "gen-2"
+
+
+def test_a_null_generation_on_the_row_stamps_null_not_the_callers_value():
+    # generation is the one nullable column of the triple: terminal_id cannot
+    # be NULL on a delivered handoff, because the delivery required a named
+    # incarnation and EffectIncarnation refuses an empty terminal. A NULL
+    # generation means the delivery established none, and the complete-time
+    # caller's assertion was never verified against anything, so the successor
+    # records none rather than adopting it.
+    donor_agent, recipient_agent, donor = _pair()
+    handoff = _begin(donor, recipient_agent)
+    delivered = th.record_packet_delivery(
+        handoff["handoff_id"],
+        delivered=True,
+        incarnation=occ.EffectIncarnation(
+            incarnation_id="inc-2", terminal_id="term-2", generation=None
+        ),
+    )
+    assert delivered["to_generation"] is None
+
+    result = th.complete_handoff(
+        handoff["handoff_id"],
+        incarnation=occ.EffectIncarnation(
+            incarnation_id="inc-2", terminal_id="term-2", generation="gen-late"
+        ),
+        expected_revision=0,
+        completed_by="supervisor",
+    )
+    successor = result["successor_occurrence"]
+    assert successor["incarnation_id"] == "inc-2"
+    assert successor["terminal_id"] == "term-2"
+    assert successor["generation"] is None
+
+
+# ---------------------------------------------------------------------------
 # transferring
 # ---------------------------------------------------------------------------
 
