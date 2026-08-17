@@ -101,7 +101,7 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
@@ -2955,6 +2955,10 @@ async def create_session(
 
         return result
 
+    except TerminalLimitError as e:
+        # Node is at its live-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request: the caller should retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -3170,6 +3174,11 @@ async def create_terminal_in_session(
         # a rejected engine is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except TerminalLimitError as e:
+        # Node is at its live-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request or a missing session: the caller should
+        # retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
@@ -3977,6 +3986,12 @@ async def run_step(
         # plain-string detail, no ``kind``), not 404 (issue #570).
         _settle_step(None, str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    except TerminalLimitError as e:
+        # The node is at its live-terminal cap (CAO_MAX_TERMINALS) — surfaced
+        # as 429 so a step scheduler can retry on a different node instead of
+        # reading a kind-less 500.
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

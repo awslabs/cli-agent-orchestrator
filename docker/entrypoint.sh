@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # cao-entrypoint — start one CAO node inside a container.
 #
+# In the k8s one-agent-per-pod topology (k8s/), the same entrypoint serves two
+# roles distinguished purely by env: the SUPERVISOR pod (code_supervisor
+# profile, CAO_ADVERTISED_URL set, no terminal cap) delegates work to WORKER
+# pods (worker profile, CAO_MAX_TERMINALS=1 — exactly one agent per pod) via
+# the assign/handoff `target_host` parameter.
+#
 # Env:
 #   CAO_BIND_HOST         bind address for cao-server (default 0.0.0.0 —
 #                         container networking is expected to gate access;
@@ -11,6 +17,13 @@
 #   CAO_INSTALL_PROFILES  optional space-separated "profile:provider" pairs to
 #                         install before the server starts,
 #                         e.g. "code_supervisor:kiro_cli developer:claude_code"
+#   CAO_MAX_TERMINALS     optional cap on live terminals this node will host
+#                         (unset = unlimited). Worker pods set 1 so each pod
+#                         hosts exactly one agent; extra placements get HTTP 429.
+#   CAO_ADVERTISED_URL    base URL at which PEERS can reach this node's
+#                         cao-server (e.g. http://cao-supervisor:9889). Set on
+#                         the supervisor pod so remote workers' send_message
+#                         callbacks can route results back cross-pod.
 #
 # SECURITY: cao-server has no per-request auth by default. Anyone who can reach
 # the port can launch agents (command execution) in this container. Restrict

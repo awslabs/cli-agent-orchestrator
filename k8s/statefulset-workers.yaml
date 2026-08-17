@@ -1,11 +1,16 @@
-# StatefulSet for CAO worker nodes.
-# Each pod = one CAO node (cao-server + tmux + agents). Workers are addressed
-# by stable DNS: cao-worker-{0..N-1}.cao-workers.cao.svc.cluster.local
+# StatefulSet for CAO worker nodes — ONE AGENT PER POD.
+# Each pod runs a cao-server whose CAO_MAX_TERMINALS=1 caps it at exactly one
+# live agent terminal. The single supervisor pod delegates work here via the
+# assign/handoff `target_host` parameter, addressing workers by stable DNS:
+#   cao-worker-{0..N-1}.cao-workers.cao-cluster.svc.cluster.local
+# A worker whose one slot is taken rejects further placements with HTTP 429,
+# so the supervisor can retry on the next worker.
 #
 # Why StatefulSet over Deployment:
 #   - Sessions are pinned to the pod that created them (stable addressing)
 #   - Predictable scale-down (highest ordinal first, supervisor can drain)
 #   - Enumerable fleet for MCP config rendering
+#   - Per-pod persistent state via volumeClaimTemplates (~/.cao survives restarts)
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -45,9 +50,26 @@ spec:
                   fieldPath: metadata.name
             - name: CAO_ALLOWED_HOSTS
               value: "$(POD_NAME).cao-workers,$(POD_NAME).cao-workers.cao-cluster.svc.cluster.local,localhost"
-            # Install profiles on startup
+            # One agent per pod: reject a second terminal placement (HTTP 429)
+            # instead of oversubscribing the pod's CPU/memory.
+            # Notes on the cap:
+            #   - It counts EVERY live terminal, including one stuck in ERROR:
+            #     a crashed agent keeps occupying the pod's only slot until the
+            #     supervisor frees it with
+            #     delete_terminal(<id>, target_host=<this pod>).
+            #   - It also blocks the optional memory_manager sidecar terminal
+            #     (memory_manager=true session flag), so cross-session memory
+            #     curation is effectively disabled on worker pods.
+            - name: CAO_MAX_TERMINALS
+              value: "1"
+            # Worker profile installed on startup. mock_cli is the
+            # credentials-free smoke-test default baked into the image; swap
+            # in a real provider CLI for actual work, e.g.:
+            #   value: "developer:claude_code"
+            # (the image must have that provider CLI installed/authenticated,
+            # and the worker egress NetworkPolicy must allow its API endpoints).
             - name: CAO_INSTALL_PROFILES
-              value: "code_supervisor:mock_cli"
+              value: "developer:mock_cli"
           resources:
             requests:
               cpu: 250m
@@ -76,6 +98,15 @@ spec:
           volumeMounts:
             - name: cao-state
               mountPath: /home/cao/.cao
-      volumes:
-        - name: cao-state
-          emptyDir: {}
+  # Per-pod persistent state (SQLite DB, logs, installed profiles). A PVC per
+  # ordinal survives pod restarts/rescheduling, unlike the emptyDir it replaces.
+  volumeClaimTemplates:
+    - metadata:
+        name: cao-state
+        labels:
+          app.kubernetes.io/part-of: cao-fleet
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
