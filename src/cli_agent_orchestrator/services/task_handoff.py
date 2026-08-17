@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
@@ -60,11 +61,13 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional, TypeVar
 
 from sqlalchemy import update as sa_update
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import session_lifecycle as sl
 from cli_agent_orchestrator.services import task_occurrence as occurrence
+
+logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
@@ -298,6 +301,12 @@ def _with_session(
             raise
         except (IntegrityError, OperationalError) as exc:
             raise TaskHandoffUnavailable(f"{unavailable}: {exc}") from exc
+        except DatabaseError as exc:
+            # A corrupt store file surfaces as DatabaseError ("file is not a
+            # database"), which is *not* an OperationalError subclass. Left
+            # unwrapped it escapes every typed seam above this one — including
+            # the admission hold's — as an untyped 500 on each managed write.
+            raise TaskHandoffUnavailable(f"{unavailable}: {exc}") from exc
     last_error: Optional[BaseException] = None
     for _attempt in range(5):
         try:
@@ -320,6 +329,10 @@ def _with_session(
         except (IntegrityError, OperationalError) as exc:
             last_error = exc
             time.sleep(0.05)
+        except DatabaseError as exc:
+            # A corrupt store file does not heal inside a retry window, so
+            # wrap it now instead of stalling every caller for five attempts.
+            raise TaskHandoffUnavailable(f"{unavailable}: {exc}") from exc
     raise TaskHandoffUnavailable(f"{unavailable}: {last_error}")
 
 
@@ -1288,12 +1301,21 @@ def hold_refusal(
     ``task_occurrence_handoffs``, so what the failure means depends on whether
     that table exists.
 
-    No table means no rows, which means no pending handoff — a proof, not a
-    guess. ``begin_handoff`` writes that table, so it cannot have succeeded
+    No table means no rows, which means no pending handoff is recoverable
+    *from this file* — not that none is pending. Normally the two are the
+    same: ``begin_handoff`` writes that table, so it cannot have succeeded
     against a store that lacks it, and there is no suspended authority to
-    protect. Refusing there would cost an operator every steer, tell and
-    operator message on an installation whose only fault is that M3-E has not
-    run on it yet, in exchange for protecting nothing. So it admits.
+    protect. But the fact is about this file's lineage, not about the
+    installation. An operator who restores a backup predating the table while
+    a handback is pending loses the pending row with the old file, and the
+    probe then admits while the recipient still holds a packet asserting it
+    is taking over — duplicate task authority until settlement, where
+    ``complete_handoff`` fails typed and rollback is the exit. That needs
+    operator error compounded with a pending handoff, and refusing every
+    installation that has not run M3-E yet to preclude it would cost every
+    steer, tell and operator message in exchange for protecting nothing. So
+    it admits — and it logs a warning, because an admission this decision
+    rests on should never be invisible.
 
     A table that exists but cannot be answered is genuinely unknown: a pending
     row may be sitting in it. Admitting to a held donor invalidates the packet
@@ -1309,6 +1331,13 @@ def hold_refusal(
         held = hold_for_agent(agent_id, db=db)
     except TaskHandoffError as exc:
         if not _handoff_store_present(db=db):
+            logger.warning(
+                "the task-handoff store has no handback table, so no pending handback is "
+                "recoverable from this file and task input is admitted for stable agent %s; "
+                "if this store was restored from a backup taken while a handback was "
+                "pending, that row went with the old file and settlement will fail typed",
+                agent_id,
+            )
             return None
         raise TaskHandoffHoldUndecidable(
             "the task-handoff store carries the handback table but could not answer whether "

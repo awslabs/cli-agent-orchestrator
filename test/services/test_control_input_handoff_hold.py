@@ -384,6 +384,70 @@ def test_a_shape_drifted_handback_table_is_undecidable_rather_than_handoff_held(
         _admit(_resolved(suffix="1", reservation_id=None))
 
 
+def test_a_corrupt_store_file_fails_closed_as_undecidable_not_as_an_untyped_error(
+    tmp_path, monkeypatch
+):
+    """A torn store file is not an ``OperationalError``, so it escaped unwrapped.
+
+    "file is not a database" raises ``sqlalchemy.exc.DatabaseError``, which is
+    not an ``OperationalError`` subclass — so ``_with_session`` used to pass it
+    through raw: past ``hold_refusal``'s typed catch, past the probe that
+    answers present-or-unknown, and past the admission seam's
+    ``except (FencedError, TaskHandoffHeld)`` at every call site. Every managed
+    write on the installation then surfaced an untyped 500 with a SQLAlchemy
+    traceback, on the one seam whose contract is that every path produces a
+    typed outcome. It must arrive as ``handoff-hold-undecidable``.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.clients import database
+
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"this is not a sqlite database file" * 128)
+    engine = create_engine(f"sqlite:///{corrupt}", connect_args={"check_same_thread": False})
+    monkeypatch.setattr(
+        database, "SessionLocal", sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    )
+
+    with pytest.raises(th.TaskHandoffHoldUndecidable) as raised:
+        th.hold_refusal(str(uuid.uuid4()))
+    assert "could not answer" in str(raised.value)
+    reason = cis._admission_refusal_reason(raised.value)
+    assert reason == contract.REASON_HANDOFF_HOLD_UNDECIDABLE
+    engine.dispose()
+
+
+def test_the_no_handback_table_admission_leaves_a_trace(_db, caplog):
+    """The admit path is a deliberate decision, so it must be observable.
+
+    No table only proves no pending handoff is recoverable *from this file*.
+    An operator who restored a pre-M3-E backup while a handback was pending
+    would be admitted past this hold with the pending row gone, and the first
+    typed sign of the duplicate authority would be ``complete_handoff``
+    failing at settlement. A warning here is the difference between a
+    diagnosable admission and an invisible one.
+    """
+    import logging
+
+    agent_id = str(uuid.uuid4())
+    _bind(agent_id, suffix="1")
+    with _db.begin() as conn:
+        conn.execute(text("DROP TABLE task_occurrence_handoffs"))
+
+    with caplog.at_level(logging.WARNING):
+        assert th.hold_refusal(agent_id) is None
+    admissions = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "no handback table" in record.message
+    ]
+    assert admissions, (
+        "the hold admitted on a store with no handback table and left no trace; "
+        f"captured: {[(r.levelname, r.message) for r in caplog.records]}"
+    )
+
+
 def test_the_undecidable_reason_is_a_first_class_refusal_in_both_vocabularies():
     """It has to be, or an operator message carrying it raises on construction.
 

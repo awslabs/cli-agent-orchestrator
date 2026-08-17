@@ -2967,8 +2967,13 @@ def _reconcile_columns_from_model(conn: Any, model: Any) -> None:
 
     A table this store has not created yet is left alone — ``create_all`` and
     the migration's own ``CREATE TABLE`` own that shape.  A column SQLite
-    cannot append raises, naming it: the migration would otherwise report
-    success while leaving the store a column short.
+    cannot append raises, naming the blocked columns.  The migration's caller
+    logs that at error with its consequence and lets ``init_db()`` continue:
+    a typed refusal from the fail-closed hold beats a dead installation, and
+    ``test_no_column_added_after_m3e_is_beyond_alter_table`` gates the shape
+    at build time.  The store is then left a column short, and every managed
+    write on it is refused as handoff-hold-undecidable until the table is
+    rebuilt — degraded and loud, not silently "successful".
     """
     table = model.__tablename__
     present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -3395,7 +3400,24 @@ def _migrate_task_occurrence_handoffs() -> None:
     try:
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
             conn.execute(_TASK_OCCURRENCE_HANDOFFS_DDL)
-            _reconcile_columns_from_model(conn, TaskOccurrenceHandoffModel)
+            try:
+                _reconcile_columns_from_model(conn, TaskOccurrenceHandoffModel)
+            except RuntimeError as e:
+                # A column SQLite cannot append to this store's older table.
+                # init_db() continues by design — a typed refusal from the
+                # fail-closed hold beats a dead installation — but the store
+                # stays a column short, and every managed write on it is then
+                # refused as handoff-hold-undecidable until the table is
+                # rebuilt. That is a degraded installation, not a routine
+                # event, so it is logged at error with the consequence
+                # spelled out rather than warned past.
+                logger.error(
+                    "task-occurrence handoff column reconcile left this store a column "
+                    "short: %s. init_db() continues because a typed refusal beats a dead "
+                    "installation, but every managed write on this store will be refused "
+                    "as handoff-hold-undecidable until the table is rebuilt",
+                    e,
+                )
             # "Exactly one task authority at every boundary", durably: at most
             # one pending handoff per occurrence, per donor and per recipient.
             # A settled row leaves all three indexes, so the same pair may hand

@@ -618,12 +618,19 @@ agents that hold or will hold a task occurrence.
 handback.** A pending handoff is a row in `task_occurrence_handoffs`, so what a
 failed read means depends on whether that table exists.
 
-A store with no such table has no rows, therefore no pending handoff — a proof
-rather than a guess, because `begin_handoff` writes that table and could not
-have succeeded against a store that lacks it. Input is admitted. Refusing there
-would cost every steer, tell and operator message in every session on an
-installation whose only fault is that M3-E has not run on it yet, in exchange
-for protecting nothing.
+A store with no such table has no rows, so no pending handoff is recoverable
+*from that file* — a fact about the file's lineage, not proof that none is
+pending. `begin_handoff` writes that table and could not have succeeded
+against a store that lacks it, so normally the two are the same. But an
+operator who restores a backup predating the table while a handback is pending
+loses the pending row with the old file, and the probe then admits while the
+recipient still holds a packet asserting it is taking over. That needs operator
+error compounded with a pending handoff; the duplicate authority lasts only
+until settlement, where `complete_handoff` fails typed and rollback is the
+exit; and refusing every installation whose only fault is that M3-E has not
+run on it yet would cost every steer, tell and operator message in exchange
+for protecting nothing. So input is admitted — and the admission logs a
+warning, because a decision this rests on should never be invisible.
 
 A table that exists but cannot be answered is genuinely unknown: a pending row
 may be sitting in it, and admitting to a held donor invalidates the packet

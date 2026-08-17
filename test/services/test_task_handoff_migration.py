@@ -290,6 +290,43 @@ def test_reconciling_an_older_shape_store_is_idempotent(tmp_path, monkeypatch):
     assert surviving == [(row["handoff_id"],)]
 
 
+def test_a_blocked_column_is_logged_at_error_with_its_consequence(
+    tmp_path, monkeypatch, caplog
+):
+    """init_db() deliberately continues past an unappendable column.
+
+    A typed refusal beats a dead installation, so the migration swallows the
+    reconcile's raise. But that leaves the store a column short, and the
+    fail-closed hold then refuses every managed write on it as undecidable —
+    a degraded installation, not a routine event. It has to be logged at
+    error with the column named and the consequence spelled out; a routine
+    warning is how the one installation that hits this gets missed.
+    """
+    import logging
+
+    # A store whose handoff table lacks ``donor_revision`` — NOT NULL with no
+    # default, so SQLite cannot ALTER it in and the reconcile must raise.
+    _store_at_older_shape(
+        tmp_path, monkeypatch, set(_M3E_UNADDABLE_COLUMNS) - {"donor_revision"}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.clients.database"):
+        database._migrate_task_occurrence_handoffs()  # must not raise
+
+    blocked = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        and "donor_revision" in record.message
+        and "column short" in record.message
+    ]
+    assert blocked, (
+        "an unappendable column left the store a column short without an "
+        "error-level trace naming it and its consequence; captured: "
+        f"{[(r.levelname, r.message) for r in caplog.records]}"
+    )
+
+
 def test_no_column_added_after_m3e_is_beyond_alter_table():
     """The gate on a *future* column, which is what makes the repair a gate.
 
@@ -301,6 +338,14 @@ def test_no_column_added_after_m3e_is_beyond_alter_table():
     reach an upgraded store, and the fail-closed hold turns that into a total
     loss of managed input there, so it must be caught here rather than in
     production.
+
+    The check runs in both directions, because the frozen set is a
+    hand-maintained literal. A *relaxing* drift — an existing NOT NULL column
+    flipped to nullable, or given a server_default — leaves the name in the
+    frozen set while the model's addability moves on, and a name-set
+    difference in one direction stays empty and passes. Asserting the
+    (name, addability) pairs forces the drift to be named here, whichever
+    side of the line it moves.
     """
     unaddable = {
         column.name
@@ -313,6 +358,14 @@ def test_no_column_added_after_m3e_is_beyond_alter_table():
         "task_occurrence_handoffs. Make the column nullable, give it a "
         "server_default, or rebuild the table explicitly — do not widen "
         "_M3E_UNADDABLE_COLUMNS."
+    )
+    relaxed = sorted(_M3E_UNADDABLE_COLUMNS - unaddable)
+    assert not relaxed, (
+        f"{relaxed} shipped with M3-E as unappendable but the model now lets "
+        "SQLite ALTER them in — a nullability or server_default change on an "
+        "existing column. If that change is deliberate, remove the name from "
+        "_M3E_UNADDABLE_COLUMNS; do not leave it frozen over a shape the model "
+        "no longer has."
     )
 
 
