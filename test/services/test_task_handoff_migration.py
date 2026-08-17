@@ -290,9 +290,7 @@ def test_reconciling_an_older_shape_store_is_idempotent(tmp_path, monkeypatch):
     assert surviving == [(row["handoff_id"],)]
 
 
-def test_a_blocked_column_is_logged_at_error_with_its_consequence(
-    tmp_path, monkeypatch, caplog
-):
+def test_a_blocked_column_is_logged_at_error_with_its_consequence(tmp_path, monkeypatch, caplog):
     """init_db() deliberately continues past an unappendable column.
 
     A typed refusal beats a dead installation, so the migration swallows the
@@ -306,9 +304,7 @@ def test_a_blocked_column_is_logged_at_error_with_its_consequence(
 
     # A store whose handoff table lacks ``donor_revision`` — NOT NULL with no
     # default, so SQLite cannot ALTER it in and the reconcile must raise.
-    _store_at_older_shape(
-        tmp_path, monkeypatch, set(_M3E_UNADDABLE_COLUMNS) - {"donor_revision"}
-    )
+    _store_at_older_shape(tmp_path, monkeypatch, set(_M3E_UNADDABLE_COLUMNS) - {"donor_revision"})
 
     with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.clients.database"):
         database._migrate_task_occurrence_handoffs()  # must not raise
