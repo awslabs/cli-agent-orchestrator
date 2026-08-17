@@ -33,6 +33,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_assign.py -v -k codex
     uv run pytest -m e2e test/e2e/test_assign.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_assign.py -v -k kiro_cli
+    uv run pytest -m e2e test/e2e/test_assign.py -v -k Pi
     uv run pytest -m e2e test/e2e/test_assign.py -v -k copilot
 """
 
@@ -420,6 +421,38 @@ class TestKiroCliAssign:
     def test_assign_with_callback(self, require_kiro):
         """Kiro CLI full round-trip: worker completes → sends result → supervisor receives."""
         _run_assign_with_callback_test(provider="kiro_cli")
+
+
+# ---------------------------------------------------------------------------
+# Pi provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestPiAssign:
+    """E2E assign tests for the Pi provider using examples/assign/ profiles."""
+
+    def test_assign_data_analyst(self, require_pi):
+        """Pi data_analyst receives a dataset and performs statistical analysis."""
+        _run_assign_test(
+            provider="pi",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_pi):
+        """Pi report_generator creates a report template."""
+        _run_assign_test(
+            provider="pi",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_pi):
+        """Pi full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="pi")
 
 
 # ---------------------------------------------------------------------------

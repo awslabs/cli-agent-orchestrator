@@ -31,6 +31,13 @@ Every derived path resolves from this value, so one override moves everything �
 - `~/.aws/opencode` (OpenCode provider config, managed via `OPENCODE_CONFIG_DIR` in `constants.py`) — OpenCode is told its config location at launch via env vars; a follow-up can repoint this.
 - Provider-native agent directories (`~/.kiro/agents`, `~/.copilot/agents`) — intentionally separate since each provider manages its own agent install path independently of CAO's data tree.
 
+The [Pi provider](pi.md) is not an exception. Its private runtime files and
+retained session data live below `CAO_HOME_DIR/pi`. CAO does not directly write
+Pi credential/configuration files or install Pi packages in Pi's own agent
+directory, but Pi may migrate or update configuration or manage packages there
+during normal operation. The generated `CAO_PI_*` variables are internal
+provider-to-extension wiring, not user-facing configuration keys.
+
 ## settings.json schema
 
 ```json

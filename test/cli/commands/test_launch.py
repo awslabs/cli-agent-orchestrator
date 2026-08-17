@@ -8,6 +8,15 @@ from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs, launch
 
+
+def test_pi_launch_requires_workspace_access_confirmation():
+    from cli_agent_orchestrator.cli.commands.launch import (
+        PROVIDERS_REQUIRING_WORKSPACE_ACCESS,
+    )
+
+    assert "pi" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+
+
 # ── Backend auto-detection (issue #308) ──────────────────────────────
 
 

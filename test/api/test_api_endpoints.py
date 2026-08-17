@@ -123,7 +123,7 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 10
+        assert len(data) == 11
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
@@ -135,6 +135,9 @@ class TestAgentProviders:
         assert "cursor_cli" in names
         assert "antigravity_cli" in names
         assert "grok_cli" in names
+        assert "pi" in names
+        assert {"name": "grok_cli", "binary": "grok", "installed": True} in data
+        assert {"name": "pi", "binary": "pi", "installed": True} in data
         for p in data:
             assert p["installed"] is True
 
@@ -145,6 +148,13 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
+        providers_dict = {p["name"]: p for p in data}
+        assert providers_dict["pi"] == {"name": "pi", "binary": "pi", "installed": False}
+        assert providers_dict["grok_cli"] == {
+            "name": "grok_cli",
+            "binary": "grok",
+            "installed": False,
+        }
         for p in data:
             assert p["installed"] is False
 
@@ -167,6 +177,7 @@ class TestAgentProviders:
         assert providers_dict["copilot_cli"]["installed"] is False
         assert providers_dict["opencode_cli"]["installed"] is False
         assert providers_dict["grok_cli"]["installed"] is False
+        assert providers_dict["pi"] == {"name": "pi", "binary": "pi", "installed": False}
 
     def test_list_providers_has_binary_field(self, client):
         """Each provider entry has correct binary name."""
@@ -183,6 +194,7 @@ class TestAgentProviders:
         assert providers_dict["opencode_cli"]["binary"] == "opencode"
         assert providers_dict["antigravity_cli"]["binary"] == "agy"
         assert providers_dict["grok_cli"]["binary"] == "grok"
+        assert providers_dict["pi"]["binary"] == "pi"
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────
