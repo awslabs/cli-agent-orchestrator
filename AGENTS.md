@@ -123,6 +123,17 @@ defends it.
   Inconclusive is a durable value distinct from negative, a failed measurement
   never overwrites an established result, and a disposition is recorded because
   it is true, not because recording it clears a check.
+- **An allowlist of known-good versions is not a guard, it is an expiry date.**
+  It excludes every future build by default, so the system degrades by standing
+  still and a vendor release silently removes a capability nobody chose to give
+  up. Where a check must exist, name the build that is known broken, not the ones
+  known good. Per-version knowledge is an override recording what was proven on a
+  build, never a precondition: a missing record selects a conservative default and
+  proceeds. **Conservative means the safe end of the range, not the null value** —
+  a zero timing or an empty set chosen because nothing was proven converts an
+  absent measurement into a silent failure. Where no default can be made safe,
+  block that one operation with a typed reason and leave the rest of the provider
+  working. Full policy: `docs/provider-version-policy.md`.
 - **Treat attempted as a state.** Record intent before the external effect,
   prove effects from the receiver's own record, and give every wait a bound and
   the transition taken when it expires. A bound that expires into another wait

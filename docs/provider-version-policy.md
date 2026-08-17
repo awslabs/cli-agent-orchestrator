@@ -1,198 +1,262 @@
 # Provider version policy
 
-CAO's provider-version policy decides which installed provider builds may cross
-the launch identity boundary and which builds may carry feature-specific
-authority.  The policy is per-provider, reversible at runtime, and fail-closed
-for unknown or unparseable versions.
+**Unpinned is the correct state. A pin is an incident artifact.**
 
-## Modes
+Every harness — Claude Code, Codex, Kimi, Muse — runs at whatever version is
+installed, with full capability, without being added to a list first. New builds
+bring capability far more often than they break the narrow slice of behaviour
+this system drives, so withholding a feature until a build is proven costs more
+than it protects.
 
-`provider_contracts.py` declares each provider's default enforcement mode:
+A pin exists only while a specific observed breakage is open. It is temporary,
+recorded, and attached to the work that removes it.
 
-* **`strict`** — exact-set membership in `SUPPORTED_VERSIONS`.  A build must be
-  listed there to launch at all.  This is an opt-in containment mode for a
-  provider with a reproduced regression; it is not the normal update policy.
+---
 
-* **`open`** — any non-empty semver-shaped observed version is accepted at the
-  launch identity boundary.  The exact `SUPPORTED_VERSIONS` tuple still gates
-  feature-specific authority: native control, rendered-session proof,
-  steer/composer, image delivery, resume, and route authority.  All providers
-  use this mode by default so routine CLI updates do not freeze admission.
-  Kimi's current build has additionally passed a compatibility check; other
-  builds still require exact feature proof before they receive advanced
-  capabilities.
+## 1. The two things called "pinning"
 
-Unknown providers and unparseable versions fail closed in every mode.
+They are different, and only one is ever legitimate for long.
 
-## Why two layers?
+| | what it means | default |
+|---|---|---|
+| **Capability allowlist** | a feature is withheld unless the installed build is listed | **not used** |
+| **Version quarantine** | a named build is known broken, so it is held back | **empty** — populated only by an open incident |
 
-The launch boundary and the capability boundary answer different questions.
+They fail in opposite directions. An allowlist excludes **every future build by
+default**, so it expires the moment the vendor ships and the system degrades by
+standing still — a vendor release silently removes a capability nobody chose to
+give up. A quarantine excludes only what has been shown to break, so a new build
+is trusted until it earns suspicion and the list shrinks as fixes land.
 
-*Launch* asks "can we start a managed process against this binary?"  Routine
-  updates should not freeze task delivery just because a pin file has not been
-  updated.
+**Prefer a quarantine. Do not introduce a new capability allowlist.** Writing
+"the version must be in this tuple" adds an expiry date to a feature.
 
-*Capability* asks "has this exact build been read or proven for the specific
-  feature we are about to use?"  A future semver may launch, but it must not
-  silently inherit 0.34.0's composer keystrokes, 0.29.2's image transport, or
-  the rendered-header session proof.
+---
 
-Splitting the two prevents both stale-route breakers *and* unproven-build
-authority leaks.
+## 2. Modes and the runtime lever
 
-## Runtime override
+`provider_contracts.py` declares each provider's enforcement mode.
 
-Each provider's mode can be forced at runtime without a code change:
+- **`open`** — any non-empty semver-shaped observed version is accepted, and gets
+  full capability. This is the default for every provider.
+- **`strict`** — exact-set membership in `SUPPORTED_VERSIONS`. A build must be
+  listed to launch at all. This is the quarantine mode: an opt-in containment for
+  a **reproduced** regression, never the normal update policy.
+
+Either can be forced at runtime with no code change:
 
 ```bash
 CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI=strict
-# The same form works for CODEX, CLAUDE, and MUSE.
+# Same form for CODEX, CLAUDE, MUSE. Values: strict | open.
 ```
 
-Valid values are `strict` and `open`.  The variable name is
-`CAO_PROVIDER_VERSION_ENFORCEMENT_<PROVIDER>` where `<PROVIDER>` is the short
-provider name (`kimi`, `codex`, `claude`, `muse`).
+The variable is `CAO_PROVIDER_VERSION_ENFORCEMENT_<PROVIDER>` using the short
+provider name. **This is the pin lever** — the whole mechanism, already present
+and reversible without a deploy.
 
-This is the generic rollback path.  If a future provider build causes a
-reproducible regression — for example, a managed launch reaches the TUI but a
-multiline composer plan submits incorrectly, or the rendered session proof no
-longer matches the bound session — set
-set the matching provider variable (for example
-`CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI=strict`) to restore exact-pin
-fail-closed behaviour while the regression is investigated. File a high
-priority CAO issue for the regression and remove the override promptly after
-the new build is stage-verified.
+---
 
-## When to switch a provider back to strict
+## 3. Per-version knowledge is an override, never a precondition
 
-Switch a provider to strict only after a reproducible regression tied to a
-specific new build.  The decision checklist applies equally to Kimi, Claude,
-Codex, and Muse:
+Some behaviour genuinely varies by build: a composer newline keystroke, a submit
+settle interval, an emptiness probe, an image transport. Recording what was proven
+on a specific build is valuable and stays.
 
-1. **Reproduce the failure on the new build.**  A flake, a transient network
-   error, or a one-off rendering timing difference is not a version-policy
-   regression.
-2. **Confirm the same operation succeeds on a proven build.**  This isolates
-   the failure to the new binary rather than to environment or task state.
-3. **Set the provider's enforcement variable to `strict`.**  This refuses the
-   new build at the launch boundary and restores exact-set behaviour.
-4. **Stage-verify the new build before removing the override.**  Read the
-   relevant bundle facts, prove the ACP identity contract, and update
-   `SUPPORTED_VERSIONS` plus the per-feature tables
-   (`_PROVEN_COMPOSER_NEWLINE`, `_PROVEN_STEER_CHORDS`,
-   `_RENDERED_SESSION_PROVEN_BUILDS`) if the build passes.  Only then return
-   the provider to `open`.
+What changes is how a *missing* record is treated:
 
-Do not leave a provider in strict mode indefinitely without updating the pin
-tables and filing the regression fix: that would reintroduce the stale-pin
-breakers the open policy exists to remove.
+- **A missing per-version record selects a conservative default and proceeds.**
+- It does not withhold the feature, and it does not silently select an unsafe
+  value.
 
-## Adding a proven build
+The second half is not a detail. A default is a claim about behaviour on an
+unknown build, so it must be the safe end of the range rather than the null value.
+This repository contains the case that motivates the rule: a build with no proven
+composer pin received `submit_settle_seconds: 0.0` against a renderer this
+codebase documents as swallowing an Enter that arrives too soon, "leaving the
+message sitting unsubmitted in the prompt box with no error." An absent
+measurement became a silent non-delivery. Use the longest proven interval as a
+floor instead, and record that the value is a floor rather than evidence.
 
-When a new provider build has been verified:
+Where no default can be made safe, **that single operation** refuses with a typed
+reason naming what is missing, and the rest of the provider stays available. A
+missing composer pin must not cost the provider its identity, its routing, or its
+ability to receive an operator message. §6 holds the two operations that cannot be
+defaulted *with the technique we use today*, which is a limitation to remove rather
+than a category to grow.
 
-1. Add it to the provider's `SUPPORTED_VERSIONS` tuple (current first).
-2. Update that provider's `PINNED_VERSIONS` reference build.
-3. Add separate proven entries to the provider's feature tables.
-4. Add a separate `RenderedSessionProof` entry to
-   rendered-session proof table if the build's native header and process
-   identity were actually verified.
-5. Keep that provider's enforcement mode `open` unless you are deliberately
-   reverting to strict.
+---
 
-For a provider temporarily held strict, only steps 1 and 2 are needed before
-the exact build can launch. Return it to open after the compatibility fix is
-merged and deployed.
+## 4. When a pin is acceptable
 
-## Narrow capability tables: the Codex native-bind exception
+All four must hold:
 
-The Codex launch paths capture their pre-task harness-native session id
-through a zero-turn app-server bootstrap (`thread/start` +
-`thread/name/set` with no `turn/*`) so the resumed TUI can guarantee an exact,
-resumable session before any task byte reaches the pane.  That guarantee is a
-capability claim about the installed build: the full exchange
-(`initialize -> initialized -> config/read -> thread/start -> thread/name/set ->
-clean process exit`, canonical UUID, exact cwd/model/effort, one materialized
-rollout, fresh `thread/resume` adopting the same id) must have been
-stage-verified for the exact binary.  Builds proven for that contract are
-listed in `provider_contracts.NATIVE_BIND_CAPABLE_VERSIONS` — currently
-`0.146.0` and `0.147.0` — and `codex_native_bootstrap.BOOTSTRAP_CAPABLE_VERSIONS`
-is that same table's Codex cell, so the bootstrap that mints a native id and
-the managed bind seam that accepts it cannot disagree about which builds are
-proven.
+1. **A reproduced breakage on the new build.** A flake, a transient network
+   error, or a one-off rendering timing difference is not a version regression.
+   Absence of proof is not evidence of breakage.
+2. **The same operation confirmed working on a previous build**, isolating the
+   failure to the new binary rather than to environment or task state.
+3. **A tracker issue** naming the failure, the build that exhibits it, and the
+   build being pinned to.
+4. **A stated unpin criterion and a named owner.** "When the bug is fixed" counts
+   only if the issue says what fixed means.
 
-This is deliberately a NARROW exception table, independent of the launch-mode
-policy **and** of the broad `SUPPORTED_VERSIONS` table:
+Pinning to work around something that **cannot be fixed yet** is legitimate and
+expected. Pinning to avoid finding out is not.
 
-- **Open launch mode does NOT carry exact-session capture.** A build accepted
-  at the launch identity boundary may still be unproven for the bootstrap
-  contract.  The Codex launch paths keep their fail-closed capability
-  boundary: an installed build outside the table cannot supply the pre-task
-  identity contract, and the launch fails closed with a typed refusal — zero
-  provider initialization, zero task bytes — rather than silently degrading
-  to a launch that cannot resume its own session.
-- **Native bind accepts exactly the proven builds, no more.** The managed-v2
-  bind seam (`managed_launch_v2._validate_readiness_for_bind`) asks its
-  version question through `provider_contracts.is_native_bind_capable`, so a
-  stage-proven build (0.147.0) binds while an unproven one (0.148.0) is
-  refused with zero task bytes even though open launch policy admitted it.
-  The seam must never consult the broad table instead: doing so reproduced a
-  real forward-compatibility failure where a 0.147.0 native launch completed
-  the bootstrap, exposed its exact session identity, reported `input_ready`,
-  and was then refused at bind.
-- **Bind capability grants no advanced authority by implication.** The narrow
-  table is not a step toward the broad one. Codex 0.147.0 has a separate
-  exact-build composer-newline proof (source inspection plus a disposable live
-  multiline canary), so managed assignment delivery may use that one surface.
-  It still gets no general control advertisement, steer/force-pause authority,
-  rendered-session proof, resume/recovery identity, or route-receipt authority
-  until each surface is independently proven.
-- **Unsupported builds do not retain exact-session capture.**  Do not
-  configure, document, or operate a Codex launch as if an unproven semver
-  could mint a resumable id; it cannot, by design.
+A pin with no issue behind it is an unexplained capability ceiling and should be
+deleted on sight. A pin whose issue is closed is stale and should be deleted on
+sight — that needs no ceremony beyond verifying against the build that broke.
 
-For the other providers the native-bind cell is their `SUPPORTED_VERSIONS`
-tuple by reference — their native identity paths were verified with each
-accepted build — so their bind behaviour is exactly their broad proven set,
-and a future narrow exception for them is written as its own literal cell
-here rather than by narrowing the broad table.
+---
 
-**Operator remediation:** install (or pin) a Codex build that is in
-`NATIVE_BIND_CAPABLE_VERSIONS`; if a newer build must serve the launch path,
-stage-verify it against the exact bootstrap contract above, add it to the
-table, and re-verify the resumed-TUI surface before removing any version
-override.  While the installed build is unproven, Codex launches refuse
-fail-closed at the bootstrap, and a managed generation that somehow reached
-bind with an unproven build is refused there too.
+## 5. Who may pin
 
-## Muse profile-carrier exception
+| actor | may pin | rationale |
+|---|---|---|
+| operator | yes | it is their installation |
+| fire marshal | yes | it owns get-it-running-again, is invoked deliberately, and records its actions as incident artifacts by construction |
+| supervisors | **no** | a supervisor sees a symptom, not a cause; a misattributed pin freezes a harness for a reason that was never true and outlives the session that set it |
+| implementers, reviewers, workers | no | they report the breakage |
 
-Muse's managed native profile uses an internal file environment surface. Its
-authority is narrower than Muse's semver-level resume support: it is enabled
-only when the runtime observes the exact full banner `Muse Code 0.1.0
-(0.1.0-R708.1)` and the resolved inner `muse-bin-*` executable has the
-stage-proven SHA-256 recorded in the closed profile-carrier cell. The
-update-capable `muse` launcher script is never that evidence. A same-semver R
-revision or changed inner digest advertises and launches as
-`profile_carrier_unverified` until separately stage-verified.
+**What a supervisor does instead:** work around it, record what it saw, avoid that
+harness for the rest of the run, and keep going. A lane that reports cleanly and
+routes around a problem is a good outcome; stalling to await a version decision
+is not.
 
-## Fail-closed invariants
+---
 
-These hold regardless of mode:
+## 6. The last two gates, and why they are work rather than exceptions
 
-* An unknown provider name raises `ProviderContractError`.
-* An unparseable version banner raises `ProviderVersionDrift`.
-* A version not in `SUPPORTED_VERSIONS` gets no broad native-control authority,
-  rendered-session proof, steer authority, image authority, ACP resume
-  identity, or route-receipt authority. A narrowly proven feature may be
-  enabled only through its own exact-build table; Codex 0.147.0's composer
-  newline is the current example.
-* A version not in `NATIVE_BIND_CAPABLE_VERSIONS` cannot become a managed
-  generation's bound native identity, whatever the launch mode admitted;
-  membership there grants bind only — never any other authority by itself.
-  Admission still consults the provider's per-feature composer table, and all
-  other advanced authorities stay governed by `SUPPORTED_VERSIONS` and their
-  own per-feature tables.
-* `IMAGE_PROVEN_BUILDS` stays pinned to the builds that actually demonstrated
-  image delivery; adding a build to `SUPPORTED_VERSIONS` does not grant it
-  image authority.
+Two capability tables still gate on exact builds. **They are not permanent
+carve-outs.** A capability that only works on enumerated builds is evidence that
+our technique for obtaining it is build-fragile, not evidence that the vendor made
+it build-specific. The goal is to remove both by finding a version-robust
+technique, and until then they are the honest description of a limitation rather
+than a design we defend.
+
+Treat a request to add a build to either table as a signal that the underlying
+approach needs a deeper look, and prefer investigating the binding technique over
+extending the list.
+
+Codex launch paths capture the pre-task harness-native session id through a
+zero-turn app-server bootstrap (`thread/start` + `thread/name/set`, no `turn/*`)
+so a resumed TUI can guarantee an exact resumable session before any task byte
+reaches the pane. That is a capability claim about the exact binary: the full
+exchange — `initialize -> initialized -> config/read -> thread/start ->
+thread/name/set -> clean process exit`, canonical UUID, exact cwd/model/effort,
+one materialized rollout, fresh `thread/resume` adopting the same id — must have
+been verified for that build. Proven builds are in
+`NATIVE_BIND_CAPABLE_VERSIONS`, and `codex_native_bootstrap.BOOTSTRAP_CAPABLE_VERSIONS`
+is that same table's Codex cell, so the bootstrap that mints an id and the bind
+seam that accepts it cannot disagree.
+
+Today this is the §3 case: no conservative default exists, because there is no
+safe way to *pretend* a session is resumable, and degrading silently would produce
+a launch that cannot resume itself. So this one operation fails closed with a typed
+refusal — zero provider initialization, zero task bytes — while everything else
+about the provider stays open.
+
+**That is a statement about the current technique, not about Codex.** The exchange
+is ordinary app-server protocol; nothing in it is documented as build-specific. The
+open question is which step actually varies between builds, and whether the
+contract can be *verified at runtime against the installed binary* instead of
+looked up in a table. A bootstrap that proves its own guarantee on the build in
+front of it needs no allowlist. Removing this gate is tracked work.
+
+Two rules keep the exception from spreading:
+
+- **The bind seam must never consult the broad table.** Doing so reproduced a real
+  forward-compatibility failure: a 0.147.0 native launch completed the bootstrap,
+  exposed its exact session identity, reported `input_ready`, and was then refused
+  at bind.
+- **Bind capability grants nothing else by implication.** It is not a step toward
+  a broad allowlist.
+
+Muse has a similar narrow cell, and the same question applies: the managed native
+profile carrier is enabled only on the exact full banner `Muse Code 0.1.0
+(0.1.0-R708.1)` with the stage-proven inner `muse-bin-*` SHA-256. Pinning to an
+inner binary digest cannot survive any vendor update by construction, which makes
+it the clearest case that the technique — not the version — is what needs fixing. The update-capable `muse` launcher script is never
+that evidence. A same-semver R revision or changed inner digest advertises as
+`profile_carrier_unverified` until separately verified.
+
+**Adding a build to a narrow table is recording an override, not lifting a gate.**
+Verify the contract, add the exact build, and leave the provider's mode `open`.
+
+---
+
+## 7. Un-pinning
+
+A pin is reviewed for as long as it exists, and the review asks one question: is
+the fix landed?
+
+1. Fix the underlying defect.
+2. Verify against the build that exhibited the breakage.
+3. Remove the pin and its entry in the same change.
+4. Close the issue, naming the verification.
+
+**A pin with no active fix effort is escalated, not renewed.** Either fix it or
+decide explicitly that the capability is abandoned. Quietly carrying the pin is
+the outcome to avoid: stale pins accumulate, and each one makes the next upgrade
+look riskier than it is.
+
+---
+
+## 8. Fail-closed invariants
+
+These hold regardless of mode, because each is a case where proceeding would
+record something untrue rather than merely act on less knowledge:
+
+- An unknown provider name raises `ProviderContractError`.
+- An unparseable version banner raises `ProviderVersionDrift`. Unparseable is not
+  the same as unlisted: the first means the observation failed, the second means
+  nothing was written down.
+- A build outside `NATIVE_BIND_CAPABLE_VERSIONS` cannot become a managed
+  generation's bound native identity, whatever the launch mode admitted.
+  Membership grants bind only.
+- An unrecognised screen or response is `unknown`, never `complete`.
+
+---
+
+## 9. What does not conform yet
+
+This document states the policy, not the current behaviour. The code still gates
+capability on allowlists, so the following are known non-conformances and the work
+list for reaching §1. Until they land, treat this section as authoritative about
+what the system actually does.
+
+| surface | current behaviour | target |
+|---|---|---|
+| `SUPPORTED_VERSIONS` | gates native control, rendered-session proof, steer/composer, image, resume, and route authority | not a capability gate; retained only as the strict-mode quarantine set |
+| `_PROVEN_COMPOSER_NEWLINE` | absence withholds multi-line delivery and yields a zero settle for single-line | override with a safe floor, never zero |
+| `_PROVEN_STEER_CHORDS` | absence withholds steer authority | override with a conservative default |
+| `_RENDERED_SESSION_PROVEN_BUILDS` | absence withholds rendered-session proof | override; unproven records as unproven rather than withholding |
+| `IMAGE_PROVEN_BUILDS` | absence withholds image authority | override with a conservative default |
+| `PINNED_VERSIONS` | advisory head of each accepted tuple | advisory only, everywhere |
+
+`NATIVE_BIND_CAPABLE_VERSIONS` and the Muse profile-carrier cell are on this list
+too, at a longer horizon. They cannot be converted by choosing a default — they
+need a version-robust technique first, which is a research task rather than a
+refactor. They are the only two surfaces permitted to gate on an exact build in the
+meantime, and neither is a target state.
+
+The conversion is not a bulk find-and-replace. Each surface needs its conservative
+default chosen and justified, and choosing the null value for any of them
+reproduces the defect §3 describes.
+
+## 10. Deliberately not built yet
+
+Recorded so they are not mistaken for oversights, and not built until the
+operator asks.
+
+- **Supervisor-initiated pinning.** Deferred for the misattribution reason in §5.
+  Revisit only with evidence that a supervisor can identify a version as the
+  culprit rather than merely being present when something failed.
+- **Supervisor-initiated fire marshal wake.** Plausibly useful, gated on a
+  genuinely-stuck test: a supervisor that can still route around a problem should.
+  A wake that fires whenever a lane is inconvenienced turns a break-glass role
+  into a routine dependency.
+- **Automatic fixer dispatch on a recorded breakage.** The recording comes first.
+- **A `conduct` verb wrapping the env-var lever**, so a quarantine can carry its
+  issue, unpin criterion, and owner as data rather than as operator memory, and
+  so `conduct status` can surface every live pin with its age. Tracked as M18.
