@@ -39,41 +39,151 @@
   those boundaries as written without generalizing them into distrust of every
   local worker.
 
-## Flexibility is the goal; guardrails serve it
+## Choosing mechanism or policy
 
-The purpose of this system is supervisor-managed flows that keep working across
-the situations they actually meet. Guardrails prevent serious problems and
-corrupted state. They are not the product, and a guardrail that makes the flow
-brittle has failed at its own job.
+The section above decides whether a guard should exist. This one decides whether
+it is code or guidance a capable supervisor follows. The failure this system
+ships is over-restriction: refusals scoped wider than the transition they
+protect, preconditions checked once and never released, and conclusions recorded
+that were never established. A guard that makes the flow brittle has failed at
+its own job, and a sound intent behind it changes nothing.
 
-- **Scope a refusal to its real blast radius.** A check that cannot answer its
-  question must not gate work whose correctness never depended on that answer.
-  Turning one unanswerable question into a total loss of supervision is a
-  defect, not caution.
-- **Unknown is not the same as unsafe.** Prefer the reading the evidence
-  actually supports. A subsystem that is absent, uninitialised, or never
-  deployed is usually telling you there is nothing to guard, not that everything
-  might be in flight.
-- **A capable supervisor blocked from managing its own session is a defect.**
-  When an agent can see the right action and the framework will not let it act,
-  treat that as the framework being wrong until a concrete corrupt transition on
-  the other side is named.
-- **Prefer adapt, reconcile, or degrade over refuse.** Refusal is correct when
-  proceeding would corrupt state. When proceeding would merely be untidy, absorb
-  the situation and carry on, leaving a legible trace.
-- **A guardrail needs a recovery path a supervisor can actually take.** A gate
-  that can only be cleared by an operator editing a store by hand is a wedge
-  wearing a guardrail's clothes.
-- **Push back on an over-defensive spec.** Loosening an illogical restriction,
-  or deprecating a rigid mechanism in favour of a more flexible one, is a valid
-  and expected outcome of implementation and review, not scope creep. Say so
-  explicitly rather than implementing something you believe makes the system
-  more brittle.
+Two independent questions decide the form. **Can a good-faith mistake here be
+detected and undone?** Spending the operator's money, destroying data, leaking a
+secret, supplying the content of an operator-reserved decision, and leaving a
+store wrong in a way nothing downstream detects are irreversible or invisible;
+those get mechanism, scoped to the irreversible step itself, with the
+surrounding flow left to policy. **Are the edge cases enumerated?** Recoverable
+failure with uncertain edges is policy — the quadrant this system keeps getting
+wrong. Recoverable failure with well-understood edges is mechanism only where
+the mechanism stabilises something. Mechanism enforces its author's assumptions
+on situations the author never saw and policy only advises them, so everything
+outside the irreversible set defaults to policy.
 
-Examine every issue, implementation pass, and review pass through this lens
-alongside the threat model above. The two are one standard: prevent the
-transitions that genuinely corrupt state, and refuse to buy that prevention with
-brittleness everywhere else.
+- **Clean implementation is a precondition for choosing mechanism.** A guard
+  that resists clean implementation is evidence the edge cases are not
+  understood: demote it to policy rather than pushing the implementation through.
+- **Soft first, tighten on evidence.** Add a guard for a failure that has been
+  observed, not one that is imaginable, and narrow it once an actual failure is
+  seen.
+- **A capable supervisor blocked from managing its own session is a defect in
+  the framework** until someone names the concrete corrupt transition on the
+  other side. That burden falls on whoever wants the guard, in review as much as
+  in repair.
+- **Loosening a guard is a first-class outcome.** Narrowing a refusal, rescoping
+  it, inverting its failure direction, and deleting it are repairs, not scope
+  creep; the bar for deleting a branch is naming the transition it prevented and
+  showing that transition cannot occur here. Say so explicitly rather than
+  implementing something you believe makes the system more brittle.
+
+## What a guard may block
+
+Guards prevent the transitions the threat model names and the irreversible set
+below. Everywhere else, prefer adapt, reconcile, or degrade over refuse: a
+situation the flow can absorb is absorbed, with a legible trace. Guards that are
+individually correct and individually fail closed still compose into states no
+actor can leave; such a state is a correctness defect of the same severity as a
+corrupt write, and "every check behaved as specified" describes it rather than
+defends it.
+
+- **Scope a refusal to its real blast radius.** Name the records and actors the
+  refusal covers, and confirm the gated work actually reads the value the check
+  failed to produce. One unreadable input refusing every command on the
+  installation, for agents party to nothing it protects, is a defect, not caution.
+- **Absent and unreadable are different answers.** Where absence proves vacuity
+  — no table means no rows means the writer cannot have run — admit. Where the
+  surface exists and cannot be read, a live row may exist and admitting would
+  invalidate something a recipient is about to act on, so hold, and hold only
+  over work that depends on the unread value.
+- **A refusal states what was observed.** "I could not read this record" and
+  "this record shows something live" never share a typed reason, however alike
+  their handling; a guard that types an unreadable surface as a live hold
+  asserts a condition it never observed and sends every downstream agent chasing
+  a recovery that cannot exist. Validate a refusal's remedies against the record
+  it just read: a remedy that cannot apply reports as unproven rather than as a
+  denial. A refusal meaning "this disposition is not implemented in this build"
+  is a fact about the code rather than the campaign, and it is an override case
+  rather than a hold.
+- **A precondition checked once is an assumption for the rest of its window.**
+  Either re-check it at use, or make the downstream failure self-clearing:
+  settle the transaction as failed, release every hold it took, and leave a
+  legible trace. Do not instead add an upstream refusal, which makes an
+  unrelated command fail for a reason its caller did not cause and cannot clear.
+- **Deliver a refusal to an actor who can act on it.** A guard that fails a
+  third party to protect a transaction that party is not in is misplaced,
+  however true its condition.
+- **Ship the exits with the guard.** For each record it writes, enumerate the
+  states reachable when composed with the other checks touching that record in
+  the same flow, and complete this sentence for each: *actor A can take action
+  B, after which this exact command succeeds.* Both blanks must fill. Parking,
+  escalating, waiting for the operator, a manual rollback, and hand-editing a
+  store are not exits. A state with no exit blocks the change.
+- **A guard that writes records only what it established.** A measurement that
+  failed partway is not a verdict: record the failure and which leg failed.
+  Inconclusive is a durable value distinct from negative, a failed measurement
+  never overwrites an established result, and a disposition is recorded because
+  it is true, not because recording it clears a check.
+- **Treat attempted as a state.** Record intent before the external effect,
+  prove effects from the receiver's own record, and give every wait a bound and
+  the transition taken when it expires. A bound that expires into another wait
+  is not a bound.
+- **Write records through their writers.** A hand-edited ledger or campaign
+  record is the silent-corruption case. Repairing a store's schema or a broken
+  migration is not a hand-edit and is the expected fix.
+
+## When a guard blocks correct work
+
+A guard that blocks progress in a situation its author did not anticipate is a
+defect in the guard. Proceed, and record the override; the unrecorded workaround
+is the thing forbidden here, not the override. Waiting for a merge or for the
+operator's hands is the wrong default, because it turns a tooling gap into a
+campaign outage, and no ticket, approval, or reviewer is required at override
+time. Open the repair through the ordinary review and deploy track in parallel:
+that track is the exit a guard's design review must show, never the one blocked
+work waits on.
+
+Run one test first, on the action you are about to take rather than on the
+guard's importance: can a good-faith mistake here be detected and undone? These
+cannot, so they are exempt and carry no override:
+
+- **Provider billing** — starting a metered or billed run, and the boundary
+  between a free fixture run and a paid provider run.
+- **Destructive or irreversible operations**, which keep their confirmations,
+  including force and break variants that perform the destructive effect.
+- **Secret handling and redaction.**
+- **Decisions the accepted design reserves to the operator.** Do not supply the
+  content of one; surface it promptly. Recording a decision the operator made
+  out of band, with its source and channel, is not making that decision.
+- **Transitions that leave a store wrong in a way nothing downstream detects.**
+
+Membership follows from irreversibility, not from importance or a subsystem's
+name. Inside the set the defaults invert: fail closed on every error path,
+including typos, unknown identifiers, probe errors, and lookup failures, so a
+guard separating a free run from a billed one refuses when it cannot identify
+which it is. An error path that reaches the irreversible effect is a defect of
+the same severity as a corrupt write, and the repair is to tighten rather than
+soften. Failing closed here withholds the specific effect, not the enclosing
+operation. Outside the set, the default under uncertainty is to proceed with a
+record.
+
+The record carries six things: the typed reason or check identifier the refusal
+raised, verbatim; the record and field the guard read and what it returned,
+including "could not read"; the action taken instead, as run; one sentence
+naming the situation the guard's author did not anticipate; an explicit
+statement that the action is none of the exempt kinds above; and the campaign,
+lane, round, and timestamp. Write it into the campaign record and the round
+report before or atomically with the action, so a crash mid-override still
+leaves the trace. Where that store cannot be written, the round transcript
+carries the record and the override proceeds: the recorder never becomes the new
+block.
+
+Repeated overrides of one guard are a defect report against that guard and the
+specification for narrowing it; file the narrowing with those records as its
+evidence, and treat an override that proves to have been wrong as evidence for
+tightening that guard specifically. A wedged lane is not a wedged campaign: keep
+every lane running that does not draw on the resource the refusal named, keep
+the report path independent of whatever is stuck, and never end correct and
+silent.
 
 ## Test and claim verification
 
@@ -97,8 +207,9 @@ that it would fail if the behaviour it names regressed.
 - **Prose is a claim and decays like one.** A docstring or comment asserting an
   invariant the code does not enforce is a defect in the same class as a wrong
   fixture. Correct it when the mechanism changes, or delete it.
-- **A gate that only fires once is not a gate.** Ask whether a guard fires on
-  every occurrence or only the first, and whether anything re-checks afterwards.
+- **A gate that only fires once is not a gate.** Ask whether any test exercises
+  the second occurrence, and what the suite would show if nothing re-checked
+  after the first.
 
 Distinguish evidence from conditions. A differential is only as good as the
 equivalence of its runs, and a measurement used as evidence must be taken under
