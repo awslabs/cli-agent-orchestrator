@@ -193,13 +193,26 @@ def test_every_connection_carries_the_pragma(db_path: Path, stdlib_default_timeo
 # BR-3 — migrators run at most once per database path per process (+ SR-2).
 # ---------------------------------------------------------------------------
 def test_migrators_run_once_per_path(db_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """THE SPIES DELEGATE TO THE REAL MIGRATORS, and since PR #628's review they must.
+
+    They were pure counters that created nothing. ``_connect`` now verifies the schema before
+    caching the path (BR-6, corrected), so a stub that counts without creating a table is
+    indistinguishable from a silently failed migration — correctly NOT cached, and correctly
+    re-run on the next call. Counting the real call is what this test was always about; the
+    stub's silence about the schema was incidental to it and is now load-bearing elsewhere
+    (see :class:`TestASilentMigrationFailureIsNotCached`).
+    """
+    real_run = database_client._migrate_workflow_run
+    real_step = database_client._migrate_workflow_run_step
     calls = {"run": 0, "step": 0}
 
     def _count_run() -> None:
         calls["run"] += 1
+        real_run()
 
     def _count_step() -> None:
         calls["step"] += 1
+        real_step()
 
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database._migrate_workflow_run", _count_run, raising=True
@@ -259,15 +272,17 @@ def test_failed_migration_is_not_cached(db_path: Path, monkeypatch: pytest.Monke
     migrators and gets a real schema. Asserted on call counts across the two calls
     plus set membership, per BR-6.
 
-    WHAT THIS DOES NOT PROVE — stated because BR-6's rationale reaches further than
-    any test of this unit honestly can: the REAL migrators each wrap their body in
-    ``except Exception`` and log at debug (clients/database.py), so a real-world
-    migration failure never raises — it returns normally and IS therefore cached as
-    success. This test cannot cover that case because ``_connect`` cannot observe it:
-    a silent failure is indistinguishable from success at this seam. Fixing it would
-    mean changing the migrators' error posture, which ``business-logic-model.md``
-    ("Error handling", row 1) explicitly places outside this unit. The rule as
-    implementable — and as tested here — is "do not cache a raise".
+    WHAT IT NO LONGER LEAVES UNPROVEN (PR #628 review, Copilot F2). This docstring used
+    to end here, saying: "the REAL migrators each wrap their body in ``except
+    Exception`` and log at debug, so a real-world migration failure never raises —
+    it returns normally and IS therefore cached as success. This test cannot cover
+    that case because ``_connect`` cannot observe it." The first half was right and
+    the conclusion was wrong: ``_connect`` cannot observe the FAILURE, but it can
+    observe the SCHEMA, and that is the thing the cache is a claim about. It now
+    verifies the columns before caching, so the silent-failure case IS covered —
+    by :class:`TestASilentMigrationFailureIsNotCached` below. The migrators' error
+    posture is unchanged, which is what ``business-logic-model.md`` ("Error
+    handling", row 1) places outside this unit.
 
     The migrators are patched on ``clients.database``, which IS the resolution point
     for ``_connect``'s function-local import: it re-reads the module attribute on
@@ -275,6 +290,7 @@ def test_failed_migration_is_not_cached(db_path: Path, monkeypatch: pytest.Monke
     module-level alias in ``workflow_journal`` to patch instead.
     """
     real_migrate_run = database_client._migrate_workflow_run  # captured before patching
+    real_migrate_step = database_client._migrate_workflow_run_step
     calls = {"run": 0, "step": 0}
 
     def _raise_once_then_delegate() -> None:
@@ -284,7 +300,11 @@ def test_failed_migration_is_not_cached(db_path: Path, monkeypatch: pytest.Monke
         real_migrate_run()
 
     def _count_step() -> None:
+        # Delegates since PR #628's review: ``_connect`` verifies the schema before caching,
+        # so a step migrator that counted without creating its table would leave the path
+        # uncached for a REASON THIS TEST IS NOT ABOUT and hide the recovery it asserts.
         calls["step"] += 1
+        real_migrate_step()
 
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database._migrate_workflow_run",
@@ -310,6 +330,188 @@ def test_failed_migration_is_not_cached(db_path: Path, monkeypatch: pytest.Monke
     assert calls == {"run": 2, "step": 1}
     assert str(db_path) in _MIGRATED_PATHS
     assert "workflow_run" in _table_names(db_path)
+
+
+# ---------------------------------------------------------------------------
+# BR-6, corrected by PR #628's review (Copilot F2) — a SILENTLY failed migration is
+# not cached as success either. This is the case ``test_failed_migration_is_not_cached``
+# above could not reach, and it is the case that actually happens in production:
+# the real migrators return normally when they fail.
+# ---------------------------------------------------------------------------
+class TestASilentMigrationFailureIsNotCached:
+    """``_MIGRATED_PATHS`` is a claim about the SCHEMA, so it is verified against the schema.
+
+    The substituted migrators here RETURN NORMALLY AND CREATE NOTHING — which is exactly what
+    the real ones do when their ``except Exception`` -> ``logger.debug`` fires. Under the old
+    "cache after both migrators return" rule the path was cached, and every later connection in
+    the process skipped the migrators and talked to a schema-less database.
+    """
+
+    @staticmethod
+    def _silent_noop_migrators(monkeypatch: pytest.MonkeyPatch) -> dict:
+        calls = {"run": 0, "step": 0}
+
+        def _noop_run() -> None:
+            calls["run"] += 1  # returns normally, creates nothing — a swallowed failure
+
+        def _noop_step() -> None:
+            calls["step"] += 1
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database._migrate_workflow_run",
+            _noop_run,
+            raising=True,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database._migrate_workflow_run_step",
+            _noop_step,
+            raising=True,
+        )
+        return calls
+
+    def test_a_migrator_that_returns_without_creating_the_schema_is_not_cached(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """THE REGRESSION TEST FOR F2. Fails against "cache after both migrators return"."""
+        self._silent_noop_migrators(monkeypatch)
+
+        _connect().close()
+
+        assert str(db_path) not in _MIGRATED_PATHS
+
+    def test_the_next_connection_retries_instead_of_trusting_the_cache(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The consequence that made F2 worth fixing: ONE transient failure must not disable
+        migration for the rest of the process. Both migrators run again on the next call, and
+        once they really create the schema the path is cached and they stop."""
+        calls = self._silent_noop_migrators(monkeypatch)
+
+        _connect().close()
+        assert calls == {"run": 1, "step": 1}
+
+        _connect().close()  # retried, not skipped
+        assert calls == {"run": 2, "step": 2}
+
+        # Now let the REAL migrators run: the schema appears, the path is cached, and a third
+        # call skips them. Without the caching half, this test would also pass against an
+        # implementation that never caches anything at all.
+        monkeypatch.undo()
+        monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+        _connect().close()
+        assert str(db_path) in _MIGRATED_PATHS
+        assert {"workflow_run", "workflow_run_step"} <= _table_names(db_path)
+
+    def test_a_partial_migration_is_not_cached_either(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """One table created, the other silently skipped — the shape a real partial failure
+        takes, since the two migrators are separate functions with separate ``try`` blocks.
+
+        A whole-table check alone would catch this; the next test is the one that needs the
+        column-level check.
+        """
+        real_migrate_run = database_client._migrate_workflow_run
+
+        def _skip_step() -> None:
+            return
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database._migrate_workflow_run_step",
+            _skip_step,
+            raising=True,
+        )
+
+        _connect().close()
+
+        assert real_migrate_run is database_client._migrate_workflow_run  # run/step unpatched
+        assert "workflow_run" in _table_names(db_path)
+        assert "workflow_run_step" not in _table_names(db_path)
+        assert str(db_path) not in _MIGRATED_PATHS
+
+    def test_a_table_missing_one_required_column_is_not_cached(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The case a table-existence check would MISS, and the one #583 actually shipped a
+        column into: the ``ALTER TABLE ADD COLUMN`` half of ``_migrate_workflow_run_step``
+        failing while the ``CREATE TABLE`` half succeeded. Five guarded ``ALTER``s now share
+        one ``try`` block, so this is the most likely partial state in production.
+
+        Simulated by creating the PRE-#583 table shape and then letting the migrators no-op,
+        which is what a locked database does to an ``ALTER``.
+        """
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                "CREATE TABLE workflow_run_step ("
+                "run_id TEXT NOT NULL, step_id TEXT NOT NULL, state TEXT NOT NULL, "
+                "attempts INTEGER NOT NULL, output_json TEXT, error TEXT, "
+                "updated_at TEXT NOT NULL, PRIMARY KEY (run_id, step_id))"
+            )
+        self._silent_noop_migrators(monkeypatch)
+
+        _connect().close()
+
+        assert "workflow_run_step" in _table_names(db_path)  # the table IS there...
+        assert str(db_path) not in _MIGRATED_PATHS  # ...and ``result_json`` is not
+
+    def test_the_required_column_sets_match_what_the_migrators_produce(self, db_path: Path):
+        """THE DRIFT GUARD. Equality, not a subset check: a column added to a migrator without
+        being added to the required set would silently drop out of the verification, and a
+        column named in the set that no migrator creates would make every path fail
+        verification and disable the cache entirely. Both are one edit away, so both fail here.
+        """
+        database_client._migrate_workflow_run()
+        database_client._migrate_workflow_run_step()
+
+        with sqlite3.connect(str(db_path)) as conn:
+            run_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflow_run)")}
+            step_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflow_run_step)")}
+
+        assert set(workflow_journal._REQUIRED_RUN_COLUMNS) == run_cols
+        assert set(workflow_journal._REQUIRED_STEP_COLUMNS) == step_cols
+
+    def test_the_predicate_never_raises_on_an_unusable_connection(self, db_path: Path):
+        """``_journal_schema_is_present`` is total, so verification cannot add a failure mode to
+        ``_connect`` that ``_connect`` did not already have. A closed connection is the cheapest
+        unusable one to produce."""
+        conn = sqlite3.connect(str(db_path))
+        conn.close()
+
+        assert workflow_journal._journal_schema_is_present(conn) is False
+
+    def test_a_verified_schema_is_cached_and_the_migrators_stop_running(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The other direction: verification must not turn BR-3 off. With the real migrators,
+        the first call migrates and caches; the second runs neither migrator."""
+        calls = {"n": 0}
+        real_run = database_client._migrate_workflow_run
+        real_step = database_client._migrate_workflow_run_step
+
+        def _count_run() -> None:
+            calls["n"] += 1
+            real_run()
+
+        def _count_step() -> None:
+            calls["n"] += 1
+            real_step()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database._migrate_workflow_run",
+            _count_run,
+            raising=True,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database._migrate_workflow_run_step",
+            _count_step,
+            raising=True,
+        )
+
+        _connect().close()
+        _connect().close()
+
+        assert calls == {"n": 2}  # two migrators, ONE migrating call
+        assert str(db_path) in _MIGRATED_PATHS
 
 
 # ---------------------------------------------------------------------------

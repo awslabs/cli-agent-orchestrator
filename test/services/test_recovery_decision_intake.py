@@ -30,7 +30,12 @@ Coverage, one group per rule from
 - BR-6/RL-2/INV-3 — a decision never silently fails (:class:`TestADecisionNeverSilentlyFails`).
 - BR-8/SR-9/RL-4 — a decision destroys no evidence (:class:`TestADecisionDestroysNoEvidence`).
 - BR-9/SR-7/RL-6 — one decision authorises exactly ONE attempt
-  (:class:`TestOneDecisionAuthorisesOneAttempt`).
+  (:class:`TestOneDecisionAuthorisesOneAttempt`, and its SECOND HALF added by PR #628's review
+  in :class:`TestUnconsumedConsentIsRevokedWhenTheDriveEnds`). The original class proved the
+  one case ``begin_step`` covers — a dispatched rerun cannot be re-authorised — and the new one
+  proves the three it does not: a resume that fails after the grant, a drive that never reaches
+  the decided step, and a ``skip``, which NOTHING consumed on any path because a replay writes
+  no row by design.
 - BR-10/TD-7 — the three surfaces share one closed set
   (:class:`TestTheThreeSurfacesShareOneClosedSet`).
 - SR-2/RL-1 — nothing is written until the WHOLE map validates, asserted by reading the
@@ -51,6 +56,7 @@ Rows are seeded THROUGH THE JOURNAL against a real temp SQLite DB (the patched
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -1041,3 +1047,249 @@ class TestTheCliDecideOption:
             STEP: "rerun",
             STEP_B: "skip",
         }
+
+
+# ---------------------------------------------------------------------------
+# BR-9's SECOND HALF (PR #628 review, Copilot F6) — consent is good for exactly the drive it
+# was granted for, so whatever that drive did not consume is REVOKED when it ends.
+# ---------------------------------------------------------------------------
+class TestUnconsumedConsentIsRevokedWhenTheDriveEnds:
+    """``begin_step`` consuming ``rerun_authorized`` covered ONE case. Three were open, and the
+    third is not a crash case at all:
+
+    1. the resume raises AFTER ``apply_decisions`` commits (a failing generation bump or
+       snapshot materialisation) — consent survived a command that reported failure;
+    2. the drive runs but never dispatches the decided step — ``rerun_authorized`` stands;
+    3. a ``skip`` is never consumed on ANY path, because a replay writes no row by design. One
+       ``skip`` was standing authorisation for every later resume of that run.
+
+    All three contradict the guarantee the CLI, the MCP tool, ``docs/workflows.md``, the
+    authoring guide and ``SKILL.md`` all state in the same words: *consent does not persist
+    across resumes*.
+
+    Every test here drives the REAL ``resume_script_run`` with ``_drive_process`` substituted,
+    so the admission gates, the generation bump, the ``finally`` and the journal writes are the
+    shipped ones — only the subprocess is absent.
+    """
+
+    @staticmethod
+    def _completing_drive(monkeypatch: pytest.MonkeyPatch, dispatch_step: bool = False):
+        """Substitute the drive. ``dispatch_step=True`` models the script actually reaching the
+        decided step, which is what CONSUMES a ``rerun`` (``begin_step`` -> ``running``)."""
+
+        from cli_agent_orchestrator.models.workflow_runtime import WorkflowRunResult
+
+        async def _drive(record, path, env):
+            if dispatch_step:
+                workflow_journal.begin_step(RUN, STEP, "2026-08-16T00:00:02Z", FP_CALL)
+            record.state = RunState.COMPLETED
+            return WorkflowRunResult(
+                run_id=RUN, workflow_name="wf", state=RunState.COMPLETED, started_at=TS
+            )
+
+        monkeypatch.setattr(script_runner, "_drive_process", _drive)
+
+    @pytest.mark.asyncio
+    async def test_a_resume_that_fails_after_the_grant_takes_it_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Copilot's own scenario: the generation bump raises AFTER the consent is committed.
+
+        The resume reports failure, so the consent it granted must not outlive it — otherwise
+        the operator's next resume re-executes a side-effecting step on consent given to a
+        command that failed, without being asked.
+        """
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("generation bump failed")
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_service.update_run_generation", _boom
+        )
+
+        with pytest.raises(RuntimeError, match="generation bump failed"):
+            await script_runner.resume_script_run(RUN, {STEP: "rerun"})
+
+        assert _state_of() == StepState.COMPLETED.value
+        assert _state_of() != StepState.RERUN_AUTHORIZED.value
+
+    @pytest.mark.asyncio
+    async def test_a_skip_does_not_stand_after_the_drive_completes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """THE WORST OF THE THREE, because it needs no failure at all: nothing ever consumed
+        ``replay_authorized``, so one ``skip`` silenced rule 7 for that step forever."""
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._completing_drive(monkeypatch)
+
+        await script_runner.resume_script_run(RUN, {STEP: "skip"})
+
+        assert _state_of() == StepState.COMPLETED.value
+        assert _state_of() != StepState.REPLAY_AUTHORIZED.value
+
+    @pytest.mark.asyncio
+    async def test_the_next_resume_halts_again_after_a_skip(self, monkeypatch: pytest.MonkeyPatch):
+        """The consequence, asserted through the GATE rather than the column — this is the
+        property the documentation promises, and the column is only how it is achieved.
+
+        Note the counterpart in :class:`TestTheLoopThisUnitCloses`: a skip must NOT halt again
+        WITHIN the resume it was granted for. Both are true, and together they are what "one
+        attempt" means — the decision holds for its own drive and expires with it.
+        """
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._completing_drive(monkeypatch)
+
+        await script_runner.resume_script_run(RUN, {STEP: "skip"})
+
+        d = decide(RUN, STEP, FP_CALL, RecoveryPolicy.MANUAL)
+        assert d.verdict is ReplayVerdict.DECISION_REQUIRED
+        assert d.rule is HaltRule.POLICY_MANUAL
+
+    @pytest.mark.asyncio
+    async def test_a_rerun_the_drive_never_dispatched_is_taken_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An earlier step halts, so the decided step is never reached and ``begin_step`` never
+        fires. The consent must expire with the attempt it was granted for."""
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._completing_drive(monkeypatch, dispatch_step=False)
+
+        await script_runner.resume_script_run(RUN, {STEP: "rerun"})
+
+        assert _state_of() == StepState.COMPLETED.value
+
+    @pytest.mark.asyncio
+    async def test_a_consumed_rerun_is_not_clobbered_by_the_revoke(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """THE MOST IMPORTANT TEST IN THIS CLASS. The revoke is a COMPARE-AND-SET, so a row the
+        drive genuinely moved must be left exactly as the drive left it.
+
+        A blind ``UPDATE ... SET state = <prior>`` would pass every other test here and quietly
+        rewrite the outcome of the step that DID re-run — turning a completed rerun back into
+        the state it held before the decision, which is both false history and a row the next
+        resume would replay instead of the result it just produced.
+        """
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._completing_drive(monkeypatch, dispatch_step=True)
+
+        await script_runner.resume_script_run(RUN, {STEP: "rerun"})
+
+        # ``begin_step`` moved it to ``running`` during the drive; the revoke matched nothing.
+        assert _state_of() == StepState.RUNNING.value
+        assert _state_of() != StepState.RERUN_AUTHORIZED.value
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_resume_neither_grants_nor_revokes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The no-decision path is byte-identical to before: no extra read, no extra write, no
+        log line. Asserted by spying on BOTH halves — a revoke that ran with an empty map would
+        be harmless but would break the claim that this path is untouched."""
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._completing_drive(monkeypatch)
+        calls: List[str] = []
+        monkeypatch.setattr(
+            workflow_journal,
+            "apply_decisions",
+            lambda *a, **k: calls.append("apply") or {},
+        )
+        monkeypatch.setattr(
+            workflow_journal,
+            "revoke_unconsumed_decisions",
+            lambda *a, **k: calls.append("revoke") or [],
+        )
+
+        await script_runner.resume_script_run(RUN)
+
+        assert calls == []
+        assert _state_of() == StepState.COMPLETED.value
+
+    @pytest.mark.asyncio
+    async def test_a_failing_revoke_never_masks_the_drives_outcome(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Best-effort, and the direction matters: losing the run's result to a bookkeeping
+        error would be a bigger fault than consent living one resume longer. The revoke is a
+        compare-and-set, so a later attempt is still safe."""
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._completing_drive(monkeypatch)
+        monkeypatch.setattr(
+            workflow_journal,
+            "revoke_unconsumed_decisions",
+            lambda *a, **k: (_ for _ in ()).throw(sqlite3.Error("revoke failed")),
+        )
+
+        result = await script_runner.resume_script_run(RUN, {STEP: "skip"})
+
+        assert result.state is RunState.COMPLETED
+
+    def test_revoke_reports_exactly_what_it_took_back(self):
+        """The primitive on its own: it returns the steps it reverted, so a caller can log or
+        assert on the set rather than re-reading every row."""
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        _seed_step(state=StepState.COMPLETED.value, step_id=STEP_B)
+
+        granted = apply_decisions(RUN, {STEP: "rerun", STEP_B: "skip"})
+        assert granted == {STEP: StepState.COMPLETED.value, STEP_B: StepState.COMPLETED.value}
+
+        # STEP is consumed the way production consumes it; STEP_B is not.
+        workflow_journal.begin_step(RUN, STEP, "2026-08-16T00:00:02Z", FP_CALL)
+
+        revoked = workflow_journal.revoke_unconsumed_decisions(RUN, granted)
+
+        assert revoked == [STEP_B]
+        assert _state_of(STEP) == StepState.RUNNING.value
+        assert _state_of(STEP_B) == StepState.COMPLETED.value
+
+    def test_revoke_with_an_empty_map_is_a_no_op(self):
+        """The ordinary resume's path through the primitive: no read, no write, no log."""
+        assert workflow_journal.revoke_unconsumed_decisions(RUN, {}) == []
+
+    def test_revoke_restores_only_state_and_destroys_no_evidence(self):
+        """BR-8/SR-9 applies to taking consent back as much as to granting it: the record of
+        what actually happened must survive both."""
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        before = _all_columns()
+
+        granted = apply_decisions(RUN, {STEP: "skip"})
+        workflow_journal.revoke_unconsumed_decisions(RUN, granted)
+
+        assert _all_columns() == before
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_resume_still_revokes(self, monkeypatch: pytest.MonkeyPatch):
+        """A cancelled resume consumed nothing, so consent must not survive it either.
+
+        WHAT THIS TEST DOES NOT PROVE, stated so the next reader does not over-read it: it does
+        NOT discriminate the direct revoke call from an ``await asyncio.to_thread(...)`` one.
+        Both forms pass this test, and both pass a real ``task.cancel()`` probe on CPython 3.12
+        — measured, not assumed. The direct call in ``resume_script_run``'s ``finally`` is a
+        defensive choice (an ``await`` there is at the mercy of cancellation delivery, which is
+        version- and repeat-cancel-dependent), not a repair of an observed failure. What this
+        test DOES pin is the outcome on the cancellation path, which is the part that matters
+        and the part that would break if the revoke were moved out of the ``finally``.
+        """
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+
+        async def _cancelled_drive(record, path, env):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(script_runner, "_drive_process", _cancelled_drive)
+
+        with pytest.raises(asyncio.CancelledError):
+            await script_runner.resume_script_run(RUN, {STEP: "rerun"})
+
+        assert _state_of() == StepState.COMPLETED.value
+        assert _state_of() != StepState.RERUN_AUTHORIZED.value

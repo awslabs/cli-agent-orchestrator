@@ -44,11 +44,57 @@ from cli_agent_orchestrator.services.workflow_errors import ReplayDivergenceErro
 
 logger = logging.getLogger(__name__)
 
-# Database paths whose journal migrators have already run in THIS process (issue #583).
+# Database paths whose journal schema has been VERIFIED PRESENT in THIS process (issue #583).
 # Keyed on PATH, not a boolean: five test modules repoint DATABASE_FILE to a temporary
 # path mid-process, and a boolean would leave them on a schema-less database (BR-4).
 # Holds paths only — never row data, connections or credentials (SR-2).
+#
+# "VERIFIED PRESENT", NOT "THE MIGRATORS RETURNED" (PR #628 review, Copilot F2). Both
+# migrators wrap their whole body in ``except Exception`` -> ``logger.debug`` and therefore
+# RETURN NORMALLY when they fail, so "both migrators returned" establishes nothing about the
+# schema: a transient lock or a DDL failure would cache a schema-less database for the rest of
+# the process and defeat every later retry. ``_connect`` now checks the columns before it
+# records the path, which is the only claim this set can honestly make.
 _MIGRATED_PATHS: set[str] = set()
+
+# The columns the journal's own SQL reads and writes, per table (PR #628 review). Compared
+# against ``PRAGMA table_info`` before a path is cached, because a migrator's silent failure is
+# invisible at its return.
+#
+# ADDING A COLUMN TO EITHER MIGRATOR MEANS WIDENING THE MATCHING SET IN THE SAME CHANGE, and
+# ``test_workflow_journal_connection_posture.py`` asserts the two sets against what the
+# migrators actually produce on a fresh database — so a column added on one side and not the
+# other fails loudly instead of quietly dropping out of the check.
+_REQUIRED_RUN_COLUMNS = frozenset(
+    {
+        "run_id",
+        "workflow_name",
+        "spec_snapshot",
+        "inputs_json",
+        "state",
+        "current_step_id",
+        "started_at",
+        "finished_at",
+        "tier",
+        "generation",
+    }
+)
+_REQUIRED_STEP_COLUMNS = frozenset(
+    {
+        "run_id",
+        "step_id",
+        "state",
+        "attempts",
+        "output_json",
+        "error",
+        "updated_at",
+        "call_fingerprint",
+        "terminal_id",
+        "reprompted",
+        "error_kind",
+        "result_json",
+    }
+)
 
 
 @dataclass
@@ -190,10 +236,27 @@ def _connect() -> sqlite3.Connection:
       guarded by :data:`_MIGRATED_PATHS`. The path is read INSIDE this function
       on every call — never captured at import and never cached beside the set
       (BR-5) — so a process that repoints ``DATABASE_FILE`` mid-run still
-      migrates the new path on its next call (BR-4). The path is recorded ONLY
-      after both migrators return (BR-6): each swallows and logs its own
-      failure at debug level, so caching a raise would turn one transient
-      fault into a process that talks to a schema-less database forever.
+      migrates the new path on its next call (BR-4). The path is recorded only
+      once the REQUIRED SCHEMA IS VERIFIED PRESENT on the new connection (BR-6,
+      corrected by PR #628's review — Copilot F2).
+
+      **"Both migrators returned" was the original condition and it was the
+      bug.** Each migrator wraps its whole body in ``except Exception`` ->
+      ``logger.debug``, so it returns normally when it FAILS: returning is not
+      succeeding. One transient lock or DDL failure therefore cached a
+      schema-less database for the rest of the process and prevented every
+      later retry — the exact outcome the old comment said the ordering
+      avoided. The migrators' swallow-and-log posture is deliberately
+      UNCHANGED (other callers depend on it, and it is
+      ``business-logic-model.md``'s "Error handling" row 1, outside this
+      unit); what changed is that this function no longer takes their return
+      as evidence. It asks the database instead, with
+      :func:`_journal_schema_is_present`.
+
+      A path that fails verification is simply not cached: the connection is
+      still returned (the caller's own query is what will fail, with a real
+      SQLite error naming the real problem), and the NEXT call re-runs both
+      migrators. That is the retry the cache was destroying.
     - **Every connection carries ``busy_timeout``** (BR-1/BR-2). It is a
       per-connection setting rather than a database property, so it cannot be
       memoised alongside the migration state and is set on each new connection.
@@ -224,13 +287,62 @@ def _connect() -> sqlite3.Connection:
     )
 
     path = str(DATABASE_FILE)  # read at call time, never cached (BR-5)
-    if path not in _MIGRATED_PATHS:
+    needs_migration = path not in _MIGRATED_PATHS
+    if needs_migration:
         _migrate_workflow_run()
         _migrate_workflow_run_step()
-        _MIGRATED_PATHS.add(path)  # only after BOTH migrators return (BR-6)
     conn = sqlite3.connect(path)
     conn.execute(f"PRAGMA busy_timeout = {WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS}")
+    if needs_migration:
+        # BR-6, corrected: cache the path only once the schema is VERIFIED, never merely
+        # because the two silently-failing migrators returned. Verified on the connection this
+        # call is about to hand back, so the check and the caller see the same database.
+        if _journal_schema_is_present(conn):
+            _MIGRATED_PATHS.add(path)
+        else:
+            # WARNING, not debug: this is the state in which every subsequent journal write
+            # fails, and the migrators have already logged their own cause at debug. The path
+            # only — never row data (SR-2). Repeats per connection until it is fixed, which is
+            # the intended volume for "the journal has no schema".
+            logger.warning(
+                "journal: required schema absent after migration for '%s'; "
+                "not caching the path so the next connection retries",
+                path,
+            )
     return conn
+
+
+def _journal_schema_is_present(conn: sqlite3.Connection) -> bool:
+    """Do both journal tables carry every column this module's SQL uses?
+
+    The verification :func:`_connect` needs and the migrators cannot provide: they swallow and
+    log their own failures, so their return says nothing about the schema (PR #628 review).
+
+    TOTAL — never raises, so it cannot add a failure mode to ``_connect`` that ``_connect``
+    did not already have. A ``PRAGMA table_info`` on a missing table returns no rows rather
+    than raising, which already answers ``False``; a corrupt or unreadable database raises
+    ``sqlite3.Error`` and is ALSO ``False``, because "we could not establish that the schema is
+    there" and "the schema is not there" call for the same decision here — do not cache. The
+    caller's own query then fails with the real error, which is a better diagnostic than
+    anything this predicate could invent.
+
+    Reads only ``PRAGMA table_info`` — no row data is touched, so nothing here can log or
+    return step content (SR-2).
+    """
+    try:
+        for table, required in (
+            ("workflow_run", _REQUIRED_RUN_COLUMNS),
+            ("workflow_run_step", _REQUIRED_STEP_COLUMNS),
+        ):
+            # The table name is interpolated from a module-level literal pair and from nothing
+            # else (SR-1) — SQLite accepts no bound parameter for an identifier, the same
+            # constraint that makes the busy_timeout pragma above an interpolation.
+            present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not required <= present:
+                return False
+    except sqlite3.Error:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -461,11 +573,11 @@ def settle_run_state_if_running(run_id: str, state: str, finished_at: Optional[s
 # member on either side fails loudly instead of drifting.
 _DECISION_STATES: Dict[str, str] = {
     "rerun": "rerun_authorized",  # -> gate rule 1 -> EXECUTE (BR-2)
-    "skip": "replay_authorized",  # -> gate rule 7 excluded -> rule 8 -> REPLAY (BR-3)
+    "skip": "replay_authorized",  # -> gate rules 7/9 excluded -> catch-all -> REPLAY (BR-3)
 }
 
 
-def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> None:
+def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> Dict[str, str]:
     """Apply a human's per-step recovery decisions to one run's rows (FR-7, BR-1..BR-10).
 
     The escape hatch for a halt: the replay gate can return ``DECISION_REQUIRED``,
@@ -529,6 +641,16 @@ def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> None:
     an accepted residual in this unit's ``security-requirements.md`` rather than
     papered over; when #505 lands, this line is where the decision joins the timeline.
 
+    **IT RETURNS THE PRIOR STATES, so consent can be revoked (PR #628 review, Copilot
+    F6).** The return value is new and additive — every existing caller ignores it. It
+    exists because BR-9's "one decision authorises exactly ONE attempt" was only HALF
+    implemented: ``begin_step`` consumes ``rerun_authorized`` by flipping the row to
+    ``running``, but NOTHING consumes ``replay_authorized`` (a replay writes no row, by
+    design), and a resume that fails after this commit leaves either state live for the
+    next resume to consume. Reverting needs the state that was overwritten, and this
+    function is the only place that still knows it. :func:`revoke_unconsumed_decisions`
+    is the other half; ``script_runner.resume_script_run`` holds the pair together.
+
     Args:
         run_id: the run being resumed. Its rows are the only ones touched.
         decisions: ``step_id`` -> decision, where a value is a ``RecoveryDecision``
@@ -536,6 +658,12 @@ def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> None:
             ``RecoveryDecision`` IS a ``(str, Enum)`` and the boundary hands raw JSON
             strings: :func:`parse_decision` is the single validation point for both
             forms (BR-10), so no surface can accept a value another rejects.
+
+    Returns:
+        ``step_id`` -> the state each row held BEFORE this call, for exactly the steps
+        written. Empty for an empty ``decisions`` map. Hand it to
+        :func:`revoke_unconsumed_decisions` when the drive this consent was granted for
+        is over.
 
     Raises:
         ValueError: if any ``step_id`` is absent from this run, or any value is not a
@@ -555,11 +683,14 @@ def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> None:
     from cli_agent_orchestrator.models.workflow_runtime import parse_decision
 
     if not decisions:
-        return  # no decision supplied is not a decision that failed
+        return {}  # no decision supplied is not a decision that failed
 
     # 1. The run's own rows are the bound on N (SC-1): a caller cannot enlarge the
     # write set by inventing ids, because step 2 rejects the whole map instead.
-    known = {row.step_id for row in get_steps(run_id)}
+    # The states come off the SAME read (PR #628 review): the prior state is what makes
+    # the grant revocable, and this is the last moment anything knows it.
+    prior_states = {row.step_id: row.state for row in get_steps(run_id)}
+    known = set(prior_states)
 
     # 2. VALIDATE THE WHOLE MAP FIRST. Nothing below this loop writes, and nothing
     # above it does either — the resolved states are collected and only then applied.
@@ -590,6 +721,94 @@ def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> None:
             decision_value,
             state,
         )
+
+    # Only the steps actually written, so a caller cannot revoke a row this call did not
+    # touch even by handing the whole map back.
+    return {step_id: prior_states[step_id] for step_id in resolved}
+
+
+def revoke_unconsumed_decisions(run_id: str, prior_states: Mapping[str, str]) -> List[str]:
+    """Take back any recovery consent the finished drive did not consume (PR #628 review, F6).
+
+    THE MISSING HALF OF BR-9's "one decision authorises exactly ONE attempt". The other half
+    already worked for one case: ``begin_step`` flips a ``rerun_authorized`` row to ``running``,
+    so a dispatched rerun cannot be re-authorised by the same decision. Three cases were not
+    covered, and the third is not a crash case at all:
+
+    1. the resume FAILS after :func:`apply_decisions` commits — a raising generation bump or
+       snapshot materialisation — and the consent survives a command that reported failure;
+    2. the drive runs but never reaches the decided step (an earlier step halts), so nothing
+       dispatches it and ``rerun_authorized`` stands;
+    3. a ``skip`` is NEVER consumed by anything, on any path, because a replay writes no row
+       BY DESIGN. One ``skip`` was therefore standing authorisation for every future resume of
+       that run — which is precisely what the CLI, the MCP tool, ``docs/workflows.md``, the
+       authoring guide and ``SKILL.md`` all promise it is not.
+
+    A COMPARE-AND-SET, NEVER A BLIND WRITE. Each ``UPDATE`` carries
+    ``AND state = <the authorised value>``, so a row the drive DID move — to ``running``,
+    ``completed``, ``failed``, or anything else — is not matched and cannot be clobbered. That
+    is what makes this safe to call unconditionally at the end of every decided resume, and it
+    is why the caller does not have to work out which steps were consumed: the database
+    answers, atomically, from the state itself.
+
+    ONE transaction, ``state`` and nothing else — the same posture as
+    :func:`apply_decisions`, and for the same reason (BR-8): revoking consent must destroy no
+    evidence of what actually happened.
+
+    Args:
+        run_id: the run whose consent is being revoked.
+        prior_states: ``step_id`` -> the state the row held before the decision, exactly as
+            :func:`apply_decisions` returned it. A step absent from this map is untouched.
+
+    Returns:
+        The ``step_id``s actually reverted, in the map's iteration order — i.e. the consents
+        that were NOT consumed. Empty when the drive consumed everything it was granted.
+
+    Raises:
+        sqlite3.Error: propagated unchanged, like every other helper here. The caller treats a
+            failure as best-effort: it must not mask the drive's own outcome, and the next
+            resume's gate still halts on anything it cannot verify.
+    """
+    if not prior_states:
+        return []
+
+    authorised = set(_DECISION_STATES.values())
+    revoked: List[str] = []
+    with _connect() as conn:
+        for step_id, prior in prior_states.items():
+            if prior in authorised:
+                # Refuse to "restore" a row to an authorised state — that would re-grant the
+                # consent this function exists to take back. Only reachable if a caller hands
+                # back a map from a nested/duplicated apply, which no shipped path does.
+                logger.warning(
+                    "journal: run '%s' step '%s': prior state is itself an authorisation; "
+                    "not revoking",
+                    run_id,
+                    step_id,
+                )
+                continue
+            for state in authorised:
+                cursor = conn.execute(
+                    "UPDATE workflow_run_step SET state = ? "
+                    "WHERE run_id = ? AND step_id = ? AND state = ?",
+                    (prior, run_id, step_id, state),
+                )
+                if cursor.rowcount:
+                    revoked.append(step_id)
+                    break
+
+    # AFTER the commit, and only for what was really taken back — the counterpart of
+    # ``apply_decisions``' grant line, so the two halves of one consent appear in one log at
+    # the same level. Identifiers and states only (SR-5).
+    for step_id in revoked:
+        logger.warning(
+            "journal: run '%s' step '%s': recovery consent was not consumed by this drive "
+            "and has been revoked (state -> %s)",
+            run_id,
+            step_id,
+            prior_states[step_id],
+        )
+    return revoked
 
 
 # ---------------------------------------------------------------------------

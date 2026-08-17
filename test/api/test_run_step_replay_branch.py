@@ -26,8 +26,16 @@ One test group per rule from
   Two tests, one per verdict, asserting different ``kind`` values: a single
   parametrised test over both verdicts would pass with one shared arm.
 - BR-7  — the halt detail carries ``rule``; the divergence detail has no ``rule``
-  key at all. FOUR assertions, one per halting condition surfacing its SPECIFIC
-  value — "a rule is present" passes with all four returning the same one.
+  key at all. SIX assertions, one per halting condition surfacing its SPECIFIC
+  value — "a rule is present" passes with all six returning the same one.
+- PR #628 review — three findings land in this file:
+  ``TestTheSixHaltingRules::test_rule_outcome_failed`` (F1, a ``failed`` row answered 200),
+  ``::test_rule_envelope_lossy`` (F5, a truncated/redacted envelope served as the step's
+  output with no field able to say so), and
+  :class:`TestAReplayedStepIsVisibleInTheRunResult` (F4, the early return left the replayed
+  step out of ``WorkflowRunResult.steps``). The F4 class carries its own BR-4 re-assertion,
+  because the fix adds a callback to the replay path and BR-4 is what bounds it: in memory
+  only, no terminal, no durable write.
 - BR-9/SR-8 — a database failure inside ``decide`` produces 500 AND
   ``run_agent_step`` is not called. The second half is the one that matters:
   asserting the 500 alone passes even if execution already happened.
@@ -495,11 +503,17 @@ class TestDecisionRequiredArm:
 
 
 # ---------------------------------------------------------------------------
-# BR-7 — each of the four halting conditions surfaces its SPECIFIC rule.
+# BR-7 — each of the six halting conditions surfaces its SPECIFIC rule.
 # ---------------------------------------------------------------------------
-class TestTheFourHaltingRules:
-    """Four assertions, not one "a rule is present": with all four returning the
-    same value, the weaker test would still pass."""
+class TestTheSixHaltingRules:
+    """Six assertions, not one "a rule is present": with all six returning the
+    same value, the weaker test would still pass.
+
+    The last two arrived with PR #628's review and are asserted THROUGH THE ROUTE, not only at
+    the gate, because the route is where an operator reads the code — and both rules exist to
+    stop this route answering HTTP 200 for a result that is not a faithful substitute for the
+    original call.
+    """
 
     def test_rule_interrupted_no_policy(self, client):
         body = _body(env_vars=_env("run-r2"))
@@ -539,11 +553,58 @@ class TestTheFourHaltingRules:
         assert resp.status_code == 409
         assert resp.json()["detail"]["rule"] == "policy_manual"
 
-    def test_the_four_rule_values_are_all_different(self, client):
-        """The forcing function for the four tests above: if a later edit made two
+    def test_rule_outcome_failed(self, client):
+        """PR #628 review (Copilot F1). A ``failed`` row previously REPLAYED: this route
+        answered 200 with a ``StepHandle`` for a call that raised on the original drive, so the
+        script continued past a failure that had been silently deleted from the replayed run.
+        """
+        body = _body(env_vars=_env("run-r8"))
+        _register_run("run-r8")
+        # Exactly the row the production settler writes for a failed step: state ``failed``,
+        # a matching current-scheme fingerprint, and an envelope (``result-envelope`` BR-1
+        # writes one unconditionally).
+        _seed_step(
+            "run-r8",
+            fingerprint=_route_fingerprint(body),
+            envelope=_envelope(last_message="", status="failed"),
+            state="failed",
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["kind"] == "decision_required"
+        assert resp.json()["detail"]["rule"] == "outcome_failed"
+        # Fail-CLOSED, not fail-open: halting must not become silent re-execution.
+        m_run.assert_not_awaited()
+
+    def test_rule_envelope_lossy(self, client):
+        """PR #628 review (Copilot F5). ``build_envelope`` redacts then bounds the text before
+        storage, while the SUCCESS arm of this route answers with ``run_agent_step``'s raw
+        ``last_message`` — and ``RunStepResponse`` has no ``truncated``/``redacted`` field, so a
+        replayed response cannot even say that what it served is abridged.
+        """
+        body = _body(env_vars=_env("run-r9"))
+        _register_run("run-r9")
+        lossy = StepResultEnvelope(
+            last_message="[REDACTED:aws-secret-key] tail",
+            status="completed",
+            terminal_id="original-terminal",
+            truncated=True,
+            redacted=True,
+        )
+        _seed_step("run-r9", fingerprint=_route_fingerprint(body), envelope=lossy)
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["kind"] == "decision_required"
+        assert resp.json()["detail"]["rule"] == "envelope_lossy"
+        m_run.assert_not_awaited()
+
+    def test_the_six_rule_values_are_all_different(self, client):
+        """The forcing function for the six tests above: if a later edit made two
         conditions report the same code, each individual assertion could still be
         "corrected" to match, but this one could not."""
-        assert len({r.value for r in HaltRule}) == 4
+        assert len({r.value for r in HaltRule}) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -815,7 +876,7 @@ class TestTheScriptTierGuard:
 class TestRecoveryField:
     def test_unknown_recovery_value_is_rejected(self, client):
         """Rejected, NEVER coerced to undeclared: the two differ at the gate's
-        rules 2 and 8, so conflating them would change the verdict."""
+        rule 2 and at its catch-all, so conflating them would change the verdict."""
         with (
             patch(_DECIDE) as m_decide,
             patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
@@ -829,8 +890,69 @@ class TestRecoveryField:
         m_decide.assert_not_called()
         m_run.assert_not_awaited()
 
+    def test_the_lint_message_names_the_real_gap_and_the_route_agrees(self, client):
+        """PR #628 review (Copilot F3) — the two halves of one claim, asserted together.
+
+        The ``unenforced-recovery-policy`` finding used to say a ``recovery=`` on ``run_step``
+        was "never validated". This test binds the corrected message to the behaviour it
+        describes, IN ONE PLACE, because that is the only way the two stop drifting: the
+        message claims a 422, so the route is driven with a bad value and must produce one; the
+        message claims the gap is client-side, so a VALID value must be accepted and honoured.
+
+        Two assertions about the same fact from opposite directions. The message alone could be
+        re-worded to match a broken route; the route alone could be correct while the message
+        lied about it, which is exactly what shipped.
+        """
+        from cli_agent_orchestrator.services.script_lint import lint_script
+
+        source = (
+            "from cao_workflow import run_step\n"
+            "run_step('kiro_cli', 'developer', 'x', recovery='idempotant')\n"
+        )
+        findings = [
+            f
+            for f in lint_script(source, "s.py").findings
+            if f.rule_id == "unenforced-recovery-policy"
+        ]
+        assert len(findings) == 1
+        assert "422" in findings[0].message
+        assert "never validated" not in findings[0].message
+
+        # Half 1 — the 422 the message promises. Same bad value the linted source uses.
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run:
+            bad = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(env_vars=_env("run-f3-bad"), recovery="idempotant"),
+            )
+        assert bad.status_code == 422
+        m_run.assert_not_awaited()
+
+        # Half 2 — the gap really is only client-side: a VALID value on ``run_step``'s wire
+        # shape is accepted and reaches the gate as the declared policy.
+        run_id = "run-f3-good"
+        _register_run(run_id)
+        seen: list = []
+
+        def _spy_decide(r_id, s_id, fingerprint, policy):
+            seen.append(policy)
+            return ReplayDecision(
+                verdict=ReplayVerdict.EXECUTE, envelope=None, reason="test", rule=None
+            )
+
+        with (
+            patch(_DECIDE, side_effect=_spy_decide),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())),
+        ):
+            good = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(env_vars=_env(run_id), recovery="idempotent"),
+            )
+        assert good.status_code == 200
+        # The MEMBER, not the string — the gate compares identity against ``RecoveryPolicy``.
+        assert seen == [RecoveryPolicy.IDEMPOTENT]
+
     def test_absent_recovery_yields_the_undeclared_behaviour(self, client):
-        """Undeclared REPLAYS at rule 8 where ``manual`` halts at rule 7 — the one
+        """Undeclared REPLAYS at the catch-all where ``manual`` halts at rule 7 — the one
         place the two differ, so this is what discriminates them."""
         run_id = "run-rec-absent"
         body = _body(env_vars=_env(run_id))
@@ -964,18 +1086,33 @@ class TestTheRouteDecidesNothing:
         assert "decision.verdict" in code
         assert "decision.rule" in code
 
-    def test_the_route_adds_no_logger_call(self):
+    def test_the_route_logs_only_inside_best_effort_bookkeeping_guards(self):
         """SR-7: the gate logs nothing by design and the decision log belongs to
         unit 12. A replay is a normal successful outcome; logging every one would
-        make the quiet path noisy and create a new place for a digest to leak."""
+        make the quiet path noisy and create a new place for a digest to leak.
+
+        TWO calls since PR #628's review, not one, and the shape is what is asserted rather
+        than the count alone: both are ``logger.warning`` inside an ``except`` guard around
+        best-effort step bookkeeping — ``_settle_step``'s (``settlement-rewire``) and
+        ``_record_replayed_step``'s (F4). Neither logs on the success path and neither can
+        carry a digest, an envelope or a prompt: each renders a fixed sentence plus
+        ``exc_info``. What this test still forbids is a log line on the REPLAY path itself,
+        which is the noise-and-leak surface SR-7 is about.
+        """
         import re
 
         from cli_agent_orchestrator.api.main import run_step
 
-        calls = re.findall(r"logger\.\w+", _code_of(run_step))
-        # Exactly the ONE pre-existing call, inside ``_settle_step``'s best-effort
-        # bookkeeping guard (``settlement-rewire``). This unit adds none.
-        assert calls == ["logger.warning"]
+        code = _code_of(run_step)
+        calls = re.findall(r"logger\.\w+", code)
+        assert calls == ["logger.warning", "logger.warning"]
+        # Every call is a WARNING inside a bookkeeping guard — never an info/debug narration
+        # of a replay, and never one that interpolates a value.
+        assert "logger.info" not in code
+        assert "logger.debug" not in code
+        for line in code.splitlines():
+            if "logger." in line:
+                assert "exc_info=True" in line or "bookkeeping" in line
 
 
 def _code_of(func) -> str:
@@ -1025,3 +1162,134 @@ class TestCompatibility:
         assert "_scopes" in signature.parameters
         source = inspect.getsource(run_step)
         assert "Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN))" in source
+
+
+# ---------------------------------------------------------------------------
+# PR #628 review, Copilot F4 — a REPLAY must still appear in the run's step list.
+# ---------------------------------------------------------------------------
+class TestAReplayedStepIsVisibleInTheRunResult:
+    """The defect: the early replay return bypasses BOTH script callbacks.
+
+    ``make_step_terminal_recorder`` is what seeds ``ScriptRunRecord.step_states[step_id]`` and
+    ``record_step_completion`` is what settles it, and neither fires on the replay path —
+    correctly, since a replay must create no terminal and write no durable row (BR-4). But
+    ``_finalize`` builds ``WorkflowRunResult.steps`` ONLY from that in-memory map, and
+    ``resume_script_run`` reconstructs the record with ``step_states={}``. So a fully replayed
+    resume reported ``steps=[]`` while every journal row was sitting right there.
+
+    The fix records the replayed step in memory ONLY, hydrated from the durable row — which is
+    why :class:`TestReplayCreatesNothing` above still passes unchanged.
+    """
+
+    def test_a_replayed_step_appears_in_the_live_record(self, client):
+        run_id = "run-f4-visible"
+        body = _body(env_vars=_env(run_id))
+        record = _register_run(run_id)
+        assert record is not None
+        _seed_step(run_id, fingerprint=_route_fingerprint(body), envelope=_envelope())
+        assert record.step_states == {}  # nothing yet — this is a resumed drive's starting state
+
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert resp.status_code == 200
+        assert resp.json()["replayed"] is True
+        m_run.assert_not_awaited()  # still no execution
+
+        # THE ASSERTION F4 IS ABOUT.
+        assert "s1" in record.step_states
+        st = record.step_states["s1"]
+        assert st.step_id == "s1"
+
+    def test_the_recorded_state_comes_from_the_durable_row_not_a_default(self, client):
+        """Hydrated from the journal, not invented. Asserted on values that could not have
+        been guessed: the ``attempts`` count the original drive reached and the terminal id the
+        envelope carries. A recorder that wrote ``StepRunState(step_id=...)`` and nothing else
+        would pass the previous test and fail this one.
+        """
+        run_id = "run-f4-hydrated"
+        body = _body(env_vars=_env(run_id))
+        record = _register_run(run_id)
+        assert record is not None
+        _seed_step(
+            run_id,
+            fingerprint=_route_fingerprint(body),
+            envelope=_envelope(terminal_id="original-terminal"),
+        )
+
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+        assert resp.json()["replayed"] is True
+
+        row = workflow_journal.get_step(run_id, "s1")
+        assert row is not None
+        st = record.step_states["s1"]
+        assert st.state.value == row.state
+        assert st.attempts == row.attempts
+        assert st.attempts >= 1  # the original attempt is not erased by the replay
+        assert st.call_fingerprint == row.call_fingerprint
+
+    def test_the_replayed_step_records_no_terminal_id(self, client):
+        """THE ONE FIELD THAT MUST NOT BE COPIED, and the reason it gets its own test.
+
+        The response serves the envelope's original ``terminal_id`` because a caller asked what
+        the step returned — and pairs it with ``replayed=True`` precisely because that terminal
+        no longer exists (SR-4). ``StepRunState.terminal_id`` is a different thing: it is the
+        list ``_reconcile_orphans`` sweeps to TEAR DOWN live terminals, so putting a dead id
+        there would be an instruction to delete something already gone.
+        """
+        run_id = "run-f4-no-terminal"
+        body = _body(env_vars=_env(run_id))
+        record = _register_run(run_id)
+        assert record is not None
+        _seed_step(
+            run_id,
+            fingerprint=_route_fingerprint(body),
+            envelope=_envelope(terminal_id="original-terminal"),
+        )
+
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        # The RESPONSE still carries it — the two are not the same field.
+        assert resp.json()["terminal_id"] == "original-terminal"
+        assert resp.json()["replayed"] is True
+        assert record.step_states["s1"].terminal_id is None
+
+    def test_recording_the_replay_writes_nothing_durable(self, client):
+        """BR-4 is not weakened by the fix: the recorder is IN-MEMORY ONLY. Asserted by
+        comparing the row byte-for-byte across the replayed call, the same way
+        :class:`TestReplayCreatesNothing` does."""
+        run_id = "run-f4-nowrite"
+        body = _body(env_vars=_env(run_id))
+        _register_run(run_id)
+        _seed_step(run_id, fingerprint=_route_fingerprint(body), envelope=_envelope())
+        before = _raw_row(run_id, "s1")
+
+        with (
+            patch("cli_agent_orchestrator.services.workflow_journal.begin_step") as m_begin,
+            patch("cli_agent_orchestrator.services.workflow_journal.settle_step") as m_settle,
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert resp.json()["replayed"] is True
+        m_begin.assert_not_called()
+        m_settle.assert_not_called()
+        assert _raw_row(run_id, "s1") == before
+
+    def test_a_yaml_tier_caller_records_nothing(self, client):
+        """The recorder carries the SAME guard as its two siblings, so a non-script call
+        reaches no registry lookup and no journal read. Proved by the absence of a record: a
+        YAML-tier run has no ``ScriptRunRecord`` at all, and asking for one must not create it.
+        """
+        run_id = "run-f4-yaml"
+        _register_run(run_id, script_tier=False)
+
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=_env(run_id)))
+
+        assert resp.status_code == 200
+        assert resp.json()["replayed"] is False  # no gate at all for this tier
+        m_run.assert_awaited_once()
+        assert run_id not in workflow_service.run_registry

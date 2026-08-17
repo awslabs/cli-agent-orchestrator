@@ -374,6 +374,36 @@ class TestUnenforcedRecoveryPolicyRule:
         # leaked into the step() arm.
         assert _findings_by_rule(result, "missing-recovery-policy") == []
 
+    def test_the_message_does_not_claim_the_value_is_never_validated(self):
+        """PR #628 review (Copilot F3) — THE OLD MESSAGE WAS FACTUALLY WRONG.
+
+        It read "recovery= on run_step() is accepted but never validated, so it is not
+        enforcement". The keyword lands in ``run_step``'s ``**opts``, is posted as an ordinary
+        body field, and ``RunStepRequest.recovery`` is typed ``Optional[RecoveryPolicy]`` — so
+        an unknown value is REJECTED WITH 422 at the route. ``test/api/test_run_step_replay_
+        branch.py::TestRecoveryField::test_unknown_recovery_value_is_rejected`` is the proof,
+        and ``test_the_message_names_the_real_gap_and_the_route_agrees`` in that file pins this
+        message against that behaviour so the two cannot drift apart again.
+
+        Asserted as a NEGATIVE on the false phrasings as well as a positive on the true one: a
+        lint message that overstates a gap teaches an author to distrust every other finding,
+        and the overstatement is what took four documents with it.
+        """
+        source = SHIM_IMPORT + "run_step('p', 'a', 'x', recovery='manual')\n"
+        message = _findings_by_rule(lint_script(source, "s.py"), "unenforced-recovery-policy")[
+            0
+        ].message
+
+        assert "never validated" not in message
+        assert "validated by nothing" not in message
+        assert "not enforcement" not in message
+        # The two true facts: the server DOES reject a bad value, and the real gap is that
+        # ``run_step`` does not check before sending.
+        assert "422" in message
+        assert "client-side" in message
+        # Still points at the surface that checks early.
+        assert "step()" in message
+
     def test_attribute_form_run_step_with_recovery_also_warns(self):
         # BR-7 is deliberately NOT receiver-qualified: a warning cannot block,
         # so the broad match is safe here where it would be unacceptable for the

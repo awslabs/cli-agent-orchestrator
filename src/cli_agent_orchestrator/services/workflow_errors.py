@@ -65,7 +65,7 @@ class HaltRule(str, Enum):
 
     WHY A CLOSED ``(str, Enum)`` IS A SECURITY PROPERTY AND NOT ONLY A DESIGN NICETY (SR-3).
     With ``diverged_fields`` gone (BR-4), ``reason`` is the only free text on either
-    exception, so the pressure to put a field VALUE somewhere is real. A four-member enum
+    exception, so the pressure to put a field VALUE somewhere is real. A closed enum
     cannot hold arbitrary text; a plain ``str`` code could, and would reintroduce that
     smuggling path through something that merely *looks* structured and reviewed. The closed
     vocabulary is what makes "put the detail somewhere safe" an actual option rather than an
@@ -73,6 +73,22 @@ class HaltRule(str, Enum):
 
     Adding a member later is easy. RENAMING one is not, once a code has been logged or
     persisted — which is the argument for semantic names.
+
+    THE LAST TWO MEMBERS WERE ADDED BY PR #628's REVIEW, and each closes a path on which the
+    gate answered ``REPLAY`` for a stored result that is not a faithful substitute for the
+    original call. Neither reuses an existing member, because a persisted code that later
+    means something adjacent is exactly the defect the paragraph above forbids:
+
+    * ``OUTCOME_FAILED`` — the row settled as a FAILURE. It is NOT ``ENVELOPE_ABSENT``: such a
+      row usually HAS an envelope (``result-envelope`` BR-1 writes one unconditionally), and
+      the remedy differs — a human decides whether to re-run the failure or accept it.
+    * ``ENVELOPE_LOSSY`` — the envelope reports its own ``truncated``/``redacted``. Also not
+      ``ENVELOPE_ABSENT``: the envelope is present and readable, it just no longer carries the
+      text the original call returned, and ``RunStepResponse`` has no field in which to say so.
+
+    Anything iterating this set is a place that must be widened in the SAME change: four
+    test modules assert the member count or the full name->value map, and
+    ``step_replay.decide`` is asserted to PRODUCE every member.
 
     Form echoes ``RecoveryPolicy`` (unit 2) so a consumer can compare, serialise and persist
     a member without a custom encoder.
@@ -82,6 +98,8 @@ class HaltRule(str, Enum):
     ENVELOPE_ABSENT = "envelope_absent"  # rule 3 — settled with no envelope (FR-4 guard 2)
     PROVENANCE_UNVERIFIABLE = "provenance_unverifiable"  # rule 5 — legacy/absent scheme (FR-6)
     POLICY_MANUAL = "policy_manual"  # rule 7 — fingerprints match, policy is manual (FR-7)
+    OUTCOME_FAILED = "outcome_failed"  # rule 8 — the settled row records a FAILED outcome
+    ENVELOPE_LOSSY = "envelope_lossy"  # rule 9 — the stored envelope truncated/redacted itself
 
 
 class ReplayDivergenceError(Exception):

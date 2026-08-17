@@ -1,10 +1,22 @@
 """The whole replay decision, in one total function (issue #583, unit ``replay-gate``).
 
 ONE journal read, no writes, no other I/O (BR-13/SR-5, NFR-2 — the gate sits on the resume hot
-path). This module is the ONLY place the eight-rule decision order exists, and ``decide``'s
+path). This module is the ONLY place the ten-rule decision order exists, and ``decide``'s
 verdict is the only thing callers branch on.
 
-THE ORDER OF THE EIGHT RULES IS THE CONTRACT, NOT A PRESENTATION OF IT (BR-1). First match
+RULES 8 AND 9 WERE ADDED BY PR #628's REVIEW AND THE ORIGINAL EIGHT WERE NOT RENUMBERED. Both
+close a path on which the gate answered ``REPLAY`` for a stored result that is not a faithful
+substitute for what the original call returned — a failed outcome (rule 8) and an envelope that
+reports its own lossiness (rule 9). They are APPENDED, immediately before the catch-all, for
+one reason: every earlier rule keeps its number, its condition and its position, so the three
+load-bearing orderings below are untouched and no existing test name is left describing a
+different rule. The cost is stated rather than hidden — a ``manual`` row whose outcome FAILED
+still halts as ``POLICY_MANUAL`` (rule 7 is reached first), which is true but less specific
+than ``OUTCOME_FAILED``. Both halt, both are resolved by the same two decisions, and the
+operator sees the failed state on ``cao workflow status``; buying a marginally better halt
+code by renumbering seven rules is not a trade this module makes.
+
+THE ORDER OF THE TEN RULES IS THE CONTRACT, NOT A PRESENTATION OF IT (BR-1). First match
 wins, and reordering them changes behaviour with NO SIGNAL — the same class of silent break as
 reordering ``step_fingerprint.compute``'s ten components. Three orderings are load-bearing, and
 each will look like a tidying opportunity to a later reader:
@@ -22,16 +34,20 @@ each will look like a tidying opportunity to a later reader:
   safe is not punished across the scheme-upgrade window; rule 5 second means unverifiable
   provenance never replays as a match (FR-6). Swapping them breaks FR-5, and deleting either
   one breaks a different requirement.
-* **``replay_authorized`` is EXCLUDED FROM RULE 7 AND NOTHING ELSE — it is not a rule of its
+* **``replay_authorized`` is EXCLUDED FROM RULES 7 AND 9 ONLY — it is not a rule of its
   own (``recovery-decision-intake`` BR-4/SR-8).** A ``skip`` decision means "use the stored
   result", so the human authorised USING a stored result, not bypassing the checks that decide
   whether one is usable. Hoisting the exclusion into a rule placed before rule 6 would
   silently disable FR-3's loud failure on a changed script; placed before rule 3 it would
-  replay a row with no envelope. As an exclusion ON rule 7, rules 3-6 all still fire and the
-  row falls to rule 8 — which is exactly what ``skip`` means. This is the placement most
-  likely to look like a tidying opportunity, and the three tests in
+  replay a row with no envelope. As an exclusion on rules 7 and 9, rules 3-6 all still fire
+  and the row falls to the catch-all — which is exactly what ``skip`` means. This is the
+  placement most likely to look like a tidying opportunity, and the three tests in
   ``test_recovery_decision_intake.py::TestSkipAuthorisationKeepsTheSafetyRules`` — one per
-  surviving safety rule — are what fail if it moves.
+  surviving safety rule — are what fail if it moves. Rule 8 needs NO exclusion and that is
+  not an inconsistency: it tests ``state``, which ``apply_decisions`` has already overwritten
+  with the authorised value, whereas rules 7 and 9 test the policy and the envelope and so
+  survive that overwrite. The dividing line is "does the condition read ``state``", not "is
+  the rule new".
 
 ``reconcile`` IS DEFERRED, WHICH IS WHY IT HAS NO BRANCH HERE (BR-11). ``component-methods.md``
 rules 2 and 4 say ``reconcile`` -> ``EXECUTE`` "via the reconciliation operation". No such
@@ -105,6 +121,9 @@ _REEXECUTION_PERMITTED = (RecoveryPolicy.IDEMPOTENT, RecoveryPolicy.RECONCILE)
 _RUNNING = "running"
 _RERUN_AUTHORIZED = "rerun_authorized"
 _REPLAY_AUTHORIZED = "replay_authorized"
+# Rule 8's state (PR #628 review). A fourth literal on the same terms as the three above, and
+# pinned against ``StepState.FAILED`` by the same test that pins them.
+_FAILED = "failed"
 
 
 class ReplayVerdict(str, Enum):
@@ -136,8 +155,8 @@ class ReplayDecision:
 
     * ``envelope`` is set **iff** ``verdict is REPLAY``. A populated envelope on any other
       verdict is a defect — it would offer a caller a result it was told not to use.
-    * ``rule`` is set **iff** ``verdict is DECISION_REQUIRED`` (INV-5). ``HaltRule``'s four
-      members map one-to-one onto the four halting rules, and
+    * ``rule`` is set **iff** ``verdict is DECISION_REQUIRED`` (INV-5). ``HaltRule``'s six
+      members map one-to-one onto the six halting rules, and
       ``RecoveryDecisionRequired(*, step_id, rule, reason)`` requires one — without this field
       the only path from gate to raiser would be parsing the prose ``reason``, i.e. reading
       English to recover a value that already exists as a closed enum (BR-8/TD-3).
@@ -178,7 +197,7 @@ def decide(
     is annotated with the requirement it serves, so a reader can see what an edit costs.
 
     TOTAL OVER VALID INPUTS (BR-12/TD-6): every reachable path returns a ``ReplayDecision``
-    and rule 8 is the catch-all. The two ways out that are not verdicts are categorically
+    and rule 10 is the catch-all. The two ways out that are not verdicts are categorically
     different and both deliberate — a precondition violation raises, an infrastructure failure
     propagates (BR-15). See ``Raises``.
 
@@ -190,7 +209,7 @@ def decide(
             ``step_fingerprint.compute``. Validated first (SR-3).
         declared_policy: what the step's author declared, or ``None`` for undeclared.
             ``None`` IS NOT A DEFAULT THAT FALLS THROUGH (BR-5): rule 2 halts on it because
-            the alternative there is re-execution, and rule 8 REPLAYS on it because replay
+            the alternative there is re-execution, and the catch-all REPLAYS on it because replay
             executes nothing. ``RecoveryPolicy``'s docstring (``models/workflow.py``:125-128)
             argues that asymmetry; ``MANUAL`` differs from undeclared only at rule 7, where a
             verified replay is available and a human asked to see the step anyway.
@@ -284,7 +303,8 @@ def decide(
     # instead is the one repair that is never available (BR-2). ``replay_authorized`` is the
     # OTHER case of that same rule and the reason it is stated as a pair: it means "this result
     # stands, serve it", so it belongs on this settled path and takes no rule-1 arm — it is
-    # judged by rules 3-6 exactly like any other settled row (unit 12's BR-5).
+    # judged by rules 3-6 exactly like any other settled row (unit 12's BR-5), and by rule 9
+    # only via that rule's explicit exclusion.
 
     # ---- rule 3: settled with no readable result (FR-4 guard 2) ----
     # A CORRUPT envelope IS an absent envelope (BR-14): ``parse_envelope`` collapses NULL,
@@ -353,11 +373,12 @@ def decide(
 
     # ---- rule 7: a verified match, but a human asked to see it (FR-7) ----
     # ...UNLESS the human has since answered (``recovery-decision-intake`` BR-4/BR-5, SR-8).
-    # ``replay_authorized`` is the durable form of a ``skip`` decision, and this is the ONLY
-    # rule it is excluded from — an exclusion, deliberately not a rule of its own placed
-    # earlier, because rules 3-6 must still decide whether the stored result is USABLE before
-    # this row is allowed to serve it. The row therefore falls to rule 8 and replays with the
-    # envelope, which is what ``skip`` means. It needs no rule-1 arm either: rule 1 is for
+    # ``replay_authorized`` is the durable form of a ``skip`` decision, and rules 7 and 9 are
+    # the only rules it is excluded from — an exclusion, deliberately not a rule of its own
+    # placed earlier, because rules 3-6 must still decide whether the stored result is USABLE
+    # before this row is allowed to serve it. The row therefore falls to the catch-all and
+    # replays with the envelope, which is what ``skip`` means. It needs no rule-1 arm either:
+    # rule 1 is for
     # states meaning EXECUTE, and a ``replay_authorized`` row still holds the result it was
     # authorised to serve, so it belongs on the settled path where rules 3-5 run first.
     if declared_policy is RecoveryPolicy.MANUAL and row.state != _REPLAY_AUTHORIZED:
@@ -371,7 +392,65 @@ def decide(
             rule=HaltRule.POLICY_MANUAL,
         )
 
-    # ---- rule 8: the catch-all, INCLUDING an undeclared policy (FR-1/BR-5) ----
+    # ---- rule 8: the recorded outcome was a FAILURE (PR #628 review, Copilot F1) ----
+    # A ``failed`` row reached the old catch-all and REPLAYED: the route answered HTTP 200
+    # with a ``StepHandle``, so the author's script continued past a call that FAILED on the
+    # original drive — where it raised, because ``run_agent_step``'s ``StepExecutionError``
+    # became a 502/504 and the shim turned that into ``ShimHTTPError``. Replaying it does not
+    # reproduce the original run; it silently deletes a failure from it.
+    #
+    # HALT rather than re-execute (the ruling on that finding). Re-executing would grant
+    # permission the step's author never gave — the same reasoning rule 2 already applies to a
+    # crash-window row — so this is fail-closed, consistent with every other condition the
+    # gate cannot resolve alone.
+    #
+    # BOTH DECISIONS ESCAPE THIS RULE, AND NEITHER NEEDS AN EXPLICIT EXCLUSION — which is
+    # worth stating because rule 9 below DOES need one and the asymmetry looks like an
+    # oversight. ``apply_decisions`` writes the authorised value INTO ``state``, overwriting
+    # ``failed``: a ``rerun`` row reads ``rerun_authorized`` and rule 1 has already returned
+    # ``EXECUTE``; a ``skip`` row reads ``replay_authorized``, so this test simply does not
+    # match and the row continues to the catch-all. Without that, a human who answered this
+    # halt would be asked again on every subsequent resume — the infinite-halt defect BR-2
+    # exists to prevent, in a new place. Rule 9's condition is the ENVELOPE's, not the state's,
+    # so it survives the overwrite and has to exclude the state by hand.
+    if row.state == _FAILED:
+        return ReplayDecision(
+            verdict=ReplayVerdict.DECISION_REQUIRED,
+            envelope=None,
+            reason=(
+                f"{where}: the stored result records a FAILED outcome, so replaying it would "
+                f"report a success the original run never produced"
+            ),
+            rule=HaltRule.OUTCOME_FAILED,
+        )
+
+    # ---- rule 9: the stored envelope reports its own lossiness (PR #628 review, F5) ----
+    # ``build_envelope`` redacts and then bounds ``last_message`` before it reaches SQLite, so
+    # a stored envelope's text is not necessarily the text the original call returned — and the
+    # original call returned the RAW text, because the success arm of the route answers with
+    # ``run_agent_step``'s own ``last_message`` and never with the envelope. ``RunStepResponse``
+    # has no ``truncated``/``redacted`` field either, so a replayed response cannot even say
+    # that what it served is abridged. An unchanged script that feeds a >32 KiB or redacted
+    # result into its next prompt therefore computes a DIFFERENT next-step fingerprint and
+    # diverges — reporting "the script changed" when nothing about the script changed.
+    #
+    # Fail closed for the same reason as rule 8, with the same ``replay_authorized`` exclusion:
+    # a human who answers ``skip`` has accepted the abridged text, and must not be re-asked
+    # forever. Note the flags are the ENVELOPE's own self-report (unit 2's INV-5), so this rule
+    # needs no second copy of the redaction or bounding logic — which is what keeps SR-2's "no
+    # ``secret_gate``, no ``build_envelope`` import" posture intact.
+    if (envelope.truncated or envelope.redacted) and row.state != _REPLAY_AUTHORIZED:
+        return ReplayDecision(
+            verdict=ReplayVerdict.DECISION_REQUIRED,
+            envelope=None,
+            reason=(
+                f"{where}: the stored result envelope reports itself truncated or redacted, "
+                f"so its text is not what the original call returned"
+            ),
+            rule=HaltRule.ENVELOPE_LOSSY,
+        )
+
+    # ---- rule 10: the catch-all, INCLUDING an undeclared policy (FR-1/BR-5) ----
     # Undeclared replays where ``MANUAL`` halts, because replay executes nothing. The envelope
     # is handed back exactly as ``parse_envelope`` produced it (SR-2).
     return ReplayDecision(

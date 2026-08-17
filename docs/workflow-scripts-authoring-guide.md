@@ -39,8 +39,8 @@ emit_output({"reviewed": True})
   between the two. Both run the step through the same shared substrate the
   server's own handoff path uses: they resolve your run's identity from the
   environment, post to `/terminals/run-step`, and return a `StepHandle`.
-  **A `recovery=` passed to `run_step` is not enforcement** — see the recovery
-  section for what it does instead.
+  **A `recovery=` passed to `run_step` is validated by the server but not by the
+  shim** — see the recovery section for when a bad value is caught.
 - **`StepHandle` has five fields:** `.step_id`, `.terminal_id`, `.output`,
   `.status`, and `.replayed`. **`.replayed` qualifies `.terminal_id`.** When it
   is `True` the server returned a stored result and ran nothing at all, and
@@ -172,26 +172,32 @@ Omitting a policy is a **fourth, distinct state**, never silently read as
 because replay executes nothing, but wherever the alternative would be
 re-execution it halts for a human instead.
 
-### `recovery=` on `run_step` is not enforcement
+### `recovery=` on `run_step` is checked late, not never
 
 `run_step` has no `recovery` parameter, so a `recovery=` you pass it is
 swallowed by `**opts` and forwarded to the server as an ordinary body field.
-The server stores it and the resume gate honours it — while **neither** the
-shim's closed-set check (which lives on `step()`) **nor** the linter's rule
-ever inspects it. A typo is accepted in silence, and you are left with a
-declaration that looks enforced and is not.
+The server stores it and the resume gate honours it, and the route's request
+model types that field as the closed policy enum — **so an unknown value is
+rejected with a `422`.** The value is validated; what `run_step` does not do is
+validate it *early*.
+
+`step()` checks the value against the closed set **before any HTTP attempt** and
+raises `ShimError` on the spot. `run_step` has no such check, so a typo survives
+until the request reaches the server and then fails **that step, mid-run** — after
+whatever earlier steps have already run and had their effects.
 
 ```python
-step("kiro_cli", "reviewer", prompt, recovery="idempotent")      # checked
-run_step("kiro_cli", "reviewer", prompt, recovery="idempotent")  # NOT checked
+step("kiro_cli", "reviewer", prompt, recovery="idempotant")      # ShimError, before any HTTP
+run_step("kiro_cli", "reviewer", prompt, recovery="idempotant")  # 422 from the server, mid-run
 ```
 
-`cao workflow validate` flags the second as `unenforced-recovery-policy`
-(a warning). Use `step()` to declare a policy, and `run_step` only to declare
-none. For the same reason, `step(..., **opts)` with the policy hidden inside
-`opts` cannot be verified statically either, and validates as
-`unverifiable-recovery-policy` — pass `recovery=` explicitly if you want it
-checked.
+Neither surface has its *value* checked by the linter — `cao workflow validate`
+sees the keyword, not what is in it. It flags the `run_step` form as
+`unenforced-recovery-policy` (a warning) for exactly that reason. Use `step()`
+to declare a policy, and `run_step` only to declare none. For the same reason,
+`step(..., **opts)` with the policy hidden inside `opts` cannot be verified
+statically either, and validates as `unverifiable-recovery-policy` — pass
+`recovery=` explicitly if you want it seen.
 
 ## Resume re-executes the script, and the server decides each step
 

@@ -464,6 +464,108 @@ def make_step_terminal_recorder(
 
 
 # ---------------------------------------------------------------------------
+# In-memory recorder for a REPLAYED step (PR #628 review, Copilot F4)
+# ---------------------------------------------------------------------------
+def record_step_replay(env_vars: Optional[Dict[str, str]]) -> Optional[Callable[[], None]]:
+    """Build the callback that makes a REPLAYED step visible in the run's result.
+
+    THE THIRD SIBLING OF ``make_step_terminal_recorder`` AND ``record_step_completion``, with
+    the identical guard (both env vars AND a live ``ScriptRunRecord``), and the one that only
+    the replay path calls. It exists because the replay branch returns BEFORE
+    ``run_agent_step``, which is deliberate — that early return is the only way to create no
+    terminal, fire neither of the other two callbacks and write no durable row
+    (``run-step-replay-branch`` BR-4). The cost was that ``ScriptRunRecord.step_states`` never
+    learned the step happened, and ``_finalize`` builds ``WorkflowRunResult.steps`` from that
+    map ALONE while ``resume_script_run`` reconstructs the record with ``step_states={}``. A
+    fully replayed resume therefore returned ``steps=[]`` with every journal row intact — the
+    run reported doing nothing, having correctly done nothing twice.
+
+    IN MEMORY ONLY. It writes NOTHING to the journal, which is what keeps BR-4 true: a replay
+    still creates no terminal and issues no ``begin_step``/``settle_step``. The distinction
+    matters — "record that the step is settled" and "settle the step" are different acts, and
+    only the second would falsify BR-4 (and bump ``attempts`` for work nothing performed).
+
+    HYDRATED FROM THE DURABLE ROW, NOT FROM THE ENVELOPE OR A DEFAULT. The row is authoritative
+    about ``state``, ``attempts``, ``output_json`` and ``error``; the envelope carries only
+    ``status`` as free text plus the terminal id. Reconstructed with the SAME field binding
+    ``workflow_service._rebuild_record_from_journal`` uses for the YAML tier, so the two tiers
+    describe a journal-sourced step identically rather than each inventing a shape.
+
+    It costs ONE extra journal read, and only on the replay path. The gate's own
+    single-read budget (``replay-gate`` BR-13/NFR-2) is a property of ``decide``, which is
+    unchanged; this read is the caller's, taken once per REPLAYED step in exchange for a
+    truthful result. ``attempts`` is deliberately NOT incremented: nothing ran.
+
+    BEST-EFFORT (INV-4, the posture every other bookkeeping call here takes). A read failure or
+    an unreadable row degrades the run's step LIST — a reporting loss — and must never fail a
+    step, so the caller wraps this and the body degrades to a minimal state rather than raising.
+    """
+    if not env_vars:
+        return None
+    run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    step_id = env_vars.get("CAO_WORKFLOW_STEP_ID")
+    if not run_id or not step_id:
+        return None
+    record = run_registry.get(run_id)
+    if not isinstance(record, ScriptRunRecord):
+        return None
+
+    def _record_replay() -> None:
+        from cli_agent_orchestrator.models.workflow import StepState
+        from cli_agent_orchestrator.services.workflow_service import _record_from_json
+
+        row = workflow_journal.get_step(run_id, step_id)
+        if row is None:
+            # Not reachable through the gate (a REPLAY verdict requires a row it just read),
+            # but this is bookkeeping: recording nothing is strictly better than raising into
+            # a step that has already succeeded.
+            logger.warning(
+                "journal: script step '%s/%s': replayed with no readable row; "
+                "the step will be absent from the run result",
+                run_id,
+                step_id,
+            )
+            return
+
+        try:
+            state = StepState(row.state)
+        except ValueError:
+            # One unknown state value must not cost the whole entry. The same degradation
+            # ``_rebuild_record_from_journal`` takes on a corrupt row, with the same reasoning:
+            # a wrong-but-plausible state is worse than an honest fallback, and RUNNING is what
+            # the step's own in-memory seed would have said.
+            logger.warning(
+                "journal: script step '%s/%s': replayed row carries an unrecognised state; "
+                "recording it as running",
+                run_id,
+                step_id,
+            )
+            state = StepState.RUNNING
+
+        st = StepRunState(
+            step_id=step_id,
+            state=state,
+            attempts=row.attempts,
+            output=_record_from_json(row.output_json),
+            error=row.error,
+            # ``terminal_id`` IS DELIBERATELY LEFT UNSET, and this is the one field where
+            # copying the durable value would be a defect rather than a fidelity win. The
+            # terminal a replayed step originally ran on NO LONGER EXISTS — that is exactly
+            # what ``RunStepResponse.replayed`` was added to tell a consumer (SR-4). This field
+            # is read by ``_reconcile_orphans`` to pick terminals to TEAR DOWN, so a dead id
+            # here is an instruction to delete something that is gone. Today the sweep would
+            # skip it anyway (it also requires a non-terminal step state, and a replayed step
+            # is settled), but that is a second condition holding the safety, not this one —
+            # and rule 8 of the replay gate is the reminder that a state set can gain members.
+            terminal_id=None,
+            call_fingerprint=row.call_fingerprint,
+        )
+        record.step_states[step_id] = st
+
+    return _record_replay
+
+
+# ---------------------------------------------------------------------------
 # Settle-time sanitisation of the two free-content columns (issue #583, unit
 # ``settlement-rewire`` SR-1..SR-6). ``settle_step`` persists what it is given and
 # ``build_envelope`` sanitises ``last_message`` only, so ``error`` and
@@ -1230,6 +1332,10 @@ async def resume_script_run(
     # ``update_run_generation`` raise — not just the happy spawn path.
     _active_drives.add(run_id)
     snapshot_path: Optional[str] = None
+    # ``step_id`` -> the state the row held before this resume's decision was applied (PR #628
+    # review, F6). Declared BEFORE the ``try`` so the ``finally`` can always read it, empty for
+    # the ordinary no-decision resume, which therefore takes no extra read and no extra write.
+    granted: Dict[str, str] = {}
     try:
         # --- Gate 3: terminal-state / tier resumability (delegated to U3) -> 409 ---
         if not _is_resumable_for_tier(row):
@@ -1249,8 +1355,12 @@ async def resume_script_run(
         # That position is the requirement — see the docstring. A ValueError here
         # aborts the resume having written nothing (the whole map is validated first),
         # and the ``finally`` below still releases the claim.
+        #
+        # THE PRIOR STATES ARE CAPTURED HERE AND REVOKED IN THE ``finally`` (PR #628 review,
+        # Copilot F6): consent is good for THIS drive and no other, so anything this drive did
+        # not consume is taken back when the drive ends — however it ends.
         if decisions:
-            await asyncio.to_thread(workflow_journal.apply_decisions, run_id, decisions)
+            granted = await asyncio.to_thread(workflow_journal.apply_decisions, run_id, decisions)
 
         # Unit A (FR-A6, ADR-3, REL-A1): re-deliver the RESOLVED inputs journaled
         # at the original run VERBATIM — read row.inputs_json and hand it to
@@ -1310,6 +1420,45 @@ async def resume_script_run(
     finally:
         _active_drives.discard(run_id)
         _delete_temp_file(snapshot_path)  # ALWAYS deleted after reap (BR-30)
+        # BR-9's second half (PR #628 review, F6). ONE decision authorises exactly ONE
+        # attempt, and this drive was that attempt — so any consent it did not consume is
+        # revoked now, and the next resume asks again. In the ``finally`` because EVERY exit
+        # path ends the attempt: a raising generation bump or snapshot materialisation (which
+        # left consent live for a resume that reported failure), a drive that never reached the
+        # decided step, and a clean completion — where a ``skip`` would otherwise stand
+        # forever, since a replay writes no row by design and nothing else consumes it.
+        #
+        # BEST-EFFORT, and it must be: a raise here would replace the drive's real outcome
+        # (including its exception) with a bookkeeping error. Failing to revoke leaves consent
+        # live for one more resume, which is a strictly smaller fault than losing the run's
+        # result — and the revoke is a compare-and-set, so retrying it later is safe.
+        #
+        # CALLED DIRECTLY, NOT THROUGH ``asyncio.to_thread``, unlike every other journal call
+        # on this path — and the reason is stated as the DEFENSIVE choice it is, not as a bug
+        # fix, because the difference was measured and is not observable today. An ``await``
+        # inside a ``finally`` completes only if cancellation is not re-delivered at that
+        # suspension point; that depends on the interpreter version and on whether the task is
+        # cancelled again, and ``CancelledError`` is a ``BaseException``, so the guard below
+        # would not catch it. BOTH FORMS PASS
+        # ``test_a_cancelled_resume_still_revokes`` AND a real ``task.cancel()`` probe on
+        # CPython 3.12 (verified — do not "restore" the threaded form on the belief that this
+        # comment describes a reproduced failure). The direct call is preferred only because it
+        # removes the question: it is one short transaction over at most a handful of single-row
+        # UPDATEs, so it costs microseconds on the loop and cannot be interrupted at all, and
+        # a cancelled resume is the exit path on which silently keeping consent would be least
+        # acceptable — it consumed nothing.
+        if granted:
+            try:
+                workflow_journal.revoke_unconsumed_decisions(run_id, granted)
+            except (
+                Exception
+            ) as e:  # noqa: BLE001 — never mask the drive's outcome; consent lives one resume longer
+                logger.warning(
+                    "resume: run '%s' failed to revoke unconsumed recovery consent "
+                    "(it remains live for the next resume): %s",
+                    run_id,
+                    e,
+                )
 
 
 # ---------------------------------------------------------------------------

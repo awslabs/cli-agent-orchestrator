@@ -54,7 +54,7 @@ class StepState(str, Enum):
     # issue #583, recovery-decision-intake (unit 12) — consent to use the STORED
     # result. Excluded from rule 7 ONLY (BR-4), so the row still needs an envelope
     # (rule 3), verifiable provenance (rules 4-5) and a matching fingerprint (rule 6)
-    # before it falls to rule 8 and replays.
+    # before it falls to the catch-all and replays.
     REPLAY_AUTHORIZED = "replay_authorized"
 
 

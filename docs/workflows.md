@@ -71,9 +71,10 @@ Every workflow follows the same path. No step is optional.
      `recovery=` fails validation. Two sibling warnings do not block:
      `unverifiable-recovery-policy` (a `step()` call passing `**kwargs`, where the linter
      cannot see whether a policy is inside) and `unenforced-recovery-policy` (a
-     `recovery=` on `run_step`, which resume honours but nothing validates). See the
-     authoring guide's recovery-policy section — a policy is a *declaration*, never a
-     permission.
+     `recovery=` on `run_step`, which resume honours and the server validates with a
+     `422`, but which the shim does not check before sending — so a typo fails that step
+     mid-run rather than up front). See the authoring guide's recovery-policy section — a
+     policy is a *declaration*, never a permission.
 3. **Run** — with an explicit, pre-announced `--run-id` so it can be cancelled.
    **Workflows are NEVER auto-run by an agent.** The user approves each run.
 4. **Status / cancel / resume** — `cao workflow status <run-id>`,

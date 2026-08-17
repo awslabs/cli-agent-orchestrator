@@ -41,7 +41,8 @@ Its public surface:
   policy" below before you pick a value.
 - `run_step(provider, agent, prompt, *, step_id=None, timeout=None, **opts) -> StepHandle` —
   the same call, **declaring no policy**. That is the only difference between the two. A
-  `recovery=` passed to `run_step` lands in `**opts` and is **not** enforcement — see below.
+  `recovery=` passed to `run_step` lands in `**opts`; the server validates it, the shim does
+  not — see below.
 - `StepHandle` has **five** fields: `.step_id`, `.terminal_id`, `.output`, `.status`, and
   `.replayed`. **`.replayed` qualifies `.terminal_id`.** When it is `True` the server returned
   a stored result and ran nothing, and `.terminal_id` is the ORIGINAL id — it names a terminal
@@ -78,12 +79,14 @@ Omitting a policy is a **fourth, distinct state** — it is never silently read 
 `run_step` for it deliberately: an undeclared step still replays (replay executes nothing), but
 where the alternative is re-execution it halts for a human.
 
-**`recovery=` on `run_step` is not enforcement.** `run_step` has no `recovery` parameter, so the
-value rides `**opts` to the server, which stores it and lets the resume gate honour it — while
-neither the shim's closed value check nor `validate`'s rule ever sees it. A typo is accepted
-silently and a declaration that looks enforced is not. `validate` reports it as
-`unenforced-recovery-policy`; `step()` is the enforced surface. Use `step()` to declare, and
-`run_step` only to declare nothing.
+**`recovery=` on `run_step` is checked late, not never.** `run_step` has no `recovery`
+parameter, so the value rides `**opts` to the server, which stores it, lets the resume gate
+honour it, and **rejects an unknown value with a `422`** — the route types that field as the
+closed policy enum. What `run_step` lacks is `step()`'s client-side check, which refuses a bad
+value *before any HTTP attempt*; on `run_step` a typo instead fails that step mid-run. Neither
+surface has its value checked by `validate` (the linter sees the keyword, not its contents),
+which is why `validate` reports the `run_step` form as `unenforced-recovery-policy`. Use
+`step()` to declare, and `run_step` only to declare nothing.
 
 ## Lifecycle
 
@@ -119,8 +122,9 @@ nits:
   keyword fails validation — the signature requires one and so does the linter. Two related
   warnings fire without blocking: `unverifiable-recovery-policy` (a `step()` call passing
   `**kwargs`, so the linter cannot see whether a policy is in there) and
-  `unenforced-recovery-policy` (a `recovery=` on `run_step`, which is honoured at resume but
-  validated by nothing). See "Declaring a recovery policy" above.
+  `unenforced-recovery-policy` (a `recovery=` on `run_step`, which is honoured at resume and
+  validated by the server with a `422`, but is not checked client-side before it is sent). See
+  "Declaring a recovery policy" above.
 
 ### c. ASK the user — NEVER auto-run
 

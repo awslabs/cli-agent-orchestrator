@@ -446,7 +446,8 @@ class RunStepRequest(BaseModel):
             "What this step's author declares about re-running it (issue #583, "
             "FR-5/FR-7), passed to the replay gate as the declared policy. "
             "Absent means UNDECLARED, which is a distinct state and never "
-            "coerced to 'manual': the two differ at the gate's rules 2 and 8. "
+            "coerced to 'manual': the two differ at the gate's rule 2 and at its "
+            "catch-all. "
             "Typed as the enum so an unknown value is REJECTED with 422 at the "
             "boundary rather than silently downgraded to undeclared, which "
             "would change the verdict (SR-6)."
@@ -3241,6 +3242,7 @@ async def run_step(
     from cli_agent_orchestrator.services.script_runner import (
         make_step_terminal_recorder,
         record_step_completion,
+        record_step_replay,
     )
     from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
     from cli_agent_orchestrator.services.workflow_errors import (
@@ -3282,6 +3284,26 @@ async def run_step(
             on_step_settled(terminal_id, error, last_message)
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
+
+    # The THIRD sibling of the two callbacks above, called on the REPLAY arm only (PR #628
+    # review, Copilot F4). The replay branch returns before ``run_agent_step``, so neither
+    # callback above fires — correct, and the only way to create no terminal and write no
+    # durable row (BR-4) — but ``_finalize`` builds ``WorkflowRunResult.steps`` from
+    # ``ScriptRunRecord.step_states`` ALONE and ``resume_script_run`` rebuilds that map empty,
+    # so a fully replayed resume reported ``steps=[]`` while every journal row was intact.
+    # This records the step IN MEMORY, hydrated from its durable row; it writes nothing, so
+    # BR-4 is unchanged. Same guard as its siblings — None for every non-script-tier call.
+    on_step_replayed = record_step_replay(body.env_vars)
+
+    def _record_replayed_step() -> None:
+        if on_step_replayed is None:
+            return
+        try:
+            on_step_replayed()
+        except Exception:  # noqa: BLE001 — bookkeeping is best-effort; never fail the step
+            # A reporting loss (the step is absent from the run's step list), never a failed
+            # step: nothing ran, and there is a correct stored result to hand back regardless.
+            logger.warning("run_step: script step replay bookkeeping failed", exc_info=True)
 
     # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
     # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
@@ -3420,6 +3442,11 @@ async def run_step(
                         f"step '{decide_step_id}': the stored result envelope carries "
                         f"no terminal id, so no replayed response can be built"
                     )
+                # Make the replayed step visible in the run's step list before answering
+                # (F4). In memory only — no terminal, no journal write, so BR-4 holds. Before
+                # the return rather than after it for the obvious reason, and best-effort so a
+                # bookkeeping failure cannot turn a correct replay into an HTTP error.
+                _record_replayed_step()
                 # ``replayed=True`` is the mitigation for the dead id (SR-4): the
                 # terminal named here no longer exists, and the flag is the only
                 # thing that stops a consumer probing it.
@@ -3438,7 +3465,7 @@ async def run_step(
             if decision.verdict is step_replay.ReplayVerdict.DECISION_REQUIRED:
                 # FR-7's surfacing. ``rule`` is set iff the verdict is
                 # DECISION_REQUIRED (``replay-gate`` BR-6), and this is where it
-                # reaches a human: without it an operator cannot tell which of four
+                # reaches a human: without it an operator cannot tell which of six
                 # conditions halted the run.
                 halt_rule = decision.rule
                 if halt_rule is None:  # pragma: no cover — see comment
@@ -3512,7 +3539,7 @@ async def run_step(
         # chain three units long: unit 1 built ``HaltRule``, unit 7 put it on
         # ``ReplayDecision`` so the condition could travel, unit 12 consumes it to
         # resolve the halt — and this is where it reaches a HUMAN. Omitting it would
-        # leave an operator guessing which of four conditions halted their run.
+        # leave an operator guessing which of six conditions halted their run.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={

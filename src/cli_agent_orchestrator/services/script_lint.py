@@ -42,9 +42,14 @@ recovery-policy rules are issue #583's business-rules.md):
   the resume-time gate fails closed for whatever it cannot verify.
 - ``unenforced-recovery-policy`` (WARNING) — a ``run_step()`` call carrying a
   ``recovery=`` keyword. ``run_step`` accepts it, the server stores it and the
-  replay gate honours it, yet nothing validates it — a declaration that looks
-  enforced and is not. ``step()`` is the enforced surface, and this rule is the
-  only layer that can see the difference.
+  replay gate honours it, AND the route's ``Optional[RecoveryPolicy]`` field
+  rejects an unknown value with 422. What is missing is only ``step()``'s
+  CLIENT-SIDE preflight, which refuses a value outside the closed set before any
+  HTTP attempt — so on ``run_step`` a typo costs a round-trip and fails that step
+  mid-run. (This entry, and the finding's message, previously said the value was
+  "never validated"; that was false, corrected by PR #628's review.) ``step()``
+  is the surface that checks early, and this rule is the only layer that can see
+  the difference statically.
 
 ``status == "fail"`` iff at least one ERROR finding (U1-BR-1); ERRORs are
 mirrored into the legacy ``errors`` list as ``"line N: [rule_id] message"``
@@ -215,9 +220,21 @@ def _walk_tree(tree: ast.AST, findings: List[LintFinding]) -> None:
                     )
         elif isinstance(node, ast.Call) and _is_run_step_call(node.func):
             # BR-7: run_step() ACCEPTS recovery=, the server stores it and the
-            # replay gate honours it, but nothing validates it. Warn, never
-            # block — and note this arm is reached only when the step arm above
-            # did not match, which exact-equality matching guarantees.
+            # replay gate honours it. Warn, never block — and note this arm is
+            # reached only when the step arm above did not match, which
+            # exact-equality matching guarantees.
+            #
+            # THE MESSAGE SAID "never validated" AND THAT WAS FALSE (PR #628
+            # review, Copilot F3). The keyword lands in run_step's **opts, is
+            # posted as an ordinary body field, and RunStepRequest.recovery is
+            # typed Optional[RecoveryPolicy] — so an unknown value is REJECTED
+            # WITH 422 at the route boundary. What run_step actually lacks is
+            # step()'s client-side preflight against the closed set, which
+            # raises ShimError before any HTTP attempt. The difference is WHEN
+            # a typo is caught, not WHETHER: on step() it costs nothing, on
+            # run_step it costs the round-trip and fails that step mid-run.
+            # The message now says exactly that, because a lint finding that
+            # overstates a gap teaches an author to distrust the linter.
             if any(kw.arg == "recovery" for kw in node.keywords):
                 findings.append(
                     LintFinding(
@@ -225,8 +242,11 @@ def _walk_tree(tree: ast.AST, findings: List[LintFinding]) -> None:
                         severity="warning",
                         line=node.lineno,
                         message=(
-                            "recovery= on run_step() is accepted but never validated, so "
-                            "it is not enforcement; declare the policy on step() instead"
+                            "recovery= on run_step() reaches the server and the replay gate "
+                            "honours it, and the route rejects an unknown value with 422 — but "
+                            "run_step runs no client-side check, so a typo fails this step "
+                            "mid-run instead of before the first HTTP call; declare the policy "
+                            "on step() instead"
                         ),
                     )
                 )

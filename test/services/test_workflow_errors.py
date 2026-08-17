@@ -231,12 +231,22 @@ class TestHaltRule:
     looks structured. Member names are SEMANTIC because rule numbers are a presentation of
     the decision order and an edit renumbers them."""
 
-    def test_exactly_four_members_with_the_expected_values(self):
+    def test_exactly_six_members_with_the_expected_values(self):
+        """WIDENED BY PR #628's REVIEW, from four to six. The last two closed two paths on
+        which the gate replayed a stored result that is not a faithful substitute for the
+        original call: a FAILED outcome, and an envelope reporting its own lossiness.
+
+        The map is asserted whole rather than by count, so a RENAMED member fails here too —
+        which is the case the class docstring above cares about, because a code that has been
+        logged or persisted cannot be renamed silently.
+        """
         assert {member.name: member.value for member in HaltRule} == {
             "INTERRUPTED_NO_POLICY": "interrupted_no_policy",
             "ENVELOPE_ABSENT": "envelope_absent",
             "PROVENANCE_UNVERIFIABLE": "provenance_unverifiable",
             "POLICY_MANUAL": "policy_manual",
+            "OUTCOME_FAILED": "outcome_failed",
+            "ENVELOPE_LOSSY": "envelope_lossy",
         }
 
     def test_a_value_outside_the_closed_set_is_rejected(self):

@@ -133,7 +133,7 @@ ENVELOPE = StepResultEnvelope(
 RESULT_JSON = serialise_envelope(ENVELOPE)
 
 # ``None`` is a first-class member of this list, not a missing entry: undeclared is a distinct
-# state from ``MANUAL`` and the two differ at rules 7 and 8.
+# state from ``MANUAL`` and the two differ at rule 7 and at the catch-all.
 POLICIES: List[Optional[RecoveryPolicy]] = [
     None,
     RecoveryPolicy.IDEMPOTENT,
@@ -928,7 +928,7 @@ class TestTheUpgradeWindow:
 
     def test_an_undeclared_policy_halts_as_provenance_unverifiable(self, _isolated_journal):
         """Rule 5 for the undeclared case. ``None`` is NOT a default that falls through to
-        rule 8 here: rule 5 catches it first, which is why the two halting routes must both be
+        the catch-all here: rule 5 catches it first, which is why the two halting routes must both be
         asserted rather than one standing in for the other."""
         _assert_tmp_db(_isolated_journal)
         self._manufacture_legacy()
@@ -1050,7 +1050,9 @@ class TestThisUnitShipsNoProductionCode:
         (BR-11). If any of them became an open ``str``, "assert by member" would stop meaning
         anything and this is where that shows up."""
         assert len({v.value for v in ReplayVerdict}) == 4
-        assert len({r.value for r in HaltRule}) == 4
+        # SIX since PR #628's review appended ``OUTCOME_FAILED`` and ``ENVELOPE_LOSSY``.
+        # ``ReplayVerdict`` stayed at four: both new rules reuse ``DECISION_REQUIRED``.
+        assert len({r.value for r in HaltRule}) == 6
         assert len({p.value for p in RecoveryPolicy}) == 3
         # The three row states this file names, pinned against their members so a rename on
         # either side fails loudly.

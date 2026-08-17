@@ -29,9 +29,14 @@ Rule coverage, one group per rule from
 - BR-6  — ``envelope`` iff ``REPLAY``, ``rule`` iff ``DECISION_REQUIRED``
   (:class:`TestFieldConditionality`).
 - BR-7  — no ``diverged_fields`` attribute (:class:`TestDecisionShape`).
-- BR-8  — each halting path returns its SPECIFIC ``HaltRule`` member — four assertions, not
+- BR-8  — each halting path returns its SPECIFIC ``HaltRule`` member — six assertions, not
   one "a rule is set" (:class:`TestSpecificHaltRules`). One membership check would pass with
   every path returning ``POLICY_MANUAL``, and unit 12 branches on this value.
+- PR #628 review — the two APPENDED rules, one class each
+  (:class:`TestFailedOutcomeHalts`, :class:`TestLossyEnvelopeHalts`). Each class asserts the
+  halt, its SPECIFIC member, BOTH human escapes (``rerun`` and ``skip``), and that no earlier
+  rule was masked — because a halt with no escape is the infinite-halt defect BR-2 exists to
+  prevent, and appending a rule is only safe while every rule before it keeps precedence.
 - BR-9/SR-4/SR-5 — the posture, by AST walk rather than grep, because this module's docstrings
   discuss logging and both exception types at length (:class:`TestPosture`).
 - BR-10 — a failing journal read propagates and produces no verdict (:class:`TestReadFailure`).
@@ -91,6 +96,17 @@ ENVELOPE = StepResultEnvelope(
     terminal_id="term-1",
 )
 RESULT_JSON = serialise_envelope(ENVELOPE)
+
+# An envelope that reports its OWN lossiness (rule 9, PR #628 review). Both flags are set so
+# one fixture covers both halves of the condition; the single-flag cases are asserted
+# separately in :class:`TestLossyEnvelopeHalts`.
+LOSSY_ENVELOPE = StepResultEnvelope(
+    last_message="[REDACTED:aws-secret-key] tail",
+    status="completed",
+    terminal_id="term-1",
+    truncated=True,
+    redacted=True,
+)
 
 # States the gate observes, spelled as the literals the gate tests by name (it takes no
 # ``StepState`` import for them, TD-1). ``recovery-decision-intake`` (unit 12) has since added
@@ -286,7 +302,7 @@ class TestPerRuleTable:
 
     def test_rule7_is_excluded_for_a_replay_authorized_row(self):
         """Rule 7's ONE exclusion (``recovery-decision-intake`` BR-4): the same row that halts
-        above falls through to rule 8 once a human has authorised using the stored result. The
+        above falls through to the catch-all once a human has authorised using the stored result. The
         three surviving-safety-rule tests live in ``test_recovery_decision_intake.py``."""
         _seed_step(state=REPLAY_AUTHORIZED, fingerprint=FP_CALL, result_json=RESULT_JSON)
         d = decide(RUN, STEP, FP_CALL, RecoveryPolicy.MANUAL)
@@ -303,33 +319,71 @@ class TestPerRuleTable:
             ReplayVerdict.REPLAY
         )
 
-    def test_rule8_match_undeclared_replays(self):
-        """Rule 8 — FR-1, and BR-5: undeclared REPLAYS, because replay executes nothing."""
+    def test_catch_all_match_undeclared_replays(self):
+        """The catch-all — FR-1, and BR-5: undeclared REPLAYS, because replay executes nothing."""
         _seed_step(state=StepState.COMPLETED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
         d = decide(RUN, STEP, FP_CALL, None)
         assert d.verdict is ReplayVerdict.REPLAY
         assert d.rule is None
         assert d.envelope == ENVELOPE
 
-    def test_rule8_match_idempotent_replays(self):
+    def test_catch_all_match_idempotent_replays(self):
         _seed_step(state=StepState.COMPLETED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
         d = decide(RUN, STEP, FP_CALL, RecoveryPolicy.IDEMPOTENT)
         assert d.verdict is ReplayVerdict.REPLAY
         assert d.envelope == ENVELOPE
 
-    def test_rule8_match_reconcile_replays(self):
+    def test_catch_all_match_reconcile_replays(self):
         _seed_step(state=StepState.COMPLETED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
         d = decide(RUN, STEP, FP_CALL, RecoveryPolicy.RECONCILE)
         assert d.verdict is ReplayVerdict.REPLAY
         assert d.envelope == ENVELOPE
 
-    def test_rule8_replays_a_failed_step_that_settled_with_an_envelope(self):
-        """A FAILED row is settled and carries an envelope (unit 2's BR-1 writes one
-        unconditionally), so it replays like any other match — absence means *crash between
-        the writes*, never *the step failed*."""
+    def test_rule8_halts_a_failed_step_rather_than_replaying_it(self):
+        """PR #628 review (Copilot F1) — THIS TEST ASSERTED THE OPPOSITE AND WAS WRONG.
+
+        Its previous form read: "a FAILED row is settled and carries an envelope (unit 2's
+        BR-1 writes one unconditionally), so it replays like any other match". The envelope
+        premise is true and the conclusion does not follow. On the ORIGINAL drive this step
+        RAISED — ``run_agent_step`` raised ``StepExecutionError``, the route answered 502/504
+        and the shim turned that into ``ShimHTTPError``. Replaying it answers HTTP 200 with a
+        ``StepHandle``, so the author's script continues past a call that failed, and the
+        failure is silently deleted from the replayed run.
+
+        Rule 8 halts instead. Envelope ABSENCE still means *crash between the writes* and
+        never *the step failed* — that distinction (unit 2's BR-1) is untouched and is why
+        this halts as ``OUTCOME_FAILED`` rather than as ``ENVELOPE_ABSENT``.
+        """
         _seed_step(state=StepState.FAILED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
         d = decide(RUN, STEP, FP_CALL, None)
+        assert d.verdict is ReplayVerdict.DECISION_REQUIRED
+        assert d.rule is HaltRule.OUTCOME_FAILED
+        # BR-6: a halting verdict hands the caller no envelope to serve.
+        assert d.envelope is None
+
+    def test_rule9_halts_a_lossy_envelope_rather_than_serving_abridged_text(self):
+        """PR #628 review (Copilot F5). ``build_envelope`` redacts and then bounds
+        ``last_message`` before it reaches SQLite, but the ORIGINAL call answered with
+        ``run_agent_step``'s raw text — the success arm of the route never touches the
+        envelope. So replaying a lossy envelope serves text the original call did not, and
+        ``RunStepResponse`` has no ``truncated``/``redacted`` field in which to say so.
+        """
+        _seed_step(
+            state=StepState.COMPLETED.value,
+            fingerprint=FP_CALL,
+            result_json=serialise_envelope(LOSSY_ENVELOPE),
+        )
+        d = decide(RUN, STEP, FP_CALL, None)
+        assert d.verdict is ReplayVerdict.DECISION_REQUIRED
+        assert d.rule is HaltRule.ENVELOPE_LOSSY
+        assert d.envelope is None
+
+    def test_rule10_match_replays_when_the_outcome_is_good_and_the_envelope_is_whole(self):
+        """The catch-all still replays — rules 8 and 9 narrowed it, they did not close it."""
+        _seed_step(state=StepState.COMPLETED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
+        d = decide(RUN, STEP, FP_CALL, None)
         assert d.verdict is ReplayVerdict.REPLAY
+        assert d.envelope == ENVELOPE
 
     def test_running_literal_matches_the_enum_value(self):
         """The gate spells ``'running'`` as a bare literal (it must not add a sixth package
@@ -422,7 +476,7 @@ class TestOrdering:
         assert d.rule is None
 
     def test_manual_halt_beats_the_replay_rule(self):
-        """Rule 7 over rule 8: a verified match with ``manual`` halts, because a human asked
+        """Rule 7 over the catch-all: a verified match with ``manual`` halts, because a human asked
         to see the step."""
         _seed_step(state=StepState.COMPLETED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
         d = decide(RUN, STEP, FP_CALL, RecoveryPolicy.MANUAL)
@@ -497,7 +551,7 @@ class TestInfiniteHaltRegression:
         Found by mutation: with rule 1's ``rerun_authorized`` arm intact, broadening rule 2 to
         "not settled" is invisible to the test above, because rule 1 answers first. So that
         test guards ONE half of the fix and this one guards the other — an unknown state with a
-        verified match and a readable envelope must reach rule 8, not be halted as
+        verified match and a readable envelope must reach the catch-all, not be halted as
         ``INTERRUPTED_NO_POLICY`` by a rule 2 that grew.
         """
         _seed_step(
@@ -596,9 +650,21 @@ class TestSpecificHaltRules:
         _seed_step(state=StepState.COMPLETED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
         assert decide(RUN, STEP, FP_CALL, RecoveryPolicy.MANUAL).rule is HaltRule.POLICY_MANUAL
 
-    def test_the_four_members_are_all_reachable_and_all_distinct(self):
-        """Together the four assertions above cover every ``HaltRule`` member exactly once. If
-        a fifth member is ever added without a producing rule, this fails and says so."""
+    def test_rule8_halts_with_outcome_failed(self):
+        _seed_step(state=StepState.FAILED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
+        assert decide(RUN, STEP, FP_CALL, None).rule is HaltRule.OUTCOME_FAILED
+
+    def test_rule9_halts_with_envelope_lossy(self):
+        _seed_step(
+            state=StepState.COMPLETED.value,
+            fingerprint=FP_CALL,
+            result_json=serialise_envelope(LOSSY_ENVELOPE),
+        )
+        assert decide(RUN, STEP, FP_CALL, None).rule is HaltRule.ENVELOPE_LOSSY
+
+    def test_the_six_members_are_all_reachable_and_all_distinct(self):
+        """Together the six assertions above cover every ``HaltRule`` member exactly once. If
+        a seventh member is ever added without a producing rule, this fails and says so."""
         produced = set()
         _seed_step(state=StepState.RUNNING.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
         produced.add(decide(RUN, STEP, FP_CALL, None).rule)
@@ -623,7 +689,204 @@ class TestSpecificHaltRules:
             step_id="s4",
         )
         produced.add(decide(RUN, "s4", FP_CALL, RecoveryPolicy.MANUAL).rule)
+        _seed_step(
+            state=StepState.FAILED.value,
+            fingerprint=FP_CALL,
+            result_json=RESULT_JSON,
+            step_id="s5",
+        )
+        produced.add(decide(RUN, "s5", FP_CALL, None).rule)
+        _seed_step(
+            state=StepState.COMPLETED.value,
+            fingerprint=FP_CALL,
+            result_json=serialise_envelope(LOSSY_ENVELOPE),
+            step_id="s6",
+        )
+        produced.add(decide(RUN, "s6", FP_CALL, None).rule)
         assert produced == set(HaltRule)
+
+
+# ---------------------------------------------------------------------------
+# PR #628 review, Copilot F1 — rule 8: a FAILED outcome never replays as a success.
+# ---------------------------------------------------------------------------
+class TestFailedOutcomeHalts:
+    """The defect: a ``failed`` row reached the catch-all and REPLAYED, so the route answered
+    HTTP 200 and the script continued past a call that raised on the original drive.
+
+    Both escapes are asserted here, not just the halt. A halt with no way out is the
+    infinite-halt defect BR-2 exists to prevent, and rule 8 is the first rule added since that
+    defect was found — so the escapes are the part most worth pinning.
+    """
+
+    @pytest.mark.parametrize("policy", _POLICIES)
+    def test_a_failed_row_halts_under_every_declared_policy(self, policy):
+        """Including ``idempotent``/``reconcile``. THIS IS THE ONE THAT LOOKS ARGUABLE, so it
+        is stated: those policies say re-EXECUTION is safe, which is a claim about running the
+        step again — it is not a claim that a recorded FAILURE may be served as a success, and
+        rules 2 and 4 are where the gate already acts on the re-execution claim. Serving the
+        failure is what the author never asked for.
+        """
+        _seed_step(state=StepState.FAILED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
+        d = decide(RUN, STEP, FP_CALL, policy)
+        assert d.verdict is ReplayVerdict.DECISION_REQUIRED
+        assert d.envelope is None
+
+    def test_rerun_escapes_it_through_rule_1(self):
+        """``rerun`` -> ``rerun_authorized`` -> rule 1 -> EXECUTE, before rule 8 is reached."""
+        _seed_step(state=RERUN_AUTHORIZED, fingerprint=FP_CALL, result_json=RESULT_JSON)
+        d = decide(RUN, STEP, FP_CALL, None)
+        assert d.verdict is ReplayVerdict.EXECUTE
+        assert d.rule is None
+
+    def test_skip_escapes_it_because_the_decision_overwrites_the_state(self):
+        """``skip`` -> ``replay_authorized``, which OVERWRITES ``failed`` in the same column
+        rule 8 tests — so rule 8 needs no exclusion of its own and the row replays.
+
+        This is the mechanism the fix depends on. If ``apply_decisions`` ever recorded a
+        decision beside ``state`` instead of in it, this test fails and rule 8 becomes an
+        infinite halt for ``skip``.
+        """
+        _seed_step(state=REPLAY_AUTHORIZED, fingerprint=FP_CALL, result_json=RESULT_JSON)
+        d = decide(RUN, STEP, FP_CALL, None)
+        assert d.verdict is ReplayVerdict.REPLAY
+        assert d.envelope == ENVELOPE
+
+    def test_a_failed_row_with_no_envelope_still_halts_as_envelope_absent(self):
+        """Rule 3 keeps precedence: rule 8 was APPENDED, so nothing before it moved. The
+        distinction is not cosmetic — ``ENVELOPE_ABSENT`` means *crash between the writes* and
+        is the guard FR-4 defines, so it must not be relabelled by the new rule.
+        """
+        _seed_step(state=StepState.FAILED.value, fingerprint=FP_CALL, result_json=None)
+        d = decide(RUN, STEP, FP_CALL, None)
+        assert d.rule is HaltRule.ENVELOPE_ABSENT
+        assert d.rule is not HaltRule.OUTCOME_FAILED
+
+    def test_a_failed_row_that_diverges_still_reports_divergence(self):
+        """Rule 6 keeps precedence too: "the script changed at this key" is the more actionable
+        fact and FR-3 requires it to be loud."""
+        _seed_step(state=StepState.FAILED.value, fingerprint=FP_OTHER_V2, result_json=RESULT_JSON)
+        assert decide(RUN, STEP, FP_CALL, None).verdict is ReplayVerdict.DIVERGED
+
+    def test_completed_unvalidated_is_not_a_failure_and_still_replays(self):
+        """The rule tests ``failed`` EXACTLY, never "not completed". ``completed_unvalidated``
+        means the step succeeded and its structured output failed schema validation — the
+        original call returned 200, so replaying it reproduces the original run.
+        """
+        _seed_step(
+            state=StepState.COMPLETED_UNVALIDATED.value,
+            fingerprint=FP_CALL,
+            result_json=RESULT_JSON,
+        )
+        assert decide(RUN, STEP, FP_CALL, None).verdict is ReplayVerdict.REPLAY
+
+    def test_the_failed_literal_matches_the_enum_value(self):
+        """The gate spells ``'failed'`` as a bare literal (TD-1 — no sixth package import for
+        one string), pinned against the enum from THIS file's own import."""
+        assert StepState.FAILED.value == "failed"
+        _seed_step(state="failed", fingerprint=FP_CALL, result_json=RESULT_JSON)
+        assert decide(RUN, STEP, FP_CALL, None).rule is HaltRule.OUTCOME_FAILED
+
+
+# ---------------------------------------------------------------------------
+# PR #628 review, Copilot F5 — rule 9: an envelope that reports its own lossiness.
+# ---------------------------------------------------------------------------
+class TestLossyEnvelopeHalts:
+    """The defect: ``build_envelope`` redacts and then bounds ``last_message``, but the original
+    call answered with ``run_agent_step``'s RAW text. Replay served the abridged text as the
+    step output and ``RunStepResponse`` carries no flag able to say so, so an unchanged script
+    that feeds the result into its next prompt computes a different next-step fingerprint and
+    FALSELY diverges — reporting a changed script when nothing changed.
+    """
+
+    @pytest.mark.parametrize(
+        "truncated,redacted",
+        [(True, False), (False, True), (True, True)],
+        ids=["truncated", "redacted", "both"],
+    )
+    def test_either_flag_alone_halts(self, truncated: bool, redacted: bool):
+        """Both halves of the ``or`` are exercised. One fixture with both flags set would pass
+        against an implementation that tested only one of them."""
+        _seed_step(
+            state=StepState.COMPLETED.value,
+            fingerprint=FP_CALL,
+            result_json=serialise_envelope(
+                StepResultEnvelope(
+                    last_message="abridged",
+                    status="completed",
+                    terminal_id="term-1",
+                    truncated=truncated,
+                    redacted=redacted,
+                )
+            ),
+        )
+        d = decide(RUN, STEP, FP_CALL, None)
+        assert d.verdict is ReplayVerdict.DECISION_REQUIRED
+        assert d.rule is HaltRule.ENVELOPE_LOSSY
+        assert d.envelope is None
+
+    def test_a_whole_envelope_is_untouched_by_the_rule(self):
+        """Both flags false — the overwhelmingly common case — still replays. Without this the
+        fix could have closed the replay path entirely and every other test would still pass.
+        """
+        assert ENVELOPE.truncated is False
+        assert ENVELOPE.redacted is False
+        _seed_step(state=StepState.COMPLETED.value, fingerprint=FP_CALL, result_json=RESULT_JSON)
+        assert decide(RUN, STEP, FP_CALL, None).verdict is ReplayVerdict.REPLAY
+
+    def test_skip_escapes_it_by_explicit_exclusion(self):
+        """Unlike rule 8, rule 9's condition is the ENVELOPE's and survives the state
+        overwrite, so it excludes ``replay_authorized`` by hand. Without that exclusion a human
+        who answered ``skip`` would be re-asked on every subsequent resume — forever.
+        """
+        _seed_step(
+            state=REPLAY_AUTHORIZED,
+            fingerprint=FP_CALL,
+            result_json=serialise_envelope(LOSSY_ENVELOPE),
+        )
+        d = decide(RUN, STEP, FP_CALL, None)
+        assert d.verdict is ReplayVerdict.REPLAY
+        assert d.envelope == LOSSY_ENVELOPE
+
+    def test_rerun_escapes_it_through_rule_1(self):
+        _seed_step(
+            state=RERUN_AUTHORIZED,
+            fingerprint=FP_CALL,
+            result_json=serialise_envelope(LOSSY_ENVELOPE),
+        )
+        assert decide(RUN, STEP, FP_CALL, None).verdict is ReplayVerdict.EXECUTE
+
+    def test_a_lossy_envelope_that_diverges_still_reports_divergence(self):
+        """Rule 6 precedence again — appended rules never mask an earlier one."""
+        _seed_step(
+            state=StepState.COMPLETED.value,
+            fingerprint=FP_OTHER_V2,
+            result_json=serialise_envelope(LOSSY_ENVELOPE),
+        )
+        assert decide(RUN, STEP, FP_CALL, None).verdict is ReplayVerdict.DIVERGED
+
+    def test_rule_8_precedes_rule_9_on_a_row_matching_both(self):
+        """A ``failed`` row with a lossy envelope satisfies both. The order is asserted rather
+        than assumed, because each rule passes in isolation while the order is wrong, and unit
+        12 branches on the member a human is shown.
+        """
+        _seed_step(
+            state=StepState.FAILED.value,
+            fingerprint=FP_CALL,
+            result_json=serialise_envelope(LOSSY_ENVELOPE),
+        )
+        d = decide(RUN, STEP, FP_CALL, None)
+        assert d.rule is HaltRule.OUTCOME_FAILED
+        assert d.rule is not HaltRule.ENVELOPE_LOSSY
+
+    def test_the_gate_still_imports_neither_secret_gate_nor_build_envelope(self):
+        """Rule 9 reads the envelope's OWN self-report (unit 2's INV-5) rather than recomputing
+        lossiness, which is what keeps SR-2 intact: a second redaction or bounding pass here
+        would be an unreviewed sanitisation path, and it could match its own
+        ``[REDACTED:<name>]`` marker.
+        """
+        imports = _package_imports()
+        assert "cli_agent_orchestrator.services.secret_gate" not in imports
+        assert imports["cli_agent_orchestrator.services.step_result"] == {"parse_envelope"}
 
 
 # ---------------------------------------------------------------------------
@@ -977,9 +1240,15 @@ class TestReconcileEquivalence:
 
     def test_the_module_docstring_states_that_the_order_is_the_contract(self):
         """BR-1's other half: the order is the thing most likely to be rearranged for
-        readability, so the reason it may not be lives with the code."""
+        readability, so the reason it may not be lives with the code.
+
+        The rule COUNT moves when a rule is appended (PR #628's review took it from eight to
+        ten), so the phrase is matched around the count rather than including it — the claim
+        under test is "the order is the contract", not the arithmetic.
+        """
         doc = step_replay.__doc__ or ""
-        assert "ORDER OF THE EIGHT RULES IS THE CONTRACT" in doc
+        assert "RULES IS THE CONTRACT" in doc
+        assert "ORDER OF THE" in doc
 
 
 # ---------------------------------------------------------------------------
@@ -1005,7 +1274,7 @@ _ALL_ROWS = [
     pytest.param(
         StepState.COMPLETED.value, FP_CALL, RESULT_JSON, RecoveryPolicy.MANUAL, id="rule7"
     ),
-    pytest.param(StepState.COMPLETED.value, FP_CALL, RESULT_JSON, None, id="rule8"),
+    pytest.param(StepState.COMPLETED.value, FP_CALL, RESULT_JSON, None, id="catch-all"),
     pytest.param(
         REPLAY_AUTHORIZED, FP_CALL, RESULT_JSON, RecoveryPolicy.MANUAL, id="rule7-excluded"
     ),
@@ -1071,21 +1340,27 @@ class TestEnvelopePassthrough:
 
     def test_a_truncated_and_redacted_envelope_keeps_its_self_reported_flags(self):
         """Evidence that hides its own lossiness is worse than none (unit 2's BR-4), so the
-        gate must not normalise the flags away."""
-        lossy = StepResultEnvelope(
-            last_message="[REDACTED:aws-key] tail",
-            status="failed",
-            terminal_id=None,
-            truncated=True,
-            redacted=True,
-        )
+        gate must not normalise the flags away.
+
+        SEEDED ``replay_authorized`` SINCE PR #628's REVIEW, and the change is the point rather
+        than a workaround: rule 9 now HALTS a lossy envelope, so the only path on which one is
+        still served is the one where a human answered ``skip`` — and that is exactly the path
+        where normalising the flags away would matter, because it is the only path a caller
+        ever receives such an envelope on. The previous seed (``failed``) would now halt at
+        rule 8 before rule 9 was even reached, which would leave this test asserting nothing
+        about the flags.
+        """
         _seed_step(
-            state=StepState.FAILED.value,
+            state=REPLAY_AUTHORIZED,
             fingerprint=FP_CALL,
-            result_json=serialise_envelope(lossy),
+            result_json=serialise_envelope(LOSSY_ENVELOPE),
         )
         d = decide(RUN, STEP, FP_CALL, None)
-        assert d.envelope == lossy
+        assert d.verdict is ReplayVerdict.REPLAY
+        assert d.envelope == LOSSY_ENVELOPE
+        assert d.envelope is not None
+        assert d.envelope.truncated is True
+        assert d.envelope.redacted is True
 
 
 # ---------------------------------------------------------------------------
@@ -1225,7 +1500,7 @@ def _stored_fingerprint(scheme: str, matches: bool) -> Optional[str]:
 class TestTotality:
     """Every combination of ``state`` x ``scheme`` x ``policy`` x fingerprint-match returns a
     ``ReplayDecision`` — the cheapest honest proof that no path falls through without a
-    verdict, with rule 8 as the catch-all.
+    verdict, with rule 10 as the catch-all.
 
     The sweep deliberately includes row shapes production does not produce (a ``running`` row
     carrying an envelope, an unknown future state), because totality is a property of the
