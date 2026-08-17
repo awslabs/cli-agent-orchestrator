@@ -48,11 +48,26 @@ spec:
             # Supervisor installs the code_supervisor profile
             - name: CAO_INSTALL_PROFILES
               value: "code_supervisor:mock_cli"
+            # Expose the working_directory parameter on assign/handoff so the
+            # supervisor can select a repo (under ~/workspace) per assignment
+            # in multi-repo fleets. Must match the worker pods' setting.
+            - name: CAO_ENABLE_WORKING_DIRECTORY
+              value: "true"
             # Deliberately NO CAO_MAX_TERMINALS here: the supervisor pod is
             # uncapped so its own terminal plus any sidecars can coexist. In
             # this topology delegated workers should not land here either way —
             # assign/handoff calls from the supervisor should always carry
             # target_host=<worker pod> so agents run on the capped worker pods.
+          # Workspace repos + git credentials (git is the workspace transport;
+          # see configmap-workspace.yaml). Both optional: an empty fleet
+          # deploys with no repos and no token.
+          envFrom:
+            - configMapRef:
+                name: cao-workspace-config
+                optional: true
+            - secretRef:
+                name: cao-git-credentials
+                optional: true
           resources:
             requests:
               cpu: 250m
@@ -81,10 +96,16 @@ spec:
           volumeMounts:
             - name: cao-state
               mountPath: /home/cao/.cao
+            # Clones are disposable (re-cloned on pod start; durable work is
+            # pushed to git), so an emptyDir suffices — no PVC needed.
+            - name: workspace
+              mountPath: /home/cao/workspace
       volumes:
         - name: cao-state
           persistentVolumeClaim:
             claimName: cao-supervisor-state
+        - name: workspace
+          emptyDir: {}
 ---
 # Persistent state for the supervisor (SQLite DB, logs, installed profiles).
 # Survives pod restarts/rescheduling, unlike the emptyDir it replaces.
