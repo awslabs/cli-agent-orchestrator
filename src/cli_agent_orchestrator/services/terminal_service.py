@@ -63,6 +63,7 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroPhase0KASError,
@@ -1453,7 +1454,11 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                             terminal_id,
                             exc,
                         )
-                raise last_err  # type: ignore[misc]
+                # Re-raise as the narrower type: the terminal and provider both
+                # resolved, so this is a missing response marker, not a bad
+                # reference. Keeps the API boundary from reporting it as 404
+                # (issue #570).
+                raise OutputExtractionError(str(last_err)) from last_err
 
             # Escalating fetch: try progressively larger capture windows until
             # the response marker is found or we hit the cap.
