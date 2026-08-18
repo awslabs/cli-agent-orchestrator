@@ -1298,6 +1298,86 @@ class TestUnconsumedConsentIsRevokedWhenTheDriveEnds:
 
         assert result.state is RunState.COMPLETED
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancelled", [False, True], ids=["returned-result", "cancelled"])
+    async def test_a_failing_live_state_mirror_never_masks_the_drives_outcome(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, cancelled: bool
+    ):
+        """The mirror is bookkeeping after a successful revoke, so its own bad return value
+        must not replace either a completed result or the ``CancelledError`` already in flight.
+
+        ``revoke_unconsumed_decisions`` currently returns keys from ``granted``, but this models
+        a future contract regression explicitly: a stray key makes the mirror's map lookup
+        raise. The outer guard is therefore part of BR-9's promise, not defensive decoration.
+        """
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+
+        if cancelled:
+
+            async def _cancelled_drive(record, path, env):
+                raise asyncio.CancelledError()
+
+            monkeypatch.setattr(script_runner, "_drive_process", _cancelled_drive)
+        else:
+            self._completing_drive(monkeypatch)
+
+        monkeypatch.setattr(
+            workflow_journal,
+            "revoke_unconsumed_decisions",
+            lambda *a, **k: [STEP_B],
+        )
+
+        with caplog.at_level(logging.WARNING, logger=script_runner.__name__):
+            if cancelled:
+                with pytest.raises(asyncio.CancelledError):
+                    await script_runner.resume_script_run(RUN, {STEP: "skip"})
+            else:
+                result = await script_runner.resume_script_run(RUN, {STEP: "skip"})
+
+        if not cancelled:
+            assert result.state is RunState.COMPLETED
+        assert any(
+            "consent was revoked but the live state could not be normalized" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unrecognised_revoked_prior_state_is_not_invented(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """A corrupt durable prior value is restored atomically but cannot become a typed state.
+
+        The settled replay record remains at its existing typed ``REPLAY_AUTHORIZED`` value:
+        manufacturing ``RUNNING`` would publish an in-flight state and alter orphan
+        reconciliation semantics. The warning is the observation; it is not permission to
+        invent a value that the durable row did not say.
+        """
+        unknown_prior = "legacy-state-not-in-this-version"
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._replaying_skip_drive(monkeypatch)
+        real_apply_decisions = workflow_journal.apply_decisions
+
+        def _grant_with_unrecognised_prior(*args, **kwargs):
+            real_apply_decisions(*args, **kwargs)
+            return {STEP: unknown_prior}
+
+        monkeypatch.setattr(workflow_journal, "apply_decisions", _grant_with_unrecognised_prior)
+
+        with caplog.at_level(logging.WARNING, logger=script_runner.__name__):
+            await script_runner.resume_script_run(RUN, {STEP: "skip"})
+
+        live_state = workflow_service.run_registry[RUN].step_states[STEP].state
+        assert _state_of() == unknown_prior
+        assert live_state is StepState.REPLAY_AUTHORIZED
+        assert live_state is not StepState.RUNNING
+        assert isinstance(live_state, StepState)
+        assert any(
+            "unrecognised prior state could not be mirrored" in record.getMessage()
+            for record in caplog.records
+        )
+
     def test_revoke_reports_exactly_what_it_took_back(self):
         """The primitive on its own: it returns the steps it reverted, so a caller can log or
         assert on the set rather than re-reading every row."""
