@@ -53,11 +53,28 @@ PROVIDER_OBSERVATION_SCHEMA = "cao-muse-native-control-observation-v1"
 KEYSTROKE_PLAN_SCHEMA = "cao-muse-native-keystroke-plan-v1"
 
 KIND_QUEUE = "queue"
-#: The closed vocabulary of this adapter.  Muse steer/chord, slash-control,
-#: and operator-message facts are unproven on the installed build, so no
-#: other kind may be opened — the generic control surface stays closed for
-#: Muse because there is nothing here it could safely do.
+#: The closed vocabulary of this *adapter operation* surface.  Muse steer
+#: and chord facts remain unproven, so no other kind may be opened here.
+#: Compact is deliberately not a kind: it travels as ordinary composer
+#: text through the v3 path (see ``CONTROL_COMPACT``), the same route the
+#: deployed Compact button takes, so advertising it costs this surface
+#: nothing and opening a kind for it would add a refusal with no verb
+#: behind it.
 KINDS = (KIND_QUEUE,)
+
+#: The compact command text, pinned here so the provider-control registry
+#: consumes one fact rather than retyping the literal on the other side.
+#:
+#: Proven on 0.2.1-R1215.1 against the live provider: typed at an idle
+#: composer it compacts (the transcript answers ``compacted``).  Sent
+#: while a turn is in flight it is refused by the provider itself —
+#: ``/compact can't run while a turn is active - press Esc to interrupt
+#: it first`` — which is why the registry pairs it with Stop rather than
+#: claiming it is deliverable at any moment.  An echo-provider session
+#: answers ``manual context compaction is not available``; that is a
+#: property of that provider class, not of the build, and it is the
+#: reason this pin cites a live-provider observation instead.
+CONTROL_COMPACT = "/compact"
 
 INTENDED = "intended"
 POSTED = "posted"

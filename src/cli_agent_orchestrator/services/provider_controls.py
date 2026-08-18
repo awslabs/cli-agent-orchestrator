@@ -98,6 +98,12 @@ KIMI_IMAGE_REFERENCE_TEMPLATE = (
 #: inserted at the token position.
 CLAUDE_IMAGE_REFERENCE_TEMPLATE = "{path}"
 
+#: Muse's reference template.  Live acceptance on 0.2.1-R1215.1 read the
+#: staged image in *both* forms — a bare path alone and an explicit "read
+#: the image file at <path>" directive — so the bare path is pinned as the
+#: weaker precondition of the two that were proven.
+MUSE_IMAGE_REFERENCE_TEMPLATE = "{path}"
+
 
 def _operator_message_block() -> Dict[str, Any]:
     """The §8.6 operator-message advertisement (same limits for both)."""
@@ -260,10 +266,148 @@ def _codex_entry() -> ProviderControls:
 #: the v3 path — identical to the deployed Compact button — and the kimi
 #: adapter's ``control()`` gating on provider-advertised commands applies
 #: to the adapter operation path, not this composer-text path.
+def _muse_entry() -> ProviderControls:
+    """The muse_cli row, bound to live measurement on 0.2.1-R1215.1.
+
+    Muse's facts came from driving the installed build rather than from
+    reading it, so each one below names the observation behind it.  The
+    fields left ``None`` are the ones nothing established: no steer chord
+    is proven (both ``Enter`` and ``M-Enter`` were observed to *enqueue*
+    mid-run, which is not the same as a chord whose consumption was
+    proven), and interactive streaming was never exercised.
+    """
+    from cli_agent_orchestrator.services import muse_native_control
+
+    return ProviderControls(
+        compact=[_text(muse_native_control.CONTROL_COMPACT), _key("Enter")],
+        stop=[_key("Escape")],
+        steer_chords=(),
+        dispatch_grace_ms=None,
+        operator_message=_operator_message_block(),
+        image={
+            "supported": True,
+            # PNG is what the live acceptance staged; every other format
+            # is unproven rather than assumed (F9), as for kimi.
+            "formats": ["png"],
+            "max_bytes": IMAGE_MAX_BYTES,
+            "max_width": IMAGE_MAX_WIDTH,
+            "max_height": IMAGE_MAX_HEIGHT,
+            "mechanism": "staged-path-text",
+            "reference_template": MUSE_IMAGE_REFERENCE_TEMPLATE,
+            "evidence": "live acceptance on 0.2.1-R1215.1: bare path and explicit directive both read",
+        },
+        interactive_streaming=None,
+        evidence={
+            "compact": "muse_native_control.CONTROL_COMPACT (adapter pin, imported)",
+            "stop": (
+                "Escape delivered by tmux send-keys cancels an in-flight turn on "
+                "0.2.1-R1215.1; the TUI survives and the prompt returns to the "
+                "composer. Escape at an idle pane leaves a draft intact, so Stop "
+                "is safe to send speculatively. C-c also cancels but clears an "
+                "idle draft and arms quit, so it is deliberately not advertised"
+            ),
+            "steer_chords": (
+                "no steer chord is proven for any muse_cli build: Enter and "
+                "M-Enter both enqueue mid-run behind an identical "
+                "'Queued input' marker, differing only in status text"
+            ),
+            "operator_message": (
+                "adapter composer-newline plan, build-pinned for 0.2.1 with a "
+                "measured 0.2s submit settle "
+                "(muse_native_control._PROVEN_COMPOSER_NEWLINE, consumed)"
+            ),
+            "image": (
+                "staged-path PNG named in composer text, proven by live "
+                "acceptance on 0.2.1-R1215.1 in both the bare-path and "
+                "explicit-directive forms; the bare path is the pinned template"
+            ),
+            "interactive_streaming": "never exercised against a muse_cli build",
+        },
+    )
+
+
+def _antigravity_entry() -> ProviderControls:
+    """The antigravity_cli row: Stop, and nothing else yet.
+
+    agy has no native control adapter, no turn-state observer, and no
+    ``NATIVE_TUI_PROVIDERS`` membership, so every field that would be
+    delivered through the composer plan stays ``None`` — advertising one
+    would promise a capability whose first use refuses for a reason the
+    caller cannot clear.  Stop is a key-only sequence that needs none of
+    that machinery, which is why it is the one fact this row carries.
+
+    ``compact`` is ``None`` as a *positive finding*, not an omission, and
+    not a gap to be closed later.  agy has no compaction affordance
+    because it does not delegate compaction to the operator: the harness
+    prunes and compresses context automatically in the backend, and the
+    CLI only *renders* the result (``CompactionInfo``,
+    ``renderCompactionMarker``, the "Conversation compacted" notice).
+    That is the vendor's stated design — the CLI is built to run
+    autonomously against Gemini's very large context window, so a manual
+    token-ceiling command was deliberately left out of the slash-command
+    interface.  Where an operator does need to shed context, agy's own
+    answer is a fresh session that ingests the prior one (``@conversation
+    <id>``) or an explicit "summarise the task state and drop the debug
+    logs" prompt, neither of which is a control event this registry can
+    deliver.
+
+    So a caller must read ``compact=None`` for agy as "this provider
+    compacts itself", not "this control is missing".  ``/clear`` is not a
+    substitute in either reading — it discards context instead of
+    summarising it.
+    """
+    return ProviderControls(
+        compact=None,
+        stop=[_key("Escape")],
+        steer_chords=(),
+        dispatch_grace_ms=None,
+        operator_message=None,
+        image=None,
+        interactive_streaming=None,
+        evidence={
+            "compact": (
+                "no compaction affordance exists on agy 1.1.14, observed three "
+                "independent ways: the binary's slash-command registry carries "
+                "33 *Command types with compactCommand absent while clear/"
+                "context/usage/rewind/fork are all present; the live TUI menu "
+                "paged end to end lists none; and print-mode /help lists none. "
+                "The absent command is by design, not an oversight: compaction "
+                "runs automatically in the provider's backend and the CLI only "
+                "renders it (CompactionInfo, renderCompactionMarker)"
+            ),
+            "stop": (
+                "Escape delivered by tmux send-keys interrupts an in-flight turn "
+                "on 1.1.14 in under 0.6s, leaving the explicit marker "
+                "'Interrupted - What should Antigravity CLI do instead?'. At an "
+                "idle pane Escape leaves a composer draft intact across repeated "
+                "presses, so Stop is safe to send speculatively. C-c is refused "
+                "as Stop: the binary double-presses to exit"
+            ),
+            "steer_chords": "no steer chord is pinned for any antigravity_cli build",
+            "dispatch_grace_ms": (
+                "no settle is needed: 12/12 submissions succeeded on 1.1.14 "
+                "including with zero delay between the last keystroke and Enter"
+            ),
+            "operator_message": (
+                "withheld: no antigravity native control adapter exists, so a "
+                "composer plan cannot be built for this provider"
+            ),
+            "image": "unadvertised; no delivery mechanism has been proven for agy",
+            "interactive_streaming": (
+                "withheld: agy's --input-format stream-json accepts no input on "
+                "1.1.14 (it emits zero events and fails during a skills reload), "
+                "so no streaming transport is proven"
+            ),
+        },
+    )
+
+
 _REGISTRY = {
     provider_contracts.PROVIDER_CODEX: _codex_entry,
     provider_contracts.PROVIDER_KIMI_CLI: _kimi_entry,
     provider_contracts.PROVIDER_CLAUDE_CODE: _claude_entry,
+    provider_contracts.PROVIDER_MUSE_CLI: _muse_entry,
+    provider_contracts.PROVIDER_ANTIGRAVITY_CLI: _antigravity_entry,
 }
 
 
@@ -318,6 +462,7 @@ def _wire_shape(entry: ProviderControls) -> Dict[str, Any]:
 IMAGE_PROVEN_BUILDS: Dict[str, tuple] = {
     provider_contracts.PROVIDER_KIMI_CLI: ("0.29.2",),
     provider_contracts.PROVIDER_CLAUDE_CODE: ("2.1.220",),
+    provider_contracts.PROVIDER_MUSE_CLI: ("0.2.1",),
 }
 
 

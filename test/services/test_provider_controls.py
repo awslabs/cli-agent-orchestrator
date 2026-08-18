@@ -21,6 +21,8 @@ from cli_agent_orchestrator.services import (
 KIMI = provider_contracts.PROVIDER_KIMI_CLI
 CLAUDE = provider_contracts.PROVIDER_CLAUDE_CODE
 CODEX = provider_contracts.PROVIDER_CODEX
+MUSE = provider_contracts.PROVIDER_MUSE_CLI
+AGY = provider_contracts.PROVIDER_ANTIGRAVITY_CLI
 
 # The pinned v3 sequences, restated exactly as a client sends them.
 COMPACT_EVENTS = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
@@ -64,6 +66,16 @@ CLAUDE_IMAGE_BLOCK = {
     "evidence": (
         "documented path-in-prompt flow (design Appendix A.9); " "live acceptance per §10.6"
     ),
+}
+MUSE_IMAGE_BLOCK = {
+    "supported": True,
+    "formats": ["png"],
+    "max_bytes": 5242880,
+    "max_width": 8000,
+    "max_height": 8000,
+    "mechanism": "staged-path-text",
+    "reference_template": "{path}",
+    "evidence": "live acceptance on 0.2.1-R1215.1: bare path and explicit directive both read",
 }
 
 
@@ -187,7 +199,29 @@ class TestDiscoveryWireShape:
                 "image": CLAUDE_IMAGE_BLOCK,
                 "interactive_streaming": {"supported": True},
             },
+            MUSE: {
+                "compact": {"events": COMPACT_EVENTS},
+                "stop": {"events": STOP_EVENTS},
+                "steer_chords": [],
+                "operator_message": OPERATOR_MESSAGE_BLOCK,
+                "image": MUSE_IMAGE_BLOCK,
+            },
+            AGY: {
+                "stop": {"events": STOP_EVENTS},
+                "steer_chords": [],
+            },
         }
+
+    def test_every_registry_row_is_advertised(self):
+        """The frozen dict above and the registry cannot drift apart.
+
+        A hand-maintained expectation beside a derived set is a gate that
+        decays: without this pairing, adding a provider row would leave
+        the assertion above green for the four it still names.
+        """
+        assert set(provider_controls.advertised_provider_controls()) == set(
+            provider_controls._REGISTRY
+        )
 
     def test_an_absent_fact_is_omitted_not_nulled(self):
         """Additive-advertisement discipline: claude has no dispatch
@@ -392,3 +426,84 @@ class TestLaneCBlocks:
         claude_evidence = provider_controls.controls_for(CLAUDE, "2.1.220")["evidence"]
         assert "Appendix A.9" in claude_evidence["image"]
         assert "_PROVEN_COMPOSER_NEWLINE" in claude_evidence["operator_message"]
+
+
+class TestMuseRow:
+    """muse_cli's row, bound to live measurement on 0.2.1-R1215.1."""
+
+    def test_the_installed_build_carries_compact_stop_text_and_image(self):
+        block = provider_controls.controls_block_for(MUSE, "Muse Code 0.2.1 (0.2.1-R1215.1)")
+        assert block["compact"] == {"events": COMPACT_EVENTS}
+        assert block["stop"] == {"events": STOP_EVENTS}
+        assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
+        assert block["image"]["build_proven"] is True
+
+    def test_compact_is_consumed_from_the_adapter_not_retyped(self):
+        """The registry holds one copy of the fact, as for every provider."""
+        from cli_agent_orchestrator.services import muse_native_control
+
+        entry = provider_controls.controls_for(MUSE, "0.2.1")
+        assert entry["compact"][0]["text"] == muse_native_control.CONTROL_COMPACT
+
+    def test_interactive_streaming_is_withheld(self):
+        """Nothing exercised streaming against muse, so nothing claims it."""
+        entry = provider_controls.controls_for(MUSE, "0.2.1")
+        assert entry["interactive_streaming"] is None
+        block = provider_controls.controls_block_for(MUSE, "0.2.1")
+        assert "interactive_streaming" not in block
+
+    def test_no_steer_chord_is_claimed(self):
+        """Enqueueing was observed; chord consumption was not."""
+        assert provider_controls.controls_for(MUSE, "0.2.1")["steer_chords"] == ()
+
+    def test_a_failed_observation_withholds_the_delivery_blocks(self):
+        block = provider_controls.controls_block_for(MUSE, None)
+        assert block["stop"] == {"events": STOP_EVENTS}
+        assert "operator_message" not in block
+        assert "image" not in block
+
+
+class TestAntigravityRow:
+    """antigravity_cli carries Stop alone, and says why for the rest."""
+
+    def test_stop_resolves_on_the_version_less_panes_that_actually_exist(self):
+        """agy panes resolve no provider_version today.
+
+        The row has to be useful in exactly that state or it is decorative:
+        agy is unmanaged, so nothing populates a version for it.
+        """
+        assert provider_controls.controls_block_for(AGY, None) == {
+            "stop": {"events": STOP_EVENTS},
+            "steer_chords": [],
+        }
+        assert provider_controls.controls_block_for(AGY, "1.1.14") == {
+            "stop": {"events": STOP_EVENTS},
+            "steer_chords": [],
+        }
+
+    def test_compact_is_absent_because_agy_has_none(self):
+        """Recorded as a finding, so Compact is correctly hidden."""
+        entry = provider_controls.controls_for(AGY, "1.1.14")
+        assert entry["compact"] is None
+        assert "compactCommand" in entry["evidence"]["compact"]
+        assert "compact" not in provider_controls.controls_block_for(AGY, "1.1.14")
+
+    def test_every_key_is_present_even_when_the_fact_is_unproven(self):
+        """A partial row omits no key: all three read surfaces index them."""
+        entry = provider_controls.controls_for(AGY, "1.1.14")
+        for key in (
+            "compact",
+            "stop",
+            "steer_chords",
+            "dispatch_grace_ms",
+            "operator_message",
+            "image",
+            "interactive_streaming",
+            "evidence",
+        ):
+            assert key in entry
+
+    def test_unproven_fields_name_what_is_missing(self):
+        evidence = provider_controls.controls_for(AGY, "1.1.14")["evidence"]
+        assert "no antigravity native control adapter" in evidence["operator_message"]
+        assert "stream-json" in evidence["interactive_streaming"]
