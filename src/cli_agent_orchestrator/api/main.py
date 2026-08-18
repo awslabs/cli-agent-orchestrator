@@ -43,6 +43,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cli_agent_orchestrator.api.attachments import router as native_attachments_router
+from cli_agent_orchestrator.api.communications import router as communications_router
 from cli_agent_orchestrator.api.roster import router as roster_router
 from cli_agent_orchestrator.api.session_lifecycle import router as session_lifecycle_router
 from cli_agent_orchestrator.api.task_handoff import router as task_handoff_router
@@ -869,6 +870,7 @@ app.include_router(task_occurrence_router)
 # Same placement, same reason: a handoff outlives the panes it coordinated, and
 # its reads are the diagnostic answer to "why was my steer refused".
 app.include_router(task_handoff_router)
+app.include_router(communications_router)
 app.include_router(roster_router)
 
 
