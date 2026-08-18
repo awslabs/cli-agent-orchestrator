@@ -948,7 +948,7 @@ class TestValidateEndpointResistsAliasAmplification:
 
     Two findings, both on this route. Round 2 of review on #585 added a
     non-string mapping key check bounded only by a depth cap, so the walk
-    revisited alias-shared subtrees exponentially. Round 3's own strawman then
+    revisited alias-shared subtrees exponentially. Further testing then
     found the larger half: jsonschema interpolates ``repr`` of an offending
     instance into every error message it builds, so an amplified value that trips
     one ``type`` error yielded a 25 MB message at 20 anchor levels and 101 MB at

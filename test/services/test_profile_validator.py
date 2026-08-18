@@ -376,7 +376,7 @@ class TestAliasAmplificationIsBounded:
     walk revisited shared subtrees exponentially while the document stayed tiny. A
     640-byte body took ~1s, doubling per anchor level. Reported by @haofeif.
 
-    Round 3's own strawman then found the larger half. jsonschema builds each error
+    Further testing found the larger half. jsonschema builds each error
     message eagerly, interpolating ``repr`` of the offending instance, so an
     amplified value that trips one ``type`` error produced a 25 MB message at 20
     levels and 101 MB at 22, which is an allocation ceiling rather than a stall and
