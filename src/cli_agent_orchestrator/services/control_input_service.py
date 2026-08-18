@@ -389,14 +389,38 @@ class ResolvedControlIdentity:
         return payload
 
 
+def _generation_unselectable(resolved: ResolvedControlIdentity) -> Optional[str]:
+    """Detail for a managed row whose admission fence cannot be named, or None.
+
+    A generation exists to select the fence a managed write is admitted
+    under.  An unmanaged row has no managed reservation to fence against and
+    therefore carries no generation; that is the ordinary legacy shape, not a
+    fault, and its write is fenced by the pane lease and the in-lease pane
+    identity re-proof instead.  A *managed* row without one is the fault: the
+    fence it must pass cannot be selected, so no byte may be admitted.
+
+    Answerable from the resolution alone, which is why both byte lanes ask it
+    before they claim anything.
+    """
+    if not resolved.managed or resolved.terminal_generation is not None:
+        return None
+    return (
+        "this managed terminal's durable sources name no generation, so the "
+        "admission fence its provider bytes must pass cannot be selected; "
+        "nothing was typed"
+    )
+
+
 def _admission_refusal_reason(exc: BaseException) -> str:
     """Which typed refusal a pre-byte admission failure carries.
 
-    The three are not interchangeable.  A generation fence is permanent and
+    The four are not interchangeable.  A generation fence is permanent and
     instructs the caller to advance to a successor; an M3-E handoff hold is
     reversible and applies to the generation the caller already has.  A caller
     that read the hold as a fence would abandon a pane a pending handback is
-    keeping alive as its rollback insurance.
+    keeping alive as its rollback insurance.  A managed row that names no
+    generation at all reports the unproven lineage it is, because "advance to
+    the successor of nothing" is not a remedy any caller can run.
 
     The undecidable case is checked first because it is a *subclass* of the
     hold: it refuses on the same pre-byte terms, but it reports that the store
@@ -404,8 +428,10 @@ def _admission_refusal_reason(exc: BaseException) -> str:
     the other way would put every unreadable store back under ``handoff-held``
     and send the operator hunting a handback nothing ever observed.
     """
-    from cli_agent_orchestrator.services import task_handoff
+    from cli_agent_orchestrator.services import generation_fence, task_handoff
 
+    if isinstance(exc, generation_fence.GenerationUnselectable):
+        return REASON_LINEAGE_UNPROVEN
     if isinstance(exc, task_handoff.TaskHandoffHoldUndecidable):
         return REASON_HANDOFF_HOLD_UNDECIDABLE
     if isinstance(exc, task_handoff.TaskHandoffHeld):
@@ -417,7 +443,7 @@ def _admission_refusal_reason(exc: BaseException) -> str:
 def provider_byte_admission(
     resolved: ResolvedControlIdentity,
     terminal_id: str,
-    generation: str,
+    generation: Optional[str],
     *,
     control_id: Optional[str] = None,
 ):
@@ -427,8 +453,16 @@ def provider_byte_admission(
     token issuer holds the terminal lock before it reaches that lock.  Read
     the immutable reservation binding, then let the shared helper acquire
     successor -> revalidate exact binding -> generation lock around the pane
-    effect.  Legacy/unmanaged writers retain their existing generation-only
-    fence behavior.
+    effect.  A legacy *managed* writer -- one with a generation but no v2
+    reservation -- retains its generation-only fence.
+
+    ``generation`` is optional because an unmanaged writer has none: it holds
+    no managed reservation, so there is no reservation to fence against, and
+    the branch below reads the argument only after ``resolved.managed`` has
+    decided the row is managed.  An unmanaged write is fenced instead by the
+    handback hold above, the pane input lease, and the in-lease pane identity
+    re-proof.  A managed row that resolves no generation cannot name its fence
+    and is refused rather than admitted unfenced.
 
     This is also where an M3-E handback suspends a stable agent's task
     authority.  The hold is checked *before* every branch below, including the
@@ -465,6 +499,16 @@ def provider_byte_admission(
     if not resolved.managed:
         yield
         return
+    # Every managed branch below fences on this exact value, so a managed row
+    # that resolves none has no fence to be admitted under.  Both callers
+    # answer this from the resolution before they claim anything; the check is
+    # repeated here because this is the choke point every managed byte passes,
+    # and because ``assert`` is stripped under ``python -O``.
+    if generation is None:
+        raise generation_fence.GenerationUnselectable(
+            f"managed terminal {terminal_id} resolves no generation, so the byte "
+            "admission fence cannot be selected"
+        )
     # A legacy managed projection can lack a v2 reservation; it has no
     # successor registry identity to revalidate and retains W13's
     # generation-only path. A real v2 reservation must never take this
@@ -1918,6 +1962,25 @@ def deliver_control_input(
     if unproven is not None:
         return _refuse(unproven[0], unproven[1], resolved=resolved)
 
+    # Asked here -- before the journal, before the lease, before any byte --
+    # because it is answerable from the resolution alone.  A precondition that
+    # needs nothing the claim produces has no reason to run after it: raising
+    # past ``open_intent`` would leave a non-terminal record no verb resolves,
+    # since the sweep only reclaims rows whose owning process is gone and this
+    # server is alive.
+    #
+    # Sitting before the claim also puts it before the at-most-once replay,
+    # which is safe only because its answer cannot change once a control has
+    # been delivered: a managed row always names a generation -- the
+    # reservation column is NOT NULL and the resolution takes the generation
+    # from the reservation -- so this can never tell a caller "nothing was
+    # typed" about a control the journal records as delivered.  That invariant
+    # is pinned by ``TestAManagedRowAlwaysNamesItsGeneration``; a schema that
+    # broke it would have to move this check after the replay return.
+    unselectable = _generation_unselectable(resolved)
+    if unselectable is not None:
+        return _refuse(REASON_LINEAGE_UNPROVEN, unselectable, resolved=resolved)
+
     # A chord is licensed per provider against the proven composer build,
     # decided here -- before the journal, before the lease, before any byte --
     # so an unproven chord is the zero-byte refusal it is.  See §3: any other
@@ -2009,7 +2072,6 @@ def deliver_control_input(
         # every literal chunk, and submit/chord without a check-then-write gap.
         from cli_agent_orchestrator.services import cohort_journal, generation_fence, task_handoff
 
-        assert binding.generation is not None
         with (
             cohort_journal.session_effect_admission(resolved.session_name),
             # The one exemption an M3-E hold has: the derived control id a
@@ -4766,6 +4828,12 @@ def deliver_native_inbox_payload(
     )
     if server_refusal is not None:
         return NativePayloadResult(REFUSED, server_refusal[0], server_refusal[1])
+    unselectable = _generation_unselectable(resolved)
+    if unselectable is not None:
+        # Typed here rather than left to the admission below, so the caller
+        # resets its batch to PENDING on the proven zero bytes instead of
+        # terminalising every message in it on an escaped exception.
+        return NativePayloadResult(REFUSED, REASON_LINEAGE_UNPROVEN, unselectable)
 
     # A data carrier for the re-proof and transport below — no journal
     # record is opened: the inbox row's claim is the at-most-once anchor.
@@ -4784,7 +4852,6 @@ def deliver_native_inbox_payload(
     try:
         from cli_agent_orchestrator.services import cohort_journal, generation_fence, task_handoff
 
-        assert binding.generation is not None
         with (
             cohort_journal.session_effect_admission(resolved.session_name),
             # No exemption: an inbox payload is ordinary task input, and the

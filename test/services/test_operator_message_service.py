@@ -398,6 +398,55 @@ class TestIdentityAndCapabilityGates:
         assert result.outcome == "refused"
         assert result.reason_code == "provider-unsupported"
 
+    @pytest.mark.parametrize("managed", [False, True])
+    def test_a_row_without_a_generation_is_refused_not_asserted(self, wire, managed):
+        """cond-0413 on the operator lane, which the control lane cannot reach.
+
+        This lane proves the composer is idle by reading the turn state of
+        the deterministic managed window, and that window's name is derived
+        from the generation.  Neither an unmanaged legacy row nor a managed
+        row that resolves none can have it named, so both leave with a typed
+        zero-byte refusal naming what was observed.  A bare ``assert`` here
+        exits as an untyped 500 that tells an operator nothing about whether
+        the message was typed.
+
+        The unmanaged case is the live one: ``7b1a724b`` is an unmanaged
+        ``claude_code`` row whose generation is NULL.
+        """
+        adapter = _FakeAdapter(record=_record(_op_id()))
+        wire(
+            _resolved(managed=managed, terminal_generation=None),
+            adapter,
+            {"deliverable": True},
+        )
+        expected = {**EXPECTED, "terminal_generation": None}
+
+        result = _submit(operation_id=_op_id(), expected_identity=expected)
+
+        assert result.outcome == "refused"
+        assert result.reason_code == "lineage-unproven"
+        assert "records no generation" in result.detail
+        assert "nothing was typed" in result.detail
+        # The zero-byte proof this lane records: the adapter owns the durable
+        # claim and every keystroke, so an untouched adapter is the durable
+        # statement that no byte was typed and no operation was opened.
+        assert adapter.calls == []
+
+    def test_the_admission_backstops_a_managed_row_that_reaches_it(self):
+        """The choke point the readiness gate above sits in front of.
+
+        The gate answers first, so this can only fire if a later change
+        moves or narrows it -- which is exactly when an unfenced managed
+        byte would otherwise be admitted.  ``FencedError`` is its base, so
+        this lane's existing handler settles it without a new except arm.
+        """
+        resolved = _resolved(managed=True, terminal_generation=None)
+        with pytest.raises(gf.GenerationUnselectable) as raised:
+            with cis.provider_byte_admission(resolved, TERMINAL, None):
+                pytest.fail("a managed row with no generation was admitted")
+        assert isinstance(raised.value, gf.FencedError)
+        assert cis._admission_refusal_reason(raised.value) == "lineage-unproven"
+
 
 class TestAttachmentBindingAndSubstitution:
     def _bound(self, monkeypatch, records):
