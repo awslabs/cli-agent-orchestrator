@@ -241,7 +241,9 @@ function AttachmentRow({ doc }: { doc: CatalogDocumentEntry }) {
             />
           ) : (
             <p data-testid="attachment-tombstone" role="status" className="text-[11px] text-amber-200">
-              {contentReasonText(state.reason ?? 'content-missing')}
+              {state.reason
+                ? contentReasonText(state.reason)
+                : 'Content unavailable — the response carried no content and no reason.'}
             </p>
           )}
         </div>
@@ -771,7 +773,9 @@ function DetailView({ response }: { response: CommunicationDetailResponse }) {
           role="status"
           className="rounded border border-amber-700/50 bg-amber-900/20 px-3 py-2 text-[11px] text-amber-200"
         >
-          {contentReasonText(response.reason ?? 'content-missing')}
+          {response.reason
+            ? contentReasonText(response.reason)
+            : 'Content unavailable — the response carried no content and no reason.'}
         </p>
       )}
 
