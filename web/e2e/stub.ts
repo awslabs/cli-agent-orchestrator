@@ -67,6 +67,28 @@ export function emptyAnnotations(): AnnotationsResponse {
   };
 }
 
+/** The catalog design §7 list envelope, as the fork API serves it. */
+export interface StubCommunicationsList {
+  schema: string;
+  coverage: string;
+  reasons: Array<{ source: string; reason: string }>;
+  communications: unknown[];
+  next_cursor: string | null;
+  total: number;
+}
+
+/** The "no conductor catalog installed" list answer (design §10, row one). */
+export function noCatalog(): StubCommunicationsList {
+  return {
+    schema: "cao-communications-index-v1",
+    coverage: "unavailable",
+    reasons: [{ source: "conductor-state-root", reason: "missing" }],
+    communications: [],
+    next_cursor: null,
+    total: 0,
+  };
+}
+
 export interface StubMacro {
   id: string;
   name: string;
@@ -211,6 +233,19 @@ export async function stubBackend(page: Page, options?: {
   /** The §9.5 annotation payload. Omit for the no-annotations control. */
   annotations?: AnnotationsResponse;
   /**
+   * The communications catalog (design §7/§8). Omit for the no-catalog
+   * control: the list route answers "unavailable + root missing", unknown
+   * detail ids 404, and the dashboard must render exactly as it does today.
+   */
+  communications?: {
+    /** Body for GET /communications?task_occurrence_id=... (any task). */
+    list?: StubCommunicationsList;
+    /** Per-id bodies for GET /communications/{id}. Unknown ids 404. */
+    details?: Record<string, unknown>;
+    /** Per-id bodies for GET /communications/attachments/{id}. */
+    attachments?: Record<string, unknown>;
+  };
+  /**
    * The fleet, when a spec needs more than one row.
    *
    * ADDITIVE, AND DEFAULTED TO THE SHARED ARRAY ON PURPOSE. Five other specs
@@ -299,6 +334,24 @@ export async function stubBackend(page: Page, options?: {
       // never an error. The default is exactly that, so every pre-existing spec
       // runs against the no-annotations control.
       return json(route, options?.annotations ?? emptyAnnotations());
+    }
+    // The communications catalog (design §7). Same control posture as
+    // /annotations: with no `communications` option the list answers
+    // "unavailable + root missing", i.e. no catalog is installed.
+    if (path === "/communications" && method === "GET") {
+      return json(route, options?.communications?.list ?? noCatalog());
+    }
+    const commAttachmentMatch = /^\/communications\/attachments\/([^/]+)$/.exec(path);
+    if (commAttachmentMatch && method === "GET") {
+      const body = options?.communications?.attachments?.[decodeURIComponent(commAttachmentMatch[1])];
+      if (body) return json(route, body);
+      return json(route, { detail: "communications-catalog-not-found" }, 404);
+    }
+    const commDetailMatch = /^\/communications\/([^/]+)$/.exec(path);
+    if (commDetailMatch && method === "GET") {
+      const body = options?.communications?.details?.[decodeURIComponent(commDetailMatch[1])];
+      if (body) return json(route, body);
+      return json(route, { detail: "communications-catalog-not-found" }, 404);
     }
     // The same projected row the listing serves, found BY ID. It used to
     // answer `status: "running"`, which is not a value `project_row` can

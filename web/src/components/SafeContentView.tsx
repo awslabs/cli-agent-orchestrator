@@ -51,7 +51,7 @@ function SafeAnchor({ node: _node, href, children }: ExtraProps & { href?: strin
       <span
         data-blocked-link="true"
         title="Link not shown: only absolute http(s) links are rendered"
-        className="text-gray-500 underline decoration-dotted cursor-text"
+        className="text-gray-400 underline decoration-dotted cursor-text"
       >
         {children}
       </span>
@@ -90,9 +90,28 @@ function el<Tag extends keyof React.JSX.IntrinsicElements>(tag: Tag, className: 
   }
 }
 
+/**
+ * The GFM task-list checkbox: always disabled and handler-free (inert), with
+ * an explicit accessible name — axe flags an unlabeled input as critical, and
+ * "checkbox, checked" without a name says nothing about what it means.
+ */
+function MdCheckbox({ node: _node, checked }: ExtraProps & { checked?: boolean }) {
+  return (
+    <input
+      type="checkbox"
+      checked={!!checked}
+      disabled
+      readOnly
+      aria-label={checked ? 'completed task' : 'open task'}
+      className="accent-emerald-600"
+    />
+  )
+}
+
 const MD_COMPONENTS: Components = {
   a: SafeAnchor,
   img: MdImage,
+  input: MdCheckbox,
   h1: el('h1', 'text-base font-bold text-white mt-3 mb-1.5'),
   h2: el('h2', 'text-sm font-bold text-white mt-3 mb-1.5'),
   h3: el('h3', 'text-sm font-semibold text-gray-100 mt-2.5 mb-1'),
@@ -113,9 +132,6 @@ const MD_COMPONENTS: Components = {
   th: el('th', 'text-left font-semibold text-gray-200 px-2 py-1'),
   td: el('td', 'px-2 py-1 align-top'),
 }
-
-// `input` (GFM task-list checkbox) stays disabled and inert; react-markdown
-// renders it without handlers, which is exactly the required posture.
 
 /** GFM Markdown, rendered inert. Budgets are the caller's job (SafeContentView). */
 export function SafeMarkdown({ content }: { content: string }) {

@@ -172,10 +172,10 @@ function AttachmentRow({ doc }: { doc: CatalogDocumentEntry }) {
           className="inline-flex items-center gap-1 min-w-0 text-left text-[11px] text-gray-200 hover:text-white"
         >
           {state.status === 'open' ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-          <FileText size={12} className="shrink-0 text-gray-500" />
+          <FileText size={12} className="shrink-0 text-gray-400" />
           <span className="truncate font-medium">{doc.display_name || doc.attachment_id}</span>
         </button>
-        <span className="text-[10px] text-gray-500">
+        <span className="text-[10px] text-gray-400">
           {doc.role} · {doc.media_type || 'unknown type'} · {formatBytes(doc.byte_size)} · {redaction}
         </span>
         {doc.content_state && doc.content_state !== 'present' && (
@@ -207,7 +207,7 @@ function AttachmentRow({ doc }: { doc: CatalogDocumentEntry }) {
           </button>
         </span>
       </div>
-      <div className="px-2 pb-1.5 text-[10px] text-gray-600 font-mono truncate" title={doc.sha256}>
+      <div className="px-2 pb-1.5 text-[10px] text-gray-400 font-mono truncate" title={doc.sha256}>
         sha256 {doc.sha256}
       </div>
       {state.status === 'loading' && (
@@ -294,7 +294,7 @@ function ProvenanceDetails({ item }: { item: CommunicationListItem }) {
       <dl className="px-2 pb-2 pt-1 border-t border-gray-800 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
         {entries.map(([key, value]) => (
           <div key={key} className="contents">
-            <dt className="text-[10px] text-gray-500">{key}</dt>
+            <dt className="text-[10px] text-gray-400">{key}</dt>
             <dd className="text-[10px] text-gray-300 font-mono break-all">{String(value)}</dd>
           </div>
         ))}
@@ -309,7 +309,10 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
   const [list, setList] = useState<ListState>({ status: 'loading' })
   const [detail, setDetail] = useState<DetailState | null>(null)
   const [detailNonce, setDetailNonce] = useState(0)
-  const [mobileView, setMobileView] = useState<'list' | 'reader'>('list')
+  // A deep link carrying a selection opens directly in the mobile reader —
+  // the link names a record, and landing on the list instead would hide the
+  // thing it points at behind one more tap.
+  const [mobileView, setMobileView] = useState<'list' | 'reader'>(selectedId ? 'reader' : 'list')
   const [activeIndex, setActiveIndex] = useState(0)
   const [loadingMore, setLoadingMore] = useState(false)
   const [moreError, setMoreError] = useState('')
@@ -487,7 +490,7 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
             )}
             <h2 className="text-sm font-semibold text-white truncate">
               Communications
-              <span className="ml-2 text-[10px] font-mono font-normal text-gray-500" title={taskOccurrenceId}>
+              <span className="ml-2 text-[10px] font-mono font-normal text-gray-400" title={taskOccurrenceId}>
                 task {taskOccurrenceId.slice(0, 12)}
               </span>
             </h2>
@@ -497,7 +500,7 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
             aria-label="Close communications"
             onClick={onClose}
             data-testid="communications-close"
-            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-gray-500 hover:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
+            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-gray-400 hover:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
           >
             <X size={16} />
           </button>
@@ -605,7 +608,7 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
                             <span className="text-[11px] font-medium text-gray-100 truncate">
                               {item.title || kindLabel(item.kind)}
                             </span>
-                            {rel && <span className="text-[10px] text-gray-500 shrink-0 ml-auto">{rel}</span>}
+                            {rel && <span className="text-[10px] text-gray-400 shrink-0 ml-auto">{rel}</span>}
                           </span>
                           <span className="flex items-center gap-1.5 flex-wrap">
                             <span className="text-[10px] text-gray-400">{kindLabel(item.kind)}</span>
@@ -623,7 +626,7 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
                               </span>
                             )}
                             {item.delivery_state && (
-                              <span className="text-[10px] text-gray-500">{item.delivery_state}</span>
+                              <span className="text-[10px] text-gray-400">{item.delivery_state}</span>
                             )}
                           </span>
                         </button>
@@ -660,7 +663,7 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
             } lg:flex flex-1 min-w-0 flex-col min-h-0`}
           >
             {!effectiveId && list.status === 'ready' && availability === 'available' && (
-              <p role="status" className="p-4 text-xs text-gray-500">
+              <p role="status" className="p-4 text-xs text-gray-400">
                 Select a communication to read it.
               </p>
             )}
@@ -736,19 +739,19 @@ function DetailView({ response }: { response: CommunicationDetailResponse }) {
             </span>
           )}
         </div>
-        <p className="text-[10px] text-gray-500">
+        <p className="text-[10px] text-gray-400">
           {[kindLabel(item.kind), author, recorded, item.delivery_state, item.goal_version ? `goal v${item.goal_version}` : null]
             .filter(Boolean)
             .join(' · ')}
         </p>
         {scope && (
-          <p data-testid="scope-disclaimer" className="text-[10px] text-gray-600">
+          <p data-testid="scope-disclaimer" className="text-[10px] text-gray-400">
             Report scope is the author&apos;s claim about this document. It does not change or report the
             task&apos;s outcome.
           </p>
         )}
         {body && (
-          <p className="text-[10px] text-gray-600 font-mono">
+          <p className="text-[10px] text-gray-400 font-mono">
             {formatBytes(body.byte_size)} · sha256 {body.sha256.slice(0, 16)}…
           </p>
         )}
