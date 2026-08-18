@@ -94,6 +94,7 @@ class CommunicationsCatalogError(RuntimeError):
 
 class CommunicationsCatalogInvalid(CommunicationsCatalogError):
     code = "communications-catalog-invalid"
+    reason: Optional[str] = None
 
 
 class CommunicationsCatalogNotFound(CommunicationsCatalogError):
@@ -115,12 +116,17 @@ def catalog_root() -> str:
 
 
 def _require_identifier(value: Any, *, field: str) -> str:
+    def _invalid(message: str) -> CommunicationsCatalogInvalid:
+        exc = CommunicationsCatalogInvalid(message)
+        exc.reason = REASON_IDENTIFIER_INVALID
+        return exc
+
     if not isinstance(value, str) or not value:
-        raise CommunicationsCatalogInvalid(f"{field} must be a non-empty string")
+        raise _invalid(f"{field} must be a non-empty string")
     if len(value) > MAX_ID_LEN:
-        raise CommunicationsCatalogInvalid(f"{field} must be at most {MAX_ID_LEN} characters")
+        raise _invalid(f"{field} must be at most {MAX_ID_LEN} characters")
     if _ID_RE.fullmatch(value) is None:
-        raise CommunicationsCatalogInvalid(f"{field} is not a well-formed identifier")
+        raise _invalid(f"{field} is not a well-formed identifier")
     return value
 
 
@@ -550,7 +556,7 @@ def list_communications(task_occurrence_id: str, cursor: Optional[str] = None) -
         all_items = [
             item
             for item in all_items
-            if item[0] < cursor_at or (item[0] == cursor_at and item[1] < cursor_id)
+            if item[0] < cursor_at or (item[0] == cursor_at and item[1] > cursor_id)
         ]
 
     total = len(all_items)

@@ -54,15 +54,18 @@ _FORBIDDEN_QUERY_PARAMS = frozenset({"path", "root", "project_dir"})
 
 
 def _http(exc: CommunicationsCatalogError) -> HTTPException:
-    return HTTPException(
-        status_code=_STATUS_FOR_CODE.get(getattr(exc, "code", ""), status.HTTP_400_BAD_REQUEST),
-        detail=str(exc).splitlines()[0],
-    )
+    status_code = _STATUS_FOR_CODE.get(getattr(exc, "code", ""), status.HTTP_400_BAD_REQUEST)
+    message = str(exc).splitlines()[0]
+    if isinstance(exc, CommunicationsCatalogInvalid) and getattr(exc, "reason", None):
+        detail: Any = {"reason": exc.reason, "message": message}
+    else:
+        detail = message
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 async def _refuse_path_params(request: Request) -> None:
     for name in request.query_params:
-        if name in _FORBIDDEN_QUERY_PARAMS:
+        if name.lower() in _FORBIDDEN_QUERY_PARAMS:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"parameter '{name}' is not allowed",

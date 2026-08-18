@@ -163,17 +163,29 @@ class TestFixedLocation:
             monkeypatch.setenv(name, "/tmp/attacker-controlled")
         assert catalog.catalog_root() == os.path.expanduser("~/.local/state/cao-conductor")
 
-    def test_path_root_and_project_dir_parameters_are_refused(self, client, root):
+    @pytest.mark.parametrize("param_name", ["path", "root", "project_dir"])
+    def test_path_root_and_project_dir_parameters_are_refused(self, client, root, param_name):
         _publish(root, "project", [])
-        for param in ("path", "root", "project_dir"):
-            response = client.get(f"/communications?task_occurrence_id=t1&{param}=/etc/passwd")
-            assert response.status_code == 400
-            assert param in response.json()["detail"]
+        response = client.get(f"/communications?task_occurrence_id=t1&{param_name}=/etc/passwd")
+        assert response.status_code == 400
+        assert param_name in response.json()["detail"]
 
     def test_detail_route_also_refuses_filesystem_override_query_params(self, client, root):
         comm = _comm("c1", "t1", "2026-08-18T00:00:00Z")
         _publish(root, "project", [comm])
         response = client.get("/communications/c1?root=/etc")
+        assert response.status_code == 400
+
+    @pytest.mark.parametrize("param_name", ["Path", "PATH", "Root", "PROJECT_DIR"])
+    def test_forbidden_query_params_are_case_insensitive(self, client, root, param_name):
+        _publish(root, "project", [])
+        response = client.get(f"/communications?task_occurrence_id=t1&{param_name}=/etc/passwd")
+        assert response.status_code == 400
+        assert param_name.lower() in response.json()["detail"].lower()
+
+        comm = _comm("c1", "t1", "2026-08-18T00:00:00Z")
+        _publish(root, "project", [comm])
+        response = client.get(f"/communications/c1?{param_name}=/etc")
         assert response.status_code == 400
 
 
@@ -324,6 +336,61 @@ class TestCursorPaging:
         assert [c["communication_id"] for c in payload["communications"]] == ["old"]
         assert payload["next_cursor"] is None
 
+    def test_cursor_tie_break_uses_ascending_id(self, client, root):
+        ts = "2026-08-18T00:00:00.000000Z"
+        comms = [
+            _comm("c1", "t1", ts),
+            _comm("c2", "t1", ts),
+            _comm("c3", "t1", ts),
+            _comm("c4", "t1", "2026-08-17T00:00:00.000000Z"),
+        ]
+        _publish(root, "project", comms)
+
+        with patch.object(catalog, "PAGE_SIZE", 2):
+            response = client.get("/communications?task_occurrence_id=t1")
+        payload = response.json()
+        assert [c["communication_id"] for c in payload["communications"]] == ["c1", "c2"]
+        cursor = payload["next_cursor"]
+        assert cursor is not None
+
+        with patch.object(catalog, "PAGE_SIZE", 2):
+            response = client.get(f"/communications?task_occurrence_id=t1&cursor={cursor}")
+        payload = response.json()
+        assert [c["communication_id"] for c in payload["communications"]] == ["c3", "c4"]
+        assert payload["next_cursor"] is None
+
+    def test_cursor_survives_republication_with_ties(self, client, root):
+        ts = "2026-08-18T00:00:00.000000Z"
+        first = [
+            _comm("c1", "t1", ts),
+            _comm("c2", "t1", ts),
+            _comm("c3", "t1", ts),
+            _comm("old", "t1", "2026-08-17T00:00:00.000000Z"),
+        ]
+        _publish(root, "project", first)
+
+        with patch.object(catalog, "PAGE_SIZE", 2):
+            response = client.get("/communications?task_occurrence_id=t1")
+        cursor = response.json()["next_cursor"]
+        assert cursor is not None
+
+        # Republication prepends a newer row.  The keyset cursor anchored inside
+        # the tied group must still resume at the next item in total order.
+        second = [
+            _comm("newer", "t1", "2026-08-18T00:00:01.000000Z"),
+            _comm("c1", "t1", ts),
+            _comm("c2", "t1", ts),
+            _comm("c3", "t1", ts),
+            _comm("old", "t1", "2026-08-17T00:00:00.000000Z"),
+        ]
+        _publish(root, "project", second)
+
+        with patch.object(catalog, "PAGE_SIZE", 2):
+            response = client.get(f"/communications?task_occurrence_id=t1&cursor={cursor}")
+        payload = response.json()
+        assert [c["communication_id"] for c in payload["communications"]] == ["c3", "old"]
+        assert payload["next_cursor"] is None
+
 
 class TestDetailEndpoint:
     def test_happy_path_returns_content_and_no_store_header(self, client, root):
@@ -356,6 +423,7 @@ class TestDetailEndpoint:
 
         response = client.get("/communications/c1")
         assert response.status_code == 503
+        assert response.json()["detail"] == "content-digest-mismatch"
         assert "the-body" not in response.text
         assert "x" * 9 not in response.text
 
@@ -409,17 +477,25 @@ class TestAttachmentEndpoint:
         assert response.status_code == 200
         payload = response.json()
         assert payload["content"] is None
-        assert payload["reason"] in ("symlink-refused", "outside-root")
+        assert payload["reason"] == "symlink-refused"
         assert "secret" not in response.text
 
 
 class TestConfinementAndBounds:
-    def test_invalid_identifiers_return_400(self, client, root):
+    @pytest.mark.parametrize(
+        "url_template",
+        [
+            "/communications?task_occurrence_id={bad}",
+            "/communications/{bad}",
+            "/communications/attachments/{bad}",
+        ],
+    )
+    def test_invalid_identifiers_return_400_with_reason_code(self, client, root, url_template):
         _publish(root, "project", [_comm("c1", "t1", "2026-08-18T00:00:00Z")])
-        for bad in ("comm with space", "bad@id"):
-            encoded = bad.replace(" ", "%20")
-            response = client.get(f"/communications/{encoded}")
-            assert response.status_code == 400, bad
+        bad = "bad@id"
+        response = client.get(url_template.format(bad=bad))
+        assert response.status_code == 400
+        assert response.json()["detail"]["reason"] == "identifier-invalid"
 
     def test_reasons_never_echo_paths_or_content_excerpts(self, client, root):
         secret = b"SECRET-EXCERPT-THAT-MUST-NOT-LEAK"
@@ -427,7 +503,7 @@ class TestConfinementAndBounds:
         comm = _comm("c1", "t1", "2026-08-18T00:00:00Z", body=body)
         _publish(root, "project", [comm], blobs={body["blob_id"]: secret})
 
-        # Force an unreadable index so the reason path is exercised.
+        # Force a malformed index so the reason path is exercised.
         bad_dir = os.path.join(root, "bad")
         os.makedirs(bad_dir, exist_ok=True)
         with open(os.path.join(bad_dir, "communications.json"), "w", encoding="utf-8") as fh:
@@ -447,6 +523,110 @@ class TestConfinementAndBounds:
         payload = response.json()
         assert payload["coverage"] == "truncated"
         assert any(r["reason"] == "project-limit" for r in payload["reasons"])
+
+
+class TestReasonCodes:
+    """Each reachable reason code must be asserted, not just implied by a status."""
+
+    def test_missing_root_reports_reason(self, client, root):
+        missing_root = os.path.join(root, "does-not-exist")
+        with patch.object(catalog, "catalog_root", return_value=missing_root):
+            response = client.get("/communications?task_occurrence_id=t1")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["coverage"] == "unavailable"
+        assert any(
+            r["source"] == "conductor-state-root" and r["reason"] == "missing"
+            for r in payload["reasons"]
+        )
+
+    def test_unreadable_root_reports_reason(self, client, root):
+        root_file = os.path.join(root, "not-a-dir")
+        with open(root_file, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        with patch.object(catalog, "catalog_root", return_value=root_file):
+            response = client.get("/communications?task_occurrence_id=t1")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["coverage"] == "unavailable"
+        assert any(
+            r["source"] == "conductor-state-root" and r["reason"] == "unreadable"
+            for r in payload["reasons"]
+        )
+
+    def test_oversize_index_reports_reason(self, client, root):
+        directory = os.path.join(root, "big")
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "communications.json"), "wb") as fh:
+            fh.write(b"x" * (catalog.MAX_INDEX_BYTES + 1))
+        response = client.get("/communications?task_occurrence_id=t1")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["coverage"] == "partial"
+        assert any(r["reason"] == "oversize" for r in payload["reasons"])
+
+    def test_outside_root_index_reports_reason(self, client, root, tmp_path):
+        directory = os.path.join(root, "escapes")
+        os.makedirs(directory, exist_ok=True)
+        target = tmp_path / "external.json"
+        target.write_text("[]", encoding="utf-8")
+        os.symlink(str(target), os.path.join(directory, "communications.json"))
+
+        response = client.get("/communications?task_occurrence_id=t1")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["coverage"] == "partial"
+        assert any(r["reason"] == "outside-root" for r in payload["reasons"])
+
+    def test_content_missing_reports_reason(self, client, root):
+        body = _doc("att-1", b"the-body")
+        comm = _comm("c1", "t1", "2026-08-18T00:00:00Z", body=body)
+        _publish(root, "project", [comm])
+
+        response = client.get("/communications/c1")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["content"] is None
+        assert payload["reason"] == "content-missing"
+
+    def test_content_unreadable_reports_reason(self, client, root):
+        # Bytes that pass digest checks but are not valid UTF-8 hit the
+        # content-unreadable path in the detail response.
+        bad_utf8 = b"\xff\xfe"
+        body = _doc("att-1", bad_utf8)
+        comm = _comm("c1", "t1", "2026-08-18T00:00:00Z", body=body)
+        _publish(root, "project", [comm], blobs={body["blob_id"]: bad_utf8})
+
+        response = client.get("/communications/c1")
+        assert response.status_code == 503
+        assert response.json()["detail"] == "content-unreadable"
+
+    def test_oversize_content_reports_reason(self, client, root):
+        big = b"x" * (catalog.MAX_CONTENT_BYTES + 1)
+        body = _doc("att-1", big)
+        comm = _comm("c1", "t1", "2026-08-18T00:00:00Z", body=body)
+        _publish(root, "project", [comm], blobs={body["blob_id"]: big})
+
+        response = client.get("/communications/c1")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["content"] is None
+        assert payload["reason"] == "oversize"
+
+    def test_not_a_regular_file_content_reports_reason(self, client, root):
+        body = _doc("att-1", b"the-body")
+        comm = _comm("c1", "t1", "2026-08-18T00:00:00Z", body=body)
+        _publish(root, "project", [comm], blobs={body["blob_id"]: b"the-body"})
+
+        object_path = os.path.join(root, "project", "communications", "content", body["blob_id"])
+        os.remove(object_path)
+        os.makedirs(object_path, exist_ok=True)
+
+        response = client.get("/communications/c1")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["content"] is None
+        assert payload["reason"] == "not-a-regular-file"
 
 
 class TestReadScope:
