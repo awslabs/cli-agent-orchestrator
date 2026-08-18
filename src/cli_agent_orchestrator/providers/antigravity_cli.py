@@ -171,6 +171,8 @@ class AntigravityCliProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         model: Optional[str] = None,
         skill_prompt: Optional[str] = None,
+        native_session_id: Optional[str] = None,
+        effort: Optional[str] = None,
     ):
         """Initialize the Antigravity CLI provider.
 
@@ -182,15 +184,19 @@ class AntigravityCliProvider(BaseProvider):
             allowed_tools: Optional list of CAO tool names the agent may use.
                 When restricted (not wildcard), the security prompt is appended
                 to the injected system prompt for soft enforcement.
-            model: Optional model override (e.g. ``"Gemini 3.1 Pro (High)"``).
+            model: Optional model override (e.g. ``"gemini-3.7-flash"``).
                 The profile's ``model`` field takes precedence when set.
             skill_prompt: Optional skill catalog text built by the service
                 layer. Appended to the system prompt at launch.
+            native_session_id: Optional existing conversation ID to resume via ``--conversation``.
+            effort: Optional reasoning effort (e.g. ``"high"``, ``"medium"``, ``"low"``).
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
         self._model = model
+        self._effort = effort
+        self._native_session_id = native_session_id
         # MCP server names registered into ~/.gemini/config/mcp_config.json,
         # removed on cleanup().
         self._mcp_server_names: list[str] = []
@@ -247,13 +253,12 @@ class AntigravityCliProvider(BaseProvider):
 
         Structure::
 
-            agy --dangerously-skip-permissions [--model "<model>"] [-i "<system prompt>"]
+            agy --dangerously-skip-permissions [--conversation "<id>"] [--model "<model>"] [--effort "<effort>"] [-i "<system prompt>"]
 
         ``--dangerously-skip-permissions`` auto-approves tool calls (required
-        for unattended orchestration). ``--model`` selects the model. The agent
-        profile's system prompt (+ skill catalog + security prompt when tool-
-        restricted) is injected via ``-i`` with an explicit "acknowledge and
-        wait" guard so the agent adopts its role without exploring on launch.
+        for unattended orchestration). ``--conversation`` resumes an exact
+        existing session. System prompt injection via ``-i`` is used ONLY for new
+        un-resumed sessions.
 
         Returns a shell-escaped command string for ``send_keys``.
         """
@@ -265,6 +270,15 @@ class AntigravityCliProvider(BaseProvider):
             )
 
         command_parts = ["agy", "--dangerously-skip-permissions"]
+
+        log_file = (
+            Path.home() / ".gemini" / "antigravity-cli" / "log" / f"terminal_{self.terminal_id}.log"
+        )
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        command_parts.extend(["--log-file", str(log_file)])
+
+        if self._native_session_id:
+            command_parts.extend(["--conversation", self._native_session_id])
 
         profile = None
         if self._agent_profile is not None:
@@ -279,27 +293,32 @@ class AntigravityCliProvider(BaseProvider):
             model = profile.model
         if model:
             command_parts.extend(["--model", model])
+        if self._effort:
+            command_parts.extend(["--effort", self._effort])
 
-        # System prompt injection via -i.
+        # System prompt injection via -i (only when NOT resuming an existing conversation).
         if profile is not None:
-            system_prompt = profile.system_prompt or ""
-            system_prompt = self._apply_skill_prompt(system_prompt)
-            # Soft tool restriction: when the profile is not allowed every tool
-            # (e.g. the read-only reviewer), append the security prompt. agy
-            # honors a clear instruction not to use disallowed tools.
-            if self._allowed_tools and "*" not in self._allowed_tools:
-                system_prompt = (
-                    f"{system_prompt}\n\n{SECURITY_PROMPT}" if system_prompt else SECURITY_PROMPT
-                )
-            if system_prompt:
-                role_name = profile.name or "agent"
-                guarded = (
-                    f"{system_prompt}\n\n---\n"
-                    f"You are the {role_name}. Acknowledge your role in one sentence, "
-                    f"then wait for tasks. Do not take any action or use any tools "
-                    f"until you receive a specific task."
-                )
-                command_parts.extend(["-i", guarded])
+            if not self._native_session_id:
+                system_prompt = profile.system_prompt or ""
+                system_prompt = self._apply_skill_prompt(system_prompt)
+                # Soft tool restriction: when the profile is not allowed every tool
+                # (e.g. the read-only reviewer), append the security prompt. agy
+                # honors a clear instruction not to use disallowed tools.
+                if self._allowed_tools and "*" not in self._allowed_tools:
+                    system_prompt = (
+                        f"{system_prompt}\n\n{SECURITY_PROMPT}"
+                        if system_prompt
+                        else SECURITY_PROMPT
+                    )
+                if system_prompt:
+                    role_name = profile.name or "agent"
+                    guarded = (
+                        f"{system_prompt}\n\n---\n"
+                        f"You are the {role_name}. Acknowledge your role in one sentence, "
+                        f"then wait for tasks. Do not take any action or use any tools "
+                        f"until you receive a specific task."
+                    )
+                    command_parts.extend(["-i", guarded])
 
             # MCP servers (cao-mcp-server etc.) → agy's shared mcp_config.json.
             if profile.mcpServers:
@@ -498,6 +517,12 @@ class AntigravityCliProvider(BaseProvider):
 
         command = self._build_agy_command()
 
+        log_file = (
+            Path.home() / ".gemini" / "antigravity-cli" / "log" / f"terminal_{self.terminal_id}.log"
+        )
+        log_offset = log_file.stat().st_size if log_file.exists() else 0
+        launch_start = time.time()
+
         # Arm the StatusMonitor stickiness gate so the launch drives a fresh
         # PROCESSING transition past any stale ready latch. Imported lazily to
         # avoid a circular import (status_monitor imports provider_manager).
@@ -531,8 +556,83 @@ class AntigravityCliProvider(BaseProvider):
                 f"Antigravity CLI initialization timed out after {ready_timeout} seconds"
             )
 
+        # Verify that the running process owns self._native_session_id.
+        self._verify_running_conversation_id(log_offset=log_offset, launch_start=launch_start)
+
         self._initialized = True
         return True
+
+    def _verify_running_conversation_id(
+        self, log_offset: int = 0, launch_start: float = 0.0
+    ) -> None:
+        """Verify that the running agy process actually owns self._native_session_id.
+
+        Only log entries written AFTER log_offset and presence lock files updated
+        AFTER launch_start are accepted, ensuring stale global logs or prior runs cannot false-pass.
+
+        Raises ProviderError if the requested ID was ignored, missing, or mismatched.
+        """
+        if not self._native_session_id:
+            return
+
+        req_id = self._native_session_id
+        log_file = (
+            Path.home() / ".gemini" / "antigravity-cli" / "log" / f"terminal_{self.terminal_id}.log"
+        )
+        found_requested = False
+
+        if log_file.exists():
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    f.seek(log_offset)
+                    new_content = f.read()
+
+                if (
+                    f"Conversation {req_id} not found" in new_content
+                    or "ignoring --conversation flag" in new_content
+                ):
+                    raise ProviderError(
+                        f"Antigravity CLI ignored requested conversation {req_id!r} (conversation not found on disk)"
+                    )
+                if (
+                    f"found conversation {req_id}" in new_content
+                    or f"Conversation {req_id}" in new_content
+                ):
+                    found_requested = True
+
+                matches = re.findall(r"(?:found|Created) conversation ([0-9a-fA-F-]+)", new_content)
+                if matches:
+                    observed_id = matches[-1]
+                    if observed_id != req_id:
+                        raise ProviderError(
+                            f"Antigravity CLI native session mismatch: requested {req_id!r}, "
+                            f"but observed running conversation {observed_id!r}"
+                        )
+            except ProviderError:
+                raise
+            except Exception:
+                pass
+
+        if not found_requested:
+            lock_file = Path.home() / ".gemini" / "antigravity-cli" / "presence" / f"{req_id}.lock"
+            if lock_file.exists() and lock_file.stat().st_mtime >= (launch_start - 2.0):
+                found_requested = True
+
+        output = get_backend().get_history(self.session_name, self.window_name)
+        if output:
+            clean = strip_terminal_escapes(output)
+            if (
+                f'conversation "{req_id}" not found' in clean
+                or f'Conversation "{req_id}" not found' in clean
+            ):
+                raise ProviderError(
+                    f"Antigravity CLI ignored requested conversation {req_id!r} (warning displayed on terminal)"
+                )
+
+        if not found_requested:
+            raise ProviderError(
+                f"Antigravity CLI failed to verify native session {req_id!r} on startup"
+            )
 
     # ------------------------------------------------------------------ #
     # Status detection

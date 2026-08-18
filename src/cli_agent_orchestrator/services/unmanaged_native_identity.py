@@ -46,8 +46,10 @@ pending the product decision.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
+import subprocess
 from typing import Any, Mapping, Optional
 
 from cli_agent_orchestrator.providers.codex import (
@@ -70,7 +72,7 @@ from cli_agent_orchestrator.services.provider_contracts import (
 #: The provider wire names whose ordinary/new-terminal launches consume a
 #: pre-task bound identity contract.  Kimi is deliberately absent: its
 #: zero-turn ACP bootstrap cannot bind a CAO profile (verified blocker).
-UNMANAGED_PRE_TASK_PROVIDERS = frozenset({"claude_code", "codex"})
+UNMANAGED_PRE_TASK_PROVIDERS = frozenset({"claude_code", "codex", "antigravity_cli"})
 
 # A bounded launch/readiness marker, not a lock or claim: it distinguishes an
 # activated launch that is currently between terminal-row creation and
@@ -94,15 +96,32 @@ __all__ = [
 ]
 
 #: Executable name per provider wire key, for resolution via ``PATH``.
+#:
+#: The value is the name handed to ``shutil.which``, NOT a policy key.  For
+#: claude and codex the provider vocabulary and the executable happen to be the
+#: same string, which is why the constants read naturally here.  Antigravity is
+#: the one provider where they diverge: its policy keys are ``antigravity`` /
+#: ``antigravity_cli`` while the binary on PATH is ``agy``, so the literal is
+#: correct and substituting a PROVIDER_* constant would make every agy launch
+#: fail to resolve.
 _PROVIDER_EXECUTABLE = {
     "claude_code": provider_contracts.PROVIDER_CLAUDE,
     "codex": provider_contracts.PROVIDER_CODEX,
+    "antigravity_cli": "agy",
 }
+
+#: How long the Antigravity mint may take.  ``_MINT_PRINT_TIMEOUT`` is handed to
+#: the provider so IT owns the deadline and reports a structured failure;
+#: ``_MINT_SUBPROCESS_TIMEOUT_SECONDS`` is the outer backstop and is deliberately
+#: LARGER, so the provider's own bounded failure is what CAO normally observes.
+_MINT_PRINT_TIMEOUT = "240s"
+_MINT_SUBPROCESS_TIMEOUT_SECONDS = 300
 
 #: Acquisition method per provider, matching the managed-v2 issuance sources.
 _ACQUISITION_BY_PROVIDER = {
     "claude_code": native_attachment.ACQUISITION_CHOSEN_SESSION_ID,
     "codex": native_attachment.ACQUISITION_ZERO_TURN_BOOTSTRAP,
+    "antigravity_cli": native_attachment.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN,
 }
 
 
@@ -349,16 +368,183 @@ def _effective_codex_route(
     return CodexRoute(model=model, effort=effort)
 
 
+def _mint_antigravity_session(
+    *,
+    terminal_id: str,
+    session_name: str,
+    working_directory: str,
+    expected_model: Optional[str],
+    expected_effort: Optional[str],
+    agent_profile: Optional[str],
+    environment: Optional[Mapping[str, str]] = None,
+) -> dict[str, Any]:
+    import json
+
+    from cli_agent_orchestrator.providers.antigravity_cli import SECURITY_PROMPT
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+    from cli_agent_orchestrator.utils.skills import build_skill_catalog
+
+    executable = _resolve_executable("antigravity_cli")
+    digest = _binary_sha256(executable)
+    env = _bootstrap_environment(
+        terminal_id=terminal_id,
+        session_name=session_name,
+        forwarded_environment=environment,
+    )
+    version_output = _version_output("antigravity_cli", executable, env)
+
+    # Delegate to the canonical version seam rather than hand-rolling the mode
+    # check here.  The hand-rolled form named a function that no longer exists
+    # (``is_proven_version`` was renamed ``is_listed_version``), so the strict
+    # branch raised AttributeError instead of a typed refusal; and because it
+    # only inspected the banner under strict enforcement, an UNPARSEABLE banner
+    # was silently discarded in the default open mode.  ``check_pinned_version``
+    # gets both right: open admits any parseable build (antigravity is unpinned,
+    # so every installed build launches), strict quarantines, and an unparseable
+    # banner fails closed in BOTH modes -- a failed observation is distinct from
+    # a version nobody wrote down.
+    try:
+        # The version tables are keyed by the SHORT provider vocabulary
+        # (``antigravity``), not the wire key (``antigravity_cli``); passing the
+        # wire key here returns "unknown provider" and refuses every build.
+        # Every other caller in the tree normalises the same way before calling.
+        provider_contracts.check_pinned_version(
+            provider_contracts.PROVIDER_ANTIGRAVITY, version_output
+        )
+    except provider_contracts.ProviderContractError as exc:
+        raise UnmanagedIdentityUnavailable(
+            f"executable {executable} refused the provider-version contract: {exc}"
+        ) from exc
+
+    profile = None
+    if agent_profile:
+        try:
+            profile = load_agent_profile(agent_profile)
+        except Exception as exc:
+            raise UnmanagedIdentityUnavailable(
+                f"failed to load agent profile {agent_profile!r} for antigravity_cli: {exc}"
+            ) from exc
+
+    model = expected_model or (getattr(profile, "model", None) or "")
+    effort = expected_effort or ""
+
+    system_prompt = (getattr(profile, "system_prompt", None) or "") if profile else ""
+    if system_prompt:
+        skill_catalog = build_skill_catalog(getattr(profile, "skills", None))
+        if skill_catalog:
+            system_prompt = f"{system_prompt}\n\n{skill_catalog}"
+        allowed_tools = getattr(profile, "allowedTools", None) or []
+        if allowed_tools and "*" not in allowed_tools:
+            system_prompt = (
+                f"{system_prompt}\n\n{SECURITY_PROMPT}" if system_prompt else SECURITY_PROMPT
+            )
+
+    role_name = (getattr(profile, "name", None) or "agent") if profile else "agent"
+    guarded_prompt = (
+        (
+            f"{system_prompt}\n\n---\n"
+            f"You are the {role_name}. Acknowledge your role in one sentence, "
+            f"then wait for tasks. Do not take any action or use any tools "
+            f"until you receive a specific task."
+        )
+        if system_prompt
+        else "Acknowledge initialization in one sentence and wait."
+    )
+
+    # The mint is a REAL billed model turn carrying the whole system prompt and
+    # skill catalog, so it is not a sub-minute operation.  Two bounds, ordered
+    # deliberately: the provider's OWN ``--print-timeout`` fires first and exits
+    # with its structured JSON error, and the subprocess bound sits above it
+    # purely as a backstop for a process that ignores its own deadline.  The
+    # inverse ordering is what makes a timeout dangerous here -- killing agy
+    # mid-turn abandons a conversation that already exists server-side while CAO
+    # records no id for it, so the session is orphaned and unresumable.  The
+    # vendor's default is 5m; the backstop must therefore exceed that, not
+    # undercut it, as the previous 30s bound did.
+    cmd = [
+        executable,
+        "-p",
+        guarded_prompt,
+        "--output-format",
+        "json",
+        "--print-timeout",
+        _MINT_PRINT_TIMEOUT,
+        "--dangerously-skip-permissions",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["--effort", effort])
+
+    try:
+        res = subprocess.run(
+            cmd,
+            cwd=working_directory,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_MINT_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        raise UnmanagedIdentityUnavailable(
+            f"antigravity_cli pre-task bootstrap failed to execute: {exc}"
+        ) from exc
+
+    if res.returncode != 0:
+        raise UnmanagedIdentityUnavailable(
+            f"antigravity_cli pre-task bootstrap failed with exit code {res.returncode}: {res.stderr.strip() or res.stdout.strip()}"
+        )
+
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise UnmanagedIdentityUnavailable(
+            f"antigravity_cli pre-task bootstrap returned invalid JSON: {res.stdout.strip()}"
+        ) from exc
+
+    cid = data.get("conversation_id")
+    if not isinstance(cid, str) or not cid:
+        raise UnmanagedIdentityUnavailable(
+            "antigravity_cli pre-task bootstrap returned no conversation_id"
+        )
+
+    return {
+        "native_session_id": cid,
+        "acquisition_method": _ACQUISITION_BY_PROVIDER["antigravity_cli"],
+        "working_directory": working_directory,
+        "model": model,
+        "effort": effort,
+        "executable_path": executable,
+        "executable_hash": digest,
+        "executable_version": version_output,
+        "agent_profile": agent_profile,
+        "role": getattr(profile, "role", None) if profile else None,
+        "bootstrap": {
+            "provider": "antigravity_cli",
+            "conversation_id": cid,
+            "id_source": provider_contracts.native_id_source(
+                provider_contracts.PROVIDER_ANTIGRAVITY_CLI
+            ),
+            "working_directory": working_directory,
+            "executable": executable,
+            "executable_hash": digest,
+            "executable_version": version_output,
+            "duration_seconds": data.get("duration_seconds", 0),
+        },
+    }
+
+
 def resolve_pre_task_identity(
     *,
     provider: str,
     working_directory: Optional[str],
     expected_model: Optional[str],
     expected_effort: Optional[str],
-    codex_profile_material: Optional[Mapping[str, Any]],
-    forwarded_environment: Optional[Mapping[str, str]],
     terminal_id: str,
     session_name: str,
+    agent_profile: Optional[str] = None,
+    codex_profile_material: Optional[Mapping[str, Any]] = None,
+    forwarded_environment: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
     """Resolve the deterministic harness-native session id for an unmanaged
     new launch, BEFORE the provider starts.
@@ -408,6 +594,17 @@ def resolve_pre_task_identity(
                 "working_directory": canonical_cwd,
             },
         }
+
+    if provider == "antigravity_cli":
+        return _mint_antigravity_session(
+            terminal_id=terminal_id,
+            session_name=session_name,
+            working_directory=canonical_cwd,
+            expected_model=expected_model,
+            expected_effort=expected_effort,
+            agent_profile=agent_profile,
+            environment=forwarded_environment,
+        )
 
     # Codex: the zero-turn app-server bootstrap materializes a resumable
     # rollout for the exact profile route; the TUI then resumes that id.

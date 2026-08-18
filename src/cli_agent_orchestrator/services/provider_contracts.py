@@ -40,7 +40,8 @@ PROVIDER_CODEX = "codex"
 PROVIDER_KIMI = "kimi"
 PROVIDER_CLAUDE = "claude"
 PROVIDER_MUSE = "muse"
-PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE, PROVIDER_MUSE)
+PROVIDER_ANTIGRAVITY = "antigravity"
+PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE, PROVIDER_MUSE, PROVIDER_ANTIGRAVITY)
 
 #: The *canonical wire keys*, which are a different namespace from the
 #: three above. Those name the executable and key the version-pin tables;
@@ -53,6 +54,7 @@ PROVIDER_CODEX_WIRE = "codex"
 PROVIDER_KIMI_CLI = "kimi_cli"
 PROVIDER_CLAUDE_CODE = "claude_code"
 PROVIDER_MUSE_CLI = "muse_cli"
+PROVIDER_ANTIGRAVITY_CLI = "antigravity_cli"
 
 #: Version-enforcement modes for the provider-version policy.
 #:
@@ -81,6 +83,7 @@ VERSION_ENFORCEMENT_MODE: dict[str, str] = {
     PROVIDER_KIMI: VERSION_ENFORCEMENT_OPEN,
     PROVIDER_CLAUDE: VERSION_ENFORCEMENT_OPEN,
     PROVIDER_MUSE: VERSION_ENFORCEMENT_OPEN,
+    PROVIDER_ANTIGRAVITY: VERSION_ENFORCEMENT_OPEN,
 }
 
 # Runtime configuration is documented in the short provider vocabulary
@@ -96,6 +99,8 @@ _VERSION_ENV_SUFFIX: dict[str, str] = {
     PROVIDER_CLAUDE_CODE: "CLAUDE",
     PROVIDER_MUSE: "MUSE",
     PROVIDER_MUSE_CLI: "MUSE",
+    PROVIDER_ANTIGRAVITY: "ANTIGRAVITY",
+    PROVIDER_ANTIGRAVITY_CLI: "ANTIGRAVITY",
 }
 
 # The launch layer uses wire identifiers, while the default policy table is
@@ -106,6 +111,7 @@ _VERSION_POLICY_KEY: dict[str, str] = {
     PROVIDER_KIMI_CLI: PROVIDER_KIMI,
     PROVIDER_CLAUDE_CODE: PROVIDER_CLAUDE,
     PROVIDER_MUSE_CLI: PROVIDER_MUSE,
+    PROVIDER_ANTIGRAVITY_CLI: PROVIDER_ANTIGRAVITY,
 }
 
 #: The pre-task identity launch markers shared by every admission surface.
@@ -226,12 +232,31 @@ SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
     PROVIDER_KIMI: ("0.34.0", "0.33.0", "0.32.0", "0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0"),
     PROVIDER_CLAUDE: ("2.1.233", "2.1.220"),
     PROVIDER_MUSE: ("0.1.0",),
+    # Antigravity is deliberately UNPINNED: no reference build in
+    # ``PINNED_VERSIONS`` and no listed build here.  In the OPEN mode it ships
+    # with, this table is not consulted at all -- ``check_pinned_version``
+    # returns before the membership test -- so every installed build launches,
+    # which is the whole point.  Naming an exact build would be an expiry date:
+    # 1.1.11 was already stale against the installed 1.1.13 when this landed,
+    # and 1.1.13 went stale during the very session that merged it (agy
+    # auto-updated to 1.1.14).
+    #
+    # Under a STRICT override this empty tuple refuses EVERY agy build, because
+    # :func:`check_pinned_version` implements strict as allowlist membership
+    # (``normalized not in accepted`` raises), not as a denylist -- despite the
+    # "quarantine" name the policy doc uses for it.  That is the intended
+    # fail-closed reading for a provider with no stage-proven build on record,
+    # and the exit is unsetting ``CAO_PROVIDER_VERSION_ENFORCEMENT_ANTIGRAVITY``
+    # or listing the build the operator has proven.  Stated explicitly because
+    # the surrounding vocabulary invites the opposite (denylist) reading.
+    PROVIDER_ANTIGRAVITY: (),
 }
+
 # The current pin must always be an accepted version — asserted here so the
 # two maps cannot silently drift apart.
-assert all(
-    PINNED_VERSIONS[provider] in versions for provider, versions in SUPPORTED_VERSIONS.items()
-)
+# Iterated over the PINS, not the accepted sets, so that a provider may carry no
+# pin at all (the unpinned default) while still holding a quarantine entry.
+assert all(pin in SUPPORTED_VERSIONS.get(provider, ()) for provider, pin in PINNED_VERSIONS.items())
 
 #: Seconds one ``--version`` observation may take before the launch fails
 #: closed.  The bound must be finite — a probe that cannot answer inside it
@@ -304,6 +329,8 @@ NATIVE_ID_SOURCES = {
     # `muse resume <id>` restores it).  `muse resume <known-id>` is the
     # restoration form, not a caller-chosen creation.
     PROVIDER_MUSE: "provider_status_discovered",
+    PROVIDER_ANTIGRAVITY: "controlled_bootstrap_turn",
+    PROVIDER_ANTIGRAVITY_CLI: "controlled_bootstrap_turn",
 }
 
 #: The reserved ``expected_effort`` meaning "this route selects no effort;
@@ -762,9 +789,11 @@ def validate_resume_argv(provider: str, argv: list[str]) -> ResumeForm:
       kimi:   ``--session <id>`` · ``-S <id>`` · ``-r <id>``
       claude: ``--resume <uuid>``
       muse:   ``muse resume <id>``
+      antigravity: ``--conversation <uuid>``
     Forbidden forms refuse with zero provider I/O.
     """
-    if provider not in PROVIDERS:
+    provider_key = _VERSION_POLICY_KEY.get(provider, provider)
+    if provider not in PROVIDERS and provider_key not in PROVIDERS:
         raise ResumeFormRefused(f"unknown provider: {provider!r}")
     args = list(argv)
     forbidden = {
@@ -831,6 +860,26 @@ def validate_resume_argv(provider: str, argv: list[str]) -> ResumeForm:
                 raise ResumeFormRefused("muse resume native id must be a canonical lowercase UUID")
             return ResumeForm(provider, tuple(args), native_id)
         raise ResumeFormRefused("muse resume accepts exactly `muse resume <id>`")
+    if provider in (PROVIDER_ANTIGRAVITY, PROVIDER_ANTIGRAVITY_CLI):
+        conv_idx = -1
+        for i, arg in enumerate(args):
+            if arg == "--conversation" and i + 1 < len(args):
+                conv_idx = i + 1
+                break
+        if conv_idx != -1 and args[conv_idx] and not args[conv_idx].startswith("-"):
+            native_id = args[conv_idx]
+            try:
+                parsed = _uuid_module.UUID(native_id)
+            except ValueError as exc:
+                raise ResumeFormRefused(
+                    f"antigravity resume native id must be a canonical UUID; got {native_id!r}"
+                ) from exc
+            if str(parsed) != native_id:
+                raise ResumeFormRefused(
+                    "antigravity resume native id must be a canonical lowercase UUID"
+                )
+            return ResumeForm(provider, tuple(args), native_id)
+        raise ResumeFormRefused("antigravity resume accepts `--conversation <uuid>`")
     raise ResumeFormRefused("claude resume accepts exactly `--resume <uuid>`")
 
 

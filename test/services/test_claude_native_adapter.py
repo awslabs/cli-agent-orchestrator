@@ -260,6 +260,7 @@ class TestPerProviderArgvDispatch:
             "kimi_cli",
             "claude_code",
             "muse_cli",
+            "antigravity_cli",
         }
         for provider in ntl.SUPPORTED_NATIVE_PROVIDERS:
             binder = ntl._binder(provider)

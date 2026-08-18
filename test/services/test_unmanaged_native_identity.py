@@ -1246,3 +1246,165 @@ def test_codex_launch_argv_resumes_minted_id():
     provider = CodexProvider("t1", "cao-s", "w1", native_session_id=sid)
     command = provider._build_codex_command()
     assert command.strip().endswith(f"resume {sid}")
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_antigravity_new_launch_binds_pre_task_identity(
+    isolated_memory_db, launch_mocks, monkeypatch
+):
+    """Antigravity: pre-task 1-turn bootstrap mints a conversation id, durable in roster and metadata."""
+    import json
+    import subprocess
+
+    native_id = str(uuid.uuid4())
+
+    def _mock_subprocess_run(cmd, *args, **kwargs):
+        if "--version" in cmd or "version" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="Antigravity CLI 1.1.11\n", stderr="")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"conversation_id": native_id}), stderr=""
+        )
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.unmanaged_native_identity._resolve_executable",
+        lambda provider: "/usr/local/bin/agy",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.unmanaged_native_identity._binary_sha256",
+        lambda exe: "a" * 64,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.unmanaged_native_identity._version_output",
+        lambda provider, exe, env: "Antigravity CLI 1.1.11",
+    )
+    monkeypatch.setattr(subprocess, "run", _mock_subprocess_run)
+
+    result = await create_terminal("antigravity_cli", "implementer-gemini", new_session=True)
+    assert result.id == "test1234"
+    agent = roster.get_agent(roster.derive_initial_agent_id("test1234"))
+    lineage = agent["current_lineage"]
+    assert lineage["native_session_id"] == native_id
+    assert lineage["harness"] == "antigravity_cli"
+    assert lineage["acquisition_method"] == roster.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN
+    from cli_agent_orchestrator.clients import database
+
+    assert database.get_terminal_metadata("test1234")["native_session_id"] == native_id
+
+
+def test_antigravity_launch_argv_resumes_minted_id():
+    from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
+
+    sid = str(uuid.uuid4())
+    provider = AntigravityCliProvider(
+        "t1", "cao-s", "w1", native_session_id=sid, model="gemini-3.7-flash", effort="high"
+    )
+    command = provider._build_agy_command()
+    assert f"--conversation {sid}" in command
+    assert "--model gemini-3.7-flash" in command
+    assert "--effort high" in command
+    assert "-i" not in command
+
+
+def test_provider_manager_creates_antigravity_provider_with_native_id_and_effort():
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    manager = ProviderManager()
+    sid = str(uuid.uuid4())
+    provider = manager.create_provider(
+        "antigravity_cli",
+        "t1",
+        "cao-s",
+        "w1",
+        agent_profile="implementer-gemini",
+        native_session_id=sid,
+        expected_model="gemini-3.7-flash",
+        expected_effort="high",
+    )
+    command = provider._build_agy_command()
+    assert f"--conversation {sid}" in command
+    assert "--model gemini-3.7-flash" in command
+    assert "--effort high" in command
+    assert "-i" not in command
+
+
+def test_validate_resume_argv_accepts_antigravity_wire_names():
+    from cli_agent_orchestrator.services import provider_contracts
+
+    sid = str(uuid.uuid4())
+    argv = ["/usr/local/bin/agy", "--dangerously-skip-permissions", "--conversation", sid]
+
+    parsed = provider_contracts.validate_resume_argv("antigravity_cli", argv)
+    assert parsed.native_id == sid
+
+    parsed_alias = provider_contracts.validate_resume_argv("antigravity", argv)
+    assert parsed_alias.native_id == sid
+
+
+def test_provider_manager_get_provider_reconstructs_antigravity_metadata(monkeypatch):
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    manager = ProviderManager()
+    sid = str(uuid.uuid4())
+
+    fake_metadata = {
+        "provider": "antigravity_cli",
+        "tmux_session": "cao-s",
+        "tmux_window": "w1",
+        "agent_profile": "implementer-gemini",
+        "native_session_id": sid,
+        "model": "gemini-3.7-flash",
+        "effort": "high",
+    }
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        lambda tid: fake_metadata,
+    )
+
+    provider = manager.get_provider("t1")
+    assert provider._native_session_id == sid
+    assert provider._model == "gemini-3.7-flash"
+    assert provider._effort == "high"
+
+
+def test_resolve_executable_is_entered_unpatched_for_every_activated_provider():
+    """``_resolve_executable`` must actually EXECUTE for every activated cell.
+
+    Every other test in this file monkeypatches this seam, so the region was
+    never entered and a stale symbol reference survived: the table was renamed
+    while its only call site still named the old one, making every activated
+    unmanaged launch raise ``NameError`` -- which is not
+    ``UnmanagedIdentityUnavailable``, so the launch path's typed handler did not
+    catch it either.  This test enters the region for real.
+
+    It deliberately does NOT require the binaries to be installed: the contract
+    is that the call either resolves a path or refuses with the module's own
+    typed error.  ``NameError``/``KeyError`` are neither, and are the failure
+    this pins.
+    """
+    from cli_agent_orchestrator.services import unmanaged_native_identity as u
+
+    assert u.UNMANAGED_PRE_TASK_PROVIDERS, "no activated providers to check"
+    for provider in sorted(u.UNMANAGED_PRE_TASK_PROVIDERS):
+        # The table must cover every activated provider...
+        assert (
+            provider in u._PROVIDER_EXECUTABLE
+        ), f"{provider!r} is activated but has no executable-name entry"
+        # ...and calling through must not blow up on a symbol/lookup error.
+        try:
+            resolved = u._resolve_executable(provider)
+        except u.UnmanagedIdentityUnavailable:
+            continue  # binary absent on this host: the typed, legal refusal
+        assert isinstance(resolved, str) and resolved
+
+
+def test_antigravity_resolves_the_agy_binary_not_its_policy_key():
+    """Antigravity is the one provider whose executable differs from its
+    provider vocabulary: the policy keys are ``antigravity`` /
+    ``antigravity_cli``, the binary on PATH is ``agy``.  Substituting a
+    ``PROVIDER_*`` constant here would make every agy launch fail to resolve,
+    so the mapping is pinned explicitly.
+    """
+    from cli_agent_orchestrator.services import unmanaged_native_identity as u
+
+    assert u._PROVIDER_EXECUTABLE["antigravity_cli"] == "agy"

@@ -79,6 +79,9 @@ ACQUISITION_ACP_BOOTSTRAP = "zero_prompt_acp_bootstrap"
 # it ACP would make the durable attachment receipt claim a route that was not
 # used.
 ACQUISITION_ZERO_TURN_BOOTSTRAP = "zero_turn_provider_bootstrap"
+#: A controlled model turn (e.g. print-mode initial prompt) minted the persistent
+#: session before TUI attachment.
+ACQUISITION_CONTROLLED_BOOTSTRAP_TURN = "controlled_bootstrap_turn"
 ACQUISITION_RESUME = "pinned_resume"
 #: The id was *chosen* by this system and handed to the provider at launch
 #: rather than obtained from it.  Distinct from the other two because both
@@ -97,6 +100,7 @@ ACQUISITION_METHODS = frozenset(
     {
         ACQUISITION_ACP_BOOTSTRAP,
         ACQUISITION_ZERO_TURN_BOOTSTRAP,
+        ACQUISITION_CONTROLLED_BOOTSTRAP_TURN,
         ACQUISITION_RESUME,
         ACQUISITION_CHOSEN_SESSION_ID,
         ACQUISITION_STATUS_DISCOVERED,
@@ -282,6 +286,13 @@ def acquire_intent(
             )
         intent["bootstrap_sent_no_turn"] = True
         intent["bootstrap_detached_before_launch"] = True
+    elif acquisition_method == ACQUISITION_CONTROLLED_BOOTSTRAP_TURN:
+        if bootstrap_detached_before_launch is not True:
+            raise NativeAttachmentInvalid(
+                "a controlled bootstrap turn must assert bootstrap_detached_before_launch=True"
+            )
+        intent["bootstrap_sent_no_turn"] = False
+        intent["bootstrap_detached_before_launch"] = True
     elif bootstrap_sent_no_turn is not None or bootstrap_detached_before_launch is not None:
         raise NativeAttachmentInvalid(
             f"bootstrap assertions are meaningless for {acquisition_method!r} and are refused "
@@ -344,6 +355,24 @@ def validate_attachment_intent(intent: Any) -> dict[str, Any]:
             raise NativeAttachmentInvalid(
                 "a zero-turn bootstrap intent must assert bootstrap_sent_no_turn=True and "
                 "bootstrap_detached_before_launch=True"
+            )
+    elif acquisition_method == ACQUISITION_CONTROLLED_BOOTSTRAP_TURN:
+        # The mirror of :func:`acquire_intent`'s controlled-bootstrap branch.
+        # A controlled bootstrap turn DID send a turn -- that is how the id is
+        # minted -- so it records ``bootstrap_sent_no_turn=False`` rather than
+        # omitting the field, and asserts only that the minting process
+        # detached before the native TUI claimed the session.  Validating the
+        # two halves apart is what let a builder-produced intent be refused by
+        # its own reader.
+        if intent.get("bootstrap_detached_before_launch") is not True:
+            raise NativeAttachmentInvalid(
+                "a controlled bootstrap turn intent must assert "
+                "bootstrap_detached_before_launch=True"
+            )
+        if intent.get("bootstrap_sent_no_turn") is not False:
+            raise NativeAttachmentInvalid(
+                "a controlled bootstrap turn intent must record "
+                "bootstrap_sent_no_turn=False; the mint is a real turn"
             )
     elif "bootstrap_sent_no_turn" in intent or "bootstrap_detached_before_launch" in intent:
         raise NativeAttachmentInvalid(

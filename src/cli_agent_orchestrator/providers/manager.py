@@ -148,8 +148,10 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
-                    model=model,
+                    model=expected_model or model,
                     skill_prompt=skill_prompt,
+                    native_session_id=native_session_id,
+                    effort=expected_effort,
                 )
             # --- Credentials-free mock provider (test/CI infrastructure) ---
             elif provider_type == ProviderType.MOCK_CLI.value:
@@ -202,6 +204,9 @@ class ProviderManager:
             metadata["tmux_session"],
             metadata["tmux_window"],
             metadata["agent_profile"],
+            native_session_id=metadata.get("native_session_id"),
+            expected_model=metadata.get("model"),
+            expected_effort=metadata.get("effort"),
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since
