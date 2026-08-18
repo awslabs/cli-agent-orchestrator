@@ -604,6 +604,7 @@ fn entry(id: CommandId) -> Command {
                 Param { name: "--engine", required: false, kind: ParamKind::Text },
                 Param { name: "--model", required: false, kind: ParamKind::Text },
                 Param { name: "--use-worktree", required: false, kind: ParamKind::Flag },
+                Param { name: "--no-wait", required: false, kind: ParamKind::Flag },
                 Param { name: "--json", required: false, kind: ParamKind::Flag },
             ],
             handoff_reason: None,

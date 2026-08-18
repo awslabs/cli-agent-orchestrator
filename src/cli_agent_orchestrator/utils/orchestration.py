@@ -24,7 +24,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import requests
 
@@ -67,6 +67,16 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
+
+# Generous client-side timeout for a SYNCHRONOUS (non-deferred) terminal create
+# call, used by handoff's early-terminal-id path (review on PR #634, issue #616).
+# Provider init (shell warm-up + CLI startup + MCP registration + auth) can
+# legitimately take up to ~45s server-side -- well past _mcp_timeout()'s 30s
+# default. That default was never a problem before because nothing called
+# _create_terminal non-deferred in production (assign always uses
+# defer_init=True); this is the first caller of that path, so it gets its own
+# padded timeout rather than silently inheriting one sized for something else.
+_HANDOFF_CREATE_TIMEOUT_S = 150.0
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
 
@@ -178,12 +188,22 @@ def _create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    create_timeout: Optional[float] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
     Args:
         agent_profile: Agent profile for the terminal
         working_directory: Optional working directory for the terminal
+        create_timeout: Client-side timeout for the create POST only (the
+            metadata/working-directory GETs above it keep using
+            ``_mcp_timeout()`` regardless -- they're fast reads either way).
+            ``None`` (default) keeps today's behavior (``_mcp_timeout()``,
+            30s), which is fine for ``defer_init=True`` (assign's path:
+            returns in <2s by design) but too short for a SYNCHRONOUS create
+            that waits out ``provider.initialize()`` (up to ~45s) -- pass an
+            explicit, larger value for that case (see
+            ``_HANDOFF_CREATE_TIMEOUT_S``).
         defer_init: If True, tell
             cao-server to skip the ``provider.initialize()`` wait and return
             as soon as the tmux window and DB record exist. Provider init
@@ -294,7 +314,7 @@ def _create_terminal(
             params=params,
             json=json_body,
             headers=_auth_headers() or None,
-            timeout=_mcp_timeout(),
+            timeout=create_timeout if create_timeout is not None else _mcp_timeout(),
         )
         response.raise_for_status()
         terminal = response.json()
@@ -338,7 +358,7 @@ def _create_terminal(
             params=params,
             json=json_body,
             headers=_auth_headers() or None,
-            timeout=_mcp_timeout(),
+            timeout=create_timeout if create_timeout is not None else _mcp_timeout(),
         )
         response.raise_for_status()
         terminal = response.json()
@@ -563,6 +583,93 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     return fallback
 
 
+async def _run_step_and_build_result(
+    payload: Dict[str, Any],
+    agent_profile: str,
+    provider: str,
+    timeout: int,
+    start_time: float,
+) -> HandoffResult:
+    """POST ``payload`` to ``/terminals/run-step`` and map the response to a HandoffResult.
+
+    Shared by both of ``_handoff_impl``'s call shapes: the default single-call
+    path (``payload`` carries a fresh ``session_name``/``caller_id``/
+    ``allowed_tools`` for the server to create the worker with) and the
+    early-terminal-id path (``payload`` carries ``reuse_terminal_id`` instead,
+    for a terminal ``_handoff_impl`` already created and reported). Response
+    interpretation -- timeout vs worker-error vs malformed-200 vs success -- is
+    identical either way, so it lives here once rather than twice.
+
+    When ``payload`` carries ``reuse_terminal_id``, an error response's
+    ``terminal_id`` falls back to that value: the caller already knows this
+    terminal exists, so there is no reason to lose track of it even if a
+    legacy plain-string ``detail`` happens not to name it. For the fresh-create
+    path ``reuse_terminal_id`` is absent, so this reduces to exactly the prior
+    behavior (surface ``tid`` from the error detail, or ``None``).
+    """
+    known_terminal_id: Optional[str] = payload.get("reuse_terminal_id")
+    # Allow the full step time plus the server-side ready-wait (up to 120s)
+    # plus headroom; the server enforces the per-step timeout internally.
+    client_timeout = float(timeout) + 180.0
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/run-step",
+            json=payload,
+            headers=_auth_headers() or None,
+            timeout=client_timeout,
+        )
+    except requests.Timeout:
+        return HandoffResult(
+            success=False,
+            message=f"Handoff timed out after {timeout} seconds",
+            output=None,
+            terminal_id=known_terminal_id,
+        )
+
+    if response.status_code != 200:
+        # Map the boundary's HTTPException back into a HandoffResult. The
+        # run-step endpoint returns a STRUCTURED detail object
+        # ({message, kind, terminal_id}) so we read terminal_id and the
+        # failure kind as fields rather than scraping the message.
+        kind, structured_detail, tid = _parse_run_step_error(response)
+        # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
+        # be reported distinctly so a 5s crash is not mislabeled as an
+        # N-second timeout. The structured `kind` is authoritative; the
+        # status code is only the fallback when an older server omits it
+        # (504 -> timeout, 502 -> error).
+        if kind == "error" or (kind is None and response.status_code == 502):
+            msg = f"Handoff failed: worker errored ({structured_detail})"
+        elif kind == "timeout" or (kind is None and response.status_code == 504):
+            msg = f"Handoff timed out after {timeout} seconds"
+        else:
+            msg = f"Handoff failed: {structured_detail}"
+        return HandoffResult(
+            success=False, message=msg, output=None, terminal_id=tid or known_terminal_id
+        )
+
+    data = response.json()
+    terminal_id = data.get("terminal_id", known_terminal_id)
+    # A 200 must carry last_message; surface a malformed body as a failure
+    # rather than silently returning success-with-None.
+    if "last_message" not in data:
+        return HandoffResult(
+            success=False,
+            message="Handoff failed: malformed run-step response (no last_message)",
+            output=None,
+            terminal_id=terminal_id,
+        )
+    output = data["last_message"]
+
+    execution_time = time.time() - start_time
+    return HandoffResult(
+        success=True,
+        message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
+        + _get_cleanup_nudge(),
+        output=output,
+        terminal_id=terminal_id,
+    )
+
+
 # Implementation functions
 async def _handoff_impl(
     agent_profile: str,
@@ -572,6 +679,8 @@ async def _handoff_impl(
     engine: Optional[str] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    on_terminal_id: Optional[Callable[[str], None]] = None,
+    wait: bool = True,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -592,19 +701,29 @@ async def _handoff_impl(
     one behavior-equivalence risk flagged in the plan; keeping the shaping
     caller-side is the choice that preserves the exact existing codex banner
     regardless of which entry point (MCP tool or CLI command) calls this.
+
+    ``on_terminal_id`` / ``wait`` (review on PR #634, issue #616): the MCP
+    ``handoff`` tool calls this with neither set, taking the single-call path
+    below exactly as written above -- BEHAVIOR UNCHANGED, still BR-8.
+    ``cao agent handoff`` passes ``on_terminal_id`` so an operator who kills a
+    blocking handoff has a real terminal_id to recover with (``cao agent
+    status``/``result``/``cancel``) instead of blind-retrying into a second
+    worker, and ``wait=False`` (``--no-wait``) to return immediately after
+    creation without waiting, extracting, or tearing down at all. Neither is
+    server-side idempotency: the terminal_id is real and recoverable, but a
+    killed-and-retried call still creates a second worker if the operator
+    retries instead of reconnecting to the terminal_id they were given. Full
+    request-id dedup needs server-side job persistence -- tracked separately
+    (a fork PR pre-empting the upstream maintainer's design there is exactly
+    the risk this split avoids).
     """
     start_time = time.time()
     terminal_id: Optional[str] = None
 
     try:
         # Resolve the supervisor context WITHOUT creating a terminal, so the
-        # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
-        # prompt-shaping can both run caller-side before the single combined
-        # call. The context also carries the supervisor's session_name,
-        # caller_id and inherited allowed_tools so the server creates the worker
-        # in the SAME session with #284 callback routing and tool inheritance
-        # preserved (BR-8 observable-behavior parity). The endpoint then
-        # creates + drives + tears down the terminal.
+        # codex fast-fail (which needs CAO_TERMINAL_ID) can run before any
+        # terminal exists, on every path below.
         ctx = _resolve_handoff_provider(agent_profile)
         provider = ctx.provider
 
@@ -622,92 +741,103 @@ async def _handoff_impl(
                 terminal_id=None,
             )
 
-        # Shape the prompt caller-side (prepends the codex [CAO Handoff] banner
-        # when provider == codex; otherwise returns the message unchanged).
-        shaped_message = _shape_handoff_message(provider, message)
-
-        # Single combined call: create -> ready-wait -> input -> complete-wait ->
-        # extract -> teardown, all server-side via run_agent_step. session_name
-        # places the worker in the supervisor's session; caller_id/allowed_tools
-        # preserve #284 callback routing and tool inheritance.
-        payload: Dict[str, Any] = {
-            "provider": provider,
-            "agent": agent_profile,
-            "prompt": shaped_message,
-            "teardown": True,
-            "timeout": float(timeout),
-            "use_worktree": use_worktree,
-        }
-        if ctx.session_name:
-            payload["session_name"] = ctx.session_name
-        if ctx.caller_id:
-            payload["caller_id"] = ctx.caller_id
-        if ctx.allowed_tools:
-            payload["allowed_tools"] = ctx.allowed_tools
-        if working_directory:
-            payload["working_directory"] = working_directory
-        if engine is not None:
-            payload["engine"] = engine
-        if model:
-            payload["model"] = model
-
-        # Allow the full step time plus the server-side ready-wait (up to 120s)
-        # plus headroom; the server enforces the per-step timeout internally.
-        client_timeout = float(timeout) + 180.0
-        try:
-            response = requests.post(
-                f"{API_BASE_URL}/terminals/run-step",
-                json=payload,
-                headers=_auth_headers() or None,
-                timeout=client_timeout,
-            )
-        except requests.Timeout:
-            return HandoffResult(
-                success=False,
-                message=f"Handoff timed out after {timeout} seconds",
-                output=None,
-                terminal_id=None,
+        if on_terminal_id is None and wait:
+            # Default path: ONE combined call -- create -> ready-wait -> input ->
+            # complete-wait -> extract -> teardown, all server-side via
+            # run_agent_step. session_name places the worker in the supervisor's
+            # session; caller_id/allowed_tools preserve #284 callback routing
+            # and tool inheritance. Byte-for-byte the original single-seam
+            # behavior (BR-8) -- this is what the MCP tool always takes.
+            shaped_message = _shape_handoff_message(provider, message)
+            payload: Dict[str, Any] = {
+                "provider": provider,
+                "agent": agent_profile,
+                "prompt": shaped_message,
+                "teardown": True,
+                "timeout": float(timeout),
+                "use_worktree": use_worktree,
+            }
+            if ctx.session_name:
+                payload["session_name"] = ctx.session_name
+            if ctx.caller_id:
+                payload["caller_id"] = ctx.caller_id
+            if ctx.allowed_tools:
+                payload["allowed_tools"] = ctx.allowed_tools
+            if working_directory:
+                payload["working_directory"] = working_directory
+            if engine is not None:
+                payload["engine"] = engine
+            if model:
+                payload["model"] = model
+            return await _run_step_and_build_result(
+                payload, agent_profile, provider, timeout, start_time
             )
 
-        if response.status_code != 200:
-            # Map the boundary's HTTPException back into a HandoffResult. The
-            # run-step endpoint returns a STRUCTURED detail object
-            # ({message, kind, terminal_id}) so we read terminal_id and the
-            # failure kind as fields rather than scraping the message.
-            kind, structured_detail, tid = _parse_run_step_error(response)
-            # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
-            # be reported distinctly so a 5s crash is not mislabeled as an
-            # N-second timeout. The structured `kind` is authoritative; the
-            # status code is only the fallback when an older server omits it
-            # (504 -> timeout, 502 -> error).
-            if kind == "error" or (kind is None and response.status_code == 502):
-                msg = f"Handoff failed: worker errored ({structured_detail})"
-            elif kind == "timeout" or (kind is None and response.status_code == 504):
-                msg = f"Handoff timed out after {timeout} seconds"
-            else:
-                msg = f"Handoff failed: {structured_detail}"
-            return HandoffResult(success=False, message=msg, output=None, terminal_id=tid)
+        # Early-terminal-id path: create SYNCHRONOUSLY first (waits out
+        # provider-ready server-side, same wait the default path's own create
+        # phase does) so terminal_id is REAL and ready by the time we report
+        # it -- a terminal_id from a deferred (still-initializing) create would
+        # race run_agent_step's reuse_terminal_id branch, which skips its
+        # readiness wait entirely on the assumption the reused terminal is
+        # already settled. _create_terminal resolves the same session/
+        # caller_id/allowed_tools inheritance _resolve_handoff_provider already
+        # computed into ``ctx`` (it does so independently via its own metadata
+        # GET); reassigning ``provider`` to its return value uses whatever it
+        # actually persisted on the terminal as the source of truth for the
+        # reuse call below, rather than assuming the two resolutions agree.
+        terminal_id, provider = _create_terminal(
+            agent_profile,
+            working_directory,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
+            create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
+        )
+        if on_terminal_id is not None:
+            try:
+                on_terminal_id(terminal_id)
+            except Exception as exc:  # noqa: BLE001 -- a UI callback must never break the handoff
+                logger.warning(
+                    "handoff: on_terminal_id callback failed for terminal %s: %s", terminal_id, exc
+                )
 
-        data = response.json()
-        terminal_id = data.get("terminal_id")
-        # A 200 must carry last_message; surface a malformed body as a failure
-        # rather than silently returning success-with-None.
-        if "last_message" not in data:
+        if not wait:
+            # --no-wait: send the prompt and return immediately. The terminal
+            # is left running (no teardown) -- the operator owns its lifecycle
+            # from here via status/result/cancel, mirroring assign's contract.
+            _send_direct_input_handoff(terminal_id, provider, message)
             return HandoffResult(
-                success=False,
-                message="Handoff failed: malformed run-step response (no last_message)",
+                success=True,
+                message=(
+                    f"Handed off to {agent_profile} ({provider}); not waiting for completion "
+                    f"(--no-wait). Check on it with `cao agent status {terminal_id}`, read its "
+                    f"result with `cao agent result {terminal_id}`, or free it with "
+                    f"`cao agent cancel --delete {terminal_id}`."
+                ),
                 output=None,
                 terminal_id=terminal_id,
             )
-        output = data["last_message"]
 
-        execution_time = time.time() - start_time
-        return HandoffResult(
-            success=True,
-            message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
-            + _get_cleanup_nudge(),
-            output=output,
-            terminal_id=terminal_id,
+        # Waiting, but the terminal already exists (on_terminal_id was given):
+        # drive it to completion via reuse_terminal_id instead of a fresh
+        # create. working_directory/model/use_worktree/session_name/caller_id/
+        # allowed_tools are all "ignored when reusing" per run_agent_step's own
+        # contract (already applied at create time above); engine is NOT
+        # ignored -- it is validated against what got persisted, so it is
+        # still forwarded here to match.
+        shaped_message = _shape_handoff_message(provider, message)
+        payload = {
+            "provider": provider,
+            "agent": agent_profile,
+            "prompt": shaped_message,
+            "reuse_terminal_id": terminal_id,
+            "teardown": True,
+            "timeout": float(timeout),
+        }
+        if engine is not None:
+            payload["engine"] = engine
+        return await _run_step_and_build_result(
+            payload, agent_profile, provider, timeout, start_time
         )
 
     except Exception as e:

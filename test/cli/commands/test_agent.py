@@ -184,7 +184,45 @@ class TestHandoff:
 
         assert result.exit_code == 0, result.output
         assert captured["args"] == ("developer", "do it", 120, "/repo")
-        assert captured["kwargs"] == {"engine": "kas", "model": "fable-5", "use_worktree": True}
+        on_terminal_id = captured["kwargs"].pop("on_terminal_id")
+        assert callable(on_terminal_id)
+        assert captured["kwargs"] == {
+            "engine": "kas",
+            "model": "fable-5",
+            "use_worktree": True,
+            "wait": True,
+        }
+
+    @patch("cli_agent_orchestrator.cli.commands.agent._handoff_impl")
+    def test_no_wait_forwards_wait_false_and_skips_the_waiting_line(self, mock_impl, runner):
+        async def _fake_handoff(*args, **kwargs):
+            return HandoffResult(
+                success=True, message="Handed off; not waiting", output=None, terminal_id="w1"
+            )
+
+        mock_impl.side_effect = _fake_handoff
+
+        result = runner.invoke(agent, ["handoff", "developer", "do it", "--no-wait"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_impl.call_args.kwargs["wait"] is False
+        assert "Waiting for" not in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.agent._handoff_impl")
+    def test_on_terminal_id_callback_writes_terminal_id_to_stderr(self, mock_impl, runner):
+        """Review on PR #634: an operator watching stderr sees the terminal_id
+        before the (possibly long) wait for completion, not just at the end."""
+
+        async def _fake_handoff(*args, on_terminal_id=None, **kwargs):
+            on_terminal_id("early-w1")
+            return HandoffResult(success=True, message="ok", output="done", terminal_id="early-w1")
+
+        mock_impl.side_effect = _fake_handoff
+
+        result = runner.invoke(agent, ["handoff", "developer", "do it"])
+
+        assert result.exit_code == 0, result.output
+        assert "terminal_id: early-w1" in result.stderr
 
     def test_timeout_out_of_range_is_rejected(self, runner):
         result = runner.invoke(agent, ["handoff", "developer", "do it", "--timeout", "0"])

@@ -151,9 +151,24 @@ def assign_cmd(agent_profile, message, working_directory, engine, model, use_wor
     default=False,
     help="Give the worker its own git worktree instead of sharing the caller's checkout.",
 )
+@click.option(
+    "--no-wait",
+    "no_wait",
+    is_flag=True,
+    default=False,
+    help="Return immediately after creating the worker; don't wait for it to complete.",
+)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def handoff_cmd(
-    agent_profile, message, timeout, working_directory, engine, model, use_worktree, as_json
+    agent_profile,
+    message,
+    timeout,
+    working_directory,
+    engine,
+    model,
+    use_worktree,
+    no_wait,
+    as_json,
 ):
     """Hand off a task to a worker terminal and BLOCK until it completes.
 
@@ -163,23 +178,43 @@ def handoff_cmd(
     session is created for it), but run this from inside one so the worker
     inherits the caller's session and tool restrictions.
 
-    Progress: this is ONE blocking call to cao-server for its whole duration
-    -- unlike `cao workflow run`, there is no server-side run id to poll
-    incrementally, so a heartbeat line prints every 30s on a TTY (elapsed
-    time only) so a long wait doesn't look hung. Suppressed under --json or
-    when stdout is not a TTY.
+    Recovering from a kill: the worker's terminal_id is printed to stderr as
+    soon as the worker exists -- before the wait for completion, not just at
+    the end -- so `Ctrl-C`-ing this command still leaves you a handle. Check
+    on it with `cao agent status TERMINAL_ID`, read whatever it produced with
+    `cao agent result TERMINAL_ID`, or free it with `cao agent cancel --delete
+    TERMINAL_ID`. This is NOT automatic retry-safety: re-running the same
+    `cao agent handoff` command after a kill creates a SECOND worker rather
+    than reattaching to the first -- there is no request-id dedup yet
+    (tracked in issue #636). Use --no-wait below, or the printed terminal_id,
+    to manage a long-running worker deliberately instead of blind-retrying.
+
+    --no-wait: returns as soon as the worker exists and has been sent MESSAGE,
+    without waiting for -- or extracting -- its result, and without tearing it
+    down. Prints the terminal_id and exits 0 immediately; poll it with `cao
+    agent status`/`result` and clean it up with `cao agent cancel --delete`
+    same as above. Use this for a task you don't want to block your shell on.
+
+    Progress: absent --no-wait, this is ONE blocking call to cao-server for
+    its whole duration -- unlike `cao workflow run`, there is no server-side
+    run id to poll incrementally, so a heartbeat line prints every 30s on a
+    TTY (elapsed time only) so a long wait doesn't look hung. Suppressed
+    under --json or when stdout is not a TTY.
 
     Exit codes:
-      0    the worker completed successfully
+      0    the worker completed successfully (or was created, under --no-wait)
       1    the worker failed, errored, or the request timed out
       130  interrupted (Ctrl-C) -- the request may still be running on
-           cao-server; this command has no handle to confirm or cancel it
-           (the single call has not returned a terminal id yet). Check
-           `cao session list` to find and clean up an orphaned worker.
+           cao-server. Check the terminal_id printed to stderr above (if any
+           was printed yet) with `cao agent status`, or `cao session list` to
+           find and clean up an orphaned worker if not.
     """
     machine = _machine_mode(as_json)
-    if not machine:
+    if not machine and not no_wait:
         click.echo(f"Waiting for '{agent_profile}' to complete (timeout {timeout}s)...")
+
+    def _report_terminal_id(terminal_id: str) -> None:
+        click.echo(f"terminal_id: {terminal_id}", err=True)
 
     stop_heartbeat = threading.Event()
 
@@ -190,7 +225,7 @@ def handoff_cmd(
             click.echo(f"  ... still waiting ({elapsed}s elapsed)", err=True)
 
     heartbeat_thread = None
-    if not machine:
+    if not machine and not no_wait:
         heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
         heartbeat_thread.start()
 
@@ -204,13 +239,15 @@ def handoff_cmd(
                 engine=engine,
                 model=model,
                 use_worktree=use_worktree,
+                on_terminal_id=_report_terminal_id,
+                wait=not no_wait,
             )
         )
     except KeyboardInterrupt:
         click.echo(
-            "\nInterrupted -- the handoff request may still be running on cao-server; "
-            "a worker terminal may have been created but its id is unknown from here. "
-            "Check `cao session list` to find and clean it up.",
+            "\nInterrupted -- the handoff request may still be running on cao-server. "
+            "If a terminal_id was printed above, check it with `cao agent status`; "
+            "otherwise check `cao session list` to find and clean up an orphaned worker.",
             err=True,
         )
         sys.exit(130)

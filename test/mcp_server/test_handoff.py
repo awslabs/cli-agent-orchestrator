@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.utils.orchestration import (
+    _HANDOFF_CREATE_TIMEOUT_S,
     HandoffContext,
     _handoff_impl,
     _shape_handoff_message,
@@ -485,3 +486,155 @@ class TestResolveHandoffProvider:
         assert ctx.session_name is None
         assert ctx.caller_id is None
         assert ctx.allowed_tools is None
+
+
+class TestHandoffEarlyTerminalId:
+    """``on_terminal_id`` / ``wait`` -- review on PR #634 (issue #616 partial
+    mitigation: recoverable terminal_id + a non-blocking mode, NOT server-side
+    idempotency). Neither is passed by the MCP ``handoff`` tool -- every test
+    above exercises the default (``on_terminal_id=None, wait=True``) path and
+    passes unchanged, which is what proves this class's new branches are
+    additive rather than a behavior change to the existing tool."""
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_on_terminal_id_called_before_run_step_completes(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """The callback fires with the REAL terminal_id before the (still
+        blocking) run-step call -- an operator who kills here has an id to
+        recover with, unlike the default path where it is only known at the
+        very end."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+        seen = []
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=seen.append))
+
+        assert seen == ["dev-t1"]
+        assert result.success is True
+        assert result.terminal_id == "dev-t1"
+        assert mock_create.call_args[1]["create_timeout"] == _HANDOFF_CREATE_TIMEOUT_S
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_on_terminal_id_exception_is_swallowed(self, mock_create, mock_provider, _nudge):
+        """A broken callback (e.g. a stderr write that fails) must not break
+        the handoff itself, mirroring run_agent_step's own on_terminal_created
+        callback contract."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+
+        def _boom(_tid):
+            raise RuntimeError("stderr closed")
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=_boom))
+
+        assert result.success is True
+        assert result.terminal_id == "dev-t1"
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_waiting_path_reuses_the_created_terminal_not_a_fresh_one(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """The run-step payload carries reuse_terminal_id, and omits every
+        field run_agent_step documents as 'ignored when reusing' -- they were
+        already applied at create time above."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = Exception
+            asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=lambda _: None))
+
+        payload = mock_requests.post.call_args[1]["json"]
+        assert payload["reuse_terminal_id"] == "dev-t1"
+        for ignored_field in (
+            "session_name",
+            "caller_id",
+            "allowed_tools",
+            "working_directory",
+            "use_worktree",
+            "model",
+        ):
+            assert ignored_field not in payload
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_waiting_path_still_forwards_engine_since_reuse_validates_it(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """Unlike the fields above, `engine` is NOT ignored on reuse --
+        run_agent_step validates it against what got persisted at create
+        time -- so it must still be forwarded here to match."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = Exception
+            asyncio.run(
+                _handoff_impl("developer", "Do task", engine="v2", on_terminal_id=lambda _: None)
+            )
+
+        assert mock_requests.post.call_args[1]["json"]["engine"] == "v2"
+
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_direct_input_handoff")
+    def test_no_wait_sends_input_and_returns_without_calling_run_step(
+        self, mock_send, mock_create, mock_provider
+    ):
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            result = asyncio.run(_handoff_impl("developer", "Do task", wait=False))
+
+        mock_send.assert_called_once_with("dev-t1", "kiro_cli", "Do task")
+        mock_requests.post.assert_not_called()
+        assert result.success is True
+        assert result.terminal_id == "dev-t1"
+        assert result.output is None
+        assert "not waiting" in result.message
+        assert "cao agent status dev-t1" in result.message
+        assert "cao agent result dev-t1" in result.message
+        assert "cao agent cancel --delete dev-t1" in result.message
+
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration._send_direct_input_handoff")
+    def test_no_wait_still_fires_on_terminal_id(self, mock_send, mock_create, mock_provider):
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+        seen = []
+
+        asyncio.run(_handoff_impl("developer", "Do task", wait=False, on_terminal_id=seen.append))
+
+        assert seen == ["dev-t1"]
+
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_codex_fast_fail_applies_to_no_wait_too(self, mock_create, mock_provider):
+        """The codex CAO_TERMINAL_ID guard runs before ANY path branches --
+        including --no-wait, which must not create an orphan terminal either."""
+        mock_provider.return_value = _ctx("codex")
+
+        with patch.dict(os.environ, {}, clear=True):
+            result = asyncio.run(_handoff_impl("developer", "Do task", wait=False))
+
+        assert result.success is False
+        assert "CAO_TERMINAL_ID not set" in result.message
+        mock_create.assert_not_called()
