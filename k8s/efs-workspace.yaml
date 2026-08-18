@@ -1,0 +1,71 @@
+# Shared EFS-backed workspace for the CAO fleet.
+#
+# One ReadWriteMany volume mounted at /home/cao/workspace on the supervisor
+# and EVERY worker pod: all agents see the same live file tree at the same
+# path, so CAO's working-directory inheritance places delegated agents in
+# the shared workspace on any pod with no per-call parameters.
+#
+# STATIC provisioning: the AWS resources are created out-of-band (see IDs
+# below) and referenced here; the aws-efs-csi-driver's node DaemonSet does
+# the NFS mount — no IAM role and no controller involvement at mount time.
+#
+# AWS resources (account 418295698799, ap-southeast-2, VPC of EKS "Cluster"):
+#   FileSystem  fs-0fe4b2ecc1b06bb67  (encrypted, generalPurpose, elastic)
+#   AccessPoint fsap-0e72f7af255f8b90c
+#     - root dir /cao-workspace (created 0770)
+#     - forces POSIX uid/gid 1000 = the image's "cao" user, so ownership is
+#       consistent fleet-wide and root is never used over NFS
+#   Mount targets in all three cluster subnets, SG cao-workspace-efs
+#     (sg-0be7873cf96e58eaf) allowing NFS :2049 from the cluster SG only.
+#
+# CONCURRENCY: a shared volume does NOT make one git working tree safe for
+# two agents — parallel agents must work in separate subdirectories or use
+# CAO's worktree-per-terminal feature (use_worktree on assign/handoff).
+#
+# POPULATING: one-time, from any pod in the fleet, e.g.:
+#   kubectl -n cao-cluster exec deploy/cao-supervisor -- \
+#     git clone https://github.com/your-org/your-project.git \
+#     /home/cao/workspace/your-project
+# (or `kubectl cp` a local checkout). Content persists across pod restarts
+# and rescheduling; it is independent of any pod's lifecycle.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+provisioner: efs.csi.aws.com
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: cao-workspace
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  capacity:
+    # EFS is elastic; this figure is required by the API but not enforced.
+    storage: 100Gi
+  accessModes: ["ReadWriteMany"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: efs-sc
+  csi:
+    driver: efs.csi.aws.com
+    # <filesystem-id>::<access-point-id> — mounts via the access point so
+    # all I/O is forced to uid/gid 1000 under /cao-workspace.
+    volumeHandle: fs-0fe4b2ecc1b06bb67::fsap-0e72f7af255f8b90c
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cao-workspace
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: efs-sc
+  volumeName: cao-workspace
+  resources:
+    requests:
+      storage: 100Gi
