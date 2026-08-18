@@ -116,8 +116,9 @@ function AttachmentRow({ doc }: { doc: CatalogDocumentEntry }) {
   // Copy/download fetch the bytes on demand (bodies are no-store; nothing is
   // cached between actions). A tombstone or a fetch failure opens the row's
   // panel instead, so the reason is displayed next to the action that asked.
+  // An already-open panel stays open while the action runs.
   const withContent = async (fn: (content: string) => void) => {
-    setState({ status: 'loading' })
+    setState(s => (s.status === 'open' ? s : { status: 'loading' }))
     try {
       const res = await api.getCommunicationAttachment(doc.attachment_id)
       if (res.content == null) {
