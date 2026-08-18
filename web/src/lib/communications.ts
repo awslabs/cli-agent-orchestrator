@@ -142,41 +142,41 @@ export type DetailFailure =
   /** 404 — stable. On a record fetch: the record is not in the catalog. On
    *  the LIST route (which cannot 404 a record): this server build has no
    *  /communications route at all. */
-  | { kind: 'not-found'; message: string }
+  | { failureKind: 'not-found'; message: string }
   /** 400/422 — the identifier in the link is not a valid catalog identifier. */
-  | { kind: 'invalid'; message: string }
+  | { failureKind: 'invalid'; message: string }
   /** 503 content-digest-mismatch — integrity failure; content is NOT rendered. */
-  | { kind: 'corrupt'; message: string }
+  | { failureKind: 'corrupt'; message: string }
   /** Anything else — network, 503, 401/403: an ordinary unavailable state. */
-  | { kind: 'unavailable'; message: string }
+  | { failureKind: 'unavailable'; message: string }
 
 /**
  * Maps a failed detail fetch to its state. `retryable` is carried implicitly
- * by the kind: only `unavailable` offers a retry, because the other three are
+ * by the failureKind: only `unavailable` offers a retry, because the other three are
  * deterministic answers about the record or the link.
  */
 export function detailFailure(error: unknown): DetailFailure {
   const err = error as ApiError
   if (err.status === 404) {
     return {
-      kind: 'not-found',
+      failureKind: 'not-found',
       message: 'This record is not in the catalog. The link may be stale, or it was never published.',
     }
   }
   if (err.status === 400) {
-    return { kind: 'invalid', message: 'The identifier in this link is not a valid catalog identifier.' }
+    return { failureKind: 'invalid', message: 'The identifier in this link is not a valid catalog identifier.' }
   }
   if (err.status === 503 && err.detail === REASON.CONTENT_DIGEST_MISMATCH) {
     return {
-      kind: 'corrupt',
+      failureKind: 'corrupt',
       message: 'Content failed its integrity check (corrupt) and is not shown.',
     }
   }
   if (err.status === 503 && err.detail === REASON.CONTENT_UNREADABLE) {
-    return { kind: 'unavailable', message: 'Content could not be read.' }
+    return { failureKind: 'unavailable', message: 'Content could not be read.' }
   }
   return {
-    kind: 'unavailable',
+    failureKind: 'unavailable',
     message: err.detail ?? (err.status ? `Request failed (${err.status}).` : 'The catalog could not be reached.'),
   }
 }
@@ -200,12 +200,12 @@ export function listFailure(error: unknown): DetailFailure {
   const err = error as ApiError
   if (err.status === 404) {
     return {
-      kind: 'not-found',
+      failureKind: 'not-found',
       message: 'No communications catalog is installed on this deployment.',
     }
   }
   if (err.status === 422) {
-    return { kind: 'invalid', message: 'The identifier in this link is not a valid catalog identifier.' }
+    return { failureKind: 'invalid', message: 'The identifier in this link is not a valid catalog identifier.' }
   }
   return detailFailure(error)
 }

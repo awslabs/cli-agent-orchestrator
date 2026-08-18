@@ -14,6 +14,10 @@ import annotationDetailsSource from '../components/AnnotationDetails.tsx?raw'
 import filterBarSource from '../components/FilterBar.tsx?raw'
 import floatingCardSource from '../components/FloatingCard.tsx?raw'
 import identityColourSource from '../lib/identityColour.ts?raw'
+import communicationsLibSource from '../lib/communications.ts?raw'
+import safeMarkdownLibSource from '../lib/safeMarkdown.ts?raw'
+import communicationsModalSource from '../components/CommunicationsModal.tsx?raw'
+import safeContentViewSource from '../components/SafeContentView.tsx?raw'
 import { render, cleanup, screen, waitFor, within, fireEvent } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
 import {
@@ -656,6 +660,10 @@ describe('the renderer holds no conductor vocabulary either', () => {
     // a shared overlay primitive is exactly where a future "position the lane
     // chip's card differently" shortcut would try to live.
     ['src/components/FloatingCard.tsx', floatingCardSource],
+    ['src/lib/communications.ts', communicationsLibSource],
+    ['src/lib/safeMarkdown.ts', safeMarkdownLibSource],
+    ['src/components/CommunicationsModal.tsx', communicationsModalSource],
+    ['src/components/SafeContentView.tsx', safeContentViewSource],
   ]
 
   // The eight terms the Python guard forbids, plus the vocabulary this

@@ -86,7 +86,7 @@ function MdImage({ node: _node, alt }: ExtraProps & { src?: string; alt?: string
 function el<Tag extends keyof React.JSX.IntrinsicElements>(tag: Tag, className: string) {
   return function MdElement({ node: _node, children, ...rest }: ExtraProps & { children?: React.ReactNode }) {
     const Tag2 = tag as 'div'
-    return <Tag2 className={className} {...(rest as object)}>{children}</Tag2>
+    return <Tag2 {...(rest as object)} className={className}>{children}</Tag2>
   }
 }
 

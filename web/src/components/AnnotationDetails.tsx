@@ -16,13 +16,16 @@
 //                 EVERY annotation and its envelope, and is copyable. It still
 //                 exists when no conductor annotation was published.
 //
-// THE CHIPS STAY NON-INTERACTIVE (AnnotationChips.tsx's founding decision).
-// Making 41 spans focusable to give the keyboard a route to the hover card
-// would have put 41 stops in the tab order of an unauthenticated dashboard and
-// re-opened the AAA 44×44 target question (§13.8) the original design avoided.
-// The info button is one control per row, is already a legal target, and
-// carries the COMPLETE detail — so the keyboard and touch paths are strictly
-// better than the pointer path rather than a degraded copy of it.
+// THE NON-TASK CHIPS STAY NON-INTERACTIVE (AnnotationChips.tsx's founding
+// decision). Making 41 spans focusable to give the keyboard a route to the
+// hover card would have put 41 stops in the tab order of an unauthenticated
+// dashboard and re-opened the AAA 44×44 target question (§13.8) the original
+// design avoided. The info button is one control per row, is already a legal
+// target, and carries the COMPLETE detail — so the keyboard and touch paths
+// are strictly better than the pointer path rather than a degraded copy of
+// it. The task-occurrence chip is the design §8.1 entry-point exception: it
+// renders as a focusable button when a catalog is present, so the operator
+// can open the communications catalog.
 //
 // ON §9.5 ("no identity bundle, no copy-to-clipboard"). That rule exists
 // because `conduct dashboard` instructs `tailscale serve` and the server is

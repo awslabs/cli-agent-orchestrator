@@ -220,7 +220,7 @@ function AttachmentRow({ doc }: { doc: CatalogDocumentEntry }) {
       {state.status === 'failed' && (
         <div data-testid="attachment-error" role="status" className="px-2 pb-2 space-y-1">
           <p className="text-[11px] text-amber-200">{state.failure.message}</p>
-          {state.failure.kind === 'unavailable' && (
+          {state.failure.failureKind === 'unavailable' && (
             <button
               type="button"
               onClick={open}
@@ -337,7 +337,7 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
         setList({
           status: 'failed',
           failure: {
-            kind: 'unavailable',
+            failureKind: 'unavailable',
             message: 'The catalog returned a response this build cannot read.',
           },
         })
@@ -537,7 +537,7 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
                 {/* As with the detail pane, only `unavailable` retries: the
                     other kinds are deterministic answers about the build or
                     the link, and a Retry there can never succeed. */}
-                {list.failure.kind === 'unavailable' && (
+                {list.failure.failureKind === 'unavailable' && (
                   <button
                     type="button"
                     onClick={loadList}
@@ -579,8 +579,8 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
                   >
                     <p className="text-[11px] font-semibold text-amber-200">
                       {list.coverage === 'partial'
-                        ? 'This list is incomplete — some sources contributed less than they hold:'
-                        : 'This list is truncated — not every row could be served:'}
+                        ? `This list is incomplete — some sources contributed less than they hold${list.reasons.length ? ':' : ''}`
+                        : `This list is truncated — not every row could be served${list.reasons.length ? ':' : ''}`}
                     </p>
                     {list.reasons.map((r, i) => (
                       <p key={`${r.source}:${r.reason}:${i}`} className="text-[10px] text-amber-100/80">
@@ -690,12 +690,12 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
             {effectiveId && detail?.status === 'failed' && (
               <div role="status" className="p-4 space-y-2">
                 <p
-                  data-testid={`detail-${detail.failure.kind}`}
+                  data-testid={`detail-${detail.failure.failureKind}`}
                   className="text-xs text-amber-200"
                 >
                   {detail.failure.message}
                 </p>
-                {detail.failure.kind === 'unavailable' ? (
+                {detail.failure.failureKind === 'unavailable' ? (
                   <button
                     type="button"
                     onClick={() => setDetailNonce(n => n + 1)}

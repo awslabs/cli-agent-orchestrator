@@ -4,6 +4,15 @@
 // and asserts on the produced DOM or on spies watching the network surfaces —
 // never on the sanitiser helper alone, because a helper returning a safe
 // string proves nothing about what the component wired it into.
+//
+// FIXTURE DISCLOSURE — cond-0477: The communications catalog fixtures in
+// sibling test files that carry a bound task_occurrence_id model a state no
+// shipped conductor writer currently produces — all current writers record
+// task_occurrence_id = NULL (cond-0477). The fork's contract is the published
+// index format and a bound occurrence is a legal value of it. The API reports
+// `coverage:"complete"`, `total:0` with no reason code for the unbound case,
+// so the reader cannot distinguish "unbound" from "genuinely empty" — a known
+// limitation that resolves when cond-0477 lands.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, cleanup, screen, fireEvent, waitFor, act } from '@testing-library/react'

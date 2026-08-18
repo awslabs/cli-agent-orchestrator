@@ -338,6 +338,15 @@ export async function stubBackend(page: Page, options?: {
     // The communications catalog (design §7). Same control posture as
     // /annotations: with no `communications` option the list answers
     // "unavailable + root missing", i.e. no catalog is installed.
+    //
+    // FIXTURE DISCLOSURE — cond-0477: Every fixture in this stub that carries
+    // a bound task_occurrence_id models a state no shipped conductor writer
+    // currently produces — all current writers record task_occurrence_id = NULL
+    // (cond-0477). The fork's contract is the published index format and a
+    // bound occurrence is a legal value of it. The API reports
+    // `coverage:"complete"`, `total:0` with no reason code for the unbound
+    // case, so the reader cannot distinguish "unbound" from "genuinely empty"
+    // — a known limitation that resolves when cond-0477 lands.
     if (path === "/communications" && method === "GET") {
       return json(route, options?.communications?.list ?? noCatalog());
     }

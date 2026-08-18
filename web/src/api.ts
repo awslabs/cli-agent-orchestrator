@@ -545,7 +545,7 @@ export interface CatalogDocumentEntry {
   redaction_applied?: boolean | null
   provenance?: Record<string, unknown> | null
   quarantine?: CatalogQuarantineInfo | null
-  /** The publisher allows extra keys; they ride along for provenance display. */
+  /** The publisher allows extra keys (backend `extra="allow"` wire model, mirrored here). */
   [key: string]: unknown
 }
 
@@ -571,6 +571,7 @@ export interface CommunicationListItem {
   superseded_by?: string | null
   body?: CatalogDocumentEntry | null
   documents: CatalogDocumentEntry[]
+  /** Extra keys allowed by the backend (`extra="allow"`), mirrored here. */
   [key: string]: unknown
 }
 

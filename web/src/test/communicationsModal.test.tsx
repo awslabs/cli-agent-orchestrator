@@ -2,6 +2,17 @@
 //
 // Fixtures mirror test/api/test_communications_catalog_api.py's shapes — the
 // API's real envelopes, not shapes the UI wishes it had received.
+//
+// FIXTURE DISCLOSURE — cond-0477: Every fixture in this file that carries a
+// bound task_occurrence_id models a state no shipped conductor writer
+// currently produces — all current writers record task_occurrence_id = NULL
+// (cond-0477). The fork's contract is the published index format and a bound
+// occurrence is a legal value of it. The API reports `coverage:"complete"`,
+// `total:0` with no reason code for the unbound case, so the reader cannot
+// distinguish "unbound" from "genuinely empty" — a known limitation that
+// resolves when cond-0477 lands. The empty/unbound path
+// (`coverage:"complete"`, `total: 0`) is covered by the empty-catalog test
+// below, which is the only answer production can currently give.
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { useState } from 'react'
@@ -479,6 +490,18 @@ describe('list failure and coverage states', () => {
     const banner = await screen.findByTestId('coverage-banner')
     expect(banner.textContent).toContain('truncated')
     expect(banner.textContent).toContain('project limit')
+  })
+
+  it('a first page of a >50-record truncated list with no reasons renders no trailing colon', async () => {
+    stubCatalog(catalogItems().slice(0, 2), {
+      listOverrides: { coverage: 'truncated', reasons: [] },
+    })
+    renderModal()
+    const banner = await screen.findByTestId('coverage-banner')
+    expect(banner.textContent).toContain('truncated')
+    // No colon when there is no reason line following it.
+    expect(banner.textContent).not.toContain(':')
+    expect(banner.textContent).toContain('not every row could be served')
   })
 })
 

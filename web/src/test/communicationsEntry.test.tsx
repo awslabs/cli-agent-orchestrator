@@ -7,9 +7,19 @@
 //     before: no buttons, no actionable chips, no fetches beyond today's;
 //   * the modal's open/selection state round-trips through
 //     ?task_occurrence_id=&communication_id= for reload, Back, and copied links.
+//
+// FIXTURE DISCLOSURE — cond-0477: Every fixture in this file that carries a
+// bound task_occurrence_id models a state no shipped conductor writer
+// currently produces — all current writers record task_occurrence_id = NULL
+// (cond-0477). The fork's contract is the published index format and a bound
+// occurrence is a legal value of it. The API reports `coverage:"complete"`,
+// `total:0` with no reason code for the unbound case, so the reader cannot
+// distinguish "unbound" from "genuinely empty" — a known limitation that
+// resolves when cond-0477 lands. The empty/unbound path is itself covered by
+// the "missing catalog root" and empty-catalog tests (communicationsModal).
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, cleanup, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
 import { useStore } from '../store'
 import { projectedTerminal } from './projectedTerminal'
@@ -246,6 +256,221 @@ describe('chips become entry points only with a task occurrence and a catalog', 
     await renderDashboard()
     await waitFor(() => expect(screen.getAllByTestId('annotation-chip').length).toBe(1))
     expect(calls.filter(u => u.startsWith('/communications'))).toEqual([])
+  })
+})
+
+describe('probe latch — a build property never changes without a restart', () => {
+  async function flushMicrotasks() {
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+  }
+
+  async function oneMorePoll() {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5200)
+    })
+    await flushMicrotasks()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    await flushMicrotasks()
+  }
+
+  const commCalls = (calls: string[]) => calls.filter(u => u.startsWith('/communications'))
+  const annotationCalls = (calls: string[]) => calls.filter(u => u === '/annotations')
+
+  it('latches the probe on a 404: a later poll issues no second GET', async () => {
+    vi.useFakeTimers()
+    try {
+      const calls = stubDashboard({
+        annotations: annotationsPayload([annotation({ subject: { type: 'task', task_occurrence_id: TASK } })]),
+        // communications handler omitted: every /communications call 404s — a
+        // property of this server build, unchangeable without a restart.
+      })
+      render(<DashboardHome onNavigate={() => {}} />)
+      for (let i = 0; i < 40; i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        await flushMicrotasks()
+        if (screen.queryByText('cao-fleet') && useStore.getState().terminalStatuses[TERMINAL.id]) break
+      }
+      for (let i = 0; i < 40; i++) {
+        await flushMicrotasks()
+        if (commCalls(calls).length >= 1) break
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        await flushMicrotasks()
+      }
+      expect(commCalls(calls).length).toBeGreaterThanOrEqual(1)
+      const commsBefore = commCalls(calls).length
+      const annotationsBefore = annotationCalls(calls).length
+      await oneMorePoll()
+      // The annotations poll really fired again; the probe did not re-fire.
+      expect(annotationCalls(calls).length).toBeGreaterThan(annotationsBefore)
+      expect(commCalls(calls)).toHaveLength(commsBefore)
+      expect(screen.getByTestId('annotation-chip').tagName).toBe('SPAN')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('latches the probe on an unreadable body for the same reason', async () => {
+    vi.useFakeTimers()
+    try {
+      const calls = stubDashboard({
+        annotations: annotationsPayload([annotation({ subject: { type: 'task', task_occurrence_id: TASK } })]),
+        communications: url => (url.startsWith('/communications?') ? { body: { unexpected: true } } : undefined),
+      })
+      render(<DashboardHome onNavigate={() => {}} />)
+      for (let i = 0; i < 40; i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        await flushMicrotasks()
+        if (screen.queryByText('cao-fleet') && useStore.getState().terminalStatuses[TERMINAL.id]) break
+      }
+      for (let i = 0; i < 40; i++) {
+        await flushMicrotasks()
+        if (commCalls(calls).length >= 1) break
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        await flushMicrotasks()
+      }
+      expect(commCalls(calls).length).toBeGreaterThanOrEqual(1)
+      const commsBefore = commCalls(calls).length
+      const annotationsBefore = annotationCalls(calls).length
+      await oneMorePoll()
+      expect(annotationCalls(calls).length).toBeGreaterThan(annotationsBefore)
+      expect(commCalls(calls)).toHaveLength(commsBefore)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a transient probe error is NOT latched: the next poll re-probes', async () => {
+    vi.useFakeTimers()
+    try {
+      let failed = false
+      const calls = stubDashboard({
+        annotations: annotationsPayload([annotation({ subject: { type: 'task', task_occurrence_id: TASK } })]),
+        communications: url => {
+          if (url.startsWith('/communications?')) {
+            if (!failed) {
+              failed = true
+              throw new TypeError('fetch failed')
+            }
+            return { body: listEnvelope([commItem('c-1')]) }
+          }
+          return { body: { communication: commItem('c-1'), content: 'x', reason: null } }
+        },
+      })
+      render(<DashboardHome onNavigate={() => {}} />)
+      for (let i = 0; i < 40; i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        await flushMicrotasks()
+        if (screen.queryByText('cao-fleet') && useStore.getState().terminalStatuses[TERMINAL.id]) break
+      }
+      for (let i = 0; i < 40; i++) {
+        await flushMicrotasks()
+        if (commCalls(calls).length >= 1) break
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        await flushMicrotasks()
+      }
+      expect(commCalls(calls).length).toBeGreaterThanOrEqual(1)
+      const commsBefore = commCalls(calls).length
+      await oneMorePoll()
+      // Wait for the re-probe's microtasks to settle.
+      for (let i = 0; i < 20; i++) {
+        await flushMicrotasks()
+        if (commCalls(calls).length > commsBefore) break
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+      }
+      expect(commCalls(calls)).toHaveLength(commsBefore + 1)
+      // The re-probe's answer armed the entry point.
+      for (let i = 0; i < 20; i++) {
+        await flushMicrotasks()
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        if (screen.queryByTestId('annotation-chip')?.getAttribute('data-actionable') === 'true') break
+      }
+      expect(screen.getByTestId('annotation-chip').getAttribute('data-actionable')).toBe('true')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a "not installed" answer is NOT latched: a catalog appearing mid-session is picked up', async () => {
+    vi.useFakeTimers()
+    try {
+      let installed = false
+      const calls = stubDashboard({
+        annotations: annotationsPayload([annotation({ subject: { type: 'task', task_occurrence_id: TASK } })]),
+        communications: url => {
+          if (url.startsWith('/communications?')) {
+            return installed
+              ? { body: listEnvelope([commItem('c-1')]) }
+              : {
+                  body: listEnvelope([], {
+                    coverage: 'unavailable',
+                    reasons: [{ source: 'conductor-state-root', reason: 'missing' }],
+                  }),
+                }
+          }
+          return { body: { communication: commItem('c-1'), content: 'x', reason: null } }
+        },
+      })
+      render(<DashboardHome onNavigate={() => {}} />)
+      for (let i = 0; i < 40; i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        await flushMicrotasks()
+        if (screen.queryByText('cao-fleet') && useStore.getState().terminalStatuses[TERMINAL.id]) break
+      }
+      for (let i = 0; i < 40; i++) {
+        await flushMicrotasks()
+        if (commCalls(calls).length >= 1) break
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        await flushMicrotasks()
+      }
+      expect(commCalls(calls).length).toBeGreaterThanOrEqual(1)
+      const commsBefore = commCalls(calls).length
+      installed = true
+      await oneMorePoll()
+      for (let i = 0; i < 20; i++) {
+        await flushMicrotasks()
+        if (commCalls(calls).length > commsBefore) break
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+      }
+      expect(commCalls(calls)).toHaveLength(commsBefore + 1)
+      for (let i = 0; i < 20; i++) {
+        await flushMicrotasks()
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10)
+        })
+        if (screen.queryByTestId('annotation-chip')?.getAttribute('data-actionable') === 'true') break
+      }
+      expect(screen.getByTestId('annotation-chip').getAttribute('data-actionable')).toBe('true')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

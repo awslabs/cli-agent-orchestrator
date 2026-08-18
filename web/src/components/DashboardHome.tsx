@@ -203,6 +203,11 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   const [catalogTarget, setCatalogTarget] = useState<CommunicationTarget | null>(null)
   /** A conductor catalog answered the probe; entry points may render. */
   const [catalogPresent, setCatalogPresent] = useState(false)
+  /** Latched when the probe's answer is a property of this server build
+   *  (404 or an unreadable body): neither can change without a restart, and
+   *  a restart serves a fresh page — so probing again can never change its
+   *  answer. "Not installed" and transient network errors are NOT latched. */
+  const catalogProbeLatchedRef = useRef(false)
 
   const totalTerminals = sessionData.reduce((sum, s) => sum + s.terminals.length, 0)
 
@@ -356,9 +361,11 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   // An UNREADABLE root still arms the entry points: the modal carries the
   // named unavailable state and its retry. While absent, the next annotations
   // poll re-probes (one bounded GET on the same cadence), so a catalog that
-  // appears mid-session is picked up without a reload.
+  // appears mid-session is picked up without a reload — except for the two
+  // answers that are properties of this server build (404, unreadable body),
+  // which latch the probe off: they cannot change without a restart.
   useEffect(() => {
-    if (catalogPresent) return
+    if (catalogPresent || catalogProbeLatchedRef.current) return
     const candidate = annotations?.annotations.find(a => communicationTarget(a) !== null)
     if (!candidate) return
     const target = communicationTarget(candidate)
@@ -369,11 +376,16 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
       .then(body => {
         if (cancelled) return
         const page = readCommunicationsList(body)
-        if (!page) return
+        if (!page) {
+          catalogProbeLatchedRef.current = true
+          return
+        }
         if (catalogAvailability(page.coverage, page.reasons) === 'not-installed') return
         setCatalogPresent(true)
       })
-      .catch(() => {})
+      .catch((error: unknown) => {
+        if ((error as { status?: number })?.status === 404) catalogProbeLatchedRef.current = true
+      })
     return () => {
       cancelled = true
     }

@@ -3,6 +3,15 @@
 // The mapping tests pin the §2.1 contract: every reason code gets its own
 // words, absent and unreadable never collapse into one another, and unknown
 // future codes degrade to a neutral message that still shows the raw code.
+//
+// FIXTURE DISCLOSURE — cond-0477: Every fixture in this file that carries a
+// bound task_occurrence_id models a state no shipped conductor writer
+// currently produces — all current writers record task_occurrence_id = NULL
+// (cond-0477). The fork's contract is the published index format and a bound
+// occurrence is a legal value of it. The API reports `coverage:"complete"`,
+// `total:0` with no reason code for the unbound case, so the reader cannot
+// distinguish "unbound" from "genuinely empty" — a known limitation that
+// resolves when cond-0477 lands.
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { api, type CatalogReason, type CommunicationsListResponse } from '../api'
@@ -170,17 +179,17 @@ describe('contentReasonText — tombstones never impersonate each other', () => 
 describe('detailFailure', () => {
   it('404 is a stable not-found, not an error with a retry', () => {
     const f = detailFailure({ status: 404, message: '404 Not Found' })
-    expect(f.kind).toBe('not-found')
+    expect(f.failureKind).toBe('not-found')
     expect(f.message).toContain('not in the catalog')
   })
 
   it('400 means the link identifier is invalid', () => {
-    expect(detailFailure({ status: 400 }).kind).toBe('invalid')
+    expect(detailFailure({ status: 400 }).failureKind).toBe('invalid')
   })
 
   it('a digest mismatch says corrupt and is never rendered', () => {
     const f = detailFailure({ status: 503, detail: 'content-digest-mismatch' })
-    expect(f.kind).toBe('corrupt')
+    expect(f.failureKind).toBe('corrupt')
     expect(f.message).toContain('integrity check')
     expect(f.message).toContain('corrupt')
     expect(f.message).not.toContain('missing')
@@ -188,18 +197,18 @@ describe('detailFailure', () => {
 
   it('a 503 carrying content-unreadable is an ordinary unavailable state', () => {
     const f = detailFailure({ status: 503, detail: 'content-unreadable' })
-    expect(f.kind).toBe('unavailable')
+    expect(f.failureKind).toBe('unavailable')
     expect(f.message).toContain('could not be read')
   })
 
   it('401/403 are ordinary unavailable states, not auth flows', () => {
-    expect(detailFailure({ status: 401 }).kind).toBe('unavailable')
-    expect(detailFailure({ status: 403 }).kind).toBe('unavailable')
+    expect(detailFailure({ status: 401 }).failureKind).toBe('unavailable')
+    expect(detailFailure({ status: 403 }).failureKind).toBe('unavailable')
   })
 
   it('a network failure is unavailable and says so', () => {
     const f = detailFailure(new TypeError('fetch failed'))
-    expect(f.kind).toBe('unavailable')
+    expect(f.failureKind).toBe('unavailable')
     expect(f.message).toContain('could not be reached')
   })
 })
@@ -209,21 +218,21 @@ describe('listFailure — the list route reads statuses its own way', () => {
     // The real list route cannot 404: root problems come back 200 +
     // coverage 'unavailable'. A 404 here is a build without the route.
     const f = listFailure({ status: 404, detail: 'communications-catalog-not-found' })
-    expect(f.kind).toBe('not-found')
+    expect(f.failureKind).toBe('not-found')
     expect(f.message).toContain('No communications catalog is installed')
     expect(f.message).not.toContain('not in the catalog')
   })
 
   it.each([400, 422])('a list %i is a deterministic invalid identifier, not retryable', status => {
     const f = listFailure({ status, detail: 'identifier-invalid' })
-    expect(f.kind).toBe('invalid')
+    expect(f.failureKind).toBe('invalid')
     expect(f.message).toContain('not a valid catalog identifier')
   })
 
   it('network and 5xx stay retryable unavailable states', () => {
-    expect(listFailure(new TypeError('fetch failed')).kind).toBe('unavailable')
-    expect(listFailure({ status: 503 }).kind).toBe('unavailable')
-    expect(listFailure({ status: 401 }).kind).toBe('unavailable')
+    expect(listFailure(new TypeError('fetch failed')).failureKind).toBe('unavailable')
+    expect(listFailure({ status: 503 }).failureKind).toBe('unavailable')
+    expect(listFailure({ status: 401 }).failureKind).toBe('unavailable')
   })
 })
 
