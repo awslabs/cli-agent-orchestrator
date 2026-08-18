@@ -1366,10 +1366,10 @@ async def resume_script_run(
         # Read BEFORE apply_decisions: that write turns a fresh decision and a stale,
         # crash-surviving authorisation into the same durable state. The subtraction is
         # per-step so a fresh decision for one step cannot launder consent left on another.
-        authorised_states = set(workflow_journal._DECISION_STATES.values())
+        authorised_states = set(workflow_journal.DECISION_STATES.values())
         for journal_step in await asyncio.to_thread(workflow_journal.get_steps, run_id):
             if journal_step.state in authorised_states and (
-                not decisions or journal_step.step_id not in decisions
+                decisions is None or journal_step.step_id not in decisions
             ):
                 raise ResumeNotAllowedError(
                     f"run '{run_id}' step '{journal_step.step_id}' has unconsumed recovery consent; "

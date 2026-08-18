@@ -1089,6 +1089,29 @@ class TestOrphanedRecoveryConsentRequiresARedecision:
         assert _all_columns() == before
 
     @pytest.mark.asyncio
+    async def test_a_refusal_releases_the_claim_and_the_remedy_still_works(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._completing_drive(monkeypatch)
+        _seed_run()
+        _seed_step(state=StepState.RERUN_AUTHORIZED.value)
+
+        with pytest.raises(workflow_service.ResumeNotAllowedError, match="fresh decision"):
+            await script_runner.resume_script_run(RUN)
+
+        assert RUN not in workflow_service._active_drives
+
+        with pytest.raises(workflow_service.ResumeNotAllowedError) as second:
+            await script_runner.resume_script_run(RUN)
+
+        assert "fresh decision" in str(second.value)
+        assert "currently executing" not in str(second.value)
+
+        result = await script_runner.resume_script_run(RUN, {STEP: "rerun"})
+
+        assert result.state is RunState.COMPLETED
+
+    @pytest.mark.asyncio
     async def test_a_fresh_decision_for_the_same_step_is_read_before_it_is_applied(
         self, monkeypatch: pytest.MonkeyPatch
     ):

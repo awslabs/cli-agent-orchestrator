@@ -571,10 +571,12 @@ def settle_run_state_if_running(run_id: str, state: str, finished_at: Optional[s
 # ``test_recovery_decision_intake.py`` pins the KEYS against ``RecoveryDecision``
 # and the VALUES against ``StepState`` from its own imports, so a rename or a third
 # member on either side fails loudly instead of drifting.
-_DECISION_STATES: Dict[str, str] = {
+DECISION_STATES: Dict[str, str] = {
     "rerun": "rerun_authorized",  # -> gate rule 1 -> EXECUTE (BR-2)
     "skip": "replay_authorized",  # -> gate rules 7/9 excluded -> catch-all -> REPLAY (BR-3)
 }
+# Kept as a compatibility alias for existing tests that pin the original name.
+_DECISION_STATES = DECISION_STATES
 
 
 def apply_decisions(run_id: str, decisions: Mapping[str, str]) -> Dict[str, str]:
@@ -772,7 +774,7 @@ def revoke_unconsumed_decisions(run_id: str, prior_states: Mapping[str, str]) ->
     if not prior_states:
         return []
 
-    authorised = set(_DECISION_STATES.values())
+    authorised = set(DECISION_STATES.values())
     revoked: List[str] = []
     with _connect() as conn:
         for step_id, prior in prior_states.items():
