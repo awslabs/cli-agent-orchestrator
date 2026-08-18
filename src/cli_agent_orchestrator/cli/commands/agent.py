@@ -158,6 +158,12 @@ def assign_cmd(agent_profile, message, working_directory, engine, model, use_wor
     default=False,
     help="Return immediately after creating the worker; don't wait for it to complete.",
 )
+@click.option(
+    "--idempotency-key",
+    "idempotency_key",
+    default=None,
+    help="Make a retry with this same value safe -- reattaches instead of creating a duplicate.",
+)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def handoff_cmd(
     agent_profile,
@@ -168,6 +174,7 @@ def handoff_cmd(
     model,
     use_worktree,
     no_wait,
+    idempotency_key,
     as_json,
 ):
     """Hand off a task to a worker terminal and BLOCK until it completes.
@@ -180,14 +187,18 @@ def handoff_cmd(
 
     Recovering from a kill: the worker's terminal_id is printed to stderr as
     soon as the worker exists -- before the wait for completion, not just at
-    the end -- so `Ctrl-C`-ing this command still leaves you a handle. Check
+    the end -- so `Ctrl-C`-ing this command still leaves you a handle: check
     on it with `cao agent status TERMINAL_ID`, read whatever it produced with
     `cao agent result TERMINAL_ID`, or free it with `cao agent cancel --delete
-    TERMINAL_ID`. This is NOT automatic retry-safety: re-running the same
-    `cao agent handoff` command after a kill creates a SECOND worker rather
-    than reattaching to the first -- there is no request-id dedup yet
-    (tracked in issue #636). Use --no-wait below, or the printed terminal_id,
-    to manage a long-running worker deliberately instead of blind-retrying.
+    TERMINAL_ID`.
+
+    For automatic retry-safety (not just a manual handle), pass
+    --idempotency-key KEY: re-running this exact command with the SAME key
+    after a kill reattaches to the worker the first, already-committed
+    attempt created, instead of creating a second one -- this covers even a
+    response that never reached this process at all, not just a `Ctrl-C`
+    after the terminal_id was already printed above. Omit it (the default)
+    and a retry creates a new worker, same as today.
 
     --no-wait: returns as soon as the worker exists and has been sent MESSAGE,
     without waiting for -- or extracting -- its result, and without tearing it
@@ -241,6 +252,7 @@ def handoff_cmd(
                 use_worktree=use_worktree,
                 on_terminal_id=_report_terminal_id,
                 wait=not no_wait,
+                idempotency_key=idempotency_key,
             )
         )
     except KeyboardInterrupt:

@@ -2416,6 +2416,7 @@ async def create_session(
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -2456,6 +2457,14 @@ async def create_session(
     that sibling endpoint threaded it through to
     ``terminal_service.create_terminal`` -- a fresh (no existing session)
     caller requesting a worktree had it silently dropped.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -2510,6 +2519,7 @@ async def create_session(
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
             use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
         )
@@ -2647,6 +2657,7 @@ async def create_terminal_in_session(
     defer_init: bool = False,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -2678,6 +2689,14 @@ async def create_terminal_in_session(
     ``defer_init`` rather than moving into the JSON body. Runs synchronously
     before the deferred-init background task (if any) is scheduled, so it
     applies the same way regardless of ``defer_init``.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -2746,6 +2765,7 @@ async def create_terminal_in_session(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
         )
         return result
     except HTTPException:

@@ -528,6 +528,65 @@ class TestCreateTerminalUseWorktree:
         _, kwargs = mock_requests.post.call_args
         assert "use_worktree" not in kwargs["params"]
 
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_idempotency_key_reaches_existing_session_params(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """Review on PR #634, issue #616."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "claude_code",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo", idempotency_key="retry-1")
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["idempotency_key"] == "retry-1"
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_idempotency_key_reaches_new_session_params(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """Review on PR #634, issue #616."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal("reviewer", idempotency_key="retry-1")
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["idempotency_key"] == "retry-1"
+
     @patch("cli_agent_orchestrator.mcp_server.server._assign_impl")
     def test_assign_tool_forwards_use_worktree_to_impl(self, mock_impl):
         """The public `assign` MCP tool itself threads use_worktree through to

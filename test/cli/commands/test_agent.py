@@ -191,7 +191,25 @@ class TestHandoff:
             "model": "fable-5",
             "use_worktree": True,
             "wait": True,
+            "idempotency_key": None,
         }
+
+    @patch("cli_agent_orchestrator.cli.commands.agent._handoff_impl")
+    def test_idempotency_key_forwarded(self, mock_impl, runner):
+        """Review on PR #634, issue #616."""
+
+        async def _fake_handoff(*args, **kwargs):
+            return HandoffResult(success=True, message="ok", output=None, terminal_id="w1")
+
+        mock_impl.side_effect = _fake_handoff
+
+        result = runner.invoke(
+            agent,
+            ["handoff", "developer", "do it", "--idempotency-key", "retry-1"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert mock_impl.call_args.kwargs["idempotency_key"] == "retry-1"
 
     @patch("cli_agent_orchestrator.cli.commands.agent._handoff_impl")
     def test_no_wait_forwards_wait_false_and_skips_the_waiting_line(self, mock_impl, runner):

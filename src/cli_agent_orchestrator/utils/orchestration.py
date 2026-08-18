@@ -189,12 +189,20 @@ def _create_terminal(
     model: Optional[str] = None,
     use_worktree: bool = False,
     create_timeout: Optional[float] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
     Args:
         agent_profile: Agent profile for the terminal
         working_directory: Optional working directory for the terminal
+        idempotency_key: Review on PR #634, issue #616. Forwarded as a query
+            param to whichever endpoint this call hits (existing-session or
+            new-session); the server returns the terminal a PRIOR call with
+            the SAME key already created instead of creating a new one --
+            safe to pass again after a lost response. See
+            ``terminal_service.create_terminal``'s docstring for the
+            mechanics. ``None`` (default): today's behavior, unprotected.
         create_timeout: Client-side timeout for the create POST only (the
             metadata/working-directory GETs above it keep using
             ``_mcp_timeout()`` regardless -- they're fast reads either way).
@@ -297,6 +305,8 @@ def _create_terminal(
             params["model"] = model
         if use_worktree:
             params["use_worktree"] = "true"
+        if idempotency_key:
+            params["idempotency_key"] = idempotency_key
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -348,6 +358,8 @@ def _create_terminal(
             params["model"] = model
         if use_worktree:
             params["use_worktree"] = "true"
+        if idempotency_key:
+            params["idempotency_key"] = idempotency_key
 
         json_body = None
         if initial_message is not None:
@@ -687,6 +699,7 @@ async def _handoff_impl(
     use_worktree: bool = False,
     on_terminal_id: Optional[Callable[[str], None]] = None,
     wait: bool = True,
+    idempotency_key: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -715,13 +728,19 @@ async def _handoff_impl(
     blocking handoff has a real terminal_id to recover with (``cao agent
     status``/``result``/``cancel``) instead of blind-retrying into a second
     worker, and ``wait=False`` (``--no-wait``) to return immediately after
-    creation without waiting, extracting, or tearing down at all. Neither is
-    server-side idempotency: the terminal_id is real and recoverable, but a
-    killed-and-retried call still creates a second worker if the operator
-    retries instead of reconnecting to the terminal_id they were given. Full
-    request-id dedup needs server-side job persistence -- tracked separately
-    (a fork PR pre-empting the upstream maintainer's design there is exactly
-    the risk this split avoids).
+    creation without waiting, extracting, or tearing down at all.
+
+    ``idempotency_key`` (review on PR #634, issue #616 -- haofeif's follow-up
+    pass): closes the gap the paragraph above used to describe as
+    out-of-scope. Forwarded to ``_create_terminal``'s early-terminal-id
+    create call, which forwards it to the server; the server persists
+    ``(idempotency_key -> terminal_id)`` atomically with the terminal row
+    (see ``terminal_service.create_terminal``'s docstring), so a caller that
+    supplies the SAME key on a retry -- including one whose FIRST attempt's
+    HTTP response was lost entirely, not just a caller who saw a
+    ``terminal_id`` and then died -- gets back the terminal that first,
+    already-committed attempt created, not a second worker. ``None``
+    (default, and always for the MCP tool): today's unprotected behavior.
     """
     start_time = time.time()
     terminal_id: Optional[str] = None
@@ -798,6 +817,7 @@ async def _handoff_impl(
             model=model,
             use_worktree=use_worktree,
             create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
+            idempotency_key=idempotency_key,
         )
         if on_terminal_id is not None:
             try:

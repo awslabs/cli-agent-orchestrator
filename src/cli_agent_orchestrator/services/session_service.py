@@ -54,6 +54,7 @@ async def create_session(
     initial_message_orchestration_type: OrchestrationType | None = None,
     model: str | None = None,
     use_worktree: bool = False,
+    idempotency_key: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
@@ -79,6 +80,12 @@ async def create_session(
     to ``create_terminal`` -- see its own docstring for the isolation/teardown
     mechanics. Previously dropped silently for a fresh session (no code path
     threaded it this far), unlike the existing-session terminal-creation path.
+
+    ``idempotency_key`` (review on PR #634, issue #616): forwarded as-is to
+    ``create_terminal`` -- see its own docstring for the retry-safety
+    mechanics. A caller supplying the same key on a retry gets back the
+    SAME terminal this function already created for it, without a second
+    tmux window or provider process.
     """
     if initial_message == "":
         raise ValueError("initial_message must not be empty")
@@ -105,6 +112,7 @@ async def create_session(
         initial_message_orchestration_type=initial_message_orchestration_type,
         model=model,
         use_worktree=use_worktree,
+        idempotency_key=idempotency_key,
         group=group,
         metadata=metadata,
     )

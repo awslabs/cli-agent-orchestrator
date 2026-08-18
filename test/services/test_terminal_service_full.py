@@ -182,6 +182,7 @@ class TestCreateTerminal:
             engine="v2",
             group=None,
             metadata=None,
+            idempotency_key=None,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
@@ -833,6 +834,154 @@ class TestCreateTerminal:
         mock_provider.initialize.assert_called_once()
         # allowed_tools should be None since profile was not found
         assert mock_provider_manager.create_provider.call_args.kwargs.get("allowed_tools") is None
+
+
+class TestCreateTerminalIdempotencyKey:
+    """Tests for the early-terminal-id short-circuit (review on PR #634,
+    issue #616): this is what stops a retry from creating a second real
+    tmux window / provider process, not just a second DB row."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_id_by_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_existing_key_returns_prior_terminal_without_any_real_work(
+        self,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_create,
+        mock_lookup,
+        mock_get_terminal,
+    ):
+        mock_lookup.return_value = "prior-terminal"
+        mock_get_terminal.return_value = {
+            "id": "prior-terminal",
+            "name": "developer-abcd",
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "agent_profile": "developer",
+            "caller_id": None,
+            "allowed_tools": None,
+            "engine": None,
+            "group": None,
+            "metadata": None,
+            "status": "idle",
+            "last_active": datetime.now(),
+        }
+
+        result = await create_terminal(
+            "kiro_cli", "developer", new_session=True, idempotency_key="retry-key-1"
+        )
+
+        assert result.id == "prior-terminal"
+        mock_lookup.assert_called_once_with("retry-key-1")
+        mock_get_terminal.assert_called_once_with("prior-terminal")
+        # The whole point: no tmux window, no provider process, no new DB row.
+        mock_tmux.session_exists.assert_not_called()
+        mock_tmux.create_session.assert_not_called()
+        mock_provider_manager.create_provider.assert_not_called()
+        mock_db_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_id_by_idempotency_key")
+    async def test_unseen_key_creates_normally_and_forwards_to_db(
+        self,
+        mock_lookup,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """A key nobody has used yet takes the full create path, exactly like
+        no key at all -- except the key is now forwarded to the DB layer so
+        THIS attempt becomes the one a future retry finds."""
+        mock_lookup.return_value = None
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        result = await create_terminal(
+            "kiro_cli", "developer", new_session=True, idempotency_key="fresh-key"
+        )
+
+        assert result.id == "test1234"
+        mock_lookup.assert_called_once_with("fresh-key")
+        assert mock_db_create.call_args.kwargs["idempotency_key"] == "fresh-key"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_id_by_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    async def test_stale_mapping_falls_through_to_a_fresh_create(
+        self,
+        mock_status_monitor,
+        mock_fifo_manager,
+        mock_fifo_dir,
+        mock_db_create,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_provider_manager,
+        mock_lookup,
+        mock_get_terminal,
+    ):
+        """The mapped terminal from a prior, now-torn-down job (e.g. a
+        completed handoff, retried long after) is gone -- get_terminal raises
+        ValueError for it. That must not crash the caller; it must create a
+        fresh terminal exactly as if the key had never been used."""
+        mock_lookup.return_value = "long-gone-terminal"
+        mock_get_terminal.side_effect = ValueError("Terminal 'long-gone-terminal' not found")
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        result = await create_terminal(
+            "kiro_cli", "developer", new_session=True, idempotency_key="stale-key"
+        )
+
+        assert result.id == "test1234"
+        mock_db_create.assert_called_once()
 
 
 class TestCreateTerminalWorktree:

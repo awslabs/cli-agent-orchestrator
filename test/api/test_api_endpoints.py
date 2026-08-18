@@ -300,6 +300,7 @@ class TestCreateSession:
             initial_message_orchestration_type=None,
             model=None,
             use_worktree=False,
+            idempotency_key=None,
             group=None,
             metadata=None,
         )
@@ -352,6 +353,30 @@ class TestCreateSession:
 
         assert response.status_code == 400
         assert "not inside a git repository" in response.json()["detail"]
+
+    def test_create_session_forwards_idempotency_key(self, client):
+        """Review on PR #634, issue #616."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "retry-1",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["idempotency_key"] == "retry-1"
 
     def test_create_session_passes_explicit_kiro_engine(self, client):
         """An explicit engine reaches the session service and the response."""

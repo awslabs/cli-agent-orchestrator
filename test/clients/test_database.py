@@ -7,11 +7,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import (
     Base,
     FlowModel,
+    IdempotencyKeyModel,
     InboxModel,
     TerminalModel,
     create_flow,
@@ -24,6 +26,7 @@ from cli_agent_orchestrator.clients.database import (
     get_inbox_messages,
     get_pending_messages,
     get_terminal_group,
+    get_terminal_id_by_idempotency_key,
     get_terminal_metadata,
     init_db,
     list_flows,
@@ -324,6 +327,142 @@ class TestTerminalOperations:
         result = delete_terminals_by_session("cao-session")
 
         assert result == 2
+
+
+class TestIdempotencyKey:
+    """Tests for the idempotency-key mapping (review on PR #634, issue #616).
+
+    A caller-supplied key lets a retry (e.g. a killed ``cao agent handoff``)
+    reattach to the terminal a prior, already-committed call already
+    produced instead of creating a second one.
+    """
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_with_key_persists_both_rows(self, mock_session_class):
+        """The idempotency row is added in the SAME session as the terminal
+        row -- one extra add(), the SAME shared commit()."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        create_terminal(
+            "test123",
+            "cao-session",
+            "window-0",
+            "kiro_cli",
+            "developer",
+            idempotency_key="retry-key-1",
+        )
+
+        assert mock_session.add.call_count == 2
+        added_terminal = mock_session.add.call_args_list[0][0][0]
+        added_key_row = mock_session.add.call_args_list[1][0][0]
+        assert isinstance(added_terminal, TerminalModel)
+        assert isinstance(added_key_row, IdempotencyKeyModel)
+        assert added_key_row.key == "retry-key-1"
+        assert added_key_row.terminal_id == "test123"
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_without_key_adds_only_the_terminal_row(self, mock_session_class):
+        """Default (no key): today's exact behavior, unchanged -- a single add()."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        create_terminal("test123", "cao-session", "window-0", "kiro_cli", "developer")
+
+        mock_session.add.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_id_by_idempotency_key_found(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_row = MagicMock()
+        mock_row.terminal_id = "test123"
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_row
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert get_terminal_id_by_idempotency_key("retry-key-1") == "test123"
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_id_by_idempotency_key_not_found(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert get_terminal_id_by_idempotency_key("never-seen") is None
+
+    def test_same_key_twice_is_atomic_second_attempt_persists_nothing(self, test_db):
+        """The core atomicity property: two create_terminal calls with the
+        SAME key but (inevitably) DIFFERENT generated terminal_ids -- the
+        second's commit fails on the idempotency_keys table's primary key,
+        and BOTH of its inserts roll back together, not just the
+        conflicting one. Needs a REAL in-memory SQLite engine (not a mock):
+        a mock has no transaction to roll back, so this is exactly the
+        property a mock-based test cannot exercise."""
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-first",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="shared-key",
+            )
+
+            with pytest.raises(IntegrityError):
+                create_terminal(
+                    "term-second",
+                    "cao-session",
+                    "window-1",
+                    "kiro_cli",
+                    "developer",
+                    idempotency_key="shared-key",
+                )
+
+            # The winner's mapping and terminal both survive the second
+            # call's failed transaction.
+            assert get_terminal_id_by_idempotency_key("shared-key") == "term-first"
+            assert get_terminal_metadata("term-first") is not None
+            # The loser's terminal row must NOT exist. If it did, the two
+            # inserts were not actually atomic -- only the idempotency insert
+            # rolled back, leaving an orphan terminal row with no
+            # idempotency mapping and no caller aware it was ever created.
+            assert get_terminal_metadata("term-second") is None
+
+    def test_different_keys_create_independent_terminals(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-a",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="key-a",
+            )
+            create_terminal(
+                "term-b",
+                "cao-session",
+                "window-1",
+                "kiro_cli",
+                "developer",
+                idempotency_key="key-b",
+            )
+
+            assert get_terminal_id_by_idempotency_key("key-a") == "term-a"
+            assert get_terminal_id_by_idempotency_key("key-b") == "term-b"
+            assert get_terminal_metadata("term-a") is not None
+            assert get_terminal_metadata("term-b") is not None
 
 
 class TestGroupAndMetadata:

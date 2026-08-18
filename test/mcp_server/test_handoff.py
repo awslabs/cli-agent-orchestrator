@@ -681,6 +681,33 @@ class TestHandoffEarlyTerminalId:
 
         assert mock_requests.post.call_args[1]["json"]["engine"] == "v2"
 
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_waiting_path_forwards_idempotency_key_to_create_terminal(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """Review on PR #634, issue #616: cao agent handoff --idempotency-key
+        reaches _create_terminal, not just the run-step reuse payload (which
+        run_agent_step would ignore anyway -- the key protects the CREATE
+        step, not the reuse step)."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = Exception
+            asyncio.run(
+                _handoff_impl(
+                    "developer",
+                    "Do task",
+                    on_terminal_id=lambda _: None,
+                    idempotency_key="retry-1",
+                )
+            )
+
+        assert mock_create.call_args[1]["idempotency_key"] == "retry-1"
+
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     @patch("cli_agent_orchestrator.utils.orchestration._send_direct_input_handoff")
