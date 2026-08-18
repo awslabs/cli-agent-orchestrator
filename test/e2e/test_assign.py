@@ -653,6 +653,31 @@ class TestAntigravityCliAssign:
         _run_assign_with_callback_test(provider="antigravity_cli")
 
 
+@pytest.mark.e2e
+class TestOmpAssign:
+    """OMP workers use the CAO MCP extension for assign and callbacks."""
+
+    def test_assign_data_analyst(self, require_omp):
+        _run_assign_test(
+            provider="omp",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS
+            + ["analysis", "send_message", "CAO_TERMINAL_ID"],
+        )
+
+    def test_assign_report_generator(self, require_omp):
+        _run_assign_test(
+            provider="omp",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_omp):
+        _run_assign_with_callback_test(provider="omp")
+
+
 # ---------------------------------------------------------------------------
 # Grok Build CLI provider
 # ---------------------------------------------------------------------------

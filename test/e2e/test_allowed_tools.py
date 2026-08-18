@@ -867,6 +867,32 @@ class TestAntigravityCliAllowedTools:
         )
 
 
+@pytest.mark.e2e
+class TestOmpAllowedTools:
+    """OMP restrictions are advisory: extension and MCP tools remain ambient."""
+
+    @pytest.mark.xfail(
+        reason="OMP CAO restrictions are soft enforcement only",
+        strict=False,
+    )
+    def test_restricted_supervisor_cannot_bash(self, require_omp):
+        _run_restricted_tool_test(
+            provider="omp",
+            agent_profile="code_supervisor",
+            allowed_tools="@cao-mcp-server",
+        )
+
+    def test_unrestricted_developer_can_bash(self, require_omp):
+        _run_unrestricted_tool_test(provider="omp", agent_profile="developer")
+
+    def test_allowed_tools_stored_in_metadata(self, require_omp):
+        _run_allowed_tools_stored_test(
+            provider="omp",
+            agent_profile="developer",
+            allowed_tools="@builtin,fs_read,@cao-mcp-server",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Grok Build CLI provider — hard enforcement via native --deny rules
 # ---------------------------------------------------------------------------

@@ -365,6 +365,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 For complete working examples with `role` and `allowedTools`, see the [examples directory](../examples/):
 
+- **[tool-restrictions/](../examples/tool-restrictions/)** — Supervisor/developer/reviewer role defaults plus an explicit `allowedTools` override, with a launch-by-launch breakdown of what's allowed and denied
 - **[assign/](../examples/assign/)** — Supervisor + worker agents with role-based restrictions
 - **[cross-provider/](../examples/cross-provider/)** — Mixed-provider workflows with per-agent tool restrictions
 - **[codex-basic/](../examples/codex-basic/)** — Codex agents with soft enforcement

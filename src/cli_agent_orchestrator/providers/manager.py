@@ -18,6 +18,7 @@ from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+from cli_agent_orchestrator.providers.omp import OmpProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,16 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
+                    model=model,
+                )
+            elif provider_type == ProviderType.OMP.value:
+                provider = OmpProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
                     model=model,
                 )
             elif provider_type == ProviderType.HERMES.value:

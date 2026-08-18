@@ -13,6 +13,7 @@ class ProviderType(str, Enum):
     HERMES = "hermes"
     CURSOR_CLI = "cursor_cli"
     ANTIGRAVITY_CLI = "antigravity_cli"
+    OMP = "omp"
     GROK_CLI = "grok_cli"
     # Credentials-free mock provider for tests/CI (no real CLI binary).
     MOCK_CLI = "mock_cli"

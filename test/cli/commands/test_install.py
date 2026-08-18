@@ -263,3 +263,24 @@ class TestCopyLocalProfileToStore:
 
         assert stem == "my-agent"
         assert (store / "my-agent.md").read_text(encoding="utf-8") == "body"
+
+
+def test_install_omp_provider_is_accepted_by_cli():
+    runner = CliRunner()
+    service_result = InstallResult(
+        success=True,
+        message="Agent 'developer' installed successfully",
+        agent_name="developer",
+        context_file="/tmp/agent-context/developer.md",
+        agent_file=None,
+        provider="omp",
+    )
+
+    with patch(
+        "cli_agent_orchestrator.cli.commands.install.install_agent",
+        return_value=service_result,
+    ) as mock_install:
+        result = runner.invoke(install, ["developer", "--provider", "omp"])
+
+    assert result.exit_code == 0
+    mock_install.assert_called_once_with("developer", "omp", None)
