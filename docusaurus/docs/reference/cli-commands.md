@@ -545,6 +545,7 @@ CAO supports multiple agent providers. Specify a provider with the `--provider` 
 | `kimi_cli` | Kimi CLI |
 | `copilot_cli` | GitHub Copilot CLI |
 | `opencode_cli` | OpenCode CLI |
+| `omp` | Oh My Pi |
 | `hermes` | Hermes |
 | `cursor_cli` | Cursor CLI |
 | `antigravity_cli` | Antigravity CLI |

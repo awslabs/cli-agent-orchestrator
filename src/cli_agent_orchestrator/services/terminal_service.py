@@ -160,6 +160,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.OMP.value,
     ProviderType.GROK_CLI.value,
 }
 
@@ -169,6 +170,7 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.OMP.value,
 }
 
 

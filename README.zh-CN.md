@@ -6,7 +6,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
 
-**CLI Agent Orchestrator (CAO)** 是一个开源的多 Agent 编排框架，面向 Claude Code、Kiro CLI、Codex CLI、Antigravity CLI、Hermes Agent、Kimi CLI、GitHub Copilot CLI、OpenCode 和 Cursor CLI 等 AI 编程 CLI。CAO 会把每个 Agent 运行在隔离的 tmux 会话中，并通过 Model Context Protocol (MCP) 以 supervisor-worker 模式协调它们。一个 supervisor Agent 可以并行、串行，或以 swarm 方式把任务分派给多个专长不同的 Agent。
+**CLI Agent Orchestrator (CAO)** 是一个开源的多 Agent 编排框架，面向 Claude Code、Kiro CLI、Codex CLI、Antigravity CLI、Hermes Agent、Kimi CLI、GitHub Copilot CLI、OpenCode、Oh My Pi 和 Cursor CLI 等 AI 编程 CLI。CAO 会把每个 Agent 运行在隔离的 tmux 会话中，并通过 Model Context Protocol (MCP) 以 supervisor-worker 模式协调它们。一个 supervisor Agent 可以并行、串行，或以 swarm 方式把任务分派给多个专长不同的 Agent。
 
 📚 **[文档站点](https://awslabs.github.io/cli-agent-orchestrator/)** —— 指南、参考文档，以及两门交互式课程（英文）。
 
@@ -132,6 +132,7 @@ CAO 驱动的是已有 CLI Agent 工具，它并不会替代这些工具。使�
 | **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://platform.moonshot.cn/docs/kimi-cli) | Moonshot API key |
 | **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
 | **OpenCode CLI**（实验性；多 Agent callback 暂时使用 inbox polling fallback，见 [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203)） | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
+| **Oh My Pi** | [Provider docs](docs/omp-cli.md) · [Installation](https://github.com/can1357/oh-my-pi) | OMP authenticated model account |
 | **Cursor CLI** | [Provider docs](docs/cursor-cli.md) · [Installation](https://cursor.com/cli) | Cursor subscription / API key |
 | **Antigravity CLI** | [Provider docs](docs/antigravity-cli.md) · [Installation](https://antigravity.google) | Google account（与 Antigravity IDE 登录共用） |
 
@@ -180,7 +181,7 @@ cao launch --agents code_supervisor
 
 # 或指定 provider
 cao launch --agents code_supervisor --provider claude_code
-# 可选值：kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
+# 可选值：kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | copilot_cli | opencode_cli | omp | cursor_cli
 
 # 不限制访问、跳过确认（危险）
 cao launch --agents code_supervisor --yolo
@@ -292,7 +293,7 @@ provider: claude_code
 ---
 ```
 
-有效值包括：`kiro_cli`、`claude_code`、`codex`、`antigravity_cli`、`hermes`、`kimi_cli`、`copilot_cli`、`opencode_cli`、`cursor_cli`。初始会话始终以 `cao launch --provider` 参数为准。详见 [`examples/cross-provider/`](examples/cross-provider/)。
+有效值包括：`kiro_cli`、`claude_code`、`codex`、`antigravity_cli`、`hermes`、`kimi_cli`、`copilot_cli`、`opencode_cli`、`omp`、`cursor_cli`。初始会话始终以 `cao launch --provider` 参数为准。详见 [`examples/cross-provider/`](examples/cross-provider/)。
 
 ### Tool Restrictions
 

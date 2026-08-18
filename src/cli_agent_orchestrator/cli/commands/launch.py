@@ -34,6 +34,7 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "kimi_cli",
     "kiro_cli",
     "opencode_cli",
+    "omp",
 }
 
 # Validation constraints for ``--env`` forwarded vars (mirrored server-side

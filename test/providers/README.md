@@ -19,12 +19,14 @@ test/providers/
 ├── test_copilot_cli_unit.py    # Copilot CLI unit tests (fast, mocked)
 ├── test_cursor_cli_unit.py     # Cursor CLI unit tests (fast, mocked)
 ├── test_opencode_cli_unit.py   # OpenCode CLI unit tests (fast, mocked)
+├── test_omp_unit.py            # Oh My Pi provider unit tests (fast, mocked)
 ├── test_base_provider.py       # Base provider abstract interface tests
 ├── test_tmux_working_directory.py # TmuxClient working directory tests
 ├── test_kiro_cli_integration.py # Kiro CLI integration tests (slow, real Kiro CLI)
 ├── fixtures/                    # Test fixture files
 │   ├── kiro_cli_*.txt          # Kiro CLI fixtures (default provider)
 │   ├── codex_*.txt             # Codex CLI fixtures
+│   ├── omp_*.txt               # OMP 17.2.10 captured fixtures
 │   └── ...                      # Per-provider fixtures
 └── README.md
 ```

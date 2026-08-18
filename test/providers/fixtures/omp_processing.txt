@@ -1,0 +1,6 @@
+Reply with exactly RAW_FIXTURE.
+
+⠋ Working… ⟨esc⟩
+
+╭── OMP session ─────────────────────────────────────────────────────────────╮
+╰─                                                                            ─╯

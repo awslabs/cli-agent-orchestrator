@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Oh My Pi (`omp`) provider with additive native configuration, profile MCP extension wiring, lifecycle detection, and supervisor/worker orchestration support (#559)
 - Add the official xAI Grok Build CLI as the `grok_cli` provider, including
   isolated per-terminal MCP configuration, native hard tool restrictions,
   multi-turn TUI support, orchestration e2e coverage, and provider docs.

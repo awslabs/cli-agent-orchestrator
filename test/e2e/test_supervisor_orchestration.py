@@ -877,6 +877,20 @@ class TestAntigravityCliSupervisorOrchestration:
         _run_supervisor_assign_test(provider="antigravity_cli")
 
 
+@pytest.mark.e2e
+class TestOmpSupervisorOrchestration:
+    """OMP supervisor delegates through CAO's extension-provided MCP tools."""
+
+    def test_supervisor_handoff(self, require_omp):
+        _run_supervisor_handoff_test(provider="omp")
+
+    def test_supervisor_assign_and_handoff(self, require_omp):
+        _run_supervisor_assign_test(provider="omp")
+
+    def test_supervisor_assign_three_analysts(self, require_omp):
+        _run_supervisor_assign_three_analysts_test(provider="omp")
+
+
 # ---------------------------------------------------------------------------
 # Grok Build CLI provider
 # ---------------------------------------------------------------------------

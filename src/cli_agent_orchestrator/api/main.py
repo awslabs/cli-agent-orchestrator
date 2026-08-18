@@ -2569,6 +2569,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "opencode_cli": "opencode",
         "cursor_cli": "agent",
         "antigravity_cli": "agy",
+        "omp": "omp",
         "grok_cli": "grok",
     }
     result = []
