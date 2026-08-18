@@ -11,8 +11,14 @@
 //     vbscript:, custom schemes, protocol-relative //host, and relative
 //     filesystem navigation are all refused;
 //   * images are replaced with a non-fetching placeholder;
-//   * byte and node budgets make pathological Markdown FAIL VISIBLY rather
-//     than hang the tab or silently truncate.
+//   * byte and node budgets make an over-budget document FAIL VISIBLY rather
+//     than silently truncate. They bound the SIZE of the content admitted and
+//     the NODE COUNT of the tree handed to the renderer — they do NOT bound
+//     parse time. A marker-dense document under the byte budget can still
+//     spend a long time inside the counting parse before the node rail trips
+//     (measured on this build: 512 KiB of dense emphasis ≈ 62 s), so a
+//     no-hang property is NOT claimed. The byte ceiling is an owner decision
+//     (design §13.3), revisited from measured usage rather than loosened here.
 
 import { unified } from 'unified'
 import remarkParse from 'remark-parse'

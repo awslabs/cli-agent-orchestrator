@@ -16,7 +16,7 @@
 // Over-budget documents are a NAMED STATE with the raw/download path next to
 // it — never a silent excerpt, never something that looks complete.
 
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Check, Copy, Download } from 'lucide-react'
@@ -167,7 +167,14 @@ export function SafeContentView({
   const markdown = isMarkdownMediaType(mediaType)
   const [mode, setMode] = useState<'rendered' | 'raw'>('rendered')
   const [copied, setCopied] = useState(false)
-  const breach = markdown && mode === 'rendered' ? markdownBudgetBreach(content) : null
+  // Memoized: the counting pass re-parses the document, and computing it in
+  // the component body would re-pay that parse on EVERY re-render — a Copy
+  // click alone renders twice (setCopied(true), then the 2s reset). The parse
+  // cost is paid once per (content, mode) pair, not once per render.
+  const breach = useMemo(
+    () => (markdown && mode === 'rendered' ? markdownBudgetBreach(content) : null),
+    [markdown, mode, content],
+  )
 
   const copy = async () => {
     try {

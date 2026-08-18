@@ -6,8 +6,9 @@
 // string proves nothing about what the component wired it into.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, cleanup, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { SafeContentView, SafeMarkdown } from '../components/SafeContentView'
+import * as safeMarkdownLib from '../lib/safeMarkdown'
 import {
   isMarkdownMediaType,
   markdownBudgetBreach,
@@ -192,6 +193,31 @@ describe('budgets fail visibly', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
     const raw = screen.getByTestId('content-raw')
     expect(raw.textContent).toBe(content) // complete, not an excerpt
+  })
+
+  it('the breach is computed once per (content, mode), not once per render', async () => {
+    vi.useFakeTimers()
+    try {
+      const spy = vi.spyOn(safeMarkdownLib, 'markdownBudgetBreach')
+      const writeText = vi.fn().mockResolvedValue(undefined)
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+      const content = '# memo\n\nsome content'
+      render(<SafeContentView content={content} mediaType="text/markdown" downloadBase="doc" />)
+      expect(spy).toHaveBeenCalledTimes(1)
+      // A Copy click re-renders twice — setCopied(true), then the 2s reset —
+      // and neither re-render may re-pay the counting parse.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('content-copy'))
+      })
+      expect(screen.getByTestId('content-copy')).toHaveTextContent('Copied')
+      act(() => {
+        vi.advanceTimersByTime(2100)
+      })
+      expect(screen.getByTestId('content-copy')).toHaveTextContent('Copy')
+      expect(spy).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
