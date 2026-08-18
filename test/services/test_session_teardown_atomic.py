@@ -26,6 +26,7 @@ mocking the race away.
 """
 
 import threading
+import time
 from typing import Dict, List, Set
 from unittest.mock import MagicMock
 
@@ -36,11 +37,52 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.backends.registry import set_backend
 from cli_agent_orchestrator.clients import database
-from cli_agent_orchestrator.services import session_env, session_service, terminal_service
+from cli_agent_orchestrator.services import (
+    session_env,
+    session_lock,
+    session_service,
+    terminal_service,
+)
 
 # Any thread join / lock acquire in these tests must be bounded: a self-deadlock
 # or a lock never released has to FAIL the test, not hang the whole run.
 DEADLOCK_TIMEOUT = 10.0
+
+
+def _wait_until_lock_contended(session_name, waiters=2, timeout=DEADLOCK_TIMEOUT):
+    """Block until ``waiters`` threads are registered on ``session_name``'s lock.
+
+    This is the deterministic way to establish that a second caller is blocked,
+    and it replaces the only alternative available to a test that cannot see
+    inside ``lock.acquire()``: "assert it is still blocked because it had not
+    finished after N seconds". That formulation is a guess about scheduling, and
+    a busy machine invalidates it — which is exactly how these tests flaked in
+    the full suite while passing in isolation.
+
+    ``session_lifecycle_lock`` bumps its refcount BEFORE calling
+    ``lock.acquire()``, so a count of 2 while another thread demonstrably holds
+    the lock means the second caller has committed to acquiring it and cannot
+    reach its critical section until the holder releases. Blocked-ness is then a
+    property of the construction rather than of the clock: a slow machine only
+    makes this wait longer, it cannot make the observation wrong.
+
+    ``timeout`` is an outer safety bound only, so a thread that never arrives
+    fails the test instead of hanging the run.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        with session_lock._registry_guard:
+            entry = session_lock._session_locks.get(session_name)
+        registered = 0 if entry is None else entry[1]
+        if registered >= waiters:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"only {registered} thread(s) registered on the lifecycle lock for "
+                f"{session_name!r} after {timeout}s, expected {waiters}: the "
+                "operation under test never reached the lock"
+            )
+        time.sleep(0.005)
 
 
 class FakeTmuxBackend:
@@ -705,20 +747,41 @@ class TeardownEntryGateBackend(FakeTmuxBackend):
     taken the lifecycle lock and enumerated rows. Tripping ``entered`` there and
     then blocking on ``release`` parks a teardown with the lock held and its race
     window wide open, so the other thread's attempt is guaranteed to overlap.
+
+    ``phases`` records, in order, the backend mutations that a caller can only
+    reach from INSIDE a lifecycle critical section. That turns "did the create
+    interleave?" into a question about ordering, answerable exactly, instead of a
+    question about how much wall clock elapsed without the create finishing.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.phases: List[str] = []
+        self._phases_lock = threading.Lock()
         self._gated = False
+
+    def _record(self, phase: str) -> None:
+        with self._phases_lock:
+            self.phases.append(phase)
 
     def session_exists_strict(self, session_name: str) -> bool:
         if not self._gated:
             self._gated = True
+            self._record("teardown-enter")
             self.entered.set()
             assert self.release.wait(DEADLOCK_TIMEOUT), "gate never released"
         return self.session_exists(session_name)
+
+    def kill_session(self, session_name: str) -> bool:
+        killed = super().kill_session(session_name)
+        self._record("teardown-kill")
+        return killed
+
+    def create_session(self, session_name, window_name, *args, **kwargs) -> None:
+        super().create_session(session_name, window_name, *args, **kwargs)
+        self._record("create-enter")
 
 
 def _create_in_thread(session_name):
@@ -768,20 +831,39 @@ def test_create_blocked_by_in_flight_teardown_same_name(real_db, runtime):
             create_finished.set()
 
     def _referee():
-        # Let the create get as far as it can (blocked on the lock), then release
-        # the teardown. If the create were NOT blocked it would have finished
-        # inside this window — which the assertion below catches.
-        assert create_started.wait(DEADLOCK_TIMEOUT)
-        blocked = not create_finished.wait(0.5)
-        backend.release.set()
-        return blocked
+        # Wait for POSITIVE evidence that the create is parked on the lifecycle
+        # lock the teardown is holding, then release the teardown. The create is
+        # committed to ``lock.acquire()`` at that point, so it provably cannot
+        # reach its critical section until the teardown's ``with`` block exits.
+        try:
+            assert create_started.wait(DEADLOCK_TIMEOUT), "create thread never started"
+            _wait_until_lock_contended("cao-race-a")
+            assert (
+                not create_finished.is_set()
+            ), "create completed while the teardown still held the lifecycle lock"
+        finally:
+            # Unconditional: a referee that died holding the gate would strand
+            # the teardown and report a bogus deadlock instead of the real failure.
+            backend.release.set()
 
     results = _run_threads([_teardown, _create, _referee])
     teardown_result, create_result, referee_result = results
 
     assert teardown_result[0] == "ok", f"teardown failed: {teardown_result[1]!r}"
-    assert referee_result[1] is True, "create was not blocked by the in-flight teardown"
+    assert (
+        referee_result[0] == "ok"
+    ), f"create was not blocked by the in-flight teardown: {referee_result[1]!r}"
     assert create_result[0] == "ok", f"create failed: {create_result[1]!r}"
+
+    # No interleaving, proven by ORDER: the create's critical section began only
+    # after the teardown had entered its own and killed the old incarnation.
+    # Without the lock, the create's ``create_session`` would land between
+    # ``teardown-enter`` and ``teardown-kill`` — the interleaving that orphans.
+    assert backend.phases == [
+        "teardown-enter",
+        "teardown-kill",
+        "create-enter",
+    ], f"create/teardown critical sections interleaved: {backend.phases}"
 
     new_id = create_result[1].id
     # Stores agree: the new incarnation is live in tmux and is the ONLY row.
@@ -844,16 +926,25 @@ def test_teardown_blocked_by_in_flight_create_same_name(real_db, runtime):
             teardown_finished.set()
 
     def _referee():
-        assert teardown_started.wait(DEADLOCK_TIMEOUT)
-        blocked = not teardown_finished.wait(0.5)
-        backend.release.set()
-        return blocked
+        # Same deterministic probe as order A, mirrored: release the create only
+        # once the teardown is provably parked on the lock the create holds.
+        try:
+            assert teardown_started.wait(DEADLOCK_TIMEOUT), "teardown thread never started"
+            _wait_until_lock_contended("cao-race-b")
+            assert (
+                not teardown_finished.is_set()
+            ), "teardown completed while the create still held the lifecycle lock"
+        finally:
+            # Unconditional, for the same reason as order A.
+            backend.release.set()
 
     results = _run_threads([_create, _teardown, _referee])
     create_result, teardown_result, referee_result = results
 
     assert create_result[0] == "ok", f"create failed: {create_result[1]!r}"
-    assert referee_result[1] is True, "teardown was not blocked by the in-flight create"
+    assert (
+        referee_result[0] == "ok"
+    ), f"teardown was not blocked by the in-flight create: {referee_result[1]!r}"
     assert teardown_result[0] == "ok", f"teardown failed: {teardown_result[1]!r}"
 
     new_id = create_result[1].id
@@ -869,35 +960,48 @@ class OverlapDetectingBackend(FakeTmuxBackend):
     """Detects two teardowns of the same name inside their critical sections.
 
     Every teardown passes through ``session_exists_strict`` while holding the
-    lifecycle lock. Marking the name busy there — with a short dwell so a genuine
-    overlap is actually observed rather than missed by luck — and unmarking it on
-    the way out records whether any two critical sections for the SAME name were
-    ever concurrent. Under mutual exclusion this must never happen.
+    lifecycle lock. Marking the name busy there and unmarking it on the way out
+    records whether any two critical sections for the SAME name were ever
+    concurrent. Under mutual exclusion this must never happen.
+
+    The FIRST entrant holds its section open until the other teardown is provably
+    registered on the lifecycle lock — a positive signal that it has arrived and
+    is committed to acquiring, rather than a guess that it probably has by now —
+    and then dwells briefly so that an implementation WITHOUT mutual exclusion,
+    which would keep walking straight into this method, is actually seen.
+
+    That dwell is a sensitivity aid ONLY, and is deliberately not load-bearing:
+    making it too short can merely cause the detector to MISS a broken
+    implementation, never to fail a correct one. The proof that the two teardowns
+    serialized does not rest on it — see ``enumerated`` in the test.
     """
+
+    SENSITIVITY_DWELL = 0.05
 
     def __init__(self) -> None:
         super().__init__()
         self._busy: Set[str] = set()
         self._busy_lock = threading.Lock()
         self.overlaps: List[str] = []
+        self._held_open = False
 
     def session_exists_strict(self, session_name: str) -> bool:
         with self._busy_lock:
             if session_name in self._busy:
                 self.overlaps.append(session_name)
             self._busy.add(session_name)
+            hold_open, self._held_open = not self._held_open, True
         try:
-            # Dwell inside the critical section so a concurrent entrant has a
-            # real chance to be seen (without this the race window is too narrow
-            # to observe reliably, and the test could pass by luck).
-            threading.Event().wait(0.15)
+            if hold_open:
+                _wait_until_lock_contended(session_name)
+                time.sleep(self.SENSITIVITY_DWELL)
             return self.session_exists(session_name)
         finally:
             with self._busy_lock:
                 self._busy.discard(session_name)
 
 
-def test_two_concurrent_teardowns_same_name_do_not_overlap(real_db, runtime):
+def test_two_concurrent_teardowns_same_name_do_not_overlap(real_db, runtime, monkeypatch):
     """Two teardowns of the same name must SERIALIZE, not interleave (#498 F3).
 
     Without the lock both enumerate the same rows, both act on the same live
@@ -913,6 +1017,24 @@ def test_two_concurrent_teardowns_same_name_do_not_overlap(real_db, runtime):
     set_backend(backend)
     _seed(backend, "cao-double", [("t1", "w1"), ("t2", "w2")], runtime)
 
+    # What each teardown enumerated at the TOP of its critical section. This is
+    # the timing-free proof that the two serialized: row enumeration and row
+    # deletion both live inside the critical section, so if the sections cannot
+    # coexist then whichever teardown runs second is guaranteed to find the
+    # registry already swept. Seeing the same rows twice means they overlapped.
+    enumerated: List[int] = []
+    enumerated_lock = threading.Lock()
+    real_list_terminals = session_service.list_terminals_by_session
+
+    def _recording_list_terminals(session_name):
+        rows = real_list_terminals(session_name)
+        if session_name == "cao-double":
+            with enumerated_lock:
+                enumerated.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(session_service, "list_terminals_by_session", _recording_list_terminals)
+
     start = threading.Barrier(2, timeout=DEADLOCK_TIMEOUT)
 
     def _teardown():
@@ -927,6 +1049,13 @@ def test_two_concurrent_teardowns_same_name_do_not_overlap(real_db, runtime):
     assert backend.overlaps == [], (
         "two teardowns of the same session name were inside their critical "
         f"sections simultaneously: {backend.overlaps}"
+    )
+    # The winner saw both rows, the loser saw a registry already swept. Only
+    # strict serialization produces this; an interleaving has the loser
+    # enumerating rows the winner has not deleted yet.
+    assert sorted(enumerated) == [0, 2], (
+        "the two teardowns did not serialize — rows each enumerated inside its "
+        f"critical section: {enumerated}"
     )
     # Exactly one kill reached the backend: the loser saw the session already gone.
     assert backend.kill_session_calls == 1
@@ -1041,8 +1170,6 @@ def test_teardown_does_not_self_deadlock_on_the_lifecycle_lock(real_db, runtime)
     Also proves the lock registry does not leak: after N teardowns of distinct
     names, nothing remains registered.
     """
-    from cli_agent_orchestrator.services import session_lock
-
     backend = FakeTmuxBackend()
     set_backend(backend)
     for i in range(5):
@@ -1085,8 +1212,6 @@ def test_no_plugin_code_runs_inside_the_lifecycle_lock(real_db, runtime):
     because ``post_kill_terminal`` is emitted per contained terminal from what
     used to be the middle of the critical section.
     """
-    from cli_agent_orchestrator.services import session_lock
-
     backend = FakeTmuxBackend()
     set_backend(backend)
     _seed(backend, "cao-plug", [("t1", "w1"), ("t2", "w2")], runtime)
@@ -1384,8 +1509,6 @@ def test_rollback_clears_forwarded_env_even_when_the_kill_raises_base_exception(
     # The lifecycle lock is released on the BaseException path too — a leaked
     # lock would deadlock every later create/teardown of this name, so prove a
     # subsequent acquire of the SAME name still succeeds promptly.
-    from cli_agent_orchestrator.services import session_lock
-
     assert session_lock._session_locks == {}
     acquired = threading.Event()
 
