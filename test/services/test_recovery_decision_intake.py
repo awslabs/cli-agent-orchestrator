@@ -1052,6 +1052,91 @@ class TestTheCliDecideOption:
 
 
 # ---------------------------------------------------------------------------
+# PR #628 review P2 — consent that survives a process death is not consent for
+# the next resume. The re-decision gate must inspect the durable row before this
+# resume can overwrite it with a fresh decision.
+# ---------------------------------------------------------------------------
+class TestOrphanedRecoveryConsentRequiresARedecision:
+    @staticmethod
+    def _completing_drive(monkeypatch: pytest.MonkeyPatch):
+        async def _drive(record, path, env):
+            record.state = RunState.COMPLETED
+            return WorkflowRunResult(
+                run_id=RUN, workflow_name="wf", state=RunState.COMPLETED, started_at=TS
+            )
+
+        monkeypatch.setattr(script_runner, "_drive_process", _drive)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "authorised_state",
+        [StepState.RERUN_AUTHORIZED.value, StepState.REPLAY_AUTHORIZED.value],
+    )
+    async def test_an_orphaned_authorisation_without_a_fresh_decision_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, authorised_state: str
+    ):
+        _seed_run()
+        _seed_step(state=authorised_state)
+        before = _all_columns()
+        self._completing_drive(monkeypatch)
+
+        with pytest.raises(
+            workflow_service.ResumeNotAllowedError,
+            match=rf"run '{RUN}' step '{STEP}'.*fresh decision",
+        ):
+            await script_runner.resume_script_run(RUN)
+
+        assert _all_columns() == before
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_decision_for_the_same_step_is_read_before_it_is_applied(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._completing_drive(monkeypatch)
+        events: List[str] = []
+        real_get_steps = workflow_journal.get_steps
+        real_apply_decisions = workflow_journal.apply_decisions
+
+        def _record_get_steps(*args, **kwargs):
+            events.append("read")
+            return real_get_steps(*args, **kwargs)
+
+        def _record_apply_decisions(*args, **kwargs):
+            events.append("apply")
+            return real_apply_decisions(*args, **kwargs)
+
+        monkeypatch.setattr(workflow_journal, "get_steps", _record_get_steps)
+        monkeypatch.setattr(workflow_journal, "apply_decisions", _record_apply_decisions)
+
+        result = await script_runner.resume_script_run(RUN, {STEP: "rerun"})
+
+        assert result.state is RunState.COMPLETED
+        assert events[:2] == ["read", "apply"]
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_decision_for_step_b_cannot_launder_step_as_orphaned_consent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _seed_run()
+        _seed_step(state=StepState.RERUN_AUTHORIZED.value)
+        _seed_step(state=StepState.COMPLETED.value, step_id=STEP_B)
+        before_a = _all_columns()
+        before_b = _all_columns(STEP_B)
+        self._completing_drive(monkeypatch)
+
+        with pytest.raises(
+            workflow_service.ResumeNotAllowedError,
+            match=rf"run '{RUN}' step '{STEP}'.*fresh decision",
+        ):
+            await script_runner.resume_script_run(RUN, {STEP_B: "rerun"})
+
+        assert _all_columns() == before_a
+        assert _all_columns(STEP_B) == before_b
+
+
+# ---------------------------------------------------------------------------
 # BR-9's SECOND HALF (PR #628 review, Copilot F6) — consent is good for exactly the drive it
 # was granted for, so whatever that drive did not consume is REVOKED when it ends.
 # ---------------------------------------------------------------------------

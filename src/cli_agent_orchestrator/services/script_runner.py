@@ -1307,10 +1307,10 @@ async def resume_script_run(
       ``_active_drives.add`` closes that window, because gate 2 has already run and
       the claim is held.
 
-    ``None``/empty is the ordinary resume and behaves exactly as before — no read, no
-    write, no log line. A caller that supplies decisions gets a ``ValueError`` for an
-    unknown ``step_id`` or value (BR-6), which the resume route's existing
-    bare-``ValueError`` arm maps to 400.
+    ``None``/empty is the ordinary resume and performs only the re-decision gate's
+    journal read; it writes no decision and emits no decision log line. A caller that
+    supplies decisions gets a ``ValueError`` for an unknown ``step_id`` or value
+    (BR-6), which the resume route's existing bare-``ValueError`` arm maps to 400.
     """
     from cli_agent_orchestrator.services.workflow_service import update_run_generation
 
@@ -1361,6 +1361,20 @@ async def resume_script_run(
                 raise ValueError("spec_snapshot.source is not a string")
         except (ValueError, TypeError, KeyError) as e:
             raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
+
+        # --- Gate 5: recovery consent is scoped to one resume -> 409 ---
+        # Read BEFORE apply_decisions: that write turns a fresh decision and a stale,
+        # crash-surviving authorisation into the same durable state. The subtraction is
+        # per-step so a fresh decision for one step cannot launder consent left on another.
+        authorised_states = set(workflow_journal._DECISION_STATES.values())
+        for journal_step in await asyncio.to_thread(workflow_journal.get_steps, run_id):
+            if journal_step.state in authorised_states and (
+                not decisions or journal_step.step_id not in decisions
+            ):
+                raise ResumeNotAllowedError(
+                    f"run '{run_id}' step '{journal_step.step_id}' has unconsumed recovery consent; "
+                    "supply a fresh decision for this step to resume"
+                )
 
         # --- The human's recovery decisions (issue #583, FR-7). NOT a gate: admission
         # is over, this resume holds the drive claim, and nothing has been spawned yet.
