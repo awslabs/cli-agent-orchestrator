@@ -91,6 +91,18 @@ class FencedError(FenceError):
     """Input/tool admission was attempted against a sealed generation."""
 
 
+class GenerationUnselectable(FencedError):
+    """A managed admission could not name the generation to fence on.
+
+    A *subclass* of ``FencedError`` because it refuses on identical pre-byte
+    terms and every byte lane must settle it the same way, and typed apart
+    from its parent because the remedies differ: a fence says this generation
+    is sealed and instructs the caller to advance to its successor, while this
+    says the row records no generation at all, and there is no successor of
+    nothing for a caller to advance to.
+    """
+
+
 class ParkRequestError(FenceRequestError):
     """An M3 park operation is malformed or conflicts with its receipt."""
 

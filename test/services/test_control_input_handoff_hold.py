@@ -506,3 +506,29 @@ def test_a_v2_reservation_mints_a_fresh_stable_agent_so_it_can_never_be_held():
 
     # And the consequence the omission rests on: a fresh uuid is never held.
     assert th.hold_refusal(str(uuid.uuid4())) is None
+
+
+def test_a_generationless_restored_pane_is_held_too():
+    """cond-0413: the hold is one of the fences an unmanaged row is left with.
+
+    A legacy row records no generation at all (``TerminalModel.generation`` is
+    nullable), and such a row is unmanaged by construction. The hold resolves
+    the pane's agent from the roster's unique live incarnation when no exact
+    generation is supplied, so it still names the party and still refuses --
+    which is why admitting a generation-less unmanaged write removes nothing.
+    """
+    _donor, _recipient, _handoff = _held_pair()
+    legacy = cis.ResolvedControlIdentity(
+        terminal_id="term-2",
+        terminal_incarnation=None,
+        terminal_generation=None,
+        provider="claude_code",
+        native_session_id="native-2",
+        execution_mode="native_tui",
+        session_name=SESSION,
+        pane_id="%2",
+        managed=False,
+        managed_reservation_id=None,
+    )
+    with pytest.raises(th.TaskHandoffHeld, match="recipient of pending handoff"):
+        _admit(legacy)

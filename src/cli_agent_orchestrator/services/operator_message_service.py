@@ -69,7 +69,7 @@ import time
 import uuid as uuidlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import image_attachments, provider_controls
@@ -796,6 +796,27 @@ def submit_operator_message(
             "advertises no image capability; attachments were not submitted",
         )
 
+    # This lane proves the receiver is parked at an input-ready composer by
+    # reading the turn state of the deterministic managed window, whose name
+    # is derived from the generation.  A row that records none -- the ordinary
+    # legacy shape, which ``conduct status`` reports as
+    # ``<id>@None(legacy-no-generation/live)`` -- cannot have that window
+    # named, so its readiness cannot be observed and no byte may be typed on
+    # an unproven composer.  Answered here, from the resolution: it needs
+    # nothing the attachment binding, the admission, or the pane lease
+    # produces, and it sits after the replay so an operation already recorded
+    # as delivered is still answered from its record rather than told nothing
+    # was typed.
+    if resolved.terminal_generation is None:
+        return _result(
+            operation_id,
+            REFUSED,
+            REASON_LINEAGE_UNPROVEN,
+            f"terminal {terminal_id} records no generation, so the managed window "
+            "whose turn state proves this composer is idle cannot be named; nothing "
+            "was typed",
+        )
+
     # Reference substitution needs read-only attachment facts only.  The
     # ready → submitted(operation_id) binding itself happens at the last
     # safe pre-write point — the adapter's pre-write hook, after the
@@ -875,9 +896,13 @@ def submit_operator_message(
         from cli_agent_orchestrator.services import generation_fence, task_handoff
 
         # Hold the shared generation fence through the adapter's durable claim
-        # and every literal/submit key.  The dashboard/operator lane otherwise
-        # had only a pane lease and could race a completed park receipt.
-        assert binding.generation is not None
+        # and every literal/submit key; a pane lease alone would let this lane
+        # race a completed park receipt.  ``binding.generation`` is non-None
+        # here because the readiness gate above refuses every generation-less
+        # row.  Should a managed row ever reach the admission without one, it
+        # raises ``GenerationUnselectable`` rather than admitting an unfenced
+        # byte, and the ``FencedError`` handler below settles that as a typed
+        # zero-byte refusal.
         with (
             control_input_service.provider_byte_admission(
                 resolved, terminal_id, binding.generation
@@ -956,17 +981,15 @@ def submit_operator_message(
             from cli_agent_orchestrator.services import managed_launch_v2
             from cli_agent_orchestrator.utils.terminal import managed_window_name
 
-            # The capability gate above already proved the provider and the
-            # managed generation (a registry entry exists only for a managed
-            # native identity); the assert keeps the types honest.
-            assert resolved.provider is not None and resolved.terminal_generation is not None
             try:
                 turn_status = managed_launch_v2._observe_turn_state(
-                    resolved.provider,
+                    cast(str, resolved.provider),
                     pane_id=binding.pane_id,
                     terminal_id=terminal_id,
                     session_name=resolved.session_name,
-                    window_name=managed_window_name(terminal_id, resolved.terminal_generation),
+                    window_name=managed_window_name(
+                        terminal_id, cast(str, resolved.terminal_generation)
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - "could not look" is not idle
                 return _result(
