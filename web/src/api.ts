@@ -516,6 +516,94 @@ export interface AnnotationsResponse {
   annotations: Annotation[]
 }
 
+// ── Communications catalog (communication-catalog design §7) ─────────────
+// The wire shape of the three /communications routes. As with annotations,
+// `kind`, `report_scope`, `content_state`, the actor fields, and every other
+// conductor-authored value are OPEN strings here: the conductor owns the
+// vocabulary and can extend it without a change on this side. The only closed
+// sets are the envelope's own bookkeeping (coverage values, reason codes).
+
+export interface CatalogQuarantineInfo {
+  reason: string
+  actor?: string | null
+  quarantined_at?: string | null
+  receipt_sha256?: string | null
+}
+
+/** One attachment or body document exactly as the publisher wrote it. */
+export interface CatalogDocumentEntry {
+  attachment_id: string
+  document_id: string
+  role: string
+  display_name: string
+  media_type: string
+  sha256: string
+  byte_size: number
+  blob_id: string
+  content_state: string
+  capture_kind?: string | null
+  redaction_applied?: boolean | null
+  provenance?: Record<string, unknown> | null
+  quarantine?: CatalogQuarantineInfo | null
+  /** The publisher allows extra keys; they ride along for provenance display. */
+  [key: string]: unknown
+}
+
+/** Metadata for one communication; the list endpoint never carries bodies. */
+export interface CommunicationListItem {
+  communication_id: string
+  project_id: string
+  session_id?: string | null
+  lane_id?: string | null
+  task_occurrence_id?: string | null
+  goal_version?: string | null
+  kind?: string | null
+  report_scope?: string | null
+  authored_by_type?: string | null
+  authored_by_id?: string | null
+  authored_at?: string | null
+  recorded_at?: string | null
+  title?: string | null
+  delivery_state?: string | null
+  visibility?: string | null
+  request_key?: string | null
+  supersedes_communication_id?: string | null
+  superseded_by?: string | null
+  body?: CatalogDocumentEntry | null
+  documents: CatalogDocumentEntry[]
+  [key: string]: unknown
+}
+
+/** Why one project contributed nothing or less than it holds. */
+export interface CatalogReason {
+  source: string
+  reason: string
+}
+
+export interface CommunicationsListResponse {
+  schema: string
+  /** "complete" | "partial" | "truncated" | "unavailable" */
+  coverage: string
+  reasons: CatalogReason[]
+  communications: CommunicationListItem[]
+  next_cursor: string | null
+  total: number
+}
+
+/** One communication with its exact UTF-8 body, or null plus a typed reason. */
+export interface CommunicationDetailResponse {
+  communication: CommunicationListItem
+  content: string | null
+  reason: string | null
+}
+
+/** One attachment with its exact UTF-8 content, or null plus a typed reason. */
+export interface AttachmentDetailResponse {
+  document: CatalogDocumentEntry
+  content: string | null
+  reason: string | null
+}
+
 /**
  * Known profile source values the backend can emit.
  * Using `string` (not a closed union) so new provider-discovered directories
@@ -1097,6 +1185,21 @@ export const api = {
   // unreadable conductor state root answers `coverage: "unavailable"` with an
   // empty list, which renders exactly as the dashboard did before it existed.
   getAnnotations: () => fetchJSON<AnnotationsResponse>('/annotations'),
+
+  // Communications catalog (design §7). The task-scoped list is keyset-paged;
+  // pass `next_cursor` back verbatim and render the server's order as
+  // returned — the total order is `recorded_at DESC, communication_id ASC`,
+  // and a client-side sort on `recorded_at` alone is not that order. Detail
+  // responses are `Cache-Control: no-store`; never cache bodies.
+  listCommunications: (taskOccurrenceId: string, cursor?: string | null) =>
+    fetchJSON<CommunicationsListResponse>(
+      `/communications?task_occurrence_id=${encodeURIComponent(taskOccurrenceId)}` +
+        (cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''),
+    ),
+  getCommunication: (id: string) =>
+    fetchJSON<CommunicationDetailResponse>(`/communications/${encodeURIComponent(id)}`),
+  getCommunicationAttachment: (id: string) =>
+    fetchJSON<AttachmentDetailResponse>(`/communications/attachments/${encodeURIComponent(id)}`),
 
   // Terminals
   getTerminalStatus: (id: string) =>
