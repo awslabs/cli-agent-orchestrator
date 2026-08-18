@@ -9,6 +9,7 @@ import pytest
 import cli_agent_orchestrator.utils.opencode_config as cfg_module
 from cli_agent_orchestrator.utils.opencode_config import (
     ensure_skills_symlink,
+    prepare_opencode_runtime_config,
     read_config,
     remove_agent_tools,
     translate_mcp_server_config,
@@ -202,6 +203,38 @@ class TestWriteConfig:
     def test_file_ends_with_newline(self, tmp_config: Path):
         write_config({"x": 1})
         assert tmp_config.read_text(encoding="utf-8").endswith("\n")
+
+
+class TestRuntimeConfig:
+    def test_rejects_existing_symlinked_root_without_touching_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        shared_config_dir = tmp_path / "shared-opencode"
+        shared_config_dir.mkdir()
+        shared_config = shared_config_dir / "opencode.json"
+        shared_config.write_text('{"shared": true}\n', encoding="utf-8")
+        source_before = shared_config.read_text(encoding="utf-8")
+
+        cao_home = tmp_path / "cao-home"
+        target_root = tmp_path / "shared-target"
+        target_root.mkdir()
+        target_config = target_root / "opencode.json"
+        target_config.write_text('{"target": true}\n', encoding="utf-8")
+        target_before = target_config.read_text(encoding="utf-8")
+
+        runtime_root = cao_home / "tmp" / "opencode-terminal"
+        runtime_root.parent.mkdir(parents=True)
+        runtime_root.symlink_to(target_root, target_is_directory=True)
+
+        monkeypatch.setattr(cfg_module, "CAO_HOME_DIR", cao_home)
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_DIR", shared_config_dir)
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_FILE", shared_config)
+
+        with pytest.raises(RuntimeError, match="symlinked or non-directory"):
+            prepare_opencode_runtime_config("terminal")
+
+        assert target_config.read_text(encoding="utf-8") == target_before
+        assert shared_config.read_text(encoding="utf-8") == source_before
 
 
 class TestUpsertMcpServer:

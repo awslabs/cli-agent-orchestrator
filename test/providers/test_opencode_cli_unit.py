@@ -1,11 +1,16 @@
 """Unit tests for the OpenCode CLI provider."""
 
+import json
 import re
+import shlex
+import stat
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+import cli_agent_orchestrator.providers.opencode_cli as opencode_provider_module
+import cli_agent_orchestrator.utils.opencode_config as opencode_config_module
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.opencode_cli import (
     ANSI_CODE_PATTERN,
@@ -17,6 +22,7 @@ from cli_agent_orchestrator.providers.opencode_cli import (
     USER_MESSAGE_PATTERN,
     OpenCodeCliProvider,
 )
+from cli_agent_orchestrator.utils.mcp_resolution import CAO_MCP_SERVER_MODULE
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -32,10 +38,12 @@ def load_ansi_fixture(name: str) -> str:
 
 
 def make_provider(
-    agent_profile: str = "developer", model: str | None = None
+    agent_profile: str = "developer",
+    model: str | None = None,
+    terminal_id: str = "test-tid",
 ) -> OpenCodeCliProvider:
     return OpenCodeCliProvider(
-        terminal_id="test-tid",
+        terminal_id=terminal_id,
         session_name="test-session",
         window_name="window-0",
         agent_profile=agent_profile,
@@ -406,6 +414,155 @@ class TestExtractLastMessage:
 
 
 class TestInitialize:
+    @pytest.fixture(autouse=True)
+    def stub_private_config(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        """Keep mocked provider lifecycle tests away from shared OpenCode state."""
+        monkeypatch.setattr(
+            opencode_provider_module,
+            "prepare_opencode_runtime_config",
+            lambda _terminal_id: tmp_path / "opencode-runtime",
+            raising=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_initialize_uses_private_config_and_refreshes_only_owned_helpers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Launch snapshots shared config without rewriting user-owned state."""
+        shared_config_dir = tmp_path / "shared-opencode"
+        config_file = shared_config_dir / "opencode.json"
+        old_helper = tmp_path / "old-install" / "cao-mcp-server"
+        old_helper.parent.mkdir(parents=True)
+        old_helper.write_text(
+            "from cli_agent_orchestrator.mcp_server.server import main\n",
+            encoding="utf-8",
+        )
+        custom_helper = tmp_path / "custom" / "cao-mcp-server"
+        custom_helper.parent.mkdir(parents=True)
+        custom_helper.write_text("#!/bin/sh\necho custom\n", encoding="utf-8")
+        custom_server = {
+            "type": "local",
+            "command": [str(custom_helper), "--custom-flag"],
+            "enabled": True,
+        }
+        (shared_config_dir / "agents").mkdir(parents=True)
+        (shared_config_dir / "plugin-state.json").write_text("{}", encoding="utf-8")
+        (shared_config_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
+        config_file.write_text(
+            json.dumps(
+                {
+                    "mcp": {
+                        "orchestration-alias": {
+                            "type": "local",
+                            "command": [str(old_helper), "--verbose"],
+                            "enabled": True,
+                        },
+                        "bare-alias": {"type": "local", "command": ["cao-mcp-server", "--bare"]},
+                        "module-alias": {
+                            "type": "local",
+                            "command": [
+                                "/old-install/python",
+                                "-m",
+                                CAO_MCP_SERVER_MODULE,
+                                "--module",
+                            ],
+                        },
+                        "user-server": custom_server,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        source_before = config_file.read_text(encoding="utf-8")
+        cao_home = tmp_path / "cao home;$runtime"
+
+        monkeypatch.setattr(opencode_config_module, "OPENCODE_CONFIG_DIR", shared_config_dir)
+        monkeypatch.setattr(opencode_config_module, "OPENCODE_CONFIG_FILE", config_file)
+        monkeypatch.setattr(opencode_config_module, "CAO_HOME_DIR", cao_home, raising=False)
+        monkeypatch.setattr(opencode_provider_module, "CAO_HOME_DIR", cao_home, raising=False)
+        monkeypatch.setattr(opencode_provider_module, "OPENCODE_CONFIG_DIR", shared_config_dir)
+        monkeypatch.setattr(opencode_provider_module, "OPENCODE_CONFIG_FILE", config_file)
+        monkeypatch.setattr(
+            opencode_provider_module,
+            "prepare_opencode_runtime_config",
+            getattr(opencode_config_module, "prepare_opencode_runtime_config", None),
+            raising=False,
+        )
+        current_helper = ["/new-install/one/cao-mcp-server"]
+        monkeypatch.setattr(
+            opencode_config_module,
+            "resolve_cao_mcp_command",
+            lambda command, args: (current_helper[0], list(args)),
+        )
+
+        async def shell_ready(*_args, **_kwargs):
+            return True
+
+        async def opencode_ready(*_args, **_kwargs):
+            return True
+
+        backend = MagicMock()
+        monkeypatch.setattr(opencode_provider_module, "wait_for_shell", shell_ready)
+        monkeypatch.setattr(opencode_provider_module, "wait_until_status", opencode_ready)
+        monkeypatch.setattr(opencode_provider_module, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            opencode_provider_module,
+            "get_server_settings",
+            lambda: {"provider_init_timeout": 1},
+        )
+
+        provider = make_provider()
+        assert await provider.initialize() is True
+
+        private_root = cao_home / "tmp" / "opencode-test-tid"
+        private_config = private_root / "opencode.json"
+        data = json.loads(private_config.read_text(encoding="utf-8"))
+        assert data["mcp"]["orchestration-alias"]["command"] == [
+            "/new-install/one/cao-mcp-server",
+            "--verbose",
+        ]
+        assert data["mcp"]["bare-alias"]["command"] == [
+            "/new-install/one/cao-mcp-server",
+            "--bare",
+        ]
+        assert data["mcp"]["module-alias"]["command"] == [
+            "/new-install/one/cao-mcp-server",
+            "--module",
+        ]
+        assert data["mcp"]["user-server"] == custom_server
+        assert config_file.read_text(encoding="utf-8") == source_before
+        assert stat.S_IMODE(private_root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(private_config.stat().st_mode) == 0o600
+        assert (private_root / "agents").is_symlink()
+        assert (private_root / "agents").resolve() == (shared_config_dir / "agents").resolve()
+        assert (private_root / "plugin-state.json").is_symlink()
+        assert not (private_root / "opencode.jsonc").exists()
+        launch_command = backend.send_keys.call_args.args[2]
+        assert f"OPENCODE_CONFIG={shlex.quote(str(private_config))}" in launch_command
+        assert f"OPENCODE_CONFIG_DIR={shlex.quote(str(private_root))}" in launch_command
+        assert shlex.split(launch_command)[:2] == [
+            f"OPENCODE_CONFIG={private_config}",
+            f"OPENCODE_CONFIG_DIR={private_root}",
+        ]
+
+        current_helper[0] = "/new-install/two/cao-mcp-server"
+        second_provider = make_provider(terminal_id="test-tid-two")
+        assert await second_provider.initialize() is True
+        second_root = cao_home / "tmp" / "opencode-test-tid-two"
+        second_data = json.loads((second_root / "opencode.json").read_text(encoding="utf-8"))
+        assert second_data["mcp"]["orchestration-alias"]["command"] == [
+            "/new-install/two/cao-mcp-server",
+            "--verbose",
+        ]
+        assert data["mcp"]["orchestration-alias"]["command"][0] == "/new-install/one/cao-mcp-server"
+
+        provider.cleanup()
+        assert not private_root.exists()
+        assert second_root.exists()
+        assert config_file.read_text(encoding="utf-8") == source_before
+        second_provider.cleanup()
+        assert not second_root.exists()
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")

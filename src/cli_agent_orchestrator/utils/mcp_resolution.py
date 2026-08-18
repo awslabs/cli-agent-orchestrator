@@ -28,9 +28,10 @@ server, or an explicit absolute path) passes through unchanged.
 
 import logging
 import shutil
+import stat
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,12 @@ _SCRIPT_FILENAME = (
     f"{CAO_MCP_SERVER_COMMAND}.exe" if sys.platform == "win32" else CAO_MCP_SERVER_COMMAND
 )
 
+# Bound the inspection of a legacy absolute console-script path.  A CAO
+# generated wrapper is only a few hundred bytes; a bounded read keeps a
+# configuration refresh from following an arbitrary large user-owned file.
+_MAX_CONSOLE_SCRIPT_BYTES = 64 * 1024
+_CONSOLE_SCRIPT_MODULE_IMPORT = b"from cli_agent_orchestrator.mcp_server.server import main"
+
 
 def _sibling_script() -> str:
     """Absolute path to cao-mcp-server next to the running interpreter, or ""."""
@@ -54,6 +61,59 @@ def _sibling_script() -> str:
         return ""
     sibling = Path(sys.executable).with_name(_SCRIPT_FILENAME)
     return str(sibling) if sibling.exists() else ""
+
+
+def get_cao_mcp_server_profile_args(command: Any) -> Optional[List[str]]:
+    """Return profile args when a stored OpenCode command is CAO-owned.
+
+    OpenCode stores a local MCP launch as one argv list.  Its old entries may
+    contain the bare helper, the module fallback, or an absolute console-script
+    path created by a prior CAO install.  Only the first two forms and an
+    absolute, regular script carrying CAO's exact console-script import are
+    safe to refresh.  In particular, a user executable merely named
+    ``cao-mcp-server`` is not CAO-owned.
+
+    ``None`` means the stored command is unrecognized and must be preserved
+    byte-for-byte.  A returned list is a fresh copy of the user profile args.
+    """
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(part, str) for part in command)
+    ):
+        return None
+
+    executable = command[0]
+    if executable == CAO_MCP_SERVER_COMMAND:
+        return list(command[1:])
+
+    if len(command) >= 3 and command[1] == "-m" and command[2] == CAO_MCP_SERVER_MODULE:
+        return list(command[3:])
+
+    if _is_cao_mcp_console_script(executable):
+        return list(command[1:])
+    return None
+
+
+def _is_cao_mcp_console_script(executable: str) -> bool:
+    """Whether *executable* is a bounded, generated CAO console script.
+
+    Inspect only absolute regular files and fail closed on all filesystem
+    errors.  This provenance check supports migration of a prior CAO install
+    without taking ownership of an unrelated same-basename custom command.
+    """
+    path = Path(executable)
+    if not path.is_absolute():
+        return False
+    try:
+        file_stat = path.stat()
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > _MAX_CONSOLE_SCRIPT_BYTES:
+            return False
+        with path.open("rb") as file:
+            contents = file.read(_MAX_CONSOLE_SCRIPT_BYTES + 1)
+    except OSError:
+        return False
+    return len(contents) <= _MAX_CONSOLE_SCRIPT_BYTES and _CONSOLE_SCRIPT_MODULE_IMPORT in contents
 
 
 def resolve_cao_mcp_command(
