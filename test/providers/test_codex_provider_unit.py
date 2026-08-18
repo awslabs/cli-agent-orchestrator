@@ -3103,11 +3103,21 @@ class TestCodexProviderApprovalPromptLive:
     The boxed "Command Approval Required" / "[a] Accept" modal that
     TestCodexProviderApprovalModal covers is not emitted by 0.147.0 at all --
     ``strings`` over the vendored native binary finds zero occurrences of that
-    copy. The live prompt is a numbered menu (see the fixture below), so without
-    APPROVAL_PROMPT_PATTERN a pane hard-blocked on a real approval classified as
-    IDLE: the prompt's own "› 1. Yes, proceed (y)" cursor line is simultaneously
-    the last USER_PREFIX_PATTERN match and an idle-prompt match, so get_status
-    saw a user message with no reply after it.
+    copy. The live prompt is a numbered menu (see the fixtures below), so without
+    an approval check a pane hard-blocked on a real approval classified as IDLE:
+    the prompt's own "› 1. Yes, proceed (y)" cursor line is simultaneously the
+    last USER_PREFIX_PATTERN match and an idle-prompt match, so get_status saw a
+    user message with no reply after it.
+
+    Detection is STRUCTURAL -- the numbered menu plus its confirm footer, anchored
+    bottom-up -- not a list of question titles inside a fixed-height window. The
+    tests below pin the three ways the title-in-a-window approach was wrong:
+    a long command preview pushed the title out of the window and failed OPEN to
+    IDLE (test_live_capture_long_command_preview_is_waiting, against a real
+    capture); the title list was incomplete
+    (test_network_approval_prompt_is_waiting); and a reply that merely QUOTED the
+    copy latched a sticky WAITING_USER_ANSWER onto a ready worker
+    (test_quoted_prompt_in_completed_reply_is_not_waiting).
     """
 
     def test_get_status_live_capture_is_waiting(self):
@@ -3159,12 +3169,12 @@ class TestCodexProviderApprovalPromptLive:
         )
 
     def test_capture_pane_trailing_padding_does_not_hide_the_prompt(self):
-        """Blank padding rows must not push the question out of the bottom region.
+        """Blank padding rows below the prompt must not defeat detection.
 
-        ``tmux capture-pane`` pads to the full pane height, and the prompt is
-        ~10 rows tall, so a raw 15-line tail can land entirely inside the
-        padding. This is the concrete reason _has_approval_prompt_in_bottom
-        compacts blank lines before taking the region.
+        ``tmux capture-pane`` pads to the full pane height, so a live prompt is
+        followed by an arbitrary number of empty rows. Those rows are why the
+        "nothing but chrome below the footer" guard has to treat blank lines as
+        chrome (:func:`_is_chrome_only` does, via ``_is_frame_padding``).
         """
         prompt = (
             "  Would you like to run the following command?\n"
@@ -3247,6 +3257,259 @@ class TestCodexProviderApprovalPromptLive:
 
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    def test_live_capture_long_command_preview_is_waiting(self):
+        """A long command preview must not push the prompt out of detection.
+
+        Fixture is an unedited ``tmux capture-pane -p`` of codex-cli 0.147.0
+        parked on an exec approval whose command is a 12-line heredoc, produced
+        the same way as the two captures above (``codex -a untrusted -s read-only
+        --no-alt-screen``) by asking it to write a script with a single
+        ``bash -lc`` heredoc. The renderer does NOT truncate the preview.
+
+        This is the P1 fail-open case, and it is real rather than constructed:
+        in this capture the question lands on non-blank row 16 counted from the
+        bottom, one row outside the 15-row window the title-based detector used,
+        so that detector found no title and returned IDLE for a pane hard-blocked
+        on a keystroke. IDLE is the dangerous direction -- it invites the
+        conductor to send more work into a dead pane.
+        """
+        output = load_fixture("codex_approval_long_preview_raw.txt")
+
+        # The premise of the regression: the question really is outside a 15-row
+        # window of non-blank rows, so this fixture cannot pass by accident.
+        rows = [line for line in output.splitlines() if line.strip()]
+        assert not any("Would you like to" in line for line in rows[-15:])
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status_from_screen(output.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    def test_network_approval_prompt_is_waiting(self):
+        """The network-access approval is a fourth title on the same menu.
+
+        SYNTHETIC, not a capture: this prompt only fires with
+        ``features.network_proxy=true`` AND reachable DNS, and the sandbox the
+        other fixtures were captured in has no network. The copy is not invented
+        though -- the title and every option string below appear verbatim in the
+        0.147.0 native binary's string table alongside the three titles the old
+        detector enumerated, which is the point: the title list was a list of the
+        variants someone had happened to see, and could not be completed.
+
+        Note this menu carries no ``(y)``/``(esc)`` key hints, so it also
+        demonstrates that detection does not depend on those.
+        """
+        output = (
+            "› fetch the changelog from example.com\n"
+            "\n"
+            "• Fetching https://example.com/CHANGELOG.md\n"
+            "\n"
+            '  Do you want to approve network access to "example.com"?\n'
+            "\n"
+            "› 1. Yes, just this once\n"
+            "  2. Yes, and allow this host for this conversation\n"
+            "  3. Yes, and allow this host in the future\n"
+            "  4. No, and block this host in the future\n"
+            "\n"
+            "  Press enter to confirm or esc to cancel\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status_from_screen(output.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    def test_detector_does_not_require_a_known_title(self):
+        """An unrecognized title over the same menu must still classify as WAITING.
+
+        The whole point of anchoring on structure: a title nobody has catalogued
+        yet (0.147.0 also ships "Approve app tool call?", and future releases will
+        ship more) still blocks the pane, so it must still be detected.
+        """
+        output = (
+            "› do the thing\n"
+            "• Working on it.\n"
+            "  Some approval question nobody has catalogued yet?\n"
+            "\n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. No, and tell Codex what to do differently (esc)\n"
+            "\n"
+            "  Press enter to confirm or esc to cancel\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_quoted_prompt_in_completed_reply_is_not_waiting(self):
+        """A reply that QUOTES the prompt must not latch WAITING_USER_ANSWER.
+
+        This is the P2 quoted-latch case, and the failure it caused is worse than
+        a one-off misread: WAITING_USER_ANSWER is sticky, and CodexProvider sets
+        ``blocks_orchestrated_input_while_waiting_user_answer``, so a finished
+        worker whose summary happened to quote both the question and the footer
+        would be held out of rotation with orchestrated delivery blocked.
+
+        Rejected by the "nothing but chrome below the footer" guard: the reply
+        continues below the quote and ends at a live composer.
+        """
+        output = (
+            "› summarize what PR #567 changes\n"
+            "\n"
+            "• PR #567 teaches the Codex provider to recognize the runtime approval\n"
+            "  prompt. Codex 0.147.0 renders it as a numbered menu:\n"
+            "\n"
+            "    Would you like to run the following command?\n"
+            "    Environment: local\n"
+            "    $ mkdir -p /tmp/subdir\n"
+            "  › 1. Yes, proceed (y)\n"
+            "    2. Yes, and don't ask again (p)\n"
+            "    3. No, and tell Codex what to do differently (esc)\n"
+            "    Press enter to confirm or esc to cancel\n"
+            "\n"
+            "  Before the fix get_status returned IDLE for that screen.\n"
+            "\n"
+            "›\n"
+            "  openai.gpt-5.6-sol high · ~/wt\n"
+        )
+
+        assert not _has_approval_prompt_in_bottom(output)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(output.splitlines()) == TerminalStatus.COMPLETED
+
+    def test_quoted_prompt_ending_a_reply_is_not_waiting(self):
+        """The harder quoted variant: the quote is the LAST thing in the reply.
+
+        With only the empty composer and status bar below it, the chrome guard
+        cannot help -- this is exactly the residual the boxed-modal detector
+        documents as a known false positive
+        (test_framed_quote_ending_a_reply_is_a_known_false_positive). The numbered
+        menu closes it on position instead: Codex draws the live prompt's
+        selection cursor flush at column 0, while a quote indented under its
+        bullet carries the cursor at column >= 2.
+        """
+        output = (
+            "› what did the approval prompt look like?\n"
+            "\n"
+            "• It renders like this:\n"
+            "\n"
+            "    Would you like to run the following command?\n"
+            "    $ mkdir -p /tmp/subdir\n"
+            "  › 1. Yes, proceed (y)\n"
+            "    2. No, and tell Codex what to do differently (esc)\n"
+            "    Press enter to confirm or esc to cancel\n"
+            "\n"
+            "›\n"
+            "  openai.gpt-5.6-sol high · ~/wt\n"
+        )
+
+        assert not _has_approval_prompt_in_bottom(output)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_answered_prompt_with_work_resumed_is_not_waiting(self):
+        """Once answered, the prompt must stop latching even though it stays in the buffer.
+
+        The rendered screen drops the prompt entirely on answer -- there is no
+        footer left to anchor on -- but the pipe-pane buffer get_status() also
+        reads is append-only and keeps the frame. The resumption copy below is
+        verbatim from a live 0.147.0 pane observed immediately after pressing
+        enter on the curl approval.
+        """
+        output = (
+            "› Fetch https://example.com/ with curl right now.\n"
+            "\n"
+            "• Running curl https://example.com/\n"
+            "\n"
+            "  Would you like to run the following command?\n"
+            "\n"
+            "  $ curl https://example.com/\n"
+            "\n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. No, and tell Codex what to do differently (esc)\n"
+            "\n"
+            "  Press enter to confirm or esc to cancel\n"
+            "\n"
+            "✔ You approved codex to run curl https://example.com/ this time\n"
+            "\n"
+            "• Ran curl https://example.com/\n"
+            "  └ (output elided)\n"
+            "\n"
+            "• Fetched the page.\n"
+            "\n"
+            "›\n"
+            "  openai.gpt-5.6-sol high · ~/wt\n"
+        )
+
+        assert not _has_approval_prompt_in_bottom(output)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_menu_without_the_selection_cursor_is_not_waiting(self):
+        """Options and a footer with no cursor anywhere are not a live menu.
+
+        Codex always draws the cursor on one option, so its absence means this is
+        a rendering of a menu rather than a menu.
+        """
+        assert not _has_approval_prompt_in_bottom(
+            "› do the thing\n"
+            "• Working on it.\n"
+            "  Would you like to run the following command?\n"
+            "  1. Yes, proceed (y)\n"
+            "  2. No, and tell Codex what to do differently (esc)\n"
+            "  Press enter to confirm or esc to cancel\n"
+        )
+
+    def test_single_option_is_not_a_menu(self):
+        """One option is not an approval -- an approval can always be declined."""
+        assert not _has_approval_prompt_in_bottom(
+            "› do the thing\n"
+            "• Working on it.\n"
+            "› 1. Acknowledged\n"
+            "  Press enter to confirm or esc to cancel\n"
+        )
+
+    def test_trust_dialog_is_not_matched_by_the_approval_footer(self):
+        """The startup trust dialog is a numbered menu too, but a different footer.
+
+        Copy taken from a live 0.147.0 startup screen. It ends "Press enter to
+        continue", not "...to confirm", so the approval detector must not claim
+        it -- TRUST_PROMPT_PATTERN_V2 owns it, and get_status still reports
+        WAITING_USER_ANSWER through that path.
+        """
+        output = (
+            "  Welcome to Codex, OpenAI's command-line coding agent\n"
+            "\n"
+            "> You are in /private/tmp/codex-cap-567\n"
+            "\n"
+            "  Do you trust the contents of this directory? Working with untrusted\n"
+            "  contents comes with higher risk of prompt injection.\n"
+            "\n"
+            "› 1. Yes, continue\n"
+            "  2. No, quit\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+
+        assert not _has_approval_prompt_in_bottom(output)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
     def test_startup_path_vetoes_readiness_on_the_live_prompt(self):
         """The startup readiness veto must know the copy Codex actually emits.
 
@@ -3260,6 +3523,21 @@ class TestCodexProviderApprovalPromptLive:
             "  Would you like to run the following command?\n"
             "› 1. Yes, proceed (y)\n"
             "  Press enter to confirm or esc to cancel\n"
+        )
+
+    def test_startup_path_vetoes_readiness_on_the_network_prompt(self):
+        """The startup veto must cover the network title too.
+
+        The footer alone already vetoes here, but the title is folded into
+        APPROVAL_PROMPT_PATTERN as well: that pattern's only remaining job is this
+        permissive negative gate, where an extra match merely keeps the startup
+        poll running and so costs nothing.
+        """
+        assert not _has_startup_idle_composer(
+            "› Write tests for @filename\n"
+            "  gpt-5.6-sol medium · Context 100% left\n"
+            '  Do you want to approve network access to "example.com"?\n'
+            "› 1. Yes, just this once\n"
         )
 
 

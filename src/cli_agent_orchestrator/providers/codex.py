@@ -143,21 +143,55 @@ STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
 #     Press enter to confirm or esc to cancel
 #
 # It is NOT a box-drawn modal and carries no "[a] Accept"/"[d] Decline" keys: it
-# is a numbered menu with a `›` selection cursor, structurally identical to the
-# trust-v2, login, and update dialogs above -- hence the same question+footer
-# corroboration shape. The three question variants are the exec, apply_patch, and
-# permission-escalation approvals; all three block the TUI on a keystroke, and all
-# three are present in the 0.147.0 binary's string table.
+# is a numbered menu with a `›` selection cursor and a confirm footer.
 #
-# Left un-anchored to the `›` cursor line on purpose: the cursor moves between the
-# numbered options as the operator arrows around, so the question and the footer
-# are the only two positionally stable rows.
+# THE TITLE IS NOT THE HOOK. An earlier revision of this detector required one of
+# three enumerated question titles inside a fixed-height bottom window, and both
+# halves of that were wrong:
+#
+#   * The enumeration is incomplete, and cannot be completed. `strings` over the
+#     0.147.0 native binary turns up at least two more approval titles driving the
+#     same menu -- `Do you want to approve network access to "<host>"?` (emitted
+#     when features.network_proxy is on, with its own `Yes, and allow this host in
+#     ...` / `No, and block this host in the future` options) and `Approve app tool
+#     call?` -- so any title list is a list of the variants someone happened to
+#     have already seen.
+#   * The fixed window fails OPEN. The command preview between the title and the
+#     menu is the verbatim command, untruncated by the renderer, so a multi-line
+#     heredoc pushes the title out of any fixed row budget; the detector then found
+#     no title and returned IDLE for a hard-blocked pane, which is the dangerous
+#     direction to be wrong in.
+#
+# So detection is structural and bottom-up instead -- see
+# :func:`_has_approval_prompt_in_bottom`. These title patterns survive only as the
+# permissive NEGATIVE gate in STARTUP_BLOCKING_INPUT_PATTERN below, where an extra
+# match merely keeps the startup poll going and is therefore free; the network
+# title is folded in there for the same reason. Nothing positive is classified off
+# a title any more.
 APPROVAL_PROMPT_PATTERN = (
-    r"Would you like to (?:run the following command"
+    r"(?:Would you like to (?:run the following command"
     r"|make the following edits"
     r"|grant these permissions)\?"
+    r"|Do you want to approve network access to)"
 )
+# Rendered as `Press ` + `enter` + ` to confirm or ` + `esc` + ` to cancel`, with
+# the key names emitted as separately styled spans -- the whole sentence is not one
+# literal in the binary, so match the stable leading fragment only.
 APPROVAL_PROMPT_FOOTER = r"Press enter to confirm"
+# One numbered menu option: "› 1. Yes, proceed (y)", "  2. No, ... (esc)". The
+# selection cursor is optional here because it sits on exactly one option at a
+# time and moves as the operator arrows around.
+APPROVAL_MENU_OPTION_PATTERN = r"^[^\S\n]*(?:›[^\S\n]+)?\d+\.[^\S\n]+\S"
+# The selected option with its cursor flush at column 0, which is where Codex
+# draws every transcript gutter marker. This is the same left-margin argument
+# _modal_line_content makes for the boxed modal: quoted or continuation prose is
+# indented under its bullet, so a menu the model merely PASTED into its own reply
+# carries its cursor at column >= 2 and fails this while a live one passes.
+APPROVAL_MENU_CURSOR_PATTERN = r"^›[^\S\n]+\d+\.[^\S\n]+\S"
+# Minimum numbered options required above the footer. Two is the floor for a
+# genuine approval (accept and decline); requiring specific option COPY instead
+# would reintroduce exactly the enumeration fragility described above.
+APPROVAL_MENU_MIN_OPTIONS = 2
 
 # Codex's boxed command-approval modal:
 #   ╭─ Command Approval Required ─╮
@@ -493,29 +527,88 @@ def _has_approval_modal_in_bottom(clean_output: str) -> bool:
     return False
 
 
+def _has_approval_menu_above(lines: list[str], footer_idx: int) -> bool:
+    """Return True when a numbered selection menu sits above ``lines[footer_idx]``.
+
+    Walks UP from the footer collecting option lines, stopping at the first
+    :func:`_is_transcript_marker` — the prompt is one transcript cell, so the
+    menu must live inside it. Option lines are classified BEFORE the marker test
+    because the cursor line ("› 1. Yes, proceed (y)") itself matches
+    USER_PREFIX_PATTERN and would otherwise end the walk immediately.
+
+    Blank rows and the question/command-preview rows between the menu and the
+    title are stepped over rather than terminating the walk, which is what makes
+    the height of the command preview irrelevant.
+
+    Requires APPROVAL_MENU_MIN_OPTIONS options AND the selection cursor flush at
+    column 0 (see APPROVAL_MENU_CURSOR_PATTERN).
+    """
+    options = 0
+    cursor_at_margin = False
+    for index in range(footer_idx - 1, -1, -1):
+        line = lines[index]
+        if re.match(APPROVAL_MENU_OPTION_PATTERN, line):
+            options += 1
+            if re.match(APPROVAL_MENU_CURSOR_PATTERN, line):
+                cursor_at_margin = True
+            continue
+        if not line.strip():
+            continue
+        if _is_transcript_marker(line):
+            break
+    return options >= APPROVAL_MENU_MIN_OPTIONS and cursor_at_margin
+
+
 def _has_approval_prompt_in_bottom(clean_output: str) -> bool:
     """Return True when Codex's runtime approval prompt is active at the bottom.
 
-    This is the prompt codex-cli 0.147.0 actually renders (verified against a
-    live capture; see APPROVAL_PROMPT_PATTERN). Corroborates the question with
-    its footer inside the bottom region, exactly like the trust-v2, login, and
-    update dialogs — the prompt is a numbered menu of the same shape, so the
-    same guard against the copy surviving in scrollback applies.
+    This is the prompt codex-cli 0.147.0 actually renders (verified against three
+    live captures). Detection is STRUCTURAL and bottom-up — the numbered menu
+    plus its confirm footer, not the question title — for the two reasons set out
+    at APPROVAL_PROMPT_PATTERN: the title list cannot be completed, and a fixed
+    row budget fails open on a long command preview.
 
-    BLANK LINES ARE DROPPED before the region is taken. The prompt is ~10 rows
-    of question, command preview, and options separated by blank filler, and
-    ``tmux capture-pane`` pads the pane to its full height with empty rows, so a
-    raw 15-line tail can land entirely inside the padding and see neither half.
-    Compacting first is what :meth:`CodexProvider.get_status_from_screen`
-    already does to the pyte viewport, so this makes the buffer path agree with
-    the screen path rather than inventing a second rule.
+    Three guards, in the order they are cheapest to refute:
+
+    1. **Footer anchor.** The LAST line matching APPROVAL_PROMPT_FOOTER. Taking
+       the last, not the first, lets an already-answered prompt in scrollback be
+       ignored rather than shadow a live one below it.
+    2. **Nothing but chrome below the anchor** (:func:`_is_chrome_only`, shared
+       with the boxed-modal detector). A live prompt blocks the TUI, so it must
+       BE the bottom of the pane. This is the guard that rejects an ordinary
+       COMPLETED reply which happens to quote both the question and the footer
+       while a live composer and more prose sit underneath — the sticky
+       WAITING_USER_ANSWER that case used to latch would wedge a ready worker.
+    3. **A numbered menu directly above the anchor**
+       (:func:`_has_approval_menu_above`), bounded by transcript markers rather
+       than a line count, so an arbitrarily tall preview still resolves.
+
+    Deliberately NOT required: any particular question title, and any particular
+    option copy. The consequence is that this also fires on Codex's other
+    blocking numbered menus that share the confirm footer (the model picker, for
+    one). That is correct rather than tolerated — those panes are equally blocked
+    on a keystroke, and WAITING_USER_ANSWER is the right answer for them too.
+
+    Residual risk, disclosed: guard 3's column-0 cursor test is what separates a
+    live menu from one pasted into a reply, so a future renderer that indents the
+    cursor would fail open to IDLE. The three live captures in
+    test/providers/fixtures/ (codex_approval_{modal,edits,long_preview}_raw.txt)
+    pin the current rendering against that.
     """
-    rows = [line for line in clean_output.splitlines() if line.strip()]
-    bottom = "\n".join(rows[-STARTUP_PROMPT_BOTTOM_LINES:])
-    return (
-        re.search(APPROVAL_PROMPT_PATTERN, bottom) is not None
-        and re.search(APPROVAL_PROMPT_FOOTER, bottom) is not None
-    )
+    lines = clean_output.splitlines()
+
+    footer_idx = None
+    for index in range(len(lines) - 1, -1, -1):
+        if re.search(APPROVAL_PROMPT_FOOTER, lines[index]):
+            footer_idx = index
+            break
+    if footer_idx is None:
+        return False
+
+    if not all(_is_chrome_only(line) for line in lines[footer_idx + 1 :]):
+        return False
+
+    return _has_approval_menu_above(lines, footer_idx)
 
 
 def _has_startup_idle_composer(clean_output: str) -> bool:
@@ -1168,6 +1261,10 @@ class CodexProvider(BaseProvider):
         # Placed after the legacy modal check and before the idle classification,
         # for the same reason: the composer and status bar keep rendering while the
         # prompt is up, so the idle-prompt check cannot see the block.
+        #
+        # Structural, not title-driven: see _has_approval_prompt_in_bottom. Both
+        # this buffer path and get_status_from_screen's rendered-screen path reach
+        # it through this one call, so the two cannot disagree.
         if _has_approval_prompt_in_bottom(clean_output):
             return TerminalStatus.WAITING_USER_ANSWER
 
