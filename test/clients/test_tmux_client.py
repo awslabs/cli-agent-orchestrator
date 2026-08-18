@@ -103,7 +103,7 @@ class TestCreateSession:
 class TestCreateSessionEnvironmentFiltering:
     """Tests for environment variable filtering in create_session (#242)."""
 
-    def _get_passed_environment(self, tmux, tmp_path, env_override):
+    def _get_passed_environment(self, tmux, tmp_path, env_override, extra_env=None):
         mock_window = MagicMock()
         mock_window.name = "w"
         mock_session = MagicMock()
@@ -111,7 +111,7 @@ class TestCreateSessionEnvironmentFiltering:
         tmux.server.new_session.return_value = mock_session
 
         with patch.dict(os.environ, env_override, clear=True):
-            tmux.create_session("ses", "w", "tid1", str(tmp_path))
+            tmux.create_session("ses", "w", "tid1", str(tmp_path), extra_env=extra_env)
 
         return tmux.server.new_session.call_args.kwargs["environment"]
 
@@ -219,6 +219,16 @@ class TestCreateSessionEnvironmentFiltering:
         )
         assert "RANDOM_VAR" not in env
         assert "MY_CUSTOM_THING" not in env
+
+    def test_operator_path_is_forwarded_unchanged(self, tmux, tmp_path):
+        """``cao launch --env PATH=...`` remains the pane's user-command PATH."""
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {"HOME": "/home/user", "PATH": "/inherited/bin"},
+            extra_env={"PATH": "/operator/bin"},
+        )
+        assert env["PATH"] == "/operator/bin"
 
 
 # ── create_window ────────────────────────────────────────────────────

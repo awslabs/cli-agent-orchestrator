@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_MODULE,
+    get_cao_mcp_server_profile_args,
     resolve_cao_mcp_command,
     resolve_mcp_server_config,
 )
@@ -26,6 +27,55 @@ class TestPassthrough:
         assert args == original
         args.append("mutated")
         assert original == ["--from", "pkg"]
+
+
+class TestStoredCaoCommandRecognition:
+    """Only verifiable stored CAO commands can be refreshed at runtime."""
+
+    def test_bare_helper_preserves_profile_args(self):
+        assert get_cao_mcp_server_profile_args(["cao-mcp-server", "--verbose"]) == ["--verbose"]
+
+    def test_module_fallback_preserves_only_profile_args(self):
+        assert get_cao_mcp_server_profile_args(
+            ["/old-install/python", "-m", CAO_MCP_SERVER_MODULE, "--verbose"]
+        ) == ["--verbose"]
+
+    def test_generated_console_script_is_recognized(self, tmp_path):
+        helper = tmp_path / "cao-mcp-server"
+        helper.write_text(
+            "from cli_agent_orchestrator.mcp_server.server import main\n",
+            encoding="utf-8",
+        )
+
+        assert get_cao_mcp_server_profile_args([str(helper), "--verbose"]) == ["--verbose"]
+
+    def test_same_basename_custom_script_is_not_recognized(self, tmp_path):
+        helper = tmp_path / "cao-mcp-server"
+        helper.write_text("#!/bin/sh\necho custom\n", encoding="utf-8")
+
+        assert get_cao_mcp_server_profile_args([str(helper), "--custom"]) is None
+
+    def test_missing_console_script_is_not_recognized(self, tmp_path):
+        assert get_cao_mcp_server_profile_args([str(tmp_path / "cao-mcp-server")]) is None
+
+    def test_unreadable_console_script_is_not_recognized(self, tmp_path):
+        helper = tmp_path / "cao-mcp-server"
+        helper.write_text(
+            "from cli_agent_orchestrator.mcp_server.server import main\n",
+            encoding="utf-8",
+        )
+
+        with patch(f"{MOD}.Path.open", side_effect=OSError("denied")):
+            assert get_cao_mcp_server_profile_args([str(helper)]) is None
+
+    def test_oversized_console_script_is_not_recognized(self, tmp_path):
+        helper = tmp_path / "cao-mcp-server"
+        helper.write_text(
+            "from cli_agent_orchestrator.mcp_server.server import main\n" + "x" * 65536,
+            encoding="utf-8",
+        )
+
+        assert get_cao_mcp_server_profile_args([str(helper)]) is None
 
 
 class TestSiblingScript:
@@ -107,14 +157,19 @@ class TestRuntimeResolution:
         assert cmd == "/venv/bin/cao-mcp-server"
         assert args == []
 
-    def test_falls_back_to_path_when_no_sibling(self):
+    def test_falls_back_to_module_when_no_sibling_even_if_path_has_helper(self):
         with (
             patch(f"{MOD}._sibling_script", return_value=""),
-            patch(f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"),
+            patch(
+                f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"
+            ) as mock_which,
+            patch(f"{MOD}.sys") as mock_sys,
         ):
+            mock_sys.executable = "/current/venv/bin/python3"
             cmd, args = resolve_cao_mcp_command("cao-mcp-server", [])
-        assert cmd == "/usr/local/bin/cao-mcp-server"
-        assert args == []
+        mock_which.assert_not_called()
+        assert cmd == "/current/venv/bin/python3"
+        assert args == ["-m", CAO_MCP_SERVER_MODULE]
 
     def test_falls_back_to_module_entrypoint(self):
         """No sibling, nothing on PATH → run the module via the interpreter."""
@@ -171,7 +226,9 @@ class TestResolveMcpServerConfig:
         with (
             patch(f"{MOD}._sibling_script", return_value=""),
             patch(f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"),
+            patch(f"{MOD}.sys") as mock_sys,
         ):
+            mock_sys.executable = "/current/venv/bin/python3"
             out = resolve_mcp_server_config(
                 {
                     "type": "stdio",
@@ -180,8 +237,8 @@ class TestResolveMcpServerConfig:
                     "env": {"CAO_TERMINAL_ID": "abc"},
                 }
             )
-        assert out["command"] == "/usr/local/bin/cao-mcp-server"
-        assert out["args"] == []
+        assert out["command"] == "/current/venv/bin/python3"
+        assert out["args"] == ["-m", CAO_MCP_SERVER_MODULE]
         assert out["type"] == "stdio"
         assert out["env"] == {"CAO_TERMINAL_ID": "abc"}
 
@@ -203,11 +260,13 @@ class TestResolveMcpServerConfig:
         with (
             patch(f"{MOD}._sibling_script", return_value=""),
             patch(f"{MOD}.shutil.which", return_value="/usr/local/bin/cao-mcp-server"),
+            patch(f"{MOD}.sys") as mock_sys,
         ):
+            mock_sys.executable = "/current/venv/bin/python3"
             once = resolve_mcp_server_config({"command": "cao-mcp-server", "args": []})
             twice = resolve_mcp_server_config(once)
         assert once == twice
-        assert twice["command"] == "/usr/local/bin/cao-mcp-server"
+        assert twice["command"] == "/current/venv/bin/python3"
 
     def test_persisted_forwarded(self):
         with (

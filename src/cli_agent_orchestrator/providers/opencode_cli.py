@@ -20,13 +20,16 @@ The provider detects the following terminal states:
 import logging
 import re
 import shlex
+import shutil
+from pathlib import Path
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.opencode_config import prepare_opencode_runtime_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 logger = logging.getLogger(__name__)
@@ -97,6 +100,7 @@ class OpenCodeCliProvider(BaseProvider):
         self._agent_profile = agent_profile or ""
         self._model = model
         self._initialized = False
+        self._config_root: Optional[Path] = None
 
     @property
     def paste_enter_count(self) -> int:
@@ -156,6 +160,7 @@ class OpenCodeCliProvider(BaseProvider):
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
+        self._config_root = prepare_opencode_runtime_config(self.terminal_id)
         command = self._build_launch_command()
         get_backend().send_keys(self.session_name, self.window_name, command)
 
@@ -172,9 +177,13 @@ class OpenCodeCliProvider(BaseProvider):
 
     def _build_launch_command(self) -> str:
         """Build the inline-env opencode launch command string."""
+        config_root = self._config_root or OPENCODE_CONFIG_DIR
+        config_file = (
+            config_root / "opencode.json" if self._config_root is not None else OPENCODE_CONFIG_FILE
+        )
         env_pairs = [
-            f"OPENCODE_CONFIG={OPENCODE_CONFIG_FILE}",
-            f"OPENCODE_CONFIG_DIR={OPENCODE_CONFIG_DIR}",
+            f"OPENCODE_CONFIG={shlex.quote(str(config_file))}",
+            f"OPENCODE_CONFIG_DIR={shlex.quote(str(config_root))}",
             "OPENCODE_DISABLE_AUTOUPDATE=1",
             "OPENCODE_DISABLE_MOUSE=1",
             "OPENCODE_DISABLE_TERMINAL_TITLE=1",
@@ -455,3 +464,18 @@ class OpenCodeCliProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up OpenCode provider state."""
         self._initialized = False
+        config_root = self._config_root
+        self._config_root = None
+        if config_root is None:
+            return
+
+        expected_root = CAO_HOME_DIR / "tmp" / f"opencode-{self.terminal_id}"
+        if config_root != expected_root or config_root.is_symlink():
+            logger.warning("Refusing to remove unexpected OpenCode config root: %s", config_root)
+            return
+        try:
+            shutil.rmtree(config_root)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Unable to remove OpenCode config root: %s", config_root, exc_info=True)

@@ -9,17 +9,33 @@ No file locking is applied; concurrent ``cao install --provider opencode_cli``
 invocations are not a supported scenario.
 """
 
+import copy
 import json
 import logging
+import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 
-from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.constants import (
+    CAO_HOME_DIR,
+    OPENCODE_CONFIG_DIR,
+    OPENCODE_CONFIG_FILE,
+    SKILLS_DIR,
+)
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    CAO_MCP_SERVER_COMMAND,
+    get_cao_mcp_server_profile_args,
+    resolve_cao_mcp_command,
+)
 
 logger = logging.getLogger(__name__)
 
 _SCHEMA = "https://opencode.ai/config.json"
+_RUNTIME_CONFIG_NAME = "opencode.json"
+_CONFIG_FILES_NOT_TO_LINK = {_RUNTIME_CONFIG_NAME, "opencode.jsonc"}
+_TERMINAL_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def to_opencode_agent_id(profile_name: str) -> str:
@@ -92,6 +108,85 @@ def write_config(data: Dict[str, Any]) -> None:
     )
 
 
+def prepare_opencode_runtime_config(terminal_id: str) -> Path:
+    """Create a private, per-terminal OpenCode config snapshot.
+
+    The shared config is installation/user state and must never be rewritten at
+    launch.  A private snapshot can instead replace stale CAO-owned MCP helper
+    paths with the current process's helper while retaining every user-owned
+    command and argument exactly as stored.
+    """
+    root = _runtime_config_root(terminal_id)
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise RuntimeError(f"Refusing symlinked or non-directory OpenCode runtime root: {root}")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError(f"Refusing symlinked or non-directory OpenCode runtime root: {root}")
+    os.chmod(root, 0o700)
+
+    _link_shared_config_siblings(root)
+    data = copy.deepcopy(read_config())
+    _refresh_cao_mcp_commands(data)
+    _write_runtime_config(root / _RUNTIME_CONFIG_NAME, data)
+    return root
+
+
+def _runtime_config_root(terminal_id: str) -> Path:
+    """Return the owned runtime root for a safe terminal identifier."""
+    if not _TERMINAL_ID_PATTERN.fullmatch(terminal_id):
+        raise ValueError(f"Invalid terminal ID for OpenCode runtime config: {terminal_id!r}")
+    return CAO_HOME_DIR / "tmp" / f"opencode-{terminal_id}"
+
+
+def _link_shared_config_siblings(root: Path) -> None:
+    """Expose shared assets in a runtime root without copying user state."""
+    if not OPENCODE_CONFIG_DIR.exists():
+        return
+
+    for source in OPENCODE_CONFIG_DIR.iterdir():
+        if source.name in _CONFIG_FILES_NOT_TO_LINK:
+            continue
+        destination = root / source.name
+        if destination.exists() or destination.is_symlink():
+            continue
+        destination.symlink_to(source, target_is_directory=source.is_dir())
+
+
+def _refresh_cao_mcp_commands(data: Dict[str, Any]) -> None:
+    """Refresh only verifiably CAO-owned local OpenCode MCP commands."""
+    mcp_servers = data.get("mcp")
+    if not isinstance(mcp_servers, dict):
+        return
+
+    for server_config in mcp_servers.values():
+        if not isinstance(server_config, dict):
+            continue
+        profile_args = get_cao_mcp_server_profile_args(server_config.get("command"))
+        if profile_args is None:
+            continue
+        command, args = resolve_cao_mcp_command(CAO_MCP_SERVER_COMMAND, profile_args)
+        server_config["command"] = [command, *args]
+
+
+def _write_runtime_config(path: Path, data: Dict[str, Any]) -> None:
+    """Atomically write a private config with owner-only file permissions."""
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file:
+            file.write(json.dumps(data, indent=2) + "\n")
+            file.flush()
+            os.fchmod(file.fileno(), 0o600)
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     """Translate a CAO mcpServer entry to OpenCode's ``mcp`` format.
 
@@ -109,12 +204,11 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     - ``"enabled": true`` added
     - ``env`` → ``environment`` (OpenCode's key for process env vars)
     """
-    # Resolve the bundled cao-mcp-server console script to a PATH-independent
-    # invocation before flattening into OpenCode's command list.
-    # persisted=True: OpenCode reads this from opencode.json at launch, so prefer
-    # the stable PATH launcher over a versioned venv path that upgrades relocate.
+    # Resolve only the bare bundled helper to the current CAO interpreter's
+    # sibling/module target before flattening it into OpenCode's command list.
+    # A globally resolved launcher may belong to an older CAO installation.
     command_str, args = resolve_cao_mcp_command(
-        cao_config.get("command", ""), cao_config.get("args", []) or [], persisted=True
+        cao_config.get("command", ""), cao_config.get("args", []) or []
     )
     full_command: List[str] = ([command_str] if command_str else []) + list(args)
 
