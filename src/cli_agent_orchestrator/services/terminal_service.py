@@ -19,6 +19,7 @@ Terminal Workflow:
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -1515,6 +1516,7 @@ def _pre_task_bind_and_resolve(
         forwarded_environment=forwarded_environment,
         terminal_id=terminal_id,
         session_name=session_name,
+        agent_profile=agent_profile,
     )
     if not isinstance(identity, dict) or not identity.get("native_session_id"):
         raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
@@ -1542,15 +1544,70 @@ def _pre_task_bind_and_resolve(
             f"transition (absent row, legacy row, or non-forward state move); "
             "the launch fails closed"
         )
-    from cli_agent_orchestrator.services import stable_agent_roster
+    from cli_agent_orchestrator.services import execution_mode as em
+    from cli_agent_orchestrator.services import native_attachment, stable_agent_roster
 
+    try:
+        acq_method = identity["acquisition_method"]
+        if acq_method in {
+            native_attachment.ACQUISITION_ZERO_TURN_BOOTSTRAP,
+            native_attachment.ACQUISITION_ACP_BOOTSTRAP,
+        }:
+            no_turn = True
+            detached = True
+        elif acq_method == native_attachment.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN:
+            no_turn = False
+            detached = True
+        else:
+            no_turn = None
+            detached = None
+
+        intent = native_attachment.acquire_intent(
+            acquisition_method=acq_method,
+            acquisition_receipt=identity.get("bootstrap")
+            or {"provider": provider, "native_session_id": identity["native_session_id"]},
+            admits_only_new_instructions=True,
+            replays_task_bytes=False,
+            bootstrap_sent_no_turn=no_turn,
+            bootstrap_detached_before_launch=detached,
+        )
+        native_attachment.declare(
+            provider=provider,
+            native_session_id=identity["native_session_id"],
+            terminal_id=terminal_id,
+            generation=terminal_generation or "1",
+            execution_mode=em.NATIVE_TUI,
+            intent=intent,
+        )
+    except native_attachment.NativeAttachmentError as exc:
+        raise unmanaged_native_identity.UnmanagedIdentityUnavailable(
+            f"terminal {terminal_id} refused native attachment claim for session {identity['native_session_id']!r}: {exc}"
+        ) from exc
+
+    route_data = {
+        k: v
+        for k, v in {
+            "model": identity.get("model"),
+            "effort": identity.get("effort"),
+            "executable_path": identity.get("executable_path"),
+            "executable_hash": identity.get("executable_hash"),
+            "executable_version": identity.get("executable_version"),
+            "working_directory": identity.get("working_directory"),
+            "agent_profile": identity.get("agent_profile"),
+            "role": identity.get("role"),
+        }.items()
+        if v
+    }
+    route_prov: dict[str, Any] = {"issuance_source": identity["acquisition_method"]}
+    if route_data:
+        route_prov["provider_route"] = json.dumps(route_data, sort_keys=True)[:512]
     stable_agent_roster.record_native_identity(
         terminal_id=terminal_id,
         generation=terminal_generation,
         native_session_id=identity["native_session_id"],
         harness=provider,
         acquisition_method=identity["acquisition_method"],
-        route_provenance={"issuance_source": identity["acquisition_method"]},
+        route_provenance=route_prov,
         continuity_note=unmanaged_native_identity.PRE_TASK_IDENTITY_CAPTURED,
     )
     return identity

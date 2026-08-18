@@ -241,6 +241,11 @@ class TestValidateStoredIntent:
             if method in {na.ACQUISITION_ACP_BOOTSTRAP, na.ACQUISITION_ZERO_TURN_BOOTSTRAP}:
                 kwargs["bootstrap_sent_no_turn"] = True
                 kwargs["bootstrap_detached_before_launch"] = True
+            elif method == na.ACQUISITION_CONTROLLED_BOOTSTRAP_TURN:
+                # A controlled bootstrap turn DID send a turn (that is how the
+                # id is minted), so it asserts only that the minting process
+                # detached before the native TUI claimed the session.
+                kwargs["bootstrap_detached_before_launch"] = True
             intent = na.acquire_intent(**kwargs)
             assert na.validate_attachment_intent(intent)["acquisition_method"] == method
 

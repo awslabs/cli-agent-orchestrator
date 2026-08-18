@@ -754,3 +754,97 @@ async def test_initialize_raises_when_agy_times_out(monkeypatch):
     )
     with pytest.raises(TimeoutError, match="initialization timed out"):
         await make_provider().initialize()
+
+
+@pytest.mark.asyncio
+async def test_verify_running_conversation_id_respects_log_offset(tmp_path, monkeypatch):
+    """Logs prior to log_offset are ignored; only logs after log_offset are verified."""
+    import time
+
+    from cli_agent_orchestrator.providers.antigravity_cli import (
+        AntigravityCliProvider,
+        ProviderError,
+    )
+
+    class FakeBackend:
+        def send_keys(self, session, window, command):
+            pass
+
+        def get_history(self, session, window, lines=100):
+            return []
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+
+    log_dir = tmp_path / ".gemini" / "antigravity-cli" / "log"
+    log_dir.mkdir(parents=True)
+    log_file = log_dir / "terminal_t123.log"
+
+    stale_text = "found conversation 11111111-1111-1111-1111-111111111111\n"
+    log_file.write_text(stale_text)
+    offset = len(stale_text.encode("utf-8"))
+
+    # The provider resolves its log through ``Path.home()``, and whether that
+    # follows a patched ``os.path.expanduser`` is PYTHON-VERSION DEPENDENT:
+    # 3.13 honours the patch, 3.10 ignores it and returns the real home. Patching
+    # only expanduser therefore made this test read the developer's actual
+    # ~/.gemini on 3.10 -- green on a machine that has agy installed, red on a
+    # clean CI runner. Patch the call the code actually makes.
+    monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path) + p.replace("~", ""))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    provider = AntigravityCliProvider(
+        "t123", "cao-s", "w123", native_session_id="22222222-2222-2222-2222-222222222222"
+    )
+
+    with pytest.raises(ProviderError, match="Antigravity CLI failed to verify native session"):
+        provider._verify_running_conversation_id(log_offset=offset, launch_start=time.time())
+
+    with open(log_file, "a") as f:
+        f.write("found conversation 22222222-2222-2222-2222-222222222222\n")
+
+    provider._verify_running_conversation_id(log_offset=offset, launch_start=time.time())
+
+
+@pytest.mark.asyncio
+async def test_verify_running_conversation_id_raises_on_mismatched_id(tmp_path, monkeypatch):
+    """Mismatched conversation ID written after log_offset raises ProviderError immediately."""
+    import time
+
+    from cli_agent_orchestrator.providers.antigravity_cli import (
+        AntigravityCliProvider,
+        ProviderError,
+    )
+
+    class FakeBackend:
+        def send_keys(self, session, window, command):
+            pass
+
+        def get_history(self, session, window, lines=100):
+            return []
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+
+    log_dir = tmp_path / ".gemini" / "antigravity-cli" / "log"
+    log_dir.mkdir(parents=True)
+    log_file = log_dir / "terminal_t123.log"
+    log_file.write_text("Created conversation 99999999-9999-9999-9999-999999999999\n")
+
+    # The provider resolves its log through ``Path.home()``, and whether that
+    # follows a patched ``os.path.expanduser`` is PYTHON-VERSION DEPENDENT:
+    # 3.13 honours the patch, 3.10 ignores it and returns the real home. Patching
+    # only expanduser therefore made this test read the developer's actual
+    # ~/.gemini on 3.10 -- green on a machine that has agy installed, red on a
+    # clean CI runner. Patch the call the code actually makes.
+    monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path) + p.replace("~", ""))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    provider = AntigravityCliProvider(
+        "t123", "cao-s", "w123", native_session_id="22222222-2222-2222-2222-222222222222"
+    )
+
+    with pytest.raises(ProviderError, match="native session mismatch"):
+        provider._verify_running_conversation_id(log_offset=0, launch_start=time.time())

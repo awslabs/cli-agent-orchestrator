@@ -7,14 +7,17 @@ import pytest
 from cli_agent_orchestrator.services import provider_contracts as pc
 
 
-@pytest.mark.parametrize("provider", ["codex", "kimi", "claude", "muse"])
+# Derived from the PROVIDERS tuple, not a hand-kept copy of it: a frozen
+# literal beside a derived set decays silently, which is exactly how
+# antigravity was added to PROVIDERS while receiving none of this coverage.
+@pytest.mark.parametrize("provider", sorted(pc.PROVIDERS))
 def test_all_providers_admit_future_semver_at_launch_boundary(provider):
     pc.check_pinned_version(provider, "99.99.99")
 
 
 @pytest.mark.parametrize(
     ("provider", "env_suffix"),
-    [("codex", "CODEX"), ("kimi", "KIMI"), ("claude", "CLAUDE"), ("muse", "MUSE")],
+    [(p, p.upper()) for p in sorted(pc.PROVIDERS)],
 )
 def test_all_providers_can_restore_strict_exact_enforcement(monkeypatch, provider, env_suffix):
     monkeypatch.setenv(f"CAO_PROVIDER_VERSION_ENFORCEMENT_{env_suffix}", "strict")
@@ -232,3 +235,33 @@ class TestRouteAttestCapability:
         status = pc.resume_status(pc.PROVIDER_CODEX, installed_version="codex-cli 0.147.0")
         assert status.identity_available is True
         assert status.authority_supported is False
+
+
+def test_antigravity_carries_no_version_pin_at_all():
+    """The operator's standing direction: agy must have NO pin, and the live
+    installed build must launch.
+
+    Pinning agy is what this asserts against, and it is not hypothetical -- the
+    merged branch pinned 1.1.11 while 1.1.13 was installed, and agy auto-updated
+    again to 1.1.14 during the session that merged it. A reintroduced pin left
+    the whole suite green before this test existed, so the requirement was
+    unpinned in both senses of the word.
+    """
+    assert (
+        pc.PROVIDER_ANTIGRAVITY not in pc.PINNED_VERSIONS
+    ), "antigravity must carry no reference build; unpinned is the required state"
+    assert (
+        pc.SUPPORTED_VERSIONS[pc.PROVIDER_ANTIGRAVITY] == ()
+    ), "antigravity must list no exact build; a one-element allowlist is an expiry date"
+    assert pc.version_enforcement_mode(pc.PROVIDER_ANTIGRAVITY) == pc.VERSION_ENFORCEMENT_OPEN
+
+    # Any semver-shaped build admits, including ones nobody has written down.
+    for build in ("1.1.11", "1.1.13", "1.1.14", "99.99.99"):
+        pc.check_pinned_version(pc.PROVIDER_ANTIGRAVITY, build)
+
+
+def test_antigravity_unparseable_banner_still_fails_closed_while_unpinned():
+    """Unpinned is not unguarded: a failed observation is distinct from a build
+    nobody wrote down, and only the former refuses."""
+    with pytest.raises(pc.ProviderVersionDrift):
+        pc.check_pinned_version(pc.PROVIDER_ANTIGRAVITY, "not-a-version")
