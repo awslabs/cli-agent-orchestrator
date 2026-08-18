@@ -1335,7 +1335,7 @@ class TestUnconsumedConsentIsRevokedWhenTheDriveEnds:
 
     @pytest.mark.asyncio
     async def test_a_cancelled_resume_still_revokes(self, monkeypatch: pytest.MonkeyPatch):
-        """A cancelled resume consumed nothing, so consent must not survive it either.
+        """A cancelled replay consumed nothing, so neither durable nor live consent survives.
 
         WHAT THIS TEST DOES NOT PROVE, stated so the next reader does not over-read it: it does
         NOT discriminate the direct revoke call from an ``await asyncio.to_thread(...)`` one.
@@ -1350,12 +1350,19 @@ class TestUnconsumedConsentIsRevokedWhenTheDriveEnds:
         _seed_step(state=StepState.COMPLETED.value)
 
         async def _cancelled_drive(record, path, env):
+            # The real replay callback publishes this temporary durable-row state before the
+            # drive is cancelled. No ``WorkflowRunResult`` exists to normalize afterwards.
+            record.step_states[STEP] = workflow_service.StepRunState(
+                step_id=STEP,
+                state=StepState.REPLAY_AUTHORIZED,
+                attempts=1,
+            )
             raise asyncio.CancelledError()
 
         monkeypatch.setattr(script_runner, "_drive_process", _cancelled_drive)
 
         with pytest.raises(asyncio.CancelledError):
-            await script_runner.resume_script_run(RUN, {STEP: "rerun"})
+            await script_runner.resume_script_run(RUN, {STEP: "skip"})
 
         assert _state_of() == StepState.COMPLETED.value
-        assert _state_of() != StepState.RERUN_AUTHORIZED.value
+        assert workflow_service.run_registry[RUN].step_states[STEP].state is StepState.COMPLETED

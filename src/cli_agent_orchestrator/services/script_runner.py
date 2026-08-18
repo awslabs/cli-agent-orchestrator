@@ -1462,20 +1462,6 @@ async def resume_script_run(
         if granted:
             try:
                 revoked = workflow_journal.revoke_unconsumed_decisions(run_id, granted)
-                # A skip replays from its temporary ``replay_authorized`` row, so the
-                # recorder correctly hydrates that state before this finally revokes it.
-                # The database return is the atomic answer to which grants survived; mirror
-                # only those rows back into the still-live record and already-built result.
-                # ``StepResult`` is mutable, and mutating it here is necessary because a
-                # ``finally`` cannot replace the value an earlier ``return`` would expose.
-                if result is not None:
-                    for step_id in revoked:
-                        prior_state = StepState(granted[step_id])
-                        if record is not None and step_id in record.step_states:
-                            record.step_states[step_id].state = prior_state
-                        for step in result.steps:
-                            if step.id == step_id:
-                                step.state = prior_state
             except (
                 Exception
             ) as e:  # noqa: BLE001 — never mask the drive's outcome; consent lives one resume longer
@@ -1485,7 +1471,39 @@ async def resume_script_run(
                     run_id,
                     e,
                 )
-    assert result is not None
+            else:
+                # A skip replays from its temporary ``replay_authorized`` row, so the
+                # recorder correctly hydrates that state before this finally revokes it.
+                # The database return is the atomic answer to which grants survived; mirror
+                # only those rows back into the still-live record and already-built result.
+                # A cancellation has no result to mutate, but the retained record is still
+                # served by the bounded status window and MUST be normalized all the same.
+                for step_id in revoked:
+                    try:
+                        prior_state = StepState(granted[step_id])
+                    except ValueError:
+                        # Match ``record_step_replay``'s malformed-row degradation: the durable
+                        # revoke DID succeed, but an unknown prior state cannot honestly appear
+                        # in the typed live record, so expose RUNNING rather than falsely
+                        # claiming the temporary authorisation remains live.
+                        logger.warning(
+                            "resume: run '%s' step '%s': recovery consent was revoked but "
+                            "the prior state is unrecognised; recording it as running",
+                            run_id,
+                            step_id,
+                        )
+                        prior_state = StepState.RUNNING
+                    if record is not None and step_id in record.step_states:
+                        record.step_states[step_id].state = prior_state
+                    if result is not None:
+                        for step in result.steps:
+                            if step.id == step_id:
+                                step.state = prior_state
+    if result is None:
+        # Reached only after a drive returned without a typed result: exceptions, including
+        # cancellation, propagate through the ``finally`` instead. Raised rather than relying
+        # on an assert, which Python optimisation may remove.
+        raise RuntimeError(f"resume: run '{run_id}' drive returned no WorkflowRunResult")
     return result
 
 
