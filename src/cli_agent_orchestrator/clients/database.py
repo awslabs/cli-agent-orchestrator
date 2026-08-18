@@ -1140,6 +1140,40 @@ def get_terminal_id_by_idempotency_key(key: str) -> Optional[str]:
         return cast(Optional[str], row.terminal_id) if row else None
 
 
+def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
+    """Delete an idempotency-key mapping, but only if it still points to
+    ``expected_terminal_id``.
+
+    Review on PR #634, issue #616 (S-001): ``create_terminal``'s fallthrough
+    for a mapping whose terminal no longer exists must clear this row FIRST.
+    ``delete_terminal`` does not cascade to ``idempotency_keys``, so leaving
+    a stale row in place would make the replacement terminal's own
+    idempotency insert collide on the same primary key and raise
+    ``IntegrityError``.
+
+    The ``expected_terminal_id`` guard is a compare-and-delete: if a
+    concurrent caller already replaced this mapping (it now points to
+    SOME OTHER terminal), this deletes nothing and this caller's own
+    create falls through to the normal atomic insert below, which then
+    correctly raises ``IntegrityError`` for the loser -- the same
+    already-accepted race behavior as two concurrent callers sharing a
+    brand-new key. Without this guard, an unconditional delete-by-key
+    could silently erase a concurrent winner's fresh, valid mapping
+    instead.
+    """
+    with SessionLocal() as db:
+        deleted = (
+            db.query(IdempotencyKeyModel)
+            .filter(
+                IdempotencyKeyModel.key == key,
+                IdempotencyKeyModel.terminal_id == expected_terminal_id,
+            )
+            .delete()
+        )
+        db.commit()
+        return deleted > 0
+
+
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
     import json as _json

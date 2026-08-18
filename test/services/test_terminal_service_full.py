@@ -6,6 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
+from cli_agent_orchestrator.clients.database import get_terminal_id_by_idempotency_key
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -1028,6 +1031,71 @@ class TestCreateTerminalIdempotencyKey:
 
         assert result.id == "test1234"
         mock_db_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_stale_mapping_fresh_create_survives_the_real_insert(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """Real-DB regression test for S-001 (review on PR #634).
+
+        ``test_stale_mapping_falls_through_to_a_fresh_create`` (above) mocks
+        ``db_create_terminal``, so it never runs the real INSERT that used
+        to collide: the stale ``idempotency_keys`` row survived the
+        terminal's deletion, so the replacement's own insert hit the same
+        primary key and raised ``IntegrityError``, which tore down the
+        just-allocated tmux/provider resources and surfaced as a 500. This
+        test leaves ``db_create_terminal`` and
+        ``get_terminal_id_by_idempotency_key`` real (module-level
+        ``isolated_memory_db`` fixture) to prove the fix against an actual
+        PK collision, not a mock.
+        """
+        db_create_terminal(
+            "long-gone-terminal",
+            "cao-session",
+            "window-0",
+            "kiro_cli",
+            "developer",
+            idempotency_key="stale-key",
+        )
+        assert db_delete_terminal("long-gone-terminal") is True  # orphans the key row
+
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        result = await create_terminal(
+            "kiro_cli", "developer", new_session=True, idempotency_key="stale-key"
+        )
+
+        assert result.id == "test1234"
+        # Not just "didn't crash" -- the replacement's OWN mapping actually
+        # landed, so a future retry with this key finds test1234, not a
+        # second-generation orphan.
+        assert get_terminal_id_by_idempotency_key("stale-key") == "test1234"
 
 
 class TestCreateTerminalWorktree:

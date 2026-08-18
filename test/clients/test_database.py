@@ -20,6 +20,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     create_terminal,
     delete_flow,
+    delete_idempotency_key,
     delete_terminal,
     delete_terminals_by_session,
     get_flow,
@@ -467,6 +468,67 @@ class TestIdempotencyKey:
             assert get_terminal_id_by_idempotency_key("key-b") == "term-b"
             assert get_terminal_metadata("term-a") is not None
             assert get_terminal_metadata("term-b") is not None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_delete_idempotency_key_matching_terminal_id(self, mock_session_class):
+        """Review S-001, PR #634: this is what lets create_terminal's
+        stale-mapping fallthrough clear a dangling row before recreating,
+        instead of colliding with it on the next insert."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_query = MagicMock()
+        mock_query.filter.return_value.delete.return_value = 1
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert delete_idempotency_key("stale-key", "long-gone-terminal") is True
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_delete_idempotency_key_no_match_returns_false(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_query = MagicMock()
+        mock_query.filter.return_value.delete.return_value = 0
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert delete_idempotency_key("never-seen", "some-terminal") is False
+
+    def test_delete_idempotency_key_guard_skips_a_mapping_already_replaced(self, test_db):
+        """The compare-and-delete guard: if the row no longer points to the
+        terminal_id the caller expected (a concurrent winner already
+        replaced it), this must delete nothing -- NOT blindly remove
+        whatever the current mapping is."""
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-winner",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="shared-key",
+            )
+
+            assert delete_idempotency_key("shared-key", "term-stale-guess") is False
+            # The real, current mapping survives untouched.
+            assert get_terminal_id_by_idempotency_key("shared-key") == "term-winner"
+
+    def test_delete_idempotency_key_removes_a_real_row(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-old",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="reused-key",
+            )
+
+            assert delete_idempotency_key("reused-key", "term-old") is True
+            assert get_terminal_id_by_idempotency_key("reused-key") is None
 
 
 class TestGroupAndMetadata:

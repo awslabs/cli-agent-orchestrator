@@ -32,6 +32,9 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import (
+    delete_idempotency_key,
+)
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_session,
@@ -286,6 +289,18 @@ async def create_terminal(
                 # fact) -- there is nothing left to recover, so fall through
                 # and create fresh rather than raising on an operator who
                 # simply reused a key from a job that already finished.
+                #
+                # The stale row must be deleted FIRST (review S-001, PR #634):
+                # deleting a terminal does not cascade to idempotency_keys, so
+                # leaving this row in place would make the replacement
+                # terminal's own idempotency insert below collide on the same
+                # primary key and raise IntegrityError -- turning a graceful
+                # fallthrough into a guaranteed 500 on every such retry. The
+                # expected_terminal_id guard makes this a compare-and-delete:
+                # if a concurrent caller already replaced the mapping, this
+                # deletes nothing and this attempt's own insert below is the
+                # one that raises IntegrityError instead.
+                delete_idempotency_key(idempotency_key, existing_terminal_id)
                 logger.info(
                     "idempotency_key %r maps to terminal %r, which no longer exists; "
                     "creating a new terminal",
