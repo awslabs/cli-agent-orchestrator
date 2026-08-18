@@ -81,10 +81,18 @@ spec:
           volumeMounts:
             - name: cao-state
               mountPath: /home/cao/.cao
+            # Shared EFS workspace (same PVC + path as the workers) so the
+            # supervisor sees delegated agents' files live — see
+            # efs-workspace.yaml.
+            - name: workspace
+              mountPath: /home/cao/workspace
       volumes:
         - name: cao-state
           persistentVolumeClaim:
             claimName: cao-supervisor-state
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cao-workspace
 ---
 # Persistent state for the supervisor (SQLite DB, logs, installed profiles).
 # Survives pod restarts/rescheduling, unlike the emptyDir it replaces.
@@ -98,6 +106,9 @@ metadata:
     app.kubernetes.io/part-of: cao-fleet
 spec:
   accessModes: ["ReadWriteOnce"]
+  # This cluster has no default StorageClass — pin one explicitly or the
+  # PVC never binds and the pod never schedules.
+  storageClassName: gp3
   resources:
     requests:
       storage: 1Gi
