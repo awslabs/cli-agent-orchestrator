@@ -100,7 +100,8 @@ def _capped(message: str) -> str:
     """
     if len(message) <= _MAX_FINDING_CHARS:
         return message
-    return f"{message[:_MAX_FINDING_CHARS]}... (message truncated, {len(message)} chars)"
+    suffix = f"... (message truncated, {len(message)} chars)"
+    return f"{message[: _MAX_FINDING_CHARS - len(suffix)]}{suffix}"
 
 
 def _structural_bound_finding(metadata: object) -> Optional["ValidationMessage"]:

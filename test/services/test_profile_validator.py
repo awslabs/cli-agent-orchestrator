@@ -13,12 +13,26 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.profile_validator import (
+    _MAX_FINDING_CHARS,
     _MAX_RENDERED_BYTES,
     ValidationMessage,
+    _capped,
     load_profile_schema,
     validate_frontmatter,
     validate_profile_text,
 )
+
+
+class TestFindingMessageCap:
+    """Schema finding text, including its marker, must fit the declared cap."""
+
+    def test_truncation_suffix_counts_toward_the_cap(self) -> None:
+        message = "x" * (_MAX_FINDING_CHARS + 1)
+
+        capped = _capped(message)
+
+        assert len(capped) == _MAX_FINDING_CHARS
+        assert capped.endswith(f"... (message truncated, {len(message)} chars)")
 
 
 class TestLoadProfileSchema:
