@@ -49,6 +49,10 @@ KIMI_IMAGE_BLOCK = {
     ),
     "evidence": "live acceptance on pinned 0.29.2 (§10.6)",
 }
+#: The per-terminal image block carries ``build_proven``: the discovery
+#: union above never licenses a send, so it does not.
+KIMI_IMAGE_BLOCK_PROVEN = {**KIMI_IMAGE_BLOCK, "build_proven": True}
+KIMI_IMAGE_BLOCK_UNPROVEN = {**KIMI_IMAGE_BLOCK, "build_proven": False}
 CLAUDE_IMAGE_BLOCK = {
     "supported": True,
     "formats": ["png", "jpeg", "gif", "webp"],
@@ -208,7 +212,7 @@ class TestPerTerminalBlock:
 
     def test_a_proven_build_advertises_its_chords(self):
         # 0.29.2 is the exact build whose live acceptance proves image
-        # delivery, so it is the one that advertises the full block.
+        # delivery, so it is the one whose image block reads build_proven.
         block = provider_controls.controls_block_for(KIMI, "0.29.2")
         assert block == {
             "compact": {"events": COMPACT_EVENTS},
@@ -216,7 +220,7 @@ class TestPerTerminalBlock:
             "steer_chords": ["C-s"],
             "dispatch_grace_ms": 5000,
             "operator_message": OPERATOR_MESSAGE_BLOCK,
-            "image": KIMI_IMAGE_BLOCK,
+            "image": KIMI_IMAGE_BLOCK_PROVEN,
             "interactive_streaming": {"supported": True},
         }
 
@@ -225,19 +229,17 @@ class TestPerTerminalBlock:
         assert block["steer_chords"] == []
 
     @pytest.mark.parametrize("build", ["0.30.0", "0.31.0", "0.32.0", "0.33.0", "0.34.0"])
-    def test_a_text_proven_build_does_not_inherit_image_authority(self, build):
-        # cond-0310/cond-0315/cond-0331: 0.31.0, 0.32.0, 0.33.0, and 0.34.0
-        # (and retained 0.30.0) are text/multiline/steer proven — their bundle
-        # composer facts are read, so they advertise the operator_message block
-        # and the C-s steer chord — but the image block is gated by the separate
-        # IMAGE_PROVEN_BUILDS table (0.29.2 only). A build whose staged-path
-        # image transport+consumption was never live-proven must NOT inherit
-        # 0.29.2's image authority. Image stays fail-closed; adding the build to
-        # SUPPORTED_VERSIONS never grants it.
+    def test_a_text_proven_build_advertises_image_as_unproven(self, build):
+        # cond-0310/cond-0315/cond-0331: these builds are
+        # text/multiline/steer proven.  Under the unpinned policy the image
+        # block is advertised for any observed build — staged-path image
+        # delivery is text riding the composer plan — but ``build_proven``
+        # records that only 0.29.2 holds the live acceptance, so a consumer
+        # can tell the default from the proof.
         block = provider_controls.controls_block_for(KIMI, build)
         assert block["steer_chords"] == ["C-s"]
         assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
-        assert "image" not in block
+        assert block["image"] == KIMI_IMAGE_BLOCK_UNPROVEN
 
     def test_an_unknown_version_advertises_no_chords(self):
         assert provider_controls.controls_block_for(KIMI, None)["steer_chords"] == []
@@ -256,17 +258,20 @@ class TestPerTerminalBlock:
         assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
         assert "image" not in block
 
-    def test_a_narrowly_bind_proven_codex_build_advertises_no_control_block(self):
-        """0.147.0 may bind a native session and still gets nothing here.
+    def test_a_narrowly_bind_proven_codex_build_advertises_text_only(self):
+        """0.147.0 may bind a native session; its control block follows the
+        observation rule.
 
-        The native-bind capability table and these build-exact control
-        tables are independent: bootstrap/resume proof grants no steer,
-        operator-message, or image authority, which stays pinned to the
-        builds whose control surface was independently stage-verified.
+        The native-bind capability table and these control tables are
+        independent.  Bind proof grants no steer chords (Codex has no chord
+        table at all) and no image block (Codex image delivery is
+        intentionally unadvertised until the native canary proves it); the
+        operator-message block is advertised for any observed build as the
+        conservative default.
         """
         block = provider_controls.controls_block_for(CODEX, "0.147.0")
         assert block["steer_chords"] == []
-        assert "operator_message" not in block
+        assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
         assert "image" not in block
 
 
@@ -297,12 +302,14 @@ class TestEvidence:
 
 
 class TestLaneCBlocks:
-    """The §8.6 additive capability blocks: build-exact like steer chords,
-    absent entirely where unproven (never nulled on the wire)."""
+    """The §8.6 additive capability blocks: advertised for any observed
+    build, with ``build_proven`` recording which builds hold the live
+    acceptance; absent entirely only where the version was never observed
+    (never nulled on the wire)."""
 
     def test_kimi_image_is_png_only_with_the_proven_template(self):
         block = provider_controls.controls_block_for(KIMI, "0.29.2")
-        assert block["image"] == KIMI_IMAGE_BLOCK
+        assert block["image"] == KIMI_IMAGE_BLOCK_PROVEN
         # The pinned directive phrasing, because that is the trigger form
         # the pinned 0.29.2 live acceptance exercised (§8.6): bare-path
         # substitution is unproven for kimi and is not claimed.
@@ -311,7 +318,7 @@ class TestLaneCBlocks:
 
     def test_claude_image_advertises_the_documented_formats(self):
         block = provider_controls.controls_block_for(CLAUDE, "2.1.220")
-        assert block["image"] == CLAUDE_IMAGE_BLOCK
+        assert block["image"] == {**CLAUDE_IMAGE_BLOCK, "build_proven": True}
         assert block["image"]["reference_template"] == "{path}"
 
     @pytest.mark.parametrize("build", KIMI_PINNED_BUILDS)
@@ -322,35 +329,31 @@ class TestLaneCBlocks:
         assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
 
     @pytest.mark.parametrize("build", ["0.29.0", "0.29.1"])
-    def test_a_text_proven_but_image_unproven_kimi_build_advertises_no_image(self, build):
-        """Image delivery authority is proven only on 0.29.2 (§10.6): the
-        older text-proven builds keep the message block but must not
-        inherit the image block's proof (Lane C r1)."""
+    def test_a_text_proven_but_image_unproven_kimi_build_marks_image_unproven(self, build):
+        """Image delivery's live acceptance covers 0.29.2 alone (§10.6):
+        the older text-proven builds advertise the image block under the
+        unpinned default and say so — ``build_proven`` is False, rather
+        than the block silently claiming 0.29.2's acceptance."""
         block = provider_controls.controls_block_for(KIMI, build)
         assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
-        assert "image" not in block
-        entry = provider_controls.controls_for(KIMI, build)
-        assert entry["operator_message"] is not None
-        assert entry["image"] is None
+        assert block["image"] == KIMI_IMAGE_BLOCK_UNPROVEN
 
-    def test_only_the_image_proven_kimi_build_advertises_image(self):
-        assert "image" not in provider_controls.controls_block_for(KIMI, "0.29.0")
-        assert "image" not in provider_controls.controls_block_for(KIMI, "0.29.1")
-        assert provider_controls.controls_block_for(KIMI, "0.29.2")["image"] == KIMI_IMAGE_BLOCK
+    def test_only_the_image_proven_kimi_build_marks_image_proven(self):
+        for build in KIMI_PINNED_BUILDS:
+            block = provider_controls.controls_block_for(KIMI, build)
+            assert block["image"] == (
+                KIMI_IMAGE_BLOCK_PROVEN if build == "0.29.2" else KIMI_IMAGE_BLOCK_UNPROVEN
+            )
 
-    def test_0300_advertises_text_and_interactive_but_never_image(self):
+    def test_0300_advertises_text_interactive_and_unproven_image(self):
         """cond-0198: the proven 0.30.0 build advertises the text/control
-        blocks and the §6.7 interactive block with its steer chords — but
-        image delivery authority stays pinned to 0.29.2 alone."""
+        blocks and the §6.7 interactive block with its steer chords; the
+        image block rides the conservative default and says so."""
         block = provider_controls.controls_block_for(KIMI, "0.30.0")
         assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
         assert block["interactive_streaming"] == {"supported": True}
         assert block["steer_chords"] == ["C-s"]
-        assert "image" not in block
-        entry = provider_controls.controls_for(KIMI, "0.30.0")
-        assert entry["operator_message"] is not None
-        assert entry["interactive_streaming"] is not None
-        assert entry["image"] is None
+        assert block["image"] == KIMI_IMAGE_BLOCK_UNPROVEN
 
     def test_operator_message_limits_are_the_spec_pins(self):
         block = provider_controls.controls_block_for(CLAUDE, "2.1.220")
@@ -358,17 +361,19 @@ class TestLaneCBlocks:
         assert block["operator_message"]["multiline"] is True
         assert block["operator_message"]["max_attachments"] == 4
 
-    def test_an_unpinned_build_omits_the_blocks_entirely(self):
-        """Fail closed like steer chords: no proof for this build, so no
-        advertisement — and the wire omits the keys rather than nulling."""
+    def test_an_unlisted_build_advertises_the_blocks_as_unproven(self):
+        """The conservative default is not the null value: an observed but
+        unlisted build keeps the delivery blocks, with the image block
+        marked unproven."""
         entry = provider_controls.controls_for(KIMI, "9.9.9")
-        assert entry["operator_message"] is None
-        assert entry["image"] is None
+        assert entry["operator_message"] is not None
+        assert entry["image"] == KIMI_IMAGE_BLOCK_UNPROVEN
         block = provider_controls.controls_block_for(KIMI, "9.9.9")
-        assert "operator_message" not in block
-        assert "image" not in block
+        assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
+        assert block["image"] == KIMI_IMAGE_BLOCK_UNPROVEN
 
     def test_an_unknown_version_omits_the_blocks(self):
+        """A failed observation (no version at all) still withholds."""
         block = provider_controls.controls_block_for(KIMI, None)
         assert "operator_message" not in block
         assert "image" not in block

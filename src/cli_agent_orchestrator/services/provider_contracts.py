@@ -2,10 +2,14 @@
 
 Each provider has one attested pre-turn native-identity source and an exact
 set of accepted resume forms. Routine launch admission is open by default so
-an ordinary CLI update does not freeze a campaign. Native identity, control,
-route, and resume capabilities remain exact-build claims: an unproven build
-cannot inherit a neighbouring build's evidence. An operator may temporarily
-restore exact-set launch enforcement after reproducing a provider regression.
+an ordinary CLI update does not freeze a campaign, and capability is
+unpinned: an installed build receives full capability through per-surface
+conservative defaults and runtime reads of its own bundle, without being
+listed anywhere first.  ``SUPPORTED_VERSIONS`` survives only as the
+strict-mode quarantine set, consulted when an operator forces
+``CAO_PROVIDER_VERSION_ENFORCEMENT_<PROVIDER>=strict`` after a reproduced
+regression.  Unparseable version banners fail closed in every mode:
+unparseable is a failed observation, not merely an unlisted build.
 
 No provider may use a "newest" or implicit-current-session shortcut, a
 completion-only hint as launch authority, or a non-resumable mode. Claude's
@@ -53,26 +57,23 @@ PROVIDER_MUSE_CLI = "muse_cli"
 #: Version-enforcement modes for the provider-version policy.
 #:
 #: ``strict``  exact-set membership in ``SUPPORTED_VERSIONS``: the version
-#:             must be a build that has been read and proven.  This is an
-#:             explicit operator choice for a reproduced regression or a
-#:             rollout that must remain on a known-good binary.
+#:             must be listed to launch at all.  This is the quarantine
+#:             mode — an explicit operator choice for a reproduced
+#:             regression or a rollout that must remain on a known-good
+#:             binary, never the normal update policy.
 #: ``open``    any non-empty semver-shaped version is accepted at the
-#:             launch identity boundary.  The exact ``SUPPORTED_VERSIONS``
-#:             tuple still gates feature-specific authority (native
-#:             control, rendered-session proof, steer/composer, image,
-#:             resume, route authority).  Open mode is used when the
-#:             provider has passed compatibility checks for a current
-#:             build and we want normal future updates to keep launching
-#:             without waiting for a manual pin, while advanced
-#:             capabilities stay fail-closed until a build is proven.
+#:             launch identity boundary, with full capability: the
+#:             per-surface conservative defaults and runtime bundle reads
+#:             cover unlisted builds.  This is the default for every
+#:             provider, so routine CLI updates freeze neither admission
+#:             nor capability.
 VERSION_ENFORCEMENT_STRICT = "strict"
 VERSION_ENFORCEMENT_OPEN = "open"
 
 #: The default enforcement mode per provider.  All providers are open by
 #: default: routine CLI updates should not freeze admission merely because a
 #: version table has not caught up.  Exact pins remain an explicit, reversible
-#: operator choice for a reproduced regression, while feature-specific
-#: authority stays gated by the exact proven-build tables below.
+#: operator choice for a reproduced regression.
 #: The mode can be overridden per-provider at runtime with
 #: ``CAO_PROVIDER_VERSION_ENFORCEMENT_<PROVIDER>=strict|open``.
 VERSION_ENFORCEMENT_MODE: dict[str, str] = {
@@ -124,11 +125,10 @@ PRE_TASK_IDENTITY_READY = "pre-task native identity ready"
 
 #: The single *current* pin per provider: the version a fresh mint/proof
 #: is expected to run, and the one a receipt records when it cannot read a
-#: more specific fact.  ``SUPPORTED_VERSIONS`` below is the acceptance
-#: authority for feature-specific capabilities; this map is the
-#: representative head of each accepted tuple.  In open mode the pin is
-#: advisory for launch identity — it names the build that is known-good
-#: today, not a hard ceiling.
+#: more specific fact.  This map is advisory everywhere — the representative
+#: head of each provider's accepted tuple, naming the build that is
+#: known-good today.  It is not a ceiling, not an equality check, and not a
+#: capability authority: an unlisted build launches with full capability.
 PINNED_VERSIONS = {
     PROVIDER_CODEX: "0.146.0",
     PROVIDER_KIMI: "0.34.0",
@@ -215,12 +215,12 @@ PINNED_VERSIONS = {
 #: Their required request and consumed response fields are unchanged; the
 #: observed differences are property ordering or additive optional fields.
 #:
-#: In open-enforcement mode (Kimi) a launch may succeed against any
-#: non-empty semver-shaped version, but the exact set below still gates
-#: feature-specific authority: native control, rendered-session proof,
-#: steer/composer, image delivery, resume, and route authority.  An
-#: unproven build therefore launches with no advanced capabilities rather
-#: than inheriting them from a neighbour.
+#: In open-enforcement mode (every provider's default) a launch succeeds
+#: against any non-empty semver-shaped version and receives full capability:
+#: the per-surface conservative defaults and runtime bundle reads cover
+#: builds nobody has listed.  The tuple below is consulted again only when a
+#: provider is forced to strict mode after a reproduced regression — it is
+#: the quarantine set, not a capability gate.
 SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
     PROVIDER_CODEX: ("0.146.0",),
     PROVIDER_KIMI: ("0.34.0", "0.33.0", "0.32.0", "0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0"),
@@ -583,10 +583,8 @@ def check_pinned_version(provider: str, installed_version: str) -> None:
 
     In open mode any provider accepts a non-empty semver-shaped observed
     version at the launch identity boundary.  In strict mode the version
-    must be an exact member of ``SUPPORTED_VERSIONS``.  Unknown providers
-    and unparseable versions always fail closed.  Open admission does not
-    grant native control, resume, route, or other advanced authority; those
-    call sites must use :func:`is_proven_version`.
+    must be an exact member of ``SUPPORTED_VERSIONS`` — the quarantine set.
+    Unknown providers and unparseable versions always fail closed.
     """
     if provider not in SUPPORTED_VERSIONS:
         raise ProviderContractError(f"unknown provider: {provider!r}")
@@ -607,15 +605,16 @@ def check_pinned_version(provider: str, installed_version: str) -> None:
         )
 
 
-def is_proven_version(provider: str, installed_version: str | None) -> bool:
-    """Return whether an exact build has evidence for advanced authority.
+def is_listed_version(provider: str, installed_version: str | None) -> bool:
+    """Return whether an exact build is a member of ``SUPPORTED_VERSIONS``.
 
-    This intentionally ignores the launch enforcement mode.  A provider may
-    be admitted in open mode so routine CLI updates do not stall a campaign,
-    but a new build must not inherit a neighbouring build's native-session,
-    control, resume, or route proof.  Callers at those capability boundaries
-    use this exact predicate and fail closed until the new build is tested and
-    added to ``SUPPORTED_VERSIONS``.
+    This is strict-mode quarantine membership, **not** a capability
+    authority.  Under the unpinned provider-version policy an unlisted build
+    receives full capability through the per-surface conservative defaults
+    and runtime bundle reads; this predicate survives only for the surfaces
+    that still name exact builds (the §6 narrow tables' reference cells and
+    the strict-mode launch quarantine in :func:`check_pinned_version`).
+    It intentionally ignores the launch enforcement mode.
     """
     if provider not in SUPPORTED_VERSIONS or not isinstance(installed_version, str):
         return False
@@ -675,7 +674,7 @@ def is_native_bind_capable(provider: str, installed_version: str | None) -> bool
     The acceptance authority for managed native bind/admission: a readiness
     receipt from a build outside this table cannot become a generation's
     bound native identity, whatever the launch enforcement mode admits.
-    Independent of :func:`is_proven_version` in both directions — a build
+    Independent of :func:`is_listed_version` in both directions — a build
     may hold this narrow proof without the broad one (Codex 0.147.0) — so
     neither predicate may stand in for the other at a call site.
     """
@@ -731,7 +730,7 @@ def is_route_attest_capable(provider: str, installed_version: str | None) -> boo
     The acceptance authority for the route-attestation seam: a receipt
     from a build outside this table cannot re-arm a launch breaker,
     whatever the launch enforcement mode admits.  Independent of
-    :func:`is_proven_version` in both directions — a build may hold this
+    :func:`is_listed_version` in both directions — a build may hold this
     narrow proof without the broad one (Codex 0.147.0) — so neither
     predicate may stand in for the other at a call site.
     """
@@ -938,17 +937,20 @@ def validate_route_proof(
     return True
 
 
-def _version_matches(provider: str, installed_version: Optional[str]) -> bool:
-    """True only when the installed version has exact feature proof.
+def _version_observed(provider: str, installed_version: Optional[str]) -> bool:
+    """True only when the installed version was successfully observed.
 
-    Open launch enforcement deliberately accepts a semver-shaped update, but
-    resume identity is a capability claim and may not inherit a neighbouring
-    build's evidence.  Keep this predicate exact-set based even when
-    ``check_pinned_version`` is open.
+    Resume identity is decided from the exact-id resume forms and their
+    runtime observations, not from build listing: an unlisted build resumes
+    through the same validated ``--session <id>`` / ``--resume <uuid>``
+    forms, and a build whose behaviour changed fails loudly at the
+    observation seam.  What remains fail-closed here is the *failed
+    observation* — an absent or unparseable banner — which is a different
+    answer from "nothing was written down about this build".
     """
-    if installed_version is None:
+    if installed_version is None or provider not in SUPPORTED_VERSIONS:
         return False
-    return is_proven_version(provider, installed_version)
+    return bool(normalized_version(installed_version))
 
 
 def resume_status(
@@ -965,8 +967,9 @@ def resume_status(
 
     Every claim derives from provider-specific, version-checked,
     generation-bound receipts: ``installed_version`` is the live
-    ``--version`` fact for the pinned binary (drift or absence removes
-    the capability), ``kimi_acp_proof`` is the validated durable ACP
+    ``--version`` observation (a failed observation — absent or unparseable
+    — removes the capability; an *unlisted* build is merely nothing written
+    down and keeps it), ``kimi_acp_proof`` is the validated durable ACP
     new→kill→load receipt, and ``route_proof`` is the provider-specific
     model-input-bound non-echo route receipt, validated against the
     pinned route expectation supplied by the authority boundary
@@ -975,7 +978,7 @@ def resume_status(
     unproven/unsupported — caller booleans can no longer promote anything.
     """
     if provider == PROVIDER_CODEX:
-        version_ok = _version_matches(PROVIDER_CODEX, installed_version)
+        version_ok = _version_observed(PROVIDER_CODEX, installed_version)
         return ProviderResumeStatus(
             provider=provider,
             identity_available=version_ok,
@@ -992,12 +995,12 @@ def resume_status(
                 "recovery/strongest-route authority unsupported until a "
                 "model-input-bound non-echo route receipt is proven"
                 if version_ok
-                else "identity unavailable: pinned Codex binary is absent or "
-                "version-drifted (fail closed, outcome 41)"
+                else "identity unavailable: the installed Codex binary's version "
+                "could not be observed (fail closed, outcome 41)"
             ),
         )
     if provider == PROVIDER_CLAUDE:
-        version_ok = _version_matches(PROVIDER_CLAUDE, installed_version)
+        version_ok = _version_observed(PROVIDER_CLAUDE, installed_version)
         return ProviderResumeStatus(
             provider=provider,
             identity_available=version_ok,
@@ -1006,12 +1009,12 @@ def resume_status(
                 "resume identity available (--session-id/--resume); unsupported "
                 "by default: no pre-input effort surface exists"
                 if version_ok
-                else "identity unavailable: pinned Claude binary is absent or "
-                "version-drifted (fail closed, outcome 41)"
+                else "identity unavailable: the installed Claude binary's version "
+                "could not be observed (fail closed, outcome 41)"
             ),
         )
     if provider == PROVIDER_KIMI:
-        version_ok = _version_matches(PROVIDER_KIMI, installed_version)
+        version_ok = _version_observed(PROVIDER_KIMI, installed_version)
         proven = version_ok and kimi_acp_proof is not None
         return ProviderResumeStatus(
             provider=provider,
@@ -1021,8 +1024,8 @@ def resume_status(
                 "identity requires the installed-CLI ACP session/new→kill→"
                 "session/load proof; effort authority unproven"
                 if proven
-                else "identity disabled until the pinned binary is "
-                "version-verified and the installed-CLI ACP "
+                else "identity disabled until the installed binary's version is "
+                "observed and the installed-CLI ACP "
                 "session/new→kill→session/load proof passes"
             ),
         )

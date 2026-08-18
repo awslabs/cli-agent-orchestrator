@@ -1210,6 +1210,7 @@ class TestAdditiveCapabilities:
                         "{path} and analyze it in the context of this message."
                     ),
                     "evidence": "live acceptance on pinned 0.29.2 (§10.6)",
+                    "build_proven": True,
                 },
                 # §6.7 (r15): the build-exact interactive-streaming send
                 # authority for this terminal's pinned build.
@@ -1221,9 +1222,10 @@ class TestAdditiveCapabilities:
     def test_the_per_terminal_block_on_an_unpinned_build_admits_no_chords(
         self, client, monkeypatch
     ):
-        """Build-exact, never the union: a kimi build outside the pinned
-        table advertises an empty chord set and no emptiness guard, so the
-        client refuses locally with zero POSTs (D9)."""
+        """Build-exact, never the union: a kimi build whose installed bundle
+        yields no chord fact for this version advertises an empty chord set
+        and no emptiness guard, so the client refuses locally with zero
+        POSTs (D9)."""
         monkeypatch.setattr(
             service,
             "resolve_control_identity",
@@ -1232,10 +1234,12 @@ class TestAdditiveCapabilities:
         block = client.get(f"/terminals/{TERMINAL}/control-identity").json()["control_input"]
         assert block["provider_controls"]["kimi_cli"]["steer_chords"] == []
         assert block["command_controls"] == {"composer_nonempty_guard": False}
-        # §8.6: the Lane C blocks fail closed with the chords — an unproven
-        # build advertises no message/image capability (omitted, not nulled).
-        assert "operator_message" not in block["provider_controls"]["kimi_cli"]
-        assert "image" not in block["provider_controls"]["kimi_cli"]
+        # §8.6 under the unpinned policy: the Lane C blocks follow the
+        # version observation — an unlisted-but-observed build advertises
+        # them, with the image block marked as not live-proven.
+        lane_c = block["provider_controls"]["kimi_cli"]
+        assert lane_c["operator_message"]["supported"] is True
+        assert lane_c["image"]["build_proven"] is False
 
     def test_a_provider_without_a_registry_entry_has_no_controls_block(self, client, monkeypatch):
         monkeypatch.setattr(

@@ -160,7 +160,10 @@ def test_installed_cell_matrix_uses_the_provider_proof_gates():
         version_banner="muse 0.1.0-R708.1",
     ).runnable
     assert matrix.assess_cell("claude_code", normalized_version="2.1.220").runnable
-    assert not matrix.assess_cell("claude_code", normalized_version="2.1.232").runnable
+    # Unpinned: an unlisted Claude build is runnable — the SessionStart
+    # hook is the runtime proof.  A failed observation is not.
+    assert matrix.assess_cell("claude_code", normalized_version="2.1.232").runnable
+    assert not matrix.assess_cell("claude_code", normalized_version="").runnable
     assert not matrix.assess_variation("codex", execution_mode="native_tui").runnable
 
 

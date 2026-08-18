@@ -94,10 +94,11 @@ def test_0340_is_the_current_pin_and_open_enforcement_allows_future_semver():
     assert pc.version_enforcement_mode("kimi") == pc.VERSION_ENFORCEMENT_OPEN
 
 
-def test_open_admission_does_not_promote_future_build_to_advanced_authority():
-    assert pc.is_proven_version("kimi", PIN_0340)
-    assert not pc.is_proven_version("kimi", "0.35.0")
-    assert not pc.is_proven_version("unknown", PIN_0340)
+def test_open_admission_keeps_quarantine_membership_exact():
+    """Listing is the strict-mode quarantine set, not a capability gate."""
+    assert pc.is_listed_version("kimi", PIN_0340)
+    assert not pc.is_listed_version("kimi", "0.35.0")
+    assert not pc.is_listed_version("unknown", PIN_0340)
 
 
 # --------------------------------------------------------------------

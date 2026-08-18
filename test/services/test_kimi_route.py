@@ -14,6 +14,8 @@ from cli_agent_orchestrator.services.kimi_route import (
 
 
 class _FakeAcpClient:
+    agent_version = "0.29.0"
+
     def __init__(self, argv, env, timeout):
         self.argv = argv
         self.env = env
@@ -25,7 +27,7 @@ class _FakeAcpClient:
         if method == "initialize":
             return {
                 "protocolVersion": 1,
-                "agentInfo": {"name": "Kimi Code CLI", "version": "0.29.0"},
+                "agentInfo": {"name": "Kimi Code CLI", "version": self.agent_version},
             }
         if method == "session/new":
             return {
@@ -81,7 +83,32 @@ def test_probe_attests_k3_max_without_prompt(tmp_path, monkeypatch):
     assert clients[0].env["KIMI_MODEL_THINKING_EFFORT"] == "max"
 
 
-def test_probe_fails_closed_on_version_drift(tmp_path, monkeypatch):
+def test_probe_admits_an_unlisted_build_under_open_enforcement(tmp_path, monkeypatch):
+    """Unpinned: the ACP read-back is the route proof, not a table row.
+
+    An unlisted build is probed exactly like a listed one — the zero-prompt
+    exchange selects and reads back the requested route, and the
+    agentInfo/--version agreement is still cross-checked.
+    """
+    monkeypatch.setattr(_FakeAcpClient, "agent_version", "0.30.1")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="0.30.1\n", stderr=""),
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.kimi_route._AcpClient", _FakeAcpClient)
+    receipt = attest_kimi_route(
+        str(tmp_path.resolve()),
+        expected_model="kimi-code/k3",
+        expected_effort="max",
+        user_config_path=tmp_path / "absent.toml",
+    )
+    assert receipt["kimi_version"] == "0.30.1"
+    assert receipt["model"] == "kimi-code/k3"
+
+
+def test_probe_refuses_an_unlisted_build_under_strict_quarantine(tmp_path, monkeypatch):
+    """The opt-in quarantine still gates the probe at the boundary."""
+    monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI", "strict")
     monkeypatch.setattr(
         "subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="0.30.1\n", stderr=""),

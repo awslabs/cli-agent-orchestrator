@@ -7,9 +7,9 @@ that exact session (``session/load`` or the ``--session <id>`` /
 Kimi resume identity is disabled (fail closed).
 
 Invariant: the proof receipt binds the exact installed binary (path +
-content digest + pinned version) and the exact session id that
+content digest + observed version) and the exact session id that
 survived the kill; ``kimi_identity_enabled`` is true only when a valid
-receipt exists for the *current* pinned binary — any binary drift
+receipt exists for the *current* installed binary — any binary change
 invalidates it.
 
 Failure mode prevented: claiming resumable identity from a version or
@@ -26,11 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from cli_agent_orchestrator.services import provider_contracts
 from cli_agent_orchestrator.services.durable_publish import publish_immutable
 from cli_agent_orchestrator.services.provider_contracts import (
     PROVIDER_KIMI,
-    SUPPORTED_VERSIONS,
     ProviderVersionDrift,
     check_pinned_version,
     normalized_version,
@@ -72,11 +70,15 @@ def run_identity_proof(
     binary = Path(kimi_binary)
     if os.path.realpath(binary) != str(binary) or not binary.is_file():
         raise KimiAcpProofError("kimi binary must be a canonical absolute file")
-    if not provider_contracts.is_proven_version(PROVIDER_KIMI, version_output):
-        raise KimiAcpProofError(
-            "Kimi ACP identity proof is unavailable for this provider build; "
-            "stage-verify it before enabling resume identity"
-        )
+    # The proof is attempted against whatever build is installed: the
+    # session/new→kill→session/load exchange below *is* the verification,
+    # so an unlisted build proves itself at runtime or fails loudly here.
+    # What still fails closed is the failed observation — an unparseable
+    # banner — and a strict-mode quarantine.
+    try:
+        check_pinned_version(PROVIDER_KIMI, version_output)
+    except ProviderVersionDrift as exc:
+        raise KimiAcpProofError(str(exc)) from exc
     outcome = acp_driver(binary)
     if not isinstance(outcome, dict) or outcome.get("resumed") is not True:
         raise KimiAcpProofError("installed CLI did not resume the exact ACP session after kill")
@@ -102,7 +104,6 @@ def run_identity_proof(
         "schema": PROOF_SCHEMA,
         # The exact version this binary reports, not a pin constant: with
         # more than one accepted build a constant could name the wrong one.
-        # check_pinned_version above already proved it is an accepted build.
         "kimi_version": normalized_version(version_output),
         "binary_path": str(binary),
         "binary_sha256": binary_digest,
@@ -169,7 +170,10 @@ def load_valid_proof(
     """
     state = Path(state_dir)
     try:
-        if not provider_contracts.is_proven_version(PROVIDER_KIMI, version_output):
+        # A failed version observation (unparseable banner) is not a proof
+        # context; an *unlisted* build is — the receipt's binary-digest
+        # binding below is the exactness, not a table row.
+        if not normalized_version(version_output):
             return None
         binary_digest = hashlib.sha256(Path(kimi_binary).read_bytes()).hexdigest()
     except (ProviderVersionDrift, OSError):
@@ -187,10 +191,11 @@ def load_valid_proof(
             and receipt.get("schema") == PROOF_SCHEMA
             and receipt.get("binary_sha256") == binary_digest
             and receipt.get("binary_path") == str(kimi_binary)
-            # Any accepted exact build, so a proof minted under a retained
-            # version still validates; the binary digest above binds it to
-            # the exact installed binary regardless.
-            and receipt.get("kimi_version") in SUPPORTED_VERSIONS[PROVIDER_KIMI]
+            # The digest above binds the receipt to the exact installed
+            # binary; the recorded version must itself be a successful
+            # observation, but listing is not required — an unlisted build's
+            # proof is exactly as good as a listed one's.
+            and bool(normalized_version(str(receipt.get("kimi_version") or "")))
             and receipt.get("resumed_after_kill") is True
             and _exchange_valid(receipt)
         ):

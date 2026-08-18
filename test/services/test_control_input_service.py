@@ -3287,7 +3287,16 @@ class TestInteractiveDeclaration:
         assert result.request_schema_version == 4
         assert client.writes == []
 
-    def test_interactive_on_an_unproven_build_fails_closed_pre_write(self, monkeypatch, journal):
+    def test_interactive_on_an_unlisted_build_delivers_under_the_default(
+        self, monkeypatch, journal
+    ):
+        """Unpinned: interactive streaming follows the version observation.
+
+        The declaration rides the deployed v3 sequence transport; an
+        unlisted-but-observed build advertises it as the conservative
+        default, so the batch delivers.  Only a failed observation (no
+        version at all) withholds the block.
+        """
         resolved = _seq_resolved(provider_version="9.9.9")
         client = self._wire(
             monkeypatch,
@@ -3296,10 +3305,8 @@ class TestInteractiveDeclaration:
             {0: {"lines": ["queued mid-turn"]}},
         )
         result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
-        assert result.outcome == REFUSED
-        assert result.reason_code == REASON_PROVIDER_UNSUPPORTED
-        assert "interactive-streaming" in result.detail
-        assert client.writes == []
+        assert result.outcome == ACCEPTED
+        assert any(write.get("text") == "queued mid-turn" for write in client.writes)
 
     def test_interactive_on_an_unknown_version_fails_closed(self, monkeypatch, journal):
         resolved = _seq_resolved(provider_version=None)

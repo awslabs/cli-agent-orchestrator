@@ -971,8 +971,15 @@ class TestRouteAttestationDispatchesByProvider:
         assert provider_receipt["pre_turn_route_surface"] is False
         assert provider_receipt["unobserved_reason"]
 
-    def test_a_drifted_claude_build_is_refused(self, tmp_path, monkeypatch):
-        """The one thing this receipt does assert must be checked."""
+    def test_an_unlisted_claude_build_is_attested_under_open_enforcement(
+        self, tmp_path, monkeypatch
+    ):
+        """Unpinned: an unlisted parseable build is probed, not refused.
+
+        The receipt names exactly what was observed — the requested route
+        as requested, no pre-turn resolution — so admitting an unlisted
+        build asserts nothing beyond the observation itself.
+        """
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.claude_route.shutil.which",
             lambda binary: "/usr/local/bin/claude",
@@ -980,6 +987,41 @@ class TestRouteAttestationDispatchesByProvider:
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.claude_route.subprocess.run",
             lambda *a, **k: SimpleNamespace(returncode=0, stdout="2.1.218\n"),
+        )
+
+        receipt = managed_launch.attest_route(_attest_request(tmp_path, "claude_code"))
+
+        assert receipt["no_task_admitted"] is True
+        assert receipt["provider_route_receipt"]["claude_version"] == "2.1.218"
+
+    def test_strict_mode_quarantines_the_unlisted_claude_build(self, tmp_path, monkeypatch):
+        """The opt-in quarantine still refuses an unlisted build."""
+        monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_CLAUDE", "strict")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.shutil.which",
+            lambda binary: "/usr/local/bin/claude",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.subprocess.run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="2.1.218\n"),
+        )
+
+        with pytest.raises(managed_launch.ManagedLaunchConflict):
+            managed_launch.attest_route(_attest_request(tmp_path, "claude_code"))
+
+    @pytest.mark.parametrize("mode", ["open", "strict"])
+    def test_an_unparseable_claude_banner_is_refused_in_every_mode(
+        self, tmp_path, monkeypatch, mode
+    ):
+        """Unparseable is a failed observation, distinct from unlisted."""
+        monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_CLAUDE", mode)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.shutil.which",
+            lambda binary: "/usr/local/bin/claude",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.subprocess.run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="garbage banner\n"),
         )
 
         with pytest.raises(managed_launch.ManagedLaunchConflict):

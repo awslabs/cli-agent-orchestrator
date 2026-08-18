@@ -293,12 +293,22 @@ class TestIdentityAndCapabilityGates:
         assert result.outcome == "refused"
         assert result.reason_code == "provider-unsupported"
 
-    def test_an_unpinned_build_advertises_no_operator_message(self, wire, monkeypatch):
-        monkeypatch.setattr(
-            cis,
-            "resolve_control_identity",
-            lambda tid: _resolved(provider_version="9.9.9"),
-        )
+    def test_an_unlisted_build_delivers_the_operator_message(self, wire, monkeypatch):
+        """Unpinned: the delivery block follows the version observation.
+
+        An unlisted-but-observed build advertises the operator-message
+        block as the conservative default, so the submit proceeds; only a
+        failed observation withholds it.
+        """
+        adapter = _FakeAdapter(record=_record(OP))
+        wire(_resolved(provider_version="9.9.9"), adapter, {"deliverable": True})
+        result = _submit()
+        assert result.outcome == "accepted"
+
+    def test_a_failed_version_observation_withholds_the_operator_message(self, wire, monkeypatch):
+        """Unparseable is a failed observation, distinct from unlisted."""
+        adapter = _FakeAdapter(record=_record(OP))
+        wire(_resolved(provider_version="not-a-version"), adapter, {"deliverable": True})
         result = _submit()
         assert result.outcome == "refused"
         assert result.reason_code == "provider-unsupported"
@@ -335,11 +345,48 @@ class TestIdentityAndCapabilityGates:
         assert result.reason_code == "generation-fenced"
         assert adapter.calls == []
 
-    def test_attachments_without_an_image_block_are_unsupported(self, wire, monkeypatch):
+    def test_attachments_on_an_unlisted_build_ride_the_conservative_default(
+        self, wire, monkeypatch
+    ):
+        """Unpinned: the image block is advertised with build_proven False.
+
+        Staged-path image delivery is text through the composer plan, so an
+        unlisted-but-observed build accepts the attachment; the per-build
+        live acceptance is recorded on the block, not enforced by
+        withholding.
+        """
+        adapter = _FakeAdapter(record=_record(OP))
+        resolved = _resolved(provider="claude_code", provider_version="1.0.0")
+        wire(resolved, adapter, {"deliverable": True})
+        record = {"attachment_id": "att-1", "format": "png", "state": "ready"}
+        monkeypatch.setattr(
+            oms.image_attachments,
+            "get_attachment",
+            lambda terminal_id, attachment_id: dict(record),
+        )
+        monkeypatch.setattr(oms.image_attachments, "bind_for_submit", lambda *a: [record])
+        monkeypatch.setattr(
+            oms.image_attachments,
+            "staged_absolute_path",
+            lambda record: f"/staged/{record['attachment_id']}.png",
+        )
+        monkeypatch.setattr(oms, "_terminal_agent_profile", lambda tid: None)
+        expected = {**EXPECTED, "provider": "claude_code"}
+        result = _submit(
+            text="see [Image #1]",
+            attachments=["att-1"],
+            token_map={"1": "att-1"},
+            expected_identity=expected,
+        )
+        assert result.outcome == "accepted"
+        assert adapter.calls[0]["text"] == "see /staged/att-1.png"
+
+    def test_attachments_without_a_version_observation_are_unsupported(self, wire, monkeypatch):
+        """A failed observation withholds the image block."""
         monkeypatch.setattr(
             cis,
             "resolve_control_identity",
-            lambda tid: _resolved(provider="claude_code", provider_version="1.0.0"),
+            lambda tid: _resolved(provider="claude_code", provider_version=None),
         )
         expected = {**EXPECTED, "provider": "claude_code"}
         result = _submit(

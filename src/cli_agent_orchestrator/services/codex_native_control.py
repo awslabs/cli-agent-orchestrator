@@ -340,6 +340,15 @@ def plan_composer_keystrokes(
     )
     undeliverable = None
     if len(lines) > 1 and pin is None:
+        # No bundle derivation exists for Codex: the 0.147.0 binary keeps
+        # its editor keymap defaults as compiled structured data — the
+        # action name ``insert_newline`` and its description are readable,
+        # but no binding string (``ctrl+j``/``ctrl-j``) appears anywhere in
+        # the binary, so there is no hint to map to a keystroke.  With no
+        # safe constant default either (a wrong keystroke types junk or
+        # submits mid-message), this provider keeps the typed refusal for
+        # unlisted builds.
+        #
         # Recorded on the plan rather than raised. The payload is well
         # formed; what is missing is a proven keystroke for the installed
         # build, which is an operational fact about this session. The

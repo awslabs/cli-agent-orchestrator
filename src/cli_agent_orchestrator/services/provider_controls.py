@@ -11,9 +11,10 @@ can never drift from the version-pinned evidence the adapters hold.
 Two read surfaces, deliberately different:
 
 - :func:`controls_for` is the SEND AUTHORITY.  It resolves a provider at
-  an exact build: steer chords come from the adapter's build-pinned table,
-  so a provider on an unpinned build gets the entry with an *empty* chord
-  set — never the union of all builds.
+  an exact build: steer chords come from the adapter's build-pinned table
+  plus its runtime bundle read of the installed build, so a build whose
+  bundle yields no chord fact gets the entry with an *empty* chord set —
+  never the union of all builds.
 - :func:`advertised_provider_controls` is DISCOVERY ONLY (§3.5): the
   top-level capabilities block, which unions builds so a client learns
   that chord events exist.  It never licenses a send; the per-terminal
@@ -45,14 +46,12 @@ class ProviderControls(TypedDict):
     entry without re-walking the tree.
 
     Lane C's ``operator_message`` and ``image`` blocks (§8.6) follow the
-    same build-exact rule as ``steer_chords``, with one stricter split:
-    ``operator_message`` is present for builds the text evidence covers
-    (``SUPPORTED_VERSIONS``) while ``image`` is present only for the exact
-    build(s) whose live acceptance proves image delivery
-    (``IMAGE_PROVEN_BUILDS``) — an unpinned build advertises no
-    message/image capability, and a text-proven but image-unproven build
-    (kimi 0.29.0/0.29.1) advertises the message block without the image
-    block rather than inheriting another build's proof.
+    version observation: an unlisted-but-observed build advertises both as
+    the conservative default (image delivery is staged-path text riding
+    the composer plan), with the image block's ``build_proven`` flag
+    recording whether the exact build holds the live acceptance
+    (``IMAGE_PROVEN_BUILDS``).  Only a failed observation — an absent or
+    unparseable version — withholds the blocks.
     """
 
     compact: Optional[List[Dict[str, Any]]]
@@ -113,10 +112,9 @@ def _operator_message_block() -> Dict[str, Any]:
 def _interactive_streaming_block() -> Dict[str, Any]:
     """The §6.7 (r15) interactive-streaming advertisement.
 
-    Present only for builds the deployed v3 sequence transport is proven
-    on (``SUPPORTED_VERSIONS``); the per-terminal block is the send
-    authority for a ``payload_class: "interactive"`` declaration, the
-    top-level union discovery only.
+    Advertised for any build whose version was observed; the per-terminal
+    block is the send authority for a ``payload_class: "interactive"``
+    declaration, the top-level union discovery only.
     """
     return {"supported": True}
 
@@ -309,25 +307,14 @@ def _wire_shape(entry: ProviderControls) -> Dict[str, Any]:
     return block
 
 
-#: Wire key → recovery-capability short name, for the SUPPORTED_VERSIONS
-#: lookup only.  The two namespaces are deliberately not merged
-#: (provider_contracts.py); the reverse map lives there as
-#: ``_WIRE_FOR_RECOVERY_NAME``.
-_SHORT_NAME_FOR_WIRE = {
-    provider_contracts.PROVIDER_CODEX: provider_contracts.PROVIDER_CODEX,
-    provider_contracts.PROVIDER_KIMI_CLI: provider_contracts.PROVIDER_KIMI,
-    provider_contracts.PROVIDER_CLAUDE_CODE: provider_contracts.PROVIDER_CLAUDE,
-}
-
-
 #: The exact builds whose live acceptance proves image delivery (§10.6,
-#: keyed by the canonical wire provider keys this registry speaks).  Text
-#: and multiline operator messages ride the adapter composer plans proven
-#: across each provider's ``SUPPORTED_VERSIONS`` line, but the image block
-#: is build-exact: kimi's staged-path ``ReadMediaFile`` flow is proven on
-#: 0.29.2 alone, so 0.29.0/0.29.1 — and any unknown build — advertise no
-#: image block rather than inheriting 0.29.2's proof.  Claude's single
-#: accepted build is its proven build.
+#: keyed by the canonical wire provider keys this registry speaks).  This
+#: table no longer *gates* the image block: staged-path image delivery is
+#: text through the composer plan, so an unlisted build advertises the
+#: block as a conservative default.  Membership here is recorded on the
+#: block as ``build_proven`` — the difference between "live-accepted on
+#: this exact build" and "advertised under the unpinned default" is a fact
+#: a consumer is entitled to read.
 IMAGE_PROVEN_BUILDS: Dict[str, tuple] = {
     provider_contracts.PROVIDER_KIMI_CLI: ("0.29.2",),
     provider_contracts.PROVIDER_CLAUDE_CODE: ("2.1.220",),
@@ -335,72 +322,32 @@ IMAGE_PROVEN_BUILDS: Dict[str, tuple] = {
 
 
 def _normalized_build(provider_version: Optional[str]) -> Optional[str]:
+    """The observed build, or None when there was no successful observation.
+
+    ``normalized_version`` answers "" for an unparseable banner; here that
+    is collapsed into None so "unparseable" and "absent" — the two failed
+    observations — take the same withholding path, distinct from any
+    unlisted-but-observed build.
+    """
     if provider_version is None:
         return None
     try:
-        return provider_contracts.normalized_version(provider_version)
+        return provider_contracts.normalized_version(provider_version) or None
     except Exception:
         return None
-
-
-def _build_supports_operator_message(provider: str, provider_version: Optional[str]) -> bool:
-    """Whether Lane C's operator-message (text) block is proven for this
-    exact build.
-
-    Same fail-closed rule as steer chords: the evidence lives on pinned
-    builds, so an unpinned (or unresolved) build advertises no
-    ``operator_message`` block at all rather than inheriting a build it
-    never proved.
-
-    ``SUPPORTED_VERSIONS`` is keyed by the recovery-capability short names
-    (``kimi``/``claude``) while this registry speaks the canonical wire
-    keys (``kimi_cli``/``claude_code``); the crossing is written down once
-    here, mirroring ``_WIRE_FOR_RECOVERY_NAME``'s warning about the two
-    namespaces.
-    """
-    normalized = _normalized_build(provider_version)
-    if normalized is None:
-        return False
-    short = _SHORT_NAME_FOR_WIRE.get(provider)
-    if short is None:
-        return False
-    return normalized in provider_contracts.SUPPORTED_VERSIONS.get(short, ())
-
-
-def _build_supports_image(provider: str, provider_version: Optional[str]) -> bool:
-    """Whether Lane C's image block is proven for this exact build.
-
-    Stricter than the text gate (Lane C r1): image delivery authority is
-    proven only by the pinned live acceptance builds in
-    ``IMAGE_PROVEN_BUILDS`` — kimi 0.29.2, claude 2.1.220 — so a build
-    whose text plan is proven (kimi 0.29.0/0.29.1) still advertises no
-    image capability it never demonstrated.
-    """
-    normalized = _normalized_build(provider_version)
-    if normalized is None:
-        return False
-    return normalized in IMAGE_PROVEN_BUILDS.get(provider, ())
-
-
-def _build_supports_interactive_streaming(provider: str, provider_version: Optional[str]) -> bool:
-    """Whether §6.7 interactive streaming is advertised for this exact build.
-
-    The declaration rides the deployed v3 sequence transport, so the proof
-    basis is the same accepted-build line as the text gate; an unpinned or
-    unresolved build advertises nothing (fail closed, D9).
-    """
-    return _build_supports_operator_message(provider, provider_version)
 
 
 def controls_for(provider: str, provider_version: Optional[str]) -> Optional[ProviderControls]:
     """The send-authority entry for ``provider`` at an exact build.
 
-    Build-exact (F11): steer chords resolve through the adapter's
-    build-pinned table with the normalized version, so a provider on an
-    unpinned build gets the entry with an empty chord set — never the
-    union of all builds.  ``None`` means the provider has no registry
-    entry at all (no Compact/Stop/Steer is deliverable to it through the
-    managed path).
+    Build-exact where the underlying fact is build-exact (F11): steer
+    chords resolve through the adapter's own table plus its runtime bundle
+    read, so a build whose bundle cannot be read gets the entry with an
+    empty chord set — never the union of all builds.  The text/image
+    blocks follow the version observation, with ``build_proven`` recorded
+    on the image block.  ``None`` means the provider has no registry entry
+    at all (no Compact/Stop/Steer is deliverable to it through the managed
+    path).
     """
     builder = _REGISTRY.get(provider)
     if builder is None:
@@ -409,15 +356,17 @@ def controls_for(provider: str, provider_version: Optional[str]) -> Optional[Pro
     # into it here cannot leak a per-build set into a later call.
     entry = builder()
     entry["steer_chords"] = _adapter_steer_chords(provider, provider_version)
-    if not _build_supports_operator_message(provider, provider_version):
+    normalized = _normalized_build(provider_version)
+    if normalized is None:
+        # A failed observation withholds the delivery blocks; the launch
+        # boundary refuses such a build anyway, so this is defense in
+        # depth for a caller that bypassed it.
         entry["operator_message"] = None
         entry["image"] = None
-    elif not _build_supports_image(provider, provider_version):
-        # Text-proven but image-unproven (kimi 0.29.0/0.29.1): the message
-        # block stays; the image block does not inherit 0.29.2's proof.
-        entry["image"] = None
-    if not _build_supports_interactive_streaming(provider, provider_version):
         entry["interactive_streaming"] = None
+        return entry
+    if entry["image"] is not None:
+        entry["image"]["build_proven"] = normalized in IMAGE_PROVEN_BUILDS.get(provider, ())
     return entry
 
 

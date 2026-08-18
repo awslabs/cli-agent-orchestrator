@@ -538,12 +538,42 @@ class TestCapabilityAdvertisement:
         assert claude["executable"] == "claude"
         assert "claude" not in block["providers"]
 
-    def test_the_advertised_versions_are_an_exact_set(self):
+    def test_the_advertised_versions_are_derived_from_the_contract(self):
+        """The handshake restates the contract tables, never a frozen copy.
+
+        A hand-maintained expected set beside the derived one is a gate
+        that decays: it would keep "passing" while the advertisement
+        drifted from the contract.  So the expectation is derived from the
+        same tables, and the pairing is what is asserted.
+        """
         claude = v2.native_tui_capabilities()["providers"]["claude_code"]
-        assert claude["supported_versions"] == [PINNED]
-        assert claude["pinned_version"] == PINNED
+        assert claude["supported_versions"] == list(provider_contracts.SUPPORTED_VERSIONS["claude"])
+        assert claude["pinned_version"] == provider_contracts.PINNED_VERSIONS["claude"]
         assert claude["version_enforcement"] == provider_contracts.VERSION_ENFORCEMENT_OPEN
-        assert provider_contracts.SUPPORTED_VERSIONS["claude"] == (PINNED,)
+        # The pin is the advisory head of the quarantine set, in both
+        # directions.
+        assert claude["pinned_version"] == claude["supported_versions"][0]
+        # The quarantine set's content itself is a literal a test may pin:
+        # strict mode refuses exactly the builds absent from it.
+        assert provider_contracts.SUPPORTED_VERSIONS["claude"] == ("2.1.233", PINNED)
+
+    def test_an_unlisted_build_is_not_a_capability_refusal(self):
+        """Open mode admits an unlisted build, and capability follows.
+
+        The per-terminal control block for an unlisted-but-observed build
+        carries the delivery surfaces with non-null defaults — unlisted is
+        merely nothing written down, not a failed observation.
+        """
+        from cli_agent_orchestrator.services import provider_controls
+
+        provider_contracts.check_pinned_version("claude", "2.1.219 (Claude Code)")
+        block = provider_controls.controls_block_for(
+            provider_contracts.PROVIDER_CLAUDE_CODE, "2.1.219 (Claude Code)"
+        )
+        assert block["operator_message"]["supported"] is True
+        assert block["image"]["supported"] is True
+        # Not the null value: the conservative default says what it is.
+        assert block["image"]["build_proven"] is False
 
     def test_a_semver_drift_launches_but_unproven_features_remain_gated(self):
         provider_contracts.check_pinned_version("claude", "2.1.219 (Claude Code)")
@@ -675,15 +705,37 @@ class TestClaudeSessionIsMintedBeforeAnyProviderIO:
         assert Path(hook["readiness_path"]).parent.exists()
         assert bootstrap["readiness_path"] == str(hook["readiness_path"])
 
-    def test_a_drifted_build_is_refused_before_an_identity_is_minted(self, tmp_path, monkeypatch):
-        """Refusing after minting would record a session never to be started."""
+    def test_an_unlisted_build_mints_an_identity(self, tmp_path, monkeypatch):
+        """Unpinned: the SessionStart hook is the runtime proof.
+
+        An unlisted build needs no table row: the hook this mint installs
+        either fires on the real build (identity self-proven) or does not
+        (readiness fails loudly).  What still refuses before minting is a
+        failed version observation — refusing after minting would record a
+        session never to be started.
+        """
+        monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
+
+        bootstrap, _ = v2._mint_claude_native_session(
+            record=self._record(tmp_path),
+            request=self._request(),
+            version_output="2.0.1 (Claude Code)",
+            digest="d" * 64,
+        )
+
+        assert bootstrap["native_session_id"]
+
+    def test_an_unparseable_banner_is_refused_before_an_identity_is_minted(
+        self, tmp_path, monkeypatch
+    ):
+        """Unparseable is a failed observation, distinct from unlisted."""
         monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
 
         with pytest.raises(Exception):
             v2._mint_claude_native_session(
                 record=self._record(tmp_path),
                 request=self._request(),
-                version_output="2.0.1 (Claude Code)",
+                version_output="not-a-version",
                 digest="d" * 64,
             )
 

@@ -40,7 +40,11 @@ import time
 from typing import Any, Callable, Mapping, Optional, Protocol, Tuple, cast
 
 from cli_agent_orchestrator.clients import database
-from cli_agent_orchestrator.services import native_attachment, provider_contracts
+from cli_agent_orchestrator.services import (
+    installed_bundle_facts,
+    native_attachment,
+    provider_contracts,
+)
 from cli_agent_orchestrator.services.canonical_json import canonical_sha256
 from cli_agent_orchestrator.services.execution_mode import NATIVE_TUI
 
@@ -331,8 +335,15 @@ def plan_composer_keystrokes(
     pin = _PROVEN_COMPOSER_NEWLINE.get(
         provider_contracts.normalized_version(provider_version or "")
     )
+    hint = None
+    if pin is None:
+        # The §3 override: the hint the pin recorded as evidence is read
+        # from the installed bundle of the exact build being driven.  A
+        # successful read licenses the keystroke; only a build whose
+        # bundle yields no hint falls through to the refusal.
+        hint = installed_bundle_facts.newline_keystroke_hint(PROVIDER, provider_version)
     undeliverable = None
-    if len(lines) > 1 and pin is None:
+    if len(lines) > 1 and pin is None and hint is None:
         # Recorded on the plan rather than raised. The payload is well
         # formed; what is missing is a proven keystroke for the installed
         # build, which is an operational fact about this session. The
@@ -343,13 +354,22 @@ def plan_composer_keystrokes(
         # of them is the alternative.
         undeliverable = (
             f"{field} spans {len(lines)} lines but no composer newline keystroke is proven "
-            f"for provider version {provider_version!r}; refusing rather than splitting the "
+            f"for provider version {provider_version!r} and none could be read from the "
+            f"installed bundle; refusing rather than splitting the "
             f"message across turns, pasting it, or flattening the newlines out of it"
         )
 
     composer_image = "\n".join(lines)
     trim_invariant = _is_trim_invariant(composer_image)
     normalization_proven = bool(pin and pin.get("submit_normalization_proven"))
+    keystroke = pin["keystroke"] if pin is not None else (hint.keystroke if hint else None)
+    evidence = pin["evidence"] if pin is not None else None
+    if pin is None and hint is not None:
+        evidence = {
+            "bundle_read": hint.description,
+            "bundle_path": hint.bundle_path,
+            "bundle_version": hint.bundle_version,
+        }
 
     plan: dict[str, Any] = {
         "schema": KEYSTROKE_PLAN_SCHEMA,
@@ -365,7 +385,7 @@ def plan_composer_keystrokes(
         "line_count": len(lines),
         "trailing_terminator": terminator,
         "provider_version": provider_version,
-        "soft_newline_keystroke": None if pin is None else pin["keystroke"],
+        "soft_newline_keystroke": keystroke,
         "submit_settle_seconds": (
             _SUBMIT_SETTLE_FLOOR_SECONDS if pin is None else float(pin["submit_settle_seconds"])
         ),
@@ -375,7 +395,17 @@ def plan_composer_keystrokes(
         # alone cannot say which, and a receipt that read a floor as
         # evidence would be asserting something nobody observed.
         "submit_settle_proven": pin is not None,
-        "composer_evidence": None if pin is None else pin["evidence"],
+        # Where the newline keystroke came from: the stage-verified
+        # per-build table, a runtime read of the installed bundle, or
+        # nowhere (the refusal case).  A bundle read is evidence about
+        # this build's own bytes; it is still not the live multiline
+        # acceptance a table row asserts, and the plan says which it is.
+        "composer_keystroke_source": (
+            "proven-build-table"
+            if pin is not None
+            else ("installed-bundle-hint" if hint is not None else None)
+        ),
+        "composer_evidence": evidence,
         "final_enter": True,
         "deliverable": undeliverable is None,
         "undeliverable_reason": undeliverable,

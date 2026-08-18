@@ -96,11 +96,11 @@ class TestNativeBindCapability:
         broad table itself is unchanged — this repair must not reach it.
         """
         assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is True
-        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
+        assert pc.is_listed_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
         assert pc.SUPPORTED_VERSIONS[pc.PROVIDER_CODEX] == ("0.146.0",)
         # And the shared builds keep both predicates.
         assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
-        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
+        assert pc.is_listed_version(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
 
     @pytest.mark.parametrize("provider", ["kimi", "claude", "muse"])
     def test_other_providers_keep_exactly_their_broad_proven_set(self, provider):
@@ -126,18 +126,26 @@ class TestNativeBindCapability:
         """
         monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_CODEX", "strict")
         assert pc.is_native_bind_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is True
-        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
+        assert pc.is_listed_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
         with pytest.raises(pc.ProviderVersionDrift):
             pc.check_pinned_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0")
 
-    def test_advanced_resume_authority_still_refuses_the_narrowly_proven_build(self):
-        """Bind capability grants no advanced authority by implication.
+    def test_bind_capability_grants_identity_but_not_route_authority(self):
+        """Bind capability grants no route authority by implication.
 
-        Automated resume/recovery identity reads the broad table, so a
-        0.147.0 generation can be bound at launch yet still has no resume
-        identity until that surface is independently stage-verified.
+        Resume identity follows the version observation under the unpinned
+        policy, so the stage-proven 0.147.0 has it; automated
+        recovery/strongest-route authority still requires a
+        model-input-bound non-echo route receipt, which nothing here
+        supplies.
         """
         status = pc.resume_status(pc.PROVIDER_CODEX, installed_version="codex-cli 0.147.0")
+        assert status.identity_available is True
+        assert status.authority_supported is False
+
+    def test_a_failed_version_observation_has_no_identity(self):
+        """Unparseable is a failed observation, not an unlisted build."""
+        status = pc.resume_status(pc.PROVIDER_CODEX, installed_version="codex-cli unknown")
         assert status.identity_available is False
         assert status.authority_supported is False
 
@@ -179,12 +187,12 @@ class TestRouteAttestCapability:
         unchanged.
         """
         assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is True
-        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
+        assert pc.is_listed_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
         assert pc.SUPPORTED_VERSIONS[pc.PROVIDER_CODEX] == ("0.146.0",)
         assert pc.NATIVE_BIND_CAPABLE_VERSIONS[pc.PROVIDER_CODEX] == ("0.146.0", "0.147.0")
         # And the shared builds keep both predicates.
         assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
-        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
+        assert pc.is_listed_version(pc.PROVIDER_CODEX, "codex-cli 0.146.0") is True
 
     @pytest.mark.parametrize("provider", ["kimi", "claude", "muse"])
     def test_other_providers_keep_exactly_their_broad_proven_set(self, provider):
@@ -208,16 +216,19 @@ class TestRouteAttestCapability:
         """
         monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_CODEX", "strict")
         assert pc.is_route_attest_capable(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is True
-        assert pc.is_proven_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
+        assert pc.is_listed_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0") is False
         with pytest.raises(pc.ProviderVersionDrift):
             pc.check_pinned_version(pc.PROVIDER_CODEX, "codex-cli 0.147.0")
 
-    def test_resume_authority_still_refuses_the_attestation_proven_build(self):
-        """Attestation capability grants no advanced authority by implication.
+    def test_attestation_capability_grants_identity_but_not_route_authority(self):
+        """Attestation capability grants no route authority by implication.
 
-        Automated resume/recovery identity still reads the broad table, so
-        a 0.147.0 route attestation does not imply a resumable identity.
+        Resume identity follows the version observation under the unpinned
+        policy, so the attestation-proven 0.147.0 has it; automated
+        recovery/strongest-route authority still requires a
+        model-input-bound non-echo route receipt, which nothing here
+        supplies.
         """
         status = pc.resume_status(pc.PROVIDER_CODEX, installed_version="codex-cli 0.147.0")
-        assert status.identity_available is False
+        assert status.identity_available is True
         assert status.authority_supported is False

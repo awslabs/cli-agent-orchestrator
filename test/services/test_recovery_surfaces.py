@@ -273,7 +273,41 @@ def test_binary_drift_invalidates_proof(kimi_binary, tmp_path):
     )
 
 
-def test_version_drift_blocks_proof(kimi_binary, tmp_path):
+def test_an_unlisted_build_proves_itself_at_runtime(kimi_binary, tmp_path):
+    """Unpinned: the exchange is the proof, so an unlisted build runs it.
+
+    The session/new→kill→session/load exchange against the installed
+    binary is itself the verification; the receipt binds the exact binary
+    by digest, so the proof an unlisted build mints is exactly as strong
+    as a listed one's.
+    """
+    receipt = kap.run_identity_proof(
+        kimi_binary=kimi_binary,
+        version_output="kimi 0.28.0",
+        state_dir=tmp_path / "state",
+        acp_driver=_acp_driver(),
+    )
+    assert receipt["kimi_version"] == "0.28.0"
+    assert kap.kimi_identity_enabled(
+        state_dir=tmp_path / "state",
+        kimi_binary=kimi_binary,
+        version_output="kimi 0.28.0",
+    )
+
+
+def test_an_unparseable_banner_blocks_the_proof(kimi_binary, tmp_path):
+    """Unparseable is a failed observation, distinct from unlisted."""
+    with pytest.raises(kap.KimiAcpProofError):
+        kap.run_identity_proof(
+            kimi_binary=kimi_binary,
+            version_output="kimi not-a-version",
+            state_dir=tmp_path / "state",
+            acp_driver=lambda b: {"session_id": "s", "resumed": True},
+        )
+
+
+def test_strict_quarantine_blocks_the_unlisted_builds_proof(kimi_binary, tmp_path, monkeypatch):
+    monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI", "strict")
     with pytest.raises(kap.KimiAcpProofError):
         kap.run_identity_proof(
             kimi_binary=kimi_binary,

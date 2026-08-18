@@ -55,15 +55,16 @@ def assess_cell(
             "argv" if runnable else None,
         )
     if provider == "claude_code":
-        runnable = provider_contracts.is_proven_version(
-            provider_contracts.PROVIDER_CLAUDE, normalized_version
-        )
+        # Under the unpinned policy the SessionStart hook is the runtime
+        # proof, so any build whose version was observed is runnable; a
+        # failed observation is not.
+        runnable = bool(normalized_version)
         return CellAssessment(
             runnable,
             (
-                "exact installed native-identity build"
+                "observed native-identity build"
                 if runnable
-                else "native identity proof is absent for this installed build"
+                else "the installed build's version could not be observed"
             ),
             "argv" if runnable else None,
         )

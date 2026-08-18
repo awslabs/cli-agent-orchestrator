@@ -218,31 +218,54 @@ record something untrue rather than merely act on less knowledge:
 
 ---
 
-## 9. What does not conform yet
+## 9. Conformance, surface by surface
 
-This document states the policy, not the current behaviour. The code still gates
-capability on allowlists, so the following are known non-conformances and the work
-list for reaching §1. Until they land, treat this section as authoritative about
-what the system actually does.
+The six capability allowlists are converted. A build absent from every per-feature
+table now gets capability from a conservative default or a runtime read of the
+installed bundle, never a withheld feature.
 
-| surface | current behaviour | target |
-|---|---|---|
-| `SUPPORTED_VERSIONS` | gates native control, rendered-session proof, steer/composer, image, resume, and route authority | not a capability gate; retained only as the strict-mode quarantine set |
-| `_PROVEN_COMPOSER_NEWLINE` | absence withholds multi-line delivery and yields a zero settle for single-line | override with a safe floor, never zero |
-| `_PROVEN_STEER_CHORDS` | absence withholds steer authority | override with a conservative default |
-| `_RENDERED_SESSION_PROVEN_BUILDS` | absence withholds rendered-session proof | override; unproven records as unproven rather than withholding |
-| `IMAGE_PROVEN_BUILDS` | absence withholds image authority | override with a conservative default |
-| `PINNED_VERSIONS` | advisory head of each accepted tuple | advisory only, everywhere |
+| surface | how a missing record resolves |
+|---|---|
+| `SUPPORTED_VERSIONS` | no longer a capability gate; the strict-mode quarantine set only. Consumers ask whether the version was *observed*, not whether it is listed |
+| `_PROVEN_COMPOSER_NEWLINE` | keystroke derived from the installed bundle, version-bound to the build being driven; settle takes the cond-0480 floor and records `submit_settle_proven: False` |
+| `_PROVEN_STEER_CHORDS` | derived from the installed bundle; unreadable keeps the loud zero-POST refusal |
+| `_RENDERED_SESSION_PROVEN_BUILDS` | derived when the bundle shows the title rewrite and the header labels, recorded as bundle-derived; a changed layout yields no proof and the attachment freezes loudly |
+| `IMAGE_PROVEN_BUILDS` | advertised for any observed build, with `build_proven` recording live acceptance separately |
+| `PINNED_VERSIONS` | advisory everywhere |
 
-`NATIVE_BIND_CAPABLE_VERSIONS` and the Muse profile-carrier cell are on this list
-too, at a longer horizon. They cannot be converted by choosing a default — they
-need a version-robust technique first, which is a research task rather than a
-refactor. They are the only two surfaces permitted to gate on an exact build in the
-meantime, and neither is a target state.
+**Bundle-derived is its own evidence tier, below `observed`.** A derived record says
+the installed bundle asserts this, not that anyone watched it work. Plans and receipts
+carry the source (`composer_keystroke_source`) so a reader can tell a derived value
+from a live proof, per §3's rule that a mechanism records only what it established.
 
-The conversion is not a bulk find-and-replace. Each surface needs its conservative
-default chosen and justified, and choosing the null value for any of them
-reproduces the defect §3 describes.
+### Where no safe default exists, and why
+
+**Codex's composer newline.** The 0.147.0 binary carries `insert_newline` and
+"Insert a newline in the editor." but **no** `ctrl+j` / `ctrl-j` string — its keymap
+defaults are compiled structured data rather than readable text. There is no hint to
+derive and no safe constant, because a wrong keystroke types junk into the composer or
+submits mid-message. So that one operation keeps its typed refusal on an unlisted Codex
+build while the rest of the provider stays open, which is exactly the §3 carve-out.
+
+Claude and Kimi hints were verified readable on the builds installed when this landed
+(Claude Code 2.1.233, Kimi 0.36.1). **Muse is not currently derivable.** Its 0.1.0-R708.1
+layout was readable; 0.2.1-R1215.1 moved the key run and the description into separate
+tables 1339 bytes apart, and the extractor requires them adjacent. The outcome is a typed
+refusal with nothing typed, so Muse multi-line delivery is refused exactly as it was
+before — no regression, and the loud direction.
+
+That update landed **six minutes after this conversion was written**, by the self-updating
+launcher, with nobody involved. Treat it as the standing evidence for §1: a readability
+measurement names a build and expires with it, so state the build you measured and expect
+to re-measure rather than recording a fact about "the installed build" in the abstract.
+
+### Still gating on an exact build
+
+`NATIVE_BIND_CAPABLE_VERSIONS` and the Muse profile-carrier cell, per §6. They cannot
+be converted by choosing a default — they need a version-robust technique, which is
+research rather than refactor, and it is done: no build has ever failed the Codex
+bootstrap contract, and both replacements are zero-cost runtime probes. Tracked
+separately. `ROUTE_ATTEST_CAPABLE_VERSIONS` belongs to that same family.
 
 ## 10. Deliberately not built yet
 

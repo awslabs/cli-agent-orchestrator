@@ -42,7 +42,11 @@ from typing import Any, Callable, Optional, Protocol, Tuple, cast
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import execution_mode as em
-from cli_agent_orchestrator.services import native_attachment, provider_contracts
+from cli_agent_orchestrator.services import (
+    installed_bundle_facts,
+    native_attachment,
+    provider_contracts,
+)
 from cli_agent_orchestrator.services.canonical_json import canonical_sha256
 
 #: The only provider this adapter speaks for.  Named rather than
@@ -470,16 +474,21 @@ def steer_chords(provider_version: Optional[str]) -> frozenset[str]:
     """The steer chords proven for this Kimi build, or an empty set.
 
     Looked up by the same normalized version the newline pin uses, so the
-    two tables agree about which build a request names.  An empty result is
-    the honest answer for an unproven build: a chord the server has not
-    read evidence for is refused with zero bytes rather than sent at a
-    composer on the strength of a guess.
+    two tables agree about which build a request names.  An unlisted build
+    is not automatically chordless: the chord dispatch the pins recorded
+    (``matchesKey(normalized, Key.ctrl("s"))``) is read from the installed
+    bundle of the exact build being driven, and a successful read is the
+    override.  An empty result — unreadable bundle, no dispatch in it —
+    remains the honest answer for an unproven build: a chord the server
+    has not read evidence for is refused with zero bytes rather than sent
+    at a composer on the strength of a guess.
     """
     if not provider_version:
         return frozenset()
-    return _PROVEN_STEER_CHORDS.get(
-        provider_contracts.normalized_version(provider_version), frozenset()
-    )
+    proven = _PROVEN_STEER_CHORDS.get(provider_contracts.normalized_version(provider_version))
+    if proven is not None:
+        return proven
+    return installed_bundle_facts.kimi_steer_chords_hint(provider_version)
 
 
 def advertised_steer_chords() -> dict[str, list[str]]:
@@ -605,8 +614,15 @@ def plan_composer_keystrokes(
     pin = _PROVEN_COMPOSER_NEWLINE.get(
         provider_contracts.normalized_version(provider_version or "")
     )
+    hint = None
+    if pin is None:
+        # The §3 override: the keybinding declaration every pin recorded
+        # as evidence is read from the installed bundle of the exact build
+        # being driven.  Only a build whose bundle yields no declaration
+        # falls through to the refusal.
+        hint = installed_bundle_facts.newline_keystroke_hint(PROVIDER, provider_version)
     undeliverable = None
-    if len(lines) > 1 and pin is None:
+    if len(lines) > 1 and pin is None and hint is None:
         # Recorded on the plan rather than raised. The payload is well
         # formed; what is missing is a proven keystroke for the *installed
         # build*, which is an operational fact about this session. The
@@ -618,13 +634,56 @@ def plan_composer_keystrokes(
         # that was not delivered, so none of them is the alternative.
         undeliverable = (
             f"{field} spans {len(lines)} lines but no composer newline keystroke is proven "
-            f"for provider version {provider_version!r}; refusing rather than splitting the "
+            f"for provider version {provider_version!r} and none could be read from the "
+            f"installed bundle; refusing rather than splitting the "
             f"message across turns, pasting it, or flattening the newlines out of it"
         )
 
     composer_image = "\n".join(lines)
-    normalization = None if pin is None else pin["normalization"]
-    model_input = composer_image if pin is None else _js_trim(composer_image)
+    if pin is not None:
+        normalization = pin["normalization"]
+        model_input = _js_trim(composer_image)
+        model_input_digest: Optional[str] = canonical_sha256(model_input)
+        model_input_exact: Optional[bool] = model_input == composer_image
+    elif hint is not None:
+        # The keystroke was read from this build's bundle, but its
+        # submit-time normalization was not: state the model-input digest
+        # only when trimming cannot change the answer, rather than
+        # asserting a normalization nobody read.
+        normalization = None
+        trim_invariant = not composer_image or not (
+            _is_js_whitespace(composer_image[0]) or _is_js_whitespace(composer_image[-1])
+        )
+        model_input = composer_image
+        model_input_digest = canonical_sha256(composer_image) if trim_invariant else None
+        model_input_exact = True if trim_invariant else None
+    else:
+        normalization = None
+        model_input = composer_image
+        model_input_digest = canonical_sha256(model_input)
+        model_input_exact = model_input == composer_image
+    keystroke = pin["keystroke"] if pin is not None else (hint.keystroke if hint else None)
+    evidence: Any = pin["evidence"] if pin is not None else None
+    if pin is None and hint is not None:
+        evidence = (
+            f"{hint.description}; bundle {hint.bundle_path} " f"(version {hint.bundle_version})"
+        )
+    burst_reset_keystroke: Optional[str] = None
+    if pin is not None:
+        burst_reset_keystroke = pin.get("burst_reset_keystroke")
+    elif hint is not None:
+        # The bundle-derived plan gets its reset key the same derived way
+        # as its newline key: the reset dispatch every proven row records
+        # as evidence is read from this build's own bundle.  Without it a
+        # derived plan would rest the submit on the settle alone -- the
+        # two defences fail independently (the table docstring above), and
+        # the unpin routes the longest, most exposed payloads onto exactly
+        # this plan shape.  A bundle whose reset dispatch does not read
+        # keeps None: the settle-only boundary, never an assumed key.
+        reset_fact = installed_bundle_facts.kimi_burst_reset_hint(provider_version)
+        if reset_fact is not None:
+            burst_reset_keystroke = reset_fact.keystroke
+            evidence = f"{evidence}; {reset_fact.description}"
 
     plan: dict[str, Any] = {
         "schema": KEYSTROKE_PLAN_SCHEMA,
@@ -632,17 +691,19 @@ def plan_composer_keystrokes(
         # Over the caller's original bytes, terminator included.
         "payload_sha256": canonical_sha256(text),
         "composer_sha256": canonical_sha256(composer_image),
-        "model_input_sha256": canonical_sha256(model_input),
+        "model_input_sha256": model_input_digest,
         "provider_normalization": normalization,
         # False means the provider's own submit-time normalization will
         # change the content -- leading/trailing whitespace only. Stated
         # as a fact rather than left for a reader to infer from digests.
-        "model_input_is_composer_exact": model_input == composer_image,
+        # None means the normalization was never read and the payload is
+        # not invariant under it, so no answer is claimed.
+        "model_input_is_composer_exact": model_input_exact,
         "line_count": len(lines),
         "trailing_terminator": terminator,
         "provider_version": provider_version,
-        "soft_newline_keystroke": None if pin is None else pin["keystroke"],
-        "burst_reset_keystroke": None if pin is None else pin.get("burst_reset_keystroke"),
+        "soft_newline_keystroke": keystroke,
+        "burst_reset_keystroke": burst_reset_keystroke,
         "submit_settle_seconds": (
             _SUBMIT_SETTLE_FLOOR_SECONDS if pin is None else float(pin["submit_settle_seconds"])
         ),
@@ -652,18 +713,23 @@ def plan_composer_keystrokes(
         # alone cannot say which, and a receipt that read a floor as
         # evidence would be asserting something nobody observed.
         "submit_settle_proven": pin is not None,
+        # Where the newline keystroke came from: the stage-verified
+        # per-build table, a runtime read of the installed bundle, or
+        # nowhere (the refusal case).
+        "composer_keystroke_source": (
+            "proven-build-table"
+            if pin is not None
+            else ("installed-bundle-hint" if hint is not None else None)
+        ),
         # What was actually read out of this build to justify the
         # keystrokes above, carried on the plan and therefore journaled
         # with it. Present here for the same reason as on the Claude plan:
         # a receipt that names a keystroke without naming the evidence for
         # it is a claim, and this adapter's whole contract is that its
-        # composer facts were read rather than assumed.
-        #
-        # It was absent until a consumer asked both adapters the same
-        # question and got a different answer for each -- which is the
-        # kind of asymmetry that reads as "unproven build" for exactly one
-        # provider and refuses every healthy generation it has.
-        "composer_evidence": None if pin is None else pin["evidence"],
+        # composer facts were read rather than assumed.  For a
+        # bundle-derived plan the evidence names the bundle, its version,
+        # and the declaration that was read.
+        "composer_evidence": evidence,
         "final_enter": True,
         "deliverable": undeliverable is None,
         "undeliverable_reason": undeliverable,

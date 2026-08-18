@@ -49,6 +49,63 @@ def _evidence(record, kind):
     }
 
 
+def _expected_native_tui_providers():
+    """The expected native_tui provider blocks, version facts derived.
+
+    The static identity facts (id source, readiness receipt kind,
+    executable) are pinned literally — they are the wiring.  The version
+    facts are derived from the contract tables in both directions: a
+    hand-maintained copy frozen beside the derived advertisement is a gate
+    that decays, and deriving the baseline makes a drift on either side
+    fail here.
+    """
+    from cli_agent_orchestrator.services import provider_contracts as contracts
+
+    def version_facts(executable):
+        return {
+            "pinned_version": contracts.PINNED_VERSIONS[executable],
+            "supported_versions": list(contracts.SUPPORTED_VERSIONS[executable]),
+            "version_enforcement": contracts.version_enforcement_mode(executable),
+        }
+
+    return {
+        "codex": {
+            "supported": True,
+            "id_source": "app_server_thread_start",
+            "readiness_receipt_kind": "codex-native-thread-start",
+            "executable": "codex",
+            **version_facts("codex"),
+        },
+        "claude_code": {
+            "supported": True,
+            "id_source": "cli_session_id",
+            "readiness_receipt_kind": "claude-native-session-start",
+            # The executable, which is a different namespace from
+            # the canonical provider key this map is keyed by.
+            "executable": "claude",
+            **version_facts("claude"),
+        },
+        "kimi_cli": {
+            "supported": True,
+            "id_source": "acp_session_new",
+            "readiness_receipt_kind": "kimi-native-tui-attached",
+            "executable": "kimi",
+            **version_facts("kimi"),
+        },
+        "muse_cli": {
+            "supported": True,
+            "id_source": "provider_status_discovered",
+            "readiness_receipt_kind": "muse-native-status-idle",
+            "executable": "muse",
+            **version_facts("muse"),
+            "profile_carrier_capability": (muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL),
+            "profile_carrier_inner_sha256": (
+                "4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c"
+            ),
+        },
+    }
+
+
 def test_capability_handshake_is_exact_and_versioned(client, monkeypatch):
     accepted_carrier = muse_native_launch.MuseProfileCarrierCapability(
         True,
@@ -112,61 +169,7 @@ def test_capability_handshake_is_exact_and_versioned(client, monkeypatch):
         # entirely, which reads as unsupported.
         "native_tui": {
             "schema_version": 1,
-            "providers": {
-                "codex": {
-                    "supported": True,
-                    "id_source": "app_server_thread_start",
-                    "readiness_receipt_kind": "codex-native-thread-start",
-                    "executable": "codex",
-                    "pinned_version": "0.146.0",
-                    "supported_versions": ["0.146.0"],
-                    "version_enforcement": "open",
-                },
-                "claude_code": {
-                    "supported": True,
-                    "id_source": "cli_session_id",
-                    "readiness_receipt_kind": "claude-native-session-start",
-                    # The executable, which is a different namespace from
-                    # the canonical provider key this map is keyed by.
-                    "executable": "claude",
-                    "pinned_version": "2.1.220",
-                    "supported_versions": ["2.1.220"],
-                    "version_enforcement": "open",
-                },
-                "kimi_cli": {
-                    "supported": True,
-                    "id_source": "acp_session_new",
-                    "readiness_receipt_kind": "kimi-native-tui-attached",
-                    "executable": "kimi",
-                    "pinned_version": "0.34.0",
-                    "supported_versions": [
-                        "0.34.0",
-                        "0.33.0",
-                        "0.32.0",
-                        "0.31.0",
-                        "0.30.0",
-                        "0.29.2",
-                        "0.29.1",
-                        "0.29.0",
-                    ],
-                    "version_enforcement": "open",
-                },
-                "muse_cli": {
-                    "supported": True,
-                    "id_source": "provider_status_discovered",
-                    "readiness_receipt_kind": "muse-native-status-idle",
-                    "executable": "muse",
-                    "pinned_version": "0.1.0",
-                    "supported_versions": ["0.1.0"],
-                    "version_enforcement": "open",
-                    "profile_carrier_capability": (
-                        muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL
-                    ),
-                    "profile_carrier_inner_sha256": (
-                        "4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c"
-                    ),
-                },
-            },
+            "providers": _expected_native_tui_providers(),
         },
     }
 

@@ -310,6 +310,33 @@ def test_strict_version_drift_refuses_before_any_provider_io(pinned_binary, monk
     assert transport.calls == []
 
 
+def test_an_unlisted_build_mints_under_open_enforcement(pinned_binary):
+    """Unpinned: an unlisted parseable build reaches the ACP mint.
+
+    The mint's session/new exchange against the installed binary is itself
+    the runtime proof of the identity contract — an unlisted build proves
+    it, or fails the exchange loudly, rather than being refused on a
+    missing table row.
+    """
+    transport = FakeAcp()
+
+    receipt = _mint(pinned_binary, transport, version_output="kimi 0.99.0")
+
+    assert receipt["native_session_id"] == SESSION_ID
+    assert receipt["provider_version"] == "0.99.0"
+    assert "session/new" in [method for method, _ in transport.calls]
+
+
+def test_an_unparseable_banner_is_refused_before_any_provider_io(pinned_binary):
+    """Unparseable is a failed observation, distinct from unlisted."""
+    transport = FakeAcp()
+
+    with pytest.raises(boot.KimiBootstrapInvalid, match="unparseable"):
+        _mint(pinned_binary, transport, version_output="kimi not-a-version")
+
+    assert transport.calls == []
+
+
 def test_a_non_executable_binary_is_refused(pinned_binary, tmp_path):
     plain = tmp_path / "not-executable"
     plain.write_bytes(b"data")
@@ -576,7 +603,7 @@ def _digest_mismatch(pinned, tmp_path):
 
 
 def _version_drift(pinned, tmp_path):
-    return {"version_output": "kimi 0.28.0"}
+    return {"version_output": "kimi not-a-version"}
 
 
 def _absent_cwd(pinned, tmp_path):
@@ -594,7 +621,7 @@ def _empty_effort(pinned, tmp_path):
 @pytest.mark.parametrize(
     "make_overrides",
     [_digest_mismatch, _version_drift, _absent_cwd, _empty_model, _empty_effort],
-    ids=["digest-mismatch", "version-drift", "absent-cwd", "empty-model", "empty-effort"],
+    ids=["digest-mismatch", "unparseable-version", "absent-cwd", "empty-model", "empty-effort"],
 )
 def test_every_pre_exchange_refusal_tears_down_exactly_once_with_no_turn(
     pinned_binary, tmp_path, make_overrides

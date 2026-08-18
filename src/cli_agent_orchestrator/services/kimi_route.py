@@ -14,11 +14,12 @@ from typing import Any, Optional, cast
 from cli_agent_orchestrator.services import provider_contracts
 from cli_agent_orchestrator.services.provider_contracts import PROVIDER_KIMI, SUPPORTED_VERSIONS
 
-#: Exact Kimi builds this probe accepts for route-authority purposes,
-#: current first — never a range.  The launch identity boundary is governed
-#: by :func:`provider_contracts.check_pinned_version`, which is open for
-#: Kimi; the route probe still insists on a proven build because a route
-#: receipt proves feature-specific authority.
+#: Exact Kimi builds this probe is checked against in strict mode — never a
+#: range.  Read from the one acceptance authority so the probe cannot drift
+#: from the contract it is attesting against.  In open mode any parseable
+#: build is probed: the zero-prompt ACP exchange below reads the route back
+#: from the provider itself, so an unlisted build proves — or fails — the
+#: route at runtime rather than inheriting a neighbour's attestation.
 SUPPORTED_KIMI_VERSIONS = SUPPORTED_VERSIONS[PROVIDER_KIMI]
 PROBE_VERSION = "kimi-acp-route-v1"
 
@@ -174,7 +175,19 @@ def attest_kimi_route(
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise KimiRouteProbeError(f"could not execute Kimi version probe: {exc}") from exc
     version = version_proc.stdout.strip()
-    if version_proc.returncode != 0 or version not in SUPPORTED_KIMI_VERSIONS:
+    normalized = provider_contracts.normalized_version(version)
+    if version_proc.returncode != 0 or not normalized:
+        raise KimiRouteProbeError(
+            f"unsupported Kimi version {version!r}; expected a semver-shaped version"
+        )
+    # Open enforcement: any semver-shaped version is probed — the ACP
+    # read-back below is the route proof.  Strict enforcement: must be an
+    # exact listed build (the quarantine set).
+    if (
+        provider_contracts.version_enforcement_mode(PROVIDER_KIMI)
+        != provider_contracts.VERSION_ENFORCEMENT_OPEN
+        and normalized not in SUPPORTED_KIMI_VERSIONS
+    ):
         raise KimiRouteProbeError(
             f"unsupported Kimi version {version!r}; expected one of "
             f"{list(SUPPORTED_KIMI_VERSIONS)!r}"

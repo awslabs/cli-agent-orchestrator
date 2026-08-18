@@ -172,17 +172,14 @@ def _validate_binary(binary: str, binary_sha256: str, version_output: str) -> st
         )
     # Open mode permits a semver-shaped update to reach the launch boundary,
     # while strict mode remains an explicit operator rollback after a
-    # reproduced regression.  Either way, the native identity proof below
-    # still requires an exact stage-verified build.
+    # reproduced regression.  The native identity proof below needs no exact
+    # build listing: the ACP exchange mints and re-loads the session against
+    # the installed binary itself, so an unlisted build proves — or loudly
+    # fails — the identity contract at runtime.
     try:
         check_pinned_version(PROVIDER_KIMI, version_output)
     except ProviderContractError as exc:
         raise KimiBootstrapInvalid(str(exc)) from exc
-    if not provider_contracts.is_proven_version(PROVIDER_KIMI, version_output):
-        raise KimiBootstrapInvalid(
-            "Kimi native session proof is unavailable for this provider build; "
-            "stage-verify it before enabling native identity"
-        )
     return observed
 
 

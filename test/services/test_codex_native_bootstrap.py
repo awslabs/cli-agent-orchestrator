@@ -39,7 +39,7 @@ def test_zero_turn_bootstrap_capability_is_narrower_than_provider_capability():
     assert cnb.is_bootstrap_capable_build("codex-cli 0.147.0") is True
     assert cnb.is_bootstrap_capable_build("codex-cli 0.148.0") is False
     assert (
-        provider_contracts.is_proven_version(provider_contracts.PROVIDER_CODEX, "codex-cli 0.147.0")
+        provider_contracts.is_listed_version(provider_contracts.PROVIDER_CODEX, "codex-cli 0.147.0")
         is False
     )
 

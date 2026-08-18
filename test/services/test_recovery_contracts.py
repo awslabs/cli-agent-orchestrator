@@ -22,22 +22,41 @@ from cli_agent_orchestrator.services.recovery_capabilities import build_capabili
 
 
 def test_pinned_versions():
-    # The current pin is the stage-verified installed build.
-    assert pc.PINNED_VERSIONS == {
-        "codex": "0.146.0",
-        "kimi": "0.34.0",
-        "claude": "2.1.220",
-        "muse": "0.1.0",
-    }
+    # The pin is advisory: the representative head of each provider's
+    # accepted tuple, never a ceiling.  The pairing is asserted in both
+    # directions so the two maps cannot silently drift apart, and the
+    # baseline is derived from the tables rather than frozen beside them —
+    # a hand-maintained copy here would be a gate that decays.
+    for provider, pin in pc.PINNED_VERSIONS.items():
+        assert pin in pc.SUPPORTED_VERSIONS[provider]
+        assert pc.SUPPORTED_VERSIONS[provider][0] == pin
+    # Open mode (the default for every provider): an unlisted semver-shaped
+    # build launches, listed or not, current or future.
     pc.check_pinned_version("codex", "0.146.0")
     pc.check_pinned_version("codex", "codex-cli 0.146.0")
     pc.check_pinned_version("codex", "codex-cli 0.145.0")
     pc.check_pinned_version("codex", "codex-cli 0.146.1")
-    # Kimi is open: a semver-shaped version below the proven set is accepted
-    # at launch, but it does not inherit feature-specific authority.
     pc.check_pinned_version("kimi", "0.28.0")
+    pc.check_pinned_version("kimi", "0.99.0")
+
+
+def test_strict_mode_quarantines_an_unlisted_build_at_the_launch_boundary(monkeypatch):
+    """The one place listing still gates: the opt-in quarantine."""
+    monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI", "strict")
     with pytest.raises(pc.ProviderVersionDrift):
-        pc.check_pinned_version("kimi", "not-a-version")
+        pc.check_pinned_version("kimi", "0.99.0")
+    # The listed builds still pass under strict quarantine.
+    pc.check_pinned_version("kimi", pc.PINNED_VERSIONS["kimi"])
+
+
+@pytest.mark.parametrize("mode", ["open", "strict"])
+def test_an_unparseable_banner_fails_closed_in_every_mode(monkeypatch, mode):
+    """Unparseable is a failed observation — distinct from unlisted, which
+    is merely nothing written down."""
+    monkeypatch.setenv("CAO_PROVIDER_VERSION_ENFORCEMENT_KIMI", mode)
+    for rejected in ("kimi", "", "not-a-version"):
+        with pytest.raises(pc.ProviderVersionDrift):
+            pc.check_pinned_version("kimi", rejected)
 
 
 def test_kimi_accepts_both_pinned_and_retained_versions_but_never_a_range():
@@ -175,16 +194,23 @@ def test_resume_status_truthful_defaults():
 
 
 def test_resume_status_version_checked_and_receipt_bound():
-    # A version-matched binary restores resume identity (never authority);
-    # version drift removes it again (outcome 41 semantics).
+    # An observed binary — listed or not — carries resume identity (never
+    # authority by itself); a failed version observation removes it
+    # (outcome 41 semantics).
     codex = pc.resume_status("codex", installed_version="codex 0.146.0")
     assert codex.identity_available and not codex.authority_supported
-    drifted = pc.resume_status("codex", installed_version="codex 0.146.1")
+    # Unlisted is merely nothing written down: identity follows the
+    # observation, not the quarantine set.
+    unlisted = pc.resume_status("codex", installed_version="codex 0.146.1")
+    assert unlisted.identity_available
+    # Unparseable is a failed observation: no identity.
+    drifted = pc.resume_status("codex", installed_version="codex not-a-version")
     assert not drifted.identity_available
     claude = pc.resume_status("claude", installed_version="2.1.220 (Claude Code)")
     assert claude.identity_available and not claude.authority_supported
-    drifted_claude = pc.resume_status("claude", installed_version="2.1.216 (Claude Code)")
-    assert not drifted_claude.identity_available
+    unlisted_claude = pc.resume_status("claude", installed_version="2.1.216 (Claude Code)")
+    assert unlisted_claude.identity_available
+    assert not pc.resume_status("claude", installed_version="(Claude Code)").identity_available
     # Kimi identity additionally requires the validated durable ACP proof.
     kimi_unproven = pc.resume_status("kimi", installed_version="kimi 0.29.0")
     assert not kimi_unproven.identity_available
@@ -192,6 +218,13 @@ def test_resume_status_version_checked_and_receipt_bound():
         "kimi", installed_version="kimi 0.29.0", kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"}
     )
     assert kimi_proven.identity_available and not kimi_proven.authority_supported
+    # An unlisted Kimi build with the durable ACP proof has identity too:
+    # the receipt is bound to the installed binary's digest, not to a row
+    # in a table.
+    kimi_unlisted_proven = pc.resume_status(
+        "kimi", installed_version="kimi 0.99.0", kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"}
+    )
+    assert kimi_unlisted_proven.identity_available
     # A provider-specific route receipt promotes ONLY that provider's authority.
     codex_route = pc.resume_status(
         "codex", installed_version="codex 0.146.0", route_proof=_valid_route_proof("codex")
@@ -432,10 +465,20 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
         assert unproven["observed_route"]["codex"] == "unsupported"
         assert unproven["enabled_providers"] == []
         assert unproven["automated_paths"]["recovery"] is False
-    # Runtime version drift removes the capability.
-    drifted = build_capabilities(
+    # An unlisted build keeps the capability its receipts prove: the route
+    # receipt binds the generation and the journaled digest, not a table
+    # row.  A *failed* version observation removes it.
+    unlisted = build_capabilities(
         containment=composition,
         provider_versions={"codex": "codex 0.146.1", "kimi": "kimi 0.29.0"},
+        kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
+        route_proofs={"codex": _valid_route_proof("codex")},
+    )
+    assert unlisted["resume"]["codex"]["identity_available"] is True
+    assert unlisted["resume"]["codex"]["authority_supported"] is True
+    drifted = build_capabilities(
+        containment=composition,
+        provider_versions={"codex": "codex not-a-version", "kimi": "kimi 0.29.0"},
         kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
         route_proofs={"codex": _valid_route_proof("codex")},
     )

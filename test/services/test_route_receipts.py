@@ -159,19 +159,25 @@ def test_generation_mismatch_and_missing_key_expose_nothing(harness):
     assert _load(harness) == {}
 
 
-def test_version_drift_and_unjournaled_digest_expose_nothing(harness):
+def test_an_unlisted_builds_receipt_still_validates(harness):
+    """Unpinned: the receipt's own evidence is the authority.
+
+    HMAC against the generation-private key, the live-reservation
+    generation match, and the journaled digest — an unlisted build's
+    receipt carries all of it, and a missing table row withdraws none.
+    """
+    receipt = _write(harness, provider_version="codex 0.144.6")
+    assert _load(harness) == {"codex": receipt}
+
+
+def test_an_unparseable_receipt_version_exposes_nothing(harness):
+    """Unparseable is a failed observation, distinct from unlisted."""
+    _write(harness, provider_version="codex not-a-version")
+    assert _load(harness) == {}
+
+
+def test_an_unjournaled_digest_exposes_nothing(harness):
     _write(harness)
-    drifted = dict(harness["expectations"])
-    assert (
-        route_receipts.load_valid_route_proofs(
-            state_dir=harness["state_dir"],
-            expected_routes=drifted,
-            expected_input_digests={"codex": frozenset({"f" * 64})},
-        )
-        == {}
-    )
-    # Installed-version drift invalidates the receipt for the pinned binary.
-    _write(harness, provider_version="codex 0.144.6", native_turn_id="turn-drifted")
     # A receipt written for a different (unjournaled) input digest never
     # gains authority even though the writer self-check passed.
     _write(harness, model_input_digest="a" * 64, native_turn_id="turn-2")
