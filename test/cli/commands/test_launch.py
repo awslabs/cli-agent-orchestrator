@@ -1001,4 +1001,4 @@ def test_minimax_code_requires_workspace_access_confirmation():
         PROVIDERS_REQUIRING_WORKSPACE_ACCESS,
     )
 
-    assert "minimax_code" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+    assert "mcode" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS

@@ -918,7 +918,7 @@ class TestMiniMaxCodeSupervisorOrchestration:
     """E2E MCP orchestration tests for MiniMax Code."""
 
     def test_supervisor_handoff(self, require_minimax_code):
-        _run_supervisor_handoff_test(provider="minimax_code")
+        _run_supervisor_handoff_test(provider="mcode")
 
     def test_supervisor_assign_and_handoff(self, require_minimax_code):
-        _run_supervisor_assign_test(provider="minimax_code")
+        _run_supervisor_assign_test(provider="mcode")

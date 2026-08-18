@@ -182,7 +182,7 @@ cao launch --agents code_supervisor
 
 # 或指定 provider
 cao launch --agents code_supervisor --provider claude_code
-# 可选值：kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | minimax_code | copilot_cli | opencode_cli | omp | cursor_cli
+# 可选值：kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | mcode | copilot_cli | opencode_cli | omp | cursor_cli
 
 # 不限制访问、跳过确认（危险）
 cao launch --agents code_supervisor --yolo
@@ -294,7 +294,7 @@ provider: claude_code
 ---
 ```
 
-有效值包括：`kiro_cli`、`claude_code`、`codex`、`antigravity_cli`、`hermes`、`kimi_cli`、`minimax_code`、`copilot_cli`、`opencode_cli`、`omp`、`cursor_cli`。初始会话始终以 `cao launch --provider` 参数为准。详见 [`examples/cross-provider/`](examples/cross-provider/)。
+有效值包括：`kiro_cli`、`claude_code`、`codex`、`antigravity_cli`、`hermes`、`kimi_cli`、`mcode`、`copilot_cli`、`opencode_cli`、`omp`、`cursor_cli`。初始会话始终以 `cao launch --provider` 参数为准。详见 [`examples/cross-provider/`](examples/cross-provider/)。
 
 ### Tool Restrictions
 

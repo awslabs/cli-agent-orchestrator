@@ -9,10 +9,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
+from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider, ProviderError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -52,7 +53,12 @@ def test_prepare_runtime_isolates_auth_and_generates_private_mcp_plugin(
                 "command": "/opt/cao/bin/cao-mcp-server",
                 "args": ["--stdio"],
                 "env": {"EXISTING": "value"},
-            }
+            },
+            "remote-tools": {
+                "type": "http",
+                "url": "https://mcp.example.test/api",
+                "headers": {"Authorization": "Bearer placeholder"},
+            },
         },
     )
     provider = make_provider()
@@ -77,6 +83,7 @@ def test_prepare_runtime_isolates_auth_and_generates_private_mcp_plugin(
     manifest = json.loads((plugin / ".minimax-plugin" / "plugin.json").read_text())
     config = json.loads((plugin / "servers.mcp.json").read_text())
     server = config["mcpServers"]["cao-orchestrator"]
+    remote = config["mcpServers"]["remote-tools"]
     assert manifest["mcpServers"] == ["servers.mcp.json"]
     assert server["command"] == "cao-mcp-server"
     assert server["args"] == ["--stdio"]
@@ -84,6 +91,13 @@ def test_prepare_runtime_isolates_auth_and_generates_private_mcp_plugin(
     assert server["env"]["EXISTING"] == "value"
     assert server["env"]["PATH"].split(os.pathsep)[0] == "/opt/cao/bin"
     assert server["timeout"] == 600_000
+    assert remote == {
+        "type": "streamable-http",
+        "url": "https://mcp.example.test/api",
+        "headers": {"Authorization": "Bearer placeholder"},
+        "description": "CAO-managed MCP server remote-tools",
+        "timeout": 600_000,
+    }
     assert (plugin / "icon.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
     assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
@@ -129,11 +143,44 @@ def test_build_command_bootstraps_profile_skills_and_soft_tool_policy(tmp_path: 
     assert "Reply exactly CAO_MCODE_READY" in bootstrap
 
 
+@pytest.mark.parametrize(
+    ("launch_model", "expected_model"),
+    [("launch/model", "launch/model"), (None, "profile/model")],
+)
+def test_prepare_runtime_applies_model_to_terminal_local_config(
+    tmp_path: Path, monkeypatch, launch_model: str | None, expected_model: str
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.yaml").write_text("defaultModel: original/model\n")
+    monkeypatch.setenv("MINIMAX_DATA_DIR", str(source))
+    profile = AgentProfile(
+        name="developer",
+        description="Developer",
+        model="profile/model",
+    )
+    provider = make_provider(model=launch_model)
+
+    with (
+        patch("cli_agent_orchestrator.providers.minimax_code.CAO_HOME_DIR", tmp_path / "cao"),
+        patch(
+            "cli_agent_orchestrator.providers.minimax_code.load_agent_profile",
+            return_value=profile,
+        ),
+    ):
+        data_dir, _ = provider._prepare_runtime()
+
+    config = yaml.safe_load((data_dir / "config.yaml").read_text())
+    assert config["defaultModel"] == expected_model
+
+
 def test_prompt_submission_and_lifecycle_properties():
     provider = make_provider(agent_profile=None)
     assert provider.paste_enter_count == 1
     assert provider.accepts_input_while_processing is True
-    assert provider.assume_processing_on_dispatch is True
+    # Deferred delivery confirmation must wait for observed current-turn
+    # activity; a synthetic PROCESSING state can hide a dropped paste/Enter.
+    assert provider.assume_processing_on_dispatch is False
     assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
     assert provider.supports_screen_detection is True
     assert provider.supports_direct_status_probe is True
@@ -162,6 +209,12 @@ def test_status_fixtures_and_completed_turn_latch():
     assert provider.get_status(new_completed) == TerminalStatus.COMPLETED
 
 
+def test_status_reports_error_and_unknown_states():
+    provider = make_provider(agent_profile=None)
+    assert provider.get_status("") == TerminalStatus.UNKNOWN
+    assert provider.get_status("Fatal: authentication backend unavailable") == TerminalStatus.ERROR
+
+
 def test_status_rejects_previous_completion_after_next_turn_dispatch():
     provider = make_provider(agent_profile=None)
     previous = load_fixture("minimax_code_completed.txt")
@@ -169,6 +222,14 @@ def test_status_rejects_previous_completion_after_next_turn_dispatch():
 
     provider.mark_input_received()
     provider._last_dispatch_time = 0
+    assert provider.get_status(previous) == TerminalStatus.PROCESSING
+    assert (
+        provider.get_status(load_fixture("minimax_code_processing.txt"))
+        == TerminalStatus.PROCESSING
+    )
+    # A full-screen redraw may replay the previous completion after showing a
+    # current-turn spinner. Activity alone does not make identical completion
+    # content fresh.
     assert provider.get_status(previous) == TerminalStatus.PROCESSING
 
     current = previous + """\
@@ -215,15 +276,23 @@ def test_extract_last_message_ignores_empty_bottom_composer_on_second_turn():
        return n ** 2
  › Create cube_second_turn.
  ● def cube_second_turn(n):
-       return n ** 3
+       value = n ** 3
+
+       return value
    └ Completed in 2s · ⚡ 42.5 tok/s
    Message · Enter send · Shift+Enter newline
  ›  \x1b[7m█\x1b[0m
  /workspace │ Full access │ ✦ MiniMax-M3 · Thinking On
 """
     assert make_provider(agent_profile=None).extract_last_message_from_script(output) == (
-        "def cube_second_turn(n):\nreturn n ** 3"
+        "def cube_second_turn(n):\n    value = n ** 3\n\n    return value"
     )
+
+
+@pytest.mark.parametrize("output", ["Message · Enter send", "●   \n└ Completed in 1s"])
+def test_extract_last_message_rejects_missing_or_empty_response(output: str):
+    with pytest.raises(ValueError, match="No MiniMax Code final response found"):
+        make_provider(agent_profile=None).extract_last_message_from_script(output)
 
 
 @pytest.mark.asyncio
@@ -255,15 +324,74 @@ async def test_initialize_launches_mcode_and_waits_for_bootstrap_completion():
 
 
 @pytest.mark.asyncio
-async def test_initialize_failure_removes_private_runtime(tmp_path: Path):
+async def test_initialize_times_out_when_bootstrap_never_becomes_ready():
     provider = make_provider(agent_profile=None)
-    private_dir = tmp_path / "private"
-    private_dir.mkdir()
-    (private_dir / "token").write_text("secret")
-    provider._data_dir = private_dir
-
-    with patch("cli_agent_orchestrator.providers.minimax_code.wait_for_shell", return_value=False):
-        with pytest.raises(TimeoutError, match="Shell initialization timed out"):
+    with (
+        patch.object(provider, "_build_command", return_value="mcode bootstrap"),
+        patch(
+            "cli_agent_orchestrator.providers.minimax_code.wait_for_shell",
+            return_value=True,
+        ),
+        patch("cli_agent_orchestrator.providers.minimax_code.get_backend"),
+        patch.object(provider, "_wait_for_bootstrap_ready", return_value=False),
+        patch.object(provider, "cleanup") as cleanup,
+    ):
+        with pytest.raises(TimeoutError, match="MiniMax Code initialization timed out"):
             await provider.initialize()
 
+    cleanup.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_initialize_failure_removes_private_runtime(tmp_path: Path):
+    provider = make_provider(agent_profile=None)
+    cao_home = tmp_path / "cao"
+    with patch("cli_agent_orchestrator.providers.minimax_code.CAO_HOME_DIR", cao_home):
+        private_dir = provider._data_dir_path()
+        private_dir.mkdir(parents=True)
+        (private_dir / "token").write_text("secret")
+        provider._data_dir = private_dir
+
+        with patch(
+            "cli_agent_orchestrator.providers.minimax_code.wait_for_shell", return_value=False
+        ):
+            with pytest.raises(TimeoutError, match="Shell initialization timed out"):
+                await provider.initialize()
+
     assert not private_dir.exists()
+
+
+def test_cleanup_refuses_symlinked_managed_ancestor(tmp_path: Path):
+    cao_home = tmp_path / "cao"
+    managed_parent = cao_home / "providers"
+    managed_parent.mkdir(parents=True)
+    external = tmp_path / "external"
+    digest = hashlib.sha256(b"deadbeef").hexdigest()
+    escaped_data_dir = external / digest
+    escaped_data_dir.mkdir(parents=True)
+    victim = escaped_data_dir / "must-survive.txt"
+    victim.write_text("outside CAO")
+    (managed_parent / "minimax_code").symlink_to(external, target_is_directory=True)
+
+    provider = make_provider(agent_profile=None)
+    with patch("cli_agent_orchestrator.providers.minimax_code.CAO_HOME_DIR", cao_home):
+        with pytest.raises(ProviderError, match="managed MiniMax Code data directory"):
+            provider.cleanup()
+
+    assert victim.read_text() == "outside CAO"
+
+
+def test_prepare_runtime_refuses_symlinked_managed_ancestor(tmp_path: Path):
+    cao_home = tmp_path / "cao"
+    managed_parent = cao_home / "providers"
+    managed_parent.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    (managed_parent / "minimax_code").symlink_to(external, target_is_directory=True)
+
+    provider = make_provider(agent_profile=None)
+    with patch("cli_agent_orchestrator.providers.minimax_code.CAO_HOME_DIR", cao_home):
+        with pytest.raises(ProviderError, match="managed MiniMax Code data directory"):
+            provider._prepare_runtime()
+
+    assert list(external.iterdir()) == []

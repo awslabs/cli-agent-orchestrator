@@ -945,17 +945,17 @@ class TestMiniMaxCodeAllowedTools:
     )
     def test_restricted_supervisor_refuses_bash(self, require_minimax_code):
         _run_restricted_tool_test(
-            provider="minimax_code",
+            provider="mcode",
             agent_profile="code_supervisor",
             allowed_tools="@cao-mcp-server",
         )
 
     def test_unrestricted_developer_can_bash(self, require_minimax_code):
-        _run_unrestricted_tool_test(provider="minimax_code", agent_profile="developer")
+        _run_unrestricted_tool_test(provider="mcode", agent_profile="developer")
 
     def test_allowed_tools_stored_in_metadata(self, require_minimax_code):
         _run_allowed_tools_stored_test(
-            provider="minimax_code",
+            provider="mcode",
             agent_profile="developer",
             allowed_tools="@builtin,fs_read,@cao-mcp-server",
         )

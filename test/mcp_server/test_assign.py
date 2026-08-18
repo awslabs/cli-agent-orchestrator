@@ -103,25 +103,25 @@ class TestCreateTerminalProviderResolution:
     @patch(
         "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="minimax_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="mcode")
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    def test_minimax_worker_omits_unsupported_engine_and_model(
+    def test_mcode_worker_omits_kiro_engine_and_forwards_model(
         self, mock_requests, mock_resolve_provider, mock_allowed_tools
     ):
-        """MiniMax workers must not receive Kiro-only or unsupported launch overrides."""
+        """MCode workers omit Kiro-only engine but receive a terminal-local model."""
         from cli_agent_orchestrator.mcp_server.server import _create_terminal
         from cli_agent_orchestrator.models.inbox import OrchestrationType
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
-            "provider": "minimax_code",
+            "provider": "mcode",
             "engine": None,
             "session_name": "cao-session",
             "allowed_tools": None,
         }
         metadata_response.raise_for_status.return_value = None
         post_response = MagicMock()
-        post_response.json.return_value = {"id": "worker-1", "provider": "minimax_code"}
+        post_response.json.return_value = {"id": "worker-1", "provider": "mcode"}
         post_response.raise_for_status.return_value = None
         mock_requests.get.return_value = metadata_response
         mock_requests.post.return_value = post_response
@@ -140,7 +140,7 @@ class TestCreateTerminalProviderResolution:
         _, kwargs = mock_requests.post.call_args
         assert kwargs["params"].get("defer_init") == "true"
         assert "engine" not in kwargs["params"]
-        assert "model" not in kwargs["params"]
+        assert kwargs["params"]["model"] == "MiniMax-M2.1"
         assert "initial_message" not in kwargs["params"]
         assert kwargs["json"]["initial_message"] == "Analyze the sensitive logs at /secret/path"
         assert kwargs["json"]["initial_message_orchestration_type"] == "assign"

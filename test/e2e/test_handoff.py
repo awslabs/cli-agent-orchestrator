@@ -471,7 +471,7 @@ class TestMiniMaxCodeHandoff:
 
     def test_handoff_simple_function(self, require_minimax_code):
         _run_handoff_test(
-            provider="minimax_code",
+            provider="mcode",
             agent_profile="developer",
             task_message=(
                 "Create a Python function called 'greet' that takes a name parameter "
@@ -481,4 +481,4 @@ class TestMiniMaxCodeHandoff:
         )
 
     def test_handoff_second_task(self, require_minimax_code):
-        _run_second_task_same_terminal_test(provider="minimax_code", agent_profile="developer")
+        _run_second_task_same_terminal_test(provider="mcode", agent_profile="developer")

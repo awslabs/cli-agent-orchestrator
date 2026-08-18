@@ -274,7 +274,7 @@ def _create_terminal(
             params["allowed_tools"] = child_allowed_tools
         if provider == ProviderType.KIRO_CLI.value and engine is not None:
             params["engine"] = engine
-        if provider != ProviderType.MINIMAX_CODE.value and model and model.strip():
+        if model and model.strip():
             params["model"] = model
         if use_worktree:
             params["use_worktree"] = "true"
@@ -324,7 +324,7 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if provider == ProviderType.KIRO_CLI.value and engine is not None:
             params["engine"] = engine
-        if provider != ProviderType.MINIMAX_CODE.value and model and model.strip():
+        if model and model.strip():
             params["model"] = model
 
         json_body = None
@@ -798,7 +798,7 @@ async def _handoff_impl(
             payload["working_directory"] = working_directory
         if provider == ProviderType.KIRO_CLI.value and engine is not None:
             payload["engine"] = engine
-        if provider != ProviderType.MINIMAX_CODE.value and model and model.strip():
+        if model and model.strip():
             payload["model"] = model
 
         # Allow the full step time plus the server-side ready-wait (up to 120s)

@@ -28,8 +28,8 @@ def test_minimax_code_uses_runtime_skills_with_soft_tool_enforcement():
         SOFT_ENFORCEMENT_PROVIDERS,
     )
 
-    assert "minimax_code" in RUNTIME_SKILL_PROMPT_PROVIDERS
-    assert "minimax_code" in SOFT_ENFORCEMENT_PROVIDERS
+    assert "mcode" in RUNTIME_SKILL_PROMPT_PROVIDERS
+    assert "mcode" in SOFT_ENFORCEMENT_PROVIDERS
 
 
 _TS = "cli_agent_orchestrator.services.terminal_service"

@@ -327,4 +327,4 @@ class TestMiniMaxCodeSendMessage:
     """E2E inbox delivery test for MiniMax Code."""
 
     def test_send_message_to_inbox(self, require_minimax_code):
-        _run_send_message_test(provider="minimax_code", agent_profile="developer")
+        _run_send_message_test(provider="mcode", agent_profile="developer")

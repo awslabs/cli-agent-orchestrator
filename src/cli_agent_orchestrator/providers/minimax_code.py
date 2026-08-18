@@ -13,6 +13,8 @@ import shutil
 from pathlib import Path
 from typing import Any, Optional
 
+import yaml
+
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR, SECURITY_PROMPT
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -24,9 +26,34 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 _PLUGIN_NAME = "cao-orchestrator"
 _PLUGIN_SERVER_NAME = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+_USER_LINE_PATTERN = re.compile(r"^\s*›[^\S\n]+(.*)$")
+_COMPLETION_LINE_PATTERN = re.compile(r"^\s*└\s+Completed in\s+\d", re.IGNORECASE)
+_COMPLETION_PATTERN = re.compile(r"(?:^|\n)\s*└\s+Completed in\s+\d", re.IGNORECASE)
+_ASSISTANT_LINE_PATTERN = re.compile(r"^(?P<indent>\s*)●\s+(?P<text>\S.*)$")
+_READY_ASSISTANT_LINE_PATTERN = re.compile(r"^\s*●\s+Ready\s*$")
+_WAITING_PATTERN = re.compile(
+    r"Approval needed|Run this command\?|Allow for this conversation|"
+    r"Always allow this action|User prompt request",
+    re.IGNORECASE,
+)
+_PROCESSING_PATTERN = re.compile(
+    r"[⠁-⣿◇◆]\s+(?:Loading|Running)(?:\s+\d+s)?[^\n]*(?:Enter queue|Esc stop)",
+    re.IGNORECASE,
+)
+_READY_PATTERN = re.compile(r"●\s+Ready|Message\s+·\s+Enter send", re.IGNORECASE)
+_ERROR_PATTERN = re.compile(
+    r"Sign in required|Authentication failed|Not authenticated|" r"(?:^|\n)\s*(?:Fatal|Error):",
+    re.IGNORECASE,
+)
+_EXTRACTION_SKIP_PATTERN = re.compile(r"^(?:├|└|Called\s|Message\s+·|/[^ ]+\s+\|)")
+_BOX_CHROME_PATTERN = re.compile(r"^[╭│╰]")
 _ICON_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
+
+
+def _last_match_start(pattern: re.Pattern[str], text: str) -> int:
+    return max((match.start() for match in pattern.finditer(text)), default=-1)
 
 
 class ProviderError(Exception):
@@ -71,10 +98,6 @@ class MiniMaxCodeProvider(BaseProvider):
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
         return True
 
-    @property
-    def assume_processing_on_dispatch(self) -> bool:
-        return True
-
     def mark_input_received(self) -> None:
         super().mark_input_received()
         self._has_received_input = True
@@ -83,16 +106,14 @@ class MiniMaxCodeProvider(BaseProvider):
 
     @staticmethod
     def _is_substantive_user_line(line: str) -> bool:
-        match = re.match(r"^\s*›[^\S\n]+(.*)$", line)
+        match = _USER_LINE_PATTERN.match(line)
         return bool(match and any(character.isalnum() for character in match.group(1)))
 
     @classmethod
     def _latest_completion_identity(cls, clean: str) -> tuple[Optional[str], bool]:
         lines = clean.splitlines()
         completion_indices = [
-            index
-            for index, line in enumerate(lines)
-            if re.match(r"^\s*└\s+Completed in\s+\d", line, re.IGNORECASE)
+            index for index, line in enumerate(lines) if _COMPLETION_LINE_PATTERN.match(line)
         ]
         if not completion_indices:
             return None, False
@@ -108,8 +129,8 @@ class MiniMaxCodeProvider(BaseProvider):
         assistants = [
             index
             for index in range(user + 1, completion)
-            if re.match(r"^\s*●\s+\S", lines[index])
-            and not re.match(r"^\s*●\s+Ready\s*$", lines[index])
+            if _ASSISTANT_LINE_PATTERN.match(lines[index])
+            and not _READY_ASSISTANT_LINE_PATTERN.match(lines[index])
         ]
         anchored = user >= 0 or bool(assistants)
         if user >= 0:
@@ -134,6 +155,33 @@ class MiniMaxCodeProvider(BaseProvider):
     def _data_dir_path(self) -> Path:
         digest = hashlib.sha256(self.terminal_id.encode("utf-8")).hexdigest()
         return CAO_HOME_DIR / "providers" / "minimax_code" / digest
+
+    @staticmethod
+    def _managed_data_root() -> Path:
+        return CAO_HOME_DIR / "providers" / "minimax_code"
+
+    def _is_managed_data_dir(self, data_dir: Path) -> bool:
+        """Return whether recursive operations stay in CAO's managed tree."""
+
+        root = self._managed_data_root()
+        expected = self._data_dir_path()
+        if data_dir != expected or data_dir.parent != root or data_dir.is_symlink():
+            return False
+        base = root.parent.parent
+        if root.name != "minimax_code" or root.parent.name != "providers":
+            return False
+        try:
+            if any(ancestor.is_symlink() for ancestor in (base, root.parent, root)):
+                return False
+            return data_dir.parent.resolve(strict=False) == root.resolve(strict=False)
+        except OSError:
+            return False
+
+    def _require_managed_data_dir(self, data_dir: Path) -> None:
+        if not self._is_managed_data_dir(data_dir):
+            raise ProviderError(
+                f"Refusing operation outside the managed MiniMax Code data directory: {data_dir}"
+            )
 
     @staticmethod
     def _secure_tree(path: Path) -> None:
@@ -166,6 +214,30 @@ class MiniMaxCodeProvider(BaseProvider):
             cls._secure_tree(destination_auth)
 
     @staticmethod
+    def _apply_model_config(data_dir: Path, model: Optional[str]) -> None:
+        if not model or not model.strip():
+            return
+        config_path = data_dir / "config.yaml"
+        try:
+            loaded = (
+                yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                if config_path.exists()
+                else {}
+            )
+        except (OSError, yaml.YAMLError) as exc:
+            raise ProviderError(f"Failed to read MiniMax Code config: {exc}") from exc
+        if loaded is None:
+            loaded = {}
+        if not isinstance(loaded, dict):
+            raise ProviderError("MiniMax Code config.yaml must contain a mapping")
+        loaded["defaultModel"] = model.strip()
+        config_path.write_text(
+            yaml.safe_dump(loaded, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        os.chmod(config_path, 0o600)
+
+    @staticmethod
     def _serialize_server(name: str, raw_config: Any) -> dict[str, Any]:
         if not _PLUGIN_SERVER_NAME.fullmatch(name):
             raise ProviderError(f"Invalid MiniMax Code MCP server name: {name!r}")
@@ -176,8 +248,26 @@ class MiniMaxCodeProvider(BaseProvider):
         )
         config = resolve_mcp_server_config(config)
         command = config.get("command")
+        url = config.get("url")
+        if not command and isinstance(url, str) and url:
+            transport = config.get("type", "http")
+            if transport == "http":
+                transport = "streamable-http"
+            if transport not in {"streamable-http", "sse"}:
+                raise ProviderError(
+                    f"MCP server {name!r} has unsupported URL transport {transport!r}"
+                )
+            return {
+                "type": transport,
+                "url": url,
+                "headers": {
+                    str(key): str(value) for key, value in (config.get("headers") or {}).items()
+                },
+                "description": f"CAO-managed MCP server {name}",
+                "timeout": 600_000,
+            }
         if not isinstance(command, str) or not command:
-            raise ProviderError(f"MCP server {name!r} must define a stdio command")
+            raise ProviderError(f"MCP server {name!r} must define a command or URL")
 
         env = {str(key): str(value) for key, value in (config.get("env") or {}).items()}
         command_path = Path(command)
@@ -210,7 +300,8 @@ class MiniMaxCodeProvider(BaseProvider):
             for name, raw_config in mcp_servers.items()
         }
         for server in servers.values():
-            server["env"]["CAO_TERMINAL_ID"] = self.terminal_id
+            if server["type"] == "stdio":
+                server["env"]["CAO_TERMINAL_ID"] = self.terminal_id
 
         manifest = {
             "schemaVersion": 1,
@@ -243,17 +334,15 @@ class MiniMaxCodeProvider(BaseProvider):
                     f"Failed to load agent profile {self._agent_profile!r}: {exc}"
                 ) from exc
 
-        if self._model or (profile is not None and profile.model):
-            raise ProviderError(
-                "MiniMax Code's interactive CLI does not expose a per-session model flag"
-            )
-
         data_dir = self._data_dir_path()
+        self._require_managed_data_dir(data_dir)
         if data_dir.exists():
             shutil.rmtree(data_dir)
         data_dir.mkdir(parents=True, mode=0o700)
         os.chmod(data_dir, 0o700)
         self._copy_auth_material(self._source_data_dir(), data_dir)
+        model = self._model or (profile.model if profile is not None else None)
+        self._apply_model_config(data_dir, model)
         if profile is not None and profile.mcpServers:
             self._write_plugin(data_dir, profile.mcpServers)
         self._data_dir = data_dir
@@ -357,25 +446,11 @@ class MiniMaxCodeProvider(BaseProvider):
 
         clean = strip_terminal_escapes(buffer)
 
-        def last(pattern: str) -> int:
-            return max(
-                (match.start() for match in re.finditer(pattern, clean, re.IGNORECASE)),
-                default=-1,
-            )
-
-        last_waiting = last(
-            r"Approval needed|Run this command\?|Allow for this conversation|"
-            r"Always allow this action|User prompt request"
-        )
-        last_processing = last(
-            r"[⠁-⣿◇◆]\s+(?:Loading|Running)(?:\s+\d+s)?[^\n]*(?:Enter queue|Esc stop)"
-        )
-        last_completion = last(r"(?:^|\n)\s*└\s+Completed in\s+\d")
-        last_ready = max(last(r"●\s+Ready"), last(r"Message\s+·\s+Enter send"))
-        last_error = last(
-            r"Sign in required|Authentication failed|Not authenticated|"
-            r"(?:^|\n)\s*(?:Fatal|Error):"
-        )
+        last_waiting = _last_match_start(_WAITING_PATTERN, clean)
+        last_processing = _last_match_start(_PROCESSING_PATTERN, clean)
+        last_completion = _last_match_start(_COMPLETION_PATTERN, clean)
+        last_ready = _last_match_start(_READY_PATTERN, clean)
+        last_error = _last_match_start(_ERROR_PATTERN, clean)
         completion_identity, completion_anchored = self._latest_completion_identity(clean)
 
         if last_waiting > max(last_processing, last_completion, last_ready):
@@ -388,8 +463,7 @@ class MiniMaxCodeProvider(BaseProvider):
             return TerminalStatus.ERROR
         if last_ready >= 0:
             if self._awaiting_turn and completion_identity == self._last_completion_identity:
-                if not self._turn_activity_seen:
-                    return TerminalStatus.PROCESSING
+                return TerminalStatus.PROCESSING
             if self._awaiting_turn and completion_identity is None:
                 return TerminalStatus.PROCESSING
             if self._awaiting_turn and not completion_anchored and not self._turn_activity_seen:
@@ -404,8 +478,7 @@ class MiniMaxCodeProvider(BaseProvider):
             return TerminalStatus.IDLE
         if completion_identity is not None:
             if self._awaiting_turn and completion_identity == self._last_completion_identity:
-                if not self._turn_activity_seen:
-                    return TerminalStatus.PROCESSING
+                return TerminalStatus.PROCESSING
             if self._awaiting_turn and not completion_anchored and not self._turn_activity_seen:
                 return TerminalStatus.PROCESSING
             self._last_completion_identity = completion_identity
@@ -430,36 +503,41 @@ class MiniMaxCodeProvider(BaseProvider):
             default=-1,
         )
         completion = max(
-            (
-                index
-                for index, line in enumerate(lines)
-                if re.match(r"^\s*└\s+Completed in\s+\d", line, re.IGNORECASE)
-            ),
+            (index for index, line in enumerate(lines) if _COMPLETION_LINE_PATTERN.match(line)),
             default=len(lines),
         )
         assistant_starts = [
             index
             for index in range(last_user + 1, completion)
-            if re.match(r"^\s*●\s+\S", lines[index])
-            and not re.match(r"^\s*●\s+Ready\s*$", lines[index])
+            if _ASSISTANT_LINE_PATTERN.match(lines[index])
+            and not _READY_ASSISTANT_LINE_PATTERN.match(lines[index])
         ]
         if not assistant_starts:
             raise ValueError("No MiniMax Code final response found")
 
         start = assistant_starts[-1]
-        response = [re.sub(r"^\s*●\s+", "", lines[start]).strip()]
+        assistant_match = _ASSISTANT_LINE_PATTERN.match(lines[start])
+        if assistant_match is None:
+            raise ValueError("No MiniMax Code final response found")
+        presentation_indent = len(assistant_match.group("indent")) + 2
+        response = [assistant_match.group("text").rstrip()]
         for line in lines[start + 1 : completion]:
             stripped = line.strip()
             if not stripped:
+                response.append("")
                 continue
-            if re.match(r"^(?:├|└|Called\s|Message\s+·|/[^ ]+\s+\|)", stripped):
+            if _EXTRACTION_SKIP_PATTERN.match(stripped):
                 continue
-            if re.match(r"^[╭│╰]", stripped):
+            if _BOX_CHROME_PATTERN.match(stripped):
                 continue
-            response.append(stripped)
+            presentation_prefix = " " * presentation_indent
+            content = (
+                line[len(presentation_prefix) :] if line.startswith(presentation_prefix) else line
+            )
+            response.append(content.rstrip())
 
-        answer = "\n".join(response).strip()
-        if not answer:
+        answer = "\n".join(response).strip("\n")
+        if not answer.strip():
             raise ValueError("MiniMax Code final response was empty")
         return answer
 
@@ -468,6 +546,7 @@ class MiniMaxCodeProvider(BaseProvider):
 
     def cleanup(self) -> None:
         data_dir = self._data_dir or self._data_dir_path()
+        self._require_managed_data_dir(data_dir)
         if data_dir.exists():
             shutil.rmtree(data_dir)
         self._data_dir = None

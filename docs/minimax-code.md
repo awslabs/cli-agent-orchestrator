@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `minimax_code` provider runs the interactive MiniMax Code CLI (`mcode`) as
+The `mcode` provider runs the interactive MiniMax Code CLI (`mcode`) as
 a long-lived, multi-turn agent in a CAO tmux window. CAO injects the selected
 agent profile and skill catalog in a bootstrap turn, then exposes orchestration
 tools such as `handoff`, `assign`, and `send_message` through a terminal-local
@@ -29,9 +29,9 @@ them to a repository.
 ## Quick start
 
 ```bash
-cao install developer --provider minimax_code
+cao install developer --provider mcode
 cao-server
-cao launch --agents developer --provider minimax_code
+cao launch --agents developer --provider mcode
 ```
 
 Pin a profile to this provider with frontmatter:
@@ -40,17 +40,18 @@ Pin a profile to this provider with frontmatter:
 ---
 name: minimax_developer
 description: Developer backed by MiniMax Code
-provider: minimax_code
+provider: mcode
 role: developer
 ---
 
 Implement the requested change and verify it.
 ```
 
-MiniMax Code's public interactive CLI does not currently expose a per-session
-model flag. CAO therefore rejects `model:` in a `minimax_code` profile and
-`--model` at launch instead of silently ignoring them. Select the model in the
-normal MiniMax Code configuration before launching CAO.
+MiniMax Code's public interactive CLI does not expose a model flag. CAO applies
+`model:` in an `mcode` profile or `--model` at launch by setting `defaultModel`
+only in the terminal-local copy of `config.yaml`; the explicit launch override
+wins over the profile value. The user's normal MiniMax Code configuration is
+not modified.
 
 ## Runtime behavior
 
@@ -94,18 +95,20 @@ terminal directory during normal cleanup and can reconstruct that cleanup
 after a `cao-server` restart.
 
 For profiles with `mcpServers`, CAO generates a local MiniMax Plugin containing
-`servers.mcp.json`. Each stdio server receives the terminal-specific
-`CAO_TERMINAL_ID`, and tool-call timeout is set to 600 seconds so synchronous
-handoffs are not cut off by the default MCP timeout. Absolute executable paths
-are converted to a bare command plus a terminal-local `PATH` prefix because
-the MiniMax Plugin schema requires PATH-resolved commands.
+`servers.mcp.json`. Stdio servers receive the terminal-specific
+`CAO_TERMINAL_ID`; URL-based `http` and `sse` profile entries are serialized as
+MiniMax Code's `streamable-http` and `sse` transports with their headers intact.
+Tool-call timeout is set to 600 seconds so synchronous handoffs are not cut off
+by the default MCP timeout. Absolute executable paths are converted to a bare
+command plus a terminal-local `PATH` prefix because the MiniMax Plugin schema
+requires PATH-resolved commands.
 
 ## Tool restrictions
 
 MiniMax Code has no public native flag for CAO's `allowedTools` vocabulary.
 Restricted profiles receive the shared CAO security instructions in the
 bootstrap prompt. This is soft, advisory enforcement: the model can ignore the
-instructions, so do not use `minimax_code` for security-critical restricted
+instructions, so do not use `mcode` for security-critical restricted
 workers. `--yolo` still resolves the CAO profile to unrestricted `['*']`.
 
 The generated Plugin includes only MCP servers declared by the selected
