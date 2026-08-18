@@ -215,6 +215,20 @@ class TestHandoffOutcomes:
         # The single combined call requests server-side teardown.
         assert mock_requests.post.call_args[1]["json"]["teardown"] is True
 
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    def test_attaches_bearer_when_auth_enabled(self, mock_provider, _nudge, _bearer):
+        """Review on PR #634: the run-step POST carries the local bearer when configured."""
+        mock_provider.return_value = _ctx("kiro_cli")
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert mock_requests.post.call_args[1]["headers"] == {"Authorization": "Bearer tok"}
+
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     def test_use_worktree_defaults_to_false_in_the_payload(self, mock_provider, _nudge):

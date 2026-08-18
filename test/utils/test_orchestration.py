@@ -14,7 +14,30 @@ from unittest.mock import MagicMock, patch
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
-from cli_agent_orchestrator.utils.orchestration import _cancel_impl, _result_impl, _status_impl
+from cli_agent_orchestrator.utils.orchestration import (
+    _auth_headers,
+    _cancel_impl,
+    _result_impl,
+    _status_impl,
+)
+
+
+class TestAuthHeaders:
+    """Tests for the local-auth bearer helper (review on PR #634).
+
+    ``_auth_headers()`` is what every ``requests`` call in this module passes as
+    ``headers=_auth_headers() or None`` -- without it, an auth-enabled cao-server
+    rejects every orchestration call with a 401.
+    """
+
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    def test_returns_bearer_header_when_token_configured(self, _bearer):
+        assert _auth_headers() == {"Authorization": "Bearer tok"}
+
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value=None)
+    def test_returns_empty_dict_when_no_token(self, _bearer):
+        """Default-off: no Authorization header -- byte-for-byte unchanged."""
+        assert _auth_headers() == {}
 
 
 class TestStatusImpl:
@@ -91,6 +114,21 @@ class TestStatusImpl:
 
         assert result == {"success": False, "terminal_id": "a1b2c3d4", "error": "boom"}
 
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    def test_attaches_bearer_when_auth_enabled(self, mock_get, _bearer):
+        """Review on PR #634: the outgoing GET carries the local bearer when configured."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"id": "a1b2c3d4", "status": "idle"}
+        resp.raise_for_status.return_value = None
+        mock_get.return_value = resp
+
+        _status_impl("a1b2c3d4")
+
+        _, kwargs = mock_get.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer tok"}
+
 
 class TestResultImpl:
     @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
@@ -134,6 +172,21 @@ class TestResultImpl:
         result = _result_impl("a1b2c3d4")
 
         assert result == {"success": False, "terminal_id": "a1b2c3d4", "error": "boom"}
+
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    def test_attaches_bearer_when_auth_enabled(self, mock_get, _bearer):
+        """Review on PR #634: the outgoing GET carries the local bearer when configured."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"output": "task complete"}
+        resp.raise_for_status.return_value = None
+        mock_get.return_value = resp
+
+        _result_impl("a1b2c3d4")
+
+        _, kwargs = mock_get.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer tok"}
 
 
 class TestCancelImpl:
@@ -188,3 +241,17 @@ class TestCancelImpl:
         mock_delete.assert_called_once_with("a1b2c3d4")
         mock_post.assert_not_called()
         assert result == {"success": True, "message": "Terminal a1b2c3d4 deleted successfully"}
+
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+    def test_attaches_bearer_when_auth_enabled(self, mock_post, _bearer):
+        """Review on PR #634: the outgoing POST carries the local bearer when configured."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        mock_post.return_value = resp
+
+        _cancel_impl("a1b2c3d4")
+
+        _, kwargs = mock_post.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer tok"}

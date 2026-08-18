@@ -57,6 +57,7 @@ class TestCreateTerminalProviderResolution:
                 "working_directory": "/repo",
             },
             json=None,
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
@@ -102,6 +103,7 @@ class TestCreateTerminalProviderResolution:
                 "working_directory": "/repo",
             },
             json=None,
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
@@ -233,6 +235,7 @@ class TestCreateTerminalProviderResolution:
                 "initial_message": "Review the current change",
                 "initial_message_orchestration_type": "assign",
             },
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
@@ -270,6 +273,7 @@ class TestCreateTerminalProviderResolution:
                 "session_name": "cao-new-session",
             },
             json={"initial_message": "Review the current change"},
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
@@ -283,6 +287,41 @@ class TestCreateTerminalProviderResolution:
                 _create_terminal("reviewer", defer_init=True)
 
         mock_requests.post.assert_not_called()
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_attaches_bearer_when_auth_enabled(
+        self, mock_requests, _bearer, mock_resolve_provider, mock_allowed_tools
+    ):
+        """Review on PR #634: both the metadata GET and the create POST carry
+        the local bearer when configured -- covers the assign/handoff path."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "claude_code",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo")
+
+        assert mock_requests.get.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+        assert mock_requests.post.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
 
 
 class TestCreateTerminalModelOverride:

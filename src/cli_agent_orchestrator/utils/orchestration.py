@@ -31,6 +31,7 @@ import requests
 from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.terminal import generate_session_name
@@ -41,6 +42,22 @@ logger = logging.getLogger(__name__)
 def _mcp_timeout() -> float:
     """Get MCP request timeout from server settings."""
     return float(get_server_settings()["mcp_request_timeout"])
+
+
+def _auth_headers() -> Dict[str, str]:
+    """Return the ``Authorization`` header for the internal client->API hop, if any.
+
+    Mirrors ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``:
+    attaches the operator-provisioned ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer is
+    enabled, and returns an empty mapping default-off so the no-auth posture stays
+    byte-for-byte unchanged. Every ``requests`` call in this module passes
+    ``headers=_auth_headers() or None`` -- without this, an auth-enabled deployment's
+    cao-server rejects every one of these calls with a 401 and the CLI/MCP orchestration
+    surface (assign, handoff, send_message, status, result, cancel, delete_terminal)
+    cannot be used at all.
+    """
+    token = get_local_bearer()
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 # Environment variable to enable/disable automatic sender terminal ID injection.
@@ -79,7 +96,9 @@ def _get_cleanup_nudge() -> str:
         if not current_terminal_id:
             return ""
         resp = requests.get(
-            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{current_terminal_id}",
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
         )
         if resp.status_code != 200:
             return ""
@@ -87,7 +106,9 @@ def _get_cleanup_nudge() -> str:
         if not session_name:
             return ""
         resp = requests.get(
-            f"{API_BASE_URL}/sessions/{session_name}/terminals", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/sessions/{session_name}/terminals",
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
         )
         if resp.status_code != 200:
             return ""
@@ -201,7 +222,9 @@ def _create_terminal(
     if current_terminal_id:
         # Get terminal metadata via API
         response = requests.get(
-            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{current_terminal_id}",
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
         )
         response.raise_for_status()
         terminal_metadata = response.json()
@@ -216,6 +239,7 @@ def _create_terminal(
             try:
                 response = requests.get(
                     f"{API_BASE_URL}/terminals/{current_terminal_id}/working-directory",
+                    headers=_auth_headers() or None,
                     timeout=_mcp_timeout(),
                 )
                 if response.status_code == 200:
@@ -269,6 +293,7 @@ def _create_terminal(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
             params=params,
             json=json_body,
+            headers=_auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -312,6 +337,7 @@ def _create_terminal(
             f"{API_BASE_URL}/sessions",
             params=params,
             json=json_body,
+            headers=_auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -343,6 +369,7 @@ def _send_direct_input(
             "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
             "orchestration_type": orchestration_type,
         },
+        headers=_auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -430,7 +457,9 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
         )
 
     response = requests.get(
-        f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
+        f"{API_BASE_URL}/terminals/{current_terminal_id}",
+        headers=_auth_headers() or None,
+        timeout=_mcp_timeout(),
     )
     response.raise_for_status()
     terminal_metadata = response.json()
@@ -513,6 +542,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
             "sender_id": sender_id,
             "message": message,
         },
+        headers=_auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -628,6 +658,7 @@ async def _handoff_impl(
             response = requests.post(
                 f"{API_BASE_URL}/terminals/run-step",
                 json=payload,
+                headers=_auth_headers() or None,
                 timeout=client_timeout,
             )
         except requests.Timeout:
@@ -801,7 +832,9 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
                     ),
                 }
             response = requests.get(
-                f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+                f"{API_BASE_URL}/terminals/{own_terminal_id}",
+                headers=_auth_headers() or None,
+                timeout=_mcp_timeout(),
             )
             try:
                 response.raise_for_status()
@@ -876,7 +909,9 @@ def _delete_terminal_impl(terminal_id: str) -> Dict[str, Any]:
     """
     try:
         response = requests.delete(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{terminal_id}",
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
         )
         if response.status_code == 409:
             return {
@@ -923,7 +958,11 @@ def _status_impl(terminal_id: str) -> Dict[str, Any]:
     no one to call it back.
     """
     try:
-        response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{terminal_id}",
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
         if response.status_code == 404:
             return {
                 "success": False,
@@ -968,6 +1007,7 @@ def _result_impl(terminal_id: str) -> Dict[str, Any]:
         response = requests.get(
             f"{API_BASE_URL}/terminals/{terminal_id}/output",
             params={"mode": "last"},
+            headers=_auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         if response.status_code == 404:
@@ -1015,6 +1055,7 @@ def _cancel_impl(terminal_id: str, delete: bool = False) -> Dict[str, Any]:
         response = requests.post(
             f"{API_BASE_URL}/terminals/{terminal_id}/key",
             params={"key": "C-c"},
+            headers=_auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         if response.status_code == 404:

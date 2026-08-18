@@ -150,3 +150,13 @@ class TestDeleteTerminal:
             result = delete_terminal("t1")
         assert result["success"] is False
         assert "Failed" in result["message"]
+
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    def test_attaches_bearer_when_auth_enabled(self, _bearer):
+        """Review on PR #634: the outgoing DELETE carries the local bearer when configured."""
+        with patch("cli_agent_orchestrator.utils.orchestration.requests.delete") as mock_delete:
+            mock_delete.return_value.raise_for_status.return_value = None
+            delete_terminal("t1")
+
+        _, kwargs = mock_delete.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer tok"}

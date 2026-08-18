@@ -5,6 +5,30 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
+from cli_agent_orchestrator.constants import API_BASE_URL
+
+
+class TestSendToInboxAuthHeaders:
+    """Review on PR #634: _send_to_inbox is the one path all six send-message
+    variants funnel through, so this is where the bearer must attach."""
+
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+    def test_attaches_bearer_when_auth_enabled(self, mock_post, _bearer):
+        from cli_agent_orchestrator.utils.orchestration import _send_to_inbox
+
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"success": True}
+        mock_post.return_value = resp
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
+            _send_to_inbox("c0ffee01", "Done!")
+
+        _, kwargs = mock_post.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer tok"}
+        assert mock_post.call_args[0][0] == f"{API_BASE_URL}/terminals/c0ffee01/inbox/messages"
+
 
 class TestSendMessageSelfSendGuard:
     """Tests for the self-send guard added for issue #24.
