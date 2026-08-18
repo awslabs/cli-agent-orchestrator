@@ -740,7 +740,7 @@ def _sanitise_output_json(output_json: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 def record_step_completion(
     env_vars: Optional[Dict[str, str]],
-) -> Optional[Callable[[Optional[str], Optional[str], Optional[str]], None]]:
+) -> Optional[Callable[[Optional[str], Optional[str], Optional[str], Optional[str]], None]]:
     """Build the RUNNING->COMPLETED/FAILED transition for a script-tier step.
 
     Mirrors ``make_step_terminal_recorder``'s guard exactly (BR-31 pattern):
@@ -761,14 +761,19 @@ def record_step_completion(
     - ``StepExecutionError`` (a crashed/timed-out step) -> ``FAILED`` with the
       error string recorded.
 
-    THE CALLBACK TAKES ``(terminal_id, error, last_message)``. ``last_message`` is
-    the step's raw text result, needed for the durable result envelope: a settled
-    row with no envelope is precisely what FR-4 guard 1 exists to prevent, and an
-    envelope built without the step's own output would satisfy the guard's letter
-    while making every future replay serve an empty result. It is ``None`` on every
-    failure arm, where the step produced no message — a FAILED step still gets an
-    envelope (unit 2 BR-1), because envelope ABSENCE must keep meaning *a crash
-    between the writes* and never *the step failed*.
+    THE CALLBACK TAKES ``(terminal_id, error, last_message, response_status=None)``.
+    ``last_message`` is the step's raw text result, needed for the durable result
+    envelope: a settled row with no envelope is precisely what FR-4 guard 1 exists
+    to prevent, and an envelope built without the step's own output would satisfy
+    the guard's letter while making every future replay serve an empty result.
+    ``response_status`` is the original successful HTTP response status, which can
+    intentionally differ from the journal state when structured output is
+    unvalidated; its ``None`` default means no response existed, so FAILED arms
+    retain their historical envelope status derived from ``StepState.FAILED``.
+    ``last_message`` and ``response_status`` are both ``None`` on every failure arm,
+    where the step produced no message — a FAILED step still gets an envelope (unit
+    2 BR-1), because envelope ABSENCE must keep meaning *a crash between the
+    writes* and never *the step failed*.
 
     ``provider``/``agent``/``prompt`` WERE PARAMETERS AND ARE GONE (TD-5). They
     existed only to compute the call fingerprint here, and the fingerprint no longer
@@ -808,6 +813,7 @@ def record_step_completion(
         terminal_id: Optional[str],
         error: Optional[str],
         last_message: Optional[str],
+        response_status: Optional[str] = None,
     ) -> None:
         st = record.step_states.get(step_id)
         if st is None:
@@ -861,7 +867,11 @@ def record_step_completion(
                 state=st.state.value,
                 updated_at=now,
                 result_json=serialise_envelope(
-                    build_envelope(last_message or "", st.state.value, st.terminal_id)
+                    build_envelope(
+                        last_message or "",
+                        response_status if response_status is not None else st.state.value,
+                        st.terminal_id,
+                    )
                 ),
                 output_json=_sanitise_output_json(raw_output_json),
                 error=_sanitise_error(st.error),
@@ -1332,6 +1342,8 @@ async def resume_script_run(
     # ``update_run_generation`` raise — not just the happy spawn path.
     _active_drives.add(run_id)
     snapshot_path: Optional[str] = None
+    record: Optional[ScriptRunRecord] = None
+    result: Optional[WorkflowRunResult] = None
     # ``step_id`` -> the state the row held before this resume's decision was applied (PR #628
     # review, F6). Declared BEFORE the ``try`` so the ``finally`` can always read it, empty for
     # the ordinary no-decision resume, which therefore takes no extra read and no extra write.
@@ -1416,7 +1428,7 @@ async def resume_script_run(
 
         env = _build_env(run_id, record.generation, journaled_inputs, resume=True)
         snapshot_path = _materialize_snapshot(run_id, source)
-        return await _drive_process(record, snapshot_path, env)
+        result = await _drive_process(record, snapshot_path, env)
     finally:
         _active_drives.discard(run_id)
         _delete_temp_file(snapshot_path)  # ALWAYS deleted after reap (BR-30)
@@ -1449,7 +1461,21 @@ async def resume_script_run(
         # acceptable — it consumed nothing.
         if granted:
             try:
-                workflow_journal.revoke_unconsumed_decisions(run_id, granted)
+                revoked = workflow_journal.revoke_unconsumed_decisions(run_id, granted)
+                # A skip replays from its temporary ``replay_authorized`` row, so the
+                # recorder correctly hydrates that state before this finally revokes it.
+                # The database return is the atomic answer to which grants survived; mirror
+                # only those rows back into the still-live record and already-built result.
+                # ``StepResult`` is mutable, and mutating it here is necessary because a
+                # ``finally`` cannot replace the value an earlier ``return`` would expose.
+                if result is not None:
+                    for step_id in revoked:
+                        prior_state = StepState(granted[step_id])
+                        if record is not None and step_id in record.step_states:
+                            record.step_states[step_id].state = prior_state
+                        for step in result.steps:
+                            if step.id == step_id:
+                                step.state = prior_state
             except (
                 Exception
             ) as e:  # noqa: BLE001 — never mask the drive's outcome; consent lives one resume longer
@@ -1459,6 +1485,8 @@ async def resume_script_run(
                     run_id,
                     e,
                 )
+    assert result is not None
+    return result
 
 
 # ---------------------------------------------------------------------------

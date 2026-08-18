@@ -77,7 +77,9 @@ from cli_agent_orchestrator.models.workflow import RecoveryPolicy, StepResultEnv
 from cli_agent_orchestrator.models.workflow_runtime import (
     RecoveryDecision,
     RunState,
+    StepResult,
     StepState,
+    WorkflowRunResult,
     parse_decision,
 )
 from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
@@ -1089,6 +1091,38 @@ class TestUnconsumedConsentIsRevokedWhenTheDriveEnds:
 
         monkeypatch.setattr(script_runner, "_drive_process", _drive)
 
+    @staticmethod
+    def _replaying_skip_drive(monkeypatch: pytest.MonkeyPatch):
+        """Model replay's durable-row hydration before the ``finally`` revokes skip.
+
+        ``replay_authorized`` is correct during this drive: the gate needs it to replay. The
+        returned result and retained registry record must instead match the state the atomic
+        revoke restored after the drive ends.
+        """
+
+        async def _drive(record, path, env):
+            record.state = RunState.COMPLETED
+            record.step_states[STEP] = workflow_service.StepRunState(
+                step_id=STEP,
+                state=StepState.REPLAY_AUTHORIZED,
+                attempts=1,
+            )
+            return WorkflowRunResult(
+                run_id=RUN,
+                workflow_name="wf",
+                state=RunState.COMPLETED,
+                steps=[
+                    StepResult(
+                        id=STEP,
+                        state=StepState.REPLAY_AUTHORIZED,
+                        attempts=1,
+                    )
+                ],
+                started_at=TS,
+            )
+
+        monkeypatch.setattr(script_runner, "_drive_process", _drive)
+
     @pytest.mark.asyncio
     async def test_a_resume_that_fails_after_the_grant_takes_it_back(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1129,6 +1163,38 @@ class TestUnconsumedConsentIsRevokedWhenTheDriveEnds:
 
         assert _state_of() == StepState.COMPLETED.value
         assert _state_of() != StepState.REPLAY_AUTHORIZED.value
+
+    @pytest.mark.asyncio
+    async def test_a_skip_resume_result_reports_the_revoked_prior_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The result is built before ``finally`` runs, so this catches publishing the
+        temporary authorisation even though the database correctly restores the row."""
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._replaying_skip_drive(monkeypatch)
+
+        result = await script_runner.resume_script_run(RUN, {STEP: "skip"})
+
+        assert result.steps[0].state is StepState.COMPLETED
+        assert _state_of() == StepState.COMPLETED.value
+
+    @pytest.mark.asyncio
+    async def test_a_skip_status_endpoint_reports_the_revoked_prior_state(
+        self, monkeypatch: pytest.MonkeyPatch, client: TestClient
+    ):
+        """The bounded registry window serves the same normalized state as the resume result,
+        rather than exposing ``replay_authorized`` after its durable grant was revoked."""
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._replaying_skip_drive(monkeypatch)
+
+        await script_runner.resume_script_run(RUN, {STEP: "skip"})
+        response = client.get(f"/workflows/runs/{RUN}")
+
+        assert response.status_code == 200
+        assert response.json()["steps"][0]["state"] == StepState.COMPLETED.value
+        assert _state_of() == StepState.COMPLETED.value
 
     @pytest.mark.asyncio
     async def test_the_next_resume_halts_again_after_a_skip(self, monkeypatch: pytest.MonkeyPatch):

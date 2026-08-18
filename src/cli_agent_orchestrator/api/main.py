@@ -3271,6 +3271,7 @@ async def run_step(
         terminal_id: Optional[str],
         error: Optional[str],
         last_message: Optional[str] = None,
+        response_status: Optional[str] = None,
     ) -> None:
         # ``last_message`` is the step's own text result and defaults to None because
         # every FAILURE arm below has none to give: the step never produced one. Only
@@ -3281,7 +3282,7 @@ async def run_step(
         if on_step_settled is None:
             return
         try:
-            on_step_settled(terminal_id, error, last_message)
+            on_step_settled(terminal_id, error, last_message, response_status)
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
 
@@ -3506,11 +3507,14 @@ async def run_step(
         # non-script callers). Before building the response so a settle failure
         # is logged, not raised. ``last_message`` is passed here and nowhere else:
         # this is the only arm where the step produced one.
-        _settle_step(result.terminal_id, None, result.last_message)
+        response_status = (
+            result.status.value if hasattr(result.status, "value") else str(result.status)
+        )
+        _settle_step(result.terminal_id, None, result.last_message, response_status)
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
-            status=(result.status.value if hasattr(result.status, "value") else str(result.status)),
+            status=response_status,
         )
     except ReplayDivergenceError as e:
         # FR-3's surfacing (BR-6/BR-7, TD-3/TD-4). 409 rather than 502/504 because

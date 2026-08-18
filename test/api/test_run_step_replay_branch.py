@@ -1165,6 +1165,49 @@ class TestCompatibility:
 
 
 # ---------------------------------------------------------------------------
+# PR #628 review, P1 — replay exposes the original response status, not journal state.
+# ---------------------------------------------------------------------------
+class TestReplayPreservesOriginalResponseStatus:
+    def test_unvalidated_completion_replays_the_live_completed_status(self, client):
+        """A schema-invalid structured output is a journal-quality distinction, not a changed
+        run-step response: live and replay must both answer ``completed`` while the durable
+        row remains ``completed_unvalidated`` for the YAML-tier-compatible state machine."""
+        from cli_agent_orchestrator.services.step_output_store import record_step_output
+
+        run_id = "run-unvalidated-status"
+        body = _body(env_vars=_env(run_id))
+        _register_run(run_id)
+        record_step_output(
+            run_id,
+            "s1",
+            {"answer": "not-an-integer"},
+            {
+                "type": "object",
+                "properties": {"answer": {"type": "integer"}},
+                "required": ["answer"],
+            },
+        )
+
+        async def _run_with_terminal_ready(**kwargs):
+            callback = kwargs["on_step_terminal_ready"]
+            assert callback is not None
+            callback("fresh-terminal", _route_fingerprint(body))
+            return _ok_result()
+
+        with patch(_RUN_STEP, new=AsyncMock(side_effect=_run_with_terminal_ready)):
+            live = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+        replay = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert live.status_code == 200
+        assert replay.status_code == 200
+        assert live.json()["status"] == "completed"
+        assert replay.json()["status"] == live.json()["status"]
+        row = workflow_journal.get_step(run_id, "s1")
+        assert row is not None
+        assert row.state == "completed_unvalidated"
+
+
+# ---------------------------------------------------------------------------
 # PR #628 review, Copilot F4 — a REPLAY must still appear in the run's step list.
 # ---------------------------------------------------------------------------
 class TestAReplayedStepIsVisibleInTheRunResult:
