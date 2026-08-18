@@ -6,6 +6,7 @@ namespace: cao-cluster
 resources:
   - namespace.yaml
   - configmap-fleet.yaml
+  - efs-workspace.yaml
   - service-workers-headless.yaml
   - statefulset-workers.yaml
   - deployment-supervisor.yaml

@@ -98,6 +98,14 @@ spec:
           volumeMounts:
             - name: cao-state
               mountPath: /home/cao/.cao
+            # Shared EFS workspace (same PVC + path on every pod) — see
+            # efs-workspace.yaml for the AWS resources and concurrency notes.
+            - name: workspace
+              mountPath: /home/cao/workspace
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cao-workspace
   # Per-pod persistent state (SQLite DB, logs, installed profiles). A PVC per
   # ordinal survives pod restarts/rescheduling, unlike the emptyDir it replaces.
   volumeClaimTemplates:
@@ -107,6 +115,9 @@ spec:
           app.kubernetes.io/part-of: cao-fleet
       spec:
         accessModes: ["ReadWriteOnce"]
+        # This cluster has no default StorageClass — pin one explicitly or
+        # the PVC never binds and the pod never schedules.
+        storageClassName: gp3
         resources:
           requests:
             storage: 1Gi
