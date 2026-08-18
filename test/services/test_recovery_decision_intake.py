@@ -164,12 +164,14 @@ def _db_path() -> str:
     return str(DATABASE_FILE)
 
 
-def _seed_run(run_id: str = RUN, *, tier: str = "script", state: str = "failed") -> None:
+def _seed_run(
+    run_id: str = RUN, *, tier: str = "script", state: str = "failed", snapshot: str = SNAPSHOT
+) -> None:
     """Seed the ``workflow_run`` row a resume reads (gate 1/gate 3)."""
     workflow_journal.insert_run(
         run_id=run_id,
         workflow_name="wf",
-        spec_snapshot=SNAPSHOT,
+        spec_snapshot=snapshot,
         inputs_json="{}",
         state=state,
         started_at=TS,
@@ -1078,7 +1080,13 @@ class TestOrphanedRecoveryConsentRequiresARedecision:
         _seed_run()
         _seed_step(state=authorised_state)
         before = _all_columns()
-        self._completing_drive(monkeypatch)
+        drive_calls: List[object] = []
+
+        async def _must_not_drive(*args: object) -> WorkflowRunResult:
+            drive_calls.append(args)
+            raise AssertionError("the drive must not be invoked after a consent refusal")
+
+        monkeypatch.setattr(script_runner, "_drive_process", _must_not_drive)
 
         with pytest.raises(
             workflow_service.ResumeNotAllowedError,
@@ -1087,6 +1095,102 @@ class TestOrphanedRecoveryConsentRequiresARedecision:
             await script_runner.resume_script_run(RUN)
 
         assert _all_columns() == before
+        assert drive_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("run_state", "make_live", "message"),
+        [
+            ("failed", True, "currently executing; cannot resume a live run"),
+            ("completed", False, "completed; not resumable"),
+        ],
+        ids=["liveness-before-consent", "resumability-before-consent"],
+    )
+    async def test_an_earlier_admission_gate_precedes_orphaned_consent(
+        self, run_state: str, make_live: bool, message: str
+    ):
+        _seed_run(state=run_state)
+        _seed_step(state=StepState.RERUN_AUTHORIZED.value)
+        if make_live:
+            workflow_service._active_drives.add(RUN)
+
+        with pytest.raises(workflow_service.ResumeNotAllowedError, match=message) as error:
+            await script_runner.resume_script_run(RUN)
+
+        assert "fresh decision" not in str(error.value)
+
+    @pytest.mark.asyncio
+    async def test_a_rerun_revoke_leaves_the_next_ordinary_resume_unblocked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+        self._completing_drive(monkeypatch)
+
+        first = await script_runner.resume_script_run(RUN, {STEP: "rerun"})
+        second = await script_runner.resume_script_run(RUN)
+
+        assert first.state is RunState.COMPLETED
+        assert second.state is RunState.COMPLETED
+        assert _state_of() == StepState.COMPLETED.value
+
+    @pytest.mark.asyncio
+    async def test_a_failed_consent_read_propagates_without_spawning_the_drive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _seed_run()
+        drive_calls: List[object] = []
+
+        async def _must_not_drive(*args: object) -> WorkflowRunResult:
+            drive_calls.append(args)
+            raise AssertionError("the drive must not be invoked after a failed consent read")
+
+        def _read_failure(*args: object) -> List[workflow_journal.StepRow]:
+            raise sqlite3.Error("injected consent read failure")
+
+        monkeypatch.setattr(script_runner, "_drive_process", _must_not_drive)
+        monkeypatch.setattr(workflow_journal, "get_steps", _read_failure)
+
+        with pytest.raises(sqlite3.Error, match="injected consent read failure"):
+            await script_runner.resume_script_run(RUN)
+
+        assert drive_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_yaml_resume_with_an_authorised_looking_step_never_hits_the_consent_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        yaml_snapshot = json.dumps(
+            {
+                "name": "wf",
+                "mode": "sequential",
+                "steps": [{"id": STEP, "provider": "kiro", "agent": "agent", "prompt": "prompt"}],
+            }
+        )
+        _seed_run(tier="yaml", snapshot=yaml_snapshot)
+        _seed_step(state=StepState.RERUN_AUTHORIZED.value)
+        get_steps_calls: List[str] = []
+        real_get_steps = workflow_journal.get_steps
+
+        def _record_get_steps(run_id: str) -> List[workflow_journal.StepRow]:
+            get_steps_calls.append(run_id)
+            return real_get_steps(run_id)
+
+        async def _complete_yaml_drive(record, order) -> WorkflowRunResult:
+            return WorkflowRunResult(
+                run_id=record.run_id,
+                workflow_name=record.workflow_name,
+                state=RunState.COMPLETED,
+                started_at=TS,
+            )
+
+        monkeypatch.setattr(workflow_journal, "get_steps", _record_get_steps)
+        monkeypatch.setattr(workflow_service, "_drive", _complete_yaml_drive)
+
+        result = await workflow_service.resume_from_last_completed(RUN)
+
+        assert result.state is RunState.COMPLETED
+        assert get_steps_calls == [RUN]
 
     @pytest.mark.asyncio
     async def test_a_refusal_releases_the_claim_and_the_remedy_still_works(

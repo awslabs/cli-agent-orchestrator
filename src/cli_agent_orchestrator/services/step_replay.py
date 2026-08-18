@@ -413,6 +413,8 @@ def decide(
     # halt would be asked again on every subsequent resume — the infinite-halt defect BR-2
     # exists to prevent, in a new place. Rule 9's condition is the ENVELOPE's, not the state's,
     # so it survives the overwrite and has to exclude the state by hand.
+    # Gate 5 in ``script_runner.resume_script_run`` also rejects an unconsumed authorisation
+    # on a later resume unless that step receives a fresh decision.
     if row.state == _FAILED:
         return ReplayDecision(
             verdict=ReplayVerdict.DECISION_REQUIRED,
