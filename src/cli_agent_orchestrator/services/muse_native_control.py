@@ -102,11 +102,20 @@ ENCODING_SOFT_NEWLINE = "soft-newline-lines-then-enter"
 #: pane cannot assume.  Whether Muse alters the composer's contents on
 #: submit was NOT established by reading the build, so
 #: ``submit_normalization_proven`` is false and the plan only states what
-#: the model received when the answer does not depend on it.  An Enter
-#: that arrives before the renderer is ready is not known to be swallowed
-#: on this build, so no submit settle is asserted; the idle gate before
-#: the queue and the composer-visible submit observation are the
-#: submission barriers here.
+#: the model received when the answer does not depend on it.
+#:
+#: The 0.2.1-R1215.1 entry is a *live measurement*, not a binary read.
+#: Driving the composer through tmux on that build, an Enter that arrives
+#: with no settle is not merely swallowed — it is demoted to a newline
+#: (0/10 submitted at both 0 ms and 50 ms).  At 100 ms it submits 6/10 and
+#: silently *merges* two separately-intended messages into one multi-line
+#: turn, which is the worse failure: the caller sees a submission and the
+#: provider receives the wrong message.  10/10 submitted cleanly at 150 ms;
+#: 0.2 is pinned as the safe end of that range rather than the smallest
+#: value observed to work.  ``C-m`` is excluded from the newline
+#: alternation on both builds: it is carriage return, and it was measured
+#: to *submit* through tmux with ``extended-keys`` both on and off, so a
+#: derivation that ever selects it truncates the message mid-send.
 _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
     "0.1.0": {
         "keystroke": "C-j",
@@ -118,16 +127,34 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
         },
         "submit_normalization_proven": False,
     },
+    "0.2.1": {
+        "keystroke": "C-j",
+        "submit_settle_seconds": 0.2,
+        "evidence": {
+            "binary_version": "0.2.1-R1215.1",
+            "keymap_submit": "enter: Submit the composer message",
+            "keymap_newline": "shift+enter / ctrl+j / ctrl+m: Insert a newline without submitting",
+            "settle_measurement": (
+                "tmux send-keys, 10 trials per interval: 0 ms 0/10, 50 ms 0/10 "
+                "(Enter demoted to newline), 100 ms 6/10 with silent message "
+                "merging, 150 ms 10/10; pinned at 0.2 as the safe end"
+            ),
+            "newline_measurement": (
+                "C-j inserts a newline with extended-keys on and off; C-m submits "
+                "in both modes and is therefore never selectable as the newline"
+            ),
+        },
+        "submit_normalization_proven": False,
+    },
 }
 
-#: The settle an unproven build waits before its Enter. A missing pin
-#: selects the safe end of the observed range — the longest proven
-#: interval for this provider — which for Muse is ``0.0``: zero is this
-#: provider's *proven* value, not a null placeholder, because no Enter
-#: swallow has been observed on the build that was read. If a future
-#: proven build ever requires a settle, this floor rises with the table.
-#: The plan marks the value with ``submit_settle_proven: False`` so a
-#: receipt reader can tell this floor from a measurement.
+#: The settle an unproven build waits before its Enter: the longest proven
+#: interval for this provider, so a build nobody measured inherits the safe
+#: end of the observed range rather than a null placeholder (the failure
+#: ``docs/provider-version-policy.md`` §3 names).  This is computed from the
+#: table, so pinning a slower build raises it automatically.  The plan marks
+#: the value with ``submit_settle_proven: False`` so a receipt reader can
+#: tell this floor from a measurement.
 _SUBMIT_SETTLE_FLOOR_SECONDS = max(
     float(entry["submit_settle_seconds"]) for entry in _PROVEN_COMPOSER_NEWLINE.values()
 )

@@ -1494,17 +1494,25 @@ def test_muse_planner_plans_a_multiline_task_with_the_pinned_c_j():
 def test_muse_planner_floors_an_unproven_build_at_the_proven_settle():
     """An unproven Muse build gets the floor, marked as a floor.
 
-    Muse's longest proven settle is ``0.0`` — zero is this provider's
-    *proven* value, not a null placeholder — so the floor changes no
-    timing here. What the plan must still distinguish is provenance:
-    the value on an unproven build is a floor, not a measurement.
+    The floor is the longest proven interval for this provider, so an
+    unmeasured build inherits the safe end of the observed range. It is
+    asserted against the derived value rather than a literal so that
+    pinning a slower build cannot leave this gate frozen on a stale
+    number. What the plan must still distinguish is provenance: the
+    value on an unproven build is a floor, not a measurement.
+
+    The floor is explicitly non-zero. A zero settle was measured on
+    0.2.1-R1215.1 to demote the Enter to a newline (0/10 submitted), so
+    a null-valued floor here would be a silent non-delivery rather than
+    a conservative default.
     """
     plan = muse_native_control.plan_composer_keystrokes(
         "one line only",
         provider_version="9.9.9",
     )
     assert plan["deliverable"] is True
-    assert plan["submit_settle_seconds"] == 0.0
+    assert plan["submit_settle_seconds"] == muse_native_control._SUBMIT_SETTLE_FLOOR_SECONDS
+    assert plan["submit_settle_seconds"] > 0.0
     assert plan["submit_settle_proven"] is False
     assert plan["composer_evidence"] is None
 
