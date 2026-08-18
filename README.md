@@ -31,7 +31,7 @@ Install:
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
-  [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi](docs/omp-cli.md),
+  [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),
   [Cursor CLI](docs/cursor-cli.md), or
   [Grok Build CLI](docs/grok-cli.md)
 
@@ -131,7 +131,7 @@ provider override while keeping the same sequence.
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
-  [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi](docs/omp-cli.md),
+  [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),
   [Cursor CLI](docs/cursor-cli.md), and
   [Grok Build CLI](docs/grok-cli.md).
 - [Security policy](SECURITY.md): vulnerability reporting and deployment
