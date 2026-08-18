@@ -174,10 +174,16 @@ APPROVAL_PROMPT_PATTERN = (
     r"|grant these permissions)\?"
     r"|Do you want to approve network access to)"
 )
-# Rendered as `Press ` + `enter` + ` to confirm or ` + `esc` + ` to cancel`, with
-# the key names emitted as separately styled spans -- the whole sentence is not one
-# literal in the binary, so match the stable leading fragment only.
-APPROVAL_PROMPT_FOOTER = r"Press enter to confirm"
+# Rendered as `Press ` + `<accept-key>` + ` to confirm or ` + `<cancel-key>` +
+# ` to cancel`, with the key names emitted as separately styled spans -- the whole
+# sentence is not one literal in the binary. The accept key is CONFIGURABLE
+# (`tui.keymap.list.accept`, e.g. "space" -> "Press space to confirm ..."), so
+# match the stable structural wording independently of the key: "Press <key> to
+# confirm". `\S+` (not `.+`) keeps it to a single key token so this can't span
+# arbitrary prose, and it stays gated by the numbered-menu-at-bottom structure in
+# _has_approval_prompt_in_bottom, so a completed reply merely quoting the phrase is
+# still rejected.
+APPROVAL_PROMPT_FOOTER = r"Press \S+ to confirm\b"
 # One numbered menu option: "› 1. Yes, proceed (y)", "  2. No, ... (esc)". The
 # selection cursor is optional here because it sits on exactly one option at a
 # time and moves as the operator arrows around.

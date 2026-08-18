@@ -3191,6 +3191,24 @@ class TestCodexProviderApprovalPromptLive:
 
         assert _has_approval_prompt_in_bottom(prompt + "\n" * 20)
 
+    @pytest.mark.parametrize("accept_key", ["enter", "space", "tab", "y"])
+    def test_configurable_confirm_key_still_detected(self, accept_key):
+        """The accept key is configurable (``tui.keymap.list.accept``), so the
+        footer can read ``Press space to confirm ...`` etc. Detection must key on
+        the structural wording, not the literal "enter" — otherwise a custom
+        keymap re-creates the original unsafe IDLE classification (haofeif P2)."""
+        prompt = (
+            "  Would you like to run the following command?\n"
+            "\n"
+            "  $ rm -rf build\n"
+            "\n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. No, and tell Codex what to do differently (esc)\n"
+            "\n"
+            f"  Press {accept_key} to confirm or esc to cancel\n"
+        )
+        assert _has_approval_prompt_in_bottom(prompt + "\n" * 10)
+
     @pytest.mark.parametrize(
         "question",
         [
