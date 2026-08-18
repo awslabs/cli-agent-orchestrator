@@ -16,6 +16,7 @@ cancel) and examples/workflow/run.sh for a non-interactive entry point.
 
 from __future__ import annotations
 
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from cao_workflow import ShimHTTPError, emit_output, get_inputs, run_step
@@ -34,6 +35,17 @@ INPUTS = {
 # same shape as fanout_example.py's SHARDS list.
 CHECKS = ["style", "security", "performance"]
 
+# /terminals/run-step validates CAO_WORKFLOW_STEP_ID against this exact
+# charset (api/main.py's RunStepRequest.validate_env_var_shape) — `target` is
+# an arbitrary author-supplied string, so it must be sanitized before it can
+# be embedded in a step_id.
+_STEP_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _slug(value: str) -> str:
+    """Map ``value`` onto the charset CAO_WORKFLOW_STEP_ID requires."""
+    return _STEP_ID_UNSAFE.sub("_", value)
+
 
 def _tone(strict: bool) -> str:
     return "flag every deviation, however minor" if strict else "flag only significant issues"
@@ -45,7 +57,7 @@ def _plan(target: str, tone: str) -> str:
         "claude_code",
         "reviewer",
         f"Draft a one-line review plan for '{target}'. {tone}. Return the plan only.",
-        step_id=f"plan:{target}",
+        step_id=f"plan-{_slug(target)}",
     )
     return handle.output
 
@@ -63,7 +75,7 @@ def _run_check(target: str, check: str, tone: str):
             "claude_code",
             "reviewer",
             f"Review '{target}' for {check} issues. {tone}. Return findings only.",
-            step_id=f"check:{target}:{check}",
+            step_id=f"check-{_slug(target)}-{check}",
         )
         return check, handle.output
     except ShimHTTPError:

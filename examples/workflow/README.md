@@ -32,7 +32,8 @@ README only covers what's specific to this example.
 2. **Sequential then concurrent** — one `run_step` plan call, then a
    `ThreadPoolExecutor` fan-out over a fixed check list, each with an explicit,
    pairwise-distinct `step_id` derived from `target` and the check name
-   (`check:<target>:<check>`) — the shape used in
+   (`check-<target>-<check>`, with `target` sanitized to the
+   `[A-Za-z0-9_-]` charset `/terminals/run-step` requires) — the shape used in
    [`docs/examples/fanout_example.py`](../../docs/examples/fanout_example.py).
 3. **Per-unit fault tolerance** — each fan-out call is wrapped in its own
    `try`/`except ShimHTTPError`; one failing check is dropped into
@@ -96,7 +97,7 @@ the run is still going, finished, or the terminal that started it is gone.
 ```bash
 cao workflow events demo-1 --no-follow   # one-shot batch read of ordered progress
 cao workflow wait demo-1                 # (re-)follow an already-submitted run
-cao workflow result demo-1 --json        # the full WorkflowRunResult, in-flight or done
+cao workflow result demo-1 --json        # the retained result assembled from the journal
 ```
 
 ## Output shapes
@@ -112,10 +113,12 @@ for the complete table):
 | `cao workflow run workflow --run-id demo-1 ... --detach` | the 202 submit body: `{run_id, state, links}` |
 | `cao workflow run workflow --run-id demo-1 ... --wait` | the complete `WorkflowRunResult` (`steps[]`, `output`, `warnings`, ...) |
 
-Only the `--wait` path (or `cao workflow result <id>`) carries the run-level
-`output` `emit_output()` produced — run-level output is not journaled, so `status`
-and a plain (non-`--wait`) `run`/`result` never include it; per-step `output` is
-always present on `steps[]`.
+Only the `--wait` path carries the run-level `output` `emit_output()` produced.
+Run-level output is not journaled: `status`'s snapshot model has no `output` field
+at all, and `result` (`/workflows/runs/{id}/result`) explicitly drops the key from
+its response rather than advertise a field it can never populate — so a plain
+(non-`--wait`) `run`, `status`, and `result` all omit it. Per-step `output` is
+unaffected and always present on `steps[]`.
 
 ## `cao workflow` vs. `cao schedule`
 

@@ -14,6 +14,7 @@ directly proves rejection happens before any worker/step exists.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -85,13 +86,18 @@ async def test_concurrent_fanout_uses_pairwise_distinct_step_ids(
 
     assert result.state == RunState.COMPLETED
     step_ids = [c["env_vars"]["CAO_WORKFLOW_STEP_ID"] for c in fake_run_step_server.recorded_calls]
-    assert step_ids[0] == "plan:myapp"  # the sequential step runs before the fan-out
+    assert step_ids[0] == "plan-myapp"  # the sequential step runs before the fan-out
     assert sorted(step_ids[1:]) == [
-        "check:myapp:performance",
-        "check:myapp:security",
-        "check:myapp:style",
+        "check-myapp-performance",
+        "check-myapp-security",
+        "check-myapp-style",
     ]
     assert len(set(step_ids)) == len(step_ids)  # pairwise distinct across the whole run
+    # The fake server doesn't enforce this (unlike the real RunStepRequest
+    # validator), so assert it directly — every step_id must be a value the
+    # real /terminals/run-step route's env_vars validator would accept.
+    for step_id in step_ids:
+        assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", step_id), step_id
     assert result.output["checks"].keys() == {"style", "security", "performance"}
     assert result.output["failed_checks"] == []
     # concurrency defaulted to 2 and the cap is a no-op at the default itself.
@@ -100,7 +106,7 @@ async def test_concurrent_fanout_uses_pairwise_distinct_step_ids(
 
 @pytest.mark.asyncio
 async def test_one_failed_check_does_not_lose_survivors(api_base_url, fake_run_step_server):
-    fake_run_step_server.fail_step_ids.add("check:myapp:security")
+    fake_run_step_server.fail_step_ids.add("check-myapp-security")
     spec = _RealSpec(_WORKFLOW_PATH, "workflow-example")
     # concurrency=3 is a VALID input, but the script conservatively caps
     # max_workers at the declared default (2) regardless.
@@ -112,7 +118,7 @@ async def test_one_failed_check_does_not_lose_survivors(api_base_url, fake_run_s
     assert result.output["max_workers"] == 2
     assert result.output["failed_checks"] == ["security"]
     assert set(result.output["checks"].keys()) == {"style", "performance"}
-    assert result.output["checks"]["style"] == "ack:check:myapp:style"
+    assert result.output["checks"]["style"] == "ack:check-myapp-style"
 
 
 def test_emit_output_sentinel_in_subprocess_stdout(api_base_url, fake_run_step_server):
