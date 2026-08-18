@@ -1335,7 +1335,7 @@ class TestUnconsumedConsentIsRevokedWhenTheDriveEnds:
 
     @pytest.mark.asyncio
     async def test_a_cancelled_resume_still_revokes(self, monkeypatch: pytest.MonkeyPatch):
-        """A cancelled replay consumed nothing, so neither durable nor live consent survives.
+        """A cancelled resume consumed nothing, so consent must not survive it either.
 
         WHAT THIS TEST DOES NOT PROVE, stated so the next reader does not over-read it: it does
         NOT discriminate the direct revoke call from an ``await asyncio.to_thread(...)`` one.
@@ -1350,8 +1350,26 @@ class TestUnconsumedConsentIsRevokedWhenTheDriveEnds:
         _seed_step(state=StepState.COMPLETED.value)
 
         async def _cancelled_drive(record, path, env):
-            # The real replay callback publishes this temporary durable-row state before the
-            # drive is cancelled. No ``WorkflowRunResult`` exists to normalize afterwards.
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(script_runner, "_drive_process", _cancelled_drive)
+
+        with pytest.raises(asyncio.CancelledError):
+            await script_runner.resume_script_run(RUN, {STEP: "rerun"})
+
+        assert _state_of() == StepState.COMPLETED.value
+        assert _state_of() != StepState.RERUN_AUTHORIZED.value
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_skip_normalizes_the_live_record(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A replayed skip can be cancelled after it hydrated the temporary authorisation;
+        revoke must then normalize the retained record even though no result exists."""
+        _seed_run()
+        _seed_step(state=StepState.COMPLETED.value)
+
+        async def _cancelled_replay_drive(record, path, env):
             record.step_states[STEP] = workflow_service.StepRunState(
                 step_id=STEP,
                 state=StepState.REPLAY_AUTHORIZED,
@@ -1359,7 +1377,7 @@ class TestUnconsumedConsentIsRevokedWhenTheDriveEnds:
             )
             raise asyncio.CancelledError()
 
-        monkeypatch.setattr(script_runner, "_drive_process", _cancelled_drive)
+        monkeypatch.setattr(script_runner, "_drive_process", _cancelled_replay_drive)
 
         with pytest.raises(asyncio.CancelledError):
             await script_runner.resume_script_run(RUN, {STEP: "skip"})

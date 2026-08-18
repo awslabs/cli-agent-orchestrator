@@ -1478,27 +1478,37 @@ async def resume_script_run(
                 # only those rows back into the still-live record and already-built result.
                 # A cancellation has no result to mutate, but the retained record is still
                 # served by the bounded status window and MUST be normalized all the same.
-                for step_id in revoked:
-                    try:
-                        prior_state = StepState(granted[step_id])
-                    except ValueError:
-                        # Match ``record_step_replay``'s malformed-row degradation: the durable
-                        # revoke DID succeed, but an unknown prior state cannot honestly appear
-                        # in the typed live record, so expose RUNNING rather than falsely
-                        # claiming the temporary authorisation remains live.
-                        logger.warning(
-                            "resume: run '%s' step '%s': recovery consent was revoked but "
-                            "the prior state is unrecognised; recording it as running",
-                            run_id,
-                            step_id,
-                        )
-                        prior_state = StepState.RUNNING
-                    if record is not None and step_id in record.step_states:
-                        record.step_states[step_id].state = prior_state
-                    if result is not None:
-                        for step in result.steps:
-                            if step.id == step_id:
-                                step.state = prior_state
+                try:
+                    for step_id in revoked:
+                        try:
+                            prior_state = StepState(granted[step_id])
+                        except ValueError:
+                            # Unlike ``record_step_replay``, this settled replay already has a
+                            # typed state. Publishing RUNNING would invent an in-flight state
+                            # and alter ``_reconcile_orphans``' terminal-state condition, so
+                            # retain it while reporting the failed mirror honestly.
+                            logger.warning(
+                                "resume: run '%s' step '%s': recovery consent was revoked but "
+                                "the unrecognised prior state could not be mirrored",
+                                run_id,
+                                step_id,
+                            )
+                            continue
+                        if record is not None and step_id in record.step_states:
+                            record.step_states[step_id].state = prior_state
+                        if result is not None:
+                            for step in result.steps:
+                                if step.id == step_id:
+                                    step.state = prior_state
+                except (
+                    Exception
+                ) as e:  # noqa: BLE001 — never mask the drive's outcome with cache bookkeeping
+                    logger.warning(
+                        "resume: run '%s': recovery consent was revoked but the live state "
+                        "could not be normalized: %s",
+                        run_id,
+                        e,
+                    )
     if result is None:
         # Reached only after a drive returned without a typed result: exceptions, including
         # cancellation, propagate through the ``finally`` instead. Raised rather than relying
