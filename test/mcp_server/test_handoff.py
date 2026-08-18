@@ -560,6 +560,13 @@ class TestHandoffEarlyTerminalId:
 
         payload = mock_requests.post.call_args[1]["json"]
         assert payload["reuse_terminal_id"] == "dev-t1"
+        # False is the honest value, not a leftover: run_agent_step ignores
+        # `teardown` entirely once reuse_terminal_id is set (created_here is
+        # always False for a reuse call), so the server cannot act on this
+        # regardless -- see the dedicated teardown tests below for what
+        # actually tears the terminal down (an explicit _delete_terminal_impl
+        # call on success).
+        assert payload["teardown"] is False
         for ignored_field in (
             "session_name",
             "caller_id",
@@ -569,6 +576,89 @@ class TestHandoffEarlyTerminalId:
             "model",
         ):
             assert ignored_field not in payload
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration._delete_terminal_impl")
+    def test_waiting_path_tears_down_the_terminal_on_success(
+        self, mock_delete, mock_create, mock_provider, _nudge
+    ):
+        """Regression (socrates review on commit 3952889): run_agent_step
+        silently never tears down a reused terminal, no matter what the
+        payload's `teardown` field says (created_here is always False for a
+        reuse call). Without this explicit call, every successful wait=True
+        handoff leaked its worker terminal."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+        mock_delete.return_value = {"success": True, "message": "Terminal dev-t1 deleted"}
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = Exception
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=lambda _: None)
+            )
+
+        assert result.success is True
+        mock_delete.assert_called_once_with("dev-t1")
+
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration._delete_terminal_impl")
+    def test_waiting_path_leaves_the_terminal_alive_on_failure(
+        self, mock_delete, mock_create, mock_provider
+    ):
+        """A failed/timed-out wait must NOT tear the terminal down -- that
+        would defeat the entire point of surfacing terminal_id early (the
+        operator needs it alive to inspect/recover with status/result/
+        cancel)."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+
+        timeout_resp = MagicMock()
+        timeout_resp.status_code = 504
+        timeout_resp.json.return_value = {
+            "detail": {
+                "message": "step did not complete",
+                "kind": "timeout",
+                "terminal_id": "dev-t1",
+            }
+        }
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = timeout_resp
+            mock_requests.Timeout = Exception
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", timeout=60, on_terminal_id=lambda _: None)
+            )
+
+        assert result.success is False
+        assert result.terminal_id == "dev-t1"
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration._delete_terminal_impl")
+    def test_waiting_path_teardown_failure_does_not_mask_success(
+        self, mock_delete, mock_create, mock_provider, _nudge
+    ):
+        """Mirrors run_agent_step's own teardown philosophy ('never let
+        cleanup mask a settled step'): a cleanup failure here must not turn
+        an already-successful handoff into a reported failure."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+        mock_delete.return_value = {"success": False, "message": "cleanup pending"}
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = Exception
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=lambda _: None)
+            )
+
+        assert result.success is True
+        mock_delete.assert_called_once_with("dev-t1")
 
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")

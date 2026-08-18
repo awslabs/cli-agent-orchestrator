@@ -831,14 +831,39 @@ async def _handoff_impl(
             "agent": agent_profile,
             "prompt": shaped_message,
             "reuse_terminal_id": terminal_id,
-            "teardown": True,
+            # False is the honest value here, not just the safe one:
+            # run_agent_step's own teardown call is gated on
+            # `teardown and created_here`, and created_here is False for ANY
+            # reuse_terminal_id call -- the server literally cannot act on
+            # this field once we're reusing, regardless of what we send.
+            # Tearing down is therefore this function's own job on success,
+            # below (review: socrates on commit 3952889 -- the prior version
+            # sent True here and never tore anything down, leaking a
+            # terminal on every successful wait=True handoff).
+            "teardown": False,
             "timeout": float(timeout),
         }
         if engine is not None:
             payload["engine"] = engine
-        return await _run_step_and_build_result(
+        result = await _run_step_and_build_result(
             payload, agent_profile, provider, timeout, start_time
         )
+        if result.success:
+            # Best-effort, mirroring run_agent_step's own teardown philosophy
+            # (services/agent_step.py: "never let cleanup mask" a settled
+            # step): a cleanup failure must not turn this already-successful
+            # handoff into a reported failure. Only on success -- a failed,
+            # errored, or timed-out wait leaves the terminal alive on purpose,
+            # so the operator can inspect/recover it via status/result/cancel,
+            # which is the entire point of surfacing terminal_id early.
+            cleanup = _delete_terminal_impl(terminal_id)
+            if not cleanup.get("success"):
+                logger.warning(
+                    "handoff: post-success teardown of terminal %s failed: %s",
+                    terminal_id,
+                    cleanup.get("message"),
+                )
+        return result
 
     except Exception as e:
         # Surface terminal_id when known. With the single-call design the server
