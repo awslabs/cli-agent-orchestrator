@@ -139,9 +139,11 @@ export function contentReasonText(reason: string): string {
 }
 
 export type DetailFailure =
-  /** 404 — a stable state: the record is not in the catalog. */
+  /** 404 — stable. On a record fetch: the record is not in the catalog. On
+   *  the LIST route (which cannot 404 a record): this server build has no
+   *  /communications route at all. */
   | { kind: 'not-found'; message: string }
-  /** 400 identifier-invalid — the deep link itself is malformed. */
+  /** 400/422 — the identifier in the link is not a valid catalog identifier. */
   | { kind: 'invalid'; message: string }
   /** 503 content-digest-mismatch — integrity failure; content is NOT rendered. */
   | { kind: 'corrupt'; message: string }
@@ -177,6 +179,35 @@ export function detailFailure(error: unknown): DetailFailure {
     kind: 'unavailable',
     message: err.detail ?? (err.status ? `Request failed (${err.status}).` : 'The catalog could not be reached.'),
   }
+}
+
+/**
+ * Maps a failed LIST fetch to its state — the detail kinds, with two
+ * list-specific readings:
+ *
+ *   * 404 CANNOT be a record answer here. The route lists a task occurrence,
+ *     not a record, and the real service answers root-level problems with
+ *     200 + coverage 'unavailable' — so a 404 means this server build has no
+ *     /communications route at all, the same condition the dashboard probe
+ *     calls "not installed". It is never "record not found".
+ *   * 422 (an over-long occurrence id) joins 400 as `invalid`: a
+ *     deterministic verdict on the link itself. Offering Retry on it would
+ *     promise an exit that cannot succeed.
+ *
+ * As with the detail pane, only `unavailable` retries.
+ */
+export function listFailure(error: unknown): DetailFailure {
+  const err = error as ApiError
+  if (err.status === 404) {
+    return {
+      kind: 'not-found',
+      message: 'No communications catalog is installed on this deployment.',
+    }
+  }
+  if (err.status === 422) {
+    return { kind: 'invalid', message: 'The identifier in this link is not a valid catalog identifier.' }
+  }
+  return detailFailure(error)
 }
 
 /**

@@ -420,6 +420,26 @@ describe('list failure and coverage states', () => {
     await screen.findAllByTestId('communication-item')
   })
 
+  it('a 404 on the list route is "not installed", never record-not-found, and offers no retry', async () => {
+    // No handler for the list route: every call 404s, as a server build
+    // without /communications answers.
+    stubFetch(() => undefined)
+    renderModal()
+    const err = await screen.findByTestId('list-error')
+    expect(err.textContent).toContain('No communications catalog is installed')
+    expect(err.textContent).not.toContain('not in the catalog')
+    expect(screen.queryByTestId('list-retry')).toBeNull()
+  })
+
+  it.each([400, 422])('a %i on the list route names the identifier and offers no retry', async status => {
+    stubFetch(url =>
+      url.startsWith('/communications?') ? { status, body: { detail: 'identifier-invalid' } } : undefined,
+    )
+    renderModal()
+    expect(await screen.findByTestId('list-error')).toHaveTextContent('not a valid catalog identifier')
+    expect(screen.queryByTestId('list-retry')).toBeNull()
+  })
+
   it('a malformed list body is an error, never a fake empty list', async () => {
     stubFetch(url => (url.startsWith('/communications?') ? { body: { unexpected: true } } : undefined))
     renderModal()

@@ -12,6 +12,7 @@ import {
   coverageReasonText,
   detailFailure,
   kindLabel,
+  listFailure,
   readCommunicationsList,
   reportScopeBadge,
   REASON,
@@ -200,6 +201,29 @@ describe('detailFailure', () => {
     const f = detailFailure(new TypeError('fetch failed'))
     expect(f.kind).toBe('unavailable')
     expect(f.message).toContain('could not be reached')
+  })
+})
+
+describe('listFailure — the list route reads statuses its own way', () => {
+  it('a list 404 means this build has no catalog route, never record-not-found', () => {
+    // The real list route cannot 404: root problems come back 200 +
+    // coverage 'unavailable'. A 404 here is a build without the route.
+    const f = listFailure({ status: 404, detail: 'communications-catalog-not-found' })
+    expect(f.kind).toBe('not-found')
+    expect(f.message).toContain('No communications catalog is installed')
+    expect(f.message).not.toContain('not in the catalog')
+  })
+
+  it.each([400, 422])('a list %i is a deterministic invalid identifier, not retryable', status => {
+    const f = listFailure({ status, detail: 'identifier-invalid' })
+    expect(f.kind).toBe('invalid')
+    expect(f.message).toContain('not a valid catalog identifier')
+  })
+
+  it('network and 5xx stay retryable unavailable states', () => {
+    expect(listFailure(new TypeError('fetch failed')).kind).toBe('unavailable')
+    expect(listFailure({ status: 503 }).kind).toBe('unavailable')
+    expect(listFailure({ status: 401 }).kind).toBe('unavailable')
   })
 })
 

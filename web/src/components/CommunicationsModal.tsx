@@ -30,6 +30,7 @@ import {
   coverageReasonText,
   detailFailure,
   kindLabel,
+  listFailure,
   readCommunicationsList,
   reportScopeBadge,
   type DetailFailure,
@@ -64,7 +65,7 @@ export interface CommunicationsModalProps {
 
 type ListState =
   | { status: 'loading' }
-  | { status: 'failed'; message: string }
+  | { status: 'failed'; failure: DetailFailure }
   | {
       status: 'ready'
       items: CommunicationListItem[]
@@ -333,7 +334,13 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
       const body = await api.listCommunications(taskOccurrenceId)
       const page = readCommunicationsList(body)
       if (!page) {
-        setList({ status: 'failed', message: 'The catalog returned a response this build cannot read.' })
+        setList({
+          status: 'failed',
+          failure: {
+            kind: 'unavailable',
+            message: 'The catalog returned a response this build cannot read.',
+          },
+        })
         return
       }
       setList({
@@ -345,7 +352,7 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
         reasons: page.reasons,
       })
     } catch (error) {
-      setList({ status: 'failed', message: detailFailure(error).message })
+      setList({ status: 'failed', failure: listFailure(error) })
     }
   }, [taskOccurrenceId])
 
@@ -525,16 +532,21 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
             {list.status === 'failed' && (
               <div role="status" className="p-4 space-y-2">
                 <p data-testid="list-error" className="text-xs text-amber-200">
-                  {list.message}
+                  {list.failure.message}
                 </p>
-                <button
-                  type="button"
-                  onClick={loadList}
-                  data-testid="list-retry"
-                  className="px-2 py-1 rounded text-[11px] bg-gray-800 text-gray-200 hover:bg-gray-700"
-                >
-                  Retry
-                </button>
+                {/* As with the detail pane, only `unavailable` retries: the
+                    other kinds are deterministic answers about the build or
+                    the link, and a Retry there can never succeed. */}
+                {list.failure.kind === 'unavailable' && (
+                  <button
+                    type="button"
+                    onClick={loadList}
+                    data-testid="list-retry"
+                    className="px-2 py-1 rounded text-[11px] bg-gray-800 text-gray-200 hover:bg-gray-700"
+                  >
+                    Retry
+                  </button>
+                )}
               </div>
             )}
             {list.status === 'ready' && availability === 'not-installed' && (
