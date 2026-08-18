@@ -224,9 +224,13 @@ def _create_terminal(
             session and new-session branches.
         use_worktree: If True, the created terminal gets an isolated git
             worktree (issue #100 Phase 1) instead of sharing
-            ``working_directory`` as given. Only meaningful on the
-            existing-session (assign) branch below -- the new-session branch
-            has no live caller today.
+            ``working_directory`` as given. Honored by both the existing-
+            session (assign/handoff) branch and the new-session branch --
+            the latter previously dropped it silently (review on PR #634:
+            a fresh-session ``cao agent handoff --use-worktree`` reported
+            success while quietly not isolating the checkout) until
+            ``POST /sessions`` grew the same parameter its
+            ``/sessions/{name}/terminals`` sibling already had.
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -342,6 +346,8 @@ def _create_terminal(
             params["engine"] = engine
         if model is not None:
             params["model"] = model
+        if use_worktree:
+            params["use_worktree"] = "true"
 
         json_body = None
         if initial_message is not None:

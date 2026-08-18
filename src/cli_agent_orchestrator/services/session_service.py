@@ -53,6 +53,7 @@ async def create_session(
     initial_message: str | None = None,
     initial_message_orchestration_type: OrchestrationType | None = None,
     model: str | None = None,
+    use_worktree: bool = False,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
@@ -73,6 +74,11 @@ async def create_session(
     terminal at creation time (``group`` is also updatable later via
     ``PATCH /terminals/{id}/group``, ``metadata`` via the ``update_metadata``
     MCP tool).
+
+    ``use_worktree`` (issue #100 Phase 1; review on PR #634): forwarded as-is
+    to ``create_terminal`` -- see its own docstring for the isolation/teardown
+    mechanics. Previously dropped silently for a fresh session (no code path
+    threaded it this far), unlike the existing-session terminal-creation path.
     """
     if initial_message == "":
         raise ValueError("initial_message must not be empty")
@@ -98,6 +104,7 @@ async def create_session(
         initial_message=initial_message,
         initial_message_orchestration_type=initial_message_orchestration_type,
         model=model,
+        use_worktree=use_worktree,
         group=group,
         metadata=metadata,
     )

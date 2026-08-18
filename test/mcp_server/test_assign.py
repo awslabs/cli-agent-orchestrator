@@ -470,6 +470,64 @@ class TestCreateTerminalUseWorktree:
         _, kwargs = mock_requests.post.call_args
         assert "use_worktree" not in kwargs["params"]
 
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_use_worktree_true_reaches_new_session_params_too(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """Regression (review on PR #634): a fresh-session caller (no
+        CAO_TERMINAL_ID -- e.g. `cao agent handoff --use-worktree` run outside
+        a CAO terminal) used to have use_worktree silently dropped, because
+        only the existing-session branch above forwarded it. POST /sessions
+        itself needed the same parameter its /sessions/{name}/terminals
+        sibling already had."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal("reviewer", use_worktree=True)
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["use_worktree"] == "true"
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_use_worktree_false_omitted_from_new_session_params(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """Default False = today's exact behavior unchanged for the
+        new-session branch too."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal("reviewer")
+
+        _, kwargs = mock_requests.post.call_args
+        assert "use_worktree" not in kwargs["params"]
+
     @patch("cli_agent_orchestrator.mcp_server.server._assign_impl")
     def test_assign_tool_forwards_use_worktree_to_impl(self, mock_impl):
         """The public `assign` MCP tool itself threads use_worktree through to

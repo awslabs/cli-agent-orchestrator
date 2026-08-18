@@ -2415,6 +2415,7 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -2447,6 +2448,14 @@ async def create_session(
     the initial terminal at creation time (``group`` is also updatable later
     via ``PATCH /terminals/{id}/group``, ``metadata`` via the
     ``update_metadata`` MCP tool).
+
+    ``use_worktree`` (issue #100 Phase 1; review on PR #634): provision an
+    isolated git worktree for this terminal instead of sharing
+    ``working_directory`` as given, mirroring ``POST
+    /sessions/{name}/terminals``'s parameter of the same name. Previously only
+    that sibling endpoint threaded it through to
+    ``terminal_service.create_terminal`` -- a fresh (no existing session)
+    caller requesting a worktree had it silently dropped.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -2500,6 +2509,7 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            use_worktree=use_worktree,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
         )
@@ -2528,6 +2538,11 @@ async def create_session(
         return result
 
     except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git
+        # repo, or the 'git worktree add' itself failed -- a client-input
+        # problem, not a server crash. Mirrors POST /sessions/{name}/terminals.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(

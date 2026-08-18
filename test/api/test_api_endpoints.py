@@ -299,9 +299,59 @@ class TestCreateSession:
             initial_message=None,
             initial_message_orchestration_type=None,
             model=None,
+            use_worktree=False,
             group=None,
             metadata=None,
         )
+
+    def test_create_session_forwards_use_worktree_true(self, client):
+        """Regression (review on PR #634): a fresh session used to have
+        use_worktree silently dropped -- POST /sessions had no such
+        parameter at all, unlike its /sessions/{name}/terminals sibling."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "use_worktree": "true",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["use_worktree"] is True
+
+    def test_create_session_worktree_error_maps_to_400(self, client):
+        """A working_directory that isn't a git repo is a client-input
+        problem, not a server crash -- mirrors POST
+        /sessions/{name}/terminals's identical mapping."""
+        from cli_agent_orchestrator.services.worktree_service import WorktreeError
+
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=WorktreeError("'/tmp/x' is not inside a git repository")
+            )
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "use_worktree": "true",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "not inside a git repository" in response.json()["detail"]
 
     def test_create_session_passes_explicit_kiro_engine(self, client):
         """An explicit engine reaches the session service and the response."""
