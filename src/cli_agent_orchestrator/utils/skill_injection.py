@@ -86,7 +86,10 @@ def refresh_agent_md_prompt(md_path: Path, profile: AgentProfile) -> bool:
 def refresh_installed_agent_for_profile(profile_name: str) -> List[Path]:
     """Refresh installed Copilot agents for one source profile."""
     profile = load_agent_profile(profile_name)
-    safe_name = profile.name.replace("/", "__")
+    # Flatten both path separators (see install_service): a backslash is a
+    # separator on Windows, and this filename is derived from the attacker-
+    # controlled resolved profile name.
+    safe_name = profile.name.replace("/", "__").replace("\\", "__")
     refreshed_paths: List[Path] = []
 
     copilot_path = COPILOT_AGENTS_DIR / f"{safe_name}.agent.md"

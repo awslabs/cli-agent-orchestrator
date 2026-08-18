@@ -27,8 +27,12 @@ def to_opencode_agent_id(profile_name: str) -> str:
 
     OpenCode treats the filename stem of an agent ``.md`` file as its agent ID
     (used for ``--agent <id>`` and keyed by the same value under
-    ``agent.<id>`` in ``opencode.json``). Profile names may contain ``/`` —
-    illegal in filenames — so the conversion replaces every slash with ``__``.
+    ``agent.<id>`` in ``opencode.json``). Profile names may contain path
+    separators — illegal in a single filename — so the conversion replaces both
+    ``/`` and ``\\`` with ``__``. Flattening the backslash too matters because it
+    is a path separator on Windows: since the id becomes the ``<id>.md`` filename,
+    an attacker-controlled name like ``..\\..\\x`` would otherwise traverse out of
+    ``OPENCODE_AGENTS_DIR`` there.
 
     The output is the single source of truth for:
 
@@ -36,9 +40,9 @@ def to_opencode_agent_id(profile_name: str) -> str:
     - the ``agent.<id>.tools`` key written to ``opencode.json``
     - the value passed to ``opencode --agent <id>`` at runtime
 
-    Idempotent: inputs that contain no ``/`` are returned unchanged.
+    Idempotent: inputs that contain no separator are returned unchanged.
     """
-    return profile_name.replace("/", "__")
+    return profile_name.replace("/", "__").replace("\\", "__")
 
 
 def ensure_skills_symlink() -> None:

@@ -1,7 +1,10 @@
 """Service helpers for installing agent profiles."""
 
+import errno
 import logging
+import ntpath
 import os
+import posixpath
 import re
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
@@ -218,11 +221,99 @@ def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
     return key, value
 
 
+def _contained_context_path(agent_name: str) -> Path:
+    """Resolve the context-copy path for ``agent_name``, refusing any escape.
+
+    The context copy's filename derives from the profile's RESOLVED frontmatter
+    ``name:``. That value is NOT covered by ``_PROFILE_NAME_RE`` -- that regex
+    validates the install *source handle* (the URL stem / bare-name argument),
+    not the resolved name -- and a profile can be installed straight from a URL,
+    so the field is attacker-controlled. Without this guard a name like
+    ``../../foo`` or an absolute path steers the write outside
+    ``AGENT_CONTEXT_DIR``.
+
+    Two layers, mirroring ``services/profile_store._profile_path``:
+
+    1. Validate the name is a single path segment -- reject empty, ``.``/``..``,
+       any ``/`` or ``\\`` separator, a NUL, or an absolute path (POSIX or
+       Windows). A profile ``name:`` is a plain filename here.
+    2. Canonical containment at the sink: resolve the full candidate and confirm
+       it stays inside the realpath of ``AGENT_CONTEXT_DIR``. This is defence in
+       depth -- it also refuses a target that resolves outside via a symlinked
+       component -- kept as a positive ``startswith`` guard dominating the
+       return so CodeQL recognises it as a path-injection barrier.
+    """
+    # NOTE: these checks run on the name AS GIVEN, before any Unicode
+    # normalization. That is safe today because nothing on this path normalizes
+    # the resolved name. If NFKC/NFKD normalization is ever introduced upstream
+    # (e.g. for i18n or storage), apply it BEFORE these checks -- a character
+    # such as U+FF0F (fullwidth solidus) folds to "/" under NFKC and would
+    # otherwise slip past the separator check.
+    if (
+        not agent_name
+        or agent_name in (".", "..")
+        or "/" in agent_name
+        or "\\" in agent_name
+        or "\x00" in agent_name
+        or ntpath.isabs(agent_name)
+        or posixpath.isabs(agent_name)
+    ):
+        raise ValueError(
+            f"Refusing to write context copy: profile name {agent_name!r} is not a "
+            "single path segment (it is empty, absolute, or contains a path "
+            "separator or traversal). A profile's frontmatter 'name:' must be a "
+            "plain filename."
+        )
+    # Resolve only the BASE (so a symlinked context root is handled), and keep
+    # the final component UNRESOLVED. Resolving the whole candidate would follow
+    # a symlink planted at the target here and either silently write to its
+    # resolved location or shadow the O_NOFOLLOW guard at the write; leaving the
+    # final component lexical means a symlink at the target is caught at the
+    # write by O_NOFOLLOW instead. Separators are already rejected above, so the
+    # candidate is always a single child of base; the containment check is the
+    # readable, CodeQL-visible barrier.
+    base = os.path.realpath(AGENT_CONTEXT_DIR)
+    candidate = os.path.join(base, f"{agent_name}.md")
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise ValueError(
+            f"Refusing to write context copy: profile name {agent_name!r} resolves "
+            f"to a path outside the agent context directory ({candidate!r})."
+        )
+    return Path(candidate)
+
+
 def _write_context_file(agent_name: str, raw_content: str) -> Path:
     """Write the unresolved profile source to the shared context directory."""
     AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-    context_file = AGENT_CONTEXT_DIR / f"{agent_name}.md"
-    context_file.write_text(raw_content, encoding="utf-8")
+    context_file = _contained_context_path(agent_name)
+    # Open with O_NOFOLLOW so the kernel itself refuses to write THROUGH a symlink
+    # at the final component: a plain ``write_text``/``open`` follows a symlink,
+    # so even after the containment check above, a symlink planted at the target
+    # (pre-existing, or swapped in via a check-then-write race) would let the
+    # write land outside the directory. O_NOFOLLOW closes that at the syscall --
+    # it is the enforcement; the containment check is the primary, readable
+    # barrier. O_TRUNC (not O_EXCL) so a normal reinstall still overwrites the
+    # profile's own regular-file copy. ELOOP on a symlink target becomes a clear
+    # refusal rather than an opaque OS error.
+    #
+    # PLATFORM NOTE: os.O_NOFOLLOW does not exist on Windows, so getattr(...) is 0
+    # there and the kernel-level symlink refusal degrades to a no-op. The name
+    # validation and containment check above still hold on Windows; only the
+    # write-time symlink/race guard is POSIX-only. Acceptable because the primary
+    # deployment target is POSIX and the validation already blocks the traversal
+    # vectors; flagged so it is a conscious limitation, not a silent gap.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(context_file, flags, 0o644)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO):
+            raise ValueError(
+                f"Refusing to write context copy: {context_file} exists and is not a "
+                "regular file (symlink, directory, or device). Remove it and reinstall."
+            ) from exc
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(raw_content)
     return context_file
 
 
@@ -340,7 +431,12 @@ def install_agent(
         allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
         agent_file: Optional[Path] = None
-        safe_filename = profile.name.replace("/", "__")
+        # Flatten BOTH path separators, not just "/": a backslash is a separator
+        # on Windows, so "..\\..\\x" would otherwise traverse out of the provider
+        # agent dir there. The resolved profile name is attacker-controlled (see
+        # _contained_context_path); the context-copy write above already aborts a
+        # separator-bearing name, but keep these provider sinks independently safe.
+        safe_filename = profile.name.replace("/", "__").replace("\\", "__")
 
         if provider == ProviderType.KIRO_CLI.value:
             if profile.engine == KiroEngine.KAS:
