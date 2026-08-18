@@ -151,6 +151,12 @@ async function openFleet(page: Page) {
 test.describe("communications catalog modal", () => {
   test("chip and row control open the catalog; selection deep-links", async ({ page }, testInfo) => {
     const isMobile = testInfo.project.name === "mobile-chromium";
+    // The reader is read-only: record every catalog request's method so the
+    // end of the test can assert nothing but GET ever left the page.
+    const methods: string[] = [];
+    page.on("request", r => {
+      if (new URL(r.url()).pathname.startsWith("/communications")) methods.push(r.method());
+    });
     await stubBackend(page, catalogOptions());
     await openFleet(page);
 
@@ -193,12 +199,27 @@ test.describe("communications catalog modal", () => {
     await modal.getByTestId("attachment-open").click();
     await expect(modal.getByTestId("attachment-row").getByTestId("md-rendered")).toContainText("attachment body");
 
+    // Copy puts the exact captured bytes on the clipboard.
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    await modal.getByTestId("content-copy").first().click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(FINAL_CONTENT);
+
+    // Download delivers the captured bytes under the safe display name.
+    const downloadPromise = page.waitForEvent("download");
+    await modal.getByTestId("content-download").first().click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe("final-report.md");
+
     await page.screenshot({ path: `${SHOTS}/${testInfo.project.name}-modal.png` });
 
     // Escape closes and strips the deep link.
     await page.keyboard.press("Escape");
     await expect(modal).not.toBeVisible();
     await expect(page).not.toHaveURL(/task_occurrence_id/);
+    // Every catalog request this page made was a GET — the reader has no
+    // task semantics and mutates nothing.
+    expect(methods.length).toBeGreaterThan(0);
+    expect(new Set(methods)).toEqual(new Set(["GET"]));
   });
 
   test("mobile: full-height list, then a back-navigable reader", async ({ page }, testInfo) => {
