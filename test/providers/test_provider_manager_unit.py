@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import cli_agent_orchestrator.providers.opencode_cli as opencode_provider_module
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
@@ -110,6 +111,43 @@ def test_cleanup_provider_calls_cleanup_and_removes():
     manager.cleanup_provider("t1")
 
     provider.cleanup.assert_called_once()
+    assert manager._providers.get("t1") is None
+
+
+def test_cleanup_provider_reconstructs_persisted_terminal_after_restart():
+    """Deletion must reach provider-owned cleanup after process restart."""
+    manager = ProviderManager()
+    restored_provider = MagicMock()
+
+    with patch.object(manager, "get_provider", return_value=restored_provider) as get_provider:
+        manager.cleanup_provider("t1")
+
+    get_provider.assert_called_once_with("t1")
+    restored_provider.cleanup.assert_called_once()
+    assert manager._providers.get("t1") is None
+
+
+def test_cleanup_provider_removes_opencode_runtime_after_restart(tmp_path, monkeypatch):
+    """The actual OpenCode cleanup path runs after manager reconstruction."""
+    manager = ProviderManager()
+    cao_home = tmp_path / "cao-home"
+    runtime_root = cao_home / "tmp" / "opencode-t1"
+    runtime_root.mkdir(parents=True)
+    (runtime_root / "opencode.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(opencode_provider_module, "CAO_HOME_DIR", cao_home)
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.OPENCODE_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": "developer",
+        },
+    ):
+        manager.cleanup_provider("t1")
+
+    assert not runtime_root.exists()
     assert manager._providers.get("t1") is None
 
 

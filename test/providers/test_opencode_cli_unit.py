@@ -577,6 +577,27 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
+    async def test_initialize_promotes_dependencies_after_ready(
+        self, mock_tmux, mock_shell, mock_wait, monkeypatch: pytest.MonkeyPatch
+    ):
+        mock_shell.return_value = True
+        mock_wait.return_value = True
+        promoted = []
+        monkeypatch.setattr(
+            opencode_provider_module,
+            "promote_opencode_runtime_dependencies",
+            promoted.append,
+        )
+
+        provider = make_provider()
+        assert await provider.initialize() is True
+
+        assert promoted == [provider._config_root]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_uses_120s_timeout(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
@@ -680,6 +701,20 @@ class TestMiscInterface:
         provider._initialized = True
         provider.cleanup()
         assert provider._initialized is False
+
+    def test_cleanup_removes_runtime_root_after_provider_reconstruction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Restart reconstruction has no in-memory root but must still clean it."""
+        cao_home = tmp_path / "cao-home"
+        runtime_root = cao_home / "tmp" / "opencode-test-tid"
+        runtime_root.mkdir(parents=True)
+        (runtime_root / "opencode.json").write_text("{}\n", encoding="utf-8")
+        monkeypatch.setattr(opencode_provider_module, "CAO_HOME_DIR", cao_home)
+
+        make_provider().cleanup()
+
+        assert not runtime_root.exists()
 
     def test_get_idle_pattern_for_log_returns_ctrl_p_pattern(self):
         pattern = make_provider().get_idle_pattern_for_log()

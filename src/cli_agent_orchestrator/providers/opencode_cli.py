@@ -17,6 +17,7 @@ The provider detects the following terminal states:
 - UNKNOWN: Fallback when no state marker matches (or empty buffer)
 """
 
+import asyncio
 import logging
 import re
 import shlex
@@ -29,7 +30,11 @@ from cli_agent_orchestrator.constants import CAO_HOME_DIR, OPENCODE_CONFIG_DIR, 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.utils.opencode_config import prepare_opencode_runtime_config
+from cli_agent_orchestrator.utils.opencode_config import (
+    opencode_runtime_config_root,
+    prepare_opencode_runtime_config,
+    promote_opencode_runtime_dependencies,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 logger = logging.getLogger(__name__)
@@ -172,6 +177,10 @@ class OpenCodeCliProvider(BaseProvider):
         ):
             raise TimeoutError("OpenCode CLI initialization timed out after 120 seconds")
 
+        # A fresh private root receives OpenCode's first-run package install.
+        # Promote that completed state only after the TUI is ready, allowing
+        # future private roots to reuse it without ever rewriting shared config.
+        await asyncio.to_thread(promote_opencode_runtime_dependencies, self._config_root)
         self._initialized = True
         return True
 
@@ -466,16 +475,28 @@ class OpenCodeCliProvider(BaseProvider):
         self._initialized = False
         config_root = self._config_root
         self._config_root = None
-        if config_root is None:
+        try:
+            expected_root = opencode_runtime_config_root(
+                self.terminal_id, cao_home_dir=CAO_HOME_DIR
+            )
+        except ValueError:
+            logger.warning(
+                "Refusing to remove OpenCode config root for invalid terminal ID: %s",
+                self.terminal_id,
+            )
             return
 
-        expected_root = CAO_HOME_DIR / "tmp" / f"opencode-{self.terminal_id}"
-        if config_root != expected_root or config_root.is_symlink():
+        if config_root is not None and config_root != expected_root:
             logger.warning("Refusing to remove unexpected OpenCode config root: %s", config_root)
             return
+        if expected_root.is_symlink():
+            logger.warning("Refusing to remove symlinked OpenCode config root: %s", expected_root)
+            return
         try:
-            shutil.rmtree(config_root)
+            shutil.rmtree(expected_root)
         except FileNotFoundError:
             pass
         except OSError:
-            logger.warning("Unable to remove OpenCode config root: %s", config_root, exc_info=True)
+            logger.warning(
+                "Unable to remove OpenCode config root: %s", expected_root, exc_info=True
+            )

@@ -20,7 +20,7 @@ The OpenCode CLI provider enables CLI Agent Orchestrator (CAO) to work with **Op
 
 ### First-launch delay
 
-On its **first ever launch** against a fresh CAO config directory (`~/.aws/opencode/`), OpenCode runs `npm install @opencode-ai/plugin` — roughly 57 MB of dependencies that take **5–30 seconds** to install. The TUI will appear blank until the install completes. This is expected; CAO's 120-second initialization timeout covers it automatically.
+On its **first ever launch** against a fresh CAO config, OpenCode runs `npm install @opencode-ai/plugin` — roughly 57 MB of dependencies that take **5–30 seconds** to install. The TUI will appear blank until the install completes. This is expected; CAO's 120-second initialization timeout covers it automatically. CAO retains that completed dependency state for later terminal launches.
 
 Subsequent launches complete in ~2 seconds.
 
@@ -71,7 +71,7 @@ curl -X POST "http://localhost:9889/sessions?provider=opencode_cli&agent_profile
 
 ## Config Isolation
 
-CAO runs OpenCode with `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG` both pointing at `~/.aws/opencode/`, which is separate from the user's personal OpenCode config at `~/.config/opencode/`. This means:
+CAO keeps its durable OpenCode installation state under `~/.aws/opencode/`, separate from the user's personal OpenCode config at `~/.config/opencode/`. Each launched terminal receives its own private snapshot under `~/.aws/cli-agent-orchestrator/tmp/`, and CAO points both `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG` at that snapshot. This means:
 
 - CAO-installed agents are visible in OpenCode's agent picker alongside the built-ins
 - CAO's MCP wiring (`opencode.json`) never touches the user's personal setup
@@ -82,8 +82,7 @@ Storage layout:
 ```
 ~/.aws/opencode/
 ├── opencode.json          # MCP servers + per-agent tool gating (written by cao install)
-├── package.json           # written by opencode on first launch
-├── node_modules/          # ~57 MB, written by opencode on first launch
+├── .cao-runtime-dependencies/ # completed first-launch package cache
 └── agents/
     ├── code_supervisor.md
     ├── developer.md
@@ -235,12 +234,7 @@ Parallel `cao install --provider opencode_cli` invocations (e.g., from a batch s
 
 ### First-launch blank TUI (5–30 seconds)
 
-OpenCode installs `@opencode-ai/plugin` into `~/.aws/opencode/node_modules/` on the first launch. The terminal will appear blank until `npm install` completes. CAO's 120-second initialization timeout covers this automatically.
-
-To pre-populate `node_modules/` before the first CAO launch (optional):
-```bash
-OPENCODE_CONFIG_DIR=~/.aws/opencode opencode --help
-```
+OpenCode installs `@opencode-ai/plugin` into its first private CAO runtime config on the first launch. The terminal will appear blank until `npm install` completes. CAO retains that completed dependency state for later terminal launches, and its 120-second initialization timeout covers the first launch automatically.
 
 ### "Unknown provider" error from the server
 

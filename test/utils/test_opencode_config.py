@@ -1,6 +1,7 @@
 """Unit tests for the opencode.json read-modify-write helper."""
 
 import json
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -140,9 +141,9 @@ class TestTranslateMcpServerConfig:
     def test_custom_uvx_entry_passes_through(self):
         """A user-defined uvx-based MCP server is translated verbatim.
 
-        Only the bundled ``cao-mcp-server`` command is rewritten (see
-        test_bundled_cao_mcp_server_command_is_resolved); any other command —
-        including a user's own ``uvx --from ...`` server — flattens unchanged.
+        Only the bundled ``cao-mcp-server`` command receives CAO ownership
+        handling at runtime; any other command — including a user's own
+        ``uvx --from ...`` server — flattens unchanged.
         """
         cao_cfg = {
             "type": "stdio",
@@ -156,22 +157,19 @@ class TestTranslateMcpServerConfig:
             "enabled": True,
         }
 
-    def test_bundled_cao_mcp_server_command_is_resolved(self):
-        """The bare cao-mcp-server command is resolved to a PATH-independent form.
+    def test_bundled_cao_mcp_server_command_stays_canonical_until_runtime(self):
+        """The durable template keeps the CAO-owned command upgrade-safe.
 
-        The bundled profiles declare ``command: cao-mcp-server``; the translator
-        resolves it so OpenCode launches it without depending on
-        the script being on the agent subprocess's PATH.
+        Runtime snapshots resolve this bare form with the active server
+        interpreter.  Persisting an absolute sibling path here would become
+        stale when a prior virtual environment is removed.
         """
         result = translate_mcp_server_config(
             {"type": "stdio", "command": "cao-mcp-server", "args": []}
         )
         assert result["type"] == "local"
         assert result["enabled"] is True
-        # Resolved away from the bare console-script name into a concrete
-        # invocation (abs path to the script, or `<python> -m ...`).
-        assert result["command"][0] != "cao-mcp-server"
-        assert result["command"]  # non-empty
+        assert result["command"] == ["cao-mcp-server"]
 
 
 class TestReadConfig:
@@ -206,6 +204,134 @@ class TestWriteConfig:
 
 
 class TestRuntimeConfig:
+    def test_refreshes_removed_legacy_helper_for_reserved_cao_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A prior CAO sibling path remains refreshable after an upgrade."""
+        shared_config_dir = tmp_path / "shared-opencode"
+        shared_config_dir.mkdir()
+        config_file = shared_config_dir / "opencode.json"
+        removed_helper = tmp_path / "removed-venv" / "cao-mcp-server"
+        config_file.write_text(
+            json.dumps(
+                {
+                    "mcp": {
+                        "cao-mcp-server": {
+                            "type": "local",
+                            "command": [str(removed_helper), "--verbose"],
+                        },
+                        "custom-server": {
+                            "type": "local",
+                            "command": [str(removed_helper), "--custom"],
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cao_home = tmp_path / "cao-home"
+        monkeypatch.setattr(cfg_module, "CAO_HOME_DIR", cao_home)
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_DIR", shared_config_dir)
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_FILE", config_file)
+        monkeypatch.setattr(
+            cfg_module,
+            "resolve_cao_mcp_command",
+            lambda command, args: ("/new-venv/cao-mcp-server", list(args)),
+        )
+
+        runtime_root = prepare_opencode_runtime_config("terminal")
+        runtime = json.loads((runtime_root / "opencode.json").read_text(encoding="utf-8"))
+        assert runtime["mcp"]["cao-mcp-server"]["command"] == [
+            "/new-venv/cao-mcp-server",
+            "--verbose",
+        ]
+        assert runtime["mcp"]["custom-server"]["command"] == [
+            str(removed_helper),
+            "--custom",
+        ]
+
+    def test_promotes_first_launch_dependencies_for_later_runtime_roots(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The first private launch seeds a persistent dependency cache once."""
+        shared_config_dir = tmp_path / "shared-opencode"
+        shared_config_dir.mkdir()
+        config_file = shared_config_dir / "opencode.json"
+        config_file.write_text("{}\n", encoding="utf-8")
+        cao_home = tmp_path / "cao-home"
+        monkeypatch.setattr(cfg_module, "CAO_HOME_DIR", cao_home)
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_DIR", shared_config_dir)
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_FILE", config_file)
+
+        first_root = prepare_opencode_runtime_config("first")
+        (first_root / "package.json").write_text('{"dependencies": {}}\n', encoding="utf-8")
+        (first_root / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+        (first_root / "node_modules").mkdir()
+        (first_root / "node_modules" / "installed.txt").write_text("ready\n", encoding="utf-8")
+
+        promote = getattr(cfg_module, "promote_opencode_runtime_dependencies")
+        promote(first_root)
+
+        second_root = prepare_opencode_runtime_config("second")
+        assert (second_root / "package.json").is_symlink()
+        assert (second_root / "package-lock.json").is_symlink()
+        assert (second_root / "node_modules").is_symlink()
+        assert (second_root / "node_modules" / "installed.txt").read_text(
+            encoding="utf-8"
+        ) == "ready\n"
+        assert (shared_config_dir / ".cao-runtime-dependencies" / ".cao-complete").read_text(
+            encoding="utf-8"
+        ) == "cao-opencode-runtime-dependencies-v1\n"
+
+    def test_does_not_reuse_unverified_shared_dependencies(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Only CAO's completed cache can seed a private runtime root."""
+        shared_config_dir = tmp_path / "shared-opencode"
+        shared_config_dir.mkdir()
+        config_file = shared_config_dir / "opencode.json"
+        config_file.write_text("{}\n", encoding="utf-8")
+        (shared_config_dir / "package.json").write_text("{}\n", encoding="utf-8")
+        (shared_config_dir / "node_modules").mkdir()
+        (shared_config_dir / "node_modules" / "installed.txt").write_text(
+            "shared\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(cfg_module, "CAO_HOME_DIR", tmp_path / "cao-home")
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_DIR", shared_config_dir)
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_FILE", config_file)
+
+        runtime_root = prepare_opencode_runtime_config("terminal")
+
+        assert not (runtime_root / "package.json").exists()
+        assert not (runtime_root / "node_modules").exists()
+        assert not (shared_config_dir / ".cao-runtime-dependencies").exists()
+
+    def test_dependency_promotion_failure_does_not_break_ready_terminal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Best-effort caching cannot turn a ready OpenCode launch into failure."""
+        shared_config_dir = tmp_path / "shared-opencode"
+        shared_config_dir.mkdir()
+        config_file = shared_config_dir / "opencode.json"
+        config_file.write_text("{}\n", encoding="utf-8")
+        monkeypatch.setattr(cfg_module, "CAO_HOME_DIR", tmp_path / "cao-home")
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_DIR", shared_config_dir)
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_FILE", config_file)
+
+        runtime_root = prepare_opencode_runtime_config("terminal")
+        (runtime_root / "package.json").write_text("{}\n", encoding="utf-8")
+        (runtime_root / "node_modules").mkdir()
+        monkeypatch.setattr(
+            cfg_module.shutil,
+            "copytree",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(shutil.Error([("src", "dst", "boom")])),
+        )
+
+        cfg_module.promote_opencode_runtime_dependencies(runtime_root)
+
+        assert not (shared_config_dir / ".cao-runtime-dependencies").exists()
+
     def test_rejects_existing_symlinked_root_without_touching_target(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):

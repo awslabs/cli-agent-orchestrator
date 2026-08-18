@@ -219,6 +219,16 @@ class ProviderManager:
         """Cleanup provider and remove from map (used when terminal is deleted)."""
         try:
             provider = self._providers.pop(terminal_id, None)
+            if provider is None:
+                try:
+                    provider = self.get_provider(terminal_id)
+                except ValueError:
+                    # Creation may have failed before the terminal row was
+                    # committed; there is no persisted provider state to clean.
+                    return
+                # get_provider() registers an on-demand provider. Remove it
+                # before cleanup so a cleanup failure cannot retain stale state.
+                self._providers.pop(terminal_id, None)
             if provider:
                 provider.cleanup()
                 logger.info(f"Cleaned up provider for terminal: {terminal_id}")

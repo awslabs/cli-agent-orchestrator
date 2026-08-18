@@ -288,13 +288,15 @@ class TestInstallAgent:
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
 
-    def test_install_opencode_uses_current_sibling_not_old_global_helper(
+    def test_install_opencode_keeps_bundled_helper_canonical(
         self, install_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """OpenCode's actual MCP command binds the bare bundled helper to CAO.
+        """OpenCode's durable MCP entry never records an installation path.
 
-        The old global executable simulates a stale installation on PATH.  A
-        custom entry and both servers' caller-supplied args must remain intact.
+        The old global executable simulates a stale installation on PATH.
+        Runtime snapshots, rather than this durable config, resolve the bare
+        helper against the active CAO server. A custom entry and both servers'
+        caller-supplied args must remain intact.
         """
         profile_text = (
             "---\n"
@@ -316,23 +318,18 @@ class TestInstallAgent:
             profile_text, encoding="utf-8"
         )
 
-        sibling = tmp_path / "server-bin" / "cao-mcp-server"
-        sibling.parent.mkdir()
-        sibling.touch()
         old_global = tmp_path / "old-global" / "cao-mcp-server"
         old_global.parent.mkdir()
         old_global.write_text("#!/bin/sh\n", encoding="utf-8")
         old_global.chmod(0o755)
         monkeypatch.setenv("PATH", str(old_global.parent))
 
-        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
-        with patch(f"{MOD}._sibling_script", return_value=str(sibling)):
-            result = install_agent("opencode-agent", "opencode_cli")
+        result = install_agent("opencode-agent", "opencode_cli")
 
         assert result.success is True
         config = json.loads(install_paths["opencode_config_file"].read_text())
         assert config["mcp"]["cao-mcp-server"]["command"] == [
-            str(sibling),
+            "cao-mcp-server",
             "--log-level",
             "debug",
         ]
