@@ -77,23 +77,6 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # Git workspace transport: workers clone/fetch/push the workspace repos
-    # (see configmap-workspace.yaml), which needs HTTPS egress to your git
-    # host. Keep this as TIGHT as possible — it is a hole in the SSRF/
-    # exfiltration bound above. Prefer, in order:
-    #   1. FQDN-based egress (Cilium/Calico Enterprise), e.g. toFQDNs
-    #      "github.com" — narrowest.
-    #   2. Your git host's published CIDRs (for GitHub: the "git" ranges in
-    #      https://api.github.com/meta), e.g.:
-    #        - to:
-    #            - ipBlock: { cidr: 140.82.112.0/20 }
-    #            - ipBlock: { cidr: 143.55.64.0/20 }
-    #          ports:
-    #            - port: 443
-    #              protocol: TCP
-    #   3. An in-namespace authenticating git proxy that workers reach over
-    #      the intra-namespace rule above (no new egress at all).
-    # Uncomment and pin CIDRs for your host; do NOT use 0.0.0.0/0.
 ---
 # NetworkPolicy — restrict access to supervisor pod.
 # Fleet panel (UI) and worker pods (cross-pod send_message callbacks to

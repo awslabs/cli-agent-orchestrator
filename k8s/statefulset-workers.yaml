@@ -70,21 +70,6 @@ spec:
             # and the worker egress NetworkPolicy must allow its API endpoints).
             - name: CAO_INSTALL_PROFILES
               value: "developer:mock_cli"
-            # Honor the working_directory the supervisor passes with each
-            # placement (repo selection in multi-repo fleets). Must match the
-            # supervisor's setting.
-            - name: CAO_ENABLE_WORKING_DIRECTORY
-              value: "true"
-          # Workspace repos + git credentials — the SAME configmap/secret as
-          # the supervisor, so every workspace resolves to the same in-pod
-          # path fleet-wide and working-directory inheritance works cross-pod.
-          envFrom:
-            - configMapRef:
-                name: cao-workspace-config
-                optional: true
-            - secretRef:
-                name: cao-git-credentials
-                optional: true
           resources:
             requests:
               cpu: 250m
@@ -113,13 +98,6 @@ spec:
           volumeMounts:
             - name: cao-state
               mountPath: /home/cao/.cao
-            # Clones are disposable (re-cloned on pod start; durable work is
-            # pushed to git), so an emptyDir suffices — no PVC needed.
-            - name: workspace
-              mountPath: /home/cao/workspace
-      volumes:
-        - name: workspace
-          emptyDir: {}
   # Per-pod persistent state (SQLite DB, logs, installed profiles). A PVC per
   # ordinal survives pod restarts/rescheduling, unlike the emptyDir it replaces.
   volumeClaimTemplates:
