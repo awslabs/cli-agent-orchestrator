@@ -591,7 +591,7 @@ export function CommunicationsModal({ taskOccurrenceId, selectedId, onSelect, on
                 )}
                 {items.length === 0 ? (
                   <p role="status" data-testid="communications-empty" className="p-4 text-xs text-gray-400">
-                    No communications are recorded for this task.
+                    The catalog reports no communications bound to this task occurrence.
                   </p>
                 ) : (
                   <div

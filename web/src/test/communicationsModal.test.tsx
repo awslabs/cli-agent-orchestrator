@@ -258,12 +258,17 @@ describe('list rendering', () => {
     expect(disclaimer.textContent).not.toMatch(/satisf|complete task|outcome achieved/i)
   })
 
-  it('an empty catalog is an explicit empty state', async () => {
+  it('an empty catalog is an explicit empty state that states what was observed', async () => {
+    // With cond-0477 un-fixed, every shipped conductor writer binds
+    // task_occurrence_id = NULL, so the published index binds no occurrence
+    // and this endpoint can only answer coverage 'complete', total 0. The
+    // wording reports the binding the API actually vouched for — it must not
+    // assert that no communications exist anywhere.
     stubCatalog([])
     renderModal()
-    expect(await screen.findByTestId('communications-empty')).toHaveTextContent(
-      'No communications are recorded for this task',
-    )
+    const empty = await screen.findByTestId('communications-empty')
+    expect(empty).toHaveTextContent('The catalog reports no communications bound to this task occurrence')
+    expect(empty.textContent).not.toContain('are recorded for this task')
   })
 })
 
