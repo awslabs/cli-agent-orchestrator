@@ -36,6 +36,7 @@ import itertools
 import os
 import threading
 import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1279,7 +1280,12 @@ async def test_unmanaged_antigravity_new_launch_binds_pre_task_identity(
     )
     monkeypatch.setattr(subprocess, "run", _mock_subprocess_run)
 
-    result = await create_terminal("antigravity_cli", "implementer-gemini", new_session=True)
+    # "developer" ships in this repo's agent_store; "implementer-gemini" is a
+    # cao-conductor profile that only exists once the conductor has deployed it,
+    # so naming it here made the test pass on a machine with that deployment and
+    # fail everywhere else. The profile is incidental to what this asserts (that
+    # the pre-task bootstrap binds a minted id into roster + metadata).
+    result = await create_terminal("antigravity_cli", "developer", new_session=True)
     assert result.id == "test1234"
     agent = roster.get_agent(roster.derive_initial_agent_id("test1234"))
     lineage = agent["current_lineage"]
@@ -1291,8 +1297,17 @@ async def test_unmanaged_antigravity_new_launch_binds_pre_task_identity(
     assert database.get_terminal_metadata("test1234")["native_session_id"] == native_id
 
 
-def test_antigravity_launch_argv_resumes_minted_id():
+def test_antigravity_launch_argv_resumes_minted_id(tmp_path, monkeypatch):
     from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
+
+    # ``_build_agy_command`` resolves the binary on PATH and mkdirs a log dir under
+    # ``Path.home()``. Neither belongs in a unit test about argv shape: the first
+    # made this fail wherever agy is not installed, and the second wrote into the
+    # real home of whoever ran it.
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/local/bin/agy" if name == "agy" else None
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
     sid = str(uuid.uuid4())
     provider = AntigravityCliProvider(
@@ -1305,8 +1320,15 @@ def test_antigravity_launch_argv_resumes_minted_id():
     assert "-i" not in command
 
 
-def test_provider_manager_creates_antigravity_provider_with_native_id_and_effort():
+def test_provider_manager_creates_antigravity_provider_with_native_id_and_effort(
+    tmp_path, monkeypatch
+):
     from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/local/bin/agy" if name == "agy" else None
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
     manager = ProviderManager()
     sid = str(uuid.uuid4())
@@ -1315,7 +1337,7 @@ def test_provider_manager_creates_antigravity_provider_with_native_id_and_effort
         "t1",
         "cao-s",
         "w1",
-        agent_profile="implementer-gemini",
+        agent_profile="developer",
         native_session_id=sid,
         expected_model="gemini-3.7-flash",
         expected_effort="high",
