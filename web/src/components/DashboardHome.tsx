@@ -1,13 +1,16 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useStore } from '../store'
 import { api, Annotation, AnnotationsResponse, SessionLifecycle, TerminalMeta } from '../api'
-import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, ArrowDownUp } from 'lucide-react'
+import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, Files, LogOut, Send, ChevronRight, ChevronDown, Users, ArrowDownUp } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
-import { CampaignAnnotations, TerminalAnnotations } from './AnnotationChips'
+import { CampaignAnnotations, TerminalAnnotations, communicationTarget } from './AnnotationChips'
+import type { CommunicationTarget } from './AnnotationChips'
+import { CommunicationsModal } from './CommunicationsModal'
+import { catalogAvailability, readCommunicationsList } from '../lib/communications'
 import { WorkStateInfoButton } from './AnnotationDetails'
 import { GlobalFilterBar, SessionFilterBar } from './FilterBar'
 import type { StatusOption } from './FilterBar'
@@ -128,6 +131,40 @@ function SessionLifecyclePill({ lifecycle }: { lifecycle?: SessionLifecycle | nu
   )
 }
 
+/**
+ * The row's document/count control (design §8.1): opens the task-scoped
+ * communications catalog when one of the row's annotations names a task
+ * occurrence. Rendered only when a catalog answered the probe — with no
+ * conductor catalog the row is byte-identical to before. The
+ * `communication_count` / `latest_communication_kind` facets are optional
+ * open strings, drawn when present and never required.
+ */
+function CommunicationsEntryButton({
+  annotations,
+  onOpen,
+}: {
+  annotations: Annotation[] | undefined
+  onOpen: (target: CommunicationTarget) => void
+}) {
+  const ann = annotations?.find(a => communicationTarget(a) !== null)
+  const target = ann ? communicationTarget(ann) : null
+  if (!ann || !target) return null
+  const count = ann.details?.communication_count
+  const latestKind = ann.details?.latest_communication_kind
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen(target)}
+      data-testid="communications-button"
+      title={`Communications${latestKind ? ` — latest: ${latestKind.replace(/_/g, ' ')}` : ''}`}
+      className="inline-flex items-center gap-0.5 p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
+    >
+      <Files size={12} />
+      {count && <span className="text-[9px] font-medium">{count}</span>}
+    </button>
+  )
+}
+
 export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => void }) {
   const { sessions, terminalStatuses, setTerminalStatus, clearTerminalStatuses, showSnackbar, deleteSession } = useStore()
   const [profileCount, setProfileCount] = useState(0)
@@ -160,6 +197,12 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   /** True once one full session-detail pass has landed — the fence's precondition. */
   const [rowsLoaded, setRowsLoaded] = useState(false)
   const seenSessionsRef = useRef<Set<string>>(new Set())
+
+  // ── Communications catalog (design §8.1) ────────────────────────────────
+  /** The open catalog modal, mirrored into the URL as a deep link. */
+  const [catalogTarget, setCatalogTarget] = useState<CommunicationTarget | null>(null)
+  /** A conductor catalog answered the probe; entry points may render. */
+  const [catalogPresent, setCatalogPresent] = useState(false)
 
   const totalTerminals = sessionData.reduce((sum, s) => sum + s.terminals.length, 0)
 
@@ -303,6 +346,88 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
     fetchAnnotations()
     const interval = setInterval(fetchAnnotations, 5000)
     return () => clearInterval(interval)
+  }, [])
+
+  // Communications catalog probe. Entry points appear only when a catalog
+  // actually answers: a missing conductor state root ("unavailable" + root
+  // `missing`), a 404 from a server without the route, a network error, and
+  // a malformed body all leave `catalogPresent` false — the dashboard renders
+  // EXACTLY as it did before this existed, the same posture as /annotations.
+  // An UNREADABLE root still arms the entry points: the modal carries the
+  // named unavailable state and its retry. While absent, the next annotations
+  // poll re-probes (one bounded GET on the same cadence), so a catalog that
+  // appears mid-session is picked up without a reload.
+  useEffect(() => {
+    if (catalogPresent) return
+    const candidate = annotations?.annotations.find(a => communicationTarget(a) !== null)
+    if (!candidate) return
+    const target = communicationTarget(candidate)
+    if (!target) return
+    let cancelled = false
+    api
+      .listCommunications(target.taskOccurrenceId)
+      .then(body => {
+        if (cancelled) return
+        const page = readCommunicationsList(body)
+        if (!page) return
+        if (catalogAvailability(page.coverage, page.reasons) === 'not-installed') return
+        setCatalogPresent(true)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [annotations, catalogPresent])
+
+  // Deep links (design §8.1): the open modal is
+  // `?task_occurrence_id=<id>&communication_id=<id>`, so reload, Back, and a
+  // copied link all land in the same place. An id the catalog does not know
+  // resolves to the modal's stable not-found state, never a blank modal.
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search)
+      const task = params.get('task_occurrence_id')
+      const comm = params.get('communication_id')
+      if (task) setCatalogTarget({ taskOccurrenceId: task, communicationId: comm })
+    } catch { /* non-browser test env */ }
+  }, [])
+
+  const catalogSyncRef = useRef(false)
+  useEffect(() => {
+    // Skip the first commit: the mount read above owns the URL then, and
+    // writing before it lands would strip an incoming deep link.
+    if (!catalogSyncRef.current) {
+      catalogSyncRef.current = true
+      return
+    }
+    try {
+      const params = new URLSearchParams(window.location.search)
+      if (catalogTarget) {
+        params.set('task_occurrence_id', catalogTarget.taskOccurrenceId)
+        if (catalogTarget.communicationId) params.set('communication_id', catalogTarget.communicationId)
+        else params.delete('communication_id')
+      } else {
+        params.delete('task_occurrence_id')
+        params.delete('communication_id')
+      }
+      const newSearch = params.toString()
+      const newUrl = `${window.location.pathname}${newSearch ? '?' + newSearch : ''}`
+      const current = `${window.location.pathname}${window.location.search}`
+      if (newUrl !== current) window.history.pushState(null, '', newUrl)
+    } catch { /* test env */ }
+  }, [catalogTarget])
+
+  useEffect(() => {
+    const handler = () => {
+      try {
+        const params = new URLSearchParams(window.location.search)
+        const task = params.get('task_occurrence_id')
+        const comm = params.get('communication_id')
+        setCatalogTarget(task ? { taskOccurrenceId: task, communicationId: comm } : null)
+      } catch { /* */ }
+    }
+    window.addEventListener('popstate', handler)
+    return () => window.removeEventListener('popstate', handler)
   }, [])
 
   // Placement is computed against EVERY terminal in the fleet, not per session,
@@ -572,6 +697,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             annotations.coverage === 'partial' ||
             annotations.coverage === 'truncated')
         }
+        onOpenCommunications={catalogPresent ? setCatalogTarget : undefined}
       />
 
       {/* Header with sort toggle */}
@@ -838,7 +964,10 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                         fork can make, and `not_fifo_monitored`
                                         already IS one. */}
                                     <StatusBadge status={currentStatus} terminal={t} annotations={annotationsFor(t.id)} />
-                                    <TerminalAnnotations annotations={annotationsFor(t.id)} />
+                                    <TerminalAnnotations
+                                      annotations={annotationsFor(t.id)}
+                                      onOpenCommunications={catalogPresent ? setCatalogTarget : undefined}
+                                    />
                                     {/* Same fallback the modals use: a blank
                                         gap and the word "unknown" are the same
                                         fact, and only one of them says so. */}
@@ -851,6 +980,13 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                         present even when the conductor has no
                                         annotations for this row. */}
                                     <WorkStateInfoButton annotations={annotationsFor(t.id)} terminal={t} status={currentStatus} />
+                                    {/* §8.1: the task's paper trail, when the
+                                        row names a task occurrence AND a
+                                        catalog answered the probe. Absent
+                                        either, nothing renders here. */}
+                                    {catalogPresent && (
+                                      <CommunicationsEntryButton annotations={annotationsFor(t.id)} onOpen={setCatalogTarget} />
+                                    )}
                                     <button onClick={() => setInboxTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Inbox"><Mail size={12} /></button>
                                     <button onClick={() => setOutputTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Output"><FileText size={12} /></button>
                                     <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider ?? undefined, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded transition-colors"><Monitor size={12} />Terminal</button>
@@ -903,6 +1039,14 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         <TerminalView terminalId={liveTerminal.id} provider={liveTerminal.provider} agentProfile={liveTerminal.agentProfile} onClose={() => setLiveTerminal(null)} />
       )}
       {outputTerminalId && <OutputViewer terminalId={outputTerminalId} onClose={() => setOutputTerminalId(null)} />}
+      {catalogTarget && (
+        <CommunicationsModal
+          taskOccurrenceId={catalogTarget.taskOccurrenceId}
+          selectedId={catalogTarget.communicationId}
+          onSelect={id => setCatalogTarget(current => (current ? { ...current, communicationId: id } : current))}
+          onClose={() => setCatalogTarget(null)}
+        />
+      )}
       <ConfirmModal
         open={!!pendingClose}
         title="Close Terminal"

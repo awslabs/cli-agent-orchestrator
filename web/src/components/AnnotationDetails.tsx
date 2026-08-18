@@ -209,7 +209,9 @@ export function AnnotationHoverCardBody({ annotation }: { annotation: Annotation
  * `hoverCard` next to it; the card is portalled, so it costs no box either.
  */
 export function useAnnotationHover(annotation: Annotation) {
-  const [anchor, setAnchor] = useState<HTMLSpanElement | null>(null)
+  // HTMLElement, not HTMLSpanElement: a chip whose subject carries a task
+  // occurrence is a <button> (design §8.1), and the anchor must not care.
+  const [anchor, setAnchor] = useState<HTMLElement | null>(null)
   const [open, setOpen] = useState(false)
   const timer = useRef<number | undefined>(undefined)
 
