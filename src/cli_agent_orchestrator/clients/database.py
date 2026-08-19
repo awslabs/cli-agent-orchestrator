@@ -731,6 +731,28 @@ def _migrate_workflow_run() -> None:
     rows back-fill to ``tier='yaml'``, ``generation='1'``. ``generation`` is TEXT,
     not INTEGER, so it compares byte-identically against the env-var-transported
     string generation value (domain-entities B4 fix).
+
+    ``manifest-column`` (issue #583 Bolt 2, ADR-583-12) additively appends ONE
+    column, ``manifest_json``, through the same PRAGMA-gated idiom — the frozen
+    execution manifest envelope, carrying source hash, inputs, repository and
+    worktree baseline, provider, model, profile, permissions, limits, retry
+    policy, the resolved-memory record, and the ``plan_id`` derived from them.
+    ``DEFAULT NULL`` means "manifest absent", which every pre-Bolt-2 row is, so
+    such a row reads back observably identical to its pre-extension form
+    (INV-1/INV-2) and no back-fill is attempted — a manifest records how a run was
+    LAUNCHED, which is not recoverable for a run that already started.
+
+    Because this body's failure is silent (see the ``except`` below), the column's
+    existence is VERIFIED rather than assumed: ``test_workflow_run_columns`` in
+    ``test/clients/test_workflow_run_migration.py`` asserts it on a fresh database,
+    with its TEXT type and NULL default. A silent failure would otherwise surface
+    far from its cause, as every run losing its manifest — which the Bolt 2
+    approval gate reads as "never approved" and refuses. That direction is
+    fail-closed, but the diagnosis is still remote, hence the assertion.
+
+    This column is NOT indexed (ADR-583-12: re-approval compares a ``plan_id``
+    read out of the envelope and no query filters on it). Writing and reading it
+    belong to the ``manifest-freeze`` unit, not to this migrator.
     """
     import sqlite3
 
@@ -761,6 +783,9 @@ def _migrate_workflow_run() -> None:
                     "ALTER TABLE workflow_run ADD COLUMN generation TEXT NOT NULL DEFAULT '1'"
                 )
                 logger.info("Migration: added generation column to workflow_run")
+            if "manifest_json" not in columns:
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN manifest_json TEXT DEFAULT NULL")
+                logger.info("Migration: added manifest_json column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -812,8 +837,22 @@ def _migrate_workflow_run_step() -> None:
     block, so the combined body now issues FOUR guarded ``ALTER`` statements, not
     one. The risk #583 minimised is materially larger than either change assumed
     alone. #583's mitigation (assert the column exists on a fresh database) is
-    therefore MORE load-bearing after this merge, and #504's three columns have no
-    equivalent assertion. Flagged rather than silently reconciled.
+    therefore MORE load-bearing after this merge. Flagged rather than silently
+    reconciled.
+
+    CORRECTION (2026-08-18, issue #583 Bolt 2, unit ``manifest-column``). The
+    sentence above previously ended by claiming that "#504's three columns have no
+    equivalent assertion". **That claim was false and has been removed.** All three
+    ARE asserted, in ``test/clients/test_workflow_run_migration.py``: ``terminal_id``,
+    ``reprompted`` and ``error_kind`` appear in ``test_workflow_run_step_columns``'s
+    exact ``set(cols) == {...}`` column set, and each carries a nullable check
+    (``[3] == 0``) plus a default check (``[4] == "NULL"``) in the same test. The
+    locations are named here so the denial cannot rot back: a reader who believed it
+    would add a duplicate assertion to close a gap that does not exist. What DOES
+    survive from the note above is the crowding itself — four guarded ``ALTER``
+    statements under one silent ``except`` is a real and growing risk, and adopting a
+    migration framework for it is recorded as a candidate decision (out of scope for
+    a single additive column).
     """
     import sqlite3
 
