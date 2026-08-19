@@ -2,6 +2,7 @@ import type { Page, Route } from "@playwright/test";
 import { tryParseNotation, renderPreview } from "../src/lib/macroNotation";
 import { projectedTerminal } from "../src/test/projectedTerminal";
 import type { AnnotationsResponse } from "../src/api";
+import viteConfig from "../vite.config";
 
 /**
  * The §10.5 stubbed server: Playwright route mocks for every HTTP endpoint
@@ -64,6 +65,28 @@ export function emptyAnnotations(): AnnotationsResponse {
     items_omitted: 0,
     reasons: [],
     annotations: [],
+  };
+}
+
+/** The catalog design §7 list envelope, as the fork API serves it. */
+export interface StubCommunicationsList {
+  schema: string;
+  coverage: string;
+  reasons: Array<{ source: string; reason: string }>;
+  communications: unknown[];
+  next_cursor: string | null;
+  total: number;
+}
+
+/** The "no conductor catalog installed" list answer (design §10, row one). */
+export function noCatalog(): StubCommunicationsList {
+  return {
+    schema: "cao-communications-index-v1",
+    coverage: "unavailable",
+    reasons: [{ source: "conductor-state-root", reason: "missing" }],
+    communications: [],
+    next_cursor: null,
+    total: 0,
   };
 }
 
@@ -191,6 +214,28 @@ function json(route: Route, body: unknown, status = 200): Promise<void> {
   });
 }
 
+// Derived from vite.config.ts `server.proxy` — the single source of truth for
+// which paths the dev/preview server would forward to the CAO backend. The
+// invariant is "every proxied path must either be stubbed or fail loudly":
+// deriving keeps the stub's loud-fallback definitionally in sync, so adding
+// or removing a proxy entry automatically widens or narrows the fallback.
+// An empty set would silently disarm that fallback and restore the proxy
+// leak, so an empty/missing proxy is a harness misconfiguration and must
+// throw at setup rather than cover nothing.
+const API_PREFIXES: readonly string[] = (() => {
+  // `defineConfig` returns a UserConfig; cast narrowly to read `server.proxy`
+  // without resorting to `any`.
+  const proxy = (viteConfig as { server?: { proxy?: Record<string, unknown> } })
+    .server?.proxy;
+  const keys = proxy ? Object.keys(proxy) : [];
+  if (keys.length === 0) {
+    throw new Error(
+      "e2e stub misconfigured: vite.config.ts server.proxy is missing or empty — the stub cannot determine which API paths must not leak to the vite preview proxy",
+    );
+  }
+  return keys;
+})();
+
 export interface StubSession {
   id: string;
   name: string;
@@ -210,6 +255,19 @@ export async function stubBackend(page: Page, options?: {
   controlInputResponses?: Array<Record<string, unknown>>;
   /** The §9.5 annotation payload. Omit for the no-annotations control. */
   annotations?: AnnotationsResponse;
+  /**
+   * The communications catalog (design §7/§8). Omit for the no-catalog
+   * control: the list route answers "unavailable + root missing", unknown
+   * detail ids 404, and the dashboard must render exactly as it does today.
+   */
+  communications?: {
+    /** Body for GET /communications?task_occurrence_id=... (any task). */
+    list?: StubCommunicationsList;
+    /** Per-id bodies for GET /communications/{id}. Unknown ids 404. */
+    details?: Record<string, unknown>;
+    /** Per-id bodies for GET /communications/attachments/{id}. */
+    attachments?: Record<string, unknown>;
+  };
   /**
    * The fleet, when a spec needs more than one row.
    *
@@ -294,11 +352,57 @@ export async function stubBackend(page: Page, options?: {
         terminals: terminalsBySession[name],
       });
     }
+    const lifecycleMatch = /^\/sessions\/([^/]+)\/lifecycle$/.exec(path);
+    if (lifecycleMatch && method === "GET") {
+      const name = decodeURIComponent(lifecycleMatch[1]);
+      // Never 404s (api.ts:1029): an undeclared session reads as `working`.
+      // The dashboard degrades a failed fetch to "no declaration" (DashboardHome
+      // .catch(() => null)), so the shape must be coherent but undeclared.
+      return json(route, {
+        session_name: name,
+        lifecycle: "working" as const,
+        restore_to: null,
+        archived: false,
+        kind: "campaign" as const,
+        declared_by: null,
+        note: null,
+        pause_deadline_at: null,
+        epoch: 0,
+        declared: false,
+      });
+    }
     if (path === "/annotations" && method === "GET") {
       // §9.5: absent conductor state = an empty, typed answer, never a 404 and
       // never an error. The default is exactly that, so every pre-existing spec
       // runs against the no-annotations control.
       return json(route, options?.annotations ?? emptyAnnotations());
+    }
+    // The communications catalog (design §7). Same control posture as
+    // /annotations: with no `communications` option the list answers
+    // "unavailable + root missing", i.e. no catalog is installed.
+    //
+    // FIXTURE DISCLOSURE — cond-0477: Every fixture in this stub that carries
+    // a bound task_occurrence_id models a state no shipped conductor writer
+    // currently produces — all current writers record task_occurrence_id = NULL
+    // (cond-0477). The fork's contract is the published index format and a
+    // bound occurrence is a legal value of it. The API reports
+    // `coverage:"complete"`, `total:0` with no reason code for the unbound
+    // case, so the reader cannot distinguish "unbound" from "genuinely empty"
+    // — a known limitation that resolves when cond-0477 lands.
+    if (path === "/communications" && method === "GET") {
+      return json(route, options?.communications?.list ?? noCatalog());
+    }
+    const commAttachmentMatch = /^\/communications\/attachments\/([^/]+)$/.exec(path);
+    if (commAttachmentMatch && method === "GET") {
+      const body = options?.communications?.attachments?.[decodeURIComponent(commAttachmentMatch[1])];
+      if (body) return json(route, body);
+      return json(route, { detail: "communications-catalog-not-found" }, 404);
+    }
+    const commDetailMatch = /^\/communications\/([^/]+)$/.exec(path);
+    if (commDetailMatch && method === "GET") {
+      const body = options?.communications?.details?.[decodeURIComponent(commDetailMatch[1])];
+      if (body) return json(route, body);
+      return json(route, { detail: "communications-catalog-not-found" }, 404);
     }
     // The same projected row the listing serves, found BY ID. It used to
     // answer `status: "running"`, which is not a value `project_row` can
@@ -556,6 +660,18 @@ export async function stubBackend(page: Page, options?: {
         updated_at: "2026-07-28T12:30:00Z",
       });
       return json(route, record);
+    }
+
+    // Unstubbed API routes must fail loudly rather than leaking to the vite
+    // proxy. The proxy forwards to http://localhost:9889, which is a real
+    // CAO server on the developer's machine (hence the 200 that masked the
+    // lifecycle leak) and ECONNREFUSED→502 on CI. An unhandled API path is a
+    // harness gap, not an asset. Only genuine app assets (document, scripts,
+    // styles, /assets/*) should continue to the network.
+    // API_PREFIXES is derived at module load from vite.config.ts server.proxy
+    // (see top of file) so the two cannot drift.
+    if (API_PREFIXES.some((p) => path === p || path.startsWith(p + "/"))) {
+      return json(route, { detail: `stub: unhandled API ${method} ${path}` }, 500);
     }
 
     // The app itself (document, scripts, styles) passes through to vite preview.

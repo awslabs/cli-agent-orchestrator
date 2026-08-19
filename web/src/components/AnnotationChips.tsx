@@ -71,6 +71,30 @@ import { fmtAbs, fmtAge, fmtRel, parseTimestamp } from '../lib/time'
 export const MAX_ROW_CHIPS = 3
 
 /**
+ * Where a chip click takes the operator (design §8.1): the task-scoped
+ * communications catalog, optionally with one record pre-selected.
+ */
+export interface CommunicationTarget {
+  taskOccurrenceId: string
+  communicationId: string | null
+}
+
+/**
+ * The ONE condition under which a chip becomes an entry point: its subject
+ * carries a `task_occurrence_id`. The annotation's kind is never inspected —
+ * task/report/checkpoint/whatever the conductor invents next all qualify, and
+ * everything else stays exactly the inert chip it was. The optional
+ * `communication_id` detail facet names the related record when the producer
+ * knows it; it is an open string, not a schema.
+ */
+export function communicationTarget(annotation: Annotation): CommunicationTarget | null {
+  const id = annotation.subject?.task_occurrence_id
+  if (typeof id !== 'string' || !id) return null
+  const commId = annotation.details?.communication_id
+  return { taskOccurrenceId: id, communicationId: typeof commId === 'string' && commId ? commId : null }
+}
+
+/**
  * Most IDENTITY chips drawn on one terminal row, capped SEPARATELY.
  *
  * A single shared cap is the obvious shape and it is wrong in both directions:
@@ -206,11 +230,20 @@ function subjectText(annotation: Annotation): string {
  * order and an annotation changing shape between renders cannot desynchronise
  * it.
  */
-export function AnnotationChip({ annotation, stale }: { annotation: Annotation; stale?: boolean }) {
+export function AnnotationChip({
+  annotation,
+  stale,
+  onOpenCommunications,
+}: {
+  annotation: Annotation
+  stale?: boolean
+  /** Present only when a conductor catalog answered the dashboard's probe. */
+  onOpenCommunications?: (target: CommunicationTarget) => void
+}) {
   return isIdentity(annotation) ? (
-    <IdentityChip annotation={annotation} stale={stale} />
+    <IdentityChip annotation={annotation} stale={stale} onOpenCommunications={onOpenCommunications} />
   ) : (
-    <SeverityChip annotation={annotation} stale={stale} />
+    <SeverityChip annotation={annotation} stale={stale} onOpenCommunications={onOpenCommunications} />
   )
 }
 
@@ -222,7 +255,15 @@ export function AnnotationChip({ annotation, stale }: { annotation: Annotation; 
  * subtitle was rejected: a red "blocked" chip that stopped being true an hour
  * ago is read as current at a glance, and the glance is the whole product.
  */
-function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: boolean }) {
+function SeverityChip({
+  annotation,
+  stale,
+  onOpenCommunications,
+}: {
+  annotation: Annotation
+  stale?: boolean
+  onOpenCommunications?: (target: CommunicationTarget) => void
+}) {
   const displayLabel = annotationDisplayLabel(annotation)
   const displayedAnnotation = displayLabel === annotation.label
     ? annotation
@@ -247,35 +288,15 @@ function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: b
   // container whose rules the 390px layout depends on.
   const { anchorProps, hoverCard } = useAnnotationHover(displayedAnnotation)
 
-  return (
+  // §8.1: a chip whose subject names a task occurrence is an ENTRY POINT into
+  // the communications catalog, and a clickable element that is not keyboard-
+  // operable is worse than a tab stop — so it becomes a real <button>. Every
+  // other chip renders byte-identically to before, and when no catalog
+  // answered the probe there is no handler and nothing changes at all.
+  const target = onOpenCommunications ? communicationTarget(displayedAnnotation) : null
+
+  const chipBody = (
     <>
-    <span
-      {...anchorProps}
-      data-testid="annotation-chip"
-      data-kind={annotation.kind}
-      data-role={role}
-      data-stale={state === 'stale' ? 'true' : 'false'}
-      data-freshness={state}
-      role="note"
-      aria-label={`${displayLabel}${age ? `, ${age}` : ''} — ${hover}`}
-      // Staleness is signalled by the neutral role, a dashed outline and a
-      // hollow dot — NOT by opacity. Dimming the whole chip was the first
-      // attempt and axe caught it: `opacity-60` blends the label into the
-      // background and drops it under the contrast floor, so the chip an
-      // operator most needs to be able to read would have been the one hardest
-      // to read. It also gives staleness a second, non-colour channel.
-      //
-      // `rounded-md` against StatusBadge's `rounded-full` separates durable
-      // work annotations from the operational headline without relying on hue.
-      //
-      // `shrink-0 whitespace-nowrap` IS LOAD-BEARING AT 390px. Without them
-      // flexbox shrank the sibling profile-name span to zero and then wrapped
-      // the chip into a 130px-tall ellipse anyway, deleting the one thing on
-      // the row that says which worker it is.
-      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md shrink-0 whitespace-nowrap max-w-full ${cls.bg} ${cls.edge} ${
-        isOld ? 'border border-dashed border-cao-neutral' : ''
-      }`}
-    >
       <span
         className={`w-1.5 h-1.5 shrink-0 rounded-full ${
           isOld ? 'border border-cao-neutral' : cls.dot
@@ -292,8 +313,57 @@ function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: b
           · {state === 'stale' ? 'stale' : 'age unknown'}
         </span>
       )}
-    </span>
-    {hoverCard}
+    </>
+  )
+  const sharedProps = {
+    ...anchorProps,
+    'data-testid': 'annotation-chip',
+    'data-kind': annotation.kind,
+    'data-role': role,
+    'data-stale': state === 'stale' ? 'true' : 'false',
+    'data-freshness': state,
+    'aria-label': `${displayLabel}${age ? `, ${age}` : ''} — ${hover}`,
+    // Staleness is signalled by the neutral role, a dashed outline and a
+    // hollow dot — NOT by opacity. Dimming the whole chip was the first
+    // attempt and axe caught it: `opacity-60` blends the label into the
+    // background and drops it under the contrast floor, so the chip an
+    // operator most needs to be able to read would have been the one hardest
+    // to read. It also gives staleness a second, non-colour channel.
+    //
+    // `rounded-md` against StatusBadge's `rounded-full` separates durable
+    // work annotations from the operational headline without relying on hue.
+    //
+    // `shrink-0 whitespace-nowrap` IS LOAD-BEARING AT 390px. Without them
+    // flexbox shrank the sibling profile-name span to zero and then wrapped
+    // the chip into a 130px-tall ellipse anyway, deleting the one thing on
+    // the row that says which worker it is.
+    className: `inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md shrink-0 whitespace-nowrap max-w-full ${cls.bg} ${cls.edge} ${
+      isOld ? 'border border-dashed border-cao-neutral' : ''
+    }${target ? ' cursor-pointer hover:ring-1 hover:ring-gray-500' : ''}`,
+  }
+
+  if (target) {
+    return (
+      <>
+        <button
+          type="button"
+          onClick={() => onOpenCommunications!(target)}
+          data-actionable="true"
+          {...sharedProps}
+        >
+          {chipBody}
+        </button>
+        {hoverCard}
+      </>
+    )
+  }
+
+  return (
+    <>
+      <span role="note" {...sharedProps}>
+        {chipBody}
+      </span>
+      {hoverCard}
     </>
   )
 }
@@ -319,7 +389,15 @@ function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: b
  * test — or an operator — to read severity off a chip that is not making a
  * severity claim.
  */
-function IdentityChip({ annotation, stale }: { annotation: Annotation; stale?: boolean }) {
+function IdentityChip({
+  annotation,
+  stale,
+  onOpenCommunications,
+}: {
+  annotation: Annotation
+  stale?: boolean
+  onOpenCommunications?: (target: CommunicationTarget) => void
+}) {
   const state = stale === undefined ? freshness(annotation.valid_until) : stale ? 'stale' : 'fresh'
   const isOld = state !== 'fresh'
   const { index, colour, tint } = identityStyle(annotation.colour_key ?? '')
@@ -334,6 +412,11 @@ function IdentityChip({ annotation, stale }: { annotation: Annotation; stale?: b
   const hover = [subjectText(annotation), facets, freshnessText].filter(Boolean).join(' · ')
   const { anchorProps, hoverCard } = useAnnotationHover(annotation)
 
+  // Same §8.1 rule as the severity chip: a task-occurrence subject makes the
+  // chip a real button into the communications catalog; every other chip is
+  // byte-identical to before.
+  const target = onOpenCommunications ? communicationTarget(annotation) : null
+
   // Dashed-and-hollow already means stale, so the UNCOLOURED variant is given
   // the opposite of both — a solid outline and a filled dot — rather than a
   // second dashed treatment nobody could tell apart from an expired chip.
@@ -343,71 +426,95 @@ function IdentityChip({ annotation, stale }: { annotation: Annotation; stale?: b
       ? ''
       : 'border border-gray-500'
 
-  return (
+  const chipBody = (
     <>
       <span
-        {...anchorProps}
-        data-testid="annotation-chip"
-        data-kind={annotation.kind}
-        data-identity="true"
-        // THE BUCKET, NEVER THE TOKEN. Echoing `colour_key` itself would put a
-        // hash of whatever identity the producer chose into the DOM of an
-        // unauthenticated page (§9.5); the slot index leaks under four bits and
-        // is all a test needs to prove two chips resolved together.
-        data-colour={index === null ? 'none' : String(index)}
-        data-stale={state === 'stale' ? 'true' : 'false'}
-        data-freshness={state}
-        role="note"
-        aria-label={`${annotation.label}${age ? `, ${age}` : ''} — ${hover}`}
-        // `shrink-0 whitespace-nowrap` for the same reason the severity chip
-        // carries them: without them flexbox shrinks the sibling profile-name
-        // span to zero at 390px. These chips are DIRECT SIBLINGS in the group's
-        // flex container — no inner wrapper — because every one of those class
-        // names is a statement about that specific parent.
-        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm font-mono shrink-0 whitespace-nowrap max-w-full ${edge}`}
-        style={colour ? { backgroundColor: tint ?? undefined } : undefined}
+        className={`w-1.5 h-1.5 shrink-0 rounded-full ${
+          isOld ? 'border border-cao-neutral' : colour ? '' : 'bg-gray-400'
+        }`}
+        style={!isOld && colour ? { backgroundColor: colour } : undefined}
+      />
+      {/* Clamped. WHERE THE FULL VALUE STILL IS, measured rather than
+          assumed — an earlier comment here claimed the facet line below
+          covers the clamp at every viewport, and it does not:
+
+            * a VCS chip's branch is `observed.branch`, the FIRST facet
+              `_vcs_details` writes, so it is always inside `MAX_FACET_LINE`
+              and the line does carry it in full below `sm`;
+            * a LANE chip's id is the label and is NOT a facet, so below `sm`
+              the line carries nothing that repairs a clamp at 16ch;
+            * at and above `sm` the line is hidden entirely, so on desktop
+              NEITHER chip is repaired by it.
+
+          The full value is reached instead by the two surfaces built for it:
+          the pointer hover card (desktop) and the row's info popover (both,
+          and the only path on a phone). Colour is a WEAK second channel: it
+          keys on the worktree (and on the full lane id), never on the drawn
+          text, so two chips clamped to the same characters usually differ in
+          colour — usually, not always, because the ramp is twelve slots.
+          Widening the clamp is a live layout question — of 172 branches on
+          the fleet, 116 exceed 30ch — and it is left to visual review on real
+          data rather than settled here. */}
+      <span
+        className={`text-[10px] font-medium truncate max-w-[16ch] sm:max-w-[30ch] ${
+          colour ? '' : 'text-gray-400'
+        }`}
+        style={colour ? { color: colour } : undefined}
       >
-        <span
-          className={`w-1.5 h-1.5 shrink-0 rounded-full ${
-            isOld ? 'border border-cao-neutral' : colour ? '' : 'bg-gray-400'
-          }`}
-          style={!isOld && colour ? { backgroundColor: colour } : undefined}
-        />
-        {/* Clamped. WHERE THE FULL VALUE STILL IS, measured rather than
-            assumed — an earlier comment here claimed the facet line below
-            covers the clamp at every viewport, and it does not:
-
-              * a VCS chip's branch is `observed.branch`, the FIRST facet
-                `_vcs_details` writes, so it is always inside `MAX_FACET_LINE`
-                and the line does carry it in full below `sm`;
-              * a LANE chip's id is the label and is NOT a facet, so below `sm`
-                the line carries nothing that repairs a clamp at 16ch;
-              * at and above `sm` the line is hidden entirely, so on desktop
-                NEITHER chip is repaired by it.
-
-            The full value is reached instead by the two surfaces built for it:
-            the pointer hover card (desktop) and the row's info popover (both,
-            and the only path on a phone). Colour is a WEAK second channel: it
-            keys on the worktree (and on the full lane id), never on the drawn
-            text, so two chips clamped to the same characters usually differ in
-            colour — usually, not always, because the ramp is twelve slots.
-            Widening the clamp is a live layout question — of 172 branches on
-            the fleet, 116 exceed 30ch — and it is left to visual review on real
-            data rather than settled here. */}
-        <span
-          className={`text-[10px] font-medium truncate max-w-[16ch] sm:max-w-[30ch] ${
-            colour ? '' : 'text-gray-400'
-          }`}
-          style={colour ? { color: colour } : undefined}
-        >
-          {annotation.label}
+        {annotation.label}
+      </span>
+      {age && <span className="text-[10px] text-gray-400 shrink-0">{age}</span>}
+      {isOld && (
+        <span data-testid="annotation-stale-note" className="text-[10px] text-gray-400 shrink-0">
+          · {state === 'stale' ? 'stale' : 'age unknown'}
         </span>
-        {age && <span className="text-[10px] text-gray-400 shrink-0">{age}</span>}
-        {isOld && (
-          <span data-testid="annotation-stale-note" className="text-[10px] text-gray-400 shrink-0">
-            · {state === 'stale' ? 'stale' : 'age unknown'}
-          </span>
-        )}
+      )}
+    </>
+  )
+  const sharedProps = {
+    ...anchorProps,
+    'data-testid': 'annotation-chip',
+    'data-kind': annotation.kind,
+    'data-identity': 'true',
+    // THE BUCKET, NEVER THE TOKEN. Echoing `colour_key` itself would put a
+    // hash of whatever identity the producer chose into the DOM of an
+    // unauthenticated page (§9.5); the slot index leaks under four bits and
+    // is all a test needs to prove two chips resolved together.
+    'data-colour': index === null ? 'none' : String(index),
+    'data-stale': state === 'stale' ? 'true' : 'false',
+    'data-freshness': state,
+    'aria-label': `${annotation.label}${age ? `, ${age}` : ''} — ${hover}`,
+    // `shrink-0 whitespace-nowrap` for the same reason the severity chip
+    // carries them: without them flexbox shrinks the sibling profile-name
+    // span to zero at 390px. These chips are DIRECT SIBLINGS in the group's
+    // flex container — no inner wrapper — because every one of those class
+    // names is a statement about that specific parent.
+    className: `inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm font-mono shrink-0 whitespace-nowrap max-w-full ${edge}${
+      target ? ' cursor-pointer hover:ring-1 hover:ring-gray-500' : ''
+    }`,
+    style: colour ? { backgroundColor: tint ?? undefined } : undefined,
+  }
+
+  if (target) {
+    return (
+      <>
+        <button
+          type="button"
+          onClick={() => onOpenCommunications!(target)}
+          data-actionable="true"
+          {...sharedProps}
+        >
+          {chipBody}
+        </button>
+        {hoverCard}
+      </>
+    )
+  }
+
+  return (
+    <>
+      <span role="note" {...sharedProps}>
+        {chipBody}
       </span>
       {hoverCard}
     </>
@@ -440,7 +547,13 @@ function FacetLine({ annotation, className }: { annotation: Annotation; classNam
  * fleet with no annotations produces byte-identical DOM to the dashboard
  * before this existed.
  */
-export function TerminalAnnotations({ annotations }: { annotations: Annotation[] | undefined }) {
+export function TerminalAnnotations({
+  annotations,
+  onOpenCommunications,
+}: {
+  annotations: Annotation[] | undefined
+  onOpenCommunications?: (target: CommunicationTarget) => void
+}) {
   if (!annotations || annotations.length === 0) return null
   // TWO GROUPS, TWO CAPS, TWO MARKERS. See `MAX_IDENTITY_CHIPS`: one shared cap
   // lets either group delete the other, and both deletions are the failure the
@@ -467,7 +580,11 @@ export function TerminalAnnotations({ annotations }: { annotations: Annotation[]
       className="flex items-center gap-1.5 flex-wrap min-w-0 basis-full sm:basis-auto"
     >
       {shownSeverity.map((a, i) => (
-        <AnnotationChip key={`${a.namespace}:${a.kind}:${a.label}:${i}`} annotation={a} />
+        <AnnotationChip
+          key={`${a.namespace}:${a.kind}:${a.label}:${i}`}
+          annotation={a}
+          onOpenCommunications={onOpenCommunications}
+        />
       ))}
       {hiddenSeverity > 0 && (
         <span
@@ -479,7 +596,11 @@ export function TerminalAnnotations({ annotations }: { annotations: Annotation[]
         </span>
       )}
       {shownIdentity.map((a, i) => (
-        <AnnotationChip key={`identity:${a.namespace}:${a.kind}:${a.label}:${i}`} annotation={a} />
+        <AnnotationChip
+          key={`identity:${a.namespace}:${a.kind}:${a.label}:${i}`}
+          annotation={a}
+          onOpenCommunications={onOpenCommunications}
+        />
       ))}
       {hiddenIdentity > 0 && (
         <span
@@ -518,12 +639,14 @@ export function CampaignAnnotations({
   omitted,
   degraded,
   pending = 0,
+  onOpenCommunications,
 }: {
   unplaced: UnplacedAnnotation[]
   fenced: number
   omitted: number
   degraded: boolean
   pending?: number
+  onOpenCommunications?: (target: CommunicationTarget) => void
 }) {
   if (unplaced.length === 0 && omitted === 0 && fenced === 0 && !degraded) return null
   // CAPPED AND SCROLL-BOUNDED, for the same reason the terminal row is. This
@@ -561,7 +684,7 @@ export function CampaignAnnotations({
               data-reason={entry.reason}
               className="flex items-start gap-2 flex-wrap"
             >
-              <AnnotationChip annotation={entry.annotation} />
+              <AnnotationChip annotation={entry.annotation} onOpenCommunications={onOpenCommunications} />
               <span className="text-[10px] text-gray-300">{subjectText(entry.annotation)}</span>
               <span className="text-[10px] text-gray-400">({REASON_TEXT[entry.reason]})</span>
               <FacetLine annotation={entry.annotation} className="text-[10px] text-gray-400 basis-full" />

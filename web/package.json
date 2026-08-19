@@ -20,7 +20,11 @@
     "lucide-react": "^0.562.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
     "sigma": "^3.0.3",
+    "unified": "^11.0.5",
     "zustand": "^4.4.0"
   },
   "devDependencies": {
