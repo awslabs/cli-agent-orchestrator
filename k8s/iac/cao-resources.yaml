@@ -282,9 +282,9 @@ Resources:
       # Egress is restricted to loopback rather than left at CloudFormation's
       # default allow-all. Mount targets never initiate connections — they only
       # answer NFS — and security groups are stateful, so replies to permitted
-      # inbound traffic are allowed regardless of egress rules. (Reasoned from
-      # documented security-group behaviour; the pre-existing file system this
-      # was modelled on runs with the default allow-all egress.)
+      # inbound traffic are allowed regardless of egress rules. Verified on a
+      # live cluster: a pod mounted this file system as nfs4 and wrote to it with
+      # the access point's uid/gid, with these egress rules in place.
       SecurityGroupEgress:
         - Description: No egress required; mount targets only answer inbound NFS
           IpProtocol: "-1"
