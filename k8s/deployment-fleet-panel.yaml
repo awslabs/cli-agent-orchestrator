@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
         - name: fleet-panel
-          image: 418295698799.dkr.ecr.ap-southeast-2.amazonaws.com/cao-fleet-panel:latest
+          image: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-fleet-panel:latest
           ports:
             - containerPort: 9888
               name: http

@@ -41,7 +41,7 @@ spec:
       containers:
         - name: cao-node
           # Same image as workers — role differs by env/config only
-          image: 418295698799.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server:latest
+          image: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server:latest
           ports:
             - containerPort: 9889
               name: http
