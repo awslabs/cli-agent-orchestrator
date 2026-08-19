@@ -1,12 +1,15 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
-# VPC + EKS cluster for the CAO fleet demo, in one stack.
+# Every AWS resource the CAO fleet demo needs, in one stack: the network, the
+# EKS cluster and its add-ons, and the CAO-specific resources (provider secret,
+# External Secrets Operator IAM role and Pod Identity association, container
+# repositories, shared EFS workspace).
 #
 # A brand-new AWS account has only a default VPC, which has no private subnets
-# and none of the tags EKS looks for. This stack builds the network and the
-# cluster together, then emits exactly the parameter values cao-resources.yaml
-# needs — including the cluster security group, which does not exist until the
-# cluster does.
+# and none of the tags EKS looks for, so there is nothing to build on. Keeping
+# everything in one stack means nothing has to be wired by hand: the workspace
+# security group references the cluster's own security group, and the mount
+# targets reference the same private subnets the nodes run in.
 #
 # WHAT IT DOES NOT DO. Two things cannot be expressed in CloudFormation because
 # they are Kubernetes objects, not AWS resources:
@@ -14,22 +17,23 @@ AWSTemplateFormatVersion: "2010-09-09"
 #   * External Secrets Operator — install with Helm.
 # Both are listed in ../README.md.
 #
-# ORDER: this stack -> storageclasses.yaml + ESO -> cao-resources.yaml -> the
-# manifests in ../.
+# ORDER: this stack -> set the provider secret value, apply
+# storageclasses.yaml, install ESO -> the manifests in ../.
 #
 # Deploy (about 15 minutes, most of it the control plane):
 #   aws cloudformation deploy \
-#     --template-file k8s/iac/cluster.yaml \
+#     --template-file k8s/iac/infrastructure.yaml \
 #     --stack-name cao-workshop \
-#     --capabilities CAPABILITY_IAM \
+#     --capabilities CAPABILITY_NAMED_IAM \
 #     --parameter-overrides ClusterName=cao-workshop
 #
 # COST while running: EKS control plane, two nodes, and one NAT gateway all bill
 # hourly. Delete the stack when the demo is over.
 
 Description: >-
-  CAO demo infrastructure: a two-AZ VPC and an EKS cluster with the add-ons the
-  CAO fleet requires.
+  CAO demo infrastructure: a two-AZ VPC, an EKS cluster with the required
+  add-ons, and the CAO provider secret, IAM, container repositories and shared
+  EFS workspace.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -40,6 +44,8 @@ Metadata:
         Parameters: [NodeInstanceType, NodeDesiredSize, NodeMaxSize, NodeDiskSize]
       - Label: { default: Network }
         Parameters: [VpcCidr]
+      - Label: { default: CAO resources }
+        Parameters: [NamePrefix, ProviderSecretName, ExternalSecretsNamespace, ExternalSecretsServiceAccount]
 
 Parameters:
   ClusterName:
@@ -94,6 +100,34 @@ Parameters:
       because the VPC CNI gives every pod a real VPC address, so pod density is
       bounded by subnet size rather than node count.
     AllowedPattern: "^10\\.\\d{1,3}\\.0\\.0/16$"
+
+  NamePrefix:
+    Type: String
+    Default: cao
+    Description: >-
+      Prefix for the CAO resource names (IAM role, container repositories).
+      Change it to run two fleets in one account.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+
+  ProviderSecretName:
+    Type: String
+    Default: cao/kiro-api-key
+    Description: >-
+      Secrets Manager secret holding the provider API key. Created empty; set the
+      value before deploying the manifests.
+    MinLength: 1
+
+  ExternalSecretsNamespace:
+    Type: String
+    Default: external-secrets
+    Description: Namespace where the External Secrets Operator controller runs.
+
+  ExternalSecretsServiceAccount:
+    Type: String
+    Default: external-secrets
+    Description: >-
+      Service account of the ESO controller. The IAM role is granted to the
+      OPERATOR, not to the CAO pods.
 
 Resources:
   # ===========================================================================
@@ -473,35 +507,257 @@ Resources:
         - RoleArn: !GetAtt EfsCsiRole.Arn
           ServiceAccount: efs-csi-controller-sa
 
+  # ===========================================================================
+  # CAO application resources
+  #
+  # These exist because of CAO rather than because of Kubernetes. They live in
+  # the same stack as the cluster so nothing has to be wired by hand: the
+  # workspace security group references the cluster's own security group, and the
+  # mount targets reference the same private subnets the nodes run in.
+  # ===========================================================================
+
+  # Created with NO value on purpose. Omitting both SecretString and
+  # GenerateSecretString yields an empty secret, so a forgotten "paste the key"
+  # step fails loudly: GetSecretValue returns ResourceNotFoundException, the
+  # ExternalSecret reports SecretSynced=False, the Kubernetes Secret is never
+  # created, and pods stop at CreateContainerConfigError. A generated placeholder
+  # would instead sync a plausible-looking value and fail later as a confusing
+  # authentication error.
+  #
+  # Never put the key in this template. Set it out of band; see ../README.md.
+  # Later stack updates will not overwrite the value, because SecretString is
+  # absent here.
+  ProviderSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Ref ProviderSecretName
+      Description: !Sub "Provider API key consumed by the ${NamePrefix} fleet via External Secrets Operator"
+      # No KmsKeyId: encrypted with the AWS-managed key. To use a
+      # customer-managed key, set it here and add kms:Decrypt on that key to the
+      # policy below, or the role cannot read the secret.
+      Tags:
+        - Key: Name
+          Value: !Ref ProviderSecretName
+
+  # The permission lives in a standalone managed policy rather than an inline
+  # Policies block so it is independently auditable and versioned.
+  ReadProviderSecretPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${NamePrefix}-read-provider-secret"
+      Description: !Sub "Read-only access to the ${NamePrefix} provider API key secret."
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Scoped to this one secret ARN. !Ref on a Secret returns the full ARN
+          # including the six-character suffix Secrets Manager appends, so no
+          # wildcard is needed.
+          - Sid: ReadProviderSecretOnly
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: !Ref ProviderSecret
+
+  # Assumed by the External Secrets Operator controller, NOT by the CAO pods. CAO
+  # agents execute arbitrary commands by design, so an AWS identity on those pods
+  # would be inheritable by a prompt-injected agent. With this split the agent
+  # pods read a plain Kubernetes Secret and hold no AWS credentials at all.
+  ExternalSecretsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-external-secrets-role"
+      Description: Lets External Secrets Operator read the CAO provider secret.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EksPodIdentity
+            Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - !Ref ReadProviderSecretPolicy
+
+  # Delivers the role above to the ESO controller pods. The association is
+  # created even though ESO is installed later — EKS does not require the
+  # namespace or service account to exist yet.
+  #
+  # Credentials are injected by a mutating admission webhook at POD CREATION, so
+  # ESO pods started before this exists never receive them and fall back to the
+  # node instance role. Restart ESO after this stack completes.
+  ExternalSecretsPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAgentAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: !Ref ExternalSecretsNamespace
+      ServiceAccount: !Ref ExternalSecretsServiceAccount
+      RoleArn: !GetAtt ExternalSecretsRole.Arn
+
+  # IMMUTABLE tags are deliberate. A mutable tag previously let a cluster run a
+  # build that predated cross-node placement while the manifests advertised it,
+  # with nothing to indicate the mismatch. Immutability makes that impossible: a
+  # tag always means one image.
+  ServerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-server"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # MUTABLE only because the panel deployment still references `latest`. Switch to
+  # IMMUTABLE once the panel is built with versioned tags.
+  PanelRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-fleet-panel"
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # Only the cluster's own nodes may mount the workspace. Being in the same stack
+  # as the cluster, this can reference the security group EKS created rather than
+  # taking it as a parameter.
+  WorkspaceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "NFS access to the ${NamePrefix} shared workspace"
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: NFS from cluster nodes
+          IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !GetAtt Cluster.ClusterSecurityGroupId
+      # Egress restricted to loopback rather than left at CloudFormation's
+      # default allow-all. Mount targets never initiate connections — they only
+      # answer NFS — and security groups are stateful, so replies to permitted
+      # inbound traffic are allowed regardless of egress rules. Verified on a
+      # live cluster: a pod mounted this file system as nfs4 and wrote to it with
+      # the access point's uid/gid, with these egress rules in place.
+      SecurityGroupEgress:
+        - Description: No egress required; mount targets only answer inbound NFS
+          IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-workspace-nfs"
+
+  # Holds the agents' shared checkout, so it is retained on stack deletion.
+  # NOTE: retention means deleting this stack leaves a billable file system
+  # behind. Delete it explicitly when decommissioning.
+  WorkspaceFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      BackupPolicy:
+        Status: ENABLED
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-workspace"
+
+  # The access point is what makes the shared volume usable without root: it pins
+  # every NFS client to uid/gid 1000, the `cao` user in the container image. A
+  # mismatch here surfaces as permission errors under /home/cao/workspace.
+  #
+  # CreationInfo must be present and must specify all three properties. Without
+  # it EFS will not create the root directory and mounts fail.
+  WorkspaceAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /cao-workspace
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0755"
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-workspace-ap"
+
+  # One mount target per AZ. A pod scheduled in an AZ with no mount target cannot
+  # mount the workspace.
+  WorkspaceMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups:
+        - !Ref WorkspaceSecurityGroup
+
+  WorkspaceMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups:
+        - !Ref WorkspaceSecurityGroup
+
 Outputs:
   ClusterName:
-    Description: Pass as ClusterName to cao-resources.yaml.
+    Description: EKS cluster name.
     Value: !Ref Cluster
 
   KubeconfigCommand:
-    Description: Run this to point kubectl at the new cluster.
+    Description: Run this to point kubectl at the cluster.
     Value: !Sub "aws eks update-kubeconfig --region ${AWS::Region} --name ${Cluster}"
 
+  ProviderSecretName:
+    Description: >-
+      Set this secret's value before deploying the manifests, and use it as the
+      remoteRef key in ../external-secrets.example.yaml.
+    Value: !Ref ProviderSecretName
+
+  ExternalSecretsRoleArn:
+    Description: IAM role the External Secrets Operator controller assumes.
+    Value: !GetAtt ExternalSecretsRole.Arn
+
+  WorkspaceVolumeHandle:
+    Description: Paste into spec.csi.volumeHandle in ../efs-workspace.yaml.
+    Value: !Sub "${WorkspaceFileSystem}::${WorkspaceAccessPoint}"
+
+  ServerRepositoryUri:
+    Description: Push the CAO server image here, and use it in ../kustomization.yaml.
+    Value: !GetAtt ServerRepository.RepositoryUri
+
+  PanelRepositoryUri:
+    Description: Fleet panel image repository.
+    Value: !GetAtt PanelRepository.RepositoryUri
+
   VpcId:
-    Description: Pass as VpcId to cao-resources.yaml.
+    Description: VPC holding the cluster.
     Value: !Ref Vpc
-
-  NodeSecurityGroupId:
-    Description: >-
-      Pass as NodeSecurityGroupId to cao-resources.yaml. This is the cluster
-      security group EKS creates and attaches to managed nodes, so allowing NFS
-      from it lets the nodes mount the shared workspace.
-    Value: !GetAtt Cluster.ClusterSecurityGroupId
-
-  WorkspaceSubnetId1:
-    Description: Pass as WorkspaceSubnetId1 to cao-resources.yaml.
-    Value: !Ref PrivateSubnetA
-
-  WorkspaceSubnetId2:
-    Description: >-
-      Pass as WorkspaceSubnetId2 to cao-resources.yaml. Leave
-      WorkspaceSubnetId3 empty — this stack builds two Availability Zones.
-    Value: !Ref PrivateSubnetB
 
   PrivateSubnetIds:
     Description: Private subnets holding the nodes, pods and EFS mount targets.
