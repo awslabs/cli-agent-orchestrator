@@ -73,11 +73,17 @@ class TestClaudeCodeIdleGap:
             18.0,  # iter1 now: gap=18<20, bypass prompt → handled
             18.0,  # last_prompt_time reset to 18
             # continues past the old 20s total window...
-            35.0,  # iter2 now: gap=35-18=17<20, trust prompt → handled → return
+            35.0,  # iter2 now: gap=35-18=17<20, trust prompt → handled
+            35.0,  # last_prompt_time reset to 35 — trust no longer ends the loop
+            36.0,  # iter3 now: gap=1<20, version banner → return
         ]
+        # A third frame is required because accepting trust no longer returns: the
+        # model-upgrade nudge can render AFTER the trust dialog, so the handler keeps
+        # polling until it sees the version banner. Live startups do exactly this.
         mock_backend.get_history.side_effect = [
             "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
             "Yes, I trust this folder",
+            "Welcome to Claude Code v2.1.235",
         ]
 
         p = self._make()
@@ -140,9 +146,17 @@ class TestClaudeCodeIdleGap:
             0.0,  # outer_deadline = 60
             0.0,  # last_prompt_time = 0
             35.0,  # iter1 now: no prompt handled yet -> idle-gap check skipped ->
-            # trust prompt found in output -> handled -> return
+            # trust prompt found in output -> handled -> continue
+            35.0,  # last_prompt_time reset to 35 — trust no longer ends the loop
+            36.0,  # iter2 now: gap=1<20, version banner -> return
         ]
-        mock_backend.get_history.return_value = "Yes, I trust this folder"
+        # side_effect rather than return_value: accepting trust no longer returns
+        # (a model-upgrade nudge can follow it), so the loop needs a second frame
+        # that ends it. A constant return_value would spin until the idle gap.
+        mock_backend.get_history.side_effect = [
+            "Yes, I trust this folder",
+            "Welcome to Claude Code v2.1.235",
+        ]
 
         p = self._make()
         await p._handle_startup_prompts()
@@ -196,11 +210,14 @@ class TestClaudeCodeIdleGap:
             3.0,  # iter1: gap=3<20, bypass prompt → handled
             3.0,  # last_prompt_time reset
             # loop continues
-            8.0,  # iter2: gap=8-3=5<20, trust prompt → handled → return
+            8.0,  # iter2: gap=8-3=5<20, trust prompt → handled
+            8.0,  # last_prompt_time reset to 8 — trust no longer ends the loop
+            9.0,  # iter3: gap=1<20, version banner → return
         ]
         mock_backend.get_history.side_effect = [
             "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
             "Yes, I trust this folder",
+            "Welcome to Claude Code v2.1.235",
         ]
 
         p = self._make()
@@ -227,11 +244,14 @@ class TestClaudeCodeIdleGap:
             5.0,  # iter1: gap=5<20, bypass prompt → handled
             5.0,  # last_prompt_time reset to 5
             # continues
-            22.0,  # iter2: gap=22-5=17<20, trust prompt → handled → return
+            22.0,  # iter2: gap=22-5=17<20, trust prompt → handled
+            22.0,  # last_prompt_time reset to 22 — trust no longer ends the loop
+            23.0,  # iter3: gap=1<20, version banner → return
         ]
         mock_backend.get_history.side_effect = [
             "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
             "Yes, I trust this folder",
+            "Welcome to Claude Code v2.1.235",
         ]
 
         p = self._make()
