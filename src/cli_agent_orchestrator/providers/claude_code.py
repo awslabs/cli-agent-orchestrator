@@ -445,9 +445,7 @@ class ClaudeCodeProvider(BaseProvider):
         # the ``--session-id`` above, leaving the parent transcript untouched.
         # The constructor has already established that both ids exist and differ.
         if self._fork_from_session_id:
-            command_parts.extend(
-                ["--resume", self._fork_from_session_id, "--fork-session"]
-            )
+            command_parts.extend(["--resume", self._fork_from_session_id, "--fork-session"])
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters

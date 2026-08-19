@@ -2174,7 +2174,9 @@ class TestForkFromSession:
 
     def test_fork_names_both_the_parent_and_the_child(self):
         provider = ClaudeCodeProvider(
-            "t123", "cao-s", "w123",
+            "t123",
+            "cao-s",
+            "w123",
             native_session_id=self._CHILD,
             fork_from_session_id=self._PARENT,
         )
@@ -2188,9 +2190,7 @@ class TestForkFromSession:
         # Without a parent the launch must carry no fork flag at all: an
         # unforked worker that silently resumed some other conversation would
         # inherit context nothing recorded it inheriting.
-        provider = ClaudeCodeProvider(
-            "t123", "cao-s", "w123", native_session_id=self._CHILD
-        )
+        provider = ClaudeCodeProvider("t123", "cao-s", "w123", native_session_id=self._CHILD)
         command = provider._build_claude_command(profile=None)
 
         assert "--fork-session" not in command
@@ -2201,16 +2201,16 @@ class TestForkFromSession:
         # Claude Code would mint an ambient id that nothing recorded, so the
         # child could not be resumed, collected, or attributed.
         with pytest.raises(ValueError, match="requires native_session_id"):
-            ClaudeCodeProvider(
-                "t123", "cao-s", "w123", fork_from_session_id=self._PARENT
-            )
+            ClaudeCodeProvider("t123", "cao-s", "w123", fork_from_session_id=self._PARENT)
 
     def test_fork_onto_its_own_source_is_refused(self):
         # That is a resume wearing a fork's flag: it lands in the very
         # conversation it meant to branch away from.
         with pytest.raises(ValueError, match="must differ"):
             ClaudeCodeProvider(
-                "t123", "cao-s", "w123",
+                "t123",
+                "cao-s",
+                "w123",
                 native_session_id=self._PARENT,
                 fork_from_session_id=self._PARENT,
             )
