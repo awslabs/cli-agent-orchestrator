@@ -36,7 +36,7 @@ Storage is split in two tiers:
 | `networkpolicy.yaml` | Ingress and egress policies per role |
 | `external-secrets.example.yaml` | Credential pipeline — applied separately (needs ESO CRDs) |
 | `iac/infrastructure.yaml` | CloudFormation: every AWS resource — VPC, EKS cluster, add-ons, secret, IAM, ECR, EFS |
-| `iac/storageclasses.yaml` | The `gp3` and `efs-sc` StorageClasses the manifests reference |
+| `storageclass-gp3.yaml` | The `gp3` StorageClass for per-pod state volumes |
 
 ## Prerequisites
 
@@ -45,13 +45,12 @@ Storage is split in two tiers:
 | 1 | Local tools | `kubectl`, `docker`, AWS CLI |
 | 2 | AWS resources — VPC, EKS cluster, add-ons, provider secret, IAM, ECR, EFS | `aws cloudformation deploy --template-file k8s/iac/infrastructure.yaml --stack-name cao-workshop --capabilities CAPABILITY_NAMED_IAM` (~15 min) |
 | 3 | kubectl access | `aws eks update-kubeconfig --region <region> --name cao-workshop` |
-| 4 | StorageClasses `gp3` and `efs-sc` | `kubectl apply -f k8s/iac/storageclasses.yaml` |
-| 5 | External Secrets Operator | Install into namespace `external-secrets` with Helm — see [external-secrets.io](https://external-secrets.io) |
-| 6 | Provider API key | Secrets Manager console → the secret named in the stack output → Edit → **Plaintext** tab → paste the raw key alone. No JSON, quotes or trailing newline |
-| 7 | Restart ESO | `kubectl -n external-secrets rollout restart deployment --all` |
-| 8 | Panel token | `kubectl -n cao-cluster create secret generic cao-panel-secret --from-literal=token="$(openssl rand -hex 32)"` |
-| 9 | Server image | Build and push — see [Building the image](#building-the-image) |
-| 10 | Credential pipeline | `kubectl apply -f k8s/external-secrets.example.yaml` |
+| 4 | External Secrets Operator | Install into namespace `external-secrets` with Helm — see [external-secrets.io](https://external-secrets.io) |
+| 5 | Provider API key | Secrets Manager console → the secret named in the stack output → Edit → **Plaintext** tab → paste the raw key alone. No JSON, quotes or trailing newline |
+| 6 | Restart ESO | `kubectl -n external-secrets rollout restart deployment --all` |
+| 7 | Panel token | `kubectl -n cao-cluster create secret generic cao-panel-secret --from-literal=token="$(openssl rand -hex 32)"` |
+| 8 | Server image | Build and push — see [Building the image](#building-the-image) |
+| 9 | Credential pipeline | `kubectl apply -f k8s/external-secrets.example.yaml` |
 
 Notes on the steps that surprise people:
 
@@ -59,11 +58,11 @@ Notes on the steps that surprise people:
   it works in a brand-new account with no VPC. It also enables NetworkPolicy
   enforcement in the VPC CNI, which is off by default and without which the
   policies in `networkpolicy.yaml` are accepted and then silently never enforced.
-- **Step 6** is manual by design: the stack creates the secret *empty*, so
+- **Step 5** is manual by design: the stack creates the secret *empty*, so
   forgetting this fails loudly instead of syncing a placeholder.
-- **Step 7** is required because Pod Identity injects credentials through a
+- **Step 6** is required because Pod Identity injects credentials through a
   webhook at pod creation, so ESO pods started before step 2 never receive them.
-- **Step 10** is separate from `kustomization.yaml` because its objects need the
+- **Step 9** is separate from `kustomization.yaml` because its objects need the
   ESO CRDs, which would make `kubectl apply -k k8s` fail on a cluster without ESO.
   Confirm the `ClusterSecretStore` is `Ready=True` and the `ExternalSecret` reports
   `SecretSynced` before deploying.
