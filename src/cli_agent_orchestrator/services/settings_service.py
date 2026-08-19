@@ -431,6 +431,52 @@ def is_learning_enabled() -> bool:
         return False
 
 
+def is_workflow_approval_required() -> bool:
+    """Return True when an unapproved script-tier workflow run must be refused (issue #583 FR-8).
+
+    Default is **False**: enforcement is opt-in. A ``plan_id`` does not exist until run start, so a
+    plan that has never run cannot have been approved and its first run is refused by design. Making
+    that the default would break every existing script-tier caller one Bolt before the authoring
+    sequence that presents a plan and takes approval BEFORE running.
+
+    PRECEDENCE IS DELIBERATELY ASYMMETRIC, AND THIS IS NOT AN OVERSIGHT. Every sibling setting here
+    resolves ``CAO_* env var > settings.json > default`` — see :func:`is_memory_enabled`. This one
+    does NOT:
+
+        ``CAO_WORKFLOW_REQUIRE_APPROVAL`` may turn the gate **ON**.
+        Only ``settings.json`` can turn it **OFF**.
+
+    The reason is that this setting is a CONTROL, not a feature toggle. Under the house precedence,
+    anything able to set an environment variable could switch the approval gate off while the
+    operator's settings file still read as configured on — which would make the weakest
+    configuration mechanism in the system the one that decides whether runs are authorised. The
+    asymmetry is monotonic in the safe direction: nothing that merely influences an environment can
+    weaken the gate, while enabling it for a single test or trial stays a one-liner.
+
+    Read failure resolves to the default (disabled) with a warning, which is the ONE place this
+    mechanism is deliberately not fail-closed. Treating an unreadable settings file as "gate on"
+    would refuse every script run in the installation on the strength of a JSON typo. Resolving to
+    disabled makes the unreadable case behave like the unconfigured case, and the asymmetry above
+    bounds the residual: an operator who enabled the gate via the environment is unaffected by a
+    corrupt file.
+    """
+    env = os.environ.get("CAO_WORKFLOW_REQUIRE_APPROVAL")
+    if env is not None and env.strip().lower() in ("1", "true", "yes"):
+        # Enable-only: a falsy env value is NOT consulted, so it cannot override an enabling
+        # settings.json below. Returning early on truthy is what makes the precedence asymmetric.
+        return True
+    try:
+        workflow_settings = _load().get("workflow", {})
+        if not isinstance(workflow_settings, dict):
+            return False
+        return bool(workflow_settings.get("require_approval", False))
+    except Exception as e:
+        logger.warning(
+            "Failed to read workflow.require_approval, defaulting to False (gate disabled): %s", e
+        )
+        return False
+
+
 def is_instruction_promotion_enabled() -> bool:
     """Return True when learned-lesson promotion into profile files is enabled.
 

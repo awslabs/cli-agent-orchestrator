@@ -123,6 +123,12 @@ class RunRow:
     finished_at: Optional[str]
     tier: str = "yaml"
     generation: str = "1"
+    # issue #583 Bolt 2, ``approval-gate``: the frozen execution manifest, readable. ``manifest-column``
+    # added the column and ``manifest-freeze`` writes it, but until now NOTHING read it back — the
+    # resume approval gate is the first reader, so it owns the read path. Additive and defaulted, the
+    # same shape ``StepRow``'s docstring describes for U1's nullable fields: a row written before this
+    # (or by a YAML run, which never freezes) reads back observably identical to its previous shape.
+    manifest_json: Optional[str] = None
 
 
 @dataclass
@@ -841,7 +847,7 @@ def get_run(run_id: str) -> Optional[RunRow]:
     with _connect() as conn:
         row = conn.execute(
             "SELECT run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            "current_step_id, started_at, finished_at, tier, generation "
+            "current_step_id, started_at, finished_at, tier, generation, manifest_json "
             "FROM workflow_run WHERE run_id = ?",
             (run_id,),
         ).fetchone()
@@ -858,6 +864,9 @@ def get_run(run_id: str) -> Optional[RunRow]:
         finished_at=row[7],
         tier=row[8],
         generation=row[9],
+        # issue #583 Bolt 2, ``approval-gate``: NULL for every YAML run and for any run whose freeze
+        # failed. Both read back as None, which the resume gate refuses when enforcement is on.
+        manifest_json=row[10],
     )
 
 

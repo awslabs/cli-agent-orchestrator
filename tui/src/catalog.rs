@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **69 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **70 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,7 +64,7 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **69 as of this branch.** Two separate merges from `main` each brought four new leaf commands
+/// **70 as of this branch.** Two separate merges from `main` each brought four new leaf commands
 /// that this table did not know about, and both were caught by
 /// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
 /// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 69;
+const COMMAND_COUNT: usize = 70;
 
 /// What the TUI does with a command.
 ///
@@ -244,6 +244,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::SkillsList,
     CommandId::SkillsRemove,
     CommandId::TerminalRestore,
+    CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
     CommandId::WorkflowDelete,
     CommandId::WorkflowEvents,
@@ -403,6 +404,8 @@ pub enum CommandId {
     TerminalRestore,
 
     // `cao workflow *`
+    /// `cao workflow approve`
+    WorkflowApprove,
     /// `cao workflow cancel`
     WorkflowCancel,
     /// `cao workflow delete`
@@ -1047,6 +1050,20 @@ fn entry(id: CommandId) -> Command {
             // HIDE: human ruled out; recovery-by-terminal-ID tooling, not a launcher action
         },
 
+        CommandId::WorkflowApprove => Command {
+            id: CommandId::WorkflowApprove,
+            parent: Some("workflow"),
+            leaf_name: "approve",
+            summary: "Approve a plan identifier so runs of that plan may start.",
+            // Hidden per the mandated default: an unclassified command defaults to HIDE so an
+            // unvetted command cannot surface half-working. Not reviewed for in-app use, and there
+            // is a reason not to rush that review — approving a plan is a deliberate human
+            // authorisation act, and surfacing it as a one-click pane entry is exactly the shape
+            // that would make it casual. (#583 Bolt 2, approval-operation)
+            policy: Policy::Hidden,
+            params: &[Param { name: "plan_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
         CommandId::WorkflowCancel => Command {
             id: CommandId::WorkflowCancel,
             parent: Some("workflow"),
@@ -1262,7 +1279,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 27 HIDE, totalling 69.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 28 HIDE, totalling 70.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1299,16 +1316,16 @@ mod tests {
     /// consistent and every test green, because nothing compared the table against the CLI. That
     /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_twentyseven() {
+    fn the_policy_distribution_is_twentyfour_eighteen_twentyeight() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 27, "expected 27 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 28, "expected 28 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            69,
-            "the three policy counts must account for all 69 leaf commands of the Click tree"
+            70,
+            "the three policy counts must account for all 70 leaf commands of the Click tree"
         );
 
         // The three counts summing to 69 does not prove 69 *distinct* commands were counted: a
@@ -1318,8 +1335,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            69,
-            "DISPLAY_ORDER must list 69 DISTINCT commands; a duplicate would let one command go \
+            70,
+            "DISPLAY_ORDER must list 70 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1443,6 +1460,7 @@ mod tests {
                     CommandId::SkillsList => CommandId::SkillsList,
                     CommandId::SkillsRemove => CommandId::SkillsRemove,
                     CommandId::TerminalRestore => CommandId::TerminalRestore,
+                    CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
                     CommandId::WorkflowDelete => CommandId::WorkflowDelete,
                     CommandId::WorkflowEvents => CommandId::WorkflowEvents,
@@ -1517,6 +1535,7 @@ mod tests {
                 CommandId::SkillsList,
                 CommandId::SkillsRemove,
                 CommandId::TerminalRestore,
+                CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,
                 CommandId::WorkflowEvents,
