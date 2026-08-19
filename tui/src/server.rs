@@ -685,6 +685,12 @@ fn route(id: CommandId) -> Option<Route> {
         // unbounded for this client's purposes.
         CommandId::WorkflowResume => None,
         CommandId::WorkflowRun => None,
+        // HIDE (issue #640), so it is unreachable through `commands()` and needs no route — the
+        // arm exists because this `match` is exhaustive, not because a route was withheld. A route
+        // does exist (`POST /workflows/runs/{run_id}/steps/{step_id}:replay`); it is unrouted here
+        // for the same reason every other HIDE row is, and `no HANDOFF or HIDE command may carry a
+        // route` is asserted below.
+        CommandId::WorkflowStep => None,
     }
 }
 
@@ -2659,7 +2665,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 27 HIDE = 69; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 28 HIDE = 70; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

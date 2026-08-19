@@ -254,9 +254,41 @@ results for calls that already completed. A **deterministic** script (see Valida
 resumes cleanly with no code change; a nondeterministic one surfaces
 `ReplayDivergenceError`.
 
+## Re-running one step
+
+`cao workflow step <run-id> <step-id>` re-executes **one** step of a run that already
+finished (or failed), without re-running the workflow. Authoring a long workflow used to
+mean a full re-run per prompt edit — fixing two sentences in step 55 of 57 cost reaching
+step 55 again. This verb closes that loop:
+
+```bash
+# re-run step 55 exactly as recorded
+cao workflow step run-abc123 draft-summary
+
+# re-run it with an edited prompt (from a file, or inline)
+cao workflow step run-abc123 draft-summary --prompt-file /tmp/better-prompt.md
+cao workflow step run-abc123 draft-summary --prompt-override 'Be terse. {{steps.research.output.notes}}'
+```
+
+The step's prompt is resolved from the **recorded** run — its journaled inputs and its
+predecessors' outputs — so a step that templates off earlier steps runs with the same
+values it saw originally. A replacement prompt replaces the *template*: `{{...}}`
+references inside it still resolve against that run, which is what makes an edited prompt
+runnable in place.
+
+The source run is **never modified**: no journal row is written, no event is emitted, and
+the recorded step's own output stays readable. Replay as many times as it takes. The
+resolved prompt is printed alongside the output, because a wrong-looking output is usually
+a prompt that resolved differently than expected.
+
+Limits: YAML-tier runs only (a script-tier step's inputs come from the script, not from a
+spec snapshot), and a step whose predecessor never produced output cannot be replayed —
+that fails with the missing reference named rather than running with a blank. Exit code is
+0 when the step ran, 1 when it failed.
+
 ## CLI reference
 
-All twelve verbs live under `cao workflow`.
+All thirteen verbs live under `cao workflow`.
 
 | Verb | Flags | Description |
 | --- | --- | --- |
@@ -271,6 +303,7 @@ All twelve verbs live under `cao workflow`.
 | `result <run_id>` | `--json` | The complete `WorkflowRunResult` for a run — the full-detail surface `run --json` no longer prints. Answers for an **in-flight** run too (the steps settled so far), not only a finished one, and works for a detached or post-restart run because it is assembled from the journal. |
 | `events <run_id>` | `--follow/--no-follow`, `--after-seq <n>`, `--json` | Stream live per-run ordered progress (SSE). `--no-follow` does a one-shot batch read. Requires the events route from issue #504 — on a build without it, both modes report that the stream is unavailable and point at `wait`/`status`, rather than claiming the run is unknown. |
 | `resume <run_id>` | `--json` | Resume a crashed/failed run from its journal (blocks). |
+| `step <run_id> <step_id>` | `--prompt-file <path>`, `--prompt-override <text>`, `--json` | Re-execute ONE recorded step live (blocks), resolving its prompt from the recorded run. Leaves the run untouched. The two prompt flags are mutually exclusive. YAML tier only. Exit 0 ran, 1 failed. |
 | `cancel <run_id>` | — | Cooperatively cancel a running workflow. |
 
 ## MCP tool reference (from inside an agent session)
