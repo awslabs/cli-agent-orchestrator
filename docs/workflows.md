@@ -433,6 +433,23 @@ takes approval *before* running is a later piece of work.
 - **Fail-closed while enabled**: a run whose manifest is missing or unreadable is refused rather than
   admitted.
 
+### Memory is frozen too, and the copy the agent sees is redacted
+
+A script-tier run resolves CAO memory **once**, at its first terminal, and records the content, its source and a
+hash of the **full** resolved content into the same manifest. Every later terminal of that run — and every resume,
+however long afterwards — is given that recorded copy. **Editing CAO memory after a failure therefore does not
+change what a resumed run sees.**
+
+One consequence is worth stating plainly, because it differs from a non-workflow terminal:
+
+> **On a workflow-driven terminal the injected memory block is the frozen, REDACTED copy**, and it is truncated if
+> the manifest's size bound bites (recorded as `memory.truncated`). A terminal you start yourself still receives
+> the live, unredacted block. The frozen copy is what makes a replay byte-identical to the original run — and it
+> means a secret sitting in curated memory stops reaching the agent's context on this path.
+
+The recorded hash covers the full resolved content, taken **before** redaction, so it identifies what was resolved
+rather than what survived the redaction rules of the day.
+
 ### Two things not yet implemented
 
 Stated here because their absence is easy to assume away:
