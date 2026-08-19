@@ -174,16 +174,20 @@ APPROVAL_PROMPT_PATTERN = (
     r"|grant these permissions)\?"
     r"|Do you want to approve network access to)"
 )
-# Rendered as `Press ` + `<accept-key>` + ` to confirm or ` + `<cancel-key>` +
+# Rendered as `Press ` + `<accept-label>` + ` to confirm or ` + `<cancel-key>` +
 # ` to cancel`, with the key names emitted as separately styled spans -- the whole
 # sentence is not one literal in the binary. The accept key is CONFIGURABLE
-# (`tui.keymap.list.accept`, e.g. "space" -> "Press space to confirm ..."), so
-# match the stable structural wording independently of the key: "Press <key> to
-# confirm". `\S+` (not `.+`) keeps it to a single key token so this can't span
-# arbitrary prose, and it stays gated by the numbered-menu-at-bottom structure in
-# _has_approval_prompt_in_bottom, so a completed reply merely quoting the phrase is
-# still rejected.
-APPROVAL_PROMPT_FOOTER = r"Press \S+ to confirm\b"
+# (`tui.keymap.list.accept`) and its label is NOT a single token: a two-stroke
+# chord such as "ctrl-x ctrl-s" renders via ShortcutHint::display_label() as
+# `ctrl + x ctrl + s` (strokes joined by a space, modifiers by " + ";
+# codex-rs/tui/src/key_hint.rs at rust-v0.147.0). Worst legal label is a chord
+# whose strokes each carry ctrl+shift+alt: 7 tokens per stroke, 14 in total, so
+# the label is matched as 1-15 whitespace-separated tokens. The bound keeps a
+# same-line prose sentence from bridging an unrelated "Press" to a distant
+# "to confirm"; the numbered-menu-at-bottom structure in
+# _has_approval_prompt_in_bottom stays the guard that rejects a completed reply
+# merely quoting the phrase.
+APPROVAL_PROMPT_FOOTER = r"Press \S+(?:[^\S\n]+\S+){0,14} to confirm\b"
 # One numbered menu option: "› 1. Yes, proceed (y)", "  2. No, ... (esc)". The
 # selection cursor is optional here because it sits on exactly one option at a
 # time and moves as the operator arrows around.

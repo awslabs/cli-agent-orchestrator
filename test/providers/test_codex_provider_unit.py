@@ -11,6 +11,7 @@ import pytest
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
+    APPROVAL_PROMPT_FOOTER,
     CodexProvider,
     ProviderError,
     _find_response_marker,
@@ -3191,12 +3192,35 @@ class TestCodexProviderApprovalPromptLive:
 
         assert _has_approval_prompt_in_bottom(prompt + "\n" * 20)
 
-    @pytest.mark.parametrize("accept_key", ["enter", "space", "tab", "y"])
+    @pytest.mark.parametrize(
+        "accept_key",
+        [
+            "enter",
+            "space",
+            "tab",
+            "y",
+            # Modified single keys: modifiers join with " + "
+            # (key_hint.rs CTRL_PREFIX et al.), so one binding is already
+            # multi-token on screen.
+            "ctrl + s",
+            "shift + tab",
+            # Two-stroke chords: RuntimeChordKeymap accepts e.g.
+            # tui.keymap.list.accept="ctrl-x ctrl-s" and
+            # ShortcutHint::display_label() joins the strokes with a single
+            # space (haofeif round 4). A single-token match classified this
+            # pane IDLE — the unsafe direction.
+            "ctrl + x ctrl + s",
+            # Worst legal shape: every modifier on both strokes, 14 tokens.
+            "ctrl + shift + alt + x ctrl + shift + alt + s",
+        ],
+    )
     def test_configurable_confirm_key_still_detected(self, accept_key):
         """The accept key is configurable (``tui.keymap.list.accept``), so the
         footer can read ``Press space to confirm ...`` etc. Detection must key on
         the structural wording, not the literal "enter" — otherwise a custom
-        keymap re-creates the original unsafe IDLE classification (haofeif P2)."""
+        keymap re-creates the original unsafe IDLE classification (haofeif P2).
+        The label is not even one token: chords render as e.g.
+        ``ctrl + x ctrl + s`` (haofeif round 4)."""
         prompt = (
             "  Would you like to run the following command?\n"
             "\n"
@@ -3208,6 +3232,48 @@ class TestCodexProviderApprovalPromptLive:
             f"  Press {accept_key} to confirm or esc to cancel\n"
         )
         assert _has_approval_prompt_in_bottom(prompt + "\n" * 10)
+
+    def test_chord_confirm_key_is_waiting_via_both_status_paths(self):
+        """A two-stroke accept chord must classify WAITING through both public
+        entry points, not just the private helper.
+
+        At ``a926f89`` the footer ``Press ctrl + x ctrl + s to confirm ...``
+        (the exact rendering of ``tui.keymap.list.accept="ctrl-x ctrl-s"`` at
+        0.147.0) made both :meth:`get_status` and :meth:`get_status_from_screen`
+        return IDLE for a hard-blocked pane, so queued input was pasted into
+        the approval menu (haofeif round 4).
+        """
+        output = (
+            "› do the thing\n"
+            "• Working on it.\n"
+            "  Would you like to run the following command?\n"
+            "\n"
+            "  $ mkdir -p /tmp/subdir\n"
+            "\n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. No, and tell Codex what to do differently (esc)\n"
+            "\n"
+            "  Press ctrl + x ctrl + s to confirm or esc to cancel\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status_from_screen(output.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    def test_footer_match_is_bounded_against_prose(self):
+        """The multi-token key label is BOUNDED (15 tokens, the worst legal
+        chord). A prose sentence that happens to contain "Press" and, much
+        later on the same line, "to confirm" must not bridge the two — the
+        bound is the regex-level backstop under the structural gates."""
+        prose = (
+            "  Press the escape key if you would instead like the assistant "
+            "to stop what it is doing right now and wait for you to confirm\n"
+        )
+        assert not re.search(APPROVAL_PROMPT_FOOTER, prose)
 
     @pytest.mark.parametrize(
         "question",
