@@ -1076,11 +1076,8 @@ LAUNCHABLE_EXECUTION_MODES: tuple[str, ...] = (em.ACP, em.NATIVE_TUI)
 #: session id the provider will resume by id; a provider without both is
 #: refused rather than launched into an unresumable pane.
 #: Derived from the adapters that actually exist rather than written out
-#: by hand.  A provider is native-launchable only if every one of the
-#: three surfaces it needs is implemented for it: an argv binder that can
-#: bind a session exactly, a readiness receipt kind, and an issuance
-#: source.  Listing a provider here that lacked one of those would
-#: advertise a capability whose first use fails part-way through a launch.
+#: by hand, ensuring parity across the argv binder, readiness receipt kind,
+#: issuance source, and pinned executable tables.
 NATIVE_TUI_PROVIDERS: frozenset[str] = frozenset(
     provider
     for provider in native_tui_launch.SUPPORTED_NATIVE_PROVIDERS

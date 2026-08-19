@@ -1120,7 +1120,7 @@ def test_only_providers_with_a_native_branch_may_launch_native():
     assert set(v2._NATIVE_TUI_READINESS_RECEIPT_KINDS) == v2.NATIVE_TUI_PROVIDERS
     assert v2.NATIVE_TUI_PROVIDERS <= set(v2._ISSUANCE_SOURCES)
     assert v2.NATIVE_TUI_PROVIDERS <= set(v2._PINNED_PROVIDER)
-    assert v2.NATIVE_TUI_PROVIDERS <= native_tui_launch.SUPPORTED_NATIVE_PROVIDERS
+    assert v2.NATIVE_TUI_PROVIDERS == native_tui_launch.SUPPORTED_NATIVE_PROVIDERS
     # Disjoint from the ACP kinds, so neither table can accept the other's
     # evidence by accident.
     assert not set(v2._NATIVE_TUI_READINESS_RECEIPT_KINDS.values()) & set(
