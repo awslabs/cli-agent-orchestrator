@@ -301,6 +301,91 @@ class TestSessionPluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_sweep_recovered_row_still_gets_post_kill_terminal(
+        self, mock_tmux, mock_list_terminals, mock_capture, _dismantle, mock_db_delete, mock_sweep
+    ):
+        """A row whose FIRST delete raised but which the sweep removed is owed
+        its event.
+
+        This is a supported recovery path: the runtime is dismantled, the sweep
+        durably removes the row, the session reports deleted — all durable, and
+        a re-run rebuilds its worklist from rows that no longer exist, so this
+        dispatch is the terminal's ONLY chance at a ``post_kill_terminal``.
+        Dropping it leaves plugin-maintained inventories permanently stale
+        (fanhongy P2 on #498).
+        """
+        registry = _registry_mock()
+        dispatched: list[tuple] = []
+
+        async def record_dispatch(event_type, event):
+            dispatched.append((event_type, event))
+
+        mock_tmux.return_value.session_exists_strict.return_value = True
+        mock_tmux.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [{"id": "aaaa1111"}, {"id": "bbbb2222"}]
+        mock_capture.side_effect = lambda tid: {
+            "tmux_session": "cao-demo",
+            "tmux_window": f"developer-{tid[:4]}",
+            "agent_profile": "developer",
+        }
+        # The first terminal's row delete fails transiently; the peer's works.
+        mock_db_delete.side_effect = lambda tid: (
+            (_ for _ in ()).throw(RuntimeError("database is locked")) if tid == "aaaa1111" else True
+        )
+        mock_sweep.return_value = None  # the sweep succeeds
+        registry.dispatch.side_effect = record_dispatch
+
+        result = delete_session("cao-demo", registry=registry)
+
+        assert result["deleted"] == ["cao-demo"]
+        # The sweep was given the failed row's id (with the peer's, idempotent).
+        assert mock_sweep.call_args.args[0] == ["aaaa1111", "bbbb2222"]
+        terminal_events = [e for kind, e in dispatched if kind == "post_kill_terminal"]
+        assert {e.terminal_id for e in terminal_events} == {"aaaa1111", "bbbb2222"}
+        assert [kind for kind, _ in dispatched][-1] == "post_kill_session"
+
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_row_that_survives_the_sweep_too_gets_no_event(
+        self, mock_tmux, mock_list_terminals, mock_capture, _dismantle, mock_db_delete, mock_sweep
+    ):
+        """The inverse bound: if the sweep ALSO fails, the row survives and the
+        event is NOT emitted — the surviving row is the retry handle, and the
+        retried ``delete_session`` owns the event once it finally removes it.
+        Emitting here too would double-fire on the retry."""
+        registry = _registry_mock()
+        dispatched: list[tuple] = []
+
+        async def record_dispatch(event_type, event):
+            dispatched.append((event_type, event))
+
+        mock_tmux.return_value.session_exists_strict.return_value = True
+        mock_tmux.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [{"id": "aaaa1111"}]
+        mock_capture.return_value = {
+            "tmux_session": "cao-demo",
+            "tmux_window": "developer-aaaa",
+            "agent_profile": "developer",
+        }
+        mock_db_delete.side_effect = RuntimeError("database is locked")
+        mock_sweep.side_effect = RuntimeError("database is locked")
+        registry.dispatch.side_effect = record_dispatch
+
+        result = delete_session("cao-demo", registry=registry)
+
+        assert any(e.get("step") == "delete_terminals_by_ids" for e in result["errors"])
+        assert [kind for kind, _ in dispatched] == ["post_kill_session"]
+
 
 class TestTerminalPluginEvents:
     """Verify terminal lifecycle events are emitted correctly."""

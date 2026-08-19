@@ -1520,3 +1520,248 @@ def test_rollback_clears_forwarded_env_even_when_the_kill_raises_base_exception(
     t.start()
     t.join(timeout=DEADLOCK_TIMEOUT)
     assert acquired.is_set(), "lifecycle lock was not released when the rollback was interrupted"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation during the off-thread create transaction (#498 follow-up).
+#
+# ``asyncio.to_thread`` cancellation cancels only the AWAITER: the worker
+# thread runs on, takes the lifecycle lock, creates the backend session and
+# commits the registry row — into the void. ``CancelledError`` is a
+# BaseException, so ``create_terminal``'s ``except Exception`` cleanup never
+# sees it, and the outer created-flags are still False so it would tear down
+# nothing anyway. The result is a live session + row with no FIFO, no
+# provider, and no caller that knows the terminal exists — exactly the
+# divergence #498 exists to eliminate.
+#
+# Both tests below block the worker at a chosen point with an Event, cancel
+# the awaiting task, then release the worker and require the compensating
+# rollback (observed via a signalling ``db_delete_terminal``) to leave both
+# stores empty. Blocked-ness and completion are established by events, never
+# by the clock.
+# ---------------------------------------------------------------------------
+
+
+def _cancel_create_scenario(session_name, worker_blocked, release_worker, rolled_back):
+    """Drive create_terminal to cancellation from its own event loop.
+
+    Returns the exception the awaited task raised (must be CancelledError).
+    The worker is released BEFORE the task is awaited: the fix holds the
+    cancellation until the worker's outcome is compensated, so the task cannot
+    finish while the worker is still parked — awaiting first would deadlock
+    the scenario against its own gate. The payoff is the strongest possible
+    assertion: by the time CancelledError propagates out of the task, the
+    compensating rollback must ALREADY be durable (``rolled_back`` set), not
+    merely scheduled.
+    """
+    import asyncio
+
+    async def scenario():
+        task = asyncio.create_task(
+            terminal_service.create_terminal(
+                provider="claude_code",
+                agent_profile="developer",
+                session_name=session_name,
+                new_session=True,
+            )
+        )
+        assert await asyncio.to_thread(
+            worker_blocked.wait, DEADLOCK_TIMEOUT
+        ), "create worker never reached its blocking point"
+        task.cancel()
+        release_worker.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), DEADLOCK_TIMEOUT)
+        except BaseException as exc:  # noqa: BLE001 — the type IS the assertion
+            raised = exc
+        else:
+            raised = None
+        assert rolled_back.is_set(), (
+            "CancelledError propagated before the compensating rollback was "
+            "durable — the cancellation must wait for the compensation"
+        )
+        return raised
+
+    return asyncio.run(scenario())
+
+
+def _signalling_row_delete(monkeypatch, rolled_back):
+    """Patch terminal_service.db_delete_terminal to signal after deleting."""
+    real_delete = terminal_service.db_delete_terminal
+
+    def signalling(terminal_id):
+        result = real_delete(terminal_id)
+        rolled_back.set()
+        return result
+
+    monkeypatch.setattr(terminal_service, "db_delete_terminal", signalling)
+
+
+def test_cancelled_create_rolls_back_worker_blocked_on_lifecycle_lock(
+    real_db, runtime, monkeypatch
+):
+    """Cancel while the worker waits for the lock — BEFORE the backend create.
+
+    The test holds the lifecycle lock, so the worker is provably parked in
+    ``lock.acquire()`` (same construction as ``_wait_until_lock_contended``).
+    After cancellation the worker proceeds to build the session AND commit the
+    row; the compensator must reacquire the lock and remove both.
+    """
+    import asyncio
+
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+
+    worker_blocked = threading.Event()
+    release_worker = threading.Event()
+    rolled_back = threading.Event()
+    _signalling_row_delete(monkeypatch, rolled_back)
+
+    def _hold_lock():
+        with session_lock.session_lifecycle_lock("cao-cancel-lock"):
+            _wait_until_lock_contended("cao-cancel-lock")
+            worker_blocked.set()
+            assert release_worker.wait(DEADLOCK_TIMEOUT), "scenario never released the holder"
+
+    holder = threading.Thread(target=_hold_lock, daemon=True)
+    holder.start()
+    try:
+        raised = _cancel_create_scenario(
+            "cao-cancel-lock", worker_blocked, release_worker, rolled_back
+        )
+    finally:
+        release_worker.set()
+        holder.join(timeout=DEADLOCK_TIMEOUT)
+
+    assert isinstance(raised, asyncio.CancelledError), f"expected CancelledError, got {raised!r}"
+    # Both stores empty: the void-created session and its row were compensated.
+    assert backend.session_exists("cao-cancel-lock") is False
+    assert database.list_terminals_by_session("cao-cancel-lock") == []
+    # The name is reusable: no lock entry leaked.
+    assert session_lock._session_locks == {}
+
+
+def test_cancelled_create_compensation_holds_the_lifecycle_lock(real_db, runtime, monkeypatch):
+    """The compensating rollback must run UNDER the lifecycle lock.
+
+    Unlocked, its late kill could destroy a NEW incarnation of the name that a
+    concurrent caller legitimately built after the void-created one — the same
+    never-observable-half-built argument the create's own rollback makes. The
+    proof is by construction, not by clock: the compensator is parked inside
+    its ``kill_session`` while a contender is provably registered on the lock
+    (the refcount observation ``_wait_until_lock_contended`` exists for), and
+    the contender must not have acquired.
+    """
+    import asyncio
+
+    class KillGateBackend(FakeTmuxBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.in_kill = threading.Event()
+            self.kill_release = threading.Event()
+
+        def kill_session(self, session_name: str) -> bool:
+            self.in_kill.set()
+            assert self.kill_release.wait(DEADLOCK_TIMEOUT), "referee never released the kill"
+            return super().kill_session(session_name)
+
+    backend = KillGateBackend()
+    set_backend(backend)
+
+    worker_blocked = threading.Event()
+    release_worker = threading.Event()
+    rolled_back = threading.Event()
+    _signalling_row_delete(monkeypatch, rolled_back)
+
+    real_create = terminal_service.db_create_terminal
+
+    def gated_create(*args, **kwargs):
+        worker_blocked.set()
+        assert release_worker.wait(DEADLOCK_TIMEOUT), "scenario never released the row write"
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(terminal_service, "db_create_terminal", gated_create)
+
+    contender_acquired = threading.Event()
+    thread_errors: Dict[str, BaseException] = {}
+
+    def _contend():
+        try:
+            assert backend.in_kill.wait(DEADLOCK_TIMEOUT), "compensator never reached its kill"
+            with session_lock.session_lifecycle_lock("cao-cancel-lockheld"):
+                contender_acquired.set()
+        except BaseException as exc:  # noqa: BLE001 — recorded for the main thread
+            thread_errors["contender"] = exc
+
+    def _referee():
+        try:
+            assert backend.in_kill.wait(DEADLOCK_TIMEOUT), "compensator never reached its kill"
+            # Holder (the compensator) + contender both registered: the
+            # contender is committed to lock.acquire() and provably cannot be
+            # inside its critical section while the compensator's kill is gated.
+            _wait_until_lock_contended("cao-cancel-lockheld")
+            assert (
+                not contender_acquired.is_set()
+            ), "compensation ran without holding the lifecycle lock"
+        except BaseException as exc:  # noqa: BLE001 — recorded for the main thread
+            thread_errors["referee"] = exc
+        finally:
+            # Unconditional: a referee that died holding the gate would strand
+            # the compensator and report a bogus deadlock instead of the real
+            # failure.
+            backend.kill_release.set()
+
+    contender = threading.Thread(target=_contend, daemon=True)
+    referee = threading.Thread(target=_referee, daemon=True)
+    contender.start()
+    referee.start()
+    try:
+        raised = _cancel_create_scenario(
+            "cao-cancel-lockheld", worker_blocked, release_worker, rolled_back
+        )
+    finally:
+        backend.kill_release.set()
+        contender.join(timeout=DEADLOCK_TIMEOUT)
+        referee.join(timeout=DEADLOCK_TIMEOUT)
+
+    assert thread_errors == {}, f"observer thread failed: {thread_errors!r}"
+    assert isinstance(raised, asyncio.CancelledError), f"expected CancelledError, got {raised!r}"
+    # The contender got the name once compensation finished — nothing leaked.
+    assert contender_acquired.is_set(), "contender never acquired after compensation"
+    assert backend.session_exists("cao-cancel-lockheld") is False
+    assert database.list_terminals_by_session("cao-cancel-lockheld") == []
+    assert session_lock._session_locks == {}
+
+
+def test_cancelled_create_rolls_back_worker_blocked_in_row_write(real_db, runtime, monkeypatch):
+    """Cancel while the worker is inside ``db_create_terminal`` — AFTER the
+    backend create. The tmux session exists at cancellation time; the row
+    commits after. The compensator must remove both."""
+    import asyncio
+
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+
+    worker_blocked = threading.Event()
+    release_worker = threading.Event()
+    rolled_back = threading.Event()
+    _signalling_row_delete(monkeypatch, rolled_back)
+
+    real_create = terminal_service.db_create_terminal
+
+    def gated_create(*args, **kwargs):
+        worker_blocked.set()
+        assert release_worker.wait(DEADLOCK_TIMEOUT), "scenario never released the row write"
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(terminal_service, "db_create_terminal", gated_create)
+
+    raised = _cancel_create_scenario("cao-cancel-row", worker_blocked, release_worker, rolled_back)
+
+    assert isinstance(raised, asyncio.CancelledError), f"expected CancelledError, got {raised!r}"
+    # The session provably existed when the worker was parked in the row write
+    # (create_session precedes db_create_terminal under the lock), so an empty
+    # backend here is the compensator's doing, not a create that never ran.
+    assert backend.session_exists("cao-cancel-row") is False
+    assert database.list_terminals_by_session("cao-cancel-row") == []
+    assert session_lock._session_locks == {}

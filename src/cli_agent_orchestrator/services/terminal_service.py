@@ -255,6 +255,62 @@ def _roll_back_backend_create_locked(
             logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
 
 
+def _roll_back_cancelled_create(
+    session_name: str,
+    terminal_id: str,
+    window_name: str,
+    *,
+    created_session: bool,
+) -> None:
+    """Undo a create whose awaiter was cancelled AFTER the worker succeeded.
+
+    Runs on a worker thread. Unlike the in-closure rollback this must
+    REACQUIRE the lifecycle lock: the worker released it when it returned, and
+    an unlocked late kill could destroy a NEW incarnation of the name that
+    another caller legitimately built in between — the same
+    never-observable-half-built argument the closure's docstring makes. Under
+    the lock, kill the session/window THIS call created, then drop the
+    committed row, so the cancelled create leaves both stores exactly as it
+    found them.
+
+    Best-effort like its sibling: the cancellation is already propagating and
+    is what the caller must see.
+    """
+    with session_lifecycle_lock(session_name):
+        _roll_back_backend_create_locked(session_name, window_name, created_session=created_session)
+        try:
+            db_delete_terminal(terminal_id)
+        except Exception:
+            logger.exception(
+                f"Rollback: failed to delete registry row {terminal_id} " "after a cancelled create"
+            )
+
+
+async def _finish_and_roll_back_cancelled_create(
+    create_worker: "asyncio.Task[Tuple[str, bool, bool]]",
+    session_name: str,
+    terminal_id: str,
+) -> None:
+    """Await the un-cancellable create worker, then compensate its outcome.
+
+    If the worker RAISED, its locked closure already rolled the backend
+    resource back and never wrote the row — nothing to do. If it RETURNED, it
+    built a session/window and committed a row that no caller will ever hear
+    about; roll both back under the lifecycle lock.
+    """
+    try:
+        window_name, session_created, _ = await create_worker
+    except BaseException:
+        return
+    await asyncio.to_thread(
+        _roll_back_cancelled_create,
+        session_name,
+        terminal_id,
+        window_name,
+        created_session=session_created,
+    )
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -633,9 +689,33 @@ async def create_terminal(
                     raise
                 return created_window_name, created_session, created_window
 
-        window_name, session_created, window_created = await asyncio.to_thread(
-            _create_session_or_window_locked
-        )
+        # The worker is UN-CANCELLABLE once dispatched: cancelling this await
+        # detaches only the awaiter, while the thread proceeds to take the
+        # lifecycle lock, create the backend session/window, and commit the
+        # registry row — into the void. CancelledError is a BaseException, so
+        # the `except Exception` cleanup below never sees it, and the outer
+        # created-flags are still False so it would tear down nothing anyway:
+        # a live session + row with no FIFO, no provider, and no caller that
+        # knows the terminal exists — the exact divergence #498 eliminates.
+        # So shield the worker, and on cancellation hand its outcome to a
+        # compensator that rolls back whatever it built (under the lifecycle
+        # lock) before letting the cancellation continue.
+        create_worker = asyncio.ensure_future(asyncio.to_thread(_create_session_or_window_locked))
+        try:
+            window_name, session_created, window_created = await asyncio.shield(create_worker)
+        except asyncio.CancelledError:
+            if not create_worker.cancelled():
+                compensator = asyncio.ensure_future(
+                    _finish_and_roll_back_cancelled_create(create_worker, session_name, terminal_id)
+                )
+                try:
+                    await asyncio.shield(compensator)
+                except asyncio.CancelledError:
+                    # A repeat cancellation landed while the compensator ran;
+                    # the shielded task still completes on the loop. The
+                    # ORIGINAL cancellation is re-raised below either way.
+                    pass
+            raise
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own

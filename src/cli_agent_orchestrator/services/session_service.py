@@ -383,6 +383,10 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             # with post_kill_session AFTER the lock is released — see below.
             cleanup_complete = True
             deferred_ids: List[str] = []
+            # Terminals whose runtime was dismantled but whose FIRST row delete
+            # raised: their rows are what the sweep below exists to remove, and
+            # their per-terminal events ride on the sweep's outcome.
+            row_delete_failed: List[Tuple[str, Dict]] = []
             for terminal_id, metadata in captured:
                 try:
                     runtime_released = terminal_service.dismantle_terminal_runtime(
@@ -411,6 +415,15 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                             torn_down.append((terminal_id, metadata))
                 except Exception as e:
                     logger.warning(f"Failed to delete registry row for {terminal_id}: {e}")
+                    # The runtime IS dismantled (this is past the deferral
+                    # check), so if the sweep below durably removes the row the
+                    # terminal is torn down in every observable way and its
+                    # post_kill_terminal is OWED — a re-run rebuilds its
+                    # worklist from rows that no longer exist and can never
+                    # re-emit it. Remember it; the sweep's success is what
+                    # converts it into ``torn_down``.
+                    if metadata:
+                        row_delete_failed.append((terminal_id, metadata))
 
             # Both remaining steps are guarded exactly like the two above, and
             # for a sharper reason: by here the kill is CONFIRMED and every
@@ -443,6 +456,14 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                         "error": str(e),
                     }
                 )
+            else:
+                # The sweep durably removed the rows whose first delete raised,
+                # so those terminals are now torn down in every observable way
+                # and owe their per-terminal event (fanhongy P2). Only on sweep
+                # SUCCESS: if the sweep failed too, the surviving row is the
+                # retry handle and the retried delete_session owns the event —
+                # emitting now as well would double-fire on that retry.
+                torn_down.extend(row_delete_failed)
 
             # Drop the per-session forwarded-env mapping (issue #248). Safe
             # even when no vars were forwarded — the helper is a no-op then.
