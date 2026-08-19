@@ -50,18 +50,43 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          # exec, not httpGet: CAO_PANEL_TOKEN guards the WHOLE origin (the
+          # panel's auth middleware covers the page, static assets, and the
+          # API alike), so an unauthenticated httpGet probe gets a permanent
+          # 401 and liveness restarts the pod forever. Probe `httpHeaders`
+          # values are static strings with no `valueFrom`, so the token cannot
+          # be injected there without pasting the secret into this manifest.
+          # Running curl INSIDE the container reads the token from the
+          # already-injected env var, keeping it out of the pod spec while
+          # still exercising a real authenticated HTTP request.
+          # timeoutSeconds is generous because /api/fleet fans out to every
+          # node in fleet.json (it still returns 200 when a node is down —
+          # per-node errors are isolated — so this stays a panel liveness
+          # check, not a fleet-wide one).
           readinessProbe:
-            httpGet:
-              path: /api/fleet
-              port: 9888
+            exec:
+              command:
+                - sh
+                - -c
+                - >-
+                  curl -fsS -o /dev/null
+                  -H "Authorization: Bearer $CAO_PANEL_TOKEN"
+                  http://127.0.0.1:9888/api/fleet
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 10
           livenessProbe:
-            httpGet:
-              path: /api/fleet
-              port: 9888
+            exec:
+              command:
+                - sh
+                - -c
+                - >-
+                  curl -fsS -o /dev/null
+                  -H "Authorization: Bearer $CAO_PANEL_TOKEN"
+                  http://127.0.0.1:9888/api/fleet
             initialDelaySeconds: 10
             periodSeconds: 15
+            timeoutSeconds: 10
           volumeMounts:
             - name: fleet-config
               mountPath: /config
