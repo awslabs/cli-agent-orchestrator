@@ -210,6 +210,17 @@ APPROVAL_MENU_OPTION_PATTERN = r"^[^\S\n]*(?:›[^\S\n]+)?\d+\.[^\S\n]+\S"
 # indented under its bullet, so a menu the model merely PASTED into its own reply
 # carries its cursor at column >= 2 and fails this while a live one passes.
 APPROVAL_MENU_CURSOR_PATTERN = r"^›[^\S\n]+\d+\.[^\S\n]+\S"
+# A wrapped option's continuation row. ListSelectionView renders wrapped rows by
+# default (SelectionRowDisplay::Wrapped, list_selection_view.rs at
+# rust-v0.147.0), and word_wrap_line indents every continuation to the option
+# TEXT column -- the width of the "{prefix} {n}. " gutter, so 5 columns for a
+# single-digit menu and one more per extra digit (build_rows sets wrap_indent to
+# the prefix width; wrap_standard_row feeds it to subsequent_indent). The
+# question, command preview, and footer rows all sit at 2 columns of indent, so
+# >= 5 columns directly under an option row is the menu's own wrapping, never
+# new content. Only honoured while inside an option (see the below-anchor scan)
+# -- indented prose elsewhere still disqualifies the block.
+APPROVAL_MENU_CONTINUATION_PATTERN = r"^[^\S\n]{5,}\S"
 # Minimum numbered options required above the footer. Two is the floor for a
 # genuine approval (accept and decline); requiring specific option COPY instead
 # would reintroduce exactly the enumeration fragility described above.
@@ -572,16 +583,22 @@ def _has_approval_prompt_in_bottom(clean_output: str) -> bool:
        model merely PASTED into a reply — carries its cursor at column >= 2 and
        fails this.
     2. **Nothing below the anchor but the rest of the menu block**: the
-       remaining (non-cursor) option rows, at most one footer hint in any of
-       its rendered forms, and chrome (:func:`_is_chrome_only`, shared with the
-       boxed-modal detector). A live prompt blocks the TUI, so its menu must BE
-       the bottom of the pane. This is the guard that rejects an ordinary
-       COMPLETED reply which quotes the menu while a live composer and more
-       prose sit underneath — the sticky WAITING_USER_ANSWER that case used to
-       latch would wedge a ready worker.
-    3. **Menu size.** At least APPROVAL_MENU_MIN_OPTIONS option rows counted
-       contiguously around the anchor (a genuine approval always offers accept
-       and decline). Contiguity matters: counting across the question or the
+       remaining (non-cursor) option rows — each an option-start row plus any
+       wrapped continuation rows at the option text column
+       (APPROVAL_MENU_CONTINUATION_PATTERN; the renderer wraps long options by
+       default, so a narrow pane splits one option across lines) — at most one
+       footer hint in any of its rendered forms, and chrome
+       (:func:`_is_chrome_only`, shared with the boxed-modal detector).
+       Continuations are honoured only while inside an option; indented prose
+       after the footer or after blank filler still disqualifies. A live
+       prompt blocks the TUI, so its menu must BE the bottom of the pane. This
+       is the guard that rejects an ordinary COMPLETED reply which quotes the
+       menu while a live composer and more prose sit underneath — the sticky
+       WAITING_USER_ANSWER that case used to latch would wedge a ready worker.
+    3. **Menu size.** At least APPROVAL_MENU_MIN_OPTIONS option-START rows
+       counted contiguously around the anchor, stepping over wrapped
+       continuation rows (a genuine approval always offers accept and
+       decline). Contiguity matters: counting across the question or the
        command preview would let a numbered list INSIDE a quoted command
        inflate the tally.
 
@@ -622,20 +639,31 @@ def _has_approval_prompt_in_bottom(clean_output: str) -> bool:
 
     options = 1  # the anchor row
     footer_seen = False
+    in_option = True  # the anchor row itself may wrap onto the next line
     for line in lines[anchor + 1 :]:
         if not footer_seen and re.match(APPROVAL_MENU_OPTION_PATTERN, line):
             options += 1
+            in_option = True
+            continue
+        if in_option and re.match(APPROVAL_MENU_CONTINUATION_PATTERN, line):
             continue
         if not footer_seen and re.search(APPROVAL_PROMPT_FOOTER, line):
             footer_seen = True
+            in_option = False
             continue
         if _is_chrome_only(line):
+            in_option = False
             continue
         return False
 
     for index in range(anchor - 1, -1, -1):
-        if re.match(APPROVAL_MENU_OPTION_PATTERN, lines[index]):
+        line = lines[index]
+        if re.match(APPROVAL_MENU_OPTION_PATTERN, line):
             options += 1
+            continue
+        if re.match(APPROVAL_MENU_CONTINUATION_PATTERN, line):
+            # Walking up, a continuation belongs to the option row above it;
+            # step over it and let that row (or anything else) decide.
             continue
         break
 

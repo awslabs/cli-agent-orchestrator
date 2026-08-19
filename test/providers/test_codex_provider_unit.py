@@ -3371,6 +3371,96 @@ class TestCodexProviderApprovalPromptLive:
 
         assert not _has_approval_prompt_in_bottom(output)
 
+    # The real capture's 108-column option and the tagged renderer's width-100
+    # wrapping of it: ListSelectionView wraps rows by default
+    # (SelectionRowDisplay::Wrapped) and word_wrap_line indents each
+    # continuation to the option text column — 5 columns for a single-digit
+    # menu (haofeif round 6).
+    _UNWRAPPED_OPTION = (
+        "  2. Yes, and don't ask again for commands that start with "
+        "`mkdir -p /private/tmp/codex-work-567/subdir` (p)"
+    )
+    _WRAPPED_OPTION = (
+        "  2. Yes, and don't ask again for commands that start with `mkdir -p\n"
+        "     /private/tmp/codex-work-567/subdir` (p)"
+    )
+
+    def test_wrapped_option_rows_are_waiting_via_both_status_paths(self):
+        """A menu whose long option WRAPPED at a narrow pane width must still
+        classify WAITING through both public entry points.
+
+        CAO's panes shrink when a narrower terminal attaches and the screen
+        path is the production path, so at ``9418e65`` the width-100 rendering
+        of this PR's own capture returned IDLE from ``get_status_from_screen``
+        while the menu was live (haofeif round 6).
+        """
+        raw = load_fixture("codex_approval_modal_raw.txt")
+        output = raw.replace(self._UNWRAPPED_OPTION, self._WRAPPED_OPTION)
+        assert output != raw, "fixture no longer contains the 108-column option"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert _has_approval_prompt_in_bottom(output)
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status_from_screen(output.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    def test_wrapped_anchor_row_is_still_the_anchor(self):
+        """The CURSOR row itself can be the one that wraps — the continuation
+        sits between the anchor and the next option and must not break the
+        below-anchor scan."""
+        raw = load_fixture("codex_approval_modal_raw.txt")
+        output = raw.replace(self._UNWRAPPED_OPTION, self._WRAPPED_OPTION)
+        # move the cursor from option 1 onto the wrapped option 2
+        output = output.replace("› 1. Yes, proceed (y)", "  1. Yes, proceed (y)")
+        output = output.replace("  2. Yes, and don't ask", "› 2. Yes, and don't ask")
+        assert "› 2." in output and "› 1." not in output
+
+        assert _has_approval_prompt_in_bottom(output)
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            # after the footer: no option is open, so option-column indent is
+            # foreign content again
+            "  Press enter to confirm or esc to cancel\n     stray indented prose",
+            # after blank filler: same — wrapping never crosses a blank row
+            "  3. No, and tell Codex what to do differently (esc)\n\n     stray indented prose",
+        ],
+    )
+    def test_indented_prose_outside_an_option_still_disqualifies(self, tail):
+        """Continuation rows are honoured only while INSIDE an option: indented
+        prose after the footer or after a blank row still proves the menu is
+        not the bottom of the pane."""
+        raw = load_fixture("codex_approval_modal_raw.txt")
+        needle = tail.splitlines()[0]
+        output = raw.replace(needle, tail)
+        assert output != raw
+
+        assert not _has_approval_prompt_in_bottom(output)
+
+    def test_two_column_indent_below_an_option_is_not_wrapping(self):
+        """The continuation floor is the option TEXT column (5), not the
+        2-column indent of the question/footer/ordinary prose.
+
+        The renderer wraps to the width of the "{prefix} {n}. " gutter, so a
+        2-column-indented line directly under an option is foreign content and
+        must disqualify the block. This is the boundary that keeps the
+        numbered-list residual (below) from swallowing a user list that
+        continues with ordinary indented prose.
+        """
+        output = (
+            "› 1. run the tests\n"
+            "  2. fix whatever fails\n"
+            "  then rerun them until green\n"
+            "› \n"
+            "  ? for shortcuts                     88% context left\n"
+        )
+
+        assert not _has_approval_prompt_in_bottom(output)
+
     def test_user_numbered_list_at_bottom_is_the_disclosed_residual(self):
         """DOCUMENTED RESIDUAL, asserted so a change is a conscious decision.
 
