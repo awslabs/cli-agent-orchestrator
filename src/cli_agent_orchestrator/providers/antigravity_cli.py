@@ -45,7 +45,6 @@ import logging
 import os
 import re
 import shlex
-import shutil
 import stat
 import threading
 import time
@@ -55,7 +54,11 @@ from typing import List, Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
+    ProviderError as BaseProviderError,
+    resolve_provider_binary,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
@@ -81,7 +84,7 @@ def _log_cleanup_exception(fut: asyncio.Future) -> None:
         logger.error("_unregister_mcp_servers raised during cleanup: %s", exc, exc_info=exc)
 
 
-class ProviderError(Exception):
+class ProviderError(BaseProviderError):
     """Exception raised for Antigravity CLI provider-specific errors."""
 
     pass
@@ -297,12 +300,7 @@ class AntigravityCliProvider(BaseProvider):
 
         Returns a shell-escaped command string for ``send_keys``.
         """
-        binary = shutil.which("agy")
-        if not binary:
-            raise ProviderError(
-                "Antigravity CLI not found: 'agy' is not on $PATH. "
-                "Install via: curl -fsSL https://antigravity.google/cli/install.sh | bash"
-            )
+        resolve_provider_binary("agy")
 
         command_parts = ["agy", "--dangerously-skip-permissions"]
 
@@ -628,8 +626,9 @@ class AntigravityCliProvider(BaseProvider):
         Raises:
             TimeoutError: If the shell or agy initialization times out.
 
-        issue #494: ``_build_agy_command`` does blocking I/O (``shutil.which``
-        and the ~/.gemini/config/mcp_config.json read-modify-write via
+        issue #494: ``_build_agy_command`` does blocking I/O (the
+        ``resolve_provider_binary`` pre-flight and the
+        ~/.gemini/config/mcp_config.json read-modify-write via
         ``_register_mcp_servers``) and ``get_backend().send_keys`` is a
         blocking subprocess exec -- both offloaded to a worker thread via
         ``asyncio.to_thread`` for the same reason as ``_handle_startup_dialog``

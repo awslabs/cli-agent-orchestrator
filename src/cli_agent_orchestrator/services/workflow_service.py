@@ -197,6 +197,21 @@ run_registry: Dict[str, Union[RunRecord, "ScriptRunRecord"]] = {}
 _active_drives: Set[str] = set()
 
 
+def _evict_terminal_record(record: Union[RunRecord, "ScriptRunRecord"]) -> None:
+    """Best-effort eviction of a settled terminal run from ``run_registry``.
+
+    The durable journal is authoritative for cold reads — ``get_run_status`` /
+    the inspect routes rebuild on a cache miss (see §2) and the engine re-
+    journals everything it drives — so once the drive loop leaves a record in a
+    terminal state its in-memory entry is released, bounding ``run_registry``
+    growth under sustained parallel agent work. A still-RUNNING record is never
+    evicted (it may be resumable / cancellable). Best-effort: absent id is a
+    no-op.
+    """
+    if record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
+        run_registry.pop(record.run_id, None)
+
+
 def _now() -> str:
     """ISO-8601 Z timestamp (bookkeeping only — never an ordering key)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1113,6 +1128,7 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         return await _drive(record, order)
     finally:
         _active_drives.discard(run_id)
+        _evict_terminal_record(record)
 
 
 async def start_run_prepared(record: RunRecord) -> WorkflowRunResult:
@@ -1144,6 +1160,7 @@ async def start_run_prepared(record: RunRecord) -> WorkflowRunResult:
         return await _drive(record, order)
     finally:
         _active_drives.discard(record.run_id)
+        _evict_terminal_record(record)
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1182,23 @@ def cancel_run(run_id: str) -> None:
     """
     record = run_registry.get(run_id)
     if record is None:
+        # Cache miss after the drive loop evicted the terminal record (the
+        # journal is authoritative for it). Preserve cancel semantics: a
+        # journaled terminal run still conflicts (409); only a genuinely
+        # unknown id is a 404.
+        row = None
+        try:
+            row = workflow_journal.get_run(run_id)
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — journal read is best-effort on a cancel path
+            logger.debug("journal: get_run('%s') failed on cancel: %s", run_id, e)
+        if row is not None and row.state in (
+            RunState.COMPLETED.value,
+            RunState.FAILED.value,
+            RunState.CANCELLED.value,
+        ):
+            raise ValueError(f"run '{run_id}' is already {row.state}; cannot cancel")
         raise KeyError(f"unknown run_id '{run_id}'")
     if record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
         raise ValueError(f"run '{run_id}' is already {record.state.value}; cannot cancel")
@@ -1581,6 +1615,7 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
         return await _drive(record, _topological_order(spec))
     finally:
         _active_drives.discard(run_id)
+        _evict_terminal_record(record)
 
 
 def _run_parallel(record: Optional[RunRecord], steps: Any) -> None:

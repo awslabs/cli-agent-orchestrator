@@ -73,7 +73,10 @@ from typing import Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
+    ProviderError as BaseProviderError,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -83,7 +86,7 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 logger = logging.getLogger(__name__)
 
 
-class ProviderError(Exception):
+class ProviderError(BaseProviderError):
     """Exception raised for provider-specific errors."""
 
     pass

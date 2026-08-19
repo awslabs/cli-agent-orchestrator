@@ -26,7 +26,7 @@ from typing import Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, resolve_provider_binary
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroPhase0KASError,
     build_kiro_command,
@@ -290,6 +290,10 @@ class KiroCliProvider(BaseProvider):
             # Normal terminal creation has already probed and rejected KAS before
             # a backend window or provider is allocated.
             raise KiroPhase0KASError(profile_has_v2_policy=False)
+
+        # Fail fast with a clear error before the pane prints "command not found"
+        # and the init wait burns the full provider_init_timeout.
+        resolve_provider_binary("kiro-cli")
 
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands

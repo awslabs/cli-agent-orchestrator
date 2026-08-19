@@ -31,6 +31,17 @@ from cli_agent_orchestrator.providers.kimi_cli import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _provider_binary_present(monkeypatch):
+    """Stub the shared binary pre-flight so command-builder tests run without
+    ``kimi`` installed on $PATH. The real missing-binary raise is covered by
+    ``test_base_provider.py::test_resolve_provider_binary_missing``."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.kimi_cli.resolve_provider_binary",
+        lambda binary: f"/usr/local/bin/{binary}",
+    )
+
+
 def _read_fixture(name: str) -> str:
     """Read a test fixture file."""
     return (FIXTURES_DIR / name).read_text()

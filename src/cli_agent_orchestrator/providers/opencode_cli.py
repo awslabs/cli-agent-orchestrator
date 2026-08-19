@@ -25,7 +25,7 @@ from typing import List, Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, resolve_provider_binary
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
@@ -172,6 +172,10 @@ class OpenCodeCliProvider(BaseProvider):
 
     def _build_launch_command(self) -> str:
         """Build the inline-env opencode launch command string."""
+        # Fail fast with a clear error before the pane prints "command not found"
+        # and the init wait burns the full provider_init_timeout.
+        resolve_provider_binary("opencode")
+
         env_pairs = [
             f"OPENCODE_CONFIG={OPENCODE_CONFIG_FILE}",
             f"OPENCODE_CONFIG_DIR={OPENCODE_CONFIG_DIR}",
