@@ -2,6 +2,7 @@ import type { Page, Route } from "@playwright/test";
 import { tryParseNotation, renderPreview } from "../src/lib/macroNotation";
 import { projectedTerminal } from "../src/test/projectedTerminal";
 import type { AnnotationsResponse } from "../src/api";
+import viteConfig from "../vite.config";
 
 /**
  * The §10.5 stubbed server: Playwright route mocks for every HTTP endpoint
@@ -212,6 +213,28 @@ function json(route: Route, body: unknown, status = 200): Promise<void> {
     body: JSON.stringify(body),
   });
 }
+
+// Derived from vite.config.ts `server.proxy` — the single source of truth for
+// which paths the dev/preview server would forward to the CAO backend. The
+// invariant is "every proxied path must either be stubbed or fail loudly":
+// deriving keeps the stub's loud-fallback definitionally in sync, so adding
+// or removing a proxy entry automatically widens or narrows the fallback.
+// An empty set would silently disarm that fallback and restore the proxy
+// leak, so an empty/missing proxy is a harness misconfiguration and must
+// throw at setup rather than cover nothing.
+const API_PREFIXES: readonly string[] = (() => {
+  // `defineConfig` returns a UserConfig; cast narrowly to read `server.proxy`
+  // without resorting to `any`.
+  const proxy = (viteConfig as { server?: { proxy?: Record<string, unknown> } })
+    .server?.proxy;
+  const keys = proxy ? Object.keys(proxy) : [];
+  if (keys.length === 0) {
+    throw new Error(
+      "e2e stub misconfigured: vite.config.ts server.proxy is missing or empty — the stub cannot determine which API paths must not leak to the vite preview proxy",
+    );
+  }
+  return keys;
+})();
 
 export interface StubSession {
   id: string;
@@ -645,13 +668,9 @@ export async function stubBackend(page: Page, options?: {
     // lifecycle leak) and ECONNREFUSED→502 on CI. An unhandled API path is a
     // harness gap, not an asset. Only genuine app assets (document, scripts,
     // styles, /assets/*) should continue to the network.
-    const API_PREFIXES = [
-      "/sessions", "/terminals", "/health", "/agents", "/settings", "/flows",
-      "/memory", "/graph", "/macros", "/control-input", "/operator-message",
-      "/annotations", "/communications", "/tracker", "/cohort-operations",
-      "/drains", "/task-occurrences",
-    ];
-    if (API_PREFIXES.some(p => path === p || path.startsWith(p + "/"))) {
+    // API_PREFIXES is derived at module load from vite.config.ts server.proxy
+    // (see top of file) so the two cannot drift.
+    if (API_PREFIXES.some((p) => path === p || path.startsWith(p + "/"))) {
       return json(route, { detail: `stub: unhandled API ${method} ${path}` }, 500);
     }
 
