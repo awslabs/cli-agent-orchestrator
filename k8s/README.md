@@ -35,32 +35,45 @@ Storage is split in two tiers:
 | `efs-workspace.yaml` | Shared workspace PV/PVC |
 | `networkpolicy.yaml` | Ingress and egress policies per role |
 | `external-secrets.example.yaml` | Credential pipeline — applied separately (needs ESO CRDs) |
-| `iac/cao-resources.yaml` | CloudFormation stack for the AWS-side resources |
+| `iac/cluster.yaml` | CloudFormation stack: VPC and EKS cluster with add-ons |
+| `iac/storageclasses.yaml` | The `gp3` and `efs-sc` StorageClasses the manifests reference |
+| `iac/cao-resources.yaml` | CloudFormation stack: CAO-specific AWS resources |
 
 ## Prerequisites
 
 Locally: `kubectl`, `docker` and the AWS CLI.
 
-On the cluster: EKS with add-ons `vpc-cni`, `coredns`, `kube-proxy`,
-`eks-pod-identity-agent`, `aws-efs-csi-driver` and `aws-ebs-csi-driver`;
-StorageClasses named `efs-sc` and `gp3`; and
-[External Secrets Operator](https://external-secrets.io) (ESO) installed in the
-`external-secrets` namespace. Allow ~1Gi requested and 3Gi limit per pod.
+Create the cluster and its network with
+[`iac/cluster.yaml`](iac/cluster.yaml) — a two-AZ VPC, an EKS cluster, a managed
+node group, and the add-ons the fleet needs (including VPC CNI with NetworkPolicy
+enforcement enabled, which is off by default). Takes about 15 minutes.
 
-NetworkPolicy enforcement is off by default, and without it the shipped policies
-are silently inert — `kubectl -n kube-system get ds aws-node -o yaml | grep
-enable-network-policy` must show `=true`.
+```bash
+aws cloudformation deploy --template-file k8s/iac/cluster.yaml \
+  --stack-name cao-workshop --capabilities CAPABILITY_IAM \
+  --parameter-overrides ClusterName=cao-workshop
+aws eks update-kubeconfig --region <region> --name cao-workshop
+kubectl apply -f k8s/iac/storageclasses.yaml
+```
 
-Create the AWS resources with [`iac/cao-resources.yaml`](iac/cao-resources.yaml)
-(provider secret, ESO role and Pod Identity association, ECR repositories, EFS
-workspace), then read its stack outputs for the values the manifests need:
+The StorageClasses are a separate file because they are Kubernetes objects, not
+AWS resources. Install [External Secrets Operator](https://external-secrets.io)
+(ESO) into the `external-secrets` namespace for the same reason. Allow ~1Gi
+requested and 3Gi limit per pod when sizing nodes.
+
+Then create the CAO-specific AWS resources with
+[`iac/cao-resources.yaml`](iac/cao-resources.yaml) (provider secret, ESO role and
+Pod Identity association, ECR repositories, EFS workspace). Every parameter it
+needs is an output of the cluster stack, so they pass straight through — read
+them with `aws cloudformation describe-stacks --stack-name cao-workshop --query
+'Stacks[0].Outputs'`.
 
 ```bash
 aws cloudformation deploy --template-file k8s/iac/cao-resources.yaml \
   --stack-name cao-resources --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides ClusterName=<cluster> VpcId=<vpc> \
-      NodeSecurityGroupId=<node-sg> WorkspaceSubnetId1=<subnet-a> \
-      WorkspaceSubnetId2=<subnet-b> WorkspaceSubnetId3=<subnet-c>
+  --parameter-overrides ClusterName=cao-workshop VpcId=<VpcId> \
+      NodeSecurityGroupId=<NodeSecurityGroupId> \
+      WorkspaceSubnetId1=<WorkspaceSubnetId1> WorkspaceSubnetId2=<WorkspaceSubnetId2>
 ```
 
 Then four manual steps:
