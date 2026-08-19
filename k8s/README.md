@@ -10,9 +10,9 @@ and delegating work across nodes. Every value shown as a concrete ID belongs to
 the account it was validated in and must be replaced — see
 [Environment-specific values](#environment-specific-values).
 
-Prerequisites are currently manual. They will be replaced by infrastructure as
-code; see [Planned automation](#planned-automation) for what changes and what
-does not.
+The CAO-specific AWS resources are created by a CloudFormation stack; the cluster
+itself is still manual. See [Automation status](#automation-status) for the
+current split.
 
 ---
 
@@ -55,224 +55,53 @@ Two storage tiers, deliberately separated:
 
 ## Prerequisites
 
-### 0. Local tooling
+Locally: `kubectl`, `docker`, the AWS CLI, and an authenticated Kiro CLI install
+directory to build the provider image.
 
-`kubectl` (with built-in kustomize), `docker`, and the AWS CLI, plus credentials
-for the target account. To build the provider image you also need an
-authenticated Kiro CLI install directory on the build host.
+On the cluster, owned by a separate cluster stack: EKS (validated on 1.35) with
+add-ons `vpc-cni`, `coredns`, `kube-proxy`, `eks-pod-identity-agent`,
+`aws-efs-csi-driver`, `aws-ebs-csi-driver`; StorageClasses `efs-sc` and `gp3`;
+External Secrets Operator in namespace `external-secrets`. Allow ~1Gi requested
+and 3Gi limit per pod. Verify NetworkPolicy enforcement is on — without it the
+four shipped policies are silently inert (`kubectl -n kube-system get ds aws-node
+-o yaml | grep enable-network-policy` must show `=true`).
 
-### 1. EKS cluster and add-ons
-
-An EKS cluster (validated on 1.35, `authenticationMode: API_AND_CONFIG_MAP`)
-with these managed add-ons:
-
-| Add-on | Why it is required |
-|---|---|
-| `vpc-cni` | Pod networking, **and** NetworkPolicy enforcement |
-| `coredns` | Service DNS — workers are addressed by DNS name |
-| `kube-proxy` | Service routing |
-| `eks-pod-identity-agent` | Delivers AWS credentials to the ESO controller |
-| `aws-efs-csi-driver` | Mounts the shared workspace |
-| `aws-ebs-csi-driver` | Provisions per-pod state volumes |
-| `metrics-server` | Optional; enables `kubectl top` |
-
-**NetworkPolicy enforcement is not on by default.** The manifests ship four
-policies, but without enforcement they are inert — silently, with no error.
-Verify:
+Deploy the AWS resources with [`iac/cao-resources.yaml`](iac/cao-resources.yaml)
+(provider secret, ESO role and Pod Identity association, ECR repositories, EFS
+workspace), then read its stack outputs for the values the manifests need. The
+template header documents every parameter and the ordering constraints.
 
 ```bash
-kubectl -n kube-system get ds aws-node \
-  -o jsonpath='{.spec.template.spec.containers[?(@.name=="aws-eks-nodeagent")].args}' \
-  | tr ',' '\n' | grep enable-network-policy
-# expect: "--enable-network-policy=true"
+aws cloudformation deploy --template-file k8s/iac/cao-resources.yaml \
+  --stack-name cao-resources --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides ClusterName=<cluster> VpcId=<vpc> \
+      NodeSecurityGroupId=<node-sg> WorkspaceSubnetId1=<subnet-a> \
+      WorkspaceSubnetId2=<subnet-b> WorkspaceSubnetId3=<subnet-c>
 ```
 
-Node capacity: each pod requests 1Gi and may use up to 3Gi, so plan for roughly
-4Gi of headroom across the fleet plus the panel. Nodes with under ~2Gi
-allocatable cannot schedule a CAO pod at all.
+Four steps remain manual:
 
-### 2. Storage classes
+1. **Set the secret value** — created empty deliberately, so a missed value fails
+   loudly. Secrets Manager console → `cao/kiro-api-key` → Edit → **Plaintext**
+   tab → paste the raw key alone. No JSON, quotes, or trailing newline: the whole
+   value becomes `KIRO_API_KEY`.
+2. **Restart ESO** so Pod Identity's creation-time webhook applies:
+   `kubectl -n external-secrets rollout restart deployment --all`
+3. **Create the panel token** (key named `token`, namespace must exist first):
+   `kubectl -n cao-cluster create secret generic cao-panel-secret --from-literal=token="$(openssl rand -hex 32)"`
+4. **Build and push both images** — the base ships only credential-free
+   `mock_cli`, and the provider is a second layer built with the Kiro CLI install
+   directory as context. Push an immutable tag; `cao-server` enforces it.
+   ```bash
+   docker build -f docker/Dockerfile -t cao-server:base .
+   docker build -f docker/Dockerfile.provider --build-arg BASE_IMAGE=cao-server:base \
+     -t <repo-uri>:<tag> ~/.toolbox/tools/kiro-cli/<version>/
+   ```
 
-Two classes are required, named as the manifests reference them:
-
-```bash
-kubectl get sc
-# efs-sc  efs.csi.aws.com          <- shared workspace
-# gp3     (EBS provisioner)        <- per-pod state
-```
-
-> On the validated cluster `gp3` uses the legacy in-tree provisioner
-> (`kubernetes.io/aws-ebs`) and works only because CSI migration translates it
-> to `ebs.csi.aws.com`. For a new cluster, create the class against the CSI
-> provisioner directly rather than relying on migration.
-
-### 3. EFS file system, access point, and mount targets
-
-Create an encrypted EFS file system and an access point that pins POSIX
-ownership to the container user:
-
-| Setting | Validated value | Notes |
-|---|---|---|
-| File system | `fs-0fe4b2ecc1b06bb67` | Encrypted, `generalPurpose`, `elastic` throughput |
-| Access point | `fsap-0e72f7af255f8b90c` | Root path `/cao-workspace` |
-| POSIX user | uid `1000`, gid `1000` | **Must match** the image's `cao` user |
-| Mount targets | one per AZ (`2a`, `2b`, `2c`) | Pods cannot mount in an AZ with no mount target |
-
-The access point's uid/gid is what makes the shared volume writable without
-granting root. A mismatch here surfaces as permission errors inside
-`/home/cao/workspace`.
-
-The mount target security group must allow inbound NFS (TCP 2049) from the node
-security group.
-
-Record both IDs — they go into `efs-workspace.yaml`.
-
-### 4. ECR repositories and images
-
-Two repositories: `cao-server` and `cao-fleet-panel`.
-
-The base image ships only `mock_cli`, which echoes prompts rather than doing
-work, so it needs no credentials and builds anywhere. A real provider is added
-as a second layer. Build both stages:
-
-```bash
-# Stage 1 — base image
-docker build -f docker/Dockerfile -t cao-server:base .
-
-# Stage 2 — layer in an authenticated Kiro CLI.
-# The build context MUST be the Kiro CLI install directory.
-docker build -f docker/Dockerfile.provider \
-  --build-arg BASE_IMAGE=cao-server:base \
-  -t cao-server:<immutable-tag> \
-  ~/.toolbox/tools/kiro-cli/<version>/
-```
-
-Push under an **immutable tag** and set it in `kustomization.yaml`. Do not
-deploy `latest`: on this cluster a mutable `latest` silently ran a build that
-predated cross-node placement while the manifests advertised it, which is
-difficult to diagnose because nothing errors.
-
-The provider image is not redistributable. Keep it in a private registry.
-
-### 5. Provider API key in Secrets Manager (AWS Console)
-
-The key never appears in a manifest. It lives in Secrets Manager and reaches the
-pods as a native Kubernetes Secret.
-
-1. Open **AWS Secrets Manager** → **Store a new secret**.
-2. Choose **Other type of secret**.
-3. Select the **Plaintext** tab and replace the contents with the raw API key
-   only — no JSON, no quotes, no trailing newline. The whole value is projected
-   verbatim into the `KIRO_API_KEY` environment variable, so stray characters
-   become part of the key.
-4. Name it `cao/kiro-api-key`.
-5. Leave encryption on the AWS-managed key (`aws/secretsmanager`). A
-   customer-managed key works but then the IAM policy in step 6 also needs
-   `kms:Decrypt` on that key.
-6. Skip rotation. Create the secret and copy its full ARN — it includes a
-   six-character suffix (for example `…:secret:cao/kiro-api-key-W6LdT4`) that
-   the IAM policy must match exactly.
-
-To rotate later, update the secret value in the console. ESO refreshes the
-Kubernetes Secret on its own, but pods read environment variables only at
-startup, so a rollout restart is required:
-
-```bash
-kubectl -n cao-cluster rollout restart deployment/cao-supervisor statefulset/cao-worker
-```
-
-### 6. IAM role for External Secrets Operator
-
-The role is attached to the **ESO controller, not the CAO pods**. This is
-deliberate: CAO agents execute arbitrary commands by design, so giving those
-pods an AWS identity would let a prompt-injected agent inherit it. With ESO the
-agent pods read a plain Kubernetes Secret and hold no AWS credentials at all.
-
-Create role `cao-external-secrets-role` with this trust policy — note Pod
-Identity requires `sts:TagSession` alongside `sts:AssumeRole`:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "EksPodIdentity",
-    "Effect": "Allow",
-    "Principal": { "Service": "pods.eks.amazonaws.com" },
-    "Action": ["sts:AssumeRole", "sts:TagSession"]
-  }]
-}
-```
-
-Attach an inline policy scoped to the single secret ARN — no wildcards:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "ReadCaoProviderSecretOnly",
-    "Effect": "Allow",
-    "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
-    "Resource": "arn:aws:secretsmanager:<region>:<account>:secret:cao/kiro-api-key-XXXXXX"
-  }]
-}
-```
-
-### 7. External Secrets Operator
-
-Install ESO (validated on v2.9.0) into namespace `external-secrets`, then
-associate the role with its service account:
-
-```bash
-aws eks create-pod-identity-association \
-  --cluster-name <cluster> \
-  --namespace external-secrets \
-  --service-account external-secrets \
-  --role-arn arn:aws:iam::<account>:role/cao-external-secrets-role
-```
-
-**Then restart the ESO controller.** Pod Identity injects credentials through a
-mutating admission webhook that runs at *pod creation*, so pods already running
-when the association was created never receive them — they fall back to the node
-instance role and fail. See [Troubleshooting](#troubleshooting) for the
-signature of this failure.
-
-```bash
-kubectl -n external-secrets rollout restart deployment --all
-```
-
-Now apply the store and the secret projection. This file is **not** part of
-`kustomization.yaml`, because its objects require the ESO CRDs — including it
-would make `kubectl apply -k k8s` fail on any cluster without ESO:
-
-```bash
-# Edit the region and secret name first if they differ.
-kubectl apply -f k8s/external-secrets.example.yaml
-```
-
-Confirm the pipeline works before deploying CAO:
-
-```bash
-kubectl get clustersecretstore aws-secretsmanager   # want Ready=True
-kubectl -n cao-cluster get externalsecret kiro-api-key  # want SecretSynced=True
-kubectl -n cao-cluster get secret kiro-api-key       # created by ESO
-```
-
-`ClusterSecretStore` intentionally carries no `auth:` block, so the AWS SDK's
-default credential chain picks up Pod Identity.
-
-### 8. Fleet panel token
-
-The panel's token guards its entire origin. Create it before deploying:
-
-```bash
-kubectl -n cao-cluster create secret generic cao-panel-secret \
-  --from-literal=token="$(openssl rand -hex 32)"
-```
-
-The key must be named `token`. The namespace must exist first — either apply
-`namespace.yaml` alone, or create this secret after step 2 of the deployment.
-
----
+Finally `kubectl apply -f k8s/external-secrets.example.yaml` — excluded from
+`kustomization.yaml` because its objects need the ESO CRDs. Confirm the
+`ClusterSecretStore` is `Ready=True` and the `ExternalSecret` reports
+`SecretSynced` before deploying.
 
 ## Deploy
 
@@ -370,7 +199,7 @@ commands need the prefix.
 ### 4. Reach the panel
 
 ```bash
-kubectl -n cao-cluster port-forward deploy/cao-fleet-panel 8080:8080
+kubectl -n cao-cluster port-forward deploy/cao-fleet-panel 8080:9888
 ```
 
 Then open `http://localhost:8080` with an `Authorization: Bearer <token>`
@@ -388,10 +217,81 @@ retained on scale-down.
 **Roll out a new image.** Push a new immutable tag, update `newTag`, apply, and
 watch both rollouts. Never reuse a tag.
 
-**Rotate the API key.** Update the secret value, then restart both workloads
-(see step 5 above).
-
 **Shut down sessions.** `cao shutdown --all` is per node, so run it on each pod.
+
+---
+
+## Rotating the provider key
+
+Rotation takes two hops — Secrets Manager to the Kubernetes Secret, then the
+Secret into the pods — and **only the first happens on its own**. Environment
+variables are read once when a container starts, so a running pod keeps serving
+the old credential indefinitely after the Secret changes.
+
+That staleness is silent. Nothing degrades, no probe fails, and the pod stays
+`Ready` with zero restarts, because everything inside it consistently uses the
+value it started with. Verified directly: after rotating a token, the Kubernetes
+Secret held the new value while the running pod still accepted only the old one
+and rejected the new one with 401. Treat the restart as part of rotation, not as
+an optional follow-up.
+
+1. **Update the value** in Secrets Manager (console or
+   `aws secretsmanager put-secret-value`). Same rules as the initial paste: raw
+   value, no JSON wrapper, no trailing newline.
+
+2. **Pull it into the cluster.** ESO re-reads on its `refreshInterval` — 1 hour
+   as shipped — so force it when you do not want to wait:
+
+   ```bash
+   kubectl -n cao-cluster annotate externalsecret kiro-api-key \
+     force-sync="$(date +%s)" --overwrite
+   ```
+
+3. **Confirm the Secret actually changed** before restarting anything, so a
+   failed sync is not mistaken for a failed rollout. Compare fingerprints rather
+   than printing the key:
+
+   ```bash
+   kubectl -n cao-cluster get externalsecret kiro-api-key \
+     -o jsonpath='{.status.refreshTime}{"  "}{.status.conditions[0].type}={.status.conditions[0].status}{"\n"}'
+   kubectl -n cao-cluster get secret kiro-api-key \
+     -o jsonpath='{.data.KIRO_API_KEY}' | base64 -d | sha256sum | cut -c1-12
+   ```
+
+4. **Restart both workloads** so the pods pick it up:
+
+   ```bash
+   kubectl -n cao-cluster rollout restart deployment/cao-supervisor statefulset/cao-worker
+   kubectl -n cao-cluster rollout status statefulset/cao-worker --timeout=900s
+   ```
+
+   Drain first if agents are mid-task — a rollout restart kills running sessions,
+   and while the state database survives on the PVC, the tmux processes do not.
+
+5. **Verify the pods now hold the new value** and can still authenticate:
+
+   ```bash
+   for p in deploy/cao-supervisor cao-worker-0 cao-worker-1 cao-worker-2; do
+     kubectl -n cao-cluster exec $p -- \
+       sh -c 'printf %s "$KIRO_API_KEY" | sha256sum | cut -c1-12'   # match step 3
+     kubectl -n cao-cluster exec $p -- kiro-cli whoami
+   done
+   ```
+
+Two ways to remove the manual restart, neither currently wired up:
+
+- **A reload controller** (for example Stakater Reloader) watches the Secret and
+  restarts the referencing workloads automatically. This is the pragmatic option,
+  at the cost of another cluster component.
+- **Mounting the Secret as a volume** instead of injecting env vars: kubelet
+  refreshes projected secret files in place, so no restart is needed. This does
+  not help here, because the provider CLI reads its key only from
+  `KIRO_API_KEY`, with no file-based equivalent — it would require support in the
+  provider first.
+
+Rotating the panel token follows the same shape: update `cao-panel-secret`, then
+`kubectl -n cao-cluster rollout restart deployment/cao-fleet-panel`. Until that
+restart, the panel keeps accepting the previous token and rejects the new one.
 
 ---
 
@@ -455,39 +355,47 @@ policy — otherwise the callback is dropped and looks like a hang.
 
 ## Environment-specific values
 
-Every value below is specific to the validated account and must be changed.
+Most of these now come from the `cao-resources` stack outputs rather than being
+edited by hand. The "validated" column records the account this was proven in —
+treat those IDs as examples, never defaults.
 
-| Value | Validated | Where |
+| Value | Validated | Source |
 |---|---|---|
-| Region | `ap-southeast-2` | Secret ARN, `ClusterSecretStore` |
-| Account | `418295698799` | ECR image names, IAM/secret ARNs |
-| ECR registry | `418295698799.dkr.ecr.ap-southeast-2.amazonaws.com` | `kustomization.yaml` |
-| Server image tag | `2.4.1-d0b398d-d3fix-kiro2.18.1-r2` | `kustomization.yaml` |
-| EFS file system | `fs-0fe4b2ecc1b06bb67` | `efs-workspace.yaml` |
-| EFS access point | `fsap-0e72f7af255f8b90c` | `efs-workspace.yaml` |
-| Secret name / ARN | `cao/kiro-api-key` (suffix `-W6LdT4`) | IAM policy, `ExternalSecret` |
-| IAM role | `cao-external-secrets-role` | Pod Identity association |
+| Region | `ap-southeast-2` | Deploy-time; `ClusterSecretStore` |
+| Account | `418295698799` | Deploy-time |
+| `volumeHandle` (EFS) | `fs-0fe4b2ecc1b06bb67::fsap-0e72f7af255f8b90c` | Stack output `WorkspaceVolumeHandle` → `efs-workspace.yaml` |
+| ECR image names | `…dkr.ecr.ap-southeast-2.amazonaws.com/cao-server` | Stack outputs `ServerRepositoryUri`, `PanelRepositoryUri` → `kustomization.yaml` |
+| Server image tag | `2.4.1-d0b398d-d3fix-kiro2.18.1-r2` | You choose at build time → `kustomization.yaml` |
+| Secret name / ARN | `cao/kiro-api-key` (suffix `-W6LdT4`) | Stack outputs `ProviderSecretName`, `ProviderSecretArn` |
+| IAM role | `cao-external-secrets-role` | Stack output `ExternalSecretsRoleArn` |
 | Namespace | `cao-cluster` | `kustomization.yaml` |
 
 Fixed by the image and safe to leave alone: container user `1000:1000`, server
-port `9889`, state path `/home/cao/.cao/state`, workspace path
+port `9889`, panel port `9888`, state path `/home/cao/.cao/state`, workspace path
 `/home/cao/workspace`.
 
 ---
 
-## Planned automation
+## Automation status
 
-Prerequisites 1 through 8 are all AWS-side or cluster-bootstrap resources and are
-the intended scope of an IaC deployment (eksctl config, CloudFormation, or CDK):
-the cluster and its add-ons, storage classes, the EFS file system with its access
-point and mount targets, ECR repositories, the Secrets Manager secret, the IAM
-role, the Pod Identity association, and the ESO installation.
+**Done — CAO-specific AWS resources.** [`iac/cao-resources.yaml`](iac/cao-resources.yaml)
+owns the provider secret, the ESO IAM role and managed policy, the Pod Identity
+association, both ECR repositories, and the EFS workspace with its access point,
+security group and mount targets. It is deliberately parameterised over the
+cluster, VPC, subnets and node security group so it can be applied to a cluster
+it did not create.
 
-The manifests in this directory are **not** in scope — they stay as kustomize
-output, and the deploy steps above do not change. Once IaC exists, the
-prerequisites section collapses to a pointer at it, while this runbook remains
-the reference for verifying and debugging what the automation produced.
+**Not yet — the cluster itself.** The VPC, EKS cluster, node capacity, managed
+add-ons, StorageClasses and the External Secrets Operator installation remain
+manual. These are shared infrastructure that usually outlives any one
+application, which is why they are a separate stack rather than part of the one
+above: CAO can then be torn down and redeployed without touching the cluster.
 
-Two things IaC cannot remove, because they are genuinely manual: entering the
-API key value (a human must paste the secret), and building the provider image
-(it layers a non-redistributable CLI from an authenticated install).
+**Never automated.** Two steps stay manual by nature — pasting the API key value,
+and building the provider image, which layers a non-redistributable CLI from an
+authenticated local install. The stack therefore expects a pre-existing image tag
+and creates the secret empty.
+
+The manifests in this directory stay as kustomize output and are not in scope for
+either stack.
+
