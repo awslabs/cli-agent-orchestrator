@@ -275,3 +275,68 @@ def test_codex_command_carries_typed_trust_override(tmp_path, monkeypatch):
     # The unified composer emits the route last (--model then the
     # reasoning-effort override), after the canonical trust override.
     assert command.endswith("--model gpt-5.6-sol -c 'model_reasoning_effort=\"xhigh\"'")
+
+
+class TestConfigDigestFollowsSymlinks:
+    """The digest describes the config as the provider will read it.
+
+    Its only use is a before/after comparison proving the operator's config did
+    not change during the probe. A managed-dotfile installation symlinks this
+    config into a version-controlled settings tree, and refusing links took the
+    whole provider offline while protecting nothing the comparison did not
+    already cover.
+    """
+
+    def test_a_symlinked_config_digests_as_its_target(self, tmp_path):
+        target = tmp_path / "real-config.toml"
+        target.write_text("model = 'gpt-5.6-sol'\n")
+        link = tmp_path / "config.toml"
+        link.symlink_to(target)
+
+        assert codex_trust._digest_or_absent(link) == codex_trust._digest_or_absent(target)
+
+    def test_a_change_through_the_symlink_is_still_detected(self, tmp_path):
+        # This is the property the guard actually defends. It survives.
+        target = tmp_path / "real-config.toml"
+        target.write_text("model = 'a'\n")
+        link = tmp_path / "config.toml"
+        link.symlink_to(target)
+
+        before = codex_trust._digest_or_absent(link)
+        target.write_text("model = 'b'\n")
+        assert codex_trust._digest_or_absent(link) != before
+
+    def test_repointing_the_symlink_is_still_detected(self, tmp_path):
+        # A swapped link is a changed config, and the comparison catches it.
+        a = tmp_path / "a.toml"
+        a.write_text("model = 'a'\n")
+        b = tmp_path / "b.toml"
+        b.write_text("model = 'b'\n")
+        link = tmp_path / "config.toml"
+        link.symlink_to(a)
+
+        before = codex_trust._digest_or_absent(link)
+        link.unlink()
+        link.symlink_to(b)
+        assert codex_trust._digest_or_absent(link) != before
+
+    def test_a_symlink_to_a_directory_is_still_refused(self, tmp_path):
+        d = tmp_path / "adir"
+        d.mkdir()
+        link = tmp_path / "config.toml"
+        link.symlink_to(d)
+
+        with pytest.raises(CodexTrustProbeError, match="not a regular file"):
+            codex_trust._digest_or_absent(link)
+
+    def test_a_broken_symlink_reads_as_absent(self, tmp_path):
+        # The provider sees nothing through it either.
+        link = tmp_path / "config.toml"
+        link.symlink_to(tmp_path / "does-not-exist.toml")
+
+        assert codex_trust._digest_or_absent(link) == "absent"
+
+    def test_a_plain_regular_file_is_unchanged(self, tmp_path):
+        p = tmp_path / "config.toml"
+        p.write_text("model = 'x'\n")
+        assert codex_trust._digest_or_absent(p) not in ("absent", "")
