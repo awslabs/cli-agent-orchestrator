@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from cli_agent_orchestrator.services import (
-    codex_native_bootstrap,
     kimi_native_launch,
     muse_native_launch,
     provider_contracts,
@@ -28,10 +27,17 @@ def assess_cell(
     version_banner: str | None = None,
 ) -> CellAssessment:
     if provider == "codex":
-        runnable = codex_native_bootstrap.is_bootstrap_capable_build(normalized_version)
+        # No build allowlist: the bootstrap proves its own contract against
+        # the installed binary, so any semver-shaped build is runnable here
+        # and an unreadable banner is not.
+        runnable = bool(provider_contracts.normalized_version(normalized_version or ""))
         return CellAssessment(
             runnable,
-            "exact installed bootstrap gate" if runnable else "bootstrap build is not proven",
+            (
+                "bootstrap proves the contract at runtime"
+                if runnable
+                else "no semver-shaped version observed"
+            ),
             "argv" if runnable else None,
         )
     if provider == "kimi_cli":

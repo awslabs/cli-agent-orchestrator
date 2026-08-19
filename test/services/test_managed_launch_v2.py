@@ -9,6 +9,8 @@ from copy import deepcopy
 
 import pytest
 
+from cli_agent_orchestrator.services import codex_native_bootstrap
+
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.managed_launch_v2 import (
     PROTOCOL_VERSION_V2,
@@ -95,6 +97,16 @@ def _ready_bridge_state(record, monkeypatch, **changes):
         "model": "gpt-5.6-sol",
         "effort": "xhigh",
         "working_directory": record["working_directory"],
+        # The runtime evidence bind requires of Codex: a fresh process
+        # resumed this exact thread. Overridable per test, which is how the
+        # refusals below are exercised.
+        "native_resume_adoption": {
+            "schema": codex_native_bootstrap.RESUME_ADOPTION_SCHEMA,
+            "method": "thread/resume",
+            "adopted_session_id": session_id,
+            "adopted_in_fresh_process": True,
+            "sent_no_turn": True,
+        },
     }
     receipt.update(changes)
     monkeypatch.setattr(
@@ -275,31 +287,16 @@ def test_bind_refused_before_ready(isolated_memory_db, worktree, tmp_path, monke
     assert not isinstance(raised.value, ManagedLaunchConflict)
 
 
-def test_bind_receipt_unproven_version_refused(isolated_memory_db, worktree, tmp_path, monkeypatch):
-    request = _reserve_request(worktree, tmp_path)
-    record, _ = v2.reserve(request)
-    v2.claim_launch(record["reservation_id"])
-    receipt = _ready_bridge_state(record, monkeypatch)
-    receipt["provider_version"] = "0.144.6"
-    with pytest.raises(ManagedLaunchConflict, match="native readiness proof is unavailable"):
-        v2.bind_native(record["reservation_id"], _bind_request(record))
-
-
-def test_bind_accepts_a_stage_proven_0147_native_readiness_receipt(
+def test_bind_accepts_a_build_no_table_ever_named(
     isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
-    """The reproduced forward-compatibility failure: Codex CLI 0.147.0.
+    """The forward-compatibility failure this seam used to reproduce.
 
-    A real 0.147.0 managed native launch completed the zero-turn bootstrap
-    (the narrow build capability the launcher consults), exposed the exact
-    provider session identity, reported ``input_ready``, and was then
-    refused here — "native readiness proof is unavailable for this provider
-    build; stage-verify it before native bind" — because this seam
-    re-consulted the *broad* provider-version table, which 0.147.0 is
-    deliberately not in. The capability bind asks about is the narrow one
-    the launch already proved: pre-turn native identity plus the input
-    path. The broad table stays untouched, so every advanced gate that
-    independently reads it keeps refusing 0.147.0.
+    A real 0.147.0 managed native launch completed the zero-turn bootstrap,
+    exposed its exact provider session identity, reported ``input_ready``, and
+    was then refused here for not being in a table. Every future build had the
+    same fate by construction. Bind now asks whether the launch produced the
+    proof, which 0.999.0 does exactly as well as 0.146.0 did.
     """
     request = _reserve_request(worktree, tmp_path, execution_mode="native_tui")
     record, _ = v2.reserve(request)
@@ -307,7 +304,7 @@ def test_bind_accepts_a_stage_proven_0147_native_readiness_receipt(
     receipt = _ready_bridge_state(
         record,
         monkeypatch,
-        provider_version="0.147.0",
+        provider_version="0.999.0",
         provider_receipt_kind="codex-native-thread-start",
     )
     bound = v2.bind_native(record["reservation_id"], _bind_request(record))
@@ -318,9 +315,7 @@ def test_bind_accepts_a_stage_proven_0147_native_readiness_receipt(
 def test_bind_accepts_the_long_proven_neighbor_at_the_native_seam(
     isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
-    """0.146.0 binds exactly as before: the new predicate widens nothing
-    that was already proven, it only stops the seam from consulting a
-    broader table than the launch path did."""
+    """0.146.0 binds exactly as before: nothing already working is disturbed."""
     request = _reserve_request(worktree, tmp_path, execution_mode="native_tui")
     record, _ = v2.reserve(request)
     v2.claim_launch(record["reservation_id"])
@@ -335,31 +330,62 @@ def test_bind_accepts_the_long_proven_neighbor_at_the_native_seam(
 
 
 @pytest.mark.parametrize(
-    "provider_version",
+    "adoption,why",
     [
-        # The next unproven build: open launch policy may admit it, bind may not.
-        "0.148.0",
-        # Not semver-shaped, so no normalized version exists to accept.
-        "codex-cli unknown-build",
-        # A two-part token is not a build this or any table ever named.
-        "0.147",
+        (None, "a receipt with no proof at all"),
+        ({}, "a proof that is not the pinned schema"),
+        (
+            {
+                "schema": "cao-codex-native-resume-adoption-v1",
+                "adopted_in_fresh_process": False,
+                "sent_no_turn": True,
+                "adopted_session_id": "MATCH",
+            },
+            "adoption that never left the minting process",
+        ),
+        (
+            {
+                "schema": "cao-codex-native-resume-adoption-v1",
+                "adopted_in_fresh_process": True,
+                "sent_no_turn": False,
+                "adopted_session_id": "MATCH",
+            },
+            "a probe that will not attest it sent no turn",
+        ),
+        (
+            {
+                "schema": "cao-codex-native-resume-adoption-v1",
+                "adopted_in_fresh_process": True,
+                "sent_no_turn": True,
+                "adopted_session_id": "thr_someone_elses_session",
+            },
+            "adoption of a different session than the receipt names",
+        ),
     ],
 )
-def test_bind_refuses_every_unproven_build_at_the_native_seam(
-    isolated_memory_db, worktree, tmp_path, monkeypatch, provider_version
+def test_bind_refuses_a_codex_receipt_without_runtime_resume_proof(
+    isolated_memory_db, worktree, tmp_path, monkeypatch, adoption, why
 ):
+    """The gate that replaced the allowlist has to actually hold.
+
+    Removing a version table only stays safe while the evidence it stood in
+    for is genuinely required; each row here is a way a receipt could claim a
+    resumable identity it does not have.
+    """
     request = _reserve_request(worktree, tmp_path, execution_mode="native_tui")
     record, _ = v2.reserve(request)
     v2.claim_launch(record["reservation_id"])
-    _ready_bridge_state(
+    receipt = _ready_bridge_state(
         record,
         monkeypatch,
-        provider_version=provider_version,
         provider_receipt_kind="codex-native-thread-start",
     )
+    if adoption is not None and adoption.get("adopted_session_id") == "MATCH":
+        adoption = dict(adoption, adopted_session_id=receipt["provider_session_id"])
+    receipt["native_resume_adoption"] = adoption
     with pytest.raises(ManagedLaunchConflict, match="native readiness proof is unavailable"):
         v2.bind_native(record["reservation_id"], _bind_request(record))
-    assert v2.get(record["reservation_id"])["state"] == "launching"
+    assert v2.get(record["reservation_id"])["state"] == "launching", why
 
 
 @pytest.mark.parametrize(

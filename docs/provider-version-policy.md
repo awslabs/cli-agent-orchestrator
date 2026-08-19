@@ -95,10 +95,17 @@ All four must hold:
    Absence of proof is not evidence of breakage.
 2. **The same operation confirmed working on a previous build**, isolating the
    failure to the new binary rather than to environment or task state.
-3. **A tracker issue** naming the failure, the build that exhibits it, and the
-   build being pinned to.
+3. **A P0 tracker issue** naming the failure, the build that exhibits it, and the
+   build being pinned to. P0 because a pin is a capability ceiling on the whole
+   installation, and its severity is the pin's age, not the symptom's.
 4. **A stated unpin criterion and a named owner.** "When the bug is fixed" counts
    only if the issue says what fixed means.
+
+The issue's work is fixed in shape: unpin and reproduce the breakage
+deterministically, find the fix, confirm deterministically that it mends the
+breakage, then land the fix and remove the pin **in the same change**, so the
+system is back on the latest build the moment it can be. A pin exists only for as
+long as it takes to find someone with the capacity to do that.
 
 Pinning to work around something that **cannot be fixed yet** is legitimate and
 expected. Pinning to avoid finding out is not.
@@ -118,6 +125,12 @@ sight — that needs no ceremony beyond verifying against the build that broke.
 | supervisors | **no** | a supervisor sees a symptom, not a cause; a misattributed pin freezes a harness for a reason that was never true and outlives the session that set it |
 | implementers, reviewers, workers | no | they report the breakage |
 
+**A pin is a fact about a provider build, never about a role.** There is no
+supervisor pin, implementer pin, or spec-writer pin, and no capability is withheld
+from one kind of worker and granted to another on version grounds. A build either
+honours a contract or it does not, and that answer does not change with the job the
+worker was given.
+
 **What a supervisor does instead:** work around it, record what it saw, avoid that
 harness for the rest of the run, and keep going. A lane that reports cleanly and
 routes around a problem is a good outcome; stalling to await a version decision
@@ -125,52 +138,41 @@ is not.
 
 ---
 
-## 6. The last two gates, and why they are work rather than exceptions
+## 6. Capability is proven at runtime, against the installed binary
 
-Two capability tables still gate on exact builds. **They are not permanent
-carve-outs.** A capability that only works on enumerated builds is evidence that
-our technique for obtaining it is build-fragile, not evidence that the vendor made
-it build-specific. The goal is to remove both by finding a version-robust
-technique, and until then they are the honest description of a limitation rather
-than a design we defend.
+No surface withholds a capability because a build is unlisted. Where a capability
+claim is stronger than "the process started" — a resumable pre-task identity, a
+zero-task route attestation — the claim is **verified while it is made**, on the
+binary in front of the process.
 
-Treat a request to add a build to either table as a signal that the underlying
-approach needs a deeper look, and prefer investigating the binding technique over
-extending the list.
+That is strictly stronger evidence than an allowlist. A table records that someone
+tested a different build on a different day; a runtime proof records that *this*
+build did the thing, just now.
 
-Codex launch paths capture the pre-task harness-native session id through a
-zero-turn app-server bootstrap (`thread/start` + `thread/name/set`, no `turn/*`)
-so a resumed TUI can guarantee an exact resumable session before any task byte
-reaches the pane. That is a capability claim about the exact binary: the full
-exchange — `initialize -> initialized -> config/read -> thread/start ->
-thread/name/set -> clean process exit`, canonical UUID, exact cwd/model/effort,
-one materialized rollout, fresh `thread/resume` adopting the same id — must have
-been verified for that build. Proven builds are in
-`NATIVE_BIND_CAPABLE_VERSIONS`, and `codex_native_bootstrap.BOOTSTRAP_CAPABLE_VERSIONS`
-is that same table's Codex cell, so the bootstrap that mints an id and the bind
-seam that accepts it cannot disagree.
+**Codex native bind.** The zero-turn app-server bootstrap mints the pre-task
+identity and proves the whole contract as it goes: `initialize -> initialized ->
+config/read -> thread/start -> thread/name/set -> clean process exit` with no
+`turn/*`, every response present and error-free, the exact project resolved as
+`trusted`, a canonical UUID, the exact cwd and route, exactly one materialized
+rollout, and a byte-identical protected user config afterwards.
 
-Today this is the §3 case: no conservative default exists, because there is no
-safe way to *pretend* a session is resumable, and degrading silently would produce
-a launch that cannot resume itself. So this one operation fails closed with a typed
-refusal — zero provider initialization, zero task bytes — while everything else
-about the provider stays open.
+One element of that contract the minting process cannot establish about itself:
+`thread/name/set` materializes the rollout inside a single app-server lifetime, so
+a mint that never leaves that lifetime has shown the rollout exists — not that
+anything else can open it. A **fresh process** therefore runs `thread/resume` on
+the minted id and must be handed back the same id, non-ephemeral, before the
+receipt claims resumability. It sends no `turn/*` and writes no task bytes, and it
+re-checks the protected config, because a proof bought with a side effect nobody
+asked for is not a proof.
 
-**That is a statement about the current technique, not about Codex.** The exchange
-is ordinary app-server protocol; nothing in it is documented as build-specific. The
-open question is which step actually varies between builds, and whether the
-contract can be *verified at runtime against the installed binary* instead of
-looked up in a table. A bootstrap that proves its own guarantee on the build in
-front of it needs no allowlist. Removing this gate is tracked work.
+The bind seam requires that proof on the readiness receipt. A build that cannot
+honour the contract fails on the contract, with zero task bytes, rather than on its
+version string — and a build nobody has listed is never refused for that reason
+alone.
 
-Two rules keep the exception from spreading:
-
-- **The bind seam must never consult the broad table.** Doing so reproduced a real
-  forward-compatibility failure: a 0.147.0 native launch completed the bootstrap,
-  exposed its exact session identity, reported `input_ready`, and was then refused
-  at bind.
-- **Bind capability grants nothing else by implication.** It is not a step toward
-  a broad allowlist.
+**Codex zero-task route attestation.** The trust probe validates the exchange it
+runs by the same standard, so it needs no separate list either. It observes and
+records the version; it does not test the version for membership.
 
 Muse's managed native profile carrier is verified at launch by a two-leg
 runtime probe (`muse exec --provider echo` with and without base instructions)
@@ -225,16 +227,16 @@ record something untrue rather than merely act on less knowledge:
 - An unparseable version banner raises `ProviderVersionDrift`. Unparseable is not
   the same as unlisted: the first means the observation failed, the second means
   nothing was written down.
-- A build outside `NATIVE_BIND_CAPABLE_VERSIONS` cannot become a managed
-  generation's bound native identity, whatever the launch mode admitted.
-  Membership grants bind only.
+- A Codex readiness receipt without a fresh-process resume-adoption proof cannot
+  become a managed generation's bound native identity, whatever the launch mode
+  admitted. The proof is evidence the launch produced, never a version lookup.
 - An unrecognised screen or response is `unknown`, never `complete`.
 
 ---
 
 ## 9. Conformance, surface by surface
 
-The six capability allowlists are converted. A build absent from every per-feature
+Every capability allowlist is converted. A build absent from every per-feature
 table now gets capability from a conservative default or a runtime read of the
 installed bundle, never a withheld feature.
 
@@ -246,6 +248,8 @@ installed bundle, never a withheld feature.
 | `_RENDERED_SESSION_PROVEN_BUILDS` | derived when the bundle shows the title rewrite and the header labels, recorded as bundle-derived; a changed layout yields no proof and the attachment freezes loudly |
 | `IMAGE_PROVEN_BUILDS` | advertised for any observed build, with `build_proven` recording live acceptance separately |
 | `PINNED_VERSIONS` | advisory everywhere |
+| Codex native bind | the bootstrap proves the contract at runtime, including a fresh-process `thread/resume` adoption; no build is listed |
+| Codex route attestation | the trust probe validates its own exchange; the version is observed and recorded, never tested for membership |
 
 **Bundle-derived is its own evidence tier, below `observed`.** A derived record says
 the installed bundle asserts this, not that anyone watched it work. Plans and receipts
@@ -275,12 +279,13 @@ to re-measure rather than recording a fact about "the installed build" in the ab
 
 ### Still gating on an exact build or launcher layout
 
-`NATIVE_BIND_CAPABLE_VERSIONS`, per §6. It cannot be converted by choosing a default —
-it needs a version-robust technique, which is research rather than refactor: no build
-has ever failed the Codex bootstrap contract, and the replacement is a zero-cost runtime
-probe. Tracked separately. `ROUTE_ATTEST_CAPABLE_VERSIONS` belongs to that same family.
-Muse is gated on Meta's launcher layout (`.muse-version` + `muse-bin-<revision>`), not on
-a build digest.
+Muse's managed profile carrier is gated on Meta's launcher layout
+(`.muse-version` + `muse-bin-<revision>`), not on a build digest, and it is a
+runtime probe rather than a list — see §6.
+
+Nothing else does. Every capability allowlist is converted: a build absent from
+every per-feature table gets capability from a conservative default, a runtime read
+of the installed bundle, or a runtime proof of the contract itself.
 
 ## 10. Deliberately not built yet
 

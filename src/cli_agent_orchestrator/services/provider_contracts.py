@@ -649,122 +649,22 @@ def is_listed_version(provider: str, installed_version: str | None) -> bool:
     return bool(normalized and normalized in SUPPORTED_VERSIONS[provider])
 
 
-#: The exact builds stage-proven for the *native bind/admission* contract:
-#: the pre-turn native identity a managed generation binds against — the
-#: zero-turn bootstrap that mints the id, the exact resume that adopts
-#: it, and the input-ready observation the readiness receipt carries.
-#:
-#: This is a capability table in its own right, deliberately NOT a view
-#: of ``SUPPORTED_VERSIONS``.  The two answer different questions and
-#: may legitimately disagree in either direction: Codex 0.147.0 holds
-#: the narrow native-bind proof (its zero-turn app-server
-#: bootstrap/resume exchange was stage-verified on the installed build)
-#: while the broad advanced surfaces — force-pause, rendered identity,
-#: resume and route authority — remain unproven, so the broad table still
-#: lists only 0.146.0 and those gates keep refusing 0.147.0 independently.
-#: Its multiline composer is separately proven in the build-exact
-#: ``codex_native_control._PROVEN_COMPOSER_NEWLINE`` table; that narrower
-#: fact does not widen the broad table.
-#:
-#: Codex's cell is the same fact as
-#: ``codex_native_bootstrap.BOOTSTRAP_CAPABLE_VERSIONS``; the canonical
-#: literal lives here so the mint that produces a native id and the bind
-#: seam that accepts it cannot drift into the state where one accepts a
-#: build the other refuses — which is exactly the reproduced failure
-#: this table exists to close.
-#:
-#: Kimi, Claude, and Muse have no separate narrow proof: their native
-#: identity paths (ACP ``session/new``, the ``--session-id`` mint, the
-#: ``/status`` discovery) were verified as part of each accepted build's
-#: broad stage verification, so their cells are the broad tuples by
-#: reference.  A future build that must be bind-gated more narrowly than
-#: the broad table is written here as its own literal tuple, never by
-#: weakening the broad one.
-NATIVE_BIND_CAPABLE_VERSIONS: dict[str, tuple[str, ...]] = {
-    PROVIDER_CODEX: ("0.146.0", "0.147.0"),
-    PROVIDER_KIMI: SUPPORTED_VERSIONS[PROVIDER_KIMI],
-    PROVIDER_CLAUDE: SUPPORTED_VERSIONS[PROVIDER_CLAUDE],
-    PROVIDER_MUSE: SUPPORTED_VERSIONS[PROVIDER_MUSE],
-}
-# The current pin must always be native-bind capable — asserted for the
-# same reason the pin/SUPPORTED_VERSIONS agreement above is: the two maps
-# must not be able to silently drift apart.
-assert all(
-    PINNED_VERSIONS[provider] in versions
-    for provider, versions in NATIVE_BIND_CAPABLE_VERSIONS.items()
-)
-
-
-def is_native_bind_capable(provider: str, installed_version: str | None) -> bool:
-    """Return whether an exact build is proven for the native bind seam.
-
-    The acceptance authority for managed native bind/admission: a readiness
-    receipt from a build outside this table cannot become a generation's
-    bound native identity, whatever the launch enforcement mode admits.
-    Independent of :func:`is_listed_version` in both directions — a build
-    may hold this narrow proof without the broad one (Codex 0.147.0) — so
-    neither predicate may stand in for the other at a call site.
-    """
-    if provider not in NATIVE_BIND_CAPABLE_VERSIONS or not isinstance(installed_version, str):
-        return False
-    normalized = normalized_version(installed_version)
-    return bool(normalized and normalized in NATIVE_BIND_CAPABLE_VERSIONS[provider])
-
-
-#: The exact builds proven for the zero-task trust/route-attestation
-#: contract: the app-server ``initialize -> config/read(includeLayers) ->
-#: thread/start(ephemeral)`` exchange with NO ``turn/*`` that the route
-#: attestor runs to prove a failed route is healthy, plus the exact trust
-#: root (`config/read` resolving the canonical project as ``trusted`` from
-#: ``sessionFlags`` provenance) and a byte-identical protected user config
-#: afterward.
-#:
-#: This is a capability table in its own right, deliberately NOT a view of
-#: ``SUPPORTED_VERSIONS``, for the same reason the native-bind table is:
-#: the two answer different questions and may disagree.  Codex 0.147.0
-#: holds the narrow zero-task attestation proof — its app-server exchange
-#: and trust/provenance surface are the same zero-turn mechanics the
-#: native-bind seam stage-verified on the installed build, and a live
-#: 0.147.0 install reached this seam refusing only on the stale exact
-#: banner gate — while the broad advanced surfaces remain unproven, so
-#: ``SUPPORTED_VERSIONS`` still lists only 0.146.0 and native
-#: control/resume/route authority keep refusing 0.147.0 independently.
-#:
-#: Kimi, Claude, and Muse have no separate narrow proof: their route
-#: probes were verified as part of each accepted build's broad stage
-#: verification, so their cells are the broad tuples by reference.  A
-#: future build that must be attestation-gated more narrowly than the
-#: broad table is written here as its own literal tuple, never by
-#: weakening the broad one.
-ROUTE_ATTEST_CAPABLE_VERSIONS: dict[str, tuple[str, ...]] = {
-    PROVIDER_CODEX: ("0.146.0", "0.147.0"),
-    PROVIDER_KIMI: SUPPORTED_VERSIONS[PROVIDER_KIMI],
-    PROVIDER_CLAUDE: SUPPORTED_VERSIONS[PROVIDER_CLAUDE],
-    PROVIDER_MUSE: SUPPORTED_VERSIONS[PROVIDER_MUSE],
-}
-# The current pin must always be route-attestation capable — asserted for
-# the same reason the pin/SUPPORTED_VERSIONS agreement above is: the two
-# maps must not be able to silently drift apart.
-assert all(
-    PINNED_VERSIONS[provider] in versions
-    for provider, versions in ROUTE_ATTEST_CAPABLE_VERSIONS.items()
-)
-
-
-def is_route_attest_capable(provider: str, installed_version: str | None) -> bool:
-    """Return whether an exact build is proven for zero-task route attestation.
-
-    The acceptance authority for the route-attestation seam: a receipt
-    from a build outside this table cannot re-arm a launch breaker,
-    whatever the launch enforcement mode admits.  Independent of
-    :func:`is_listed_version` in both directions — a build may hold this
-    narrow proof without the broad one (Codex 0.147.0) — so neither
-    predicate may stand in for the other at a call site.
-    """
-    if provider not in ROUTE_ATTEST_CAPABLE_VERSIONS or not isinstance(installed_version, str):
-        return False
-    normalized = normalized_version(installed_version)
-    return bool(normalized and normalized in ROUTE_ATTEST_CAPABLE_VERSIONS[provider])
+# Native bind and zero-task route attestation are proven at runtime against
+# the installed binary, never by version-table membership.  Both contracts are
+# fully checkable while they execute — the bootstrap validates its own
+# app-server exchange, trust resolution, canonical id, exact route, single
+# materialized rollout, protected-config stability, and a fresh-process
+# ``thread/resume`` adopting the same id; the trust probe validates its own
+# exchange the same way.  A build that passes has proven the contract on the
+# bytes in front of the process, which is strictly stronger than a record that
+# someone once tested a different build.  A capability allowlist would instead
+# refuse every future build by default, so a vendor release would silently
+# remove a capability nobody chose to give up.  See
+# ``docs/provider-version-policy.md`` §1.
+#
+# Holding a build back remains possible and is a separate mechanism:
+# ``VERSION_ENFORCEMENT_MODE`` plus ``SUPPORTED_VERSIONS`` is the quarantine
+# lever, populated only by an open incident.
 
 
 def native_id_source(provider: str) -> str:

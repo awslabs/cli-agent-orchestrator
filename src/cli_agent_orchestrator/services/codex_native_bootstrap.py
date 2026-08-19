@@ -33,41 +33,19 @@ BOOTSTRAP_SCHEMA = "cao-codex-native-bootstrap-v1"
 EXIT_PROOF_SCHEMA = "cao-codex-native-bootstrap-exit-v1"
 MATERIALIZATION_METHOD = "thread/name/set"
 
-#: The narrow set of Codex builds proven for the zero-turn bootstrap/resume
-#: contract — ``initialize -> initialized -> config/read ->
-#: thread/start(ephemeral=false) -> thread/name/set -> clean process exit`` with
-#: NO ``turn/*``, returning a canonical UUID, exact cwd/model/effort for an
-#: explicit route, one materialized rollout, and a fresh app-server process
-#: ``thread/resume`` adopting the same UUID.  The default-route probe on
-#: 0.147.0 returned ``model=gpt-5.6-sol`` and ``reasoningEffort=null``.
-#:
-#: This is deliberately NARROWER than the provider ``SUPPORTED_VERSIONS``:
-#: only the bootstrap/resume surface was stage-verified for 0.147.0, not the
-#: composer/control/force-pause and other advanced surfaces, so 0.147.0 stays
-#: out of the broad table until those are independently proven.  An
-#: authenticated visual TUI smoke remains an installed-E2E follow-up.
-#:
-#: The canonical literal lives in
-#: ``provider_contracts.NATIVE_BIND_CAPABLE_VERSIONS`` — the managed bind
-#: seam accepts exactly these builds through that table — and this name is
-#: the same object, so the mint that produces a native id and the bind that
-#: accepts it cannot disagree about which builds are proven.
-BOOTSTRAP_CAPABLE_VERSIONS = provider_contracts.NATIVE_BIND_CAPABLE_VERSIONS[
-    provider_contracts.PROVIDER_CODEX
-]
+#: The schema of the fresh-process resume-adoption proof recorded on every
+#: bootstrap receipt.  The zero-turn contract's last element is that a
+#: *different* process can resume the minted thread and be handed back the
+#: same id; a mint that materialized a rollout only this process can read is
+#: not a resumable session, and nothing downstream may treat it as one.
+RESUME_ADOPTION_SCHEMA = "cao-codex-native-resume-adoption-v1"
 
-
-def is_bootstrap_capable_build(version_output: Optional[str]) -> bool:
-    """Whether an installed Codex build is proven for the zero-turn bootstrap.
-
-    Exact-set membership in :data:`BOOTSTRAP_CAPABLE_VERSIONS`, independent of
-    the provider-wide version-enforcement mode.  A build that launches in open
-    mode still may not inherit a neighbouring build's bootstrap/resume proof.
-    """
-    if not isinstance(version_output, str):
-        return False
-    normalized = provider_contracts.normalized_version(version_output)
-    return normalized in BOOTSTRAP_CAPABLE_VERSIONS
+#: The app-server method and parameter name the adoption leg uses.  Both are
+#: read back from the installed binary's own error vocabulary when they are
+#: wrong (``Invalid request: missing field `threadId```), so a build that
+#: renames either fails this leg loudly rather than skipping it.
+RESUME_METHOD = "thread/resume"
+RESUME_THREAD_ID_PARAM = "threadId"
 
 
 class CodexBootstrapError(RuntimeError):
@@ -90,12 +68,6 @@ def _validate_binary(binary: str, digest: str, version_output: str) -> str:
         raise CodexBootstrapError(
             f"codex binary digest changed: expected {digest}, observed {observed}"
         )
-    if not is_bootstrap_capable_build(version_output):
-        raise CodexBootstrapError(
-            "Codex native bootstrap/resume capability is unproven for this build; "
-            f"accepted {list(BOOTSTRAP_CAPABLE_VERSIONS)}, installed "
-            f"{(version_output or '').strip()!r}"
-        )
     return observed
 
 
@@ -113,6 +85,96 @@ def _rollout_path(codex_home: Path, thread_id: str) -> Path:
             f"for {thread_id}: found {len(matches)} under {sessions}"
         )
     return matches[0]
+
+
+def _prove_resume_adoption(
+    argv: list[str],
+    native_id: str,
+    timeout: float,
+    *,
+    env: Optional[Mapping[str, str]],
+    config_path: pathlib.Path,
+) -> dict[str, Any]:
+    """Prove a *fresh process* resumes the minted thread and is handed the same id.
+
+    This is the last element of the zero-turn contract, and the only one the
+    minting process cannot establish about itself: ``thread/name/set``
+    materializes a rollout inside one app-server lifetime, so a mint that
+    never leaves that lifetime has shown the rollout exists, not that anything
+    else can adopt it.  Verified here against the binary actually installed,
+    which is why no build needs to be listed anywhere first — a build that
+    cannot do this fails the leg, and a build that can has proven the contract
+    on the bytes in front of this process.
+
+    Sends no ``turn/*`` and writes no task bytes.  The protected user config is
+    re-checked afterwards for the same reason the mint checks it: a probe that
+    silently rewrote the operator's configuration would have bought its proof
+    with a side effect nobody asked for.
+    """
+    requests: list[dict[str, Any]] = [
+        {
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "cao-native-resume-adoption", "version": BOOTSTRAP_SCHEMA}
+            },
+        },
+        {"method": "initialized", "params": {}},
+        {"id": 2, "method": RESUME_METHOD, "params": {RESUME_THREAD_ID_PARAM: native_id}},
+    ]
+    before = _digest_or_absent(config_path)
+    try:
+        stdout, stderr, returncode = _run_app_server_probe(
+            argv, requests, timeout, env=dict(env) if env is not None else None
+        )
+    except Exception as exc:  # noqa: BLE001 - normalized to the bootstrap's own error
+        raise CodexBootstrapError(
+            f"Codex {RESUME_METHOD} adoption probe failed for {native_id}: {exc}"
+        ) from exc
+    if _digest_or_absent(config_path) != before:
+        raise CodexBootstrapError(
+            "protected Codex user config changed during the resume-adoption probe"
+        )
+    if returncode not in (0, -15):
+        raise CodexBootstrapError(
+            f"codex app-server exited {returncode} during resume adoption: {stderr[-500:]}"
+        )
+    response = _response_by_id(stdout, 2)
+    if "error" in response or "result" not in response:
+        raise CodexBootstrapError(
+            f"codex {RESUME_METHOD} failed for {native_id}: {response.get('error')!r}"
+        )
+    thread = (response.get("result") or {}).get("thread") or {}
+    adopted = thread.get("id")
+    if adopted != native_id:
+        raise CodexBootstrapError(
+            f"codex {RESUME_METHOD} adopted {adopted!r}, not the minted {native_id!r}"
+        )
+    # ``sessionId`` is checked only when the build reports one.  Asserting a
+    # field this build does not carry would refuse a working resume for the
+    # shape of its response rather than for its behaviour; ignoring a field it
+    # does carry would let a mismatch through.
+    session_id = thread.get("sessionId")
+    if session_id is not None and session_id != native_id:
+        raise CodexBootstrapError(
+            f"codex {RESUME_METHOD} returned sessionId {session_id!r} for thread {native_id!r}"
+        )
+    if thread.get("ephemeral") is True:
+        raise CodexBootstrapError(
+            f"codex {RESUME_METHOD} adopted {native_id} as an ephemeral thread"
+        )
+    return {
+        "schema": RESUME_ADOPTION_SCHEMA,
+        "method": RESUME_METHOD,
+        "adopted_session_id": adopted,
+        "adopted_in_fresh_process": True,
+        "reported_session_id": session_id,
+        "ephemeral": thread.get("ephemeral"),
+        "sent_no_turn": True,
+        "exit_status": returncode,
+        "exchange_sha256": _digest({"initialize": _response_by_id(stdout, 1), "resume": response}),
+        "protected_config_sha256": before,
+    }
 
 
 def mint_session(
@@ -291,6 +353,12 @@ def mint_session(
             + ", ".join(route_mismatch)
         )
     rollout_path = _rollout_path(codex_home, native_id)
+    # The contract's last element, and the reason no build needs listing: a
+    # separate process resumes what this one minted, or the mint is not a
+    # resumable session and fails closed here — before any pane exists.
+    resume_adoption = _prove_resume_adoption(
+        argv, native_id, timeout, env=child_env, config_path=config_path
+    )
 
     return {
         "schema": BOOTSTRAP_SCHEMA,
@@ -298,8 +366,11 @@ def mint_session(
         "native_session_id": native_id,
         "id_source": provider_contracts.native_id_source(provider_contracts.PROVIDER_CODEX),
         "provider_version": provider_contracts.normalized_version(version_output),
-        "bootstrap_capable_versions": list(BOOTSTRAP_CAPABLE_VERSIONS),
         "bootstrap_capability": "zero-turn-resume",
+        # Runtime evidence in place of a version allowlist. The bind seam
+        # requires this block rather than asking whether someone listed this
+        # build, which is a fact about a different binary on a different day.
+        "resume_adoption_proof": resume_adoption,
         "binary_path": codex_binary,
         "binary_sha256": digest,
         "working_directory": working_directory,

@@ -16,19 +16,6 @@ from cli_agent_orchestrator.services.codex_trust import (
 )
 
 
-def test_route_attest_capability_is_the_canonical_provider_table():
-    # The zero-task route attestor owns no single-version banner constant
-    # of its own; it consumes the capability's canonical literal in
-    # provider_contracts, exactly as the native-bind seam does. The Codex
-    # cell admits 0.146.0 (preserved) and the stage-proven 0.147.0, and
-    # nothing else.
-    assert (
-        codex_trust.ROUTE_ATTEST_CAPABLE_VERSIONS
-        == provider_contracts.ROUTE_ATTEST_CAPABLE_VERSIONS[provider_contracts.PROVIDER_CODEX]
-    )
-    assert codex_trust.ROUTE_ATTEST_CAPABLE_VERSIONS == ("0.146.0", "0.147.0")
-
-
 def _app_server_stdout(root: str) -> str:
     responses = [
         {"id": 1, "result": {"serverInfo": {"name": "codex"}}},
@@ -177,24 +164,52 @@ def test_zero_turn_receipt_identity_is_exact_and_version_scoped(tmp_path, monkey
     assert all(item.get("method") != "turn/start" for item in app_requests[0])
 
 
-def test_probe_fails_closed_on_codex_0148(tmp_path, monkeypatch):
-    """Admitting 0.147.0 for zero-task route attestation is not a range.
+def test_an_unlisted_build_is_not_refused_for_its_version(tmp_path, monkeypatch):
+    """A build nobody listed reaches the probe and is judged by the exchange.
 
-    A 0.148.0 install stays fail-closed: its app-server mechanics have not
-    been proven for this capability, so the breaker stays un-rearmed until
-    that build is stage-verified.
+    The former exact-set gate refused every future build by default, so a
+    vendor release removed route attestation without anyone deciding to give
+    it up. Capability is now decided by the exchange this probe actually runs
+    — every response present and error-free, the exact project resolved as
+    trusted, the protected config byte-identical — which is a fact about the
+    installed binary rather than about a list.
+    """
+    target = tmp_path / "worktree"
+    target.mkdir()
+    root = str(target.resolve())
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="codex-cli 0.999.0\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        codex_trust, "_run_app_server_probe", lambda *a, **k: (_app_server_stdout(root), "", 0)
+    )
+    receipt = attest_trusted_project(
+        root,
+        expected_model="gpt-5.6-sol",
+        expected_effort="xhigh",
+        user_config_path=tmp_path / "absent.toml",
+    )
+    assert receipt["codex_version"] == "codex-cli 0.999.0"
+
+
+@pytest.mark.parametrize("banner", ["", "codex-cli unknown", "codex-cli 0.147"])
+def test_an_unreadable_version_still_fails_closed(tmp_path, monkeypatch, banner):
+    """Open is not unconditional: a version that cannot be read is refused.
+
+    The observation is recorded on the receipt, so a banner nobody can parse
+    would put an unusable string where a version belongs.
     """
     target = tmp_path / "worktree"
     target.mkdir()
     monkeypatch.setattr(
         "subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout="codex-cli 0.148.0\n", stderr=""
-        ),
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=banner + "\n", stderr=""),
     )
-    with pytest.raises(
-        CodexTrustProbeError, match=r"unsupported Codex version 'codex-cli 0\.148\.0'"
-    ):
+    with pytest.raises(CodexTrustProbeError, match="semver-shaped Codex version"):
         attest_trusted_project(
             str(target.resolve()),
             expected_model="gpt-5.6-sol",
@@ -203,41 +218,14 @@ def test_probe_fails_closed_on_codex_0148(tmp_path, monkeypatch):
         )
 
 
-def test_probe_fails_closed_on_version_drift(tmp_path, monkeypatch):
+def test_a_failed_version_probe_still_fails_closed(tmp_path, monkeypatch):
     target = tmp_path / "worktree"
     target.mkdir()
     monkeypatch.setattr(
         "subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout="codex-cli 0.146.1\n", stderr=""
-        ),
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
     )
-    with pytest.raises(CodexTrustProbeError, match="unsupported Codex version"):
-        attest_trusted_project(
-            str(target.resolve()),
-            expected_model="gpt-5.6-sol",
-            expected_effort="xhigh",
-            user_config_path=tmp_path / "absent.toml",
-        )
-
-
-def test_probe_fails_closed_on_previous_pin_0145_0(tmp_path, monkeypatch):
-    # The previously pinned banner (0.145.0) must fail closed once the
-    # capability has moved: admission is exact-set membership — 0.146.0
-    # and 0.147.0 for the zero-task route-attestation capability — never a
-    # range or a minimum.
-    target = tmp_path / "worktree"
-    target.mkdir()
-    monkeypatch.setattr(
-        "subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout="codex-cli 0.145.0\n", stderr=""
-        ),
-    )
-    with pytest.raises(
-        CodexTrustProbeError,
-        match=r"unsupported Codex version 'codex-cli 0\.145\.0'; expected one of \['0\.146\.0', '0\.147\.0'\]",
-    ):
+    with pytest.raises(CodexTrustProbeError, match="semver-shaped Codex version"):
         attest_trusted_project(
             str(target.resolve()),
             expected_model="gpt-5.6-sol",
