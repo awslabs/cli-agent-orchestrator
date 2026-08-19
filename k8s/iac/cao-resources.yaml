@@ -1,0 +1,407 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# CAO-specific AWS resources for the EKS deployment in ../.
+#
+# SCOPE: this stack owns only resources that exist *because of* CAO — the
+# provider secret, the IAM role that reads it, the Pod Identity association
+# that delivers that role, the two container repositories, and the shared
+# workspace file system.
+#
+# OUT OF SCOPE (a separate cluster stack owns these): the VPC, the EKS cluster,
+# node capacity, the managed add-ons (vpc-cni, coredns, kube-proxy,
+# eks-pod-identity-agent, EBS/EFS CSI drivers), the StorageClasses, and the
+# External Secrets Operator installation itself. This stack takes the cluster
+# name, VPC, subnets and node security group as parameters so it can be applied
+# to a cluster it did not create.
+#
+# ORDER: the cluster and External Secrets Operator must exist first, because the
+# Pod Identity association references the ESO namespace and service account.
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file k8s/iac/cao-resources.yaml \
+#     --stack-name cao-resources \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides ClusterName=<cluster> VpcId=<vpc> \
+#         NodeSecurityGroupId=<sg> WorkspaceSubnetId1=<subnet-a> \
+#         WorkspaceSubnetId2=<subnet-b> WorkspaceSubnetId3=<subnet-c>
+#
+# Then paste this stack's outputs into ../efs-workspace.yaml and
+# ../kustomization.yaml, and set the secret value — see ../README.md.
+
+Description: >-
+  CAO on EKS: provider secret, External Secrets Operator IAM role and Pod
+  Identity association, container repositories, and shared EFS workspace.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Target cluster }
+        Parameters: [ClusterName, ExternalSecretsNamespace, ExternalSecretsServiceAccount]
+      - Label: { default: Naming }
+        Parameters: [NamePrefix, ProviderSecretName]
+      - Label: { default: Shared workspace networking }
+        Parameters: [VpcId, NodeSecurityGroupId, WorkspaceSubnetId1, WorkspaceSubnetId2, WorkspaceSubnetId3]
+    ParameterLabels:
+      NodeSecurityGroupId: { default: Node security group allowed to mount NFS }
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: >-
+      Existing EKS cluster to create the Pod Identity association in. The
+      cluster must already have the eks-pod-identity-agent add-on and External
+      Secrets Operator installed.
+    MinLength: 1
+
+  NamePrefix:
+    Type: String
+    Default: cao
+    Description: Prefix for resource names. Change to run two fleets in one account.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+    ConstraintDescription: lowercase letters, digits and hyphens, starting with a letter
+
+  ProviderSecretName:
+    Type: String
+    Default: cao/kiro-api-key
+    Description: >-
+      Secrets Manager secret name holding the provider API key. Must match the
+      remoteRef key in ../external-secrets.example.yaml.
+    MinLength: 1
+
+  ExternalSecretsNamespace:
+    Type: String
+    Default: external-secrets
+    Description: Namespace where the External Secrets Operator controller runs.
+
+  ExternalSecretsServiceAccount:
+    Type: String
+    Default: external-secrets
+    Description: >-
+      Service account of the ESO controller. The IAM role is granted to the
+      OPERATOR, not to the CAO pods — see the security note in ../README.md.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the cluster nodes.
+
+  NodeSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      Security group attached to the cluster nodes. NFS (2049) ingress to the
+      workspace file system is allowed from this group only.
+
+  WorkspaceSubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      First subnet for an EFS mount target. Pods scheduled in an Availability
+      Zone with no mount target cannot mount the workspace, so supply one subnet
+      per AZ the nodes run in.
+
+  WorkspaceSubnetId2:
+    Type: String
+    Default: ""
+    Description: Second mount-target subnet. Leave empty for a single-AZ cluster.
+
+  WorkspaceSubnetId3:
+    Type: String
+    Default: ""
+    Description: Third mount-target subnet. Leave empty if unused.
+
+Conditions:
+  HasSubnet2: !Not [!Equals [!Ref WorkspaceSubnetId2, ""]]
+  HasSubnet3: !Not [!Equals [!Ref WorkspaceSubnetId3, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Provider credential
+  # ---------------------------------------------------------------------------
+
+  # Created with NO value on purpose. Omitting both SecretString and
+  # GenerateSecretString creates an empty secret, so a forgotten "paste the key"
+  # step fails loudly: GetSecretValue returns ResourceNotFoundException, the
+  # ExternalSecret reports SecretSynced=False, the Kubernetes Secret is never
+  # created, and the pods stop at CreateContainerConfigError. A generated
+  # placeholder would instead sync a plausible-looking value and fail later at
+  # runtime with a confusing authentication error.
+  #
+  # Never put the key in this template. Set it out of band (console or CLI); see
+  # ../README.md. CloudFormation will not overwrite the value on later stack
+  # updates because SecretString is absent here.
+  ProviderSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Ref ProviderSecretName
+      Description: !Sub "Provider API key consumed by the ${NamePrefix} fleet via External Secrets Operator"
+      # No KmsKeyId: encrypted with the AWS-managed key. Supply a
+      # customer-managed key here if required, and add kms:Decrypt on that key
+      # to ExternalSecretsRole below — the role cannot read the secret without
+      # it.
+      Tags:
+        - Key: Name
+          Value: !Ref ProviderSecretName
+        - Key: app.kubernetes.io/part-of
+          Value: !Sub "${NamePrefix}-fleet"
+
+  # The role is assumed by the External Secrets Operator controller, NOT by the
+  # CAO pods. CAO agents execute arbitrary commands by design, so an AWS
+  # identity on those pods would be inheritable by a prompt-injected agent. With
+  # this split the agent pods read a plain Kubernetes Secret and hold no AWS
+  # credentials at all.
+  #
+  # The permission lives in a standalone managed policy rather than an inline
+  # Policies block so it is independently auditable and versioned, and so the
+  # template passes the IAM_NO_INLINE_POLICY_CHECK control.
+  ReadProviderSecretPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${NamePrefix}-read-provider-secret"
+      Description: !Sub "Read-only access to the ${NamePrefix} provider API key secret."
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Scoped to this one secret ARN. !Ref on a Secret returns the full ARN
+          # including the six-character suffix Secrets Manager appends, so no
+          # wildcard is needed.
+          - Sid: ReadProviderSecretOnly
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: !Ref ProviderSecret
+
+  ExternalSecretsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-external-secrets-role"
+      Description: Lets External Secrets Operator read the CAO provider secret.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EksPodIdentity
+            Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            # sts:TagSession is required in addition to sts:AssumeRole; Pod
+            # Identity attaches session tags and the assume call fails without
+            # it.
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - !Ref ReadProviderSecretPolicy
+      Tags:
+        - Key: app.kubernetes.io/part-of
+          Value: !Sub "${NamePrefix}-fleet"
+
+  # Delivers the role above to the ESO controller pods.
+  #
+  # Credentials are injected by a mutating admission webhook at POD CREATION, so
+  # controller pods that were already running when this association was created
+  # never receive them — they silently fall back to the node instance role and
+  # fail with AccessDenied naming that role. Restart the ESO deployment after
+  # this stack completes; see ../README.md.
+  ExternalSecretsPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: !Ref ExternalSecretsNamespace
+      ServiceAccount: !Ref ExternalSecretsServiceAccount
+      RoleArn: !GetAtt ExternalSecretsRole.Arn
+      Tags:
+        - Key: app.kubernetes.io/part-of
+          Value: !Sub "${NamePrefix}-fleet"
+
+  # ---------------------------------------------------------------------------
+  # Container repositories
+  # ---------------------------------------------------------------------------
+
+  # IMMUTABLE tags are deliberate. A mutable tag on this repository previously
+  # let the cluster run a build that predated cross-node placement while the
+  # manifests advertised it, with nothing to indicate a mismatch. Immutability
+  # makes that class of drift impossible: a tag always means one image.
+  ServerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-server"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: app.kubernetes.io/part-of
+          Value: !Sub "${NamePrefix}-fleet"
+
+  # MUTABLE only because the panel deployment still references the `latest` tag.
+  # Switch this to IMMUTABLE once the panel is built with versioned tags — the
+  # reasoning on ServerRepository applies here too.
+  PanelRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-fleet-panel"
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      Tags:
+        - Key: app.kubernetes.io/part-of
+          Value: !Sub "${NamePrefix}-fleet"
+
+  # ---------------------------------------------------------------------------
+  # Shared workspace (EFS)
+  # ---------------------------------------------------------------------------
+
+  WorkspaceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "NFS access to the ${NamePrefix} shared workspace"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: NFS from cluster nodes
+          IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref NodeSecurityGroupId
+      # Egress is restricted to loopback rather than left at CloudFormation's
+      # default allow-all. Mount targets never initiate connections — they only
+      # answer NFS — and security groups are stateful, so replies to permitted
+      # inbound traffic are allowed regardless of egress rules. (Reasoned from
+      # documented security-group behaviour; the pre-existing file system this
+      # was modelled on runs with the default allow-all egress.)
+      SecurityGroupEgress:
+        - Description: No egress required; mount targets only answer inbound NFS
+          IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-workspace-nfs"
+        - Key: app.kubernetes.io/part-of
+          Value: !Sub "${NamePrefix}-fleet"
+
+  # Holds the agents' shared checkout, so it is retained on stack deletion.
+  # NOTE: retention means deleting this stack leaves a billable file system
+  # behind. Delete it explicitly when decommissioning.
+  WorkspaceFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      BackupPolicy:
+        Status: ENABLED
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-workspace"
+        - Key: app.kubernetes.io/part-of
+          Value: !Sub "${NamePrefix}-fleet"
+
+  # The access point is what makes the shared volume usable without root: it
+  # pins every NFS client to uid/gid 1000, which is the `cao` user in the
+  # container image. A mismatch here shows up as permission errors inside
+  # /home/cao/workspace.
+  #
+  # CreationInfo must be present, and must specify all three properties. Without
+  # it EFS will not create the root directory, and mounts fail.
+  WorkspaceAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /cao-workspace
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0755"
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-workspace-ap"
+        - Key: app.kubernetes.io/part-of
+          Value: !Sub "${NamePrefix}-fleet"
+
+  WorkspaceMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Ref WorkspaceSubnetId1
+      SecurityGroups:
+        - !Ref WorkspaceSecurityGroup
+
+  WorkspaceMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Condition: HasSubnet2
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Ref WorkspaceSubnetId2
+      SecurityGroups:
+        - !Ref WorkspaceSecurityGroup
+
+  WorkspaceMountTarget3:
+    Type: AWS::EFS::MountTarget
+    Condition: HasSubnet3
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Ref WorkspaceSubnetId3
+      SecurityGroups:
+        - !Ref WorkspaceSecurityGroup
+
+Outputs:
+  ProviderSecretArn:
+    Description: Secret holding the provider API key. Set its value before deploying the manifests.
+    Value: !Ref ProviderSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-ProviderSecretArn"
+
+  ProviderSecretName:
+    Description: Secret name to use as the remoteRef key in external-secrets.example.yaml.
+    Value: !Ref ProviderSecretName
+
+  ExternalSecretsRoleArn:
+    Description: IAM role assumed by the External Secrets Operator controller.
+    Value: !GetAtt ExternalSecretsRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ExternalSecretsRoleArn"
+
+  WorkspaceFileSystemId:
+    Description: Shared workspace file system.
+    Value: !Ref WorkspaceFileSystem
+
+  WorkspaceAccessPointId:
+    Description: Access point pinning the workspace to uid/gid 1000.
+    Value: !Ref WorkspaceAccessPoint
+
+  WorkspaceVolumeHandle:
+    Description: >-
+      Paste directly into spec.csi.volumeHandle in ../efs-workspace.yaml.
+    Value: !Sub "${WorkspaceFileSystem}::${WorkspaceAccessPoint}"
+
+  ServerRepositoryUri:
+    Description: >-
+      cao-server image repository. Use as the images[].name in
+      ../kustomization.yaml.
+    Value: !GetAtt ServerRepository.RepositoryUri
+
+  PanelRepositoryUri:
+    Description: Fleet panel image repository.
+    Value: !GetAtt PanelRepository.RepositoryUri
