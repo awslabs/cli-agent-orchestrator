@@ -33,9 +33,28 @@ class CodexTrustProbeError(RuntimeError):
 
 
 def _digest_or_absent(path: pathlib.Path) -> str:
+    """Digest the config as Codex will read it, or report it absent.
+
+    The digest exists to be compared before and after the probe: the
+    property defended is that the operator's config did not change while we
+    probed. Nothing here writes to the path.
+
+    A symlink is therefore not refused. Reading through a link to a regular
+    file yields exactly the bytes Codex itself will read, and if either the
+    link or its target changes mid-probe the before/after comparison is what
+    catches it — the same mechanism that catches a regular file being
+    rewritten. Refusing links protected nothing the comparison did not
+    already cover, while making every managed-dotfile installation, where
+    this config is a symlink into a version-controlled settings tree,
+    unable to launch Codex at all.
+
+    ``is_file`` follows the link, so a link to a directory, device, or fifo
+    is still refused, and a broken link reports absent — which is what
+    Codex sees through it too.
+    """
     if not path.exists():
         return "absent"
-    if not path.is_file() or path.is_symlink():
+    if not path.is_file():
         raise CodexTrustProbeError("protected Codex config is not a regular file")
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+from cli_agent_orchestrator.services import kimi_route
 from cli_agent_orchestrator.services.kimi_route import (
     KimiRouteProbeError,
     attest_kimi_route,
@@ -276,3 +277,68 @@ def test_managed_kimi_command_forces_attested_route_last():
         assert command.endswith("kimi --yolo --model kimi-code/k3")
     finally:
         provider.cleanup()
+
+
+class TestKimiConfigDigestFollowsSymlinks:
+    """The digest describes the config as the provider will read it.
+
+    Its only use is a before/after comparison proving the operator's config did
+    not change during the probe. A managed-dotfile installation symlinks this
+    config into a version-controlled settings tree, and refusing links took the
+    whole provider offline while protecting nothing the comparison did not
+    already cover.
+    """
+
+    def test_a_symlinked_config_digests_as_its_target(self, tmp_path):
+        target = tmp_path / "real-config.toml"
+        target.write_text("model = 'gpt-5.6-sol'\n")
+        link = tmp_path / "config.toml"
+        link.symlink_to(target)
+
+        assert kimi_route._digest_or_absent(link) == kimi_route._digest_or_absent(target)
+
+    def test_a_change_through_the_symlink_is_still_detected(self, tmp_path):
+        # This is the property the guard actually defends. It survives.
+        target = tmp_path / "real-config.toml"
+        target.write_text("model = 'a'\n")
+        link = tmp_path / "config.toml"
+        link.symlink_to(target)
+
+        before = kimi_route._digest_or_absent(link)
+        target.write_text("model = 'b'\n")
+        assert kimi_route._digest_or_absent(link) != before
+
+    def test_repointing_the_symlink_is_still_detected(self, tmp_path):
+        # A swapped link is a changed config, and the comparison catches it.
+        a = tmp_path / "a.toml"
+        a.write_text("model = 'a'\n")
+        b = tmp_path / "b.toml"
+        b.write_text("model = 'b'\n")
+        link = tmp_path / "config.toml"
+        link.symlink_to(a)
+
+        before = kimi_route._digest_or_absent(link)
+        link.unlink()
+        link.symlink_to(b)
+        assert kimi_route._digest_or_absent(link) != before
+
+    def test_a_symlink_to_a_directory_is_still_refused(self, tmp_path):
+        d = tmp_path / "adir"
+        d.mkdir()
+        link = tmp_path / "config.toml"
+        link.symlink_to(d)
+
+        with pytest.raises(KimiRouteProbeError, match="not a regular file"):
+            kimi_route._digest_or_absent(link)
+
+    def test_a_broken_symlink_reads_as_absent(self, tmp_path):
+        # The provider sees nothing through it either.
+        link = tmp_path / "config.toml"
+        link.symlink_to(tmp_path / "does-not-exist.toml")
+
+        assert kimi_route._digest_or_absent(link) == "absent"
+
+    def test_a_plain_regular_file_is_unchanged(self, tmp_path):
+        p = tmp_path / "config.toml"
+        p.write_text("model = 'x'\n")
+        assert kimi_route._digest_or_absent(p) not in ("absent", "")
