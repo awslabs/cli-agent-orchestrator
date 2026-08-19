@@ -51,9 +51,9 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     StepState,
     WorkflowRunResult,
 )
-from cli_agent_orchestrator.services import terminal_service, workflow_journal
+from cli_agent_orchestrator.services import manifest_freeze, terminal_service, workflow_journal
 from cli_agent_orchestrator.services.script_lint import lint_script
-from cli_agent_orchestrator.services.secret_gate import redact_secrets
+from cli_agent_orchestrator.services.secret_gate import redact_json_leaves, redact_secrets
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part, step_output_store
 from cli_agent_orchestrator.services.step_result import build_envelope, serialise_envelope
 from cli_agent_orchestrator.services.workflow_service import (
@@ -662,25 +662,6 @@ def _sanitise_error(error: Optional[str]) -> Optional[str]:
     return _ERROR_TRUNCATION_MARKER.format(dropped=dropped) + tail
 
 
-def _redact_json_leaves(node: Any) -> Any:
-    """Recursively ``redact_secrets`` every string inside a parsed JSON document (SR-4).
-
-    Dict KEYS are redacted alongside values. A credential is as capable of landing in
-    a key as in a value, and INV-5 admits no unredacted credential; the accepted cost
-    is that two keys differing only inside a redacted span collapse into one, which
-    loses a member but cannot produce an invalid document. Non-string scalars pass
-    through untouched — there is nothing in an ``int`` for a pattern to match.
-    """
-    if isinstance(node, str):
-        redacted, _fired = redact_secrets(node)
-        return redacted
-    if isinstance(node, dict):
-        return {_redact_json_leaves(k): _redact_json_leaves(v) for k, v in node.items()}
-    if isinstance(node, list):
-        return [_redact_json_leaves(v) for v in node]
-    return node
-
-
 def _output_placeholder(reason: str, byte_length: int) -> str:
     """A small, VALID JSON document standing in for an ``output_json`` that was dropped.
 
@@ -725,7 +706,7 @@ def _sanitise_output_json(output_json: Optional[str]) -> Optional[str]:
     except Exception:  # noqa: BLE001 — totality is the contract (SR-6); see the docstring
         return _output_placeholder("unparseable", raw_bytes)
     try:
-        serialised = json.dumps(_redact_json_leaves(document), separators=(",", ":"))
+        serialised = json.dumps(redact_json_leaves(document), separators=(",", ":"))
     except Exception:  # noqa: BLE001 — a value the walk cannot re-serialise (or a depth
         # limit) must still settle the step, so it degrades to the same placeholder.
         return _output_placeholder("unserialisable", raw_bytes)
@@ -1216,6 +1197,13 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
             record.started_at,
             "script",
             "1",
+            # issue #583 Bolt 2, ``manifest-freeze``: the frozen manifest rides the SAME INSERT as
+            # the run row. ADR-583-4's lesson — Bolt 1's critical hazard was two writes for one
+            # logical settle, and a crash between them left a state nothing could detect. Here that
+            # window would produce a NULL manifest indistinguishable from a YAML run and from a
+            # failed freeze. ``build_manifest_json`` is TOTAL and returns None on any failure, which
+            # writes NULL and fails CLOSED at the approval gate.
+            manifest_freeze.build_manifest_json(source_hash=spec.content_hash, inputs=inputs),
         )
     except (
         Exception

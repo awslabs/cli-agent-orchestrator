@@ -77,6 +77,18 @@ _REQUIRED_RUN_COLUMNS = frozenset(
         "finished_at",
         "tier",
         "generation",
+        # manifest-column (issue #583 Bolt 2, ADR-583-12). Registering the column here is
+        # NOT bookkeeping — it is what gives the silent-migration risk a RUNTIME mitigation.
+        # ``_migrate_workflow_run`` swallows its own failures at debug level, so a failed
+        # ALTER leaves the column absent with no signal. With the column in this set,
+        # ``_journal_schema_is_present`` answers False for such a database, ``_connect``
+        # declines to cache the schema, and the migrators therefore keep running on later
+        # connections instead of being skipped — the path self-heals. Omitting it would make
+        # the new column drop silently out of verification, which is exactly the drift the
+        # equality assertion in
+        # ``test_workflow_journal_connection_posture.py::test_the_required_column_sets_match_what_the_migrators_produce``
+        # exists to catch.
+        "manifest_json",
     }
 )
 _REQUIRED_STEP_COLUMNS = frozenset(
@@ -358,6 +370,7 @@ def insert_run(
     started_at: str,
     tier: str = "yaml",
     generation: str = "1",
+    manifest_json: Optional[str] = None,
 ) -> None:
     """INSERT the ``workflow_run`` row at ``start_run`` (lifecycle table, E1).
 
@@ -378,8 +391,8 @@ def insert_run(
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -389,6 +402,7 @@ def insert_run(
                 started_at,
                 tier,
                 generation,
+                manifest_json,
             ),
         )
 
@@ -404,6 +418,7 @@ def insert_run_with_steps(
     updated_at: str,
     tier: str = "yaml",
     generation: str = "1",
+    manifest_json: Optional[str] = None,
 ) -> None:
     """Atomically INSERT the run row AND seed its step rows in ONE transaction (U2, TR-1).
 
@@ -433,8 +448,8 @@ def insert_run_with_steps(
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -444,6 +459,7 @@ def insert_run_with_steps(
                 started_at,
                 tier,
                 generation,
+                manifest_json,
             ),
         )
         conn.executemany(

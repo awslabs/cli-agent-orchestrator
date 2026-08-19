@@ -111,6 +111,7 @@ from cli_agent_orchestrator.security.auth import (
 )
 from cli_agent_orchestrator.services import (
     flow_service,
+    manifest_freeze,
     secret_gate,
     session_service,
     terminal_service,
@@ -4283,6 +4284,15 @@ async def submit_workflow_run_endpoint(
                 started_at,
                 "script",
                 "1",
+                # issue #583 Bolt 2, ``manifest-freeze``: the frozen manifest rides the SAME
+                # INSERT as the run row (ADR-583-4's no-two-writes lesson). This is the ASYNC
+                # script arm; the blocking arm freezes in ``script_runner`` the same way, and
+                # BOTH script entry points must freeze or a run's approvability would depend on
+                # which route started it. ``build_manifest_json`` is total and returns None on
+                # failure, which writes NULL and fails CLOSED at the approval gate.
+                manifest_freeze.build_manifest_json(
+                    source_hash=spec.content_hash, inputs=body.inputs
+                ),
             )
         except sqlite3.IntegrityError:
             # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
