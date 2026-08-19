@@ -35,82 +35,54 @@ Storage is split in two tiers:
 | `efs-workspace.yaml` | Shared workspace PV/PVC |
 | `networkpolicy.yaml` | Ingress and egress policies per role |
 | `external-secrets.example.yaml` | Credential pipeline — applied separately (needs ESO CRDs) |
-| `iac/cluster.yaml` | CloudFormation stack: VPC and EKS cluster with add-ons |
+| `iac/infrastructure.yaml` | CloudFormation: every AWS resource — VPC, EKS cluster, add-ons, secret, IAM, ECR, EFS |
 | `iac/storageclasses.yaml` | The `gp3` and `efs-sc` StorageClasses the manifests reference |
-| `iac/cao-resources.yaml` | CloudFormation stack: CAO-specific AWS resources |
 
 ## Prerequisites
 
-Locally: `kubectl`, `docker` and the AWS CLI.
+| # | Step | How |
+|---|---|---|
+| 1 | Local tools | `kubectl`, `docker`, AWS CLI |
+| 2 | AWS resources — VPC, EKS cluster, add-ons, provider secret, IAM, ECR, EFS | `aws cloudformation deploy --template-file k8s/iac/infrastructure.yaml --stack-name cao-workshop --capabilities CAPABILITY_NAMED_IAM` (~15 min) |
+| 3 | kubectl access | `aws eks update-kubeconfig --region <region> --name cao-workshop` |
+| 4 | StorageClasses `gp3` and `efs-sc` | `kubectl apply -f k8s/iac/storageclasses.yaml` |
+| 5 | External Secrets Operator | Install into namespace `external-secrets` with Helm — see [external-secrets.io](https://external-secrets.io) |
+| 6 | Provider API key | Secrets Manager console → the secret named in the stack output → Edit → **Plaintext** tab → paste the raw key alone. No JSON, quotes or trailing newline |
+| 7 | Restart ESO | `kubectl -n external-secrets rollout restart deployment --all` |
+| 8 | Panel token | `kubectl -n cao-cluster create secret generic cao-panel-secret --from-literal=token="$(openssl rand -hex 32)"` |
+| 9 | Server image | Build and push — see [Building the image](#building-the-image) |
+| 10 | Credential pipeline | `kubectl apply -f k8s/external-secrets.example.yaml` |
 
-Create the cluster and its network with
-[`iac/cluster.yaml`](iac/cluster.yaml) — a two-AZ VPC, an EKS cluster, a managed
-node group, and the add-ons the fleet needs (including VPC CNI with NetworkPolicy
-enforcement enabled, which is off by default). Takes about 15 minutes.
+Notes on the steps that surprise people:
 
-```bash
-aws cloudformation deploy --template-file k8s/iac/cluster.yaml \
-  --stack-name cao-workshop --capabilities CAPABILITY_IAM \
-  --parameter-overrides ClusterName=cao-workshop
-aws eks update-kubeconfig --region <region> --name cao-workshop
-kubectl apply -f k8s/iac/storageclasses.yaml
-```
+- **Step 2** creates everything AWS-side in one stack, including the network, so
+  it works in a brand-new account with no VPC. It also enables NetworkPolicy
+  enforcement in the VPC CNI, which is off by default and without which the
+  policies in `networkpolicy.yaml` are accepted and then silently never enforced.
+- **Step 6** is manual by design: the stack creates the secret *empty*, so
+  forgetting this fails loudly instead of syncing a placeholder.
+- **Step 7** is required because Pod Identity injects credentials through a
+  webhook at pod creation, so ESO pods started before step 2 never receive them.
+- **Step 10** is separate from `kustomization.yaml` because its objects need the
+  ESO CRDs, which would make `kubectl apply -k k8s` fail on a cluster without ESO.
+  Confirm the `ClusterSecretStore` is `Ready=True` and the `ExternalSecret` reports
+  `SecretSynced` before deploying.
 
-The StorageClasses are a separate file because they are Kubernetes objects, not
-AWS resources. Install [External Secrets Operator](https://external-secrets.io)
-(ESO) into the `external-secrets` namespace for the same reason. Allow ~1Gi
-requested and 3Gi limit per pod when sizing nodes.
+### Building the image
 
-Then create the CAO-specific AWS resources with
-[`iac/cao-resources.yaml`](iac/cao-resources.yaml) (provider secret, ESO role and
-Pod Identity association, ECR repositories, EFS workspace). Every parameter it
-needs is an output of the cluster stack, so they pass straight through — read
-them with `aws cloudformation describe-stacks --stack-name cao-workshop --query
-'Stacks[0].Outputs'`.
-
-```bash
-aws cloudformation deploy --template-file k8s/iac/cao-resources.yaml \
-  --stack-name cao-resources --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides ClusterName=cao-workshop VpcId=<VpcId> \
-      NodeSecurityGroupId=<NodeSecurityGroupId> \
-      WorkspaceSubnetId1=<WorkspaceSubnetId1> WorkspaceSubnetId2=<WorkspaceSubnetId2>
-```
-
-Then four manual steps:
-
-1. **Set the secret value.** The stack creates it empty on purpose, so a missed
-   value fails loudly. In the Secrets Manager console open `cao/kiro-api-key` →
-   Edit → **Plaintext** tab → paste the raw key alone. No JSON, quotes or
-   trailing newline: the whole value becomes `KIRO_API_KEY`.
-2. **Restart ESO**, because Pod Identity injects credentials through a webhook at
-   pod creation and pods predating the association never receive them:
-   `kubectl -n external-secrets rollout restart deployment --all`
-3. **Create the panel token** (key must be named `token`; the namespace must
-   exist first):
-   `kubectl -n cao-cluster create secret generic cao-panel-secret --from-literal=token="$(openssl rand -hex 32)"`
-4. **Build and push the server image.** The base image ships only the
-   credential-free `mock_cli` provider, so it builds anywhere; a real provider is
-   layered on top from an authenticated CLI install directory (see
-   [../docs/kiro-cli.md](../docs/kiro-cli.md)). Push an immutable tag.
-
-   ```bash
-   docker build -f docker/Dockerfile -t cao-server:base .
-   docker build -f docker/Dockerfile.provider --build-arg BASE_IMAGE=cao-server:base \
-     -t <repo-uri>:<tag> <kiro-cli-install-dir>
-   ```
-
-   The panel image is expected to already exist in your registry; this repository
-   does not yet ship a Dockerfile for it.
-
-Finally apply the credential pipeline. It is excluded from `kustomization.yaml`
-because its objects need the ESO CRDs, which would make `kubectl apply -k k8s`
-fail on a cluster without ESO:
+The base image ships only the credential-free `mock_cli` provider, so it builds
+anywhere. A real provider is layered on top from an authenticated CLI install
+directory — see [../docs/kiro-cli.md](../docs/kiro-cli.md). Push an immutable tag;
+the server repository enforces it.
 
 ```bash
-kubectl apply -f k8s/external-secrets.example.yaml
-kubectl get clustersecretstore aws-secretsmanager        # want Ready=True
-kubectl -n cao-cluster get externalsecret kiro-api-key   # want SecretSynced=True
+docker build -f docker/Dockerfile -t cao-server:base .
+docker build -f docker/Dockerfile.provider --build-arg BASE_IMAGE=cao-server:base \
+  -t <ServerRepositoryUri>:<tag> <kiro-cli-install-dir>
 ```
+
+The panel image is expected to already exist in your registry; this repository
+does not yet ship a Dockerfile for it.
 
 ## Deploy
 
