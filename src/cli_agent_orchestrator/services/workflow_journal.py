@@ -476,6 +476,35 @@ def insert_run_with_steps(
         )
 
 
+def update_run_manifest(run_id: str, manifest_json: str) -> None:
+    """Replace ``workflow_run.manifest_json`` for ``run_id`` (issue #583 ``memory-resolve-once``).
+
+    THE ONLY SANCTIONED CALLER IS THE MEMORY FILL, and the narrowness is the point. The manifest is
+    written once at run start, in the same INSERT as the run row, precisely so there is no crash
+    window between two writes (ADR-583-4). Memory is the one field that cannot ride that write — it
+    resolves lazily, at the first point a run needs it, and a run that creates no terminal must
+    resolve nothing — so ``manifest-freeze`` leaves the memory record empty and this is the write
+    that fills it.
+
+    THE CALLER MUST PRESERVE EVERY OTHER FIELD BYTE-FOR-BYTE, and ``execution_manifest.with_memory``
+    is what guarantees it. The other fields are the inputs the ``plan_id`` was hashed from, and a
+    human may already have approved that identifier: rewrite one and the plan a run is executing
+    stops matching the approval that authorised it. A general "update the manifest" primitive would
+    be an invitation to do exactly that, which is why this function takes a whole document rather
+    than field arguments and says so here instead of accepting a field name.
+
+    Raises on failure rather than swallowing, because the caller must NOT hand a memory block to a
+    terminal whose record did not persist — a run that used memory the manifest does not record is
+    the one outcome FR-9 forbids, and it fails silently (an empty record is indistinguishable from a
+    run that never created a terminal).
+    """
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE workflow_run SET manifest_json = ? WHERE run_id = ?",
+            (manifest_json, run_id),
+        )
+
+
 def insert_steps(run_id: str, steps: Sequence[Tuple[str, str]], updated_at: str) -> None:
     """INSERT one ``workflow_run_step`` row per ``(step_id, state)`` (E2).
 
