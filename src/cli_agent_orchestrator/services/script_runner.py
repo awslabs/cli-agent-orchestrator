@@ -51,7 +51,12 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     StepState,
     WorkflowRunResult,
 )
-from cli_agent_orchestrator.services import manifest_freeze, terminal_service, workflow_journal
+from cli_agent_orchestrator.services import (
+    approval_gate,
+    manifest_freeze,
+    terminal_service,
+    workflow_journal,
+)
 from cli_agent_orchestrator.services.script_lint import lint_script
 from cli_agent_orchestrator.services.secret_gate import redact_json_leaves, redact_secrets
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part, step_output_store
@@ -1158,6 +1163,23 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     if result.status == "fail":
         raise ScriptLintError(result.findings)  # ZERO code ran, no journal row yet
 
+    # --- Step 0b: approval gate (issue #583 Bolt 2, ``approval-gate``) ---
+    # Built ONCE here and handed to the INSERT below unchanged, so the manifest that is CHECKED is
+    # byte-identical to the one STORED — and ADR-583-4's one-write discipline is preserved.
+    manifest_json = manifest_freeze.build_manifest_json(
+        source_hash=spec.content_hash, inputs=inputs
+    )
+    # Placed here, and not lower, for two reasons that are both about leaving nothing behind:
+    #   * BEFORE the registry write and the journal INSERT, so a refused start leaves no live record
+    #     and no ``workflow_run`` row. Every first run of a new plan is refused by design, so
+    #     recording them would durably record runs that never happened.
+    #   * OUTSIDE the ``try`` around ``insert_run`` below, which swallows EVERY exception by design
+    #     ("journal insert is best-effort; live floor still serves"). A refusal raised inside it would
+    #     be logged and the run would continue — the gate would appear to work and would authorise
+    #     nothing.
+    # No-ops entirely when enforcement is disabled, which is the default.
+    approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+
     # --- Step 1: register the live record + journal the durable run row ---
     record = ScriptRunRecord(
         run_id=run_id,
@@ -1203,7 +1225,9 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
             # window would produce a NULL manifest indistinguishable from a YAML run and from a
             # failed freeze. ``build_manifest_json`` is TOTAL and returns None on any failure, which
             # writes NULL and fails CLOSED at the approval gate.
-            manifest_freeze.build_manifest_json(source_hash=spec.content_hash, inputs=inputs),
+            # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 0b and has already gated on
+            # it; reusing it rather than rebuilding is what makes checked-equals-stored true.
+            manifest_json,
         )
     except (
         Exception
@@ -1363,6 +1387,29 @@ async def resume_script_run(
                     f"run '{run_id}' step '{journal_step.step_id}' has unconsumed recovery consent; "
                     "supply a fresh decision for this step to resume"
                 )
+
+        # --- Gate 6: plan approval -> 403 (issue #583 Bolt 2, ``approval-gate``) ---
+        # LAST of the admission gates, and that position is the requirement rather than a preference.
+        #
+        # It was authored as gate 5 against Bolt 2's base and RENUMBERED to 6 when Bolt 2 rebased onto
+        # a merged Bolt 1: PR #628's review added the recovery-consent gate above, at the same place,
+        # after Bolt 2 had branched. Both gates survive and the ORDERING PRINCIPLE is what decided
+        # which goes first — consent is a fact about the RUN, like gates 1-4, while approval is a fact
+        # about the PLAN, so approval stays last among admission checks.
+        #
+        # It must come:
+        #   * AFTER gates 1-5, so "unknown run", "already live", "not resumable", "corrupt snapshot"
+        #     and "unconsumed consent" keep their own answers — a caller must be able to tell those
+        #     from "needs approval", and the concurrent-resume question is settled by the drive claim
+        #     above before this gate is ever asked.
+        #   * BEFORE ``apply_decisions`` below and BEFORE the generation bump further down. The bump
+        #     fences out any still-live process for this run, so bumping and then refusing would kill
+        #     a possibly-healthy run on behalf of a resume that was itself rejected — two losses from
+        #     one refusal. ``apply_decisions`` writes, and a refused resume must leave nothing behind.
+        # ``plan_id`` comes from the manifest ALREADY on the row and is never recomputed: recomputing
+        # would re-read the script from disk, so an edit between start and resume would refuse a run
+        # whose approval is perfectly valid for what it actually froze.
+        approval_gate.ensure_plan_approved(tier=row.tier, manifest_json=row.manifest_json)
 
         # --- The human's recovery decisions (issue #583, FR-7). NOT a gate: admission
         # is over, this resume holds the drive claim, and nothing has been spawned yet.
