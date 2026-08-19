@@ -26,6 +26,18 @@ spec:
         app.kubernetes.io/name: cao-supervisor
         app.kubernetes.io/part-of: cao-fleet
     spec:
+      # fsGroup makes the EBS gp3 volume writable by the unprivileged `cao`
+      # user (uid/gid 1000). Without it the CSI driver presents the freshly
+      # formatted ext4 volume root as root:root 0755, so uid 1000 cannot create
+      # anything under it and CAO dies on startup trying to make db/, logs/,
+      # fifos/ and locks/. kubelet chowns the volume to root:1000 with g+rwx
+      # and the setgid bit, so directories CAO creates inherit gid 1000.
+      #
+      # OnRootMismatch skips the recursive chown when the volume root already
+      # has the expected ownership, so pod restarts do not re-walk the volume.
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: cao-node
           # Same image as workers — role differs by env/config only
@@ -47,19 +59,56 @@ spec:
               value: "http://cao-supervisor.cao-cluster.svc.cluster.local:9889"
             # Supervisor installs the code_supervisor profile
             - name: CAO_INSTALL_PROFILES
-              value: "code_supervisor:mock_cli"
+              value: "code_supervisor:kiro_cli"
+            # Put CAO's state tree on the mounted gp3 PVC. Without this, CAO
+            # defaults to ~/.aws/cli-agent-orchestrator on the container's
+            # ephemeral filesystem, so the PVC mounted at /home/cao/.cao held
+            # nothing but lost+found and every restart lost the database,
+            # agent-store and terminal logs.
+            #
+            # A SUBDIRECTORY of the mount, not the mount root: constants.py
+            # does mkdir(mode=0o700) then chmod(0o700) with the chmod wrapped in
+            # `except OSError: pass`. Pointed at the root-owned mount root that
+            # chmod silently fails and the state tree stays group-readable;
+            # pointed here CAO creates the directory itself as 1000:1000 and the
+            # intended owner-only 0700 posture actually takes effect.
+            #
+            # This belongs on the per-pod RWO gp3 volume and NOT on the shared
+            # EFS workspace: the tree holds a SQLite DB, named pipes for tmux
+            # pipe-pane streaming, and flock targets, all of which are unsafe
+            # over NFS.
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/state
+            # Provider API key, synced from AWS Secrets Manager by External
+            # Secrets Operator — see k8s/external-secrets.example.yaml. The
+            # Secret must already exist (ExternalSecret SecretSynced=True) or
+            # this pod fails with CreateContainerConfigError. Env is read once
+            # at container start, so a key rotation needs a rollout restart.
+            - name: KIRO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kiro-api-key
+                  key: KIRO_API_KEY
             # Deliberately NO CAO_MAX_TERMINALS here: the supervisor pod is
             # uncapped so its own terminal plus any sidecars can coexist. In
             # this topology delegated workers should not land here either way —
             # assign/handoff calls from the supervisor should always carry
             # target_host=<worker pod> so agents run on the capped worker pods.
           resources:
+            # Sized for a REAL provider CLI, not the mock. kiro-cli ships a
+            # 665 MB `kiro-cli-chat` binary that gets mapped in when an agent
+            # runs, on top of ~230 MB for cao-server itself. The original
+            # 1Gi limit was set when mock_cli (a small shell script) was the
+            # only provider, and it OOMKilled this pod (exit 137) the first
+            # time a real agent ran — which also wiped all session state,
+            # since state does not currently live on the mounted PVC.
+            # Revisit if you go back to a mock-only fleet.
             requests:
               cpu: 250m
-              memory: 512Mi
+              memory: 1Gi
             limits:
               cpu: "1"
-              memory: 1Gi
+              memory: 3Gi
           readinessProbe:
             httpGet:
               path: /health
