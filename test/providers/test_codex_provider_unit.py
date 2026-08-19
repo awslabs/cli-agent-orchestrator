@@ -3276,6 +3276,123 @@ class TestCodexProviderApprovalPromptLive:
         assert not re.search(APPROVAL_PROMPT_FOOTER, prose)
 
     @pytest.mark.parametrize(
+        ("keymap_case", "footer_replacement"),
+        [
+            # tui.keymap.list.accept = [] — an empty list explicitly unbinds
+            # (config/src/tui_keymap.rs at rust-v0.147.0), and
+            # accept_cancel_hint_line's (None, Some(cancel)) arm renders the
+            # cancel hint alone (popup_consts.rs).
+            ("accept_unbound_cancel_only", "  Press esc to cancel"),
+            # Both list actions unbound: the (None, None) arm renders an empty
+            # line — the blocking menu has NO footer at all.
+            ("both_unbound_no_footer", ""),
+            # Both unbound on a request with a thread label: the overlay
+            # appends its own hint, so the whole footer is the thread hint
+            # (approval_overlay.rs approval_footer_hint).
+            ("both_unbound_thread_hint", "  Press t to open thread"),
+        ],
+    )
+    def test_unbound_accept_keymap_is_waiting_via_both_status_paths(
+        self, keymap_case, footer_replacement
+    ):
+        """An approval menu with the accept action UNBOUND must still classify
+        WAITING through both public entry points.
+
+        Codex 0.147.0 renders the same blocking numbered menu either with a
+        cancel-only footer or with no footer line at all, so the footer cannot
+        be the anchor — the menu is (haofeif round 5). At ``e6f0a57`` these
+        shapes returned IDLE from both paths while the overlay stayed active,
+        re-enabling delivery into a blocked pane.
+
+        Built from the real capture with only the footer line swapped, so the
+        menu/preview/question rows stay pinned to the live rendering.
+        """
+        raw = load_fixture("codex_approval_modal_raw.txt")
+        footer_line = next(line for line in raw.splitlines() if "to confirm" in line)
+        output = raw.replace(footer_line, footer_replacement)
+        assert output != raw
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert _has_approval_prompt_in_bottom(output)
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status_from_screen(output.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    def test_quoted_menu_without_footer_is_still_rejected(self):
+        """Making the footer optional must not admit a menu the model QUOTED.
+
+        The discriminator is the column-0 cursor: quoted or continuation prose
+        is indented under its bullet, so a pasted menu carries its cursor at
+        column >= 2 and finds no anchor even now that no footer is required.
+        """
+        output = (
+            "› what did the approval look like?\n"
+            "• It showed this menu:\n"
+            "  › 1. Yes, proceed (y)\n"
+            "    2. No, and tell Codex what to do differently (esc)\n"
+            "› \n"
+            "  ? for shortcuts                     88% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert not _has_approval_prompt_in_bottom(output)
+        assert provider.get_status(output) != TerminalStatus.WAITING_USER_ANSWER
+
+    def test_menu_with_reply_below_is_rejected_even_without_footer(self):
+        """A scrolled-out menu followed by reply content must stay rejected:
+        the menu-block scan below the anchor refuses anything that is not an
+        option row, a footer hint, or chrome."""
+        output = (
+            "› 1. Yes, proceed (y)\n"
+            "  2. No, and tell Codex what to do differently (esc)\n"
+            "• proceeding with the command.\n"
+            "› \n"
+            "  ? for shortcuts                     88% context left\n"
+        )
+
+        assert not _has_approval_prompt_in_bottom(output)
+
+    def test_single_numbered_line_at_bottom_is_not_a_menu(self):
+        """A lone column-0 numbered line over the idle composer is NOT a menu.
+
+        APPROVAL_MENU_MIN_OPTIONS is the floor: a genuine approval always
+        offers at least accept and decline, so a single-item shape — most
+        commonly a user message that happens to start with "1." — must not
+        anchor. This is also what keeps the disclosed numbered-list residual
+        (below) confined to MULTI-line user lists.
+        """
+        output = (
+            "› 1. run the tests\n" "› \n" "  ? for shortcuts                     88% context left\n"
+        )
+
+        assert not _has_approval_prompt_in_bottom(output)
+
+    def test_user_numbered_list_at_bottom_is_the_disclosed_residual(self):
+        """DOCUMENTED RESIDUAL, asserted so a change is a conscious decision.
+
+        A user message that is itself a numbered list renders with the same
+        column-0 gutter marker as a live menu cursor, so parked at the bottom
+        of an otherwise idle pane (codex interrupted before replying) it now
+        reads WAITING rather than IDLE. That errs toward withholding work —
+        never toward pasting into a blocked pane — and clears as soon as codex
+        renders any activity below the cell (the case above). The
+        footer-anchored detector rejected this shape only by failing open to
+        IDLE on every unbound-keymap approval, the dangerous direction.
+        """
+        output = (
+            "› 1. run the tests\n"
+            "  2. fix whatever fails\n"
+            "› \n"
+            "  ? for shortcuts                     88% context left\n"
+        )
+
+        assert _has_approval_prompt_in_bottom(output)
+
+    @pytest.mark.parametrize(
         "question",
         [
             "Would you like to run the following command?",

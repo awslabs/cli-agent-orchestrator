@@ -174,20 +174,32 @@ APPROVAL_PROMPT_PATTERN = (
     r"|grant these permissions)\?"
     r"|Do you want to approve network access to)"
 )
-# Rendered as `Press ` + `<accept-label>` + ` to confirm or ` + `<cancel-key>` +
-# ` to cancel`, with the key names emitted as separately styled spans -- the whole
-# sentence is not one literal in the binary. The accept key is CONFIGURABLE
-# (`tui.keymap.list.accept`) and its label is NOT a single token: a two-stroke
+# The footer under a blocking list menu is OPTIONAL CORROBORATION, not an
+# anchor: both list actions are unbindable (`tui.keymap.list.accept = []` --
+# an empty list explicitly unbinds; config/src/tui_keymap.rs at rust-v0.147.0),
+# and accept_cancel_hint_line (tui/src/bottom_pane/popup_consts.rs) renders one
+# of FOUR shapes accordingly:
+#   both bound     -> "Press <a> to confirm or <c> to cancel"
+#   accept unbound -> "Press <c> to cancel"
+#   cancel unbound -> "Press <a> to confirm"
+#   both unbound   -> no footer line at all
+# The approval overlay may append " or <k> to open thread"
+# (approval_overlay.rs), which is also the WHOLE line when both list actions
+# are unbound, and the generic popups (model picker) say "to go back" where
+# the approval says "to cancel". So this pattern's job is only to recognise a
+# footer line as part of the menu block wherever one is rendered.
+#
+# The key labels are emitted as separately styled spans -- the sentence is not
+# one literal in the binary -- and a label is NOT a single token: a two-stroke
 # chord such as "ctrl-x ctrl-s" renders via ShortcutHint::display_label() as
 # `ctrl + x ctrl + s` (strokes joined by a space, modifiers by " + ";
-# codex-rs/tui/src/key_hint.rs at rust-v0.147.0). Worst legal label is a chord
-# whose strokes each carry ctrl+shift+alt: 7 tokens per stroke, 14 in total, so
-# the label is matched as 1-15 whitespace-separated tokens. The bound keeps a
-# same-line prose sentence from bridging an unrelated "Press" to a distant
-# "to confirm"; the numbered-menu-at-bottom structure in
-# _has_approval_prompt_in_bottom stays the guard that rejects a completed reply
-# merely quoting the phrase.
-APPROVAL_PROMPT_FOOTER = r"Press \S+(?:[^\S\n]+\S+){0,14} to confirm\b"
+# key_hint.rs). Worst legal label is a chord whose strokes each carry
+# ctrl+shift+alt: 7 tokens per stroke, 14 in total, so a label is matched as
+# 1-15 whitespace-separated tokens. The bound keeps a same-line prose sentence
+# from bridging an unrelated "Press" to a distant "to confirm".
+APPROVAL_PROMPT_FOOTER = (
+    r"Press \S+(?:[^\S\n]+\S+){0,14} to (?:confirm|cancel|go back|open thread)\b"
+)
 # One numbered menu option: "› 1. Yes, proceed (y)", "  2. No, ... (esc)". The
 # selection cursor is optional here because it sits on exactly one option at a
 # time and moves as the operator arrows around.
@@ -537,88 +549,97 @@ def _has_approval_modal_in_bottom(clean_output: str) -> bool:
     return False
 
 
-def _has_approval_menu_above(lines: list[str], footer_idx: int) -> bool:
-    """Return True when a numbered selection menu sits above ``lines[footer_idx]``.
-
-    Walks UP from the footer collecting option lines, stopping at the first
-    :func:`_is_transcript_marker` — the prompt is one transcript cell, so the
-    menu must live inside it. Option lines are classified BEFORE the marker test
-    because the cursor line ("› 1. Yes, proceed (y)") itself matches
-    USER_PREFIX_PATTERN and would otherwise end the walk immediately.
-
-    Blank rows and the question/command-preview rows between the menu and the
-    title are stepped over rather than terminating the walk, which is what makes
-    the height of the command preview irrelevant.
-
-    Requires APPROVAL_MENU_MIN_OPTIONS options AND the selection cursor flush at
-    column 0 (see APPROVAL_MENU_CURSOR_PATTERN).
-    """
-    options = 0
-    cursor_at_margin = False
-    for index in range(footer_idx - 1, -1, -1):
-        line = lines[index]
-        if re.match(APPROVAL_MENU_OPTION_PATTERN, line):
-            options += 1
-            if re.match(APPROVAL_MENU_CURSOR_PATTERN, line):
-                cursor_at_margin = True
-            continue
-        if not line.strip():
-            continue
-        if _is_transcript_marker(line):
-            break
-    return options >= APPROVAL_MENU_MIN_OPTIONS and cursor_at_margin
-
-
 def _has_approval_prompt_in_bottom(clean_output: str) -> bool:
     """Return True when Codex's runtime approval prompt is active at the bottom.
 
     This is the prompt codex-cli 0.147.0 actually renders (verified against three
     live captures). Detection is STRUCTURAL and bottom-up — the numbered menu
-    plus its confirm footer, not the question title — for the two reasons set out
-    at APPROVAL_PROMPT_PATTERN: the title list cannot be completed, and a fixed
-    row budget fails open on a long command preview.
+    itself, not the question title and not the footer — because none of the
+    alternatives can be relied on: the title list cannot be completed, a fixed
+    row budget fails open on a long command preview (see
+    APPROVAL_PROMPT_PATTERN), and the footer is absent entirely when the list
+    actions are unbound (`tui.keymap.list.accept = []` renders the same blocking
+    menu with only "Press esc to cancel", or with no footer line at all — see
+    APPROVAL_PROMPT_FOOTER).
 
     Three guards, in the order they are cheapest to refute:
 
-    1. **Footer anchor.** The LAST line matching APPROVAL_PROMPT_FOOTER. Taking
-       the last, not the first, lets an already-answered prompt in scrollback be
-       ignored rather than shadow a live one below it.
-    2. **Nothing but chrome below the anchor** (:func:`_is_chrome_only`, shared
-       with the boxed-modal detector). A live prompt blocks the TUI, so it must
-       BE the bottom of the pane. This is the guard that rejects an ordinary
-       COMPLETED reply which happens to quote both the question and the footer
-       while a live composer and more prose sit underneath — the sticky
-       WAITING_USER_ANSWER that case used to latch would wedge a ready worker.
-    3. **A numbered menu directly above the anchor**
-       (:func:`_has_approval_menu_above`), bounded by transcript markers rather
-       than a line count, so an arbitrarily tall preview still resolves.
+    1. **Menu-cursor anchor.** The LAST line whose selection cursor sits flush
+       at column 0 (APPROVAL_MENU_CURSOR_PATTERN). Taking the last, not the
+       first, lets an already-answered prompt in scrollback be ignored rather
+       than shadow a live one below it. Column 0 is where Codex draws every
+       transcript gutter marker, so quoted or continuation prose — a menu the
+       model merely PASTED into a reply — carries its cursor at column >= 2 and
+       fails this.
+    2. **Nothing below the anchor but the rest of the menu block**: the
+       remaining (non-cursor) option rows, at most one footer hint in any of
+       its rendered forms, and chrome (:func:`_is_chrome_only`, shared with the
+       boxed-modal detector). A live prompt blocks the TUI, so its menu must BE
+       the bottom of the pane. This is the guard that rejects an ordinary
+       COMPLETED reply which quotes the menu while a live composer and more
+       prose sit underneath — the sticky WAITING_USER_ANSWER that case used to
+       latch would wedge a ready worker.
+    3. **Menu size.** At least APPROVAL_MENU_MIN_OPTIONS option rows counted
+       contiguously around the anchor (a genuine approval always offers accept
+       and decline). Contiguity matters: counting across the question or the
+       command preview would let a numbered list INSIDE a quoted command
+       inflate the tally.
 
-    Deliberately NOT required: any particular question title, and any particular
-    option copy. The consequence is that this also fires on Codex's other
-    blocking numbered menus that share the confirm footer (the model picker, for
-    one). That is correct rather than tolerated — those panes are equally blocked
+    Deliberately NOT required: any particular question title, any particular
+    option copy, and the footer. The footer, when present in any of its four
+    rendered shapes, is accepted as part of the block; its absence proves
+    nothing because unbinding the accept action removes it while the menu still
+    blocks. Firing on Codex's other blocking numbered menus (the model picker,
+    for one) is correct rather than tolerated — those panes are equally blocked
     on a keystroke, and WAITING_USER_ANSWER is the right answer for them too.
 
-    Residual risk, disclosed: guard 3's column-0 cursor test is what separates a
-    live menu from one pasted into a reply, so a future renderer that indents the
-    cursor would fail open to IDLE. The three live captures in
-    test/providers/fixtures/ (codex_approval_{modal,edits,long_preview}_raw.txt)
-    pin the current rendering against that.
+    Residual risks, disclosed:
+
+    - The column-0 cursor test is what separates a live menu from one pasted
+      into a reply, so a future renderer that indents the cursor would fail
+      open to IDLE. The live captures in test/providers/fixtures/
+      (codex_approval_{modal,edits,long_preview}_raw.txt) pin the current
+      rendering against that.
+    - A USER message that is itself a numbered list ("1. foo\\n2. bar") renders
+      with the same column-0 gutter marker ("› 1. foo" over "  2. bar"), so if
+      it is the last transcript cell with only the idle composer below — codex
+      interrupted before replying, say — it now reads WAITING rather than IDLE.
+      That errs toward withholding work, never toward pasting into a blocked
+      pane, and clears as soon as codex renders any activity below the cell.
+      The footer-anchored version rejected this shape, but only by failing open
+      to IDLE on every unbound-keymap approval, which is the dangerous
+      direction to be wrong in.
     """
     lines = clean_output.splitlines()
 
-    footer_idx = None
+    anchor = None
     for index in range(len(lines) - 1, -1, -1):
-        if re.search(APPROVAL_PROMPT_FOOTER, lines[index]):
-            footer_idx = index
+        if re.match(APPROVAL_MENU_CURSOR_PATTERN, lines[index]):
+            anchor = index
             break
-    if footer_idx is None:
+    if anchor is None:
         return False
 
-    if not all(_is_chrome_only(line) for line in lines[footer_idx + 1 :]):
+    options = 1  # the anchor row
+    footer_seen = False
+    for line in lines[anchor + 1 :]:
+        if not footer_seen and re.match(APPROVAL_MENU_OPTION_PATTERN, line):
+            options += 1
+            continue
+        if not footer_seen and re.search(APPROVAL_PROMPT_FOOTER, line):
+            footer_seen = True
+            continue
+        if _is_chrome_only(line):
+            continue
         return False
 
-    return _has_approval_menu_above(lines, footer_idx)
+    for index in range(anchor - 1, -1, -1):
+        if re.match(APPROVAL_MENU_OPTION_PATTERN, lines[index]):
+            options += 1
+            continue
+        break
+
+    return options >= APPROVAL_MENU_MIN_OPTIONS
 
 
 def _has_startup_idle_composer(clean_output: str) -> bool:
