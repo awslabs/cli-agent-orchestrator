@@ -30,7 +30,10 @@
 #   docker build -t cao-server:<tag>-kiro<ver> \
 #     -f docker/Dockerfile.provider \
 #     --build-arg BASE_IMAGE=cao-server:<tag> \
-#     ~/.toolbox/tools/kiro-cli/<ver>/                                # provider
+#     <kiro-cli-install-dir>                                        # provider
+#
+# <kiro-cli-install-dir> is the directory containing the kiro-cli, kiro-cli-chat
+# and kiro-cli-term executables. See ../docs/kiro-cli.md for installation.
 #
 # The binaries are dynamically linked, so they must match the base image's libc
 # (python:3.12-slim => Debian bookworm, glibc 2.36). The smoke test fails the
@@ -47,7 +50,7 @@ USER root
 # the launcher can exec its helpers (see the PATH note above).
 COPY --chmod=755 . /opt/kiro-cli/
 RUN set -eux; \
-    rm -f /opt/kiro-cli/toolbox_post_install_script; \
+    rm -f /opt/kiro-cli/*_post_install_script; \
     for b in kiro-cli kiro-cli-chat kiro-cli-term; do \
         ln -sf "/opt/kiro-cli/$b" "/usr/local/bin/$b"; \
     done

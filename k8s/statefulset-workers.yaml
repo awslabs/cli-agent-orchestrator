@@ -49,7 +49,7 @@ spec:
       containers:
         - name: cao-node
           # TODO: Replace with your ECR image URI after push
-          image: 418295698799.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server:latest
+          image: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server:latest
           ports:
             - containerPort: 9889
               name: http
