@@ -215,6 +215,7 @@ class ClaudeCodeProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         native_session_id: Optional[str] = None,
+        fork_from_session_id: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -224,6 +225,28 @@ class ClaudeCodeProvider(BaseProvider):
         # must consume (``--session-id <id>``); None keeps the legacy
         # ambient launch.
         self._native_session_id = native_session_id
+        # The parent conversation this launch branches from. The child reads the
+        # parent's transcript once at startup and then diverges: the parent's
+        # transcript is never appended to, so a parent may be live in its own
+        # pane while this launch happens, and several children may branch from
+        # one parent concurrently.
+        #
+        # Forking requires an explicit destination id. Without one Claude Code
+        # mints an ambient id that nothing recorded, so the child could not be
+        # resumed, collected, or attributed — which is the failure
+        # ``native_session_id`` exists to prevent, reintroduced one level down.
+        self._fork_from_session_id = fork_from_session_id
+        if fork_from_session_id and not native_session_id:
+            raise ValueError(
+                "fork_from_session_id requires native_session_id: a fork must "
+                "name the exact id it becomes, not accept an ambient one"
+            )
+        if fork_from_session_id and fork_from_session_id == native_session_id:
+            raise ValueError(
+                "fork_from_session_id must differ from native_session_id: a "
+                "fork onto its own source resumes the parent it meant to branch "
+                "from, and would append to the transcript it must leave intact"
+            )
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -416,6 +439,13 @@ class ClaudeCodeProvider(BaseProvider):
         # creates an unrelated fresh conversation.
         if self._native_session_id:
             command_parts.extend(["--session-id", self._native_session_id])
+
+        # A fork names its source as well as its destination. ``--resume`` alone
+        # would re-enter the parent; ``--fork-session`` redirects the write to
+        # the ``--session-id`` above, leaving the parent transcript untouched.
+        # The constructor has already established that both ids exist and differ.
+        if self._fork_from_session_id:
+            command_parts.extend(["--resume", self._fork_from_session_id, "--fork-session"])
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters

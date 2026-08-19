@@ -2159,3 +2159,58 @@ class TestWaitUntilInputReady:
 
         provider = ClaudeCodeProvider("t5", "sess", "win")
         assert await BaseProvider.wait_until_input_ready(provider) is True
+
+
+class TestForkFromSession:
+    """A fork branches from a parent conversation without disturbing it.
+
+    The launch must name both ends: the parent it reads and the id it becomes.
+    Naming only the parent is a resume, which would append to the transcript the
+    fork exists to leave intact.
+    """
+
+    _PARENT = "11111111-1111-1111-1111-111111111111"
+    _CHILD = "22222222-2222-2222-2222-222222222222"
+
+    def test_fork_names_both_the_parent_and_the_child(self):
+        provider = ClaudeCodeProvider(
+            "t123",
+            "cao-s",
+            "w123",
+            native_session_id=self._CHILD,
+            fork_from_session_id=self._PARENT,
+        )
+        command = provider._build_claude_command(profile=None)
+
+        assert "--fork-session" in command
+        assert f"--session-id {self._CHILD}" in command
+        assert f"--resume {self._PARENT}" in command
+
+    def test_a_plain_launch_is_not_a_fork(self):
+        # Without a parent the launch must carry no fork flag at all: an
+        # unforked worker that silently resumed some other conversation would
+        # inherit context nothing recorded it inheriting.
+        provider = ClaudeCodeProvider("t123", "cao-s", "w123", native_session_id=self._CHILD)
+        command = provider._build_claude_command(profile=None)
+
+        assert "--fork-session" not in command
+        assert "--resume" not in command
+        assert f"--session-id {self._CHILD}" in command
+
+    def test_fork_without_a_destination_id_is_refused(self):
+        # Claude Code would mint an ambient id that nothing recorded, so the
+        # child could not be resumed, collected, or attributed.
+        with pytest.raises(ValueError, match="requires native_session_id"):
+            ClaudeCodeProvider("t123", "cao-s", "w123", fork_from_session_id=self._PARENT)
+
+    def test_fork_onto_its_own_source_is_refused(self):
+        # That is a resume wearing a fork's flag: it lands in the very
+        # conversation it meant to branch away from.
+        with pytest.raises(ValueError, match="must differ"):
+            ClaudeCodeProvider(
+                "t123",
+                "cao-s",
+                "w123",
+                native_session_id=self._PARENT,
+                fork_from_session_id=self._PARENT,
+            )
