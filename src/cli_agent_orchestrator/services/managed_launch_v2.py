@@ -4432,9 +4432,18 @@ def _prepare_muse_fresh_launch(
         wrapper_executable=executable, full_banner=version_output
     )
     if not carrier.supported:
+        # The refusal carries the verb that clears it, addressed to the operator
+        # who is the only actor able to take it. Without the digest and the
+        # variable name here, the reason alone names a probe the reader cannot
+        # act on.
         raise ManagedLaunchConflict(
             "Muse profile carrier is unavailable for this installed wrapper/binary pair "
-            f"({carrier.reason}); stage-verify it before enabling profile launch"
+            f"({carrier.reason}). To proceed on a build you have verified yourself, set "
+            f"{muse_native_launch.CAO_MUSE_PROFILE_CARRIER_PROVEN_ENV}="
+            f"{carrier.inner_executable_sha256 or '<inner-sha256>'} in the conductor's "
+            "environment and restart it so the value is read at launch; the digest is "
+            "the sha256 of the resolved muse-bin-<revision>, not the muse wrapper. An "
+            "unproven verdict often clears on a plain retry."
         )
     # Semver-level listing is not required either: the /status observation
     # below discovers the provider-minted id from the pane at runtime, so an

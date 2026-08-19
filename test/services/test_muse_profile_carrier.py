@@ -148,7 +148,7 @@ def test_probe_truth_table_unproven_usage_dump_row(tmp_path):
     capability = muse.profile_carrier_capability(
         wrapper_executable=str(wrapper), full_banner=BANNER
     )
-    assert capability.supported is True
+    assert capability.supported is False
     assert capability.proof == muse.PROOF_UNPROVEN
     assert "unknown preset" in capability.reason
 
@@ -163,7 +163,7 @@ def test_probe_truth_table_unproven_missing_file_error_row(tmp_path):
     capability = muse.profile_carrier_capability(
         wrapper_executable=str(wrapper), full_banner=BANNER
     )
-    assert capability.supported is True
+    assert capability.supported is False
     assert capability.proof == muse.PROOF_UNPROVEN
     assert "failed to read" in capability.reason
 
@@ -178,7 +178,7 @@ def test_probe_truth_table_unproven_unrecognized_error_row(tmp_path):
     capability = muse.profile_carrier_capability(
         wrapper_executable=str(wrapper), full_banner=BANNER
     )
-    assert capability.supported is True
+    assert capability.supported is False
     assert capability.proof == muse.PROOF_UNPROVEN
     assert "fatal: unexpected internal error" in capability.reason
 
@@ -193,7 +193,7 @@ def test_probe_truth_table_unproven_control_fails_row(tmp_path):
     capability = muse.profile_carrier_capability(
         wrapper_executable=str(wrapper), full_banner=BANNER
     )
-    assert capability.supported is True
+    assert capability.supported is False
     assert capability.proof == muse.PROOF_UNPROVEN
     assert "control leg crash" in capability.reason
 
@@ -346,3 +346,38 @@ def test_disproved_carrier_refuses_before_profile_file_or_pane_effect(monkeypatc
             profile_material={"system_prompt": "private", "profile_sha256": "a" * 64},
         )
     assert wrote_profile is False
+
+
+def test_an_unproven_probe_refuses_rather_than_launching(tmp_path):
+    """An inconclusive probe must not license a launch.
+
+    The failure this guards is silent: a build whose carrier leg exits
+    non-zero for an unrecognised reason *and* which ignores the file would,
+    under a permissive default, launch a worker running the vendor's default
+    persona behind a receipt asserting the CAO profile was composed —
+    undetectable once the pane is live. Refusing converts that into a visible,
+    retryable stop.
+    """
+    wrapper, inner = _make_probe_stub(tmp_path, behavior="unrecognized_error")
+
+    cap = muse.profile_carrier_capability(wrapper_executable=str(wrapper), full_banner=BANNER)
+
+    assert cap.proof == muse.PROOF_UNPROVEN
+    assert cap.supported is False
+    # unproven and disproved stay distinguishable: they call for different
+    # operator actions (retry versus attest), so one reason may never stand in
+    # for the other.
+    assert "profile_carrier_unproven" in cap.reason
+    assert muse.PROOF_DISPROVED not in cap.reason
+
+
+def test_the_operator_override_also_clears_an_unproven_verdict(tmp_path, monkeypatch):
+    """The refusal ships a verb that clears it in every state that fires it."""
+    wrapper, inner = _make_probe_stub(tmp_path, behavior="unrecognized_error")
+    inner_digest = muse._sha256_file(str(inner))
+
+    monkeypatch.setenv(muse.CAO_MUSE_PROFILE_CARRIER_PROVEN_ENV, inner_digest)
+    cap = muse.profile_carrier_capability(wrapper_executable=str(wrapper), full_banner=BANNER)
+
+    assert cap.supported is True
+    assert cap.proof == muse.PROOF_PROBED_BY_OPERATOR

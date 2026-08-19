@@ -307,9 +307,22 @@ def profile_carrier_capability(
             inner_executable=inner,
             inner_executable_sha256=digest,
         )
+    # An inconclusive probe refuses rather than proceeding.  Proceeding would
+    # convert an absent measurement into a silent failure, which is the exact
+    # §3 defect: the carrier leg can exit non-zero for a reason this probe does
+    # not recognise *while the build also ignores the file*, and the launch
+    # would then compose a profile the provider never reads — a worker running
+    # the vendor's default persona behind a receipt asserting
+    # ``profile_system_prompt_sha256``, undetectable once the pane is live.
+    #
+    # This refusal is self-clearing in a way ``disproved`` is not: the ordinary
+    # causes (a full temp dir, a slow spawn, a timeout) pass on a retry, and the
+    # operator override below clears a persistent one. ``unproven`` therefore
+    # stays a durable value distinct from ``disproved`` — the reason string says
+    # which was observed — while both take the safe end of the range.
     reason = f"profile_carrier_unproven: {detail}" if detail else "profile_carrier_unproven"
     return MuseProfileCarrierCapability(
-        supported=True,
+        supported=False,
         reason=reason,
         proof=PROOF_UNPROVEN,
         full_banner=full_banner.strip(),

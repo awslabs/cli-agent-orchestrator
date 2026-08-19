@@ -175,9 +175,25 @@ Two rules keep the exception from spreading:
 Muse's managed native profile carrier is verified at launch by a two-leg
 runtime probe (`muse exec --provider echo` with and without base instructions)
 against the resolved inner binary rather than an allowlist of build digests.
-An unproven build defaults to open, while a disproved build (where base
-instructions are ignored) fails closed to prevent launching unconfigured
-workers.
+Only a `probed` verdict launches. A `disproved` build — one that ran a clean
+turn with base instructions present, so it ignores them — fails closed, and so
+does an `unproven` one, because a probe that established nothing cannot license
+a launch: the alternative would compose a profile the provider may never read
+and leave a receipt asserting it, undetectable once the pane is live.
+
+The two refusals stay distinct in the reason string, because they call for
+different actions. `unproven` is ordinarily transient — a full temp dir, a slow
+spawn, a timeout — and clears on a retry. `disproved` is a property of the
+build and will not. Both are cleared deliberately by setting
+`CAO_MUSE_PROFILE_CARRIER_PROVEN` to the sha256 of the resolved
+`muse-bin-<revision>` and restarting the conductor, which records an operator
+attestation as `probed_by_operator` rather than lifting the gate.
+
+The probe measures `muse exec --provider echo`; the launch it gates is the
+interactive TUI. That is a proxy, and it is the strongest zero-cost signal
+available — it exercises the same `TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE` surface
+on the same inner binary. It does not prove the TUI honours that surface, and
+no claim in the receipt or refusal says otherwise.
 
 ---
 
