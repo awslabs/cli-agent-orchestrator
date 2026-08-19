@@ -172,16 +172,12 @@ Two rules keep the exception from spreading:
 - **Bind capability grants nothing else by implication.** It is not a step toward
   a broad allowlist.
 
-Muse has a similar narrow cell, and the same question applies: the managed native
-profile carrier is enabled only on the exact full banner `Muse Code 0.1.0
-(0.1.0-R708.1)` with the stage-proven inner `muse-bin-*` SHA-256. Pinning to an
-inner binary digest cannot survive any vendor update by construction, which makes
-it the clearest case that the technique — not the version — is what needs fixing. The update-capable `muse` launcher script is never
-that evidence. A same-semver R revision or changed inner digest advertises as
-`profile_carrier_unverified` until separately verified.
-
-**Adding a build to a narrow table is recording an override, not lifting a gate.**
-Verify the contract, add the exact build, and leave the provider's mode `open`.
+Muse's managed native profile carrier is verified at launch by a two-leg
+runtime probe (`muse exec --provider echo` with and without base instructions)
+against the resolved inner binary rather than an allowlist of build digests.
+An unproven build defaults to open, while a disproved build (where base
+instructions are ignored) fails closed to prevent launching unconfigured
+workers.
 
 ---
 
@@ -259,13 +255,14 @@ launcher, with nobody involved. Treat it as the standing evidence for §1: a rea
 measurement names a build and expires with it, so state the build you measured and expect
 to re-measure rather than recording a fact about "the installed build" in the abstract.
 
-### Still gating on an exact build
+### Still gating on an exact build or launcher layout
 
-`NATIVE_BIND_CAPABLE_VERSIONS` and the Muse profile-carrier cell, per §6. They cannot
-be converted by choosing a default — they need a version-robust technique, which is
-research rather than refactor, and it is done: no build has ever failed the Codex
-bootstrap contract, and both replacements are zero-cost runtime probes. Tracked
-separately. `ROUTE_ATTEST_CAPABLE_VERSIONS` belongs to that same family.
+`NATIVE_BIND_CAPABLE_VERSIONS`, per §6. It cannot be converted by choosing a default —
+it needs a version-robust technique, which is research rather than refactor: no build
+has ever failed the Codex bootstrap contract, and the replacement is a zero-cost runtime
+probe. Tracked separately. `ROUTE_ATTEST_CAPABLE_VERSIONS` belongs to that same family.
+Muse is gated on Meta's launcher layout (`.muse-version` + `muse-bin-<revision>`), not on
+a build digest.
 
 ## 10. Deliberately not built yet
 

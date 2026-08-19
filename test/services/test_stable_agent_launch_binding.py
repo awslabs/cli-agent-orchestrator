@@ -857,9 +857,9 @@ def test_muse_v2_enrollment_truthful_not_faked(isolated_memory_db, monkeypatch):
         muse_native_launch,
         "installed_profile_carrier_capability",
         lambda: muse_native_launch.MuseProfileCarrierCapability(
-            True,
-            "",
-            cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+            supported=True,
+            reason="",
+            proof=muse_native_launch.PROOF_PROBED,
             full_banner="Muse Code 0.1.0 (0.1.0-R708.1)",
             inner_executable="/fixture/muse-bin-0.1.0-R708.1",
             inner_executable_sha256=(

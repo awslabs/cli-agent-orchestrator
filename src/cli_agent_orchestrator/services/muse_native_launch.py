@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import uuid as _uuid_module
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,42 +66,37 @@ FORBIDDEN_OPTIONS = frozenset(
 )
 
 #: The installed surface that carries the CAO profile system prompt into
-#: the main session as base instructions.  ``muse --agents <JSON>`` was
-#: read on the installed 0.1.0-R708.1 build and does NOT compose into the
-#: main session agent: the overlay registers session agent definitions for
-#: the workflow/subagent ``agentType`` path, and an echo-provider probe
-#: with the overlay set ran a clean turn with the profile line unchanged.
-#: The env-addressed file below *does* compose: with it set, an
-#: echo-provider launch and an exact ``muse resume <id>`` both refuse with
-#: "provider does not support base instructions" — the same
-#: run-configuration refusal a built-in preset with base instructions
-#: (``--preset miniswe``) produces, which is deterministic proof the file's
-#: exact bytes become the session's base instructions on the meta provider.
+#: the main session as base instructions.  ``muse --agents <JSON>`` does
+#: NOT compose into the main session agent: the overlay registers session
+#: agent definitions for the workflow/subagent ``agentType`` path, and an
+#: echo-provider probe with the overlay set ran a clean turn with the
+#: profile line unchanged.
 #:
-#: The variable is an internal build surface (``TBH_EVAL_*``), not a
-#: documented end-user option, so this enrollment is pinned to the exact
-#: full-banner-plus-inner-digest carrier cell below and fails closed if a
-#: future build stops honoring it — an unproven build never inherits the
-#: capability.  The file is generation-private and
-#: content-addressed, so the same stable material and digest feed the
-#: launch and any later exact ``muse resume <id>`` of the same pane.
+#: The env-addressed file below *does* compose: with it set, an
+#: echo-provider launch refuses with "provider does not support base
+#: instructions" — the same run-configuration refusal a built-in preset with
+#: base instructions (``--preset miniswe``) produces, which is deterministic
+#: proof the file's exact bytes reach the session as base instructions.
+#:
+#: The variable is an internal build surface (``TBH_EVAL_*``), verified at
+#: launch via a two-leg runtime self-probe against the resolved inner
+#: binary (:func:`probe_profile_carrier`).  The file is generation-private
+#: and content-addressed, so the same stable material feeds the launch and
+#: any later exact ``muse resume <id>`` of the same pane.
 PROFILE_SYSTEM_PROMPT_ENV = "TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE"
 
 #: The generation-private filename the profile system prompt is written
 #: to, under the managed-v2 companion dir for the terminal/generation.
 PROFILE_SYSTEM_PROMPT_FILENAME = "muse-profile-system-prompt.txt"
 
-# The carrier is an internal build surface, so its authority is intentionally
-# narrower than Muse's semver-level identity/resume support.  This one cell is
-# backed by the disposable 2026-08-10 fresh -> kill -> exact-resume canary.
-# It records no canary profile bytes, sentinel, or native session id.
-PROFILE_CARRIER_CAPABILITY_CELL = "muse-profile-carrier-2026-08-10-r708.1"
-_PROFILE_CARRIER_CAPABILITIES = {
-    (
-        "Muse Code 0.1.0 (0.1.0-R708.1)",
-        "4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c",
-    ): PROFILE_CARRIER_CAPABILITY_CELL,
-}
+CARRIER_PROBE_REFUSAL = "provider does not support base instructions"
+PROOF_PROBED = "probed"
+PROOF_DISPROVED = "disproved"
+PROOF_UNPROVEN = "unproven"
+PROOF_PROBED_BY_OPERATOR = "probed_by_operator"
+CAO_MUSE_PROFILE_CARRIER_PROVEN_ENV = "CAO_MUSE_PROFILE_CARRIER_PROVEN"
+
+_PROBE_CACHE: dict[tuple[str, str], tuple[str, str]] = {}
 _MUSE_BANNER_REVISION = re.compile(
     r"^Muse Code (?P<semver>\d+\.\d+\.\d+) \((?P<revision>\d+\.\d+\.\d+-R\d+(?:\.\d+)?)\)$"
 )
@@ -108,10 +104,11 @@ _MUSE_BANNER_REVISION = re.compile(
 
 @dataclass(frozen=True)
 class MuseProfileCarrierCapability:
-    """A closed, runtime-observed profile-carrier capability cell."""
+    """A runtime-observed profile-carrier capability."""
 
     supported: bool
     reason: str
+    proof: str = PROOF_UNPROVEN
     cell: Optional[str] = None
     full_banner: Optional[str] = None
     inner_executable: Optional[str] = None
@@ -124,6 +121,93 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def probe_profile_carrier(inner_executable: str, *, timeout: float = 5.0) -> tuple[str, str]:
+    """Probe the inner executable for runtime profile carrier support."""
+    try:
+        canonical_inner = os.path.realpath(inner_executable)
+        digest = _sha256_file(canonical_inner)
+    except OSError as exc:
+        return PROOF_UNPROVEN, str(exc)
+
+    cache_key = (canonical_inner, digest)
+    if cache_key in _PROBE_CACHE:
+        return _PROBE_CACHE[cache_key]
+
+    with tempfile.TemporaryDirectory() as td:
+        prompt_file = Path(td) / "probe-prompt.txt"
+        prompt_file.write_text("ping\n", encoding="utf-8")
+        minimal_env = {
+            k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT")
+        }
+        minimal_env["MUSE_NO_AUTO_UPDATE"] = "1"
+
+        carrier_env = {**minimal_env, PROFILE_SYSTEM_PROMPT_ENV: str(prompt_file)}
+        try:
+            carrier_res = subprocess.run(
+                [canonical_inner, "exec", "--provider", "echo", "--no-session-log", "ping"],
+                cwd=td,
+                env=carrier_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            verdict = (PROOF_UNPROVEN, str(exc))
+            _PROBE_CACHE[cache_key] = verdict
+            return verdict
+
+        if carrier_res.returncode == 0:
+            first_line = (
+                carrier_res.stderr.strip().splitlines()[0]
+                if carrier_res.stderr.strip()
+                else "carrier leg exited 0"
+            )
+            verdict = (PROOF_DISPROVED, first_line)
+            _PROBE_CACHE[cache_key] = verdict
+            return verdict
+
+        if CARRIER_PROBE_REFUSAL not in carrier_res.stderr:
+            first_line = (
+                carrier_res.stderr.strip().splitlines()[0]
+                if carrier_res.stderr.strip()
+                else f"carrier leg exited {carrier_res.returncode}"
+            )
+            verdict = (PROOF_UNPROVEN, first_line)
+            _PROBE_CACHE[cache_key] = verdict
+            return verdict
+
+        control_env = dict(minimal_env)
+        try:
+            control_res = subprocess.run(
+                [canonical_inner, "exec", "--provider", "echo", "--no-session-log", "ping"],
+                cwd=td,
+                env=control_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            verdict = (PROOF_UNPROVEN, str(exc))
+            _PROBE_CACHE[cache_key] = verdict
+            return verdict
+
+        if control_res.returncode == 0:
+            verdict = (PROOF_PROBED, "")
+            _PROBE_CACHE[cache_key] = verdict
+            return verdict
+
+        first_line = (
+            control_res.stderr.strip().splitlines()[0]
+            if control_res.stderr.strip()
+            else f"control leg exited {control_res.returncode}"
+        )
+        verdict = (PROOF_UNPROVEN, first_line)
+        _PROBE_CACHE[cache_key] = verdict
+        return verdict
 
 
 def resolve_profile_carrier_inner_executable(wrapper_executable: str, full_banner: str) -> str:
@@ -171,31 +255,63 @@ def resolve_profile_carrier_inner_executable(wrapper_executable: str, full_banne
 def profile_carrier_capability(
     *, wrapper_executable: str, full_banner: str
 ) -> MuseProfileCarrierCapability:
-    """Return the one proven carrier cell for a resolved Muse installation."""
+    """Return the profile-carrier capability for a resolved Muse installation."""
     try:
         inner = resolve_profile_carrier_inner_executable(wrapper_executable, full_banner)
         digest = _sha256_file(inner)
     except MuseProfileCarrierUnverified as exc:
         return MuseProfileCarrierCapability(
-            False, "profile_carrier_unverified", full_banner=full_banner
+            supported=False,
+            reason=str(exc),
+            proof=PROOF_UNPROVEN,
+            full_banner=full_banner.strip() if full_banner else None,
         )
-    except OSError:
+    except OSError as exc:
         return MuseProfileCarrierCapability(
-            False, "profile_carrier_unverified", full_banner=full_banner
+            supported=False,
+            reason=f"profile_carrier_unverified: {exc}",
+            proof=PROOF_UNPROVEN,
+            full_banner=full_banner.strip() if full_banner else None,
         )
-    cell = _PROFILE_CARRIER_CAPABILITIES.get((full_banner.strip(), digest))
-    if cell is None:
+
+    operator_override = os.environ.get(CAO_MUSE_PROFILE_CARRIER_PROVEN_ENV, "").strip()
+    if operator_override and operator_override == digest:
         return MuseProfileCarrierCapability(
-            False,
-            "profile_carrier_unverified",
+            supported=True,
+            reason="",
+            proof=PROOF_PROBED_BY_OPERATOR,
             full_banner=full_banner.strip(),
             inner_executable=inner,
             inner_executable_sha256=digest,
         )
+
+    proof, detail = probe_profile_carrier(inner)
+    if proof == PROOF_PROBED:
+        return MuseProfileCarrierCapability(
+            supported=True,
+            reason="",
+            proof=proof,
+            full_banner=full_banner.strip(),
+            inner_executable=inner,
+            inner_executable_sha256=digest,
+        )
+    if proof == PROOF_DISPROVED:
+        return MuseProfileCarrierCapability(
+            supported=False,
+            reason=(
+                "the installed build ran a clean muse exec --provider echo turn "
+                "with non-empty base instructions present"
+            ),
+            proof=proof,
+            full_banner=full_banner.strip(),
+            inner_executable=inner,
+            inner_executable_sha256=digest,
+        )
+    reason = f"profile_carrier_unproven: {detail}" if detail else "profile_carrier_unproven"
     return MuseProfileCarrierCapability(
-        True,
-        "",
-        cell=cell,
+        supported=True,
+        reason=reason,
+        proof=PROOF_UNPROVEN,
         full_banner=full_banner.strip(),
         inner_executable=inner,
         inner_executable_sha256=digest,
@@ -206,7 +322,11 @@ def installed_profile_carrier_capability() -> MuseProfileCarrierCapability:
     """Observe the currently selected Muse wrapper without granting a fallback."""
     wrapper = shutil.which("muse")
     if not wrapper:
-        return MuseProfileCarrierCapability(False, "profile_carrier_unverified")
+        return MuseProfileCarrierCapability(
+            supported=False,
+            reason="profile_carrier_unverified: Muse wrapper is absent",
+            proof=PROOF_UNPROVEN,
+        )
     wrapper = os.path.realpath(wrapper)
     try:
         result = subprocess.run(
@@ -217,10 +337,18 @@ def installed_profile_carrier_capability() -> MuseProfileCarrierCapability:
             check=False,
             env={**os.environ, "MUSE_NO_AUTO_UPDATE": "1"},
         )
-    except (OSError, subprocess.SubprocessError):
-        return MuseProfileCarrierCapability(False, "profile_carrier_unverified")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return MuseProfileCarrierCapability(
+            supported=False,
+            reason=f"profile_carrier_unverified: failed to execute Muse wrapper ({exc})",
+            proof=PROOF_UNPROVEN,
+        )
     if result.returncode != 0:
-        return MuseProfileCarrierCapability(False, "profile_carrier_unverified")
+        return MuseProfileCarrierCapability(
+            supported=False,
+            reason=f"profile_carrier_unverified: Muse wrapper exited {result.returncode}",
+            proof=PROOF_UNPROVEN,
+        )
     return profile_carrier_capability(
         wrapper_executable=wrapper, full_banner=(result.stdout or result.stderr or "").strip()
     )

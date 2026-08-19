@@ -251,9 +251,9 @@ def test_muse_is_enrolled_in_the_derived_native_tui_provider_set():
 def test_muse_capability_payload_is_truthful(monkeypatch):
     """The capability block names Muse's real kind, source, and executable."""
     accepted_carrier = muse_native_launch.MuseProfileCarrierCapability(
-        True,
-        "",
-        cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+        supported=True,
+        reason="",
+        proof=muse_native_launch.PROOF_PROBED,
         full_banner=MUSE_BANNER,
         inner_executable="/fixture/muse-bin-0.1.0-R708.1",
         inner_executable_sha256=MUSE_INNER_SHA256,
@@ -271,8 +271,9 @@ def test_muse_capability_payload_is_truthful(monkeypatch):
     assert block["readiness_receipt_kind"] == "muse-native-status-idle"
     assert block["executable"] == "muse"
     assert "0.1.0" in block["supported_versions"]
-    assert block["profile_carrier_capability"] == muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL
+    assert block["profile_carrier_proof"] == muse_native_launch.PROOF_PROBED
     assert block["profile_carrier_inner_sha256"] == MUSE_INNER_SHA256
+    assert block["profile_carrier_reason"] == ""
 
 
 def test_the_other_native_providers_are_unchanged_by_muse_enrollment():
@@ -728,9 +729,9 @@ def muse_harness(monkeypatch):
         inner = os.path.realpath(inner_path)
         state.carrier_inner = inner
         return muse_native_launch.MuseProfileCarrierCapability(
-            True,
-            "",
-            cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+            supported=True,
+            reason="",
+            proof=muse_native_launch.PROOF_PROBED,
             full_banner=full_banner,
             inner_executable=inner,
             inner_executable_sha256=hashlib.sha256(Path(inner).read_bytes()).hexdigest(),
@@ -903,10 +904,7 @@ async def test_muse_launch_discovers_the_provider_generated_session(
     intent = attachment["intent"]
     assert intent["acquisition_method"] == native_attachment.ACQUISITION_STATUS_DISCOVERED
     assert intent["acquisition_receipt"]["id_source"] == "provider_status_discovered"
-    assert (
-        intent["acquisition_receipt"]["profile_carrier_capability"]
-        == muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL
-    )
+    assert intent["acquisition_receipt"]["profile_carrier_capability"] is None
     assert intent["acquisition_receipt"]["profile_carrier_inner_sha256"]
 
     # The /status capture preceded the attachment claim.

@@ -1625,9 +1625,9 @@ def test_muse_resume_revalidates_the_profile_carrier_and_proves_its_inner_image(
         compatibility_cell_ref="muse_cli:meta:native_tui:r708.1",
     )
     capability = muse_native_launch.MuseProfileCarrierCapability(
-        True,
-        "",
-        cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+        supported=True,
+        reason="",
+        proof=muse_native_launch.PROOF_PROBED,
         full_banner=full_banner,
         inner_executable=inner,
         inner_executable_sha256=inner_digest,

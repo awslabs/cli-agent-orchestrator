@@ -1124,7 +1124,7 @@ def native_tui_capabilities() -> dict[str, Any]:
     providers = {}
     for provider in sorted(NATIVE_TUI_PROVIDERS):
         executable = _PINNED_PROVIDER[provider]
-        supported = provider != "muse_cli" or muse_carrier.supported
+        supported = True
         provider_capability = {
             "supported": supported,
             "id_source": _ISSUANCE_SOURCES[provider],
@@ -1140,15 +1140,15 @@ def native_tui_capabilities() -> dict[str, Any]:
             "version_enforcement": contracts.version_enforcement_mode(executable),
         }
         if provider == "muse_cli":
-            # This is deliberately narrower than ``supported_versions``:
-            # the internal profile carrier was proven for one full launcher
-            # revision + inner executable digest, not for every 0.1.0 build.
-            provider_capability["profile_carrier_capability"] = muse_carrier.cell
+            # native_tui_capabilities() reads shutil.which("muse") from the
+            # server's PATH while a launch uses bridge_request["provider_executable"],
+            # so this capability report observes the server's local binary and
+            # cannot answer the carrier question for a launching peer.
+            provider_capability["profile_carrier_proof"] = muse_carrier.proof
             provider_capability["profile_carrier_inner_sha256"] = (
                 muse_carrier.inner_executable_sha256
             )
-            if not supported:
-                provider_capability["reason"] = muse_carrier.reason
+            provider_capability["profile_carrier_reason"] = muse_carrier.reason
         providers[provider] = provider_capability
     return {"schema_version": NATIVE_TUI_CAPABILITY_SCHEMA_VERSION, "providers": providers}
 
