@@ -219,6 +219,9 @@ describe('list rendering', () => {
     const items = await screen.findAllByTestId('communication-item')
     const ids = items.map(el => el.getAttribute('data-communication-id'))
     expect(ids).toEqual(['c-final-msg', 'c-final-file', 'c-inter', 'c-check', 'c-assign', 'c-msg'])
+    // The detail pane is a second async stage (effectiveId -> getCommunication).
+    // Await the detail's gated DOM before counting badges that include it.
+    await screen.findByTestId('md-rendered')
     const badges = screen.getAllByTestId('scope-badge').map(b => b.textContent)
     expect(badges.filter(b => b === 'final report')).toHaveLength(2 + 1) // two list rows + auto-selected detail
     expect(badges).toContain('intermediate report')

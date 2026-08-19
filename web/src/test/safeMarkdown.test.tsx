@@ -24,6 +24,7 @@ import {
   safeDownloadName,
   safeLinkHref,
   MAX_MARKDOWN_RENDER_BYTES,
+  MAX_MARKDOWN_NODES,
 } from '../lib/safeMarkdown'
 
 function renderMd(content: string) {
@@ -187,7 +188,16 @@ describe('budgets fail visibly', () => {
   })
 
   it('a marker-dense document trips the node budget under the byte budget', () => {
-    const content = '*a* '.repeat(20_000) // ~80 KiB, tens of thousands of nodes
+    // MAX_MARKDOWN_NODES = 10_000. Each `*a* ` contributes ~3 nodes (emphasis
+    // + text + paragraph wrapper), so 3*N+1 nodes. Require a margin well over
+    // the budget so a future change in the node-per-marker ratio cannot
+    // silently flip the test back to a pass. Derived from the constant, not a
+    // magic number, and measured locally at ~140 ms vs ~3644 ms for the old
+    // 20_000-repeat fixture — well under 500 ms and an order of magnitude of
+    // headroom on a 3×-slower runner.
+    const repeats = Math.ceil((MAX_MARKDOWN_NODES + 1000) / 3)
+    const content = '*a* '.repeat(repeats) // ~14.7 KiB, ~11 002 nodes
+    expect(new TextEncoder().encode(content).length).toBeLessThan(MAX_MARKDOWN_RENDER_BYTES)
     expect(markdownBudgetBreach(content)).toBe('nodes')
     render(<SafeContentView content={content} mediaType="text/markdown" downloadBase="doc" />)
     const notice = screen.getByTestId('markdown-render-budget')

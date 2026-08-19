@@ -329,6 +329,25 @@ export async function stubBackend(page: Page, options?: {
         terminals: terminalsBySession[name],
       });
     }
+    const lifecycleMatch = /^\/sessions\/([^/]+)\/lifecycle$/.exec(path);
+    if (lifecycleMatch && method === "GET") {
+      const name = decodeURIComponent(lifecycleMatch[1]);
+      // Never 404s (api.ts:1029): an undeclared session reads as `working`.
+      // The dashboard degrades a failed fetch to "no declaration" (DashboardHome
+      // .catch(() => null)), so the shape must be coherent but undeclared.
+      return json(route, {
+        session_name: name,
+        lifecycle: "working" as const,
+        restore_to: null,
+        archived: false,
+        kind: "campaign" as const,
+        declared_by: null,
+        note: null,
+        pause_deadline_at: null,
+        epoch: 0,
+        declared: false,
+      });
+    }
     if (path === "/annotations" && method === "GET") {
       // §9.5: absent conductor state = an empty, typed answer, never a 404 and
       // never an error. The default is exactly that, so every pre-existing spec
@@ -618,6 +637,22 @@ export async function stubBackend(page: Page, options?: {
         updated_at: "2026-07-28T12:30:00Z",
       });
       return json(route, record);
+    }
+
+    // Unstubbed API routes must fail loudly rather than leaking to the vite
+    // proxy. The proxy forwards to http://localhost:9889, which is a real
+    // CAO server on the developer's machine (hence the 200 that masked the
+    // lifecycle leak) and ECONNREFUSED→502 on CI. An unhandled API path is a
+    // harness gap, not an asset. Only genuine app assets (document, scripts,
+    // styles, /assets/*) should continue to the network.
+    const API_PREFIXES = [
+      "/sessions", "/terminals", "/health", "/agents", "/settings", "/flows",
+      "/memory", "/graph", "/macros", "/control-input", "/operator-message",
+      "/annotations", "/communications", "/tracker", "/cohort-operations",
+      "/drains", "/task-occurrences",
+    ];
+    if (API_PREFIXES.some(p => path === p || path.startsWith(p + "/"))) {
+      return json(route, { detail: `stub: unhandled API ${method} ${path}` }, 500);
     }
 
     // The app itself (document, scripts, styles) passes through to vite preview.
