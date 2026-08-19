@@ -77,6 +77,39 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
+    # Provider API egress (required once a REAL provider replaces mock_cli —
+    # kiro_cli/claude_code/codex all call a vendor HTTPS endpoint; with only the
+    # two rules above a worker agent hangs with no network error, which looks
+    # like a CAO bug rather than a policy denial).
+    #
+    # This is public-internet HTTPS only, with the private ranges and the
+    # instance metadata endpoint carved back out. That keeps the property the
+    # egress policy exists for: CAO_CALLBACK_URL arrives from a worker's
+    # creator and the worker POSTs to it, so a hostile/injected URL still
+    # cannot reach another VPC service, a peered network, or IMDS to steal the
+    # node role's credentials. Intra-namespace traffic is unaffected — it is
+    # allowed by the podSelector rule above, not by this ipBlock.
+    #
+    # Two caveats before treating this as a tight boundary:
+    #   - It is still egress to the whole public internet on 443, so it does
+    #     NOT stop exfiltration to an attacker-controlled host. Narrow `cidr`
+    #     to the vendor's published ranges, or route through an authenticating
+    #     egress proxy, if that matters for your threat model.
+    #   - `except` must actually be honoured by your CNI's policy engine.
+    #     Verified on this cluster (AWS VPC CNI, network policy enforcement
+    #     enabled): public 443 succeeds while 169.254.169.254 and in-VPC
+    #     private addresses are refused. Re-verify after a CNI upgrade.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - port: 443
+          protocol: TCP
 ---
 # NetworkPolicy — restrict access to supervisor pod.
 # Fleet panel (UI) and worker pods (cross-pod send_message callbacks to
@@ -107,4 +140,65 @@ spec:
               app.kubernetes.io/name: cao-worker
       ports:
         - port: 9889
+          protocol: TCP
+---
+# NetworkPolicy — restrict egress FROM the supervisor pod.
+#
+# This exists because the worker egress policy alone made the trust boundary
+# one-sided. NetworkPolicy is additive and only becomes deny-by-default for a
+# pod once a policy of that policyType selects it, so with only the three
+# policies above the supervisor had UNRESTRICTED egress — despite being the pod
+# that runs a command-capable agent (code_supervisor) AND the pod that mints the
+# CAO_CALLBACK_URL values workers are told to POST to. A prompt-injected
+# supervisor agent could reach any in-VPC service or the instance metadata
+# endpoint and steal the node role's credentials. The rules below mirror
+# cao-worker-egress so both roles are bounded the same way.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-supervisor-egress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-supervisor
+  policyTypes:
+    - Egress
+  egress:
+    # Intra-namespace: remote agent placement onto workers (assign/handoff with
+    # target_host reaches cao-worker-N.cao-workers:9889) and any other cao-fleet
+    # pod in this namespace.
+    - to:
+        - podSelector: {}
+    # DNS: the supervisor resolves worker pod/service DNS names to place agents.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Provider API egress. The supervisor runs a real provider too
+    # (CAO_INSTALL_PROFILES=code_supervisor:kiro_cli), so it needs the same
+    # vendor-HTTPS path as workers — without this rule the supervisor's own
+    # agent hangs with no network error. Identical carve-outs: private ranges
+    # and the metadata endpoint stay unreachable, so this does not reopen the
+    # SSRF hole for the callback URLs the supervisor itself injects. See the
+    # longer note on the worker egress rule for the residual risk (public 443
+    # is still open, so this bounds reachability, not exfiltration).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - port: 443
           protocol: TCP
