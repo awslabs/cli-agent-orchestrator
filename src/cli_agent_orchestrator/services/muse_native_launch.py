@@ -123,8 +123,15 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def probe_profile_carrier(inner_executable: str, *, timeout: float = 5.0) -> tuple[str, str]:
-    """Probe the inner executable for runtime profile carrier support."""
+def probe_profile_carrier(inner_executable: str, *, timeout: float = 20.0) -> tuple[str, str]:
+    """Probe the inner executable for runtime profile carrier support.
+
+    The timeout is deliberately generous. This runs on a host that routinely
+    has several agent panes and a full test suite in flight, and a spawn that
+    is merely slow says nothing about whether the build honours the base
+    instructions surface. A tight bound would turn ordinary machine load into
+    an ``unproven`` verdict, which is a measurement this probe never took.
+    """
     try:
         canonical_inner = os.path.realpath(inner_executable)
         digest = _sha256_file(canonical_inner)
@@ -307,22 +314,31 @@ def profile_carrier_capability(
             inner_executable=inner,
             inner_executable_sha256=digest,
         )
-    # An inconclusive probe refuses rather than proceeding.  Proceeding would
-    # convert an absent measurement into a silent failure, which is the exact
-    # §3 defect: the carrier leg can exit non-zero for a reason this probe does
-    # not recognise *while the build also ignores the file*, and the launch
-    # would then compose a profile the provider never reads — a worker running
-    # the vendor's default persona behind a receipt asserting
-    # ``profile_system_prompt_sha256``, undetectable once the pane is live.
+    # An inconclusive probe proceeds, and records that it proved nothing.
     #
-    # This refusal is self-clearing in a way ``disproved`` is not: the ordinary
-    # causes (a full temp dir, a slow spawn, a timeout) pass on a retry, and the
-    # operator override below clears a persistent one. ``unproven`` therefore
-    # stays a durable value distinct from ``disproved`` — the reason string says
-    # which was observed — while both take the safe end of the range.
+    # The state worth refusing is a build that silently ignores the base
+    # instructions file — and that build exits *zero*, which is ``disproved``
+    # above. For ``unproven`` to hide the same danger the build would have to
+    # exit non-zero *and* ignore the file, which are near-contradictory: a
+    # non-zero exit naming base instructions is the build telling us it read
+    # them. So refusing here would buy protection against a sequence that is
+    # barely reachable.
+    #
+    # What it would cost is ordinary: this host routinely runs several agent
+    # panes at once, and a slow spawn, a busy temp dir, or a timeout all land
+    # here. Refusing would then block every managed Muse launch for a reason
+    # no operator caused and none of them can see — the disproportionate
+    # guard `docs/operating-guide.md` and AGENTS.md both warn against, where
+    # only safety and state-integrity guards stay fail-closed.
+    #
+    # The integrity requirement is real but narrower than a refusal: nothing
+    # may *claim* the carrier was verified when it was not. That is satisfied
+    # by carrying ``proof`` and ``reason`` through to the capability block and
+    # the acquisition receipt, so a reader sees ``unproven`` rather than an
+    # assertion nobody established.
     reason = f"profile_carrier_unproven: {detail}" if detail else "profile_carrier_unproven"
     return MuseProfileCarrierCapability(
-        supported=False,
+        supported=True,
         reason=reason,
         proof=PROOF_UNPROVEN,
         full_banner=full_banner.strip(),

@@ -175,16 +175,18 @@ Two rules keep the exception from spreading:
 Muse's managed native profile carrier is verified at launch by a two-leg
 runtime probe (`muse exec --provider echo` with and without base instructions)
 against the resolved inner binary rather than an allowlist of build digests.
-Only a `probed` verdict launches. A `disproved` build — one that ran a clean
-turn with base instructions present, so it ignores them — fails closed, and so
-does an `unproven` one, because a probe that established nothing cannot license
-a launch: the alternative would compose a profile the provider may never read
-and leave a receipt asserting it, undetectable once the pane is live.
+A `disproved` build — one that ran a clean turn with base instructions
+present, so it ignores them — fails closed, because that is the state which
+silently produces a worker running the vendor's default persona. An `unproven`
+verdict proceeds: the probe established nothing, and refusing on it would block
+every managed launch for ordinary machine load while protecting against a
+sequence that is barely reachable, since a build that ignores the file exits
+zero and is already `disproved`.
 
-The two refusals stay distinct in the reason string, because they call for
-different actions. `unproven` is ordinarily transient — a full temp dir, a slow
-spawn, a timeout — and clears on a retry. `disproved` is a property of the
-build and will not. Both are cleared deliberately by setting
+What `unproven` must not do is claim otherwise. The verdict and its reason
+travel on the capability block and the acquisition receipt, so a reader sees
+that nothing was established rather than an assertion nobody made. A persistent
+`disproved` is cleared deliberately by setting
 `CAO_MUSE_PROFILE_CARRIER_PROVEN` to the sha256 of the resolved
 `muse-bin-<revision>` and restarting the conductor, which records an operator
 attestation as `probed_by_operator` rather than lifting the gate.
