@@ -14,7 +14,16 @@ resources:
   - networkpolicy.yaml
 
 images:
+  # Pin an IMMUTABLE tag. `latest` in this repo pointed at a pre-feature build
+  # for days, so the cluster silently ran an image without cross-node
+  # placement or the per-node terminal cap while the manifests advertised
+  # both. Bump this deliberately when you push a new image.
   - name: 418295698799.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server
-    newTag: latest
+    # Built from docker/Dockerfile then layered with docker/Dockerfile.provider
+    # to add an authenticated kiro-cli 2.18.1 (the base image ships only
+    # mock_cli). "d3fix" = install now persists the resolved provider into the
+    # profile, which is what makes cross-node placement resolve kiro_cli on the
+    # target node instead of falling back to DEFAULT_PROVIDER.
+    newTag: 2.4.1-d0b398d-d3fix-kiro2.18.1-r2
   - name: 418295698799.dkr.ecr.ap-southeast-2.amazonaws.com/cao-fleet-panel
     newTag: latest
