@@ -3051,6 +3051,13 @@ async def get_terminal_output(
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
+    except OutputExtractionError as e:
+        # Ordered before the ValueError arm it subclasses, same as run_step: the
+        # terminal and the route both resolved -- only the response marker was
+        # missing from the scrollback -- so this is a server-side extraction
+        # failure, not a bad terminal reference. Keep it a 500, not a 404
+        # (issue #570), and a plain-string detail like the run-step arm.
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

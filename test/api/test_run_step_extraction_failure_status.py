@@ -69,3 +69,58 @@ class TestExceptionType:
     def test_carries_the_provider_message(self):
         with pytest.raises(ValueError, match=_MARKER_MISSING):
             raise OutputExtractionError(_MARKER_MISSING)
+
+
+class TestExtractionFailureSettlement:
+    """An extraction failure must settle a script step as FAILED.
+
+    The ``run_step`` boundary settles the step in its OutputExtractionError arm
+    (``_settle_step(None, str(e))``), just like the other arms that run after
+    dispatch. These assertions pin that bookkeeping so the call cannot be
+    dropped or altered without detection -- same shape as the parametrized
+    untyped-failure settlement guard in test_run_step.py.
+    """
+
+    def test_extraction_failure_settles_script_step_failed(self, client, monkeypatch):
+        from cli_agent_orchestrator.models.workflow import StepState
+        from cli_agent_orchestrator.models.workflow_runtime import RunState
+        from cli_agent_orchestrator.services import workflow_journal, workflow_service
+        from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
+
+        run_id = "run-bookkeeping"
+        env_vars = {
+            "CAO_WORKFLOW_RUN_ID": run_id,
+            "CAO_WORKFLOW_GENERATION": "1",
+            "CAO_WORKFLOW_STEP_ID": "step-1",
+        }
+        record = ScriptRunRecord(
+            run_id=run_id,
+            workflow_name="wf",
+            state=RunState.RUNNING,
+            cancelled=False,
+            current_step_id=None,
+            step_states={},
+            process=None,
+            generation="1",
+            started_at="2026-07-15T00:00:00Z",
+            finished_at=None,
+        )
+        monkeypatch.setitem(workflow_service.run_registry, run_id, record)
+        monkeypatch.setattr(workflow_journal, "append_step", lambda *args, **kwargs: None)
+        monkeypatch.setattr(workflow_journal, "update_step", lambda *args, **kwargs: None)
+
+        exc = OutputExtractionError(_MARKER_MISSING)
+        with (
+            patch(
+                "cli_agent_orchestrator.services.workflow_service.check_generation",
+                return_value=None,
+            ),
+            patch(_RUN_STEP, new=AsyncMock(side_effect=exc)),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=env_vars))
+
+        assert resp.status_code == 500
+        step = record.step_states["step-1"]
+        assert step.state == StepState.FAILED
+        assert step.attempts == 1
+        assert step.error == _MARKER_MISSING
