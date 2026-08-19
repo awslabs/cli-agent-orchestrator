@@ -34,7 +34,7 @@ from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.security import auth
 from cli_agent_orchestrator.services import control_input_service as service
-from cli_agent_orchestrator.services import native_pane_input
+from cli_agent_orchestrator.services import native_pane_input, provider_controls
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
@@ -1132,7 +1132,10 @@ class TestAdditiveCapabilities:
     def test_the_provider_controls_block_is_the_discovery_union(self, client):
         body = client.get("/control-input/capabilities").json()
         controls = body["provider_controls"]
-        assert set(controls) == {"codex", "kimi_cli", "claude_code"}
+        # Derived, not frozen: a literal set here is a second copy of the
+        # registry that goes stale the moment a provider row lands, and it
+        # fails in the API layer rather than where the row was added.
+        assert set(controls) == set(provider_controls._REGISTRY)
         assert controls["kimi_cli"]["compact"] == {
             "events": [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
         }
@@ -1148,6 +1151,19 @@ class TestAdditiveCapabilities:
         assert controls["codex"]["stop"] == controls["kimi_cli"]["stop"]
         assert controls["codex"]["steer_chords"] == []
         assert "dispatch_grace_ms" not in controls["codex"]
+        # Muse carries compact and stop but was never exercised for
+        # streaming, so that key is omitted rather than nulled.
+        assert controls["muse_cli"]["compact"] == controls["kimi_cli"]["compact"]
+        assert controls["muse_cli"]["stop"] == controls["kimi_cli"]["stop"]
+        assert controls["muse_cli"]["steer_chords"] == []
+        assert "interactive_streaming" not in controls["muse_cli"]
+        # agy advertises Stop alone. compact is absent because the provider
+        # has no compaction affordance at all — it compacts itself — so the
+        # key is omitted here exactly as any other absent fact would be.
+        assert controls["antigravity_cli"]["stop"] == controls["kimi_cli"]["stop"]
+        assert controls["antigravity_cli"]["steer_chords"] == []
+        assert "compact" not in controls["antigravity_cli"]
+        assert "operator_message" not in controls["antigravity_cli"]
 
     def test_the_command_controls_block_is_advertised(self, client):
         body = client.get("/control-input/capabilities").json()

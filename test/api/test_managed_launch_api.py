@@ -98,19 +98,20 @@ def _expected_native_tui_providers():
             "readiness_receipt_kind": "muse-native-status-idle",
             "executable": "muse",
             **version_facts("muse"),
-            "profile_carrier_capability": (muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL),
+            "profile_carrier_proof": "probed",
             "profile_carrier_inner_sha256": (
                 "4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c"
             ),
+            "profile_carrier_reason": "",
         },
     }
 
 
 def test_capability_handshake_is_exact_and_versioned(client, monkeypatch):
     accepted_carrier = muse_native_launch.MuseProfileCarrierCapability(
-        True,
-        "",
-        cell=muse_native_launch.PROFILE_CARRIER_CAPABILITY_CELL,
+        supported=True,
+        reason="",
+        proof=muse_native_launch.PROOF_PROBED,
         full_banner="Muse Code 0.1.0 (0.1.0-R708.1)",
         inner_executable="/fixture/muse-bin-0.1.0-R708.1",
         inner_executable_sha256="4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c",

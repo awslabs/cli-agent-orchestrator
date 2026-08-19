@@ -20,12 +20,11 @@ Status detection: the ``⟩`` prompt stays rendered through a whole turn, so the
 in-flight signal is the spinner text ("esc to interrupt"); otherwise the bare
 ``⟩`` prompt means ready (IDLE before a task, COMPLETED after one).
 
-Profile material: since cond-0377B the managed-v2 native launch composes
-the CAO profile system prompt into the session as base instructions through
-the installed ``TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE`` env surface (see
-``muse_native_launch.PROFILE_SYSTEM_PROMPT_ENV`` and its deterministic
-echo-refusal proof).  The ``--agents <JSON>`` overlay was read on the
-installed 0.1.0-R708.1 build and does NOT compose into the main session
+Profile material: the managed-v2 native launch composes the CAO profile
+system prompt into the session as base instructions through the
+``TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE`` env surface (verified via runtime
+probe, see ``muse_native_launch.probe_profile_carrier``).  The
+``--agents <JSON>`` overlay does NOT compose into the main session
 agent — it registers session agent definitions for the workflow/subagent
 ``agentType`` path only — so the managed launch never relies on it for the
 CAO role/profile.  The reviewer's declared read-only tools are enforced by

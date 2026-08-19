@@ -500,11 +500,20 @@ def _source_profile_and_material(
     canonical = os.path.realpath(path)
     digest = _sha256_file(Path(canonical))
     carrier = muse_native_launch.installed_profile_carrier_capability()
-    assert carrier.supported and carrier.cell and carrier.inner_executable_sha256
-    cell_ref = f"muse_cli:{cell.model}:native_tui:{carrier.cell}"
-    cell_digest = _sha256_text(
-        f"{cell_ref}\n{carrier.full_banner}\n{carrier.inner_executable_sha256}"
+    assert carrier.supported and carrier.inner_executable_sha256
+    assert carrier.proof in (
+        muse_native_launch.PROOF_PROBED,
+        muse_native_launch.PROOF_PROBED_BY_OPERATOR,
+        muse_native_launch.PROOF_UNPROVEN,
     )
+    if carrier.cell is not None:
+        cell_ref = f"muse_cli:{cell.model}:native_tui:{carrier.cell}"
+        cell_digest = _sha256_text(
+            f"{cell_ref}\n{carrier.full_banner}\n{carrier.inner_executable_sha256}"
+        )
+    else:
+        cell_ref = None
+        cell_digest = None
     return (
         {
             "profile_system_prompt_path": canonical,

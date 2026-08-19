@@ -172,16 +172,30 @@ Two rules keep the exception from spreading:
 - **Bind capability grants nothing else by implication.** It is not a step toward
   a broad allowlist.
 
-Muse has a similar narrow cell, and the same question applies: the managed native
-profile carrier is enabled only on the exact full banner `Muse Code 0.1.0
-(0.1.0-R708.1)` with the stage-proven inner `muse-bin-*` SHA-256. Pinning to an
-inner binary digest cannot survive any vendor update by construction, which makes
-it the clearest case that the technique — not the version — is what needs fixing. The update-capable `muse` launcher script is never
-that evidence. A same-semver R revision or changed inner digest advertises as
-`profile_carrier_unverified` until separately verified.
+Muse's managed native profile carrier is verified at launch by a two-leg
+runtime probe (`muse exec --provider echo` with and without base instructions)
+against the resolved inner binary rather than an allowlist of build digests.
+A `disproved` build — one that ran a clean turn with base instructions
+present, so it ignores them — fails closed, because that is the state which
+silently produces a worker running the vendor's default persona. An `unproven`
+verdict proceeds: the probe established nothing, and refusing on it would block
+every managed launch for ordinary machine load while protecting against a
+sequence that is barely reachable, since a build that ignores the file exits
+zero and is already `disproved`.
 
-**Adding a build to a narrow table is recording an override, not lifting a gate.**
-Verify the contract, add the exact build, and leave the provider's mode `open`.
+What `unproven` must not do is claim otherwise. The verdict and its reason
+travel on the capability block and the acquisition receipt, so a reader sees
+that nothing was established rather than an assertion nobody made. A persistent
+`disproved` is cleared deliberately by setting
+`CAO_MUSE_PROFILE_CARRIER_PROVEN` to the sha256 of the resolved
+`muse-bin-<revision>` and restarting the conductor, which records an operator
+attestation as `probed_by_operator` rather than lifting the gate.
+
+The probe measures `muse exec --provider echo`; the launch it gates is the
+interactive TUI. That is a proxy, and it is the strongest zero-cost signal
+available — it exercises the same `TBH_EVAL_APPEND_SYSTEM_PROMPT_FILE` surface
+on the same inner binary. It does not prove the TUI honours that surface, and
+no claim in the receipt or refusal says otherwise.
 
 ---
 
@@ -259,13 +273,14 @@ launcher, with nobody involved. Treat it as the standing evidence for §1: a rea
 measurement names a build and expires with it, so state the build you measured and expect
 to re-measure rather than recording a fact about "the installed build" in the abstract.
 
-### Still gating on an exact build
+### Still gating on an exact build or launcher layout
 
-`NATIVE_BIND_CAPABLE_VERSIONS` and the Muse profile-carrier cell, per §6. They cannot
-be converted by choosing a default — they need a version-robust technique, which is
-research rather than refactor, and it is done: no build has ever failed the Codex
-bootstrap contract, and both replacements are zero-cost runtime probes. Tracked
-separately. `ROUTE_ATTEST_CAPABLE_VERSIONS` belongs to that same family.
+`NATIVE_BIND_CAPABLE_VERSIONS`, per §6. It cannot be converted by choosing a default —
+it needs a version-robust technique, which is research rather than refactor: no build
+has ever failed the Codex bootstrap contract, and the replacement is a zero-cost runtime
+probe. Tracked separately. `ROUTE_ATTEST_CAPABLE_VERSIONS` belongs to that same family.
+Muse is gated on Meta's launcher layout (`.muse-version` + `muse-bin-<revision>`), not on
+a build digest.
 
 ## 10. Deliberately not built yet
 

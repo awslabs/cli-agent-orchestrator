@@ -1124,7 +1124,7 @@ def native_tui_capabilities() -> dict[str, Any]:
     providers = {}
     for provider in sorted(NATIVE_TUI_PROVIDERS):
         executable = _PINNED_PROVIDER[provider]
-        supported = provider != "muse_cli" or muse_carrier.supported
+        supported = True
         provider_capability = {
             "supported": supported,
             "id_source": _ISSUANCE_SOURCES[provider],
@@ -1140,15 +1140,15 @@ def native_tui_capabilities() -> dict[str, Any]:
             "version_enforcement": contracts.version_enforcement_mode(executable),
         }
         if provider == "muse_cli":
-            # This is deliberately narrower than ``supported_versions``:
-            # the internal profile carrier was proven for one full launcher
-            # revision + inner executable digest, not for every 0.1.0 build.
-            provider_capability["profile_carrier_capability"] = muse_carrier.cell
+            # native_tui_capabilities() reads shutil.which("muse") from the
+            # server's PATH while a launch uses bridge_request["provider_executable"],
+            # so this capability report observes the server's local binary and
+            # cannot answer the carrier question for a launching peer.
+            provider_capability["profile_carrier_proof"] = muse_carrier.proof
             provider_capability["profile_carrier_inner_sha256"] = (
                 muse_carrier.inner_executable_sha256
             )
-            if not supported:
-                provider_capability["reason"] = muse_carrier.reason
+            provider_capability["profile_carrier_reason"] = muse_carrier.reason
         providers[provider] = provider_capability
     return {"schema_version": NATIVE_TUI_CAPABILITY_SCHEMA_VERSION, "providers": providers}
 
@@ -4432,9 +4432,18 @@ def _prepare_muse_fresh_launch(
         wrapper_executable=executable, full_banner=version_output
     )
     if not carrier.supported:
+        # The refusal carries the verb that clears it, addressed to the operator
+        # who is the only actor able to take it. Without the digest and the
+        # variable name here, the reason alone names a probe the reader cannot
+        # act on.
         raise ManagedLaunchConflict(
             "Muse profile carrier is unavailable for this installed wrapper/binary pair "
-            f"({carrier.reason}); stage-verify it before enabling profile launch"
+            f"({carrier.reason}). To proceed on a build you have verified yourself, set "
+            f"{muse_native_launch.CAO_MUSE_PROFILE_CARRIER_PROVEN_ENV}="
+            f"{carrier.inner_executable_sha256 or '<inner-sha256>'} in the conductor's "
+            "environment and restart it so the value is read at launch; the digest is "
+            "the sha256 of the resolved muse-bin-<revision>, not the muse wrapper. An "
+            "unproven verdict often clears on a plain retry."
         )
     # Semver-level listing is not required either: the /status observation
     # below discovers the provider-minted id from the pane at runtime, so an
