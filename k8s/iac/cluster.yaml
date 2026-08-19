@@ -1,0 +1,512 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# VPC + EKS cluster for the CAO fleet demo, in one stack.
+#
+# A brand-new AWS account has only a default VPC, which has no private subnets
+# and none of the tags EKS looks for. This stack builds the network and the
+# cluster together, then emits exactly the parameter values cao-resources.yaml
+# needs — including the cluster security group, which does not exist until the
+# cluster does.
+#
+# WHAT IT DOES NOT DO. Two things cannot be expressed in CloudFormation because
+# they are Kubernetes objects, not AWS resources:
+#   * StorageClasses `gp3` and `efs-sc` — apply k8s/iac/storageclasses.yaml.
+#   * External Secrets Operator — install with Helm.
+# Both are listed in ../README.md.
+#
+# ORDER: this stack -> storageclasses.yaml + ESO -> cao-resources.yaml -> the
+# manifests in ../.
+#
+# Deploy (about 15 minutes, most of it the control plane):
+#   aws cloudformation deploy \
+#     --template-file k8s/iac/cluster.yaml \
+#     --stack-name cao-workshop \
+#     --capabilities CAPABILITY_IAM \
+#     --parameter-overrides ClusterName=cao-workshop
+#
+# COST while running: EKS control plane, two nodes, and one NAT gateway all bill
+# hourly. Delete the stack when the demo is over.
+
+Description: >-
+  CAO demo infrastructure: a two-AZ VPC and an EKS cluster with the add-ons the
+  CAO fleet requires.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Cluster }
+        Parameters: [ClusterName, KubernetesVersion]
+      - Label: { default: Nodes }
+        Parameters: [NodeInstanceType, NodeDesiredSize, NodeMaxSize, NodeDiskSize]
+      - Label: { default: Network }
+        Parameters: [VpcCidr]
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: cao-workshop
+    Description: EKS cluster name. Also used for subnet discovery tags.
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-_]{1,99}$"
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.36"
+    Description: >-
+      Kubernetes version. 1.36 is the current EKS default; the CAO fleet was
+      validated on 1.35 and nothing it does is version-specific.
+    AllowedPattern: "^1\\.(3[3-9]|4[0-9])$"
+
+  NodeInstanceType:
+    Type: String
+    Default: m6i.xlarge
+    Description: >-
+      Node instance type. m6i.xlarge (16 GiB) is the default rather than .large
+      because each CAO pod requests 1Gi and may use up to 3Gi: a real provider
+      CLI maps in a large binary and a running agent settles near 660Mi. Two
+      .large nodes would leave the fleet one burst away from eviction.
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Desired node count. Two comfortably holds a supervisor, three workers and the panel.
+
+  NodeMaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: Maximum node count.
+
+  NodeDiskSize:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    Description: >-
+      Node root volume in GiB. Larger than the 20 GiB default because the CAO
+      server image with a bundled provider CLI is well over a gigabyte.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: >-
+      VPC CIDR, which must be a /16. Four /20 subnets are carved from it
+      automatically, leaving the upper half free. Subnets are sized generously
+      because the VPC CNI gives every pod a real VPC address, so pod density is
+      bounded by subnet size rather than node count.
+    AllowedPattern: "^10\\.\\d{1,3}\\.0\\.0/16$"
+
+Resources:
+  # ===========================================================================
+  # Network — two Availability Zones, one NAT gateway
+  # ===========================================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      # Both required by EKS: nodes resolve the cluster endpoint by DNS, and EFS
+      # mount targets are addressed by DNS name.
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Subnet CIDRs are carved with Fn::Cidr rather than taken as parameters, so
+  # there is nothing to compute by hand. The third argument is the host-bit
+  # count, so 12 yields /20s (4091 usable each): 0-1 public, 2-3 private.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 12]]
+      # Needed for the NAT gateway and any internet-facing load balancer.
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public-a"
+        # Marks the subnet usable for internet-facing load balancers.
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 12]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public-b"
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+
+  # Nodes, pods and EFS mount targets live here.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private-a"
+        # Marks the subnet usable for internal load balancers.
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+        - Key: karpenter.sh/discovery
+          Value: !Ref ClusterName
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private-b"
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+        - Key: karpenter.sh/discovery
+          Value: !Ref ClusterName
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-nat"
+
+  # A single NAT gateway in the first AZ. Both private subnets egress through it,
+  # which is the right trade for a demo: one NAT instead of two roughly halves
+  # the standing cost. The accepted consequence is that losing this AZ removes
+  # outbound internet for the whole cluster, and that traffic from the second AZ
+  # crosses an AZ boundary. For production, add a NAT per AZ and give each
+  # private subnet its own route table.
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-nat"
+
+  # One shared private route table, since both AZs use the same NAT gateway.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ===========================================================================
+  # Cluster
+  # ===========================================================================
+
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        # Public access is on so kubectl works from a workstation without a
+        # bastion or VPN, which a demo needs. Private access is also on so
+        # in-cluster traffic to the API server stays inside the VPC. Restrict
+        # PublicAccessCidrs for anything longer-lived than a demo.
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      AccessConfig:
+        # API_AND_CONFIG_MAP keeps the aws-auth ConfigMap working alongside
+        # access entries, which is the friendlier default for tooling that still
+        # expects it.
+        AuthenticationMode: API_AND_CONFIG_MAP
+        # Grants cluster-admin to whoever deploys this stack, so kubectl works
+        # immediately afterwards with no extra wiring.
+        BootstrapClusterCreatorAdminPermissions: true
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+
+  # ===========================================================================
+  # Nodes
+  # ===========================================================================
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        # Lets the VPC CNI attach ENIs and assign pod addresses. Granted on the
+        # node role rather than through Pod Identity because the CNI runs before
+        # any credential-delivery mechanism is available.
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        # Pull permission for the CAO images in ECR.
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub "${ClusterName}-nodes"
+      NodeRole: !GetAtt NodeRole.Arn
+      # Private subnets only: nodes have no public addresses and reach the
+      # internet through the NAT gateway.
+      Subnets:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      AmiType: AL2023_x86_64_STANDARD
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      DiskSize: !Ref NodeDiskSize
+      ScalingConfig:
+        MinSize: 1
+        DesiredSize: !Ref NodeDesiredSize
+        MaxSize: !Ref NodeMaxSize
+      Labels:
+        role: cao-fleet
+
+  # ===========================================================================
+  # Add-ons
+  # ===========================================================================
+
+  # Must exist before any Pod Identity association can deliver credentials, so
+  # the CSI driver add-ons below depend on it.
+  PodIdentityAgentAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      # NetworkPolicy enforcement is OFF in the CNI by default, and without it
+      # the policies shipped in ../networkpolicy.yaml are silently inert: they
+      # are accepted by the API server and simply never enforced. The CAO fleet
+      # relies on them to bound what a command-capable agent can reach.
+      ConfigurationValues: '{"enableNetworkPolicy":"true"}'
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  # CoreDNS runs as pods, so it cannot become healthy until nodes exist.
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  MetricsServerAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: metrics-server
+      ResolveConflicts: OVERWRITE
+
+  # --- EBS CSI: per-pod state volumes -----------------------------------------
+
+  EbsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            # Pod Identity requires TagSession alongside AssumeRole; the assume
+            # call fails without it.
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+
+  EbsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [NodeGroup, PodIdentityAgentAddon]
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+      # The add-on creates its own Pod Identity association, so there is no
+      # separate association resource and no IRSA/OIDC provider to manage.
+      PodIdentityAssociations:
+        - RoleArn: !GetAtt EbsCsiRole.Arn
+          ServiceAccount: ebs-csi-controller-sa
+
+  # --- EFS CSI: shared agent workspace ----------------------------------------
+
+  EfsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy
+
+  EfsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [NodeGroup, PodIdentityAgentAddon]
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: aws-efs-csi-driver
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - RoleArn: !GetAtt EfsCsiRole.Arn
+          ServiceAccount: efs-csi-controller-sa
+
+Outputs:
+  ClusterName:
+    Description: Pass as ClusterName to cao-resources.yaml.
+    Value: !Ref Cluster
+
+  KubeconfigCommand:
+    Description: Run this to point kubectl at the new cluster.
+    Value: !Sub "aws eks update-kubeconfig --region ${AWS::Region} --name ${Cluster}"
+
+  VpcId:
+    Description: Pass as VpcId to cao-resources.yaml.
+    Value: !Ref Vpc
+
+  NodeSecurityGroupId:
+    Description: >-
+      Pass as NodeSecurityGroupId to cao-resources.yaml. This is the cluster
+      security group EKS creates and attaches to managed nodes, so allowing NFS
+      from it lets the nodes mount the shared workspace.
+    Value: !GetAtt Cluster.ClusterSecurityGroupId
+
+  WorkspaceSubnetId1:
+    Description: Pass as WorkspaceSubnetId1 to cao-resources.yaml.
+    Value: !Ref PrivateSubnetA
+
+  WorkspaceSubnetId2:
+    Description: >-
+      Pass as WorkspaceSubnetId2 to cao-resources.yaml. Leave
+      WorkspaceSubnetId3 empty — this stack builds two Availability Zones.
+    Value: !Ref PrivateSubnetB
+
+  PrivateSubnetIds:
+    Description: Private subnets holding the nodes, pods and EFS mount targets.
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+
+  PublicSubnetIds:
+    Description: Public subnets for the NAT gateway and internet-facing load balancers.
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
