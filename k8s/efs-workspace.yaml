@@ -5,18 +5,28 @@
 # path, so CAO's working-directory inheritance places delegated agents in
 # the shared workspace on any pod with no per-call parameters.
 #
-# STATIC provisioning: the AWS resources are created out-of-band (see IDs
-# below) and referenced here; the aws-efs-csi-driver's node DaemonSet does
-# the NFS mount — no IAM role and no controller involvement at mount time.
+# STATIC provisioning: the AWS resources are created by
+# iac/infrastructure.yaml and referenced here by ID; the aws-efs-csi-driver's
+# node DaemonSet does the NFS mount — no IAM role and no controller
+# involvement at mount time.
 #
-# AWS resources (account <account-id>, ap-southeast-2, VPC of EKS "Cluster"):
-#   FileSystem  fs-0fe4b2ecc1b06bb67  (encrypted, generalPurpose, elastic)
-#   AccessPoint fsap-0e72f7af255f8b90c
-#     - root dir /cao-workspace (created 0770)
-#     - forces POSIX uid/gid 1000 = the image's "cao" user, so ownership is
-#       consistent fleet-wide and root is never used over NFS
-#   Mount targets in all three cluster subnets, SG cao-workspace-efs
-#     (sg-0be7873cf96e58eaf) allowing NFS :2049 from the cluster SG only.
+# The `volumeHandle` below is a PLACEHOLDER and the manifest will not mount
+# until it is filled in. Take the value verbatim from the stack:
+#
+#   aws cloudformation describe-stacks --stack-name cao-workshop \
+#     --query "Stacks[0].Outputs[?OutputKey=='WorkspaceVolumeHandle'].OutputValue" \
+#     --output text
+#
+# A stale ID fails at mount time, not at apply time: the pod stays
+# ContainerCreating and the reason only appears in `kubectl describe pod`.
+#
+# What the stack creates:
+#   FileSystem   encrypted, generalPurpose, elastic throughput
+#   AccessPoint  root dir /cao-workspace, created 0755, forcing POSIX
+#                uid/gid 1000 = the image's "cao" user, so ownership is
+#                consistent fleet-wide and root is never used over NFS
+#   Mount targets in all three cluster subnets, with a security group
+#                allowing NFS :2049 from the cluster security group only.
 #
 # CONCURRENCY: a shared volume does NOT make one git working tree safe for
 # two agents — parallel agents must work in separate subdirectories or use
@@ -53,7 +63,7 @@ spec:
     driver: efs.csi.aws.com
     # <filesystem-id>::<access-point-id> — mounts via the access point so
     # all I/O is forced to uid/gid 1000 under /cao-workspace.
-    volumeHandle: fs-0fe4b2ecc1b06bb67::fsap-0e72f7af255f8b90c
+    volumeHandle: <filesystem-id>::<access-point-id>
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

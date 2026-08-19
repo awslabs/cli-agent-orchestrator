@@ -16,7 +16,9 @@
 #                         the container/pod DNS name peers will use to reach it)
 #   CAO_INSTALL_PROFILES  optional space-separated "profile:provider" pairs to
 #                         install before the server starts,
-#                         e.g. "code_supervisor:kiro_cli developer:claude_code"
+#                         e.g. "code_supervisor:claude_code developer:claude_code"
+#   CAO_WARM_PROVIDER     set to 0 to skip the provider preflight below
+#                         (default: run it)
 #   CAO_MAX_TERMINALS     optional cap on live terminals this node will host
 #                         (unset = unlimited). Worker pods set 1 so each pod
 #                         hosts exactly one agent; extra placements get HTTP 429.
@@ -45,6 +47,40 @@ if [ -n "${CAO_INSTALL_PROFILES:-}" ]; then
     cao install "${profile}" --provider "${provider}" \
       || echo "[cao-entrypoint] WARN: install ${spec} failed (continuing)"
   done
+fi
+
+# Provider preflight — one throwaway model call before the server accepts work.
+#
+# This is not a health check, it is a warm-up, and it exists because of two
+# behaviours that otherwise both land on the first real prompt:
+#
+#   1. The first invocation of an Anthropic model in an account that has not
+#      activated it makes Bedrock auto-initiate an AWS Marketplace subscription.
+#      Activation can take up to two minutes, during which calls fail with a 403
+#      naming marketplace actions. Paying that cost here, while the pod is
+#      starting anyway, keeps it off the critical path.
+#   2. Every distinct model needs its own activation, so this warms each pinned
+#      tier rather than just the primary.
+#
+# Non-fatal on purpose, and note that `|| true` is doing real work under
+# `set -euo pipefail`: an exit 127 anywhere in a pipeline becomes the pipeline's
+# status, so a missing binary would otherwise kill the container. A pod that
+# cannot reach Bedrock should still start and report a clear error to an operator
+# rather than crash-looping with the reason buried in a previous container's log.
+if [ "${CAO_WARM_PROVIDER:-1}" != "0" ] && [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
+  for model_var in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL; do
+    model="${!model_var:-}"
+    [ -n "${model}" ] || continue
+    echo "[cao-entrypoint] warming ${model_var}=${model}"
+    if ANTHROPIC_MODEL="${model}" timeout 180 claude -p "Reply with the single word: ok" \
+         >/tmp/warm.log 2>&1; then
+      echo "[cao-entrypoint] ${model_var} responded: $(tr -d '\n' < /tmp/warm.log | tail -c 120)"
+    else
+      echo "[cao-entrypoint] WARN: ${model_var} did not respond; first real prompt may be slow or fail"
+      echo "[cao-entrypoint] WARN: $(tr -d '\n' < /tmp/warm.log | tail -c 300)"
+    fi
+  done
+  rm -f /tmp/warm.log || true
 fi
 
 echo "[cao-entrypoint] starting cao-server on ${BIND_HOST}:${PORT}"

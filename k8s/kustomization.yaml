@@ -8,25 +8,26 @@ resources:
   # Cluster-scoped, so unaffected by the namespace above. A fresh EKS cluster
   # ships only `gp2`, so without this the per-pod state PVCs never bind.
   - storageclass-gp3.yaml
-  - configmap-fleet.yaml
   - efs-workspace.yaml
   - service-workers-headless.yaml
   - statefulset-workers.yaml
   - deployment-supervisor.yaml
-  - deployment-fleet-panel.yaml
   - networkpolicy.yaml
+
+# No fleet panel and no external-secrets. The panel is out because the CAO
+# repository ships no Dockerfile for its image, so it cannot be built from
+# source; that also removes configmap-fleet.yaml, which existed only to tell the
+# panel which nodes to poll. External Secrets is out because Claude Code on
+# Bedrock has no API key to sync — the pods authenticate as their own Pod
+# Identity, so there is nothing to fetch from Secrets Manager.
 
 images:
   # Pin an IMMUTABLE tag. A mutable `latest` tag once left the cluster running a
   # build that predated cross-node placement while these manifests advertised
   # it, with nothing to indicate the mismatch. Bump this deliberately when you
   # push a new image.
-  - name: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server
-    # Example tag. Built from docker/Dockerfile, then layered with
-    # docker/Dockerfile.provider to add an authenticated provider CLI; the base
-    # image ships only mock_cli. Replace with your own tag.
-    newTag: 2.4.1-kiro2.18.1
-  - name: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-fleet-panel
-    newTag: latest
-  - name: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-fleet-panel
-    newTag: latest
+  - name: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-server
+    # Example tag. Built from docker/Dockerfile, which now installs Claude Code
+    # from public npm — there is no second provider layer to add, because
+    # nothing has to be vendored from an authenticated local install.
+    newTag: 2.4.1-cc2

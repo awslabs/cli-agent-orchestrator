@@ -11,14 +11,15 @@ AWSTemplateFormatVersion: "2010-09-09"
 # security group references the cluster's own security group, and the mount
 # targets reference the same private subnets the nodes run in.
 #
-# WHAT IT DOES NOT DO. Two things cannot be expressed in CloudFormation because
-# they are Kubernetes objects, not AWS resources:
-#   * External Secrets Operator — install with Helm. (The StorageClasses the
-#     manifests need ship with the kustomization in ../.)
-# Both are listed in ../README.md.
+# WHAT IT DOES NOT DO. It does not create the Kubernetes objects — those ship
+# with the kustomization in ../, including the StorageClasses. It also does not
+# build or push the container image; see ../README.md.
 #
-# ORDER: this stack -> set the provider secret value, install ESO -> the
-# manifests in ../.
+# ORDER: this stack -> build and push the image -> the manifests in ../.
+#
+# There is no provider secret and no External Secrets Operator. Claude Code on
+# Bedrock authenticates as the pod's own identity, so nothing needs a key
+# pasted in by hand.
 #
 # Deploy (about 15 minutes, most of it the control plane):
 #   aws cloudformation deploy \
@@ -45,7 +46,9 @@ Metadata:
       - Label: { default: Network }
         Parameters: [VpcCidr]
       - Label: { default: CAO resources }
-        Parameters: [NamePrefix, ProviderSecretName, ExternalSecretsNamespace, ExternalSecretsServiceAccount]
+        Parameters: [NamePrefix, AgentNamespace, SupervisorServiceAccount, WorkerServiceAccount]
+      - Label: { default: Access }
+        Parameters: [ClusterAdminPrincipalArn]
 
 Parameters:
   ClusterName:
@@ -56,20 +59,27 @@ Parameters:
 
   KubernetesVersion:
     Type: String
-    Default: "1.36"
+    Default: "1.35"
     Description: >-
-      Kubernetes version. 1.36 is the current EKS default; the CAO fleet was
-      validated on 1.35 and nothing it does is version-specific.
+      Kubernetes version. Pinned to the version the CAO fleet was actually
+      validated on rather than tracking the current EKS default, so a new EKS
+      default cannot change what a workshop deploys underneath it.
     AllowedPattern: "^1\\.(3[3-9]|4[0-9])$"
 
   NodeInstanceType:
     Type: String
-    Default: m6i.xlarge
+    Default: m7g.xlarge
     Description: >-
-      Node instance type. m6i.xlarge (16 GiB) is the default rather than .large
-      because each CAO pod requests 1Gi and may use up to 3Gi: a real provider
-      CLI maps in a large binary and a running agent settles near 660Mi. Two
-      .large nodes would leave the fleet one burst away from eviction.
+      Node instance type. .xlarge (16 GiB) rather than .large because each CAO
+      pod requests 1Gi and may use up to 3Gi: a running agent settles near
+      660Mi. Two .large nodes would leave the fleet one burst away from
+      eviction.
+
+      Graviton (m7g) rather than Intel (m6i) so the node architecture matches
+      the Workshop Studio code editor, which is m8g.large — arm64. The image is
+      built on the code editor and pushed to this account's ECR, so an x86 node
+      group would mean either a cross-build under emulation or an image that
+      simply will not start. Keep this and AmiType below in agreement.
 
   NodeDesiredSize:
     Type: Number
@@ -109,25 +119,38 @@ Parameters:
       Change it to run two fleets in one account.
     AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
 
-  ProviderSecretName:
+  AgentNamespace:
     Type: String
-    Default: cao/kiro-api-key
+    Default: cao-cluster
     Description: >-
-      Secrets Manager secret holding the provider API key. Created empty; set the
-      value before deploying the manifests.
-    MinLength: 1
+      Namespace the CAO fleet runs in. Must match `namespace:` in
+      ../kustomization.yaml, or the Pod Identity associations below deliver
+      credentials to a namespace with no pods in it.
 
-  ExternalSecretsNamespace:
+  SupervisorServiceAccount:
     Type: String
-    Default: external-secrets
-    Description: Namespace where the External Secrets Operator controller runs.
+    Default: cao-supervisor
+    Description: Service account of the supervisor pod.
 
-  ExternalSecretsServiceAccount:
+  WorkerServiceAccount:
     Type: String
-    Default: external-secrets
+    Default: cao-worker
+    Description: Service account of the worker pods.
+
+  ClusterAdminPrincipalArn:
+    Type: String
+    Default: ""
     Description: >-
-      Service account of the ESO controller. The IAM role is granted to the
-      OPERATOR, not to the CAO pods.
+      Optional IAM principal to grant cluster-admin via an EKS access entry.
+      REQUIRED in Workshop Studio: the stack is deployed by the WS provisioning
+      role, so BootstrapClusterCreatorAdminPermissions grants admin to THAT
+      principal and the participant role gets no cluster access at all — every
+      kubectl command in the workshop then fails Unauthorized. Set this to the
+      participant role ARN. Leave empty when deploying by hand, where the
+      deploying principal is already the creator.
+
+Conditions:
+  HasClusterAdminPrincipal: !Not [!Equals [!Ref ClusterAdminPrincipalArn, ""]]
 
 Resources:
   # ===========================================================================
@@ -387,7 +410,8 @@ Resources:
       Subnets:
         - !Ref PrivateSubnetA
         - !Ref PrivateSubnetB
-      AmiType: AL2023_x86_64_STANDARD
+      # Must match the architecture of NodeInstanceType.
+      AmiType: AL2023_ARM_64_STANDARD
       InstanceTypes:
         - !Ref NodeInstanceType
       DiskSize: !Ref NodeDiskSize
@@ -516,66 +540,77 @@ Resources:
   # mount targets reference the same private subnets the nodes run in.
   # ===========================================================================
 
-  # Created with NO value on purpose. Omitting both SecretString and
-  # GenerateSecretString yields an empty secret, so a forgotten "paste the key"
-  # step fails loudly: GetSecretValue returns ResourceNotFoundException, the
-  # ExternalSecret reports SecretSynced=False, the Kubernetes Secret is never
-  # created, and pods stop at CreateContainerConfigError. A generated placeholder
-  # would instead sync a plausible-looking value and fail later as a confusing
-  # authentication error.
+  # Bedrock access for the agent pods.
   #
-  # Never put the key in this template. Set it out of band; see ../README.md.
-  # Later stack updates will not overwrite the value, because SecretString is
-  # absent here.
-  ProviderSecret:
-    Type: AWS::SecretsManager::Secret
-    # Delete, not Retain. A retained secret keeps its name, so the next deploy of
-    # this stack fails with a name conflict — which makes the teardown-and-rebuild
-    # cycle a workshop depends on impossible without manual cleanup. The trade is
-    # that tearing down the stack discards the pasted API key, which is
-    # acceptable here because it is re-pasted as a setup step anyway. Switch both
-    # this and WorkspaceFileSystem to Retain for a long-lived deployment.
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Retain
-    Properties:
-      Name: !Ref ProviderSecretName
-      Description: !Sub "Provider API key consumed by the ${NamePrefix} fleet via External Secrets Operator"
-      # No KmsKeyId: encrypted with the AWS-managed key. To use a
-      # customer-managed key, set it here and add kms:Decrypt on that key to the
-      # policy below, or the role cannot read the secret.
-      Tags:
-        - Key: Name
-          Value: !Ref ProviderSecretName
-
-  # The permission lives in a standalone managed policy rather than an inline
-  # Policies block so it is independently auditable and versioned.
-  ReadProviderSecretPolicy:
+  # This REVERSES a deliberate property of the kiro-cli design this stack grew
+  # from, and the reversal is forced rather than chosen. kiro-cli authenticates
+  # to the Kiro service with an OIDC bearer token from an interactive device
+  # flow — `kiro-cli login` exposes no token, API-key or headless option — so a
+  # pod fleet cannot log in unattended. That design left the agent pods with no
+  # AWS identity at all, and bounded them further by blocking IMDS in
+  # ../networkpolicy.yaml. Claude Code on Bedrock authenticates with SigV4,
+  # which needs a real AWS identity on the pod but needs no human.
+  #
+  # The mitigation is scope, not absence. This role grants model invocation and
+  # nothing else: no S3, no Secrets Manager, no IAM, no EC2. A prompt-injected
+  # agent that exfiltrates these credentials gains only the ability to call a
+  # model it was already calling on the operator's behalf.
+  #
+  # There is no provider secret and no External Secrets Operator any more.
+  # Bedrock auth is the pod's own identity, so the Secrets Manager secret, the
+  # read policy, the ESO controller role and its Pod Identity association all
+  # became dead weight and are gone — along with four of the nine setup steps
+  # in ../README.md.
+  AgentBedrockPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: !Sub "${NamePrefix}-read-provider-secret"
-      Description: !Sub "Read-only access to the ${NamePrefix} provider API key secret."
+      ManagedPolicyName: !Sub "${NamePrefix}-agent-bedrock"
+      Description: >-
+        Bedrock model invocation for the CAO agent pods. Deliberately the only
+        AWS permission these pods hold.
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          # Scoped to this one secret ARN. !Ref on a Secret returns the full ARN
-          # including the six-character suffix Secrets Manager appends, so no
-          # wildcard is needed.
-          - Sid: ReadProviderSecretOnly
+          # Claude Code uses the Bedrock INVOKE API, not Converse. A working
+          # `aws bedrock-runtime converse` call proves nothing about this grant.
+          - Sid: InvokeModels
             Effect: Allow
             Action:
-              - secretsmanager:GetSecretValue
-              - secretsmanager:DescribeSecret
-            Resource: !Ref ProviderSecret
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+          # Claude Code probes inference profiles during startup.
+          - Sid: ReadModelCatalogue
+            Effect: Allow
+            Action:
+              - bedrock:ListInferenceProfiles
+              - bedrock:GetInferenceProfile
+              - bedrock:ListFoundationModels
+              - bedrock:GetFoundationModel
+            Resource: "*"
+          # The first invocation of an Anthropic model in an account that has
+          # not activated it makes Bedrock auto-initiate an AWS Marketplace
+          # subscription, and that subscribe call authorises against the CALLING
+          # principal. Without this the symptom is a 403 naming marketplace
+          # actions, which reads like a model problem rather than a permissions
+          # one. Anthropic models need it; Amazon, Meta, Mistral, DeepSeek and
+          # OpenAI models do not. The condition scopes it to Bedrock's own
+          # subscribe call so it can never authorise a direct one.
+          - Sid: MarketplaceActivationViaBedrockOnly
+            Effect: Allow
+            Action:
+              - aws-marketplace:ViewSubscriptions
+              - aws-marketplace:Subscribe
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:CalledViaLast: bedrock.amazonaws.com
 
-  # Assumed by the External Secrets Operator controller, NOT by the CAO pods. CAO
-  # agents execute arbitrary commands by design, so an AWS identity on those pods
-  # would be inheritable by a prompt-injected agent. With this split the agent
-  # pods read a plain Kubernetes Secret and hold no AWS credentials at all.
-  ExternalSecretsRole:
+  AgentBedrockRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${NamePrefix}-external-secrets-role"
-      Description: Lets External Secrets Operator read the CAO provider secret.
+      RoleName: !Sub "${NamePrefix}-agent-bedrock-role"
+      Description: Assumed by the CAO supervisor and worker pods through EKS Pod Identity.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -583,27 +618,57 @@ Resources:
             Effect: Allow
             Principal:
               Service: pods.eks.amazonaws.com
+            # Pod Identity requires TagSession alongside AssumeRole; the assume
+            # call fails without it.
             Action:
               - sts:AssumeRole
               - sts:TagSession
       ManagedPolicyArns:
-        - !Ref ReadProviderSecretPolicy
+        - !Ref AgentBedrockPolicy
 
-  # Delivers the role above to the ESO controller pods. The association is
-  # created even though ESO is installed later — EKS does not require the
-  # namespace or service account to exist yet.
+  # One association per service account. Pod Identity binds a role to a
+  # (namespace, service account) pair, so the supervisor and the workers each
+  # need their own even though they share one role.
   #
-  # Credentials are injected by a mutating admission webhook at POD CREATION, so
-  # ESO pods started before this exists never receive them and fall back to the
-  # node instance role. Restart ESO after this stack completes.
-  ExternalSecretsPodIdentity:
+  # Credentials arrive through a mutating admission webhook at POD CREATION, so
+  # a pod that started before its association existed never receives them and
+  # falls back to the node instance role with no failing probe to signal it.
+  # Both associations are created by this stack before any CAO pod exists, so
+  # ordering is safe here — but adding one under a running fleet needs a
+  # rollout restart.
+  SupervisorPodIdentity:
     Type: AWS::EKS::PodIdentityAssociation
     DependsOn: PodIdentityAgentAddon
     Properties:
       ClusterName: !Ref Cluster
-      Namespace: !Ref ExternalSecretsNamespace
-      ServiceAccount: !Ref ExternalSecretsServiceAccount
-      RoleArn: !GetAtt ExternalSecretsRole.Arn
+      Namespace: !Ref AgentNamespace
+      ServiceAccount: !Ref SupervisorServiceAccount
+      RoleArn: !GetAtt AgentBedrockRole.Arn
+
+  WorkerPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAgentAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: !Ref AgentNamespace
+      ServiceAccount: !Ref WorkerServiceAccount
+      RoleArn: !GetAtt AgentBedrockRole.Arn
+
+  # Grants cluster-admin to a principal that is not this stack's creator.
+  # BootstrapClusterCreatorAdminPermissions covers only the deploying principal,
+  # which in Workshop Studio is the provisioning role rather than the
+  # participant — see the ClusterAdminPrincipalArn parameter.
+  ClusterAdminAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasClusterAdminPrincipal
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Ref ClusterAdminPrincipalArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: !Sub "arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          AccessScope:
+            Type: cluster
 
   # IMMUTABLE tags are deliberate. A mutable tag previously let a cluster run a
   # build that predated cross-node placement while the manifests advertised it,
@@ -634,15 +699,9 @@ Resources:
             ]
           }
 
-  # MUTABLE only because the panel deployment still references `latest`. Switch to
-  # IMMUTABLE once the panel is built with versioned tags.
-  PanelRepository:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub "${NamePrefix}-fleet-panel"
-      ImageTagMutability: MUTABLE
-      ImageScanningConfiguration:
-        ScanOnPush: true
+  # No panel repository. The fleet panel is not part of this deployment: the CAO
+  # repository ships no Dockerfile for it, so the image cannot be built from
+  # source here.
 
   # Only the cluster's own nodes may mount the workspace. Being in the same stack
   # as the cluster, this can reference the security group EKS created rather than
@@ -687,8 +746,15 @@ Resources:
       Encrypted: true
       PerformanceMode: generalPurpose
       ThroughputMode: elastic
+      # DISABLED deliberately, and it has to agree with DeletionPolicy above.
+      # AWS Backup recovery points are NOT owned by the file system: enabling
+      # backups and then deleting the stack leaves recovery points behind in the
+      # default vault, still billing, with the file system that explains them
+      # gone. For a workshop torn down and rebuilt many times that is a slow
+      # leak nobody goes looking for. Enable this only alongside
+      # DeletionPolicy: Retain, where something is actually worth recovering.
       BackupPolicy:
-        Status: ENABLED
+        Status: DISABLED
       FileSystemTags:
         - Key: Name
           Value: !Sub "${NamePrefix}-workspace"
@@ -743,15 +809,11 @@ Outputs:
     Description: Run this to point kubectl at the cluster.
     Value: !Sub "aws eks update-kubeconfig --region ${AWS::Region} --name ${Cluster}"
 
-  ProviderSecretName:
+  AgentBedrockRoleArn:
     Description: >-
-      Set this secret's value before deploying the manifests, and use it as the
-      remoteRef key in ../external-secrets.example.yaml.
-    Value: !Ref ProviderSecretName
-
-  ExternalSecretsRoleArn:
-    Description: IAM role the External Secrets Operator controller assumes.
-    Value: !GetAtt ExternalSecretsRole.Arn
+      IAM role the supervisor and worker pods assume through Pod Identity. Their
+      only AWS permission is Bedrock model invocation.
+    Value: !GetAtt AgentBedrockRole.Arn
 
   WorkspaceVolumeHandle:
     Description: Paste into spec.csi.volumeHandle in ../efs-workspace.yaml.
@@ -760,10 +822,6 @@ Outputs:
   ServerRepositoryUri:
     Description: Push the CAO server image here, and use it in ../kustomization.yaml.
     Value: !GetAtt ServerRepository.RepositoryUri
-
-  PanelRepositoryUri:
-    Description: Fleet panel image repository.
-    Value: !GetAtt PanelRepository.RepositoryUri
 
   VpcId:
     Description: VPC holding the cluster.

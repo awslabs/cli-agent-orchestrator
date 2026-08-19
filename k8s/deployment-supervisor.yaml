@@ -38,10 +38,15 @@ spec:
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
+      # Bound to the Bedrock role by a Pod Identity association in
+      # iac/infrastructure.yaml. The association is keyed on (namespace, service
+      # account), so this name must match the SupervisorServiceAccount stack
+      # parameter or the pod silently gets no credentials.
+      serviceAccountName: cao-supervisor
       containers:
         - name: cao-node
           # Same image as workers — role differs by env/config only
-          image: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server:latest
+          image: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-server:latest
           ports:
             - containerPort: 9889
               name: http
@@ -59,7 +64,7 @@ spec:
               value: "http://cao-supervisor.cao-cluster.svc.cluster.local:9889"
             # Supervisor installs the code_supervisor profile
             - name: CAO_INSTALL_PROFILES
-              value: "code_supervisor:kiro_cli"
+              value: "code_supervisor:claude_code"
             # Put CAO's state tree on the mounted gp3 PVC. Without this, CAO
             # defaults to ~/.aws/cli-agent-orchestrator on the container's
             # ephemeral filesystem, so the PVC mounted at /home/cao/.cao held
@@ -79,30 +84,83 @@ spec:
             # over NFS.
             - name: CAO_HOME_DIR
               value: /home/cao/.cao/state
-            # Provider API key, synced from AWS Secrets Manager by External
-            # Secrets Operator — see k8s/external-secrets.example.yaml. The
-            # Secret must already exist (ExternalSecret SecretSynced=True) or
-            # this pod fails with CreateContainerConfigError. Env is read once
-            # at container start, so a key rotation needs a rollout restart.
-            - name: KIRO_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: kiro-api-key
-                  key: KIRO_API_KEY
+            # Both defaults are too short for a containerized cold start, and
+            # they fail in ways that look like different bugs.
+            #
+            # CAO_PROVIDER_INIT_TIMEOUT (default 60) is the server-side budget
+            # for bringing a provider REPL up. Claude Code ships as a ~330 MB
+            # native binary, and its first launch in a pod took ~45s just to
+            # render, before the startup-dialog handler had answered anything —
+            # so 60s failed intermittently with "Claude Code initialization
+            # timed out after 60s" and left the terminal in status `unknown`.
+            #
+            # CAO_MCP_REQUEST_TIMEOUT (default 30) is the CLIENT-side HTTP read
+            # timeout, and it must exceed the init budget above or `cao launch`
+            # reports `Read timed out. (read timeout=30)` while the server goes
+            # on to create the session successfully — a failure message for a
+            # launch that worked.
+            - name: CAO_PROVIDER_INIT_TIMEOUT
+              value: "180"
+            - name: CAO_MCP_REQUEST_TIMEOUT
+              value: "240"
+            # --- Claude Code on Bedrock -------------------------------------
+            #
+            # There is no API key. Claude Code signs Bedrock requests with
+            # SigV4 using the credentials Pod Identity injects for the service
+            # account above, so nothing has to be pasted in or rotated.
+            #
+            # USE_BEDROCK, not USE_ANTHROPIC_AWS. They are different products:
+            # CLAUDE_CODE_USE_ANTHROPIC_AWS selects Claude Platform on AWS and
+            # additionally requires ANTHROPIC_AWS_WORKSPACE_ID, which a vended
+            # workshop account does not have.
+            - name: CLAUDE_CODE_USE_BEDROCK
+              value: "1"
+            # Set explicitly, and the failure it prevents is silent rather
+            # than loud. The Pod Identity webhook injects the two credential
+            # variables and AWS_STS_REGIONAL_ENDPOINTS, but NOT a region; with
+            # neither AWS_REGION nor AWS_DEFAULT_REGION set, Claude Code does not
+            # error, it falls back to a built-in default region and keeps
+            # working — so the pod looks healthy while every model call leaves
+            # this cluster's region.
+            - name: AWS_REGION
+              value: "<region>"
+            # Every tier is pinned, and that is not belt-and-braces. Claude
+            # Code's built-in defaults point at 5.x models, and a vended
+            # workshop account is entitled to 4.5/4.6 only — every 5.x model
+            # returns `401 ... not available for this account`, which no IAM
+            # change fixes. Any tier left unpinned therefore fails the moment
+            # something reaches for it.
+            #
+            # Only TWO distinct models across the four variables, because
+            # Marketplace activation is per model and each distinct model costs
+            # its own activation round-trip on first use.
+            - name: ANTHROPIC_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            # Set explicitly, and NOT to a Sonnet id: `/model opus` fails
+            # without it, and pointing it at Sonnet would misreport which model
+            # actually answered.
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            # The fast tier stays on Haiku deliberately. It runs unattended on
+            # every turn for background bookkeeping, and paying Opus rates for
+            # that is pure waste.
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              value: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
             # Deliberately NO CAO_MAX_TERMINALS here: the supervisor pod is
             # uncapped so its own terminal plus any sidecars can coexist. In
             # this topology delegated workers should not land here either way —
             # assign/handoff calls from the supervisor should always carry
             # target_host=<worker pod> so agents run on the capped worker pods.
           resources:
-            # Sized for a REAL provider CLI, not the mock. kiro-cli ships a
-            # 665 MB `kiro-cli-chat` binary that gets mapped in when an agent
-            # runs, on top of ~230 MB for cao-server itself. The original
-            # 1Gi limit was set when mock_cli (a small shell script) was the
-            # only provider, and it OOMKilled this pod (exit 137) the first
-            # time a real agent ran — which also wiped all session state,
-            # since state does not currently live on the mounted PVC.
-            # Revisit if you go back to a mock-only fleet.
+            # Sized for a REAL provider CLI, not the mock. A 1Gi limit was set
+            # when mock_cli (a small shell script) was the only provider, and it
+            # OOMKilled this pod (exit 137) the first time a real agent ran.
+            # Claude Code is a Node process rather than the 665 MB static binary
+            # kiro-cli mapped in, so the headroom here is more generous than it
+            # now needs to be — measure before trimming it, since an OOMKill
+            # takes any running session with it.
             requests:
               cpu: 250m
               memory: 1Gi
@@ -143,6 +201,17 @@ spec:
           persistentVolumeClaim:
             claimName: cao-workspace
 ---
+# The identity Pod Identity binds the Bedrock role to. Nothing here grants
+# Kubernetes API access — the pod never talks to the API server.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cao-supervisor
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-supervisor
+    app.kubernetes.io/part-of: cao-fleet
+---
 # Persistent state for the supervisor (SQLite DB, logs, installed profiles).
 # Survives pod restarts/rescheduling, unlike the emptyDir it replaces.
 apiVersion: v1
@@ -162,8 +231,8 @@ spec:
     requests:
       storage: 1Gi
 ---
-# ClusterIP Service for the supervisor (fleet panel and worker callbacks
-# connect to this)
+# ClusterIP Service for the supervisor. This is what CAO_ADVERTISED_URL above
+# resolves to, so it is the address workers POST their results back to.
 apiVersion: v1
 kind: Service
 metadata:

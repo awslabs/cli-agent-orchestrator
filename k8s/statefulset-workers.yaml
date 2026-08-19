@@ -24,7 +24,13 @@ metadata:
     app.kubernetes.io/part-of: cao-fleet
 spec:
   serviceName: cao-workers
-  replicas: 3
+  # 1 while the plumbing is being brought up — supervisor + one worker is
+  # already a cross-pod topology, so it exercises target_host placement and the
+  # send_message callback route. Raise to 3 to exercise the parts that need a
+  # second worker: the 429-when-full response and the supervisor moving on to
+  # the next worker. Keep this in agreement with the fleet ConfigMap if the
+  # panel is ever added back.
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: cao-worker
@@ -46,10 +52,16 @@ spec:
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
+      # Bound to the Bedrock role by a Pod Identity association in
+      # iac/infrastructure.yaml. Must match the WorkerServiceAccount stack
+      # parameter, or the pods get no credentials and every model call fails.
+      serviceAccountName: cao-worker
       containers:
         - name: cao-node
-          # TODO: Replace with your ECR image URI after push
-          image: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server:latest
+          # Same image as the supervisor — the role differs by env/config only.
+          # The placeholders and the tag are filled in by deploy.sh from the
+          # stack's ServerRepositoryUri output.
+          image: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-server:latest
           ports:
             - containerPort: 9889
               name: http
@@ -77,14 +89,11 @@ spec:
             #     curation is effectively disabled on worker pods.
             - name: CAO_MAX_TERMINALS
               value: "1"
-            # Worker profile installed on startup. mock_cli is the
-            # credentials-free smoke-test default baked into the image; swap
-            # in a real provider CLI for actual work, e.g.:
-            #   value: "developer:claude_code"
-            # (the image must have that provider CLI installed/authenticated,
-            # and the worker egress NetworkPolicy must allow its API endpoints).
+            # Worker profile installed on startup. The provider must be present
+            # in the image AND reachable through the egress NetworkPolicy;
+            # mock_cli is the credentials-free fallback baked in for smoke tests.
             - name: CAO_INSTALL_PROFILES
-              value: "developer:kiro_cli"
+              value: "developer:claude_code"
             # Put CAO's state tree on this pod's gp3 PVC — see the matching
             # comment in deployment-supervisor.yaml for why this is a
             # subdirectory of the mount rather than the mount root, and why
@@ -92,23 +101,47 @@ spec:
             # pipes + flock over NFS).
             - name: CAO_HOME_DIR
               value: /home/cao/.cao/state
-            # Provider API key, synced from AWS Secrets Manager by External
-            # Secrets Operator — see k8s/external-secrets.example.yaml. The
-            # Secret must already exist (ExternalSecret SecretSynced=True) or
-            # this pod fails with CreateContainerConfigError. Env is read once
-            # at container start, so a key rotation needs a rollout restart.
-            - name: KIRO_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: kiro-api-key
-                  key: KIRO_API_KEY
+            # Raised from the 60s/30s defaults for the reasons documented in
+            # deployment-supervisor.yaml: Claude Code's cold start in a pod
+            # outruns the server-side init budget, and the client-side HTTP read
+            # timeout has to outlast that budget or `cao launch` reports a read
+            # timeout for a launch that in fact succeeded. Kept in agreement with
+            # the supervisor — a worker whose init budget is shorter fails
+            # delegated placements the supervisor itself would have survived.
+            - name: CAO_PROVIDER_INIT_TIMEOUT
+              value: "180"
+            - name: CAO_MCP_REQUEST_TIMEOUT
+              value: "240"
+            # --- Claude Code on Bedrock -------------------------------------
+            #
+            # No API key: SigV4 against the Pod Identity credentials for the
+            # service account above. See deployment-supervisor.yaml for why
+            # every tier is pinned and why only two distinct models are used.
+            - name: CLAUDE_CODE_USE_BEDROCK
+              value: "1"
+            # Set explicitly, and the failure it prevents is silent rather
+            # than loud. The Pod Identity webhook injects the two credential
+            # variables and AWS_STS_REGIONAL_ENDPOINTS, but NOT a region; with
+            # neither AWS_REGION nor AWS_DEFAULT_REGION set, Claude Code does not
+            # error, it falls back to a built-in default region and keeps
+            # working — so the pod looks healthy while every model call leaves
+            # this cluster's region.
+            - name: AWS_REGION
+              value: "<region>"
+            - name: ANTHROPIC_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              value: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
           resources:
             # Sized for a REAL provider CLI, not the mock — same reasoning as
-            # the supervisor: kiro-cli's 665 MB `kiro-cli-chat` binary plus
-            # ~230 MB of cao-server exceeded the previous 1Gi limit and got the
-            # supervisor OOMKilled (exit 137) as soon as a real agent ran. Each
-            # worker hosts exactly one agent (CAO_MAX_TERMINALS=1), so this is
-            # sized for a single concurrent agent, not N.
+            # the supervisor, where a 1Gi limit OOMKilled the pod (exit 137) the
+            # first time a real agent ran. Each worker hosts exactly one agent
+            # (CAO_MAX_TERMINALS=1), so this is sized for a single concurrent
+            # agent, not N.
             requests:
               cpu: 250m
               memory: 1Gi
@@ -159,3 +192,16 @@ spec:
         resources:
           requests:
             storage: 1Gi
+---
+# The identity Pod Identity binds the Bedrock role to. Shared by every worker
+# ordinal: Pod Identity keys on (namespace, service account), not on pod name,
+# so one service account covers the whole StatefulSet regardless of replica
+# count. Grants no Kubernetes API access — the pods never talk to the API server.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cao-worker
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-worker
+    app.kubernetes.io/part-of: cao-fleet

@@ -45,18 +45,29 @@ RUN apt-get update \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
-# No provider CLI is baked in. The previous `npm install -g
-# @anthropic-ai/kiro-cli` here made this image UNBUILDABLE: that package does
-# not exist on the public npm registry (404), so the build failed at this
-# layer and produced nothing. nodejs/npm were installed only to serve it and
-# are dropped with it.
+# --- Provider CLI: Claude Code ------------------------------------------------
 #
-# Ship a real provider by layering onto this image, e.g.:
-#   FROM <this-image>
-#   COPY --chmod=755 path/to/kiro-cli /usr/local/bin/kiro-cli
-# or mount the binary in (see k8s/ for a hostPath/volume example) and set the
-# profile's provider accordingly. The credentials-free mock_cli below is what
-# the k8s manifests select by default, so the fleet is testable as-is.
+# Installed here from the public npm registry, which is the whole reason this
+# image needs no second layer. The provider used to be kiro-cli, which cannot be
+# installed this way: `npm install -g @anthropic-ai/kiro-cli` 404s (the previous
+# version of this file recorded that it made the image unbuildable), and the
+# real installer produces an ~800 MB tree that had to be vendored in from an
+# authenticated local install via a separate Dockerfile.provider. That made the
+# image non-redistributable and the build non-reproducible.
+#
+# It also could not authenticate unattended: `kiro-cli login` offers only
+# --license/--identity-provider/--region/--use-device-flow, so every pod needed
+# a human at a browser. Claude Code on Bedrock authenticates with SigV4 from the
+# pod's own EKS Pod Identity credentials — see k8s/deployment-supervisor.yaml.
+#
+# Node 22+ is required. bookworm's nodejs is too old, so install from NodeSource.
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/* \
+    # Fail the build here rather than at pod startup if the CLI is unusable.
+    && claude --version
 
 # Never run the (unauthenticated) server as root: anyone who reaches the port
 # gets command execution as this user.
@@ -74,6 +85,26 @@ COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/cao-entrypoint
 USER cao
 WORKDIR /home/cao/workspace
 RUN mkdir -p /home/cao/workspace
+
+# Mark Claude Code's first-run onboarding as done.
+#
+# Without this the CLI opens with the interactive THEME PICKER, which is not one
+# of the dialogs CAO's startup handler knows how to answer (see
+# providers/claude_code.py:_handle_startup_prompts), so `cao launch` never gets a
+# REPL and fails with "Claude Code initialization timed out". A container is
+# always a first run — nobody has ever completed onboarding in this image.
+#
+# `hasCompletedOnboarding` is the whole gate; verified by disassembling the
+# installed CLI, whose check is `if(!config.hasCompletedOnboarding|| ...)`.
+# `lastOnboardingVersion` is written alongside it by the real onboarding flow but
+# is never read back, so it is deliberately NOT set here — it would couple this
+# image to a CLI version for no effect.
+#
+# This file lives on the container filesystem, not on the state PVC, so it must
+# be baked into the image: seeding it in a running pod is lost on the next
+# restart.
+RUN printf '{\n  "hasCompletedOnboarding": true\n}\n' > /home/cao/.claude.json \
+    && chmod 600 /home/cao/.claude.json
 
 # ~/.cao holds SQLite state, logs, and installed profiles — mount a volume/PVC
 # here for persistence across container restarts.
