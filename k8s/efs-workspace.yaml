@@ -9,7 +9,7 @@
 # below) and referenced here; the aws-efs-csi-driver's node DaemonSet does
 # the NFS mount — no IAM role and no controller involvement at mount time.
 #
-# AWS resources (account 418295698799, ap-southeast-2, VPC of EKS "Cluster"):
+# AWS resources (account <account-id>, ap-southeast-2, VPC of EKS "Cluster"):
 #   FileSystem  fs-0fe4b2ecc1b06bb67  (encrypted, generalPurpose, elastic)
 #   AccessPoint fsap-0e72f7af255f8b90c
 #     - root dir /cao-workspace (created 0770)
