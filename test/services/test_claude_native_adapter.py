@@ -260,7 +260,6 @@ class TestPerProviderArgvDispatch:
             "kimi_cli",
             "claude_code",
             "muse_cli",
-            "antigravity_cli",
         }
         for provider in ntl.SUPPORTED_NATIVE_PROVIDERS:
             binder = ntl._binder(provider)
@@ -528,6 +527,7 @@ class TestSchemasAreNotShared:
 
 class TestCapabilityAdvertisement:
     def test_native_support_is_derived_from_implemented_adapters(self):
+        """Forward guard: native_tui_capabilities is total over NATIVE_TUI_PROVIDERS."""
         block = v2.native_tui_capabilities()
         assert block["schema_version"] == 1
         assert set(block["providers"]) == set(v2.NATIVE_TUI_PROVIDERS)

@@ -1213,23 +1213,6 @@ def _codex_argv(
         raise NativeLaunchInvalid(str(exc)) from exc
 
 
-def _antigravity_argv(
-    *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
-) -> list[str]:
-    args = [binary, "--dangerously-skip-permissions", "--conversation", session_id]
-    if extra_args:
-        args.extend(extra_args)
-    return args
-
-
-def _antigravity_binds_exactly(argv: Sequence[str], session_id: str) -> bool:
-    argv_list = list(argv)
-    for i, arg in enumerate(argv_list):
-        if arg == "--conversation" and i + 1 < len(argv_list):
-            return argv_list[i + 1] == session_id
-    return False
-
-
 #: Per-provider argv construction and the matching "does this argv bind
 #: exactly that session?" check. The two halves are registered together
 #: on purpose: a builder paired with the wrong checker would construct a
@@ -1240,7 +1223,6 @@ _ARGV_BINDERS: dict[str, dict[str, Any]] = {
     "kimi_cli": {"build": _kimi_argv, "binds_exactly": kimi_native_launch.resumes_exactly},
     "claude_code": {"build": _claude_argv, "binds_exactly": claude_native_launch.binds_exactly},
     "muse_cli": {"build": _muse_argv, "binds_exactly": muse_native_launch.resumes_exactly},
-    "antigravity_cli": {"build": _antigravity_argv, "binds_exactly": _antigravity_binds_exactly},
 }
 
 SUPPORTED_NATIVE_PROVIDERS = frozenset(_ARGV_BINDERS)

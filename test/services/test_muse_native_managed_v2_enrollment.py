@@ -245,7 +245,7 @@ def test_muse_is_enrolled_in_the_derived_native_tui_provider_set():
     assert set(v2._NATIVE_TUI_READINESS_RECEIPT_KINDS) == v2.NATIVE_TUI_PROVIDERS
     assert set(v2._ISSUANCE_SOURCES) == v2.NATIVE_TUI_PROVIDERS
     assert set(v2._PINNED_PROVIDER) == v2.NATIVE_TUI_PROVIDERS
-    assert v2.NATIVE_TUI_PROVIDERS <= native_tui_launch.SUPPORTED_NATIVE_PROVIDERS
+    assert v2.NATIVE_TUI_PROVIDERS == native_tui_launch.SUPPORTED_NATIVE_PROVIDERS
 
 
 def test_muse_capability_payload_is_truthful(monkeypatch):
