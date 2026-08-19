@@ -36,7 +36,6 @@ FROM python:3.12-slim
 
 # tmux >= 3.3 required by CAO (bookworm ships 3.3a). git for agent workspaces,
 # curl for healthchecks, procps for provider process detection.
-# nodejs + npm for provider CLIs (kiro-cli, claude).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tmux \
@@ -44,12 +43,20 @@ RUN apt-get update \
         curl \
         ca-certificates \
         procps \
-        nodejs \
-        npm \
     && rm -rf /var/lib/apt/lists/*
 
-# Install kiro-cli globally (provider CLI for Kiro)
-RUN npm install -g @anthropic-ai/kiro-cli && npm cache clean --force
+# No provider CLI is baked in. The previous `npm install -g
+# @anthropic-ai/kiro-cli` here made this image UNBUILDABLE: that package does
+# not exist on the public npm registry (404), so the build failed at this
+# layer and produced nothing. nodejs/npm were installed only to serve it and
+# are dropped with it.
+#
+# Ship a real provider by layering onto this image, e.g.:
+#   FROM <this-image>
+#   COPY --chmod=755 path/to/kiro-cli /usr/local/bin/kiro-cli
+# or mount the binary in (see k8s/ for a hostPath/volume example) and set the
+# profile's provider accordingly. The credentials-free mock_cli below is what
+# the k8s manifests select by default, so the fleet is testable as-is.
 
 # Never run the (unauthenticated) server as root: anyone who reaches the port
 # gets command execution as this user.
