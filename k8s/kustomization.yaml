@@ -5,6 +5,9 @@ namespace: cao-cluster
 
 resources:
   - namespace.yaml
+  # Cluster-scoped, so unaffected by the namespace above. A fresh EKS cluster
+  # ships only `gp2`, so without this the per-pod state PVCs never bind.
+  - storageclass-gp3.yaml
   - configmap-fleet.yaml
   - efs-workspace.yaml
   - service-workers-headless.yaml

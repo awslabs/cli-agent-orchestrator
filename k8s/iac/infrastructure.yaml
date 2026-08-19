@@ -13,12 +13,12 @@ AWSTemplateFormatVersion: "2010-09-09"
 #
 # WHAT IT DOES NOT DO. Two things cannot be expressed in CloudFormation because
 # they are Kubernetes objects, not AWS resources:
-#   * StorageClasses `gp3` and `efs-sc` — apply k8s/iac/storageclasses.yaml.
-#   * External Secrets Operator — install with Helm.
+#   * External Secrets Operator — install with Helm. (The StorageClasses the
+#     manifests need ship with the kustomization in ../.)
 # Both are listed in ../README.md.
 #
-# ORDER: this stack -> set the provider secret value, apply
-# storageclasses.yaml, install ESO -> the manifests in ../.
+# ORDER: this stack -> set the provider secret value, install ESO -> the
+# manifests in ../.
 #
 # Deploy (about 15 minutes, most of it the control plane):
 #   aws cloudformation deploy \
@@ -529,7 +529,13 @@ Resources:
   # absent here.
   ProviderSecret:
     Type: AWS::SecretsManager::Secret
-    DeletionPolicy: Retain
+    # Delete, not Retain. A retained secret keeps its name, so the next deploy of
+    # this stack fails with a name conflict — which makes the teardown-and-rebuild
+    # cycle a workshop depends on impossible without manual cleanup. The trade is
+    # that tearing down the stack discards the pasted API key, which is
+    # acceptable here because it is re-pasted as a setup step anyway. Switch both
+    # this and WorkspaceFileSystem to Retain for a long-lived deployment.
+    DeletionPolicy: Delete
     UpdateReplacePolicy: Retain
     Properties:
       Name: !Ref ProviderSecretName
@@ -666,12 +672,16 @@ Resources:
         - Key: Name
           Value: !Sub "${NamePrefix}-workspace-nfs"
 
-  # Holds the agents' shared checkout, so it is retained on stack deletion.
-  # NOTE: retention means deleting this stack leaves a billable file system
-  # behind. Delete it explicitly when decommissioning.
+  # Holds the agents' shared checkout.
+  #
+  # Delete, not Retain: a retained file system keeps billing after the stack is
+  # gone and has to be found and removed by hand. For a workshop that is torn
+  # down and rebuilt, leaving nothing behind is worth more than preserving the
+  # checkout — agents clone into it as a setup step. Switch to Retain if the
+  # workspace holds anything you cannot recreate.
   WorkspaceFileSystem:
     Type: AWS::EFS::FileSystem
-    DeletionPolicy: Retain
+    DeletionPolicy: Delete
     UpdateReplacePolicy: Retain
     Properties:
       Encrypted: true
