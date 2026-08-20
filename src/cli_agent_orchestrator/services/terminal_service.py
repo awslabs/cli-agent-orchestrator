@@ -80,6 +80,10 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import worktree_service
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
+from cli_agent_orchestrator.services.memory_gateway import (
+    memory_context_for_terminal,
+    remote_memory_url,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import (
@@ -137,7 +141,7 @@ def inject_memory_context(
     Tracks which terminals have already been injected so that only the very
     first user message after init receives the memory block.
 
-    Calls MemoryService.get_curated_memory_context(), which returns a formatted
+    Calls the configured memory backend, which returns a formatted
     <cao-memory>...</cao-memory> block (or empty string if no memories exist).
     Stateless — no file mutation, no backup/restore.
 
@@ -184,8 +188,16 @@ def inject_memory_context(
         return frozen_memory + "\n\n" + first_message
 
     try:
-        svc = MemoryService()
-        context = svc.get_curated_memory_context(terminal_id, task_description=first_message[:200])
+        if remote_memory_url():
+            context = memory_context_for_terminal(
+                terminal_id,
+                task_description=first_message[:200],
+            )
+        else:
+            context = MemoryService().get_curated_memory_context(
+                terminal_id,
+                task_description=first_message[:200],
+            )
         if context:
             return context + "\n\n" + first_message
     except Exception as e:

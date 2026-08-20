@@ -1,0 +1,104 @@
+# Persistent supervisor with one EBS-backed state claim.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cao-supervisor
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-supervisor
+    app.kubernetes.io/part-of: cao-elastic-fleet
+spec:
+  serviceName: cao-supervisor
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-supervisor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-supervisor
+        app.kubernetes.io/part-of: cao-elastic-fleet
+    spec:
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: cao-node
+          image: cao-server:latest
+          ports:
+            - name: http
+              containerPort: 9889
+          env:
+            - name: CAO_BIND_HOST
+              value: "0.0.0.0"
+            - name: CAO_API_PORT
+              value: "9889"
+            - name: CAO_ALLOWED_HOSTS
+              value: "cao-supervisor,cao-supervisor.cao-cluster.svc.cluster.local,localhost"
+            - name: CAO_ADVERTISED_URL
+              value: http://cao-supervisor.cao-cluster.svc.cluster.local:9889
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/state
+            - name: CAO_PROJECT_ID
+              value: cao-cluster
+            - name: CAO_INSTALL_PROFILES
+              value: code_supervisor:kiro_cli
+            - name: CAO_ELASTIC_BROKER_URL
+              value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890
+            - name: CAO_ELASTIC_BROKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-elastic-broker-token
+                  key: token
+            - name: KIRO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kiro-api-key
+                  key: KIRO_API_KEY
+          volumeMounts:
+            - name: state
+              mountPath: /home/cao/.cao
+            - name: workspace
+              mountPath: /home/cao/workspace
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 3Gi
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cao-elastic-workspace
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-supervisor
+  namespace: cao-cluster
+spec:
+  selector:
+    app.kubernetes.io/name: cao-supervisor
+  ports:
+    - name: http
+      port: 9889
+      targetPort: 9889

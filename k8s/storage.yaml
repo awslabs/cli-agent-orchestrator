@@ -1,0 +1,37 @@
+# Cluster-dedicated EFS workspace; supervisor CAO state remains on EBS.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+  labels:
+    app.kubernetes.io/part-of: cao-elastic-fleet
+provisioner: efs.csi.aws.com
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: cao-elastic-workspace
+  labels:
+    app.kubernetes.io/part-of: cao-elastic-fleet
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes: ["ReadWriteMany"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: efs-sc
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: <filesystem-id>::<access-point-id>
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cao-elastic-workspace
+  namespace: cao-cluster
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: efs-sc
+  volumeName: cao-elastic-workspace
+  resources:
+    requests:
+      storage: 100Gi

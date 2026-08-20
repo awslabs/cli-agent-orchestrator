@@ -1,9 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
-# Every AWS resource the CAO fleet demo needs, in one stack: the network, the
-# EKS cluster and its add-ons, and the CAO-specific resources (provider secret,
-# External Secrets Operator IAM role and Pod Identity association, container
-# repositories, shared EFS workspace).
+# AWS infrastructure for a CAO elastic-worker cluster: the network, EKS cluster
+# and add-ons, provider secret, External Secrets Operator IAM integration,
+# container repositories, and a cluster-dedicated EFS workspace.
 #
 # A brand-new AWS account has only a default VPC, which has no private subnets
 # and none of the tags EKS looks for, so there is nothing to build on. Keeping
@@ -13,8 +12,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 #
 # WHAT IT DOES NOT DO. Two things cannot be expressed in CloudFormation because
 # they are Kubernetes objects, not AWS resources:
-#   * External Secrets Operator — install with Helm. (The StorageClasses the
-#     manifests need ship with the kustomization in ../.)
+#   * External Secrets Operator — install with Helm. The Kubernetes
+#     StorageClasses and secret projection objects ship with ../.
 # Both are listed in ../README.md.
 #
 # ORDER: this stack -> set the provider secret value, install ESO -> the
@@ -27,13 +26,13 @@ AWSTemplateFormatVersion: "2010-09-09"
 #     --capabilities CAPABILITY_NAMED_IAM \
 #     --parameter-overrides ClusterName=cao-workshop
 #
-# COST while running: EKS control plane, two nodes, and one NAT gateway all bill
-# hourly. Delete the stack when the demo is over.
+# COST while running: the EKS control plane, nodes, NAT gateway, EFS storage and
+# backups all incur charges.
 
 Description: >-
-  CAO demo infrastructure: a two-AZ VPC, an EKS cluster with the required
-  add-ons, and the CAO provider secret, IAM, container repositories and shared
-  EFS workspace.
+  CAO elastic-worker infrastructure: a two-AZ VPC, an EKS cluster with the
+  required add-ons, and the CAO provider secret, IAM, container repositories
+  and a cluster-dedicated EFS workspace.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -75,7 +74,9 @@ Parameters:
     Type: Number
     Default: 2
     MinValue: 1
-    Description: Desired node count. Two comfortably holds a supervisor, three workers and the panel.
+    Description: >-
+      Desired baseline node count. Two nodes hold the supervisor and broker
+      while leaving capacity for elastic worker Jobs.
 
   NodeMaxSize:
     Type: Number
@@ -266,7 +267,7 @@ Resources:
           Value: !Sub "${ClusterName}-nat"
 
   # A single NAT gateway in the first AZ. Both private subnets egress through it,
-  # which is the right trade for a demo: one NAT instead of two roughly halves
+  # which is a cost-conscious baseline: one NAT instead of two roughly halves
   # the standing cost. The accepted consequence is that losing this AZ removes
   # outbound internet for the whole cluster, and that traffic from the second AZ
   # crosses an AZ boundary. For production, add a NAT per AZ and give each
@@ -335,10 +336,10 @@ Resources:
         SubnetIds:
           - !Ref PrivateSubnetA
           - !Ref PrivateSubnetB
-        # Public access is on so kubectl works from a workstation without a
-        # bastion or VPN, which a demo needs. Private access is also on so
-        # in-cluster traffic to the API server stays inside the VPC. Restrict
-        # PublicAccessCidrs for anything longer-lived than a demo.
+        # Public access allows kubectl from an authorized workstation. Private
+        # access keeps in-cluster API traffic inside the VPC. Restrict the
+        # public endpoint CIDRs or disable public access in a long-lived
+        # environment.
         EndpointPublicAccess: true
         EndpointPrivateAccess: true
       AccessConfig:
@@ -396,7 +397,7 @@ Resources:
         DesiredSize: !Ref NodeDesiredSize
         MaxSize: !Ref NodeMaxSize
       Labels:
-        role: cao-fleet
+        role: cao-elastic
 
   # ===========================================================================
   # Add-ons
@@ -479,7 +480,7 @@ Resources:
         - RoleArn: !GetAtt EbsCsiRole.Arn
           ServiceAccount: ebs-csi-controller-sa
 
-  # --- EFS CSI: shared agent workspace ----------------------------------------
+  # --- EFS CSI: cluster-dedicated agent workspace -----------------------------
 
   EfsCsiRole:
     Type: AWS::IAM::Role
@@ -529,17 +530,14 @@ Resources:
   # absent here.
   ProviderSecret:
     Type: AWS::SecretsManager::Secret
-    # Delete, not Retain. A retained secret keeps its name, so the next deploy of
-    # this stack fails with a name conflict — which makes the teardown-and-rebuild
-    # cycle a workshop depends on impossible without manual cleanup. The trade is
-    # that tearing down the stack discards the pasted API key, which is
-    # acceptable here because it is re-pasted as a setup step anyway. Switch both
-    # this and WorkspaceFileSystem to Retain for a long-lived deployment.
-    DeletionPolicy: Delete
+    # Keep credentials when the infrastructure stack is deleted accidentally.
+    # A retained named secret must be imported, renamed, or deleted manually
+    # before recreating a stack with the same ProviderSecretName.
+    DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
       Name: !Ref ProviderSecretName
-      Description: !Sub "Provider API key consumed by the ${NamePrefix} fleet via External Secrets Operator"
+      Description: !Sub "Provider API key consumed by ${NamePrefix} via External Secrets Operator"
       # No KmsKeyId: encrypted with the AWS-managed key. To use a
       # customer-managed key, set it here and add kms:Decrypt on that key to the
       # policy below, or the role cannot read the secret.
@@ -605,10 +603,8 @@ Resources:
       ServiceAccount: !Ref ExternalSecretsServiceAccount
       RoleArn: !GetAtt ExternalSecretsRole.Arn
 
-  # IMMUTABLE tags are deliberate. A mutable tag previously let a cluster run a
-  # build that predated cross-node placement while the manifests advertised it,
-  # with nothing to indicate the mismatch. Immutability makes that impossible: a
-  # tag always means one image.
+  # Both runtime images use immutable tags so the supervisor, broker and
+  # disposable workers cannot silently run different builds under one tag.
   ServerRepository:
     Type: AWS::ECR::Repository
     Properties:
@@ -634,15 +630,30 @@ Resources:
             ]
           }
 
-  # MUTABLE only because the panel deployment still references `latest`. Switch to
-  # IMMUTABLE once the panel is built with versioned tags.
-  PanelRepository:
+  WorkerBrokerRepository:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: !Sub "${NamePrefix}-fleet-panel"
-      ImageTagMutability: MUTABLE
+      RepositoryName: !Sub "${NamePrefix}-worker-broker"
+      ImageTagMutability: IMMUTABLE
       ImageScanningConfiguration:
         ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
 
   # Only the cluster's own nodes may mount the workspace. Being in the same stack
   # as the cluster, this can reference the security group EKS created rather than
@@ -650,7 +661,7 @@ Resources:
   WorkspaceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub "NFS access to the ${NamePrefix} shared workspace"
+      GroupDescription: !Sub "NFS access to the ${NamePrefix} dedicated workspace"
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         - Description: NFS from cluster nodes
@@ -672,16 +683,15 @@ Resources:
         - Key: Name
           Value: !Sub "${NamePrefix}-workspace-nfs"
 
-  # Holds the agents' shared checkout.
+  # Holds the CAO cluster's workspace. The file system and access point are
+  # dedicated to this stack; only CAO nodes mount them.
   #
-  # Delete, not Retain: a retained file system keeps billing after the stack is
-  # gone and has to be found and removed by hand. For a workshop that is torn
-  # down and rebuilt, leaving nothing behind is worth more than preserving the
-  # checkout — agents clone into it as a setup step. Switch to Retain if the
-  # workspace holds anything you cannot recreate.
+  # Retain protects agent work if the stack is deleted accidentally. The
+  # retained file system continues to incur storage and backup charges and must
+  # be deleted explicitly when its data is no longer required.
   WorkspaceFileSystem:
     Type: AWS::EFS::FileSystem
-    DeletionPolicy: Delete
+    DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
       Encrypted: true
@@ -693,8 +703,8 @@ Resources:
         - Key: Name
           Value: !Sub "${NamePrefix}-workspace"
 
-  # The access point is what makes the shared volume usable without root: it pins
-  # every NFS client to uid/gid 1000, the `cao` user in the container image. A
+  # The access point makes the cluster-dedicated volume usable without root: it
+  # pins every NFS client to uid/gid 1000, the `cao` user in the container. A
   # mismatch here surfaces as permission errors under /home/cao/workspace.
   #
   # CreationInfo must be present and must specify all three properties. Without
@@ -746,7 +756,7 @@ Outputs:
   ProviderSecretName:
     Description: >-
       Set this secret's value before deploying the manifests, and use it as the
-      remoteRef key in ../external-secrets.example.yaml.
+      remoteRef key in ../external-secret.yaml.
     Value: !Ref ProviderSecretName
 
   ExternalSecretsRoleArn:
@@ -754,16 +764,16 @@ Outputs:
     Value: !GetAtt ExternalSecretsRole.Arn
 
   WorkspaceVolumeHandle:
-    Description: Paste into spec.csi.volumeHandle in ../efs-workspace.yaml.
+    Description: Paste into spec.csi.volumeHandle in ../storage.yaml.
     Value: !Sub "${WorkspaceFileSystem}::${WorkspaceAccessPoint}"
 
   ServerRepositoryUri:
     Description: Push the CAO server image here, and use it in ../kustomization.yaml.
     Value: !GetAtt ServerRepository.RepositoryUri
 
-  PanelRepositoryUri:
-    Description: Fleet panel image repository.
-    Value: !GetAtt PanelRepository.RepositoryUri
+  WorkerBrokerRepositoryUri:
+    Description: Push the elastic worker broker image here.
+    Value: !GetAtt WorkerBrokerRepository.RepositoryUri
 
   VpcId:
     Description: VPC holding the cluster.
