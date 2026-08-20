@@ -80,8 +80,22 @@ done
 
 # The image tag lives in kustomization.yaml's `images:` block, which overrides
 # the tag written in each pod spec — so setting it here is enough.
-LC_ALL=C sed -i.bak -E "s|^(\s*)newTag:.*|\1newTag: $TAG|" "$RENDER/kustomization.yaml"
+#
+# `[[:space:]]` rather than `\s`: `\s` is a GNU extension that BSD sed matches
+# as a literal `s`, so on macOS this substitution silently did nothing and the
+# manifests kept whatever tag was checked in. The failure surfaced ten minutes
+# later as an ImagePullBackOff on a tag that never existed in the registry.
+LC_ALL=C sed -i.bak -E "s|^([[:space:]]*)newTag:.*|\1newTag: $TAG|" "$RENDER/kustomization.yaml"
 rm -f "$RENDER/kustomization.yaml.bak"
+
+# A no-op substitution must not be survivable. Anything that stops the line
+# above from matching - a renamed field, another sed dialect - would otherwise
+# deploy the checked-in tag while this script reported the requested one.
+RENDERED_TAG="$(grep -E '^[[:space:]]*newTag:' "$RENDER/kustomization.yaml" | awk '{print $2}')"
+[ "$RENDERED_TAG" = "$TAG" ] || {
+  echo "error: asked for tag '$TAG' but the manifests render '$RENDERED_TAG'" >&2
+  exit 1
+}
 
 # Any placeholder left over is a manifest this script has not been taught about.
 if grep -rn '<[a-z-]*-id>\|<region>' "$RENDER" --include='*.yaml'; then

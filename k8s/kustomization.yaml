@@ -30,4 +30,4 @@ images:
     # Example tag. Built from docker/Dockerfile, which now installs Claude Code
     # from public npm — there is no second provider layer to add, because
     # nothing has to be vendored from an authenticated local install.
-    newTag: 2.4.1-cc2
+    newTag: 2.4.1-cc3
