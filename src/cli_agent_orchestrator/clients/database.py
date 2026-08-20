@@ -271,6 +271,31 @@ class FlowModel(Base):
     enabled = Column(Boolean, default=True)
 
 
+class IdempotencyKeyModel(Base):
+    """Maps a caller-supplied idempotency key to the terminal it created.
+
+    Review on PR #634, issue #616: a caller that retries the same logical
+    create-terminal request (e.g. ``cao agent handoff`` killed after the
+    server committed a terminal but before the HTTP response reached the
+    client) supplies the SAME key on retry. ``create_terminal`` looks it up
+    BEFORE doing any real work (tmux window, provider process) and returns
+    the terminal that key already produced instead of creating a second one.
+
+    ``key`` is the primary key (not just unique) specifically so a second
+    ``INSERT`` for an already-claimed key raises ``IntegrityError`` at
+    ``commit()`` time rather than silently overwriting the first mapping --
+    the row is written once, by whichever caller's transaction commits
+    first (see ``create_terminal``'s own docs for what happens to the loser
+    of that rare race).
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    key = Column(String, primary_key=True)
+    terminal_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -1038,8 +1063,27 @@ def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create terminal metadata record."""
+    """Create terminal metadata record.
+
+    ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
+    session as the terminal row -- one ``commit()``, so SQLite's single-writer
+    transaction covers both inserts atomically (review on PR #634, issue
+    #616). This is what lets a retry with the same key find the terminal even
+    if the ORIGINAL caller never saw the HTTP response: the mapping is
+    durably committed server-side before any response is sent, regardless of
+    what happens to that response afterward.
+
+    ``key`` is this table's primary key, so a genuine collision (a second,
+    concurrent caller committing a DIFFERENT terminal for the SAME key before
+    either saw the other's mapping -- the narrow race this single-transaction
+    design does not fully close, only the sequential-retry gap it targets)
+    raises ``IntegrityError`` and rolls back BOTH inserts together; neither
+    row is left half-committed. The caller (``terminal_service.create_terminal``)
+    is responsible for translating that into cleanup of whatever tmux/provider
+    resources it had already allocated before this call.
+    """
     import json as _json
 
     with SessionLocal() as db:
@@ -1058,6 +1102,8 @@ def create_terminal(
             metadata_json=_json.dumps(metadata) if metadata else None,
         )
         db.add(terminal)
+        if idempotency_key:
+            db.add(IdempotencyKeyModel(key=idempotency_key, terminal_id=terminal_id))
         db.commit()
         return {
             "id": terminal.id,
@@ -1079,6 +1125,53 @@ def create_terminal(
             "group": group if group else None,
             "metadata": metadata if metadata else None,
         }
+
+
+def get_terminal_id_by_idempotency_key(key: str) -> Optional[str]:
+    """Return the terminal a prior ``create_terminal`` call already produced
+    for ``key``, or ``None`` if this key has never been used.
+
+    Review on PR #634, issue #616. A plain read, no locking: the caller
+    (``terminal_service.create_terminal``) uses this to decide whether to do
+    any real work at all, before generating a terminal id or touching tmux.
+    """
+    with SessionLocal() as db:
+        row = db.query(IdempotencyKeyModel).filter(IdempotencyKeyModel.key == key).first()
+        return cast(Optional[str], row.terminal_id) if row else None
+
+
+def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
+    """Delete an idempotency-key mapping, but only if it still points to
+    ``expected_terminal_id``.
+
+    Review on PR #634, issue #616 (S-001): ``create_terminal``'s fallthrough
+    for a mapping whose terminal no longer exists must clear this row FIRST.
+    ``delete_terminal`` does not cascade to ``idempotency_keys``, so leaving
+    a stale row in place would make the replacement terminal's own
+    idempotency insert collide on the same primary key and raise
+    ``IntegrityError``.
+
+    The ``expected_terminal_id`` guard is a compare-and-delete: if a
+    concurrent caller already replaced this mapping (it now points to
+    SOME OTHER terminal), this deletes nothing and this caller's own
+    create falls through to the normal atomic insert below, which then
+    correctly raises ``IntegrityError`` for the loser -- the same
+    already-accepted race behavior as two concurrent callers sharing a
+    brand-new key. Without this guard, an unconditional delete-by-key
+    could silently erase a concurrent winner's fresh, valid mapping
+    instead.
+    """
+    with SessionLocal() as db:
+        deleted = (
+            db.query(IdempotencyKeyModel)
+            .filter(
+                IdempotencyKeyModel.key == key,
+                IdempotencyKeyModel.terminal_id == expected_terminal_id,
+            )
+            .delete()
+        )
+        db.commit()
+        return deleted > 0
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:

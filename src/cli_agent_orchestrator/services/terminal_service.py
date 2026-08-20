@@ -32,9 +32,13 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import (
+    delete_idempotency_key,
+)
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_session,
+    get_terminal_id_by_idempotency_key,
     get_terminal_metadata,
     list_siblings_by_group_prefix,
     update_last_active,
@@ -204,10 +208,13 @@ async def create_terminal(
     use_worktree: bool = False,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
     This function orchestrates the complete terminal creation workflow:
+    0. If ``idempotency_key`` maps to a terminal from a prior call, return
+       IT instead -- no tmux window, no provider process, no new DB row
     1. Generate unique terminal ID and window name
     2. Create tmux session/window (new or existing)
     3. Save terminal metadata to database
@@ -253,6 +260,17 @@ async def create_terminal(
         metadata: Free-form JSON describing what this terminal is doing.
             Also updatable later by the running agent via the
             ``update_metadata`` MCP tool.
+        idempotency_key: Review on PR #634, issue #616. When given and a
+            PRIOR call already created a terminal for this exact key, that
+            terminal is returned as-is and nothing else in this function
+            runs -- no tmux window, no provider process, no new DB row. This
+            is what makes a retry after a lost response safe: the caller
+            that never saw the first response (e.g. a killed CLI process)
+            can call again with the SAME key and land on the terminal the
+            first, already-committed attempt produced, instead of creating a
+            second worker. Persisted atomically with the terminal row (see
+            ``database.create_terminal``); ``None`` (default) is the
+            existing, unprotected behavior every current caller keeps.
 
     Returns:
         Terminal object with all metadata populated
@@ -261,6 +279,36 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    if idempotency_key:
+        existing_terminal_id = get_terminal_id_by_idempotency_key(idempotency_key)
+        if existing_terminal_id is not None:
+            try:
+                return Terminal(**get_terminal(existing_terminal_id))
+            except ValueError:
+                # The key's mapping outlived the terminal it pointed to (e.g.
+                # a completed-and-torn-down handoff, retried long after the
+                # fact) -- there is nothing left to recover, so fall through
+                # and create fresh rather than raising on an operator who
+                # simply reused a key from a job that already finished.
+                #
+                # The stale row must be deleted FIRST (review S-001, PR #634):
+                # deleting a terminal does not cascade to idempotency_keys, so
+                # leaving this row in place would make the replacement
+                # terminal's own idempotency insert below collide on the same
+                # primary key and raise IntegrityError -- turning a graceful
+                # fallthrough into a guaranteed 500 on every such retry. The
+                # expected_terminal_id guard makes this a compare-and-delete:
+                # if a concurrent caller already replaced the mapping, this
+                # deletes nothing and this attempt's own insert below is the
+                # one that raises IntegrityError instead.
+                delete_idempotency_key(idempotency_key, existing_terminal_id)
+                logger.info(
+                    "idempotency_key %r maps to terminal %r, which no longer exists; "
+                    "creating a new terminal",
+                    idempotency_key,
+                    existing_terminal_id,
+                )
+
     terminal_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
@@ -453,6 +501,7 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             working_directory=resolved_working_directory,
+            idempotency_key=idempotency_key,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
