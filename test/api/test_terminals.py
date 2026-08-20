@@ -1,5 +1,6 @@
 """Tests for terminal-related API endpoints including working directory and exit."""
 
+from datetime import datetime
 from typing import Dict
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -12,6 +13,7 @@ from cli_agent_orchestrator.constants import (
     TERMINAL_GROUP_MAX_ELEMENTS,
     TERMINAL_METADATA_MAX_BYTES,
 )
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import Terminal
 
 
@@ -598,6 +600,107 @@ class TestCreateInboxMessageEndpoint:
             )
             mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
 
+    def test_create_inbox_message_deferred_skips_provider_delivery(self, client):
+        mock_msg = MagicMock()
+        mock_msg.id = 9
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+        with (
+            patch("cli_agent_orchestrator.api.main.create_inbox_message", return_value=mock_msg),
+            patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={
+                    "sender_id": "sender1",
+                    "message": "callback",
+                    "defer_delivery": "true",
+                },
+            )
+        assert response.status_code == 200
+        mock_inbox.deliver_pending.assert_not_called()
+
+    def test_claim_inbox_message_success(self, client):
+        claimed = InboxMessage(
+            id=9,
+            sender_id="bbbb2222",
+            receiver_id="abcd1234",
+            message="callback",
+            status=MessageStatus.DELIVERED,
+            created_at=datetime(2026, 3, 13, 12, 0, 0),
+        )
+        with patch(
+            "cli_agent_orchestrator.api.main.claim_inbox_message", return_value=claimed
+        ) as claim:
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages/9/claim",
+                params={"sender_id": "bbbb2222"},
+            )
+        assert response.status_code == 200
+        assert response.json()["message"] == "callback"
+        claim.assert_called_once_with("abcd1234", 9, sender_id="bbbb2222")
+
+    def test_claim_inbox_message_conflict_when_not_pending(self, client):
+        with patch("cli_agent_orchestrator.api.main.claim_inbox_message", return_value=None):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages/9/claim",
+                params={"sender_id": "bbbb2222"},
+            )
+        assert response.status_code == 409
+
+    def test_managed_persistent_message_strips_legacy_runtime_suffix_server_side(self, client):
+        mock_msg = MagicMock()
+        mock_msg.id = 7
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+        request_id = "a" * 32
+        managed = (
+            f"[Managed persistent request request_id={request_id}] task"
+            "\n\n[Message from terminal deadbeef. "
+            "Use send_message MCP tool for any follow-up work.]"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message", return_value=mock_msg
+            ) as create,
+            patch("cli_agent_orchestrator.api.main.inbox_service"),
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": managed},
+            )
+        assert response.status_code == 200
+        create.assert_called_once_with(
+            "sender1",
+            "abcd1234",
+            f"[Managed persistent request request_id={request_id}] task",
+        )
+
+    def test_ordinary_message_keeps_legacy_runtime_suffix(self, client):
+        mock_msg = MagicMock()
+        mock_msg.id = 8
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+        ordinary = (
+            "ordinary task\n\n[Message from terminal deadbeef. "
+            "Use send_message MCP tool for any follow-up work.]"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message", return_value=mock_msg
+            ) as create,
+            patch("cli_agent_orchestrator.api.main.inbox_service"),
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": ordinary},
+            )
+        assert response.status_code == 200
+        create.assert_called_once_with("sender1", "abcd1234", ordinary)
+
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
         mock_msg = MagicMock()
@@ -645,6 +748,30 @@ class TestCreateInboxMessageEndpoint:
 
             assert response.status_code == 500
             assert "Failed to create inbox message" in response.json()["detail"]
+
+    def test_get_managed_request_success(self, client):
+        request_id = "a" * 32
+        row = InboxMessage(
+            id=17,
+            sender_id="sender-1",
+            receiver_id="abcd1234",
+            message=f"[Managed persistent request request_id={request_id}] task",
+            status=MessageStatus.DELIVERED,
+            created_at=datetime(2026, 3, 13, 12, 0, 0),
+        )
+        with patch(
+            "cli_agent_orchestrator.api.main.find_inbox_message_by_marker", return_value=row
+        ) as find:
+            response = client.get(f"/terminals/abcd1234/inbox/managed-request/{request_id}")
+        assert response.status_code == 200
+        assert response.json()["sender_id"] == "sender-1"
+        find.assert_called_once_with(
+            "abcd1234", f"[Managed persistent request request_id={request_id}]"
+        )
+
+    def test_get_managed_request_rejects_bad_id(self, client):
+        response = client.get("/terminals/abcd1234/inbox/managed-request/not-valid")
+        assert response.status_code == 400
 
 
 class TestWebSocketLocalhostRestriction:

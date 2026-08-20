@@ -584,6 +584,36 @@ class StatusMonitor:
 
         with self._lock:
             cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            # A tmux-backed terminal can outlive cao-server. After a server restart
+            # the in-memory StatusMonitor cache and FIFO rolling buffer are empty,
+            # even though the persisted terminal and its live pane are healthy.
+            # InboxService gates delivery on this status, so returning UNKNOWN
+            # forever strands every durable inbox message until the pane happens
+            # to emit fresh output. Rehydrate UNKNOWN from the live tmux history
+            # on demand. Provider status detection is deliberately used here so
+            # the same CLI-specific readiness rules apply as the normal stream.
+            if cached == TerminalStatus.UNKNOWN:
+                try:
+                    provider = provider_manager.get_provider(terminal_id)
+                    history = (
+                        get_backend().get_history(provider.session_name, provider.window_name)
+                        if provider is not None
+                        else ""
+                    )
+                    fresh = (
+                        provider.get_status(history)
+                        if provider is not None and history
+                        else TerminalStatus.UNKNOWN
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"Unable to rehydrate status for restored terminal {terminal_id}: {e}"
+                    )
+                    fresh = TerminalStatus.UNKNOWN
+                if fresh != TerminalStatus.UNKNOWN:
+                    self._apply_detection(terminal_id, fresh)
+                    return fresh
+
             # When cached status is PROCESSING, the debounced detection may be
             # stuck: TUI providers (kiro-cli) can send escape sequences
             # continuously after becoming idle, preventing the 200ms quiescence

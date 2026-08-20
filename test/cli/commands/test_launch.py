@@ -427,6 +427,37 @@ def test_launch_workspace_confirmation_skipped_with_yolo_flag():
         mock_post.assert_called_once()
 
 
+def test_profile_yolo_skips_confirmation_and_sends_unrestricted_policy():
+    """Profile `yolo: true` behaves like CLI --yolo without another flag."""
+    runner = CliRunner()
+    profile = MagicMock()
+    profile.yolo = True
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile", return_value=profile),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
+            return_value="codex",
+        ),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "chatgpt-worker", "--headless"])
+
+        assert result.exit_code == 0
+        assert "Proceed?" not in result.output
+        assert "WARNING" in result.output
+        params = mock_post.call_args.kwargs["params"]
+        assert params["allowed_tools"] == "*"
+
+
 def test_launch_workspace_confirmation_for_default_provider():
     """Test that default provider (kiro_cli) also triggers workspace confirmation."""
     runner = CliRunner()

@@ -43,7 +43,9 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
+    claim_inbox_message,
     create_inbox_message,
+    find_inbox_message_by_marker,
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
@@ -248,6 +250,7 @@ class CreateTerminalBody(BaseModel):
 
     initial_message: Optional[str] = None
     initial_message_orchestration_type: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 def _check_group_size(group: Optional[List[str]]) -> Optional[List[str]]:
@@ -2633,6 +2636,7 @@ async def create_terminal_in_session(
     engine: Optional[KiroEngine] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
+    managed_callback: bool = False,
     model: Optional[str] = None,
     use_worktree: bool = False,
     body: Optional[CreateTerminalBody] = None,
@@ -2683,6 +2687,7 @@ async def create_terminal_in_session(
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
         initial_message = body.initial_message if body else None
+        metadata = _check_metadata_size(body.metadata if body else None)
 
         # The initial-message payload is only delivered on the deferred-init
         # path; create_terminal() ignores it otherwise. Reject it explicitly
@@ -2727,6 +2732,23 @@ async def create_terminal_in_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
+            env_vars=(
+                {
+                    "CAO_MANAGED_CALLBACK": "true",
+                    "CAO_MANAGED_CALLBACK_MODE": (
+                        str(metadata.get("managed_callback_mode") or "wait")
+                        if isinstance(metadata, dict)
+                        else "wait"
+                    ),
+                    "CAO_MANAGED_ASSIGNMENT_ID": (
+                        str(metadata.get("managed_assignment_id") or "")
+                        if isinstance(metadata, dict)
+                        else ""
+                    ),
+                }
+                if managed_callback
+                else None
+            ),
             caller_id=caller_id,
             defer_init=defer_init,
             initial_message=initial_message,
@@ -2734,6 +2756,7 @@ async def create_terminal_in_session(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            metadata=metadata,
         )
         return result
     except HTTPException:
@@ -5520,12 +5543,36 @@ async def delete_terminal(
         )
 
 
+_LEGACY_RUNTIME_ADDRESS_SUFFIX = re.compile(
+    r"\n\n\[Message from terminal [^]\n]+\. "
+    r"Use send_message MCP tool for any follow-up work\.\]\s*$"
+)
+_MANAGED_PERSISTENT_MESSAGE_PREFIXES = (
+    "[Managed persistent request request_id=",
+    "[Persistent department result request_id=",
+)
+
+
+def _sanitize_managed_persistent_message(message: str) -> str:
+    """Strip legacy model-visible runtime addresses from managed semantic messages.
+
+    The sender/receiver runtime IDs remain in structured inbox columns for routing
+    and audit. They must never be duplicated into model-visible managed persistent
+    message text. Enforcing this at the API boundary protects even an already-running
+    older MCP client until it restarts onto the client-side suppression code.
+    """
+    if not message.startswith(_MANAGED_PERSISTENT_MESSAGE_PREFIXES):
+        return message
+    return _LEGACY_RUNTIME_ADDRESS_SUFFIX.sub("", message)
+
+
 @app.post("/terminals/{receiver_id}/inbox/messages")
 async def create_inbox_message_endpoint(
     request: Request,
     receiver_id: TerminalId,
     sender_id: str,
     message: str,
+    defer_delivery: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
@@ -5533,7 +5580,7 @@ async def create_inbox_message_endpoint(
         inbox_msg = create_inbox_message(
             sender_id,
             receiver_id,
-            message,
+            _sanitize_managed_persistent_message(message),
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -5543,12 +5590,15 @@ async def create_inbox_message_endpoint(
             detail=f"Failed to create inbox message: {str(e)}",
         )
 
-    # Attempt immediate delivery if terminal is already IDLE.
-    # If not, InboxService will deliver on next IDLE status event.
-    try:
-        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
-    except Exception as e:
-        logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
+    # Managed callback waits intentionally keep the row PENDING so the waiting
+    # MCP call can atomically claim it as a tool result instead of injecting a
+    # duplicate user turn into the supervisor TUI. If the waiter dies, the
+    # normal reconcile sweep adopts the still-pending row after its grace window.
+    if not defer_delivery:
+        try:
+            inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+        except Exception as e:
+            logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 
     return {
         "success": True,
@@ -5556,6 +5606,49 @@ async def create_inbox_message_endpoint(
         "sender_id": inbox_msg.sender_id,
         "receiver_id": inbox_msg.receiver_id,
         "created_at": inbox_msg.created_at.isoformat(),
+    }
+
+
+@app.post("/terminals/{terminal_id}/inbox/messages/{message_id}/claim")
+async def claim_inbox_message_endpoint(
+    terminal_id: TerminalId,
+    message_id: int,
+    sender_id: Optional[TerminalId] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Claim a pending callback without injecting it into the terminal TUI."""
+    claimed = claim_inbox_message(terminal_id, message_id, sender_id=sender_id)
+    if claimed is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Inbox message is not pending or does not match the receiver/sender",
+        )
+    return {
+        "success": True,
+        "message_id": claimed.id,
+        "message": claimed.message,
+        "status": claimed.status.value,
+        "created_at": claimed.created_at.isoformat() if claimed.created_at else None,
+    }
+
+
+@app.get("/terminals/{terminal_id}/inbox/managed-request/{request_id}")
+async def get_managed_request_endpoint(
+    terminal_id: TerminalId,
+    request_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict:
+    """Resolve one durable managed request to its original sender internally."""
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        raise HTTPException(status_code=400, detail="Invalid managed request id")
+    marker = f"[Managed persistent request request_id={request_id}]"
+    row = find_inbox_message_by_marker(terminal_id, marker)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Managed request not found")
+    return {
+        "message_id": row.id,
+        "sender_id": row.sender_id,
+        "status": row.status.value,
     }
 
 

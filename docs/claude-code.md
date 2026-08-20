@@ -119,6 +119,21 @@ Claude Code's Ink TUI buffers pasted input even while the agent is processing. C
 
 See [Inbox Delivery](inbox-delivery.md) for the full architecture, two-flag gate, and how to enable this for other providers.
 
+## Resume a Specific Claude Conversation
+
+A Claude Code profile can pin an existing Claude conversation with `claudeSessionId`. CAO passes the value to Claude Code as `--resume <session-id>` each time the terminal starts, so restarting the CAO session does not force a new Claude conversation.
+
+```markdown
+---
+name: aiva
+description: Long-lived executive assistant
+provider: claude_code
+claudeSessionId: bcff4abd-706a-4d78-97f2-7edc9361d4b7
+---
+```
+
+The CAO tmux/session identity and the Claude conversation identity remain separate. `claudeSessionId` controls only the Claude conversation being resumed.
+
 ## Native Agent Routing
 
 When a CAO profile specifies a `native_agent` field, the provider passes `--agent <name>` directly to Claude Code's native agent store (`~/.claude/agents/`). This is a thin-wrapper mode where Claude Code handles all configuration (MCP servers, hooks, tools, model).

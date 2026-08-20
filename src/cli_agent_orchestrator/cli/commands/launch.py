@@ -183,23 +183,29 @@ def launch(
 
         resolved_allowed_tools = None
         no_role_set = False
-        if yolo:
+        profile = None
+        try:
+            profile = load_agent_profile(agents)
+        except (FileNotFoundError, RuntimeError):
+            pass
+        profile_yolo = bool(profile and getattr(profile, "yolo", False) is True)
+
+        # Profile-level yolo is an explicit permission floor, so it cannot be
+        # accidentally narrowed by an inherited/CLI allowed-tools list.
+        if yolo or profile_yolo:
             resolved_allowed_tools = ["*"]
         elif allowed_tools:
             resolved_allowed_tools = list(allowed_tools)
+        elif profile is not None:
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            no_role_set = not profile.role and not profile.allowedTools
+            resolved_allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
         else:
-            # Load profile to get role-based defaults
-            try:
-                profile = load_agent_profile(agents)
-                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
-                no_role_set = not profile.role and not profile.allowedTools
-                resolved_allowed_tools = resolve_allowed_tools(
-                    profile.allowedTools, profile.role, mcp_server_names
-                )
-            except (FileNotFoundError, RuntimeError):
-                # Profile not found — use developer defaults (backward compatible)
-                no_role_set = True
-                resolved_allowed_tools = resolve_allowed_tools(None, None, None)
+            # Profile not found — use developer defaults (backward compatible).
+            no_role_set = True
+            resolved_allowed_tools = resolve_allowed_tools(None, None, None)
 
         # Honour profile.provider whenever the user did not pass --provider
         # explicitly. This runs regardless of which permission-resolution
@@ -216,6 +222,10 @@ def launch(
 
             provider = resolve_provider(agents, DEFAULT_PROVIDER)
 
+        if profile_yolo and provider != "codex":
+            raise click.ClickException("profile field 'yolo' is currently supported only for provider 'codex'")
+        effective_yolo = bool(yolo or profile_yolo)
+
         # Validate provider
         if provider not in PROVIDERS:
             raise click.ClickException(
@@ -223,7 +233,7 @@ def launch(
             )
         # Confirmation / warning prompts
         if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS:
-            if yolo:
+            if effective_yolo:
                 # --yolo: warn but don't block
                 click.echo(click.style("\n[WARNING] --yolo mode enabled", fg="yellow", bold=True))
                 click.echo(
