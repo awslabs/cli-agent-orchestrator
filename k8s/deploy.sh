@@ -26,7 +26,14 @@ out() {
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
 }
 
-REGION="$(aws configure get region)"
+# `|| true` is load-bearing. `aws configure get region` exits 1 - rather than
+# returning empty with status 0 - when no region is set in ~/.aws/config, so
+# under the `set -e` above this line aborted the whole script before either
+# fallback below could run. The script then died before its first echo, which
+# made a misconfigured box look like a command that silently did nothing:
+# no output, no namespace, no pods. Observed on a real deployment.
+REGION="$(aws configure get region || true)"
+[ -n "${AWS_DEFAULT_REGION:-}" ] && REGION="$AWS_DEFAULT_REGION"
 [ -n "${AWS_REGION:-}" ] && REGION="$AWS_REGION"
 [ -n "$REGION" ] || { echo "error: no region — set AWS_REGION" >&2; exit 1; }
 
