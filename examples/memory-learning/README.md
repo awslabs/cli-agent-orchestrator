@@ -293,23 +293,40 @@ cao-server &
 
 # 2. Session 1: store a fact as if an agent learned it mid-session.
 #    (uses the built-in `developer` profile -- nothing to install)
-cao launch --agents developer --headless --async --yolo "Use the memory_store tool to save this fact: scope=global, memory_type=feedback, key=fast-test-runs, tags=testing,pytest, content='Run tests with pytest --no-cov in this repo, it is much faster.' Then call memory_recall for that key to confirm it saved, and stop."
+cao launch --agents developer --headless --yolo "Use the memory_store tool to save this fact: scope=global, memory_type=feedback, key=fast-test-runs, tags=testing,pytest, content='Run tests with pytest --no-cov in this repo, it is much faster.' Then call memory_recall for that key to confirm it saved, and stop."
 
 # 3. Confirm it landed
 cao memory show fast-test-runs --scope global
 
-# 4. Session 2: launch a BRAND NEW session and watch your own terminal --
-#    cao launch attaches you to it unless you pass --headless, so the pasted
-#    first message (including the <cao-memory> block) is right there in the
-#    pane before the agent's response starts.
-cao launch --agents developer --session-name memory-demo-2 \
+# 4. Session 2: launch a BRAND NEW session and stay attached to watch it --
+#    cao launch only delivers a positional message in --headless mode, so
+#    the prompt is sent separately below, from a second shell.
+cao launch --agents developer --session-name memory-demo-2
+```
+
+In a **second shell**, send the prompt that triggers recall -- watch the first
+shell's pane: the `<cao-memory>` block is pasted in before the agent's response
+starts.
+
+```bash
+cao session send memory-demo-2 \
   "What's the fastest way to run the test suite locally?"
 ```
 
-The agent in step 4 never called `memory_store` -- it recalls what a *different*
-agent, in a *different* session, learned earlier. Pass `--memory` to `cao launch` in
-step 2 to additionally launch a `memory_manager` terminal and exercise the curated
-injection path instead of the deterministic fallback (see [How it works](#how-it-works)).
+That agent never called `memory_store` -- it recalls what a *different* agent, in
+a *different* session, learned earlier (the deterministic fallback path). Curated
+injection instead requires a `memory_manager` sidecar in *Session 2's* session
+(see [How it works](#how-it-works) -- a sidecar launched with Session 1 shares
+Session 1's session, not Session 2's, so it would never be found). Launch Session 2
+with `--memory` and wait for the sidecar to come up before sending:
+
+```bash
+cao launch --agents developer --session-name memory-demo-2 --memory
+# second shell -- wait until the memory_manager row shows `idle`:
+cao session status memory-demo-2 --workers
+cao session send memory-demo-2 \
+  "What's the fastest way to run the test suite locally?"
+```
 
 For Part 2 live, set `memory.learning_enabled: true` in `settings.json` (or export
 `CAO_MEMORY_LEARNING_ENABLED=true`), have a supervisor `report_outcome` a few times
