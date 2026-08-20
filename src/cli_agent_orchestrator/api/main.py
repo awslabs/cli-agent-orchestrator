@@ -5926,6 +5926,121 @@ def _get_memory_service():
     return MemoryService()
 
 
+class InternalMemoryContext(BaseModel):
+    terminal_id: Optional[str] = None
+    session_name: Optional[str] = None
+    provider: Optional[str] = None
+    agent_profile: Optional[str] = None
+    cwd: Optional[str] = None
+
+
+class InternalMemoryStoreRequest(BaseModel):
+    content: str
+    scope: MemoryScope = MemoryScope.PROJECT
+    memory_type: MemoryType = MemoryType.PROJECT
+    key: Optional[MemoryKey] = None
+    tags: str = ""
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryRecallRequest(BaseModel):
+    query: Optional[str] = None
+    scope: Optional[MemoryScope] = None
+    memory_type: Optional[MemoryType] = None
+    limit: int = Field(default=10, ge=1, le=100)
+    terminal_context: Optional[InternalMemoryContext] = None
+    search_mode: str = "hybrid"
+    sort_by: str = "recency"
+    include_related: bool = False
+
+
+class InternalMemoryForgetRequest(BaseModel):
+    key: MemoryKey
+    scope: MemoryScope = MemoryScope.PROJECT
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryInjectionRequest(BaseModel):
+    terminal_context: InternalMemoryContext
+    budget_chars: int = Field(default=3000, ge=0, le=20000)
+
+
+@app.post("/internal/memory/store")
+async def internal_memory_store(
+    body: InternalMemoryStoreRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Store memory on this node for a remote CAO worker."""
+    _require_memory_enabled()
+    memory = await _get_memory_service().store(
+        content=body.content,
+        scope=body.scope.value,
+        memory_type=body.memory_type.value,
+        key=body.key,
+        tags=body.tags,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+    )
+    return {
+        "memory": memory.model_dump(mode="json"),
+        "action": memory.action,
+    }
+
+
+@app.post("/internal/memory/recall")
+async def internal_memory_recall(
+    body: InternalMemoryRecallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Recall memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    memories = await _get_memory_service().recall(
+        query=body.query,
+        scope=body.scope.value if body.scope else None,
+        memory_type=body.memory_type.value if body.memory_type else None,
+        limit=body.limit,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+        search_mode=body.search_mode,
+        sort_by=body.sort_by,
+        include_related=body.include_related,
+    )
+    return {"memories": [memory.model_dump(mode="json") for memory in memories]}
+
+
+@app.post("/internal/memory/forget")
+async def internal_memory_forget(
+    body: InternalMemoryForgetRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Forget memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    deleted = await _get_memory_service().forget(
+        key=body.key,
+        scope=body.scope.value,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+    )
+    return {"deleted": deleted}
+
+
+@app.post("/internal/memory/context")
+async def internal_memory_context(
+    body: InternalMemoryInjectionRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, str]:
+    """Build the startup memory block for a terminal owned by another node."""
+    _require_memory_enabled()
+    context = _get_memory_service().get_memory_context(
+        body.terminal_context.model_dump(exclude_none=True),
+        budget_chars=body.budget_chars,
+    )
+    return {"context": context}
+
+
 def _require_memory_enabled() -> None:
     """Raise 404 when the memory subsystem is disabled.
 

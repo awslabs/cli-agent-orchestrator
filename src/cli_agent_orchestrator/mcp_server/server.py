@@ -1723,6 +1723,87 @@ else:
         )
 
 
+def _elastic_broker_config() -> Tuple[str, str]:
+    url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    token = os.environ.get("CAO_ELASTIC_BROKER_TOKEN", "").strip()
+    if not url or not token:
+        raise ValueError(
+            "elastic workers are not configured: set CAO_ELASTIC_BROKER_URL "
+            "and CAO_ELASTIC_BROKER_TOKEN on the supervisor"
+        )
+    return url, token
+
+
+def _release_elastic_worker(broker_url: str, broker_token: str, worker_id: str) -> bool:
+    try:
+        response = requests.delete(
+            f"{broker_url}/workers/{worker_id}",
+            headers={"X-CAO-Broker-Token": broker_token},
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+        return response.status_code < 400 or response.status_code == 404
+    except requests.RequestException as exc:
+        logger.warning("Failed to release elastic worker %s: %s", worker_id, exc)
+        return False
+
+
+@mcp.tool()
+async def assign_elastic(
+    agent_profile: str = Field(
+        description='Agent profile for the disposable worker (for example "developer")'
+    ),
+    message: str = Field(description="Task for the disposable worker"),
+    provider: str = Field(default="kiro_cli", description="Provider installed in the worker"),
+    engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
+) -> Dict[str, Any]:
+    """Provision one Kubernetes Job and assign one task to it.
+
+    The worker must call ``complete_assignment`` exactly once after producing
+    its final result. That tool durably delivers the callback before releasing
+    this worker's Job.
+    """
+    try:
+        if not _current_terminal_id():
+            raise ValueError("assign_elastic must run from inside a CAO terminal")
+        broker_url, broker_token = _elastic_broker_config()
+        response = requests.post(
+            f"{broker_url}/workers",
+            headers={"X-CAO-Broker-Token": broker_token},
+            json={"agent_profile": agent_profile, "provider": provider},
+            timeout=(REMOTE_CONNECT_TIMEOUT, 360),
+        )
+        response.raise_for_status()
+        lease = response.json()
+        worker_id = str(lease["worker_id"])
+        worker_message = (
+            message + "\n\n[Elastic worker lifecycle: when the task is fully complete, "
+            "call complete_assignment with your final result. Do not use "
+            "send_message for the final result; complete_assignment acknowledges "
+            "delivery before terminating this disposable worker.]"
+        )
+        result = _assign_impl(
+            agent_profile,
+            worker_message,
+            str(lease["working_directory"]),
+            engine=engine,
+            model=model,
+            target_host=str(lease["target_host"]),
+        )
+        result["worker_id"] = worker_id
+        result["elastic"] = True
+        if not result.get("success"):
+            result["worker_released"] = _release_elastic_worker(broker_url, broker_token, worker_id)
+        return result
+    except Exception as exc:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "elastic": True,
+            "message": f"Elastic assignment failed: {exc}",
+        }
+
+
 # Implementation function for send_message
 def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
     """Implementation of send_message logic."""
@@ -1844,6 +1925,48 @@ async def send_message(
         Dict with success status and message details
     """
     return _send_message_impl(receiver_id, message)
+
+
+@mcp.tool()
+async def complete_assignment(
+    message: str = Field(description="Final result to deliver to the assigning supervisor"),
+) -> Dict[str, Any]:
+    """Deliver an elastic worker's final result, then release its Kubernetes Job."""
+    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
+    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
+    if not worker_id or not broker_url or not release_token:
+        return {
+            "success": False,
+            "error": "complete_assignment is only available inside an elastic worker",
+        }
+
+    delivered = _send_message_impl(None, message)
+    if not delivered.get("success"):
+        return {
+            "success": False,
+            "delivered": delivered,
+            "error": "result delivery failed; worker was not released",
+        }
+    try:
+        response = requests.post(
+            f"{broker_url}/workers/{worker_id}/complete",
+            headers={"X-CAO-Release-Token": release_token},
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "delivered": delivered,
+            "error": f"result delivered but worker release failed: {exc}",
+        }
+    return {
+        "success": True,
+        "delivered": delivered,
+        "worker_id": worker_id,
+        "release_scheduled": True,
+    }
 
 
 @mcp.tool()
@@ -2324,19 +2447,29 @@ async def memory_store(
     Use this to persist facts, decisions, user preferences, and project conventions
     that should be available across agent sessions.
     """
+    from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, store_memory
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        memory = await service.store(
-            content=content,
-            scope=scope,
-            memory_type=memory_type,
-            key=key,
-            tags=tags or "",
-            terminal_context=terminal_context,
-        )
+        if remote_memory_url():
+            memory = await store_memory(
+                content=content,
+                scope=scope,
+                memory_type=memory_type,
+                key=key,
+                tags=tags or "",
+                terminal_context=terminal_context,
+            )
+        else:
+            memory = await MemoryService().store(
+                content=content,
+                scope=scope,
+                memory_type=memory_type,
+                key=key,
+                tags=tags or "",
+                terminal_context=terminal_context,
+            )
         return {
             "success": True,
             "key": memory.key,
@@ -2411,6 +2544,7 @@ async def memory_recall(
 
     Use this to check if relevant knowledge already exists before asking the user.
     """
+    from cli_agent_orchestrator.services.memory_gateway import recall_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
     from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
@@ -2423,17 +2557,23 @@ async def memory_recall(
         }
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        memories = await service.recall(
-            query=query,
-            scope=scope,
-            memory_type=memory_type,
-            limit=limit,
-            terminal_context=terminal_context,
-            search_mode=search_mode,
-            sort_by=sort_by,
-            include_related=bool(include_related) if isinstance(include_related, bool) else False,
+        kwargs = {
+            "query": query,
+            "scope": scope,
+            "memory_type": memory_type,
+            "limit": limit,
+            "terminal_context": terminal_context,
+            "search_mode": search_mode,
+            "sort_by": sort_by,
+            "include_related": (
+                bool(include_related) if isinstance(include_related, bool) else False
+            ),
+        }
+        memories = (
+            await recall_memory(**kwargs)
+            if remote_memory_url()
+            else await MemoryService().recall(**kwargs)
         )
         return {
             "success": True,
@@ -2471,15 +2611,23 @@ async def memory_forget(
 
     Deletes the wiki topic file and removes the entry from index.md.
     """
+    from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        deleted = await service.forget(
-            key=key,
-            scope=scope,
-            terminal_context=terminal_context,
+        deleted = (
+            await forget_memory(
+                key=key,
+                scope=scope,
+                terminal_context=terminal_context,
+            )
+            if remote_memory_url()
+            else await MemoryService().forget(
+                key=key,
+                scope=scope,
+                terminal_context=terminal_context,
+            )
         )
         return {
             "success": True,

@@ -1,33 +1,42 @@
+# Canonical elastic-worker deployment: one long-lived supervisor, one narrow
+# privileged broker, and worker pods that exist only for the duration of a task.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-
-namespace: cao-cluster
-
 resources:
   - namespace.yaml
-  # Cluster-scoped, so unaffected by the namespace above. A fresh EKS cluster
-  # ships only `gp2`, so without this the per-pod state PVCs never bind.
   - storageclass-gp3.yaml
-  - efs-workspace.yaml
-  - service-workers-headless.yaml
-  - statefulset-workers.yaml
-  - deployment-supervisor.yaml
+  - storage.yaml
+  - rbac.yaml
+  - broker.yaml
+  - supervisor.yaml
   - networkpolicy.yaml
 
+# There is no statefulset-workers.yaml and no service-workers-headless.yaml: a
+# worker is a Job the broker mints per task, and the broker gives each one its
+# own ClusterIP Service, so there is no fixed fleet to address by ordinal.
+#
 # No fleet panel and no external-secrets. The panel is out because the CAO
 # repository ships no Dockerfile for its image, so it cannot be built from
 # source; that also removes configmap-fleet.yaml, which existed only to tell the
 # panel which nodes to poll. External Secrets is out because Claude Code on
-# Bedrock has no API key to sync — the pods authenticate as their own Pod
-# Identity, so there is nothing to fetch from Secrets Manager.
+# Bedrock has no API key to sync - the pods authenticate as their own Pod
+# Identity, so there is nothing to fetch from Secrets Manager. The one secret
+# that does exist, the broker token, is generated locally by deploy.sh.
 
 images:
   # Pin an IMMUTABLE tag. A mutable `latest` tag once left the cluster running a
   # build that predated cross-node placement while these manifests advertised
   # it, with nothing to indicate the mismatch. Bump this deliberately when you
   # push a new image.
+  #
+  # deploy.sh rewrites EVERY `newTag:` line to the tag it is given, so both
+  # images below always move together. They are built from the same commit by
+  # the same CodeBuild run, so a split tag would only ever mean a mistake.
   - name: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-server
-    # Example tag. Built from docker/Dockerfile, which now installs Claude Code
-    # from public npm — there is no second provider layer to add, because
-    # nothing has to be vendored from an authenticated local install.
+    # Built from docker/Dockerfile, which installs Claude Code from public npm
+    # and carries the entrypoint that runs `cao init`, installs the profiles
+    # named in CAO_INSTALL_PROFILES, and execs cao-server.
+    newTag: 2.4.1-cc3
+  - name: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-worker-broker
+    # Built from docker/Dockerfile.broker.
     newTag: 2.4.1-cc3
