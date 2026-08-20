@@ -36,10 +36,10 @@ images:
     # Built from docker/Dockerfile, which installs Claude Code from public npm
     # and carries the entrypoint that runs `cao init`, installs the profiles
     # named in CAO_INSTALL_PROFILES, and execs cao-server.
-    newTag: 2.4.1-cc3
+    newTag: 2.4.1-el1
   - name: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-worker-broker
     # Built from docker/Dockerfile.broker.
-    newTag: 2.4.1-cc3
+    newTag: 2.4.1-el1
 
 # The `images:` block above rewrites container `image:` fields. It does NOT
 # rewrite an image name that happens to sit in an env var - and the broker takes
