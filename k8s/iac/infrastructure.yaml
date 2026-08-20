@@ -134,8 +134,12 @@ Parameters:
 
   WorkerServiceAccount:
     Type: String
-    Default: cao-worker
-    Description: Service account of the worker pods.
+    Default: cao-elastic-worker
+    Description: >-
+      Service account of the worker pods. Must match
+      CAO_ELASTIC_WORKER_SERVICE_ACCOUNT on the broker, which is what actually
+      stamps this name onto each Job it mints. A mismatch is not a deploy error:
+      the worker starts, becomes Ready, and then fails its first model call.
 
   ClusterAdminPrincipalArn:
     Type: String
@@ -699,6 +703,42 @@ Resources:
             ]
           }
 
+  # The broker image, from docker/Dockerfile.broker. A separate repository rather
+  # than a second tag in the one above, because the two images share nothing: the
+  # server image is a ~310 MiB arm64 build carrying a provider CLI, the broker is
+  # python:3.12-slim plus one file. Same tag in both, always, since one CodeBuild
+  # run builds both from one commit.
+  BrokerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-worker-broker"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # No Pod Identity association for the broker's service account, deliberately.
+  # It is the only pod that can reach the Kubernetes API and the only one with no
+  # AWS credentials at all — it forwards the region and the model pins into the
+  # Jobs it mints and never calls a model itself. Adding an association here would
+  # hand pod-creation and Bedrock invoke to the same identity for no reason.
+
   # No panel repository. The fleet panel is not part of this deployment: the CAO
   # repository ships no Dockerfile for it, so the image cannot be built from
   # source here.
@@ -816,16 +856,28 @@ Outputs:
     Value: !GetAtt AgentBedrockRole.Arn
 
   WorkspaceVolumeHandle:
-    Description: Paste into spec.csi.volumeHandle in ../efs-workspace.yaml.
+    Description: Rendered into spec.csi.volumeHandle in ../storage.yaml by ../deploy.sh.
     Value: !Sub "${WorkspaceFileSystem}::${WorkspaceAccessPoint}"
 
   ServerRepositoryUri:
     Description: Push the CAO server image here, and use it in ../kustomization.yaml.
     Value: !GetAtt ServerRepository.RepositoryUri
 
+  BrokerRepositoryUri:
+    Description: Push the worker-broker image here. ../deploy.sh reads this.
+    Value: !GetAtt BrokerRepository.RepositoryUri
+
   VpcId:
     Description: VPC holding the cluster.
     Value: !Ref Vpc
+
+  VpcCidrBlock:
+    Description: >-
+      Rendered into the broker's egress NetworkPolicy by ../deploy.sh. The broker
+      needs to reach the Kubernetes API server, whose control plane ENIs sit in
+      this range — and the agent pods' egress policy blocks it, so the broker gets
+      an explicit allow instead of a copy of their rules.
+    Value: !Ref VpcCidr
 
   PrivateSubnetIds:
     Description: Private subnets holding the nodes, pods and EFS mount targets.

@@ -40,3 +40,25 @@ images:
   - name: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-worker-broker
     # Built from docker/Dockerfile.broker.
     newTag: 2.4.1-cc3
+
+# The `images:` block above rewrites container `image:` fields. It does NOT
+# rewrite an image name that happens to sit in an env var - and the broker takes
+# the image for the workers it mints in exactly that form. Left alone, the
+# supervisor would move to a new tag while the broker kept minting workers on the
+# old one, with nothing in `kubectl get pods` to show it.
+#
+# So the value is not written anywhere by hand: this copies the supervisor's
+# already-rewritten image into the broker's env. `replacements` is evaluated
+# after `images`, so what lands in the env carries the final tag (verified with
+# kustomize 5.7.1, `kubectl kustomize`).
+replacements:
+  - source:
+      kind: StatefulSet
+      name: cao-supervisor
+      fieldPath: spec.template.spec.containers.[name=cao-node].image
+    targets:
+      - select:
+          kind: Deployment
+          name: cao-worker-broker
+        fieldPaths:
+          - spec.template.spec.containers.[name=broker].env.[name=CAO_ELASTIC_WORKER_IMAGE].value

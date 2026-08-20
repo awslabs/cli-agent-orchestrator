@@ -2,6 +2,12 @@
 # Only the supervisor can reach workers.
 # This is critical: cao-server is an unauthenticated command-execution surface;
 # NetworkPolicy is the minimum trust boundary in k8s.
+#
+# These select `app.kubernetes.io/name: cao-elastic-worker`, the label broker.py
+# stamps on every Job it mints — so a worker that exists for 40 seconds is
+# covered from the moment it starts, with nothing to apply per task. The
+# kubelet's readiness probe to 9889 is not affected by an ingress policy;
+# verified on this cluster, where probes succeed under exactly these rules.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -12,7 +18,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: cao-worker
+      app.kubernetes.io/name: cao-elastic-worker
   policyTypes:
     - Ingress
   ingress:
@@ -24,6 +30,92 @@ spec:
               app.kubernetes.io/name: cao-supervisor
       ports:
         - port: 9889
+          protocol: TCP
+---
+# NetworkPolicy — ingress to the broker's lease API.
+#
+# Two callers, and both are needed for a lease to complete its cycle:
+#   supervisor      POST /workers        to take a lease (assign_elastic)
+#   elastic worker  POST /workers/{id}/complete  to give it back
+#
+# Leaving the worker out is a tempting simplification and a bad one: the worker's
+# release call would be dropped, the reaper would eventually mark the lease
+# `expired`, and every delegation would look like it timed out 900s after a task
+# that actually finished in 40s.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-broker-ingress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-worker-broker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-supervisor
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-elastic-worker
+      ports:
+        - port: 9890
+          protocol: TCP
+---
+# NetworkPolicy — egress FROM the broker.
+#
+# Deliberately NOT a copy of the agent egress rules. The broker runs no agent and
+# holds no credentials, so it needs neither vendor HTTPS nor the Pod Identity
+# endpoint — it needs DNS and the Kubernetes API server, and nothing else. That
+# makes it the most tightly bounded pod in the namespace despite being the only
+# one that can create another pod.
+#
+# The API server rule is the subtle part. Copying the agents' `0.0.0.0/0` +
+# private-range-`except` rule onto the broker BLOCKS it: `kubernetes.default`
+# resolves to 172.20.0.1, inside the 172.16.0.0/12 carve-out, and the control
+# plane ENIs the traffic actually lands on are inside the VPC CIDR carve-out. The
+# broker's own /health does not touch the API server, so it would come up Ready
+# and then fail every single lease request — a healthy pod that cannot do its
+# job. Hence an explicit allow, rendered from the stack's VpcCidrBlock output.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-broker-egress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-worker-broker
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Kubernetes API server: Job and Service create/delete, pod status polling.
+    # The service ClusterIP and the in-VPC control plane ENIs are both reached
+    # through this rule.
+    - to:
+        - ipBlock:
+            cidr: <vpc-cidr>
+        - ipBlock:
+            cidr: 172.20.0.0/16
+      ports:
+        - port: 443
           protocol: TCP
 ---
 # NetworkPolicy — restrict egress FROM worker pods. A worker agent has command
@@ -51,7 +143,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: cao-worker
+      app.kubernetes.io/name: cao-elastic-worker
   policyTypes:
     - Egress
   egress:
@@ -133,6 +225,10 @@ spec:
 # NetworkPolicy — restrict access to supervisor pod.
 # Only worker pods may reach it, for cross-pod send_message callbacks to
 # supervisor:9889 — required for the one-agent-per-pod assign flow.
+#
+# The broker is deliberately NOT allowed in. It receives the supervisor's URL as
+# a string to forward (CAO_MEMORY_API_URL) and never dials it itself, so the pod
+# that can create pods has no path to the pod holding the conversation.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -152,7 +248,7 @@ spec:
         # (POST /terminals/{id}/inbox/messages via CAO_CALLBACK_URL).
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: cao-worker
+              app.kubernetes.io/name: cao-elastic-worker
       ports:
         - port: 9889
           protocol: TCP
@@ -182,12 +278,17 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Intra-namespace: remote agent placement onto workers (assign/handoff with
-    # target_host reaches cao-worker-N.cao-workers:9889) and any other cao-fleet
-    # pod in this namespace.
+    # Intra-namespace, all ports. This is what lets the supervisor reach the
+    # broker on 9890 to take a lease, and then the leased worker on 9889 at the
+    # per-worker Service the broker created for it. Worker Services come and go
+    # per task, so a rule enumerating destinations by name could not work here;
+    # the bound that matters is "this namespace only", which this keeps.
     - to:
         - podSelector: {}
-    # DNS: the supervisor resolves worker pod/service DNS names to place agents.
+    # DNS: the supervisor resolves the broker's and each leased worker's service
+    # name. Note a lease hands back an FQDN, not a bare pod name — a bare pod
+    # name does not resolve, which is the first thing that breaks in any
+    # cross-pod delegation and reads like a CAO bug.
     - to:
         - namespaceSelector: {}
           podSelector:
