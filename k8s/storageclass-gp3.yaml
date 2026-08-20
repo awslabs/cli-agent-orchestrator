@@ -1,11 +1,9 @@
-# StorageClass for the per-pod state volumes in deployment-supervisor.yaml and
-# statefulset-workers.yaml. Applied as part of `kubectl apply -k k8s`.
+# StorageClass for the supervisor's EBS-backed CAO state claim.
 #
 # A fresh EKS cluster ships only `gp2`, backed by the legacy in-tree provisioner,
 # so without this the state PVCs never bind and the pods stay Pending.
 #
-# `efs-sc`, the other class the manifests name, is defined in efs-workspace.yaml
-# next to the PV and PVC that use it — it is not repeated here.
+# `efs-sc`, the other class the manifests name, is defined in storage.yaml.
 #
 # On a cluster that already defines `gp3`, drop this file from kustomization.yaml:
 # a StorageClass's provisioner, parameters and reclaimPolicy are immutable, so
@@ -15,7 +13,7 @@ kind: StorageClass
 metadata:
   name: gp3
   labels:
-    app.kubernetes.io/part-of: cao-fleet
+    app.kubernetes.io/part-of: cao-elastic-fleet
 provisioner: ebs.csi.aws.com
 # An EBS volume lives in one Availability Zone. Binding before the pod is
 # scheduled can place the volume in an AZ the pod cannot run in, leaving the pod

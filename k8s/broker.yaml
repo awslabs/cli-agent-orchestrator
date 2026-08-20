@@ -1,0 +1,76 @@
+# Broker deployment for creating and cleaning up elastic worker Jobs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cao-worker-broker
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-worker-broker
+    app.kubernetes.io/part-of: cao-elastic-fleet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-worker-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-worker-broker
+        app.kubernetes.io/part-of: cao-elastic-fleet
+    spec:
+      serviceAccountName: cao-worker-broker
+      containers:
+        - name: broker
+          image: cao-worker-broker:latest
+          ports:
+            - name: http
+              containerPort: 9890
+          env:
+            - name: CAO_ELASTIC_NAMESPACE
+              value: cao-cluster
+            - name: CAO_ELASTIC_WORKER_IMAGE
+              # Kustomize image transforms do not rewrite env values. The
+              # deployment procedure replaces this with the same immutable
+              # image used by the supervisor.
+              value: <account-id>.dkr.ecr.<aws-region>.amazonaws.com/cao-server:<immutable-tag>
+            - name: CAO_ELASTIC_WORKSPACE_PVC
+              value: cao-elastic-workspace
+            - name: CAO_ELASTIC_WORKSPACE_ROOT
+              value: /home/cao/workspace/jobs
+            - name: CAO_ELASTIC_PROJECT_ID
+              value: cao-cluster
+            - name: CAO_MEMORY_API_URL
+              value: http://cao-supervisor.cao-cluster.svc.cluster.local:9889
+            - name: CAO_ELASTIC_BROKER_URL
+              value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890
+            - name: CAO_ELASTIC_BROKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-elastic-broker-token
+                  key: token
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9890
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-worker-broker
+  namespace: cao-cluster
+spec:
+  selector:
+    app.kubernetes.io/name: cao-worker-broker
+  ports:
+    - name: http
+      port: 9890
+      targetPort: 9890

@@ -1,32 +1,19 @@
+# Canonical elastic-worker deployment.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-
-namespace: cao-cluster
-
 resources:
   - namespace.yaml
-  # Cluster-scoped, so unaffected by the namespace above. A fresh EKS cluster
-  # ships only `gp2`, so without this the per-pod state PVCs never bind.
   - storageclass-gp3.yaml
-  - configmap-fleet.yaml
-  - efs-workspace.yaml
-  - service-workers-headless.yaml
-  - statefulset-workers.yaml
-  - deployment-supervisor.yaml
-  - deployment-fleet-panel.yaml
+  - storage.yaml
+  - rbac.yaml
+  - external-secret.yaml
+  - broker.yaml
+  - supervisor.yaml
   - networkpolicy.yaml
-
 images:
-  # Pin an IMMUTABLE tag. A mutable `latest` tag once left the cluster running a
-  # build that predated cross-node placement while these manifests advertised
-  # it, with nothing to indicate the mismatch. Bump this deliberately when you
-  # push a new image.
-  - name: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-server
-    # Example tag. Built from docker/Dockerfile, then layered with
-    # docker/Dockerfile.provider to add an authenticated provider CLI; the base
-    # image ships only mock_cli. Replace with your own tag.
-    newTag: 2.4.1-kiro2.18.1
-  - name: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-fleet-panel
-    newTag: latest
-  - name: <account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cao-fleet-panel
-    newTag: latest
+  - name: cao-server
+    newName: <account-id>.dkr.ecr.<aws-region>.amazonaws.com/cao-server
+    newTag: <immutable-tag>
+  - name: cao-worker-broker
+    newName: <account-id>.dkr.ecr.<aws-region>.amazonaws.com/cao-worker-broker
+    newTag: <immutable-tag>

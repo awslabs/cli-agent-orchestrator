@@ -2758,11 +2758,23 @@ class MemoryService:
         Returns ``""`` when ``memory.enabled`` is False (U5 / SC-6) — never
         reads index.md or wiki files.
         """
-        if not _is_memory_enabled():
-            return ""
-
         terminal_context = self._get_terminal_context(terminal_id)
         if not terminal_context:
+            return ""
+        return self.get_memory_context(terminal_context, budget_chars=budget_chars)
+
+    def get_memory_context(
+        self,
+        terminal_context: dict,
+        budget_chars: int = 3000,
+    ) -> str:
+        """Build an injection block from explicit caller context.
+
+        Distributed CAO nodes use this entry point because the memory owner
+        does not have the worker terminal in its local database. The existing
+        terminal-ID method above remains the local compatibility path.
+        """
+        if not _is_memory_enabled():
             return ""
 
         scopes_in_order = [

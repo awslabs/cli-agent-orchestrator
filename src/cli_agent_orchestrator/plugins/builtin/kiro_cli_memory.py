@@ -32,6 +32,10 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
+from cli_agent_orchestrator.services.memory_gateway import (
+    memory_context_for_terminal,
+    remote_memory_url,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 
@@ -75,7 +79,13 @@ class KiroCliMemoryPlugin(CaoPlugin):
             return
 
         try:
-            context_block = MemoryService().get_memory_context_for_terminal(event.terminal_id)
+            if remote_memory_url():
+                context_block = await asyncio.to_thread(
+                    memory_context_for_terminal,
+                    event.terminal_id,
+                )
+            else:
+                context_block = MemoryService().get_memory_context_for_terminal(event.terminal_id)
         except Exception as exc:
             logger.warning(
                 "kiro_cli_memory: memory fetch failed for %s: %s",
