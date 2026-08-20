@@ -1754,7 +1754,14 @@ async def assign_elastic(
         description='Agent profile for the disposable worker (for example "developer")'
     ),
     message: str = Field(description="Task for the disposable worker"),
-    provider: str = Field(default="kiro_cli", description="Provider installed in the worker"),
+    provider: Optional[str] = Field(
+        default=None,
+        description=(
+            "Provider to install in the worker. Omit to use the broker's "
+            "configured default, which is what the deployment's image actually "
+            "contains."
+        ),
+    ),
     engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
 ) -> Dict[str, Any]:
@@ -1763,22 +1770,47 @@ async def assign_elastic(
     The worker must call ``complete_assignment`` exactly once after producing
     its final result. That tool durably delivers the callback before releasing
     this worker's Job.
+
+    A successful return means the task was PLACED, not that it finished - the
+    result arrives later through the supervisor's inbox. So a worker that dies
+    before calling ``complete_assignment`` is indistinguishable from a slow one
+    here, and nothing on this side can tell them apart. The broker resolves it:
+    it holds the lease, reaps a worker whose pod ended or whose completion never
+    arrived, and records which happened. Query ``GET /workers`` on the broker
+    when a delegation reports success and produces no artifact.
     """
     try:
         if not _current_terminal_id():
             raise ValueError("assign_elastic must run from inside a CAO terminal")
         broker_url, broker_token = _elastic_broker_config()
+        # `provider` is omitted rather than defaulted here on purpose. A default
+        # baked into this signature silently overrides the broker's, so a fleet
+        # whose image ships one provider would still be asked for another - and
+        # the failure names a CLI the caller never mentioned. The provider a
+        # worker can actually run is a property of the deployment, so the
+        # deployment decides it.
+        #
+        # The isinstance check is not defensive noise. Called through FastMCP,
+        # `provider` arrives resolved to a string or None; called directly - as
+        # the tests do - the unfilled default is the `FieldInfo` object itself,
+        # which a plain truthiness test would happily place into the request body.
+        payload: Dict[str, Any] = {"agent_profile": agent_profile}
+        if isinstance(provider, str) and provider.strip():
+            payload["provider"] = provider.strip()
         response = requests.post(
             f"{broker_url}/workers",
             headers={"X-CAO-Broker-Token": broker_token},
-            json={"agent_profile": agent_profile, "provider": provider},
+            json=payload,
             timeout=(REMOTE_CONNECT_TIMEOUT, 360),
         )
         response.raise_for_status()
         lease = response.json()
         worker_id = str(lease["worker_id"])
         worker_message = (
-            message + "\n\n[Elastic worker lifecycle: when the task is fully complete, "
+            message + "\n\n[Elastic worker lifecycle: make every tool call you "
+            "need BEFORE you write any prose. Text that settles before your first "
+            "tool call is read as the end of your turn, and this terminal is then "
+            "killed with the task unfinished. When the task is fully complete, "
             "call complete_assignment with your final result. Do not use "
             "send_message for the final result; complete_assignment acknowledges "
             "delivery before terminating this disposable worker.]"
