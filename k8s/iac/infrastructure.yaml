@@ -352,8 +352,73 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
 
+  # Envelope encryption for Kubernetes Secrets in etcd.
+  #
+  # There is exactly one Secret in this namespace and it is worth wrapping:
+  # `cao-elastic-broker-token`, minted by ../deploy.sh, is the credential that
+  # authorises asking the broker to create a pod. Everything else authenticates
+  # through Pod Identity and puts nothing in etcd.
+  #
+  # Create-time only. EKS will not accept EncryptionConfig on a running cluster,
+  # so a cluster built without this has to be replaced to get it.
+  SecretsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub "Envelope encryption for Kubernetes Secrets in ${ClusterName}"
+      Enabled: true
+      EnableKeyRotation: true
+      # The minimum KMS allows. A key is only ever scheduled for deletion, never
+      # deleted outright, so the shortest window leaves the least behind.
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # KMS rejects a policy that locks out every principal, and an IAM policy
+          # granting kms:Decrypt means nothing unless the key policy delegates to
+          # the account. This is that delegation, not a wildcard grant.
+          - Sid: DelegateToAccountIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-secrets"
+
+  # Granted through IAM rather than by naming ClusterRole as a Principal in the key
+  # policy above, because KMS validates principals as the policy is written and a
+  # role created moments earlier in the same stack is not always visible yet. The
+  # symptom is an intermittent MalformedPolicyDocumentException about an invalid
+  # principal. Naming the key from the role is the same authorisation without the
+  # timing dependency.
+  ClusterKmsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: secrets-envelope-encryption
+      Roles:
+        - !Ref ClusterRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # CreateGrant is required: EKS grants the encryption provider in the
+          # managed control plane rather than calling KMS with this role on every
+          # Secret read.
+          - Effect: Allow
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: !GetAtt SecretsKey.Arn
+
   Cluster:
     Type: AWS::EKS::Cluster
+    # EncryptionConfig is validated at create time with no retry, so the grant has
+    # to exist first.
+    DependsOn: ClusterKmsPolicy
     Properties:
       Name: !Ref ClusterName
       Version: !Ref KubernetesVersion
@@ -376,6 +441,12 @@ Resources:
         # Grants cluster-admin to whoever deploys this stack, so kubectl works
         # immediately afterwards with no extra wiring.
         BootstrapClusterCreatorAdminPermissions: true
+      # `secrets` is the only resource EKS supports here.
+      EncryptionConfig:
+        - Resources:
+            - secrets
+          Provider:
+            KeyArn: !GetAtt SecretsKey.Arn
       Tags:
         - Key: Name
           Value: !Ref ClusterName
@@ -680,6 +751,20 @@ Resources:
   # tag always means one image.
   ServerRepository:
     Type: AWS::ECR::Repository
+    # CKV_AWS_136 wants EncryptionConfiguration with a KMS CMK. Suppressed rather
+    # than implemented, unlike the etcd key above, and the difference is the
+    # threat: this repository holds images built from a public git repo and public
+    # package registries, so there is no secret material in it. A CMK would mean
+    # granting kms:Decrypt on the IMAGE PULL path, and a missing grant there
+    # surfaces as ImagePullBackOff on a pod that pulled fine yesterday.
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_136
+            comment: >-
+              Repository holds images built from public sources and is already
+              encrypted at rest with AES256. A CMK would add a kms:Decrypt grant
+              to the image-pull path for no confidentiality gain.
     Properties:
       RepositoryName: !Sub "${NamePrefix}-server"
       ImageTagMutability: IMMUTABLE
@@ -717,6 +802,15 @@ Resources:
   # run builds both from one commit.
   BrokerRepository:
     Type: AWS::ECR::Repository
+    # Same CKV_AWS_136 reasoning as ServerRepository above.
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_136
+            comment: >-
+              Repository holds one image built from public sources and is already
+              encrypted at rest with AES256. A CMK would add a kms:Decrypt grant
+              to the image-pull path for no confidentiality gain.
     Properties:
       RepositoryName: !Sub "${NamePrefix}-worker-broker"
       ImageTagMutability: IMMUTABLE

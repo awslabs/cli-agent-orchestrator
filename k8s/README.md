@@ -47,7 +47,7 @@ first, speak once at the end".
 ## Prerequisites
 
 - AWS CLI, `kubectl`, Docker with `buildx` (the images are arm64)
-- Credentials allowed to create VPC, EKS, IAM, ECR and EFS resources
+- Credentials allowed to create VPC, EKS, IAM, KMS, ECR and EFS resources
 - No Helm, no External Secrets Operator, and no provider API key. Claude Code
   signs Bedrock requests with SigV4 using credentials from EKS Pod Identity, so
   there is no secret to sync. The one secret in the namespace is the broker
@@ -56,8 +56,14 @@ first, speak once at the end".
 ## Provision AWS infrastructure
 
 The template creates a two-AZ VPC, an EKS cluster and managed node group, the
-required add-ons, two ECR repositories, the EFS workspace, and the Pod Identity
-associations that give the supervisor and the workers Bedrock access.
+required add-ons, two ECR repositories, the EFS workspace, the KMS key that
+envelope-encrypts Kubernetes Secrets, and the Pod Identity associations that give
+the supervisor and the workers Bedrock access.
+
+The KMS key is worth one note: `EncryptionConfig` is **create-time only** on an
+EKS cluster, so a cluster built without it has to be replaced to get it. It is
+there because the broker token is a real credential — it authorises asking for a
+pod — and it is the only thing this fleet puts in etcd.
 
 ```bash
 export AWS_REGION=us-east-1
@@ -334,6 +340,12 @@ aws ec2 delete-volume --region "${AWS_REGION}" --volume-id vol-...
 The EFS file system is `DeletionPolicy: Delete` and goes with the stack, so
 workspace data is **not** preserved. Switch it to `Retain` in
 `iac/infrastructure.yaml` if the checkout holds anything you cannot recreate.
+
+One thing does outlive the stack by design: `SecretsKey`, the KMS key that
+envelope-encrypts Kubernetes Secrets. KMS never deletes a key outright, only
+schedules it, so the delete leaves it `PendingDeletion` for 7 days — the shortest
+window KMS allows. Nothing else references it and it costs $1/month prorated;
+cancel the deletion only if you need to read an etcd backup from that cluster.
 
 ## Testing the broker
 
