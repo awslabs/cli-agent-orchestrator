@@ -241,6 +241,40 @@ def test_status_rejects_previous_completion_after_next_turn_dispatch():
     assert provider.get_status(current) == TerminalStatus.COMPLETED
 
 
+def test_status_buffer_reset_does_not_treat_stale_completion_as_started():
+    """A retained completion after dispatch is not current-turn activity."""
+
+    provider = make_provider(agent_profile=None)
+    previous = load_fixture("minimax_code_completed.txt")
+    assert provider.get_status(previous) == TerminalStatus.IDLE
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+
+    # This is the capture-pane view used by deferred-submit recovery when the
+    # paste/Enter was dropped. Reporting PROCESSING here would suppress every
+    # retry even though MiniMax has emitted no bytes for the new turn.
+    assert provider.get_status(previous) == TerminalStatus.IDLE
+
+
+def test_status_buffer_reset_accepts_fresh_byte_identical_completion_after_activity():
+    """A repeated prompt/answer can complete in a fresh buffer generation."""
+
+    provider = make_provider(agent_profile=None)
+    completed = load_fixture("minimax_code_completed.txt")
+    processing = load_fixture("minimax_code_processing.txt")
+    assert provider.get_status(completed) == TerminalStatus.IDLE
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+
+    # StatusMonitor's fresh rolling buffer now contains both the processing
+    # frame and the newly emitted completion. Its prompt/answer bytes match the
+    # prior turn, but observed activity ties them to the new generation.
+    assert provider.get_status(f"{processing}\n{completed}") == TerminalStatus.COMPLETED
+
+
 def test_status_completes_long_response_after_assistant_marker_leaves_viewport():
     provider = make_provider(agent_profile=None)
     previous = load_fixture("minimax_code_completed.txt")

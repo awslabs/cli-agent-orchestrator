@@ -82,6 +82,8 @@ class MiniMaxCodeProvider(BaseProvider):
         self._awaiting_turn = False
         self._turn_activity_seen = False
         self._last_completion_identity: Optional[str] = None
+        self._last_completion_buffer_epoch: Optional[int] = None
+        self._status_buffer_epoch = 0
 
     supports_screen_detection = True
     supports_direct_status_probe = True
@@ -103,6 +105,18 @@ class MiniMaxCodeProvider(BaseProvider):
         self._has_received_input = True
         self._awaiting_turn = True
         self._turn_activity_seen = False
+
+    def notify_status_buffer_reset(self, epoch: int) -> None:
+        """Record the explicit rolling-buffer generation for the next turn.
+
+        Keep the prior completion fingerprint and its epoch. A retained screen
+        immediately after the reset is still stale, but an identical completion
+        may be accepted after current-turn activity is observed in the new
+        generation.
+        """
+
+        if epoch > self._status_buffer_epoch:
+            self._status_buffer_epoch = epoch
 
     @staticmethod
     def _is_substantive_user_line(line: str) -> bool:
@@ -453,6 +467,12 @@ class MiniMaxCodeProvider(BaseProvider):
         last_error = _last_match_start(_ERROR_PATTERN, clean)
         completion_identity, completion_anchored = self._latest_completion_identity(clean)
 
+        # A fast turn can emit its processing frame and completion in the same
+        # rolling-buffer generation before CAO performs an intermediate status
+        # probe. The ordering still proves current-turn activity.
+        if self._awaiting_turn and 0 <= last_processing < last_completion:
+            self._turn_activity_seen = True
+
         if last_waiting > max(last_processing, last_completion, last_ready):
             return TerminalStatus.WAITING_USER_ANSWER
         if last_processing > last_completion:
@@ -462,33 +482,44 @@ class MiniMaxCodeProvider(BaseProvider):
         if last_error > max(last_processing, last_completion, last_ready):
             return TerminalStatus.ERROR
         if last_ready >= 0:
-            if self._awaiting_turn and completion_identity == self._last_completion_identity:
-                return TerminalStatus.PROCESSING
             if self._awaiting_turn and completion_identity is None:
-                return TerminalStatus.PROCESSING
+                return TerminalStatus.IDLE
+            if self._awaiting_turn and completion_identity == self._last_completion_identity:
+                if self._last_completion_buffer_epoch == self._status_buffer_epoch:
+                    return TerminalStatus.PROCESSING
+                if not self._turn_activity_seen:
+                    # The buffer was cleared, but a full-screen TUI can retain
+                    # and redraw the previous completion without accepting the
+                    # new prompt. Do not report synthetic work to deferred-submit
+                    # confirmation; it must remain eligible for retry.
+                    return TerminalStatus.IDLE
             if self._awaiting_turn and not completion_anchored and not self._turn_activity_seen:
                 return TerminalStatus.PROCESSING
             if completion_identity is not None and self._has_received_input:
                 self._last_completion_identity = completion_identity
+                self._last_completion_buffer_epoch = self._status_buffer_epoch
                 self._awaiting_turn = False
                 self._turn_activity_seen = False
                 return TerminalStatus.COMPLETED
             if completion_identity is not None:
                 self._last_completion_identity = completion_identity
+                self._last_completion_buffer_epoch = self._status_buffer_epoch
             return TerminalStatus.IDLE
         if completion_identity is not None:
             if self._awaiting_turn and completion_identity == self._last_completion_identity:
-                return TerminalStatus.PROCESSING
+                if self._last_completion_buffer_epoch == self._status_buffer_epoch:
+                    return TerminalStatus.PROCESSING
+                if not self._turn_activity_seen:
+                    return TerminalStatus.UNKNOWN
             if self._awaiting_turn and not completion_anchored and not self._turn_activity_seen:
                 return TerminalStatus.PROCESSING
             self._last_completion_identity = completion_identity
+            self._last_completion_buffer_epoch = self._status_buffer_epoch
             if self._has_received_input:
                 self._awaiting_turn = False
                 self._turn_activity_seen = False
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
-        if self._awaiting_turn:
-            return TerminalStatus.PROCESSING
         return TerminalStatus.UNKNOWN
 
     def get_status_from_screen(self, screen_lines: list[str]) -> TerminalStatus:
@@ -555,3 +586,5 @@ class MiniMaxCodeProvider(BaseProvider):
         self._awaiting_turn = False
         self._turn_activity_seen = False
         self._last_completion_identity = None
+        self._last_completion_buffer_epoch = None
+        self._status_buffer_epoch = 0
