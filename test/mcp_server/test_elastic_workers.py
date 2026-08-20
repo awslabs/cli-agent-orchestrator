@@ -36,6 +36,78 @@ def test_assign_elastic_provisions_then_assigns(monkeypatch):
     assert "complete_assignment" in assign.call_args.args[1]
 
 
+def _lease_response():
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "worker_id": "deadbeef",
+        "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
+        "working_directory": "/home/cao/workspace/jobs/deadbeef",
+        "release_token": "release-token",
+    }
+    return response
+
+
+def test_assign_elastic_omits_provider_so_the_broker_default_wins(monkeypatch):
+    """A provider default in the tool signature would override the broker's.
+
+    The provider a worker can actually run is a property of the deployment's
+    image, so a caller that says nothing must leave the choice to the broker
+    rather than silently requesting whatever this signature happens to name.
+    """
+    monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
+    monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
+    with (
+        patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        patch.object(server.requests, "post", return_value=_lease_response()) as post,
+        patch.object(server, "_assign_impl", return_value={"success": True}),
+    ):
+        asyncio.run(server.assign_elastic("developer", "Implement it"))
+
+    assert post.call_args.kwargs["json"] == {"agent_profile": "developer"}
+
+
+def test_assign_elastic_forwards_an_explicit_provider(monkeypatch):
+    monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
+    monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
+    with (
+        patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        patch.object(server.requests, "post", return_value=_lease_response()) as post,
+        patch.object(server, "_assign_impl", return_value={"success": True}),
+    ):
+        asyncio.run(
+            server.assign_elastic("developer", "Implement it", provider="claude_code")
+        )
+
+    assert post.call_args.kwargs["json"] == {
+        "agent_profile": "developer",
+        "provider": "claude_code",
+    }
+
+
+def test_assign_elastic_warns_the_worker_not_to_speak_first(monkeypatch):
+    """The turn detector reads settled prose as end-of-turn and kills the window.
+
+    A worker that opens with "working on it" is therefore terminated mid-task
+    while the assignment still reports success, so the instruction that prevents
+    it has to travel with every task.
+    """
+    monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
+    monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
+    with (
+        patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        patch.object(server.requests, "post", return_value=_lease_response()),
+        patch.object(
+            server, "_assign_impl", return_value={"success": True}
+        ) as assign,
+    ):
+        asyncio.run(server.assign_elastic("developer", "Implement it"))
+
+    sent = assign.call_args.args[1]
+    assert "BEFORE you write any prose" in sent
+    assert "killed" in sent
+
+
 def test_assign_elastic_releases_when_assignment_fails(monkeypatch):
     monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")

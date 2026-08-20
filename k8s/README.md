@@ -326,7 +326,9 @@ kubectl -n "${NAMESPACE}" exec cao-supervisor-0 -- \
 
 ## Cleanup
 
-Remove the Kubernetes objects:
+Remove the Kubernetes objects first, and in this order. Every PV here uses
+`Retain`, so deleting the namespace or the stack ahead of the claims orphans EBS
+volumes that then have to be tracked down by ID.
 
 ```bash
 kubectl delete -k k8s
