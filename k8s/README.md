@@ -1,197 +1,299 @@
-# Deploying the CAO fleet on Amazon EKS
+# CAO Elastic Workers
 
-These manifests run a CAO fleet in a Kubernetes cluster: a supervisor that
-delegates work, worker pods that execute it, and a panel that observes them.
-Validated on EKS 1.35.
+These manifests run one persistent CAO supervisor and create one disposable
+Kubernetes Job for each `assign_elastic` call. Worker runtime state uses
+`emptyDir`; the supervisor owns durable CAO memory on its EBS claim. All nodes
+mount the EFS workspace dedicated to this CAO cluster.
 
-Values shown as concrete IDs are examples — replace them with your own. See
-[Values to replace](#values-to-replace).
-
-## What gets deployed
-
-| Component | Kind | Replicas | Role |
+| Component | Kubernetes kind | Storage | Lifecycle |
 |---|---|---|---|
-| `cao-supervisor` | Deployment | 1 | Hosts the supervising agent, delegates to workers |
-| `cao-worker` | StatefulSet | 3 | One agent per pod (`CAO_MAX_TERMINALS=1`), stable DNS names |
-| `cao-fleet-panel` | Deployment | 1 | Read-only web view of the fleet |
+| `cao-supervisor` | StatefulSet, one replica | EBS state and dedicated EFS workspace | Persistent |
+| `cao-worker-broker` | Deployment, one replica | None | Persistent |
+| `cao-worker-<id>` | One Job per assignment | `emptyDir` state and dedicated EFS workspace | Deleted after callback |
 
-Storage is split in two tiers:
-
-- **Shared workspace** — EFS at `/home/cao/workspace`, RWX, so every agent sees
-  the same checkout.
-- **Per-pod state** — EBS `gp3` at `/home/cao/.cao`, RWO, holding the SQLite
-  database, agent store, logs, FIFOs and locks. This must not go on EFS: SQLite,
-  `flock` and named pipes are unsafe over NFS.
-
-| File | Purpose |
-|---|---|
-| `kustomization.yaml` | Entry point: resource list, namespace, image tags |
-| `namespace.yaml` | The `cao-cluster` namespace |
-| `deployment-supervisor.yaml` | Supervisor pod, state volume, env |
-| `statefulset-workers.yaml` | Worker pods and their per-pod state volumes |
-| `service-workers-headless.yaml` | Headless Service giving workers stable DNS |
-| `deployment-fleet-panel.yaml` | Fleet panel and its authenticated probes |
-| `configmap-fleet.yaml` | `fleet.json` registry the panel reads |
-| `efs-workspace.yaml` | Shared workspace PV/PVC |
-| `networkpolicy.yaml` | Ingress and egress policies per role |
-| `external-secrets.example.yaml` | Credential pipeline — applied separately (needs ESO CRDs) |
-| `iac/infrastructure.yaml` | CloudFormation: every AWS resource — VPC, EKS cluster, add-ons, secret, IAM, ECR, EFS |
-| `storageclass-gp3.yaml` | The `gp3` StorageClass for per-pod state volumes |
+The broker creates each worker Job and its temporary Service. Workers send
+memory operations to the supervisor API, so project memory has one durable
+owner instead of being split across per-pod state directories.
 
 ## Prerequisites
 
-| # | Step | How |
-|---|---|---|
-| 1 | Local tools | `kubectl`, `docker`, AWS CLI |
-| 2 | AWS resources — VPC, EKS cluster, add-ons, provider secret, IAM, ECR, EFS | `aws cloudformation deploy --template-file k8s/iac/infrastructure.yaml --stack-name cao-workshop --capabilities CAPABILITY_NAMED_IAM` (~15 min) |
-| 3 | kubectl access | `aws eks update-kubeconfig --region <region> --name cao-workshop` |
-| 4 | External Secrets Operator | Install into namespace `external-secrets` with Helm — see [external-secrets.io](https://external-secrets.io) |
-| 5 | Provider API key | Secrets Manager console → the secret named in the stack output → Edit → **Plaintext** tab → paste the raw key alone. No JSON, quotes or trailing newline |
-| 6 | Restart ESO | `kubectl -n external-secrets rollout restart deployment --all` |
-| 7 | Panel token | `kubectl -n cao-cluster create secret generic cao-panel-secret --from-literal=token="$(openssl rand -hex 32)"` |
-| 8 | Server image | Build and push — see [Building the image](#building-the-image) |
-| 9 | Credential pipeline | `kubectl apply -f k8s/external-secrets.example.yaml` |
+- AWS CLI, `kubectl`, Docker, and Helm
+- AWS credentials allowed to create VPC, EKS, IAM, ECR, EFS, and Secrets
+  Manager resources
+- A provider base image containing CAO and the selected provider CLI
 
-Notes on the steps that surprise people:
+## Provision AWS Infrastructure
 
-- **Step 2** creates everything AWS-side in one stack, including the network, so
-  it works in a brand-new account with no VPC. It also enables NetworkPolicy
-  enforcement in the VPC CNI, which is off by default and without which the
-  policies in `networkpolicy.yaml` are accepted and then silently never enforced.
-- **Step 5** is manual by design: the stack creates the secret *empty*, so
-  forgetting this fails loudly instead of syncing a placeholder.
-- **Step 6** is required because Pod Identity injects credentials through a
-  webhook at pod creation, so ESO pods started before step 2 never receive them.
-- **Step 9** is separate from `kustomization.yaml` because its objects need the
-  ESO CRDs, which would make `kubectl apply -k k8s` fail on a cluster without ESO.
-  Confirm the `ClusterSecretStore` is `Ready=True` and the `ExternalSecret` reports
-  `SecretSynced` before deploying.
-
-### Building the image
-
-The base image ships only the credential-free `mock_cli` provider, so it builds
-anywhere. A real provider is layered on top from an authenticated CLI install
-directory — see [../docs/kiro-cli.md](../docs/kiro-cli.md). Push an immutable tag;
-the server repository enforces it.
+The CloudFormation template creates a two-AZ VPC, EKS cluster and managed node
+group, required EKS add-ons, ECR repositories, EFS workspace, provider secret,
+and the IAM role used by External Secrets Operator.
 
 ```bash
-docker build -f docker/Dockerfile -t cao-server:base .
-docker build -f docker/Dockerfile.provider --build-arg BASE_IMAGE=cao-server:base \
-  -t <ServerRepositoryUri>:<tag> <kiro-cli-install-dir>
+AWS_REGION="<aws-region>"
+STACK_NAME="cao-workshop"
+CLUSTER_NAME="cao-workshop"
+
+aws cloudformation deploy \
+  --region "${AWS_REGION}" \
+  --template-file k8s/iac/infrastructure.yaml \
+  --stack-name "${STACK_NAME}" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides ClusterName="${CLUSTER_NAME}"
+
+aws eks update-kubeconfig \
+  --region "${AWS_REGION}" \
+  --name "${CLUSTER_NAME}"
+
+aws cloudformation describe-stacks \
+  --region "${AWS_REGION}" \
+  --stack-name "${STACK_NAME}" \
+  --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+  --output table
 ```
 
-The panel image is expected to already exist in your registry; this repository
-does not yet ship a Dockerfile for it.
+Set the provider API key on the empty secret created by the stack:
+
+```bash
+SECRET_NAME="$(
+  aws cloudformation describe-stacks \
+    --region "${AWS_REGION}" \
+    --stack-name "${STACK_NAME}" \
+    --query "Stacks[0].Outputs[?OutputKey=='ProviderSecretName'].OutputValue | [0]" \
+    --output text
+)"
+
+aws secretsmanager put-secret-value \
+  --region "${AWS_REGION}" \
+  --secret-id "${SECRET_NAME}" \
+  --secret-string '{"KIRO_API_KEY":"<provider-api-key>"}'
+```
+
+Install External Secrets Operator after the stack completes. Restarting it
+ensures pods receive the EKS Pod Identity association created by the stack.
+
+```bash
+helm repo add external-secrets https://charts.external-secrets.io
+helm repo update
+helm upgrade --install external-secrets external-secrets/external-secrets \
+  --namespace external-secrets \
+  --create-namespace
+kubectl -n external-secrets rollout restart deployment/external-secrets
+```
+
+## Build
+
+Choose a new immutable tag for every build, then update both tags in
+`kustomization.yaml` and the worker image value in `broker.yaml`.
+
+```bash
+AWS_ACCOUNT="<account-id>"
+AWS_REGION=ap-southeast-2
+TAG="cao-$(date +%Y%m%d%H%M)"
+REGISTRY="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+BASE_PROVIDER_IMAGE="<provider-image>:<tag>"
+
+docker build \
+  --build-arg BASE_PROVIDER_IMAGE="${BASE_PROVIDER_IMAGE}" \
+  -f docker/Dockerfile \
+  -t "${REGISTRY}/cao-server:${TAG}" .
+docker build \
+  -f docker/Dockerfile.broker \
+  -t "${REGISTRY}/cao-worker-broker:${TAG}" .
+```
+
+The provider base image must already contain the CAO runtime, its container
+entrypoint, the selected provider CLI, and the unprivileged `cao` user. This
+branch image replaces the installed CAO wheel while retaining that runtime.
+
+Authenticate to ECR and push both images:
+
+```bash
+aws ecr get-login-password --region "${AWS_REGION}" |
+  docker login --username AWS --password-stdin "${REGISTRY}"
+docker push "${REGISTRY}/cao-server:${TAG}"
+docker push "${REGISTRY}/cao-worker-broker:${TAG}"
+```
 
 ## Deploy
 
-Point the manifests at your environment first:
+Replace the public placeholders before applying:
 
-| File | Change |
+| File | Values |
 |---|---|
-| `kustomization.yaml` | Account and region in both image names, plus `newTag` |
-| `efs-workspace.yaml` | `volumeHandle: <fs-id>::<access-point-id>` |
-| `configmap-fleet.yaml` | One `machines` entry per worker replica |
-| `statefulset-workers.yaml` | `replicas` if not 3 |
+| `kustomization.yaml` | `<account-id>`, `<aws-region>`, and `<immutable-tag>` for both images |
+| `broker.yaml` | The same server image URI and immutable tag in `CAO_ELASTIC_WORKER_IMAGE` |
+| `storage.yaml` | `<filesystem-id>` and `<access-point-id>` for the stack-created EFS access point |
+| `external-secret.yaml` | `<aws-region>` used by the `ClusterSecretStore` |
 
-The worker count appears twice — StatefulSet `replicas` and the fleet ConfigMap.
-They must agree, or the panel reports nodes that do not exist.
+Use `ServerRepositoryUri`, `WorkerBrokerRepositoryUri`, and
+`WorkspaceVolumeHandle` from the CloudFormation outputs. Split
+`WorkspaceVolumeHandle` at `::` for the two placeholders in `storage.yaml`.
+
+Create the broker credential outside Git:
 
 ```bash
+kubectl create namespace cao-cluster --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n cao-cluster create secret generic cao-elastic-broker-token \
+  --from-literal=token="$(openssl rand -hex 32)"
 kubectl apply -k k8s
-kubectl -n cao-cluster rollout status deployment/cao-supervisor --timeout=600s
-kubectl -n cao-cluster rollout status statefulset/cao-worker   --timeout=900s
 ```
 
-Workers roll one at a time, so allow several minutes.
+The supervisor agent uses `assign_elastic`. A disposable worker must finish
+with `complete_assignment`; that delivers its result before the broker deletes
+only that worker's Job and Service.
 
 ## Verify
 
 ```bash
-# All pods ready, no restarts
-kubectl -n cao-cluster get pods
-
-# Provider present and authenticated on every node
-for p in deploy/cao-supervisor cao-worker-0 cao-worker-1 cao-worker-2; do
-  kubectl -n cao-cluster exec $p -- kiro-cli whoami
-done
-
-# State on the persistent volume, owned 1000:1000 mode 0700
-kubectl -n cao-cluster exec cao-worker-0 -- ls -ldn /home/cao/.cao/state
-
-# Workspace is the same volume everywhere
-kubectl -n cao-cluster exec deploy/cao-supervisor -- touch /home/cao/workspace/.probe
-kubectl -n cao-cluster exec cao-worker-1 -- ls /home/cao/workspace/.probe
-kubectl -n cao-cluster exec deploy/cao-supervisor -- rm /home/cao/workspace/.probe
-
-# Each node resolves its own provider — cross-node placement depends on this
-kubectl -n cao-cluster exec cao-worker-0 -- python -c \
-  "from cli_agent_orchestrator.utils.agent_profiles import resolve_provider; \
-   print(resolve_provider('developer', fallback_provider='mock_cli'))"   # want kiro_cli
+kubectl -n cao-cluster get externalsecret,pvc,pod,job,service
+kubectl -n cao-cluster rollout status deployment/cao-worker-broker
+kubectl -n cao-cluster rollout status statefulset/cao-supervisor
 ```
 
-Then an end-to-end run:
+Default `project` memory is shared through the supervisor because all elastic
+nodes use `CAO_PROJECT_ID=cao-cluster`. Local CAO installations are unchanged
+unless `CAO_MEMORY_API_URL` is explicitly configured.
+
+## Run a Demo Assignment
+
+The following demo starts a `code_supervisor` session inside the supervisor
+pod. The supervisor creates a producer worker Job and a delayed consumer worker
+Job before waiting for callbacks. The producer stores a project memory and the
+consumer recalls it from the supervisor-owned memory service.
+
+Set the namespace:
 
 ```bash
-kubectl -n cao-cluster exec deploy/cao-supervisor -- \
-  cao launch --agents code_supervisor --provider kiro_cli \
-    --session-name demo --headless --auto-approve \
-    --working-directory /home/cao/workspace
-
-kubectl -n cao-cluster exec deploy/cao-supervisor -- cao session status cao-demo
+NAMESPACE=cao-cluster
 ```
 
-`--session-name demo` creates a session named `cao-demo`; later commands need the
-prefix.
-
-To reach the panel, `kubectl -n cao-cluster port-forward deploy/cao-fleet-panel
-8080:9888` and open `http://localhost:8080` with an `Authorization: Bearer
-<token>` header. Unauthenticated requests return 401 by design.
-
-## Operations
-
-**Scale workers.** Update `replicas` and the ConfigMap `machines` list together,
-then re-apply. Scale-down removes the highest ordinal first; drain that worker
-beforehand. State volumes are retained.
-
-**Roll out a new image.** Push a new immutable tag, update `newTag`, apply. Never
-reuse a tag — a mutable tag can leave the cluster running an old build with
-nothing to indicate the mismatch.
-
-**Rotate the provider key.** Rotation is two hops and only the first is
-automatic: ESO re-reads Secrets Manager on its refresh interval (1 hour), but
-pods read environment variables only at startup, so a running pod keeps using the
-old key until restarted — with no failing probe to signal it.
+In one terminal, watch disposable worker Jobs and pods appear and disappear:
 
 ```bash
-# 1. Update the value in Secrets Manager, then force an immediate sync
-kubectl -n cao-cluster annotate externalsecret kiro-api-key force-sync="$(date +%s)" --overwrite
-
-# 2. Confirm the Kubernetes Secret changed (compare fingerprints, never print the key)
-kubectl -n cao-cluster get secret kiro-api-key -o jsonpath='{.data.KIRO_API_KEY}' \
-  | base64 -d | sha256sum | cut -c1-12
-
-# 3. Restart both workloads so the pods pick it up
-kubectl -n cao-cluster rollout restart deployment/cao-supervisor statefulset/cao-worker
+kubectl -n "${NAMESPACE}" get jobs,pods \
+  -l app.kubernetes.io/name=cao-elastic-worker \
+  --watch
 ```
 
-A rollout restart ends running sessions. The state database survives on the PVC,
-but the agent processes do not, so drain first if agents are mid-task. The same
-applies to the panel token: update `cao-panel-secret`, then restart the panel.
+In another terminal, create the supervisor session and submit the demo task:
 
-**Shut down sessions.** `cao shutdown --all` is per node, so run it on each pod.
+```bash
+SUPERVISOR_ID="$(
+  kubectl -n "${NAMESPACE}" exec -i cao-supervisor-0 -- python - <<'PY'
+import requests
 
-## Values to replace
+task = """
+Run this demonstration using elastic workers. Do not perform the worker tasks
+yourself.
 
-| Value | Where it comes from |
-|---|---|
-| `<account-id>`, region | Your AWS account — image names in `kustomization.yaml` and the pod specs |
-| `volumeHandle` | Stack output `WorkspaceVolumeHandle` → `efs-workspace.yaml` |
-| Image repositories | Stack outputs `ServerRepositoryUri`, `PanelRepositoryUri` → `kustomization.yaml` |
-| Image tag | Chosen at build time → `kustomization.yaml` |
-| Secret name | Stack output `ProviderSecretName` → `external-secrets.example.yaml` |
-| IAM role | Stack output `ExternalSecretsRoleArn` → Pod Identity association |
+1. Call assign_elastic with agent_profile="developer" and provider="kiro_cli".
+   Tell the worker to store project memory with key "elastic-demo-shared",
+   memory_type "project", and content "The elastic producer completed the demo."
+   It must finish with complete_assignment and include the stored fact in its
+   result.
+2. Immediately call assign_elastic again with agent_profile="developer" and
+   provider="kiro_cli". Tell this consumer worker to run `sleep 60`, recall
+   project memory key "elastic-demo-shared", and finish with
+   complete_assignment containing the recalled value.
+3. Do not poll or wait with shell commands. After both assignments have been
+   accepted, report their worker IDs and end the current turn. Their callbacks
+   will arrive through the supervisor inbox.
+"""
 
-Fixed by the image and safe to leave alone: container user `1000:1000`, server
-port `9889`, panel port `9888`, state path `/home/cao/.cao/state`, workspace path
-`/home/cao/workspace`.
+response = requests.post(
+    "http://cao-supervisor:9889/sessions",
+    params={
+        "agent_profile": "code_supervisor",
+        "provider": "kiro_cli",
+        "working_directory": "/home/cao/workspace",
+    },
+    json={"initial_message": task},
+    timeout=30,
+)
+response.raise_for_status()
+print(response.json()["id"])
+PY
+)"
+
+echo "Supervisor terminal: ${SUPERVISOR_ID}"
+```
+
+Session creation is asynchronous. Follow the supervisor output:
+
+```bash
+kubectl -n "${NAMESPACE}" exec -i \
+  cao-supervisor-0 -- env TERMINAL_ID="${SUPERVISOR_ID}" python - <<'PY'
+import os
+import requests
+
+response = requests.get(
+    f"http://cao-supervisor:9889/terminals/{os.environ['TERMINAL_ID']}/output",
+    params={"mode": "full"},
+    timeout=30,
+)
+response.raise_for_status()
+print(response.json()["output"])
+PY
+```
+
+Read callbacks delivered by completed workers:
+
+```bash
+kubectl -n "${NAMESPACE}" exec -i \
+  cao-supervisor-0 -- env TERMINAL_ID="${SUPERVISOR_ID}" python - <<'PY'
+import json
+import os
+import requests
+import time
+
+url = (
+    f"http://cao-supervisor:9889/terminals/"
+    f"{os.environ['TERMINAL_ID']}/inbox/messages"
+)
+deadline = time.monotonic() + 600
+
+while time.monotonic() < deadline:
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    messages = response.json()
+    if len(messages) >= 2:
+        print(json.dumps(messages, indent=2))
+        break
+    time.sleep(5)
+else:
+    raise TimeoutError("Timed out waiting for two worker callbacks")
+PY
+```
+
+Verify that the producer's memory is stored on the supervisor EBS volume:
+
+```bash
+kubectl -n "${NAMESPACE}" exec cao-supervisor-0 -- \
+  cao memory show elastic-demo-shared --scope project
+```
+
+After the demo, both worker Jobs and Services should be gone because each
+worker called `complete_assignment` only after delivering its result:
+
+```bash
+kubectl -n "${NAMESPACE}" get jobs,services \
+  -l app.kubernetes.io/name=cao-elastic-worker
+```
+
+Remove the demonstration memory when it is no longer needed:
+
+```bash
+kubectl -n "${NAMESPACE}" exec cao-supervisor-0 -- \
+  cao memory delete elastic-demo-shared --scope project --yes
+```
+
+## Cleanup
+
+```bash
+kubectl delete -k k8s
+kubectl delete namespace cao-cluster
+```
+
+The EFS PV and CloudFormation file system use `Retain`; cleanup does not delete
+workspace data. The retained EFS filesystem and provider secret must be removed
+explicitly when they are no longer required.
