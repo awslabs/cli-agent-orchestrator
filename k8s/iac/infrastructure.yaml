@@ -610,6 +610,13 @@ Resources:
     Properties:
       RepositoryName: !Sub "${NamePrefix}-server"
       ImageTagMutability: IMMUTABLE
+      # Without this the stack cannot be deleted. ECR refuses to drop a repository
+      # that still holds images, and the build steps in README.md push one here, so
+      # a delete-stack ALWAYS hits `cannot be deleted because it still contains
+      # images` and leaves the stack DELETE_FAILED - taking the VPC with it,
+      # because the subnets fail alongside it. Observed on the first teardown of
+      # the workshop twin of this template.
+      EmptyOnDelete: true
       ImageScanningConfiguration:
         ScanOnPush: true
       LifecyclePolicy:
@@ -635,6 +642,9 @@ Resources:
     Properties:
       RepositoryName: !Sub "${NamePrefix}-worker-broker"
       ImageTagMutability: IMMUTABLE
+      # Same reason as ServerRepository above; a missing flag here fails the whole
+      # delete, not just this resource.
+      EmptyOnDelete: true
       ImageScanningConfiguration:
         ScanOnPush: true
       LifecyclePolicy:
