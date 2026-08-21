@@ -91,6 +91,13 @@ MCP tool discovery is authoritative for clients. The declarations in
 [`ops_mcp_server/server.py`](../src/cli_agent_orchestrator/ops_mcp_server/server.py)
 are the source of truth when the server surface changes.
 
+For a runnable walkthrough of the full lifecycle — discover, launch, poll for
+readiness, follow up, read output, shut down — see
+[`examples/ops-mcp/`](../examples/ops-mcp/). It also documents the boundary
+between this external plane and in-session orchestration, and the readiness
+polling that `launch_session` requires because it returns before the provider is
+up.
+
 Choose the surface by caller:
 
 | Caller | Preferred surface |
