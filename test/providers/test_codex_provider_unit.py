@@ -4089,3 +4089,63 @@ class TestCodexProviderBlocksOrchestratedInputWhileWaitingUserAnswer:
         mock_tmux.send_keys.assert_not_called()
         mock_notify.assert_called_once()
         assert mock_notify.call_args.kwargs["delete_worker"] is False
+
+
+class TestCodexInitConfiguredTimeouts:
+    """Codex init timeouts must come from settings, not hard-coded literals."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_uses_configured_startup_prompt_timeout(
+        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings
+    ):
+        """The trust-prompt budget comes from settings, not a hard-coded 20.0.
+
+        An operator on a slow/containerized host must be able to widen it via
+        ``startup_prompt_handler_timeout`` without a code change.
+        """
+        mock_settings.return_value = {
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 45,
+        }
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_handle_trust_prompt", new_callable=AsyncMock) as mock_trust:
+            await provider.initialize()
+
+        mock_trust.assert_awaited_once_with(timeout=45.0)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_init_timeout_error_reports_the_configured_bound(
+        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings
+    ):
+        """The init-timeout message must name the timeout actually applied.
+
+        The bound is ``provider_init_timeout``, but the message was hard-coded
+        to "60 seconds" — so an operator who raised or lowered the setting was
+        told a number the code never used.
+        """
+        mock_settings.return_value = {
+            "provider_init_timeout": 150,
+            "startup_prompt_handler_timeout": 20,
+        }
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False  # never reaches a ready status
+        mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_handle_trust_prompt", new_callable=AsyncMock):
+            with pytest.raises(TimeoutError, match="150"):
+                await provider.initialize()
+
+        assert mock_wait_status.await_args.kwargs["timeout"] == 150.0
