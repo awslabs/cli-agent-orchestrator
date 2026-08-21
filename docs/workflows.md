@@ -378,4 +378,7 @@ before assuming a verb and a tool with similar names do the same thing:
   - [`conditional_example.py`](examples/conditional_example.py) — branching, explicit `step_id` per branch.
   - [`fanout_example.py`](examples/fanout_example.py) — concurrent fan-out via `ThreadPoolExecutor`.
   - [`loop_raw_http_example.py`](examples/loop_raw_http_example.py) — the same loop with no shim, raw `urllib` against the identity env vars.
+- [`examples/workflows/pr-health/`](../examples/workflows/pr-health/) — a
+  deterministic open-PR health scorer with guarded enforcement and a biweekly
+  scheduled-flow example.
 - [`skills/cao-workflow/SKILL.md`](../skills/cao-workflow/SKILL.md) — the agent-facing skill that teaches this lifecycle.
