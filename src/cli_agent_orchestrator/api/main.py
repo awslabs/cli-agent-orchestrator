@@ -4645,6 +4645,8 @@ async def start_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(e.findings)},
             )
+        except approval_gate.PlanApprovalRequiredError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except ValueError as e:
@@ -4805,8 +4807,10 @@ async def submit_workflow_run_endpoint(
         # that never happened. The blocking arm in ``script_runner`` gates identically at its Step 0b,
         # because otherwise a run's approvability would depend on which route started it. No-ops
         # entirely when enforcement is disabled, which is the default.
-        manifest_json = manifest_freeze.build_manifest_json(
-            source_hash=spec.content_hash, inputs=body.inputs
+        manifest_json = await asyncio.to_thread(
+            manifest_freeze.build_manifest_json,
+            source_hash=spec.content_hash,
+            inputs=body.inputs,
         )
         try:
             approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)

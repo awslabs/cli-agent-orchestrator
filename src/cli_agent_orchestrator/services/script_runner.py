@@ -1166,8 +1166,10 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     # --- Step 0b: approval gate (issue #583 Bolt 2, ``approval-gate``) ---
     # Built ONCE here and handed to the INSERT below unchanged, so the manifest that is CHECKED is
     # byte-identical to the one STORED — and ADR-583-4's one-write discipline is preserved.
-    manifest_json = manifest_freeze.build_manifest_json(
-        source_hash=spec.content_hash, inputs=inputs
+    manifest_json = await asyncio.to_thread(
+        manifest_freeze.build_manifest_json,
+        source_hash=spec.content_hash,
+        inputs=inputs,
     )
     # Placed here, and not lower, for two reasons that are both about leaving nothing behind:
     #   * BEFORE the registry write and the journal INSERT, so a refused start leaves no live record
