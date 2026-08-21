@@ -609,8 +609,11 @@ async def run_agent_step(
     #
     # ``None`` — a non-workflow caller, a YAML run, a run with no manifest, or a persist that failed —
     # means "pass nothing", and ``send_input`` then behaves exactly as it always has.
-    frozen_memory = frozen_run_memory.frozen_memory_for(
-        (env_vars or {}).get("CAO_WORKFLOW_RUN_ID"), terminal_id, prompt
+    frozen_memory = await asyncio.to_thread(
+        frozen_run_memory.frozen_memory_for,
+        (env_vars or {}).get("CAO_WORKFLOW_RUN_ID"),
+        terminal_id,
+        prompt,
     )
     if frozen_memory is None:
         # The call is left BYTE-IDENTICAL on the no-frozen-block path, rather than passing an extra
@@ -620,7 +623,10 @@ async def run_agent_step(
         await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
     else:
         await asyncio.to_thread(
-            terminal_service.send_input, terminal_id, prompt, frozen_memory=frozen_memory
+            terminal_service.send_input,
+            terminal_id,
+            prompt,
+            frozen_memory=frozen_memory,
         )
 
     # Wait for completion — IN-PROCESS poll of status_monitor (NOT the
