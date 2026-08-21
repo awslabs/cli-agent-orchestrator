@@ -1,6 +1,8 @@
 """Unit tests for the Cursor CLI provider."""
 
+import json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -54,10 +56,11 @@ def make_provider(
     allowed_tools: list | None = None,
     model: str | None = None,
     skill_prompt: str | None = None,
+    terminal_id: str = "test-tid",
 ) -> CursorCliProvider:
     """Build a CursorCliProvider with the given configuration."""
     return CursorCliProvider(
-        terminal_id="test-tid",
+        terminal_id=terminal_id,
         session_name="test-session",
         window_name="window-0",
         agent_profile=agent_profile,
@@ -737,94 +740,148 @@ class TestBuildCommand:
         assert "--system-prompt" not in cmd
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_mcp_servers_forwarded_via_plugin_dir(self, mock_load):
-        # v2026 removed ``--mcp <json>``. The replacement is
-        # ``--plugin-dir <path>`` pointing at a directory holding a
-        # plugin manifest. We synthesise that directory at build
-        # time; the test asserts the flag is present, points at an
-        # existing directory, and that the manifest's mcpServers
-        # map carries CAO_TERMINAL_ID.
-        import json
-        from pathlib import Path
-
+    def test_mcp_servers_materialized_in_isolated_agent_plugin(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path / "cao-tmp"))
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = None
         profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
         mock_load.return_value = profile
+
         provider = make_provider(agent_profile="developer")
-        cmd = provider._build_cursor_command()
-        assert "--mcp" not in cmd
-        assert "--plugin-dir" in cmd
-        assert "--approve-mcps" in cmd
-        m = re.search(r"--plugin-dir\s+(\S+)", cmd)
-        assert m is not None, f"--plugin-dir <path> not found in: {cmd}"
-        plugin_dir = Path(m.group(1))
-        assert plugin_dir.is_dir()
-        # The synthesised manifest must include the server with the
-        # terminal id forwarded into its env.
+        command_parts = shlex.split(provider._build_cursor_command())
+        plugin_dir = Path(command_parts[command_parts.index("--plugin-dir") + 1])
+
+        assert plugin_dir.parent == tmp_path / "cao-tmp"
+        assert "--approve-mcps" in command_parts
+        assert not (worktree / ".cursor").exists()
         manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
-        servers = manifest["mcpServers"]
-        assert "cao-mcp-server" in servers
-        assert servers["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
-
-    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_mcp_resolves_bundled_command_in_manifest(self, mock_load):
-        # Wiring guard: the bare cao-mcp-server command must be rewritten to
-        # a PATH-independent invocation in the written plugin manifest. A
-        # refactor that drops the resolve_mcp_server_config call fails this.
-        import json
-        from pathlib import Path
-
-        profile = MagicMock()
-        profile.model = None
-        profile.system_prompt = None
-        profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
-        mock_load.return_value = profile
-        provider = make_provider(agent_profile="developer")
-        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
-        # NOTE: mcp_resolution and cursor_cli import the SAME shutil module
-        # object, so a blanket which->None would break the provider's own
-        # cursor-binary lookup (stubbed by the autouse fixture). Only the
-        # cao-mcp-server lookup may miss.
-        which_cursor_keeps_working = lambda name: (
-            None if name == "cao-mcp-server" else "/usr/local/bin/cursor-agent"
-        )
-        with (
-            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
-            patch(f"{MOD}.shutil.which", side_effect=which_cursor_keeps_working),
-        ):
-            cmd = provider._build_cursor_command()
-        m = re.search(r"--plugin-dir\s+(\S+)", cmd)
-        assert m is not None
-        manifest = json.loads((Path(m.group(1)) / "plugin.json").read_text(encoding="utf-8"))
-        assert manifest["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
-
-    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_mcp_preserves_existing_cao_terminal_id(self, mock_load):
-        # The constructor's terminal_id must NOT override an
-        # explicit preset (matches the prior --mcp behaviour).
-        import json
-        from pathlib import Path
-
-        profile = MagicMock()
-        profile.model = None
-        profile.system_prompt = None
-        profile.mcpServers = {
+        config = json.loads((plugin_dir / "mcp.json").read_text(encoding="utf-8"))
+        assert manifest["$schema"] == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+        assert manifest["name"] == "cao-terminal-test-tid"
+        assert config["$schema"] == "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
+        assert set(config) == {"$schema", "mcpServers"}
+        assert config["mcpServers"] == {
             "cao-mcp-server": {
-                "command": "cao-mcp-server",
+                "type": "stdio",
+                "command": "./bin/cao-mcp-server",
                 "args": [],
-                "env": {"CAO_TERMINAL_ID": "preset"},
+                "env": {"CAO_TERMINAL_ID": "test-tid"},
             }
         }
-        mock_load.return_value = profile
-        provider = make_provider(agent_profile="developer")
-        cmd = provider._build_cursor_command()
-        m = re.search(r"--plugin-dir\s+(\S+)", cmd)
-        assert m is not None
-        plugin_dir = Path(m.group(1))
-        manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
-        assert manifest["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "preset"
+        launcher = plugin_dir / "bin" / "cao-mcp-server"
+        assert launcher.read_text(encoding="utf-8").startswith("#!")
+        assert (launcher.stat().st_mode & 0o777) == 0o700
+        assert (plugin_dir.stat().st_mode & 0o777) == 0o700
+        assert ((plugin_dir / "mcp.json").stat().st_mode & 0o777) == 0o600
+
+        provider.cleanup()
+        assert not plugin_dir.exists()
+
+    def test_mcp_plugin_uses_plugin_relative_cao_launcher(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path))
+        provider = make_provider()
+        plugin_dir = Path(
+            provider._write_plugin_dir(
+                {"cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}}
+            )
+        )
+        server = json.loads((plugin_dir / "mcp.json").read_text(encoding="utf-8"))["mcpServers"][
+            "cao-mcp-server"
+        ]
+        assert server["command"] == "./bin/cao-mcp-server"
+        assert not Path(server["command"]).is_absolute()
+
+    def test_mcp_preserves_existing_cao_terminal_id_in_agent_plugin(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path))
+        plugin_dir = Path(
+            make_provider()._write_plugin_dir(
+                {
+                    "cao-mcp-server": {
+                        "command": "cao-mcp-server",
+                        "args": [],
+                        "env": {"CAO_TERMINAL_ID": "preset"},
+                    }
+                }
+            )
+        )
+        config = json.loads((plugin_dir / "mcp.json").read_text(encoding="utf-8"))
+        assert config["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "preset"
+
+    @pytest.mark.parametrize(
+        ("servers", "match"),
+        [
+            (
+                {"other-server": {"type": "stdio", "command": "other-server", "args": []}},
+                "only the bundled",
+            ),
+            (
+                {
+                    "cao-mcp-server": {
+                        "type": "stdio",
+                        "command": "/venv/bin/cao-mcp-server",
+                        "args": [],
+                    }
+                },
+                "requires the bundled",
+            ),
+            (
+                {
+                    "cao-mcp-server": {
+                        "type": "stdio",
+                        "command": "cao-mcp-server",
+                        "timeout": 30,
+                    }
+                },
+                "cannot represent fields",
+            ),
+            (
+                {
+                    "cao-mcp-server": {
+                        "type": "stdio",
+                        "command": "cao-mcp-server",
+                        "env": {"API_TOKEN": "not-a-real-token"},
+                    }
+                },
+                "accepts only CAO_TERMINAL_ID",
+            ),
+        ],
+    )
+    def test_mcp_plugin_rejects_nonportable_profile_config(
+        self, servers, match, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path))
+        provider = make_provider()
+        with pytest.raises(ProviderError, match=match):
+            provider._write_plugin_dir(servers)
+        assert not list(tmp_path.iterdir())
+
+    def test_mcp_plugins_are_isolated_for_concurrent_workers(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path / "cao-tmp"))
+        first = make_provider(terminal_id="first-tid")
+        second = make_provider(terminal_id="second-tid")
+        servers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+
+        first_dir = Path(first._write_plugin_dir(servers))
+        second_dir = Path(second._write_plugin_dir(servers))
+
+        assert first_dir != second_dir
+        first_config = json.loads((first_dir / "mcp.json").read_text(encoding="utf-8"))
+        second_config = json.loads((second_dir / "mcp.json").read_text(encoding="utf-8"))
+        assert first_config["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "first-tid"
+        assert (
+            second_config["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "second-tid"
+        )
+
+        first.cleanup()
+        assert not first_dir.exists()
+        assert second_dir.exists()
+        second.cleanup()
+        assert not second_dir.exists()
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_tool_restrictions_skip_system_prompt(self, mock_load):
@@ -1066,6 +1123,38 @@ class TestBuildCommandBinaryResolution:
 
 class TestInitialize:
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_initialize_materializes_isolated_mcp_plugin_before_launch(
+        self, mock_backend, mock_shell, mock_wait, mock_load, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path / "cao-tmp"))
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        mock_load.return_value = profile
+        mock_shell.return_value = True
+        mock_wait.return_value = True
+        provider = make_provider(agent_profile="developer")
+
+        assert await provider.initialize() is True
+        mock_load.assert_called_once_with("developer")
+        sent = mock_backend.return_value.send_keys.call_args.args[2]
+        command_parts = shlex.split(sent)
+        plugin_dir = Path(command_parts[command_parts.index("--plugin-dir") + 1])
+        config = json.loads((plugin_dir / "mcp.json").read_text(encoding="utf-8"))
+        assert config["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+        assert "--approve-mcps" in sent
+        assert "--plugin-dir" in sent
+        assert not (tmp_path / ".cursor").exists()
+
+        provider.cleanup()
+        assert not plugin_dir.exists()
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
@@ -1106,17 +1195,23 @@ class TestInitialize:
             await provider.initialize()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
     async def test_initialize_does_not_send_system_prompt_flag(
-        self, mock_backend, mock_shell, mock_wait
+        self, mock_backend, mock_shell, mock_wait, mock_load
     ):
         # v2026.06.15 has a confirmed bug where any request that
         # carries --system-prompt is rejected by the backend, so
         # the provider deliberately omits the flag.
         mock_shell.return_value = True
         mock_wait.return_value = True
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = "DEVELOPER_AGENT_BODY"
+        profile.mcpServers = None
+        mock_load.return_value = profile
         provider = make_provider(agent_profile="developer")
         await provider.initialize()
         sent = mock_backend.return_value.send_keys.call_args.args[2]
@@ -1197,27 +1292,26 @@ class TestMiscInterface:
 
     def test_cleanup_removes_tracked_tmp_paths(self, tmp_path, monkeypatch):
         # Copilot review #3412413702 (P1): cleanup() must delete
-        # the per-session temp files the provider wrote (system
-        # prompt + plugin dir). We stub _cao_tmp_dir to redirect
-        # to a temp dir and assert the files are removed on
-        # cleanup().
+        # the per-session temp files the provider wrote. We stub
+        # _cao_tmp_dir to redirect to a temp dir and assert the files
+        # are removed on cleanup().
         monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path))
         provider = make_provider()
-        # Materialise a fake system-prompt file and a fake plugin
-        # dir as if a launch had run.
+        # Materialise a fake system-prompt file and an unrelated
+        # per-session directory as if a launch had run.
         prompt_path = tmp_path / f"{provider.terminal_id}-system-prompt.md"
         prompt_path.write_text("dummy")
-        plugin_dir = tmp_path / f"{provider.terminal_id}-cursor-plugins"
-        plugin_dir.mkdir()
-        (plugin_dir / "plugin.json").write_text("{}")
-        provider._tmp_paths = [prompt_path, plugin_dir]
+        extra_dir = tmp_path / f"{provider.terminal_id}-provider-state"
+        extra_dir.mkdir()
+        (extra_dir / "state.json").write_text("{}")
+        provider._tmp_paths = [prompt_path, extra_dir]
         # Sanity: the files are there before cleanup.
         assert prompt_path.exists()
-        assert plugin_dir.is_dir()
+        assert extra_dir.is_dir()
         provider.cleanup()
         # And gone after.
         assert not prompt_path.exists()
-        assert not plugin_dir.exists()
+        assert not extra_dir.exists()
         # The registry is also drained so a second cleanup is a
         # no-op (idempotent).
         assert provider._tmp_paths == []
