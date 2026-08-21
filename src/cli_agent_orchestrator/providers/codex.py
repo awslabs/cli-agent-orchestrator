@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-IDLE_PROMPT_PATTERN = r"(?:❯|›|codex>)"
+IDLE_PROMPT_PATTERN = r"(?:❯|›|»|codex>)"
 # Number of lines from the bottom of capture to check for the idle prompt.
 # With --no-alt-screen, codex output is inline (scrollback contains history),
 # so we can't anchor to \Z. Instead, check the last few lines where the prompt
@@ -49,15 +49,16 @@ ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|[^\S\n]*•)"
 # paren) is required so legitimate model bullets like "• Called attention
 # to the bug" don't get filtered as tool calls.
 MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+[\w-]+\.[\w-]+\("
-# Match user input: "You ..." (label style) or "› text" (Codex interactive prompt).
-# The "›[^\S\n]*\S" alternative requires a non-whitespace character on the same line
-# to distinguish user input ("› what is your role?") from the empty idle prompt ("› ").
+# Match user input: "You ..." (label style), "› text" (older Codex interactive
+# prompt), or "» text" (Codex 0.149+ interactive prompt). The prompt alternative
+# requires a non-whitespace character on the same line to distinguish user input
+# from an empty idle prompt.
 # [^\S\n] matches horizontal whitespace only (spaces/tabs), preventing the pattern
 # from crossing newline boundaries into subsequent lines.
-USER_PREFIX_PATTERN = r"^(?:You\b|›[^\S\n]*\S)"
+USER_PREFIX_PATTERN = r"^(?:You\b|[›»][^\S\n]*\S)"
 # Strict idle prompt pattern for extraction: matches empty prompt lines only.
 # Distinguishes "› " (idle) from "› user message" (user input with text).
-IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|codex>)\s*$"
+IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
@@ -283,7 +284,8 @@ STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     r"Write tests for @filename|"
     r"Improve documentation in @filename|"
     r"Run /review on my current changes|"
-    r"Use /skills to list available skills"
+    r"Use /skills to list available skills|"
+    r"Ask Codex to do anything"
     r")\s*$"
 )
 
