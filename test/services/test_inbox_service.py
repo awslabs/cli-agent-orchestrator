@@ -10,6 +10,7 @@ from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
 
@@ -22,6 +23,10 @@ def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageSta
         status=status,
         created_at=datetime.now(),
     )
+
+
+def _codex_provider():
+    return MagicMock(spec=CodexProvider)
 
 
 class TestDeliverPending:
@@ -74,11 +79,15 @@ class TestDeliverPending:
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_skips_when_processing(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+    def test_skips_when_processing(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = MagicMock()
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -209,6 +218,142 @@ class TestDeliverPending:
         # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
         assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
         assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_cached_processing_with_fresh_idle_delivers(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = _codex_provider()
+        mock_term_svc._get_direct_rendered_status.return_value = TerminalStatus.IDLE
+        mock_term_svc._confirm_input_accepted_or_resubmit.return_value = True
+
+        InboxService().deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_cached_processing_with_fresh_processing_does_not_deliver(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = _codex_provider()
+        mock_term_svc._get_direct_rendered_status.return_value = TerminalStatus.PROCESSING
+
+        InboxService().deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_not_called()
+        mock_update.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "fresh_status",
+        [
+            TerminalStatus.UNKNOWN,
+            TerminalStatus.WAITING_USER_ANSWER,
+            TerminalStatus.ERROR,
+        ],
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_cached_processing_with_unclear_or_blocked_fresh_status_does_not_deliver(
+        self,
+        mock_get,
+        mock_monitor,
+        mock_pm,
+        mock_term_svc,
+        mock_update,
+        fresh_status,
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = _codex_provider()
+        mock_term_svc._get_direct_rendered_status.return_value = fresh_status
+
+        InboxService().deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_codex_accepted_send_stays_delivered_once(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = _codex_provider()
+        mock_term_svc._confirm_input_accepted_or_resubmit.return_value = True
+
+        InboxService().deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_term_svc._confirm_input_accepted_or_resubmit.assert_called_once()
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_unconfirmed_codex_send_returns_to_pending(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update, caplog
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = _codex_provider()
+        mock_term_svc._confirm_input_accepted_or_resubmit.return_value = False
+
+        InboxService().deliver_pending("term-1")
+
+        assert mock_update.call_args_list == [
+            call(1, MessageStatus.DELIVERED),
+            call(1, MessageStatus.PENDING),
+        ]
+        assert "not accepted after bounded retries" in caplog.text
+
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_reentrant_ready_event_does_not_duplicate_delivery(
+        self, mock_get, mock_update, mock_monitor, mock_pm, mock_term_svc
+    ):
+        message = _make_message()
+        state = {"status": MessageStatus.PENDING}
+        mock_get.side_effect = lambda *_args, **_kwargs: (
+            [message] if state["status"] == MessageStatus.PENDING else []
+        )
+        mock_update.side_effect = lambda _id, status: state.update(status=status)
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = _codex_provider()
+        mock_term_svc._confirm_input_accepted_or_resubmit.return_value = True
+        service = InboxService()
+        mock_term_svc.send_input.side_effect = lambda *_args, **_kwargs: service.deliver_pending(
+            "term-1"
+        )
+
+        service.deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
 
 class TestEagerInboxDelivery:
