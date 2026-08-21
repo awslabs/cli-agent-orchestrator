@@ -88,6 +88,14 @@ const SOURCES: &[(&str, &str)] = &[
     // verb: `renderer` receives the refusal argv as an opaque `Option<String>` from `Refused` and
     // hands it straight to `ResultsPane::refuse`, so it never names, builds, or spawns it. (#321)
     ("src/renderer.rs", include_str!("../src/renderer.rs")),
+    // Added by the semantic colour layer (#556). Listed for coverage, not because a palette is a
+    // plausible place to spawn tmux — it is the least likely module in the crate. That is the
+    // reason to list it rather than an argument against: the `mod`-declaration cross-check below
+    // makes every `src/` file mandatory precisely so nobody has to be right about which files are
+    // "interesting", and the one judged uninteresting is where an unscanned hole would sit. Adding
+    // this entry was in fact FORCED by that cross-check, which reddened the moment `main.rs`
+    // declared `mod theme;` — the asymmetry the `env_guard` comment above describes, working. (#556)
+    ("src/theme.rs", include_str!("../src/theme.rs")),
 ];
 
 /// Strips `//`-comments so the needles named in prose are not counted as code.
@@ -340,10 +348,10 @@ fn no_rust_source_calls_either_backend_attach_session() {
     // (#321)
     assert_eq!(
         SOURCES.len(),
-        10,
-        "expected exactly 10 Rust sources under src/ (main, error, handoff, types, env_guard, \
-         catalog, results_pane, server, guided_flow, renderer); a new module must be added to \
-         SOURCES or this tripwire silently stops covering it"
+        11,
+        "expected exactly 11 Rust sources under src/ (main, error, handoff, types, env_guard, \
+         catalog, results_pane, server, guided_flow, renderer, theme); a new module must be added \
+         to SOURCES or this tripwire silently stops covering it"
     );
 
     let crate_root = SOURCES
