@@ -136,6 +136,11 @@
     },
     "useLegacyMcpJson": {
       "type": "boolean"
+    },
+    "x-cao-source-stem": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "description": "CAO-generated context-copy provenance. Records the original profile source stem."
     }
   },
   "additionalProperties": false
