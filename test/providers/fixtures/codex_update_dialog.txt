@@ -1,0 +1,10 @@
+OpenAI Codex (v0.142.5)
+workdir: /home/user/repo
+
+✨ Update available! 0.142.5 -> 0.144.5
+
+1. Update now (runs npm install -g @openai/codex)
+2. Skip
+3. Skip until next version
+
+Press enter to continue

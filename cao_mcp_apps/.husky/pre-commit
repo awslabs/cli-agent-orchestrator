@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Fast pre-commit gate: lint + type checks on staged changes only.
+# Target: complete the staged-change sweep in < 15s.
+cd "$(dirname "$0")/.."
+npx lint-staged

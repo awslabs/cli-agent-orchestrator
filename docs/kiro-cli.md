@@ -27,7 +27,7 @@ kiro-cli --version
 cao-server
 
 # Launch a Kiro CLI-backed session (agent profile is required)
-cao launch --agents developer --provider kiro_cli
+cao launch --agents developer --provider kiro_cli --engine v2
 ```
 
 Via HTTP API:
@@ -37,6 +37,10 @@ curl -X POST "http://localhost:9889/sessions?provider=kiro_cli&agent_profile=dev
 ```
 
 **Note**: Kiro CLI requires an agent profile — it cannot be launched without one.
+
+`--engine v2` is explicit but optional because v2 is the default. `--engine kas`
+is an opt-in Phase 0 selection; CAO capability-probes it and currently rejects it
+before terminal allocation rather than claiming runtime KAS support.
 
 ## Features
 
@@ -120,7 +124,7 @@ The profile name determines the prompt pattern used for status detection. Built-
 The provider launches using kiro-cli's default UI, with automatic `--legacy-ui` fallback:
 
 ```
-kiro-cli chat --agent developer
+kiro-cli chat --agent-engine v2 --agent developer
 ```
 
 The provider auto-detects whether the terminal is in legacy or TUI mode and uses the appropriate detection patterns. If initialization times out, the provider automatically exits and retries with `--legacy-ui`. Both TUI and legacy detection patterns are fully supported.
@@ -196,3 +200,38 @@ uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k KiroCli -o 
    - CAO's `load_agent_profile()` primarily scans for `.md` files
    - If the agent is not found, CAO gracefully falls back — kiro-cli resolves `.json` profiles natively
    - As a workaround, you can create a stub `.md` file alongside the `.json` profile
+
+## kiro-cli 2.11+ Notes
+
+Starting with kiro-cli 2.11, the TUI changed how it accepts pasted input and how
+it renders the processing indicator. CAO's kiro_cli provider handles these:
+
+- **Paste submission**: kiro 2.11 needs **two** Enter keystrokes after a
+  bracketed paste to submit the message (first Enter finalizes the paste, second
+  submits). The provider sets `paste_enter_count = 2` and `paste_submit_delay =
+  1.0s`. Older kiro versions submitted on a single Enter.
+- **Processing indicator**: kiro 2.11 replaced `"Kiro is working"` with
+  `"Thinking..."` (with an optional `"(esc to cancel)"` suffix). The provider
+  matches either variant in `TUI_PROCESSING_PATTERN`.
+- **Idle placeholder always visible**: The `"ask a question or describe a task"`
+  placeholder text remains in the raw buffer even during processing. The
+  provider's Check 6 in `get_status()` requires a bordered response box (two
+  separators + ≥2 content lines between them) before a bare idle-prompt match is
+  treated as COMPLETED — otherwise the worker would be torn down within seconds
+  of a task being sent.
+- **Spinner animation floods the event bus**: kiro 2.11's TUI redraws a braille
+  spinner (`⠋⠙⠹⠸⠼⠴⠦⠧`) roughly 10 times per second while an agent is thinking.
+  Each redraw is a separate FIFO write. Without coalescing, that produces
+  thousands of `terminal.{id}.output` events per turn — enough to overflow the
+  shared async queue and drop the worker's real state transitions along with
+  the animation noise. CAO's FIFO reader batches chunks arriving within a
+  50ms window into one publish (`_COALESCE_WINDOW`), reducing publish rate
+  ~20x during bursts. Consumers see the same bytes in the same order; only
+  the event boundaries change. If handoff/assign start hanging on a newer
+  kiro release, check whether the animation frame rate increased beyond what
+  50ms can absorb.
+
+If you upgrade kiro-cli and handoffs stop working (worker gets killed
+prematurely, or the task sits unsent in the input box), check whether the
+paste-submit behavior or processing-indicator text changed in the new version
+and update the provider constants accordingly.

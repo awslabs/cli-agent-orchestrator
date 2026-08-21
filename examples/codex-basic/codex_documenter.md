@@ -6,11 +6,8 @@ role: developer  # @builtin, fs_*, execute_bash, @cao-mcp-server. For fine-grain
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 
 skills: [technical-writing, api-documentation, user-guides, tutorials, readme-creation, developer-docs]
 experience_level: senior

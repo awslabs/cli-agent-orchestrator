@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# mock_cli — deterministic stand-in for a coding-CLI agent.
+#
+# Implements the minimum REPL surface CAO's terminal-state detection
+# needs (IDLE / PROCESSING / COMPLETED / ERROR) without any model API,
+# auth, or network call. Used by MockCliProvider for credential-free
+# orchestration tests in fork CI.
+#
+# Protocol:
+#   - Prints a banner + prompt char "❯ ", then reads stdin lines.
+#   - On each input line, sleeps --delay-ms (default 50), then echoes
+#     "> MOCK: <input>" and reprints the prompt.
+#   - Magic strings:
+#       /exit | /quit          → clean exit 0
+#       __mock_error__         → emit ERROR indicator (drives ERROR status)
+#       __mock_sleep_<N>       → sleep N seconds (exercises long PROCESSING)
+#
+# Not on PATH outside pytest — see test/conftest.py PATH-prepend.
+
+set -u
+
+DELAY_MS=50
+PROMPT=$'\xe2\x9d\xaf '   # "❯ "  — same prompt char family as Claude Code
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --delay-ms) DELAY_MS="${2:?--delay-ms requires a value}"; shift 2 ;;
+        --version)  echo "mock_cli 0.1.0"; exit 0 ;;
+        --help)
+            cat <<'EOF'
+mock_cli — deterministic CLI agent stub for CAO tests.
+
+Usage: mock_cli [--delay-ms N] [--version] [--help]
+
+This binary is intentionally minimal. See docs/mock-cli-provider.md
+in the cli-agent-orchestrator repo for the full protocol.
+EOF
+            exit 0 ;;
+        *) shift ;;   # ignore unknown flags so future providers can pass extras
+    esac
+done
+
+# Convert ms → seconds via bash arithmetic only (no awk/bc dependency).
+DELAY_SEC="0.$(printf '%03d' "$DELAY_MS")"
+
+echo "MockCli ready."
+printf '%s' "$PROMPT"
+
+while IFS= read -r line; do
+    # Strip bracketed paste markers so magic strings survive the CAO send_input path
+    # (which wraps all input in \x1b[200~...\x1b[201~).
+    clean_line="${line#$'\x1b[200~'}"
+    clean_line="${clean_line%$'\x1b[201~'}"
+
+    case "$clean_line" in
+        /exit|/quit)
+            echo "goodbye"
+            exit 0
+            ;;
+        __mock_error__)
+            echo "ERROR: mock failure injected"
+            printf '%s' "$PROMPT"
+            ;;
+        __mock_sleep_*)
+            sec="${clean_line#__mock_sleep_}"
+            sleep "$sec"
+            echo "> MOCK: slept ${sec}s"
+            printf '%s' "$PROMPT"
+            ;;
+        "")
+            # Empty input (e.g., from bracketed paste with no real text) — skip
+            printf '%s' "$PROMPT"
+            ;;
+        *)
+            sleep "$DELAY_SEC"
+            echo "> MOCK: $clean_line"
+            printf '%s' "$PROMPT"
+            ;;
+    esac
+done

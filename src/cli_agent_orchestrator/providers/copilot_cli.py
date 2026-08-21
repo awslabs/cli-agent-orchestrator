@@ -2,23 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import shlex
-import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 from libtmux.exc import LibTmuxException
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ class CopilotCliProvider(BaseProvider):
 
     def _history(self, tail_lines: Optional[int] = None) -> str:
         try:
-            raw = tmux_client.get_history(
+            raw = get_backend().get_history(
                 self.session_name, self.window_name, tail_lines=tail_lines
             )
         except (
@@ -112,14 +113,22 @@ class CopilotCliProvider(BaseProvider):
                 self._copilot_help_text_cache = ""
         return flag in self._copilot_help_text_cache
 
-    def _wait_for_shell_ready(self, timeout: float = 30.0, polling_interval: float = 0.5) -> bool:
-        """Wait for a stable non-empty shell screen using provider-safe history reads."""
+    async def _wait_for_shell_ready(
+        self, timeout: float = 30.0, polling_interval: float = 0.5
+    ) -> bool:
+        """Wait for a stable non-empty shell screen using provider-safe history reads.
+
+        issue #494: real coroutine, not sync code called from an async
+        caller (initialize()) -- the blocking history read is offloaded via
+        asyncio.to_thread and the poll delay is asyncio.sleep, so this no
+        longer blocks the shared event loop while waiting.
+        """
         start_time = time.time()
         previous_output: Optional[str] = None
         stable_reads = 0
 
         while time.time() - start_time < timeout:
-            output = self._history(tail_lines=120)
+            output = await asyncio.to_thread(self._history, tail_lines=120)
             if output and output.strip():
                 if previous_output is not None and output == previous_output:
                     stable_reads += 1
@@ -129,7 +138,7 @@ class CopilotCliProvider(BaseProvider):
                     stable_reads = 0
 
             previous_output = output
-            time.sleep(polling_interval)
+            await asyncio.sleep(polling_interval)
 
         return False
 
@@ -145,7 +154,7 @@ class CopilotCliProvider(BaseProvider):
 
         command_parts.extend(["--config-dir", str(config_dir)])
         try:
-            pane_working_dir = tmux_client.get_pane_working_directory(
+            pane_working_dir = get_backend().get_pane_working_directory(
                 self.session_name,
                 self.window_name,
             )
@@ -176,38 +185,42 @@ class CopilotCliProvider(BaseProvider):
         return shlex.join(command_parts)
 
     def _build_runtime_mcp_config(self) -> str:
-        merged_servers: dict = {}
-        venv_script = Path(sys.executable).with_name("cao-mcp-server")
-        found_script = shutil.which("cao-mcp-server")
-        mcp_args: list[str]
-        if venv_script.exists():
-            mcp_command = str(venv_script)
-            mcp_args = []
-        elif found_script:
-            mcp_command = found_script
-            mcp_args = []
-        else:
-            mcp_command = sys.executable
-            mcp_args = ["-m", "cli_agent_orchestrator.mcp_server.server"]
-
-        merged_servers["cao-mcp-server"] = {
-            "command": mcp_command,
-            "args": mcp_args,
-            "disabled": False,
-            "env": {"CAO_TERMINAL_ID": self.terminal_id},
+        # Resolve the bundled cao-mcp-server console script to a PATH-independent
+        # invocation via the shared resolver.
+        mcp_command, mcp_args = resolve_cao_mcp_command("cao-mcp-server", [])
+        merged_servers: dict = {
+            "cao-mcp-server": {
+                "command": mcp_command,
+                "args": mcp_args,
+                "disabled": False,
+                "env": {"CAO_TERMINAL_ID": self.terminal_id},
+            }
         }
         return json.dumps({"mcpServers": merged_servers}, ensure_ascii=False)
 
     def _send_enter(self) -> None:
-        tmux_client.send_special_key(self.session_name, self.window_name, "Enter")
+        get_backend().send_special_key(self.session_name, self.window_name, "Enter")
 
     def _send_key(self, key: str) -> None:
-        tmux_client.send_special_key(self.session_name, self.window_name, key)
+        get_backend().send_special_key(self.session_name, self.window_name, key)
 
-    def _accept_trust_prompts(self, timeout: float = 30.0) -> None:
+    async def _accept_trust_prompts(self, timeout: float = 30.0) -> None:
+        """Poll the pane and auto-accept Copilot's folder-trust dialogs.
+
+        issue #494: real coroutine, not sync code called from an async
+        caller. Re-entered from initialize()'s polling loop (see its
+        WAITING_USER_ANSWER branch) -- that re-entrant contract is unchanged,
+        only the blocking mechanics are: ``_history`` and the ``_send_enter``/
+        ``_send_key`` backend calls are offloaded via ``asyncio.to_thread``
+        (the two helpers themselves stay sync -- they are also called
+        directly from tests and other contexts, so wrapping happens at each
+        call site here rather than making them coroutines) and every poll
+        delay is ``asyncio.sleep``, so this no longer blocks the shared event
+        loop while polling.
+        """
         start = time.time()
         while time.time() - start < timeout:
-            raw_content = self._history(tail_lines=120)
+            raw_content = await asyncio.to_thread(self._history, tail_lines=120)
             content = raw_content.lower()
 
             if (
@@ -217,8 +230,8 @@ class CopilotCliProvider(BaseProvider):
             ):
                 # The first option is pre-selected; Enter is the most reliable
                 # accept action across Copilot builds.
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if (
@@ -227,36 +240,36 @@ class CopilotCliProvider(BaseProvider):
             ) and re.search(r"\b1\.\s*yes\b", content):
                 # Option 1 is selected by default in the trust dialog; Enter is
                 # the most reliable way to accept across Copilot builds.
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if "do you trust all the actions in this folder" in content:
-                self._send_key("y")
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_key, "y")
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if re.search(r"\[\s*y\s*/\s*n\s*]", content):
-                self._send_key("y")
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_key, "y")
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if "confirm folder trust" in content or "press enter to continue" in content:
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if re.search(WAITING_PROMPT_PATTERN, content, re.IGNORECASE):
                 # Generic waiting prompt fallback: confirm with Enter.
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if self._has_idle_prompt_near_end(raw_content.splitlines()):
                 return
-            time.sleep(1)
+            await asyncio.sleep(1)
 
         logger.warning(
             "Trust prompt handler timed out for %s:%s",
@@ -264,11 +277,23 @@ class CopilotCliProvider(BaseProvider):
             self.window_name,
         )
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
+        """Initialize the Copilot CLI provider by starting ``copilot``.
+
+        issue #494: ``self._command()`` does two blocking things --
+        ``_supports_flag`` runs a cached blocking ``subprocess.run(["copilot",
+        "--help"])`` and ``get_backend().get_pane_working_directory`` is a
+        blocking subprocess call -- and ``get_backend().send_keys`` is
+        likewise blocking. All three are offloaded via ``asyncio.to_thread``
+        so building and sending the launch command can't block the shared
+        event loop under concurrent session creation. ``status_monitor.
+        get_status`` stays inline -- it is in-memory only, no blocking I/O.
+        """
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         try:
-            shell_ready = wait_for_shell(
-                tmux_client, self.session_name, self.window_name, timeout=30.0
-            )
+            init_timeout = get_server_settings()["provider_init_timeout"]
+            shell_ready = await wait_for_shell(self.terminal_id, timeout=init_timeout)
         except Exception as exc:
             logger.warning(
                 "wait_for_shell failed for %s:%s, retrying with provider history: %s",
@@ -276,20 +301,24 @@ class CopilotCliProvider(BaseProvider):
                 self.window_name,
                 exc,
             )
-            shell_ready = self._wait_for_shell_ready(timeout=30.0)
+            init_timeout = get_server_settings()["provider_init_timeout"]
+            shell_ready = await self._wait_for_shell_ready(timeout=init_timeout)
 
         if not shell_ready:
-            raise TimeoutError("Shell initialization timed out after 30 seconds")
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
-        tmux_client.send_keys(self.session_name, self.window_name, self._command())
+        command = await asyncio.to_thread(self._command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         deadline = time.time() + 60.0
-        self._accept_trust_prompts(timeout=10.0)
+        await self._accept_trust_prompts(timeout=10.0)
         while time.time() < deadline:
-            status = self.get_status()
+            status = status_monitor.get_status(self.terminal_id)
             if status == TerminalStatus.WAITING_USER_ANSWER:
-                self._accept_trust_prompts(timeout=5.0)
-                time.sleep(1.0)
+                await self._accept_trust_prompts(timeout=5.0)
+                await asyncio.sleep(1.0)
                 continue
             if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
                 # Return on the first ready state like the other providers.
@@ -298,7 +327,7 @@ class CopilotCliProvider(BaseProvider):
                 # handling before the terminal is actually usable.
                 self._initialized = True
                 return True
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
         raise TimeoutError("Copilot initialization timed out after 60 seconds")
 
@@ -415,11 +444,27 @@ class CopilotCliProvider(BaseProvider):
             break
         return trimmed
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        effective_tail_lines = tail_lines if tail_lines is not None else 220
-        output = self._history(tail_lines=effective_tail_lines)
+    def get_status(self, output: str) -> TerminalStatus:
+        # Native status (herdr): trust the backend's agent state when available,
+        # before the tmux capture-pane fallback below (which is a tmux-only path).
+        native = self._resolve_native_status(output)
+        if native is not None:
+            return native
+
+        # For TUI apps, the raw FIFO buffer may contain only ANSI escapes.
+        # Fall back to tmux capture-pane when the buffer has no visible text.
+        cleaned = self._clean(output) if output else ""
+        if not cleaned.strip():
+            try:
+                output = self._history()
+            except Exception:
+                pass
+        if not output or not output.strip():
+            return TerminalStatus.UNKNOWN
+
+        output = self._clean(output)
         if not output.strip():
-            return TerminalStatus.PROCESSING
+            return TerminalStatus.UNKNOWN
 
         lines = output.splitlines()
         has_idle_prompt_at_end = self._has_idle_prompt_near_end(lines)

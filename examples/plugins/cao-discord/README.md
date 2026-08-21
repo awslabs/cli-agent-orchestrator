@@ -33,7 +33,7 @@ CAO_DISCORD_TIMEOUT_SECONDS=5.0
    ```bash
    cao-server
    ```
-5. Launch a multi-agent workflow such as `cao flow ...` and watch the Discord channel for forwarded inter-agent messages.
+5. Launch a scheduled flow such as `cao schedule run ...` and watch the Discord channel for forwarded inter-agent messages.
 
 ## Configuration
 

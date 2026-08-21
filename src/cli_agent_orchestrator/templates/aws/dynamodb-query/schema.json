@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dynamodb-query",
+  "description": "Query DynamoDB tables by partition key",
+  "type": "object",
+  "properties": {
+    "profile": {
+      "type": "string",
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "region": {
+      "type": "string",
+      "description": "AWS region",
+      "pattern": "^[a-z]{2}-[a-z]+-[0-9]+$"
+    },
+    "table_name": {
+      "type": "string",
+      "description": "DynamoDB table name",
+      "pattern": "^[a-zA-Z0-9._-]+$"
+    },
+    "partition_key_name": {
+      "type": "string",
+      "description": "Partition key attribute name",
+      "pattern": "^[a-zA-Z0-9_#.-]+$"
+    },
+    "partition_key_value": {
+      "type": "string",
+      "description": "Value to query",
+      "pattern": "^[a-zA-Z0-9_.:-]+$"
+    },
+    "partition_key_type": {
+      "type": "string",
+      "description": "DynamoDB type",
+      "enum": ["S", "N", "B"]
+    },
+    "limit": {
+      "type": "integer",
+      "description": "Max items to return",
+      "minimum": 1,
+      "default": 1
+    }
+  },
+  "required": ["profile", "region", "table_name", "partition_key_name", "partition_key_value", "partition_key_type"],
+  "additionalProperties": false
+}

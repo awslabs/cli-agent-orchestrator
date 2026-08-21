@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>How CAO Works — Interactive Course</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="../course-assets/styles.css">
+
+  <style>
+    :root {
+      --color-accent:       #2A7B9B;
+      --color-accent-hover: #1F6280;
+      --color-accent-light: #E4F2F7;
+      --color-accent-muted: #5A9DB8;
+    }
+    /* Color flow label to match the active actor (no red) */
+    /* Tint the flow step label to match whichever actor is active. */
+    .flow-animation:has(#flow-you.active) .flow-step-label { color: #3b82f6; }
+    .flow-animation:has(#flow-server.active) .flow-step-label { color: var(--color-actor-2); }
+    .flow-animation:has(#flow-supervisor.active) .flow-step-label { color: var(--color-actor-3); }
+    .flow-animation:has(#flow-workers.active) .flow-step-label { color: var(--color-actor-5); }
+    .flow-step-label {
+      font-weight: 600;
+      transition: color 0.3s ease;
+    }
+
+    /* Make glossary terms more visible */
+    .term {
+      border-bottom: 2px dashed var(--color-accent) !important;
+      color: var(--color-accent) !important;
+      font-weight: 500;
+    }
+    .term:hover {
+      background: var(--color-accent-light);
+      border-radius: 2px;
+    }
+
+    /* Add spacing between card titles and body text */
+    .pattern-card h3 {
+      margin-bottom: var(--space-3);
+      padding-bottom: var(--space-2);
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    /* Screen headings: larger, colored, with space below */
+    .screen h2 {
+      color: var(--color-accent);
+      margin-bottom: var(--space-4);
+      padding-bottom: var(--space-2);
+      border-bottom: 2px solid var(--color-accent-light);
+    }
+
+    /* Prevent vertical text in callouts and cards */
+    .callout, .callout p, .callout strong,
+    .pattern-card, .pattern-card p,
+    .quiz-container, .quiz-question {
+      word-break: break-word;
+      overflow-wrap: break-word;
+    }
+    .callout code, .pattern-card code, .quiz-question code {
+      word-break: break-all;
+    }
+    /* Keep chip appearance after drop */
+    .dnd-zone-target[data-placed] {
+      background: var(--color-accent-light);
+      border: 2px solid var(--color-accent-muted);
+      border-radius: var(--radius-sm);
+      padding: var(--space-2) var(--space-3);
+      font-weight: 500;
+      color: var(--color-accent-hover);
+    }
+    .dnd-zone-target.correct-placed[data-placed] {
+      border-color: var(--color-success);
+      background: var(--color-success-light);
+      color: var(--color-success);
+    }
+    .dnd-zone-target.incorrect-placed[data-placed] {
+      border-color: var(--color-error);
+      background: var(--color-error-light);
+      color: var(--color-error);
+    }
+  </style>
+
+  <script src="../course-assets/main.js" defer></script>
+</head>
+<body>
+
+  <nav class="nav" id="nav">
+    <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+    <div class="nav-inner">
+      <span class="nav-title">How CAO Works</span>
+      <div class="nav-dots" id="nav-dots" role="tablist">
+        <button class="nav-dot" data-target="module-1" data-tooltip="What CAO Does" role="tab" aria-label="Module 1: What CAO Does"></button>
+        <button class="nav-dot" data-target="module-2" data-tooltip="The Cast of Characters" role="tab" aria-label="Module 2: The Cast of Characters"></button>
+        <button class="nav-dot" data-target="module-3" data-tooltip="How Agents Talk" role="tab" aria-label="Module 3: How Agents Talk"></button>
+        <button class="nav-dot" data-target="module-4" data-tooltip="Running Your Own Agents" role="tab" aria-label="Module 4: Running Your Own Agents"></button>
+      </div>
+    </div>
+  </nav>
+
+  <main id="main">

@@ -1,0 +1,867 @@
+"""Unit tests for the workflow run engine (issue #312, Bolt 3 / N5).
+
+Covers the load-bearing algorithm from ``functional-design/business-logic-model.md``:
+the two nested recovery loops (Traces A–E, §2a), determinism, input-validation
+before any terminal is created, ``retries: 0``, ``_substitute`` (happy + unknown-ref
++ no-eval), cancel (boundary skip / 409 / 404), ``get_run_status`` (snapshot / 404 /
+no-secret-leak), and the reserved seams raising ``NotBuiltYetError``.
+
+``run_agent_step`` and ``step_output_store`` are mocked — no real terminals.
+"""
+
+from __future__ import annotations
+
+from typing import List
+from unittest.mock import AsyncMock
+
+import pytest
+
+from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
+from cli_agent_orchestrator.models.workflow import (
+    NotBuiltYetError,
+    RunState,
+    StepState,
+    WorkflowSpec,
+    WorkflowStep,
+)
+from cli_agent_orchestrator.models.workflow_runtime import StepOutputRecord
+from cli_agent_orchestrator.services import workflow_service as ws
+from cli_agent_orchestrator.services.agent_step import StepExecutionError
+
+_SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+
+
+@pytest.fixture(autouse=True)
+def _clean_registry(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Each test starts with an empty run registry + output store.
+
+    ``DATABASE_FILE`` is pointed at an empty temp path so the engine's
+    best-effort journal write-through (and start_run's journal dup-check)
+    never touches — or reads — the developer's real database.
+    """
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.constants.DATABASE_FILE", tmp_path / "wf.db", raising=True
+    )
+    ws.run_registry.clear()
+    ws._active_drives.clear()
+    ws.step_output_store._store.clear()
+    yield
+    ws.run_registry.clear()
+    ws._active_drives.clear()
+    ws.step_output_store._store.clear()
+
+
+def _ok(terminal_id: str = "t1") -> AgentStepResult:
+    return AgentStepResult(
+        terminal_id=terminal_id, last_message="done", status=TerminalStatus.COMPLETED
+    )
+
+
+def _spec(
+    *,
+    name: str = "wf",
+    schema=None,
+    retries=None,
+    on_failure=None,
+    mode: str = "sequential",
+    steps=None,
+) -> WorkflowSpec:
+    if steps is None:
+        steps = [
+            WorkflowStep(
+                id="s1",
+                provider="claude_code",
+                agent="dev",
+                prompt="go",
+                output_schema=schema,
+                retries=retries,
+                on_failure=on_failure,
+            )
+        ]
+    return WorkflowSpec(name=name, mode=mode, steps=steps)
+
+
+def _put_valid(run_id: str, step_id: str = "s1") -> None:
+    ws.step_output_store.put(
+        run_id,
+        step_id,
+        StepOutputRecord(
+            run_id=run_id,
+            step_id=step_id,
+            output={"answer": "42"},
+            validated=True,
+            errors=[],
+            state=StepState.COMPLETED,
+        ),
+    )
+
+
+def _put_invalid(run_id: str, step_id: str = "s1") -> None:
+    ws.step_output_store.put(
+        run_id,
+        step_id,
+        StepOutputRecord(
+            run_id=run_id,
+            step_id=step_id,
+            output={"wrong": 1},
+            validated=False,
+            errors=["bad"],
+            state=StepState.COMPLETED_UNVALIDATED,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# §2a — Worked traces of the two nested loops
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_trace_a_clean_run(monkeypatch):
+    """Trace A: attempt 1 COMPLETED + validated output -> COMPLETED, attempts=1."""
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+
+    # First call records a valid output so _collect_structured_output validates.
+    async def _side(*a, **kw):
+        _put_valid(kw["env_vars"]["CAO_WORKFLOW_RUN_ID"], kw["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        return _ok()
+
+    mock.side_effect = _side
+
+    res = await ws.start_run(_spec(schema=_SCHEMA), {}, "runA")
+    assert res.state == RunState.COMPLETED
+    assert res.steps[0].state == StepState.COMPLETED
+    assert res.steps[0].attempts == 1
+    assert res.steps[0].output == {"answer": "42"}
+    assert mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_workflow_step_forwards_explicit_engine(monkeypatch):
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    spec = _spec(
+        steps=[
+            WorkflowStep(
+                id="s1",
+                provider="kiro_cli",
+                agent="dev",
+                prompt="go",
+                engine="kas",
+            )
+        ]
+    )
+
+    await ws.start_run(spec, {}, "engine-run")
+
+    assert mock.await_args.kwargs["engine"] == "kas"
+
+
+@pytest.mark.asyncio
+async def test_trace_b_worker_crashes_twice_then_succeeds(monkeypatch):
+    """Trace B: two StepExecutionErrors, third attempt COMPLETED -> attempts=3."""
+    calls = {"n": 0}
+
+    async def _side(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise StepExecutionError("boom", kind="error", terminal_id="tx")
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    res = await ws.start_run(_spec(), {}, "runB")  # no schema -> free-form COMPLETED
+    assert res.state == RunState.COMPLETED
+    assert res.steps[0].state == StepState.COMPLETED
+    assert res.steps[0].attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_trace_c_reprompt_then_crash_consumes_attempt(monkeypatch):
+    """Trace C: attempt1 COMPLETED+invalid -> reprompt RAISES -> consumes attempt;
+    attempt2 COMPLETED, reprompted already -> COMPLETED_UNVALIDATED."""
+    calls = {"n": 0}
+
+    async def _side(*a, **kw):
+        calls["n"] += 1
+        run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        step_id = kw["env_vars"]["CAO_WORKFLOW_STEP_ID"]
+        if calls["n"] == 1:
+            _put_invalid(run_id, step_id)  # primary run lands an invalid record
+            return _ok()
+        if calls["n"] == 2:
+            raise StepExecutionError("reprompt crash", kind="error", terminal_id="tr")
+        # attempt 2's primary run
+        _put_invalid(run_id, step_id)
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    res = await ws.start_run(_spec(schema=_SCHEMA), {}, "runC")
+    assert res.state == RunState.COMPLETED
+    assert res.steps[0].state == StepState.COMPLETED_UNVALIDATED
+    assert res.steps[0].attempts == 2  # reprompt crash consumed an attempt
+
+
+@pytest.mark.asyncio
+async def test_trace_d_schema_never_met(monkeypatch):
+    """Trace D: COMPLETED+invalid, reprompt OK but still invalid -> UNVALIDATED,
+    one attempt (the reprompt is the inner loop, not a retry)."""
+
+    async def _side(*a, **kw):
+        run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        step_id = kw["env_vars"]["CAO_WORKFLOW_STEP_ID"]
+        _put_invalid(run_id, step_id)
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    res = await ws.start_run(_spec(schema=_SCHEMA), {}, "runD")
+    assert res.state == RunState.COMPLETED
+    assert res.steps[0].state == StepState.COMPLETED_UNVALIDATED
+    assert res.steps[0].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_trace_d_missing_after_reprompt_is_unvalidated_not_failure(monkeypatch):
+    """Decision note D1: a MISSING return after the reprompt is == invalid ->
+    COMPLETED_UNVALIDATED, NOT a failure (never raises through B3-BR-4)."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    # Never put anything into the store -> record stays missing.
+    res = await ws.start_run(_spec(schema=_SCHEMA), {}, "runDm")
+    assert res.state == RunState.COMPLETED
+    assert res.steps[0].state == StepState.COMPLETED_UNVALIDATED
+    assert res.steps[0].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_trace_e_all_attempts_crash_halt(monkeypatch):
+    """Trace E: attempts 1..4 all crash -> FAILED; on_failure=halt -> run FAILED."""
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(side_effect=StepExecutionError("dead", kind="timeout", terminal_id="td")),
+    )
+    res = await ws.start_run(_spec(on_failure="halt"), {}, "runE")
+    assert res.state == RunState.FAILED
+    assert res.steps[0].state == StepState.FAILED
+    assert res.steps[0].attempts == 4  # default 3 retries -> 4 attempts
+    assert res.steps[0].error is not None
+
+
+# ---------------------------------------------------------------------------
+# on_failure halt / continue + _skip_remaining
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_on_failure_halt_skips_successors(monkeypatch):
+    """A halted step stays FAILED; its un-run successors -> SKIPPED."""
+
+    async def _side(*a, **kw):
+        step_id = kw["env_vars"]["CAO_WORKFLOW_STEP_ID"]
+        if step_id == "s1":
+            raise StepExecutionError("dead", kind="error", terminal_id="t")
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    steps = [
+        WorkflowStep(id="s1", provider="p", agent="g", prompt="a", on_failure="halt", retries=0),
+        WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
+    ]
+    res = await ws.start_run(_spec(steps=steps), {}, "runHalt")
+    assert res.state == RunState.FAILED
+    states = {s.id: s.state for s in res.steps}
+    assert states["s1"] == StepState.FAILED
+    assert states["s2"] == StepState.SKIPPED
+
+
+@pytest.mark.asyncio
+async def test_on_failure_continue_run_completes(monkeypatch):
+    """on_failure=continue: failed step recorded FAILED, run still COMPLETED."""
+
+    async def _side(*a, **kw):
+        step_id = kw["env_vars"]["CAO_WORKFLOW_STEP_ID"]
+        if step_id == "s1":
+            raise StepExecutionError("dead", kind="error", terminal_id="t")
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    steps = [
+        WorkflowStep(
+            id="s1", provider="p", agent="g", prompt="a", on_failure="continue", retries=0
+        ),
+        WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
+    ]
+    res = await ws.start_run(_spec(steps=steps), {}, "runCont")
+    assert res.state == RunState.COMPLETED
+    states = {s.id: s.state for s in res.steps}
+    assert states["s1"] == StepState.FAILED
+    assert states["s2"] == StepState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_retries_zero_one_attempt(monkeypatch):
+    """retries:0 -> exactly one attempt, no retry."""
+    mock = AsyncMock(side_effect=StepExecutionError("x", kind="error", terminal_id="t"))
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    res = await ws.start_run(_spec(retries=0, on_failure="halt"), {}, "runR0")
+    assert res.steps[0].attempts == 1
+    assert mock.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Determinism
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_determinism_same_spec_same_order(monkeypatch):
+    """Same spec -> identical step order, repeated (B3-RD-1)."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    steps = [
+        WorkflowStep(id="alpha", provider="p", agent="g", prompt="a"),
+        WorkflowStep(id="beta", provider="p", agent="g", prompt="b"),
+        WorkflowStep(id="gamma", provider="p", agent="g", prompt="c"),
+    ]
+    order1 = [s.id for s in ws._topological_order(_spec(steps=steps))]
+    order2 = [s.id for s in ws._topological_order(_spec(steps=steps))]
+    assert order1 == order2 == ["alpha", "beta", "gamma"]
+
+
+# ---------------------------------------------------------------------------
+# Input validation BEFORE any terminal
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_missing_required_input_no_terminal(monkeypatch):
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    spec = _spec()
+    spec.inputs = {"topic": InputDecl(type="string", required=True)}
+    with pytest.raises(ValueError, match="missing required input 'topic'"):
+        await ws.start_run(spec, {}, "runMiss")
+    assert mock.await_count == 0  # NO terminal created
+
+
+@pytest.mark.asyncio
+async def test_type_mismatch_input_no_terminal(monkeypatch):
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    spec = _spec()
+    spec.inputs = {"count": InputDecl(type="int", required=True)}
+    with pytest.raises(ValueError, match="must be an int"):
+        await ws.start_run(spec, {"count": "not-an-int"}, "runType")
+    assert mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_input_rejected(monkeypatch):
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    with pytest.raises(ValueError, match="unknown input 'bogus'"):
+        await ws.start_run(_spec(), {"bogus": 1}, "runUnk")
+    assert mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mid_run_engine_error_finalizes_record_failed(monkeypatch):
+    """B2: a WorkflowEngineError raised by _substitute mid-run (a bad template
+    reference, raised OUTSIDE _run_step's StepExecutionError guard) must propagate
+    to the boundary AND leave the registered record in a terminal FAILED state with
+    finished_at set — never stranded in RUNNING (domain-entities lifecycle / RD-3)."""
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+
+    # Step prompt references an upstream step that never ran -> _substitute raises
+    # WorkflowEngineError. This passes input validation (no inputs declared), so the
+    # record IS registered before _run_step calls _substitute.
+    step = WorkflowStep(
+        id="s1",
+        provider="claude_code",
+        agent="dev",
+        prompt="use {{steps.ghost.output.x}}",
+    )
+    with pytest.raises(ws.WorkflowEngineError, match="produced no output"):
+        await ws.start_run(_spec(steps=[step]), {}, "runEngineErr")
+
+    # The worker was never reached (the error is raised before run_agent_step).
+    assert mock.await_count == 0
+    # The registered record settled to a terminal FAILED state, not RUNNING.
+    rec = ws.run_registry["runEngineErr"]
+    assert rec.state == RunState.FAILED
+    assert rec.finished_at is not None
+    assert rec.current_step_id is None
+    assert rec.step_states["s1"].state == StepState.FAILED
+
+
+# ---------------------------------------------------------------------------
+# _substitute
+# ---------------------------------------------------------------------------
+def _record_with(inputs=None, outputs=None) -> ws.RunRecord:
+    spec = _spec()
+    rec = ws.RunRecord(
+        run_id="r",
+        workflow_name="wf",
+        spec=spec,
+        inputs=inputs or {},
+        step_states={"s1": ws.StepRunState(step_id="s1")},
+    )
+    if outputs:
+        for sid, out in outputs.items():
+            st = ws.StepRunState(step_id=sid)
+            st.output = StepOutputRecord(
+                run_id="r", step_id=sid, output=out, validated=True, state=StepState.COMPLETED
+            )
+            rec.step_states[sid] = st
+    return rec
+
+
+def test_substitute_resolves_input_and_step_output():
+    rec = _record_with(inputs={"topic": "cats"}, outputs={"prior": {"summary": "purr"}})
+    out = ws._substitute(
+        "topic={{workflow.inputs.topic}} prior={{steps.prior.output.summary}}", rec
+    )
+    assert out == "topic=cats prior=purr"
+
+
+def test_substitute_unknown_input_raises_engine_error():
+    rec = _record_with(inputs={})
+    with pytest.raises(ws.WorkflowEngineError, match="unknown input"):
+        ws._substitute("{{workflow.inputs.nope}}", rec)
+
+
+def test_substitute_missing_upstream_output_raises_engine_error():
+    rec = _record_with()
+    with pytest.raises(ws.WorkflowEngineError, match="produced no output"):
+        ws._substitute("{{steps.unrun.output.field}}", rec)
+
+
+def test_substitute_unsupported_reference_raises():
+    rec = _record_with()
+    with pytest.raises(ws.WorkflowEngineError, match="unsupported template reference"):
+        ws._substitute("{{os.environ.SECRET}}", rec)
+
+
+def test_substitute_no_eval_of_input_value():
+    """A {...}-bearing input VALUE is substituted literally, never interpreted."""
+    rec = _record_with(inputs={"x": "{evil.format} {{nested}}"})
+    # The placeholder resolves to the raw value; the value's own braces are NOT
+    # re-evaluated (no recursive .format / eval).
+    out = ws._substitute("v={{workflow.inputs.x}}", rec)
+    assert out == "v={evil.format} {{nested}}"
+
+
+# ---------------------------------------------------------------------------
+# cancel_run
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_cancel_at_boundary_skips_remaining(monkeypatch):
+    """Cancel observed at a step boundary -> CANCELLED + remaining PENDING SKIPPED."""
+
+    async def _side(*a, **kw):
+        # Cancel the run while step s1 is "in flight" so the flag is seen at the
+        # NEXT boundary.
+        ws.cancel_run("runCancel")
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    steps = [
+        WorkflowStep(id="s1", provider="p", agent="g", prompt="a"),
+        WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
+    ]
+    res = await ws.start_run(_spec(steps=steps), {}, "runCancel")
+    assert res.state == RunState.CANCELLED
+    states = {s.id: s.state for s in res.steps}
+    assert states["s1"] == StepState.COMPLETED  # in-flight step ran to completion
+    assert states["s2"] == StepState.SKIPPED
+
+
+def test_cancel_unknown_run_404():
+    with pytest.raises(KeyError):
+        ws.cancel_run("does-not-exist")
+
+
+@pytest.mark.asyncio
+async def test_cancel_terminal_run_conflict(monkeypatch):
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    await ws.start_run(_spec(), {}, "runDone")
+    with pytest.raises(ValueError, match="already completed"):
+        ws.cancel_run("runDone")
+
+
+@pytest.mark.asyncio
+async def test_cancel_interrupts_in_flight_wait_converges_cancelled(monkeypatch):
+    """#409b: a run blocked inside an in-flight (hung) step wait converges to
+    CANCELLED when cancelled — not observed only at the next boundary.
+
+    The mocked run_agent_step blocks on the run's cancel_event exactly as the
+    real _wait_for_completion does, then raises StepCancelledError. The engine
+    must settle the run CANCELLED (not FAILED, not COMPLETED) and NOT consume the
+    retry budget (attempts stays 1)."""
+    from cli_agent_orchestrator.services.agent_step import StepCancelledError
+
+    async def _hang_until_cancelled(*a, **kw):
+        run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        cancel_event = kw["cancel_event"]
+        # Fire the cancel from "outside" once the step is in-flight, then honor it
+        # exactly as the real substrate would (interrupt the wait, raise).
+        ws.cancel_run(run_id)
+        await cancel_event.wait()
+        raise StepCancelledError(terminal_id="term-hung")
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_hang_until_cancelled))
+    steps = [
+        WorkflowStep(id="s1", provider="p", agent="g", prompt="a", retries=3),
+        WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
+    ]
+    res = await ws.start_run(_spec(steps=steps), {}, "runHang")
+
+    assert res.state == RunState.CANCELLED
+    states = {s.id: s.state for s in res.steps}
+    # Interrupted step is SKIPPED (not FAILED, not stuck RUNNING) and its retry
+    # budget was NOT consumed — a cancel is not a run-failure.
+    assert states["s1"] == StepState.SKIPPED
+    assert states["s2"] == StepState.SKIPPED
+    assert res.steps[0].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_sets_event_on_record(monkeypatch):
+    """cancel_run fires the record's cancel_event (the interrupt seam) in addition
+    to flagging cancelled — so an in-flight wait can observe it immediately."""
+
+    async def _side(*a, **kw):
+        run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        rec = ws.run_registry[run_id]
+        assert not rec.cancel_event.is_set()
+        ws.cancel_run(run_id)
+        assert rec.cancelled is True
+        assert rec.cancel_event.is_set()  # the interrupt seam fired
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    res = await ws.start_run(_spec(), {}, "runEvt")
+    assert res.state == RunState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_double_cancel_is_idempotent(monkeypatch):
+    """Cancelling twice while a step is in flight must not raise (setting an
+    already-set Event is a no-op) and still converges CANCELLED."""
+
+    async def _side(*a, **kw):
+        run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        ws.cancel_run(run_id)
+        ws.cancel_run(run_id)  # second cancel — must be a no-op, never raise
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    steps = [
+        WorkflowStep(id="s1", provider="p", agent="g", prompt="a"),
+        WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
+    ]
+    res = await ws.start_run(_spec(steps=steps), {}, "runDbl")
+    assert res.state == RunState.CANCELLED
+
+
+# ---------------------------------------------------------------------------
+# get_run_status
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_get_run_status_snapshot_shape(monkeypatch):
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    await ws.start_run(_spec(), {}, "runStat")
+    status = ws.get_run_status("runStat")
+    assert status.run_id == "runStat"
+    assert status.state == RunState.COMPLETED
+    assert [s.id for s in status.steps] == ["s1"]
+    assert status.steps[0].state == StepState.COMPLETED
+
+
+def test_get_run_status_unknown_404():
+    with pytest.raises(KeyError):
+        ws.get_run_status("nope")
+
+
+@pytest.mark.asyncio
+async def test_get_run_status_carries_no_output_or_prompt(monkeypatch):
+    """B3-SD-3: the snapshot DTO carries no per-step output/prompt fields."""
+
+    async def _side(*a, **kw):
+        _put_valid("runLeak", "s1")
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    await ws.start_run(_spec(schema=_SCHEMA), {}, "runLeak")
+    status = ws.get_run_status("runLeak")
+    step_fields = set(status.steps[0].model_dump().keys())
+    assert step_fields == {"id", "state", "attempts"}
+    assert "output" not in status.model_dump()
+
+
+# ---------------------------------------------------------------------------
+# Reserved seams
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_reserved_mode_raises_not_built_yet(monkeypatch):
+    """A mode: parallel spec -> NotBuiltYetError, NOT a silent sequential run."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    spec = _spec(mode="parallel")
+    with pytest.raises(NotBuiltYetError):
+        await ws.start_run(spec, {}, "runPar")
+
+
+@pytest.mark.asyncio
+async def test_reserved_loop_mode_raises(monkeypatch):
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    spec = _spec(mode="loop")
+    with pytest.raises(NotBuiltYetError):
+        await ws.start_run(spec, {}, "runLoop")
+
+
+def test_reserved_seam_methods_raise():
+    # ``resume_from_last_completed`` is NO LONGER reserved as of Bolt 4 / N6 — it is
+    # un-reserved here and exercised by test_workflow_journal_resume.py. The
+    # remaining parallel/loop/guard seams stay reserved (N7/N8).
+    with pytest.raises(NotBuiltYetError):
+        ws._run_parallel(None, None)
+    with pytest.raises(NotBuiltYetError):
+        ws._run_loop(None, None)
+    with pytest.raises(NotBuiltYetError):
+        ws._eval_on_stall(None, None)
+    with pytest.raises(NotBuiltYetError):
+        ws._eval_on_no_progress(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_run_id_conflict(monkeypatch):
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    await ws.start_run(_spec(), {}, "dup")
+    with pytest.raises(KeyError, match="already exists"):
+        await ws.start_run(_spec(), {}, "dup")
+
+
+@pytest.mark.asyncio
+async def test_bad_run_id_rejected(monkeypatch):
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    with pytest.raises(ValueError):
+        await ws.start_run(_spec(), {}, "../escape")
+
+
+# ---------------------------------------------------------------------------
+# Unit A — _validate_inputs generalized over both spec tiers (ADR-1, BR-A8)
+# ---------------------------------------------------------------------------
+class _FakeScriptSpecInputs:
+    """Minimal duck-typed spec exposing only ``.inputs`` (the Protocol surface)."""
+
+    def __init__(self, inputs):
+        self.inputs = inputs
+
+
+def test_validate_inputs_scriptspec_fills_defaults_and_types():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs(
+        {
+            "topic": InputDecl(type="string", required=True),
+            "count": InputDecl(type="int", default=5),
+        }
+    )
+    resolved = ws._validate_inputs(spec, {"topic": "birds"})
+    # Default filled for the omitted, non-required input; provided value kept.
+    assert resolved == {"topic": "birds", "count": 5}
+
+
+def test_validate_inputs_scriptspec_rejects_undeclared():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs({"topic": InputDecl(type="string")})
+    with pytest.raises(ValueError, match="unknown input 'bogus'"):
+        ws._validate_inputs(spec, {"topic": "x", "bogus": 1})
+
+
+def test_validate_inputs_scriptspec_type_mismatch_rejected():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs({"count": InputDecl(type="int", required=True)})
+    with pytest.raises(ValueError, match="must be an int"):
+        ws._validate_inputs(spec, {"count": "not-an-int"})
+
+
+def test_validate_inputs_scriptspec_missing_required_rejected():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs({"topic": InputDecl(type="string", required=True)})
+    with pytest.raises(ValueError, match="missing required input 'topic'"):
+        ws._validate_inputs(spec, {})
+
+
+def test_validate_inputs_yaml_behavior_unchanged_regression():
+    """BR-A8/REL-A4: generalizing the signature must not change WorkflowSpec
+    (YAML) validation — a real WorkflowSpec resolves exactly as before."""
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _spec()
+    spec.inputs = {
+        "topic": InputDecl(type="string", required=True),
+        "count": InputDecl(type="int", default=7),
+        "flag": InputDecl(type="bool", default=True),
+    }
+    resolved = ws._validate_inputs(spec, {"topic": "t"})
+    assert resolved == {"topic": "t", "count": 7, "flag": True}
+    # And the same rejection semantics hold for the YAML tier.
+    with pytest.raises(ValueError, match="unknown input"):
+        ws._validate_inputs(spec, {"topic": "t", "extra": 1})
+
+
+# ---------------------------------------------------------------------------
+# U2 (issue #505) — start_run_prepared: the drive-only YAML async entry (ADR-3)
+# ---------------------------------------------------------------------------
+def _prepared_record(run_id: str, spec=None) -> "ws.RunRecord":
+    """Build a RunRecord exactly as the async submit handler (C1) does at step 6."""
+    spec = spec or _spec()
+    return ws.RunRecord(
+        run_id=run_id,
+        workflow_name=spec.name,
+        spec=spec,
+        inputs={},
+        state=RunState.RUNNING,
+        current_step_id=None,
+        cancelled=False,
+        step_states={step.id: ws.StepRunState(step_id=step.id) for step in spec.steps},
+        started_at=ws._now(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_run_prepared_drives_to_terminal(monkeypatch):
+    """CR-2/FR-2.6: the prepared entry drives an already-registered record to a
+    terminal state via the SAME shared drive loop as a blocking run."""
+
+    async def _side(*a, **kw):
+        _put_valid(kw["env_vars"]["CAO_WORKFLOW_RUN_ID"], kw["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    record = _prepared_record("run-prep", _spec(schema=_SCHEMA))
+    # C1 registered the record BEFORE scheduling the drive; the prepared entry
+    # does NOT register it.
+    ws.run_registry["run-prep"] = record
+
+    res = await ws.start_run_prepared(record)
+    assert res.state == RunState.COMPLETED
+    assert res.steps[0].state == StepState.COMPLETED
+    # DR-2: liveness mark cleared on exit (finally discard).
+    assert "run-prep" not in ws._active_drives
+
+
+@pytest.mark.asyncio
+async def test_start_run_prepared_does_not_readmit_or_reinsert(monkeypatch):
+    """DR-1/DR-2 (the double-admission regression): the prepared entry must NOT call
+    ``_check_run_id_available`` (which would 409 on the already-registered id) nor
+    ``_journal_insert_run`` (which would IntegrityError on the already-journaled
+    id). Contrast: re-entering blocking ``start_run`` WOULD 409 here."""
+
+    async def _side(*a, **kw):
+        _put_valid(kw["env_vars"]["CAO_WORKFLOW_RUN_ID"], kw["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    def _fail_admission(run_id):
+        raise AssertionError("start_run_prepared must not call _check_run_id_available")
+
+    def _fail_insert(record):
+        raise AssertionError("start_run_prepared must not re-insert the run row")
+
+    monkeypatch.setattr(ws, "_check_run_id_available", _fail_admission)
+    monkeypatch.setattr(ws, "_journal_insert_run", _fail_insert)
+
+    record = _prepared_record("run-prep-2", _spec(schema=_SCHEMA))
+    ws.run_registry["run-prep-2"] = record  # already registered by C1
+
+    res = await ws.start_run_prepared(record)
+    assert res.state == RunState.COMPLETED
+
+    # Control: restore the real admission and prove that re-entering the blocking
+    # path on the same already-registered id WOULD raise KeyError (-> 409). This is
+    # exactly the double-admission the prepared entry avoids by skipping the check.
+    monkeypatch.undo()
+    with pytest.raises(KeyError):
+        ws._check_run_id_available("run-prep-2")
+
+
+@pytest.mark.asyncio
+async def test_start_run_prepared_marks_then_clears_active_drive(monkeypatch):
+    """The run is present in ``_active_drives`` WHILE driving and absent after —
+    the liveness truth the crash-remnant / resume logic relies on."""
+    observed = {"live_during_drive": False}
+
+    async def _side(*a, **kw):
+        observed["live_during_drive"] = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"] in ws._active_drives
+        _put_valid(kw["env_vars"]["CAO_WORKFLOW_RUN_ID"], kw["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    record = _prepared_record("run-prep-3", _spec(schema=_SCHEMA))
+    ws.run_registry["run-prep-3"] = record
+    await ws.start_run_prepared(record)
+    assert observed["live_during_drive"] is True
+    assert "run-prep-3" not in ws._active_drives
+
+
+# ---------------------------------------------------------------------------
+# U9 (issue #505): the drive's journal write-through supplies the substrate that
+# ``_resolve_error_kind`` infers over on the journal-only path (JP-1). These tests
+# drive a real run to a terminal FAILED/CANCELLED state, then resolve the kind from
+# get_run + get_steps alone (empty-registry read) — proving the service drive and
+# U9's read-surface resolver agree end to end.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_drive_failure_journals_error_that_resolver_infers_timeout(monkeypatch):
+    """U9 (RP-3 / JP-1): a run whose step fails with a timeout-flavored error journals
+    that error text; ``_resolve_error_kind`` over the journal rows infers 'timeout'."""
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+    from cli_agent_orchestrator.services import workflow_journal
+
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(
+            side_effect=StepExecutionError(
+                "step Timeout after 60s", kind="timeout", terminal_id="td"
+            )
+        ),
+    )
+    res = await ws.start_run(_spec(on_failure="halt", retries=0), {}, "u9-timeout")
+    assert res.state == RunState.FAILED
+
+    # Resolve from the DURABLE journal rows alone (the detached-path substrate), not
+    # the live result object — the empty-registry read U9's result route performs.
+    row = workflow_journal.get_run("u9-timeout")
+    steps = workflow_journal.get_steps("u9-timeout")
+    assert any(s.error and "Timeout" in s.error for s in steps)
+    assert _resolve_error_kind(row, steps) == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_drive_failure_journals_generic_error_resolver_infers_error(monkeypatch):
+    """U9 (RP-3 / JP-1): a non-timeout step failure journals its error; the resolver
+    infers the generic 'error' kind from the journal rows."""
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+    from cli_agent_orchestrator.services import workflow_journal
+
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(
+            side_effect=StepExecutionError("provider returned 500", kind="error", terminal_id="te")
+        ),
+    )
+    res = await ws.start_run(_spec(on_failure="halt", retries=0), {}, "u9-error")
+    assert res.state == RunState.FAILED
+
+    row = workflow_journal.get_run("u9-error")
+    steps = workflow_journal.get_steps("u9-error")
+    assert _resolve_error_kind(row, steps) == "error"

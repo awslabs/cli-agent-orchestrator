@@ -14,18 +14,19 @@ The provider detects the following terminal states:
 - PROCESSING: Agent working (``esc interrupt`` footer)
 - COMPLETED: Agent finished turn (``▣ <agent> · <model> · Ns`` marker + idle footer)
 - WAITING_USER_ANSWER: Permission dialog active (``△ Permission required`` visible)
-- ERROR: Fallback when no state marker matches
+- UNKNOWN: Fallback when no state marker matches (or empty buffer)
 """
 
 import logging
 import re
 import shlex
-from typing import Optional
+from typing import List, Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,20 @@ class OpenCodeCliProvider(BaseProvider):
         return 1
 
     @property
+    def paste_submit_delay(self) -> float:
+        """OpenCode's TUI can swallow an Enter sent too soon after the bracketed-paste
+        end marker. 1.0s (matching kiro_cli) is conservative and avoids the
+        deferred-init "never started processing" race (see #479)."""
+        return 1.0
+
+    # Opt-in for the deferred-init direct status probe (capture-pane bypass).
+    # OpenCode's get_status() detector is line-oriented and works correctly on a
+    # rendered capture-pane snapshot. Providers whose get_status() relies on
+    # dispatch bookkeeping (e.g. kiro_cli, antigravity_cli, cursor_cli) must NOT
+    # set this flag — their COMPLETED/IDLE split is not screen-detectable.
+    supports_direct_status_probe = True
+
+    @property
     def extraction_tail_lines(self) -> int:
         """Capture extra scrollback for extraction (belt-and-braces).
 
@@ -122,7 +137,7 @@ class OpenCodeCliProvider(BaseProvider):
         """
         return 2000
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Start the OpenCode TUI and wait for the idle splash frame.
 
         Steps:
@@ -137,15 +152,16 @@ class OpenCodeCliProvider(BaseProvider):
         Raises:
             TimeoutError: If shell or OpenCode doesn't reach IDLE/COMPLETED in time.
         """
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         command = self._build_launch_command()
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # 120s covers first-run npm install (5–30s) and concurrent multi-agent launches.
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=120.0,
         ):
@@ -173,8 +189,8 @@ class OpenCodeCliProvider(BaseProvider):
         # env vars are shell words; join cmd parts with shlex for proper quoting
         return " ".join(env_pairs) + " " + shlex.join(cmd_parts)
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Detect current TUI state from the tmux capture buffer.
+    def get_status(self, output: str) -> TerminalStatus:
+        """Detect current TUI state from the StatusMonitor buffer string.
 
         Priority order:
         1. WAITING_USER_ANSWER — permission dialog heading present, no idle footer after it
@@ -183,17 +199,25 @@ class OpenCodeCliProvider(BaseProvider):
         3. COMPLETED — last full ``▣…·…·…Ns`` marker present, idle footer after it,
            no later ``▣`` token (would indicate a new incomplete turn)
         4. IDLE — idle footer present, no ``esc interrupt`` anywhere
-        5. ERROR — fallback
+        5. UNKNOWN — fallback
 
         Args:
-            tail_lines: Lines to capture; None uses the tmux_client default.
+            output: StatusMonitor buffer string for this terminal.
 
         Returns:
             Current TerminalStatus.
         """
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        # Native status (herdr): trust the backend's agent state when available;
+        # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
+        native = self._resolve_native_status(output)
+        if native is not None:
+            return native
+
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         clean = re.sub(ANSI_CODE_PATTERN, "", output)
 
@@ -247,8 +271,72 @@ class OpenCodeCliProvider(BaseProvider):
         ):
             return TerminalStatus.IDLE
 
-        # ── 5. ERROR (fallback) ───────────────────────────────────────────────
-        return TerminalStatus.ERROR
+        # ── 5. UNKNOWN (fallback) ─────────────────────────────────────────────
+        return TerminalStatus.UNKNOWN
+
+    # ── Screen-based detection (pyte) ────────────────────────────────────────
+
+    supports_screen_detection = True
+
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        """Detect status from a pyte-composited viewport (escape-free rows).
+
+        The pyte screen represents the current terminal viewport without any
+        ANSI escape sequences, so the status markers are clean text — no
+        buffer-eviction or escape-stripping issues.
+
+        Precedence mirrors ``get_status``:
+        1. WAITING_USER_ANSWER — permission dialog heading
+        2. PROCESSING — ``esc interrupt`` footer
+        3. COMPLETED — completion marker followed by idle footer
+        4. IDLE — idle footer present
+        5. UNKNOWN — fallback
+        """
+        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        if not rows:
+            return TerminalStatus.UNKNOWN
+
+        # Join with newlines so multiline patterns work.
+        joined = "\n".join(rows)
+
+        # ── 1. WAITING_USER_ANSWER ───────────────────────────────────────
+        if re.search(PERMISSION_PROMPT_PATTERN, joined):
+            # Permission dialog replaces the normal footer; if idle footer
+            # also appears the user already dismissed it.
+            if not re.search(IDLE_FOOTER_PATTERN, joined):
+                return TerminalStatus.WAITING_USER_ANSWER
+
+        # ── 2. PROCESSING ───────────────────────────────────────────────
+        last_esc_line = -1
+        for i, row in enumerate(rows):
+            if re.search(PROCESSING_FOOTER_PATTERN, row):
+                last_esc_line = i
+
+        esc_is_stale = False
+        if last_esc_line >= 0:
+            later = rows[last_esc_line + 1 :]
+            has_idle_later = any(re.search(IDLE_FOOTER_PATTERN, row) for row in later)
+            has_completion_later = any(re.search(COMPLETION_MARKER_PATTERN, row) for row in later)
+            if not has_idle_later and not has_completion_later:
+                return TerminalStatus.PROCESSING
+            esc_is_stale = True
+
+        # ── 3. COMPLETED ────────────────────────────────────────────────
+        completion_matches = list(re.finditer(COMPLETION_MARKER_PATTERN, joined))
+        if completion_matches:
+            last_end = completion_matches[-1].end()
+            after = joined[last_end:]
+            if re.search(IDLE_FOOTER_PATTERN, after) and not re.search(r"▣", after):
+                return TerminalStatus.COMPLETED
+
+        # ── 4. IDLE ─────────────────────────────────────────────────────
+        if re.search(IDLE_FOOTER_PATTERN, joined) and (
+            not re.search(PROCESSING_FOOTER_PATTERN, joined) or esc_is_stale
+        ):
+            return TerminalStatus.IDLE
+
+        # ── 5. UNKNOWN (fallback) ───────────────────────────────────────
+        return TerminalStatus.UNKNOWN
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract the agent's response from the TUI scrollback.

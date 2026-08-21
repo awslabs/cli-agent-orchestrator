@@ -16,7 +16,6 @@ Requires:
 - Running CAO server
 - Agent profiles installed:
     cao install examples/cross-provider/data_analyst_claude_code.md
-    cao install examples/cross-provider/data_analyst_gemini_cli.md
     cao install examples/cross-provider/data_analyst_kiro_cli.md
 - Authenticated CLI tools for each provider used in the test
 - tmux
@@ -85,8 +84,13 @@ def _add_terminal_in_session(
 ):
     """Add a terminal to an existing session via the API.
 
-    The ``provider`` param is the *fallback* — if the agent profile declares
-    its own provider, ``resolve_provider()`` overrides it.
+    The cross-provider override lives in the worker's agent profile (its
+    ``provider:`` frontmatter key). The ``POST .../terminals`` endpoint only
+    consults ``resolve_provider()`` (which reads that key) when no explicit
+    ``provider`` query param is sent — an explicit param is taken as
+    authoritative and would suppress the override. So we deliberately do NOT
+    send ``provider`` here; the worker's provider is resolved from its profile.
+    ``provider`` is retained only as the display fallback in the return value.
 
     Retries on 500 errors (typically init timeouts) up to ``retries`` times.
 
@@ -99,7 +103,6 @@ def _add_terminal_in_session(
         resp = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
             params={
-                "provider": provider,
                 "agent_profile": agent_profile,
             },
         )
@@ -212,7 +215,7 @@ def _run_cross_provider_test(
             assert wait_for_status(worker_id, "completed", timeout=COMPLETION_TIMEOUT)
 
         # Step 7: Validate output
-        # Gemini CLI's Ink TUI may show spinners after COMPLETED that
+        # Some providers' TUIs may show spinners after COMPLETED that
         # temporarily obscure the response. Retry extraction.
         output = ""
         for _ in range(4):
@@ -253,37 +256,11 @@ def _run_cross_provider_test(
 # ---------------------------------------------------------------------------
 # Test classes — one per cross-provider combo
 #
-# NOTE: Claude Code combos (KiroToClaude, ClaudeToGemini) cannot run when
-# the test runner itself is Claude Code — nested sessions are blocked by
-# the CLAUDECODE env var check.  They are kept for CI or manual runs
+# NOTE: Claude Code combos (e.g. KiroToClaude) cannot run when the test
+# runner itself is Claude Code — nested sessions are blocked by the
+# CLAUDECODE env var check.  They are kept for CI or manual runs
 # outside Claude Code.
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.e2e
-class TestCrossProviderKiroToGemini:
-    """Kiro CLI supervisor session, worker runs on Gemini CLI."""
-
-    def test_assign_cross_provider(self, require_kiro, require_gemini):
-        """Worker profile declares provider: gemini_cli, overriding kiro_cli fallback."""
-        _run_cross_provider_test(
-            supervisor_provider="kiro_cli",
-            worker_profile="data_analyst_gemini_cli",
-            expected_worker_provider="gemini_cli",
-        )
-
-
-@pytest.mark.e2e
-class TestCrossProviderGeminiToKiro:
-    """Gemini CLI supervisor session, worker runs on Kiro CLI."""
-
-    def test_assign_cross_provider(self, require_gemini, require_kiro):
-        """Worker profile declares provider: kiro_cli, overriding gemini_cli fallback."""
-        _run_cross_provider_test(
-            supervisor_provider="gemini_cli",
-            worker_profile="data_analyst_kiro_cli",
-            expected_worker_provider="kiro_cli",
-        )
 
 
 @pytest.mark.e2e
@@ -303,16 +280,32 @@ class TestCrossProviderKiroToClaude:
 
 
 @pytest.mark.e2e
-class TestCrossProviderClaudeToGemini:
-    """Claude Code supervisor session, worker runs on Gemini CLI.
+class TestCrossProviderClaudeToKimi:
+    """Claude Code supervisor session, worker runs on Kimi CLI.
 
     NOTE: Cannot run inside Claude Code (nested session blocked).
     """
 
-    def test_assign_cross_provider(self, require_claude, require_gemini):
-        """Worker profile declares provider: gemini_cli, overriding claude_code fallback."""
+    def test_assign_cross_provider(self, require_claude, require_kimi):
+        """Worker profile declares provider: kimi_cli, overriding claude_code fallback."""
         _run_cross_provider_test(
             supervisor_provider="claude_code",
-            worker_profile="data_analyst_gemini_cli",
-            expected_worker_provider="gemini_cli",
+            worker_profile="data_analyst_kimi_cli",
+            expected_worker_provider="kimi_cli",
+        )
+
+
+@pytest.mark.e2e
+class TestCrossProviderKimiToClaude:
+    """Kimi CLI supervisor session, worker runs on Claude Code.
+
+    NOTE: Cannot run inside Claude Code (nested session blocked).
+    """
+
+    def test_assign_cross_provider(self, require_kimi, require_claude):
+        """Worker profile declares provider: claude_code, overriding kimi_cli fallback."""
+        _run_cross_provider_test(
+            supervisor_provider="kimi_cli",
+            worker_profile="data_analyst_claude_code",
+            expected_worker_provider="claude_code",
         )

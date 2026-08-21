@@ -1,5 +1,6 @@
 """Memory service for CAO memory system (Phase 2 — wiki + SQLite metadata)."""
 
+import asyncio
 import fcntl
 import hashlib
 import logging
@@ -11,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Set
 
 from cli_agent_orchestrator.constants import (
     MEMORY_BASE_DIR,
@@ -19,6 +20,15 @@ from cli_agent_orchestrator.constants import (
     MEMORY_SCOPE_BUDGET_CHARS,
 )
 from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
+from cli_agent_orchestrator.services.memory_archive.base import ExportReport, ImportReport
+from cli_agent_orchestrator.services.memory_format import (
+    normalize_memory_tags,
+    parse_index_entry,
+)
+from cli_agent_orchestrator.utils.path_validation import (
+    safe_join_under_base,
+    validate_path_component,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +46,31 @@ class MemoryDisabledError(RuntimeError):
     Read paths (recall, get_memory_context_for_terminal) instead return an
     empty result, since silent empty reads are a safer no-op than raising.
     """
+
+
+class MemoryPartialWriteError(RuntimeError):
+    """Raised when durable wiki projections outlive a failed metadata write."""
+
+    error_kind = "memory_metadata_partial_write"
+    repair_command = "cao memory repair --apply"
+
+    def __init__(
+        self,
+        *,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        file_path: str,
+    ) -> None:
+        self.key = key
+        self.scope = scope
+        self.scope_id = scope_id
+        self.file_path = file_path
+        self.completed_phases = ["wiki", "index"]
+        super().__init__(
+            "Memory content and index were saved, but SQLite metadata could not be updated. "
+            f"Run `{self.repair_command}`."
+        )
 
 
 def _is_memory_enabled() -> bool:
@@ -234,6 +269,14 @@ class MemoryService:
         self.base_dir = base_dir or MEMORY_BASE_DIR
         self._db_engine = db_engine
         self._db_session_factory: Any = None
+        # Strong refs to in-flight background compile tasks (event-loop path)
+        # so they are not garbage-collected before completion.
+        self._compile_tasks: Set[Any] = set()
+        # Per-topic debounce: at most one compile in flight per
+        # (scope, scope_id, key). Guarded by a threading lock because
+        # schedule/complete can run on the event loop or a worker thread.
+        self._compile_inflight: Set[Any] = set()
+        self._compile_inflight_lock = threading.Lock()
         if db_engine is not None:
             from sqlalchemy.orm import sessionmaker
 
@@ -264,12 +307,30 @@ class MemoryService:
         source_provider: Optional[str],
         source_terminal_id: Optional[str],
         token_estimate: Optional[int],
+        last_compiled_at: Optional[datetime] = None,
+        related_keys: Optional[str] = None,
+        preserve_provenance: bool = False,
     ) -> None:
         """Insert or update the metadata row for (key, scope, scope_id).
 
         Symmetric upsert: every field set on insert is also set on update —
         ``memory_type``, ``tags``, ``file_path``, ``source_provider``,
         ``source_terminal_id``, ``token_estimate``, ``updated_at``.
+
+        ``preserve_provenance`` leaves ``source_provider`` and
+        ``source_terminal_id`` untouched on update. The compile write-back
+        sets it: a background rewrite is not a new store, so it must not
+        erase who stored the memory. (None provenance from store() itself
+        IS written — the latest store genuinely had no terminal context.)
+
+        ``last_compiled_at`` is only written when non-None — a
+        plain append or fallback must not clobber a prior successful compile
+        timestamp, so we leave the existing value intact when it is None.
+
+        ``related_keys`` follows the same rule: None means
+        "never attempted" and leaves any prior value intact; ``""`` means
+        "computed, none found" and IS written (distinct from None so the
+        second pass doesn't retry endlessly).
         """
         from cli_agent_orchestrator.clients.database import MemoryMetadataModel
 
@@ -291,10 +352,21 @@ class MemoryService:
                 existing.memory_type = memory_type
                 existing.tags = tags
                 existing.file_path = file_path
-                existing.source_provider = source_provider
-                existing.source_terminal_id = source_terminal_id
+                if not preserve_provenance:
+                    existing.source_provider = source_provider
+                    existing.source_terminal_id = source_terminal_id
                 existing.token_estimate = token_estimate
-                existing.updated_at = datetime.now(timezone.utc)
+                if last_compiled_at is not None:
+                    # A compile write: pin updated_at to the same instant so
+                    # the staleness check (last_compiled_at >= updated_at)
+                    # sees the topic as freshly compiled, not perpetually
+                    # stale by the microseconds between two now() calls.
+                    existing.updated_at = last_compiled_at
+                    existing.last_compiled_at = last_compiled_at
+                else:
+                    existing.updated_at = datetime.now(timezone.utc)
+                if related_keys is not None:
+                    existing.related_keys = related_keys
                 db.commit()
             else:
                 row = MemoryMetadataModel(
@@ -308,6 +380,8 @@ class MemoryService:
                     source_provider=source_provider,
                     source_terminal_id=source_terminal_id,
                     token_estimate=token_estimate,
+                    last_compiled_at=last_compiled_at,
+                    related_keys=related_keys,
                 )
                 db.add(row)
                 db.commit()
@@ -333,6 +407,34 @@ class MemoryService:
     # Scope resolution
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def resolve_caller_scope(terminal_context: Optional[dict]) -> str:
+        """Derive the caller's effective scope.
+
+        Used by ``store()`` as the upper bound for cross-scope writes. The
+        caller may declare an explicit ``caller_scope`` in
+        ``terminal_context`` (trust-equivalent to the operator); otherwise
+        we default to ``"global"`` (the most permissive, operator/CLI
+        semantics).
+
+        Inferred downgrade from ``terminal_id``/``agent_profile``/
+        ``session_name`` was deliberately rejected: it broke legacy callers
+        that pass full terminal contexts while legitimately writing
+        ``scope="global"``. The threat-model intent is preserved — a
+        caller that must be constrained sets ``caller_scope`` explicitly.
+        """
+        ctx = terminal_context or {}
+        explicit = ctx.get("caller_scope")
+        if isinstance(explicit, str) and explicit in {
+            "session",
+            "project",
+            "agent",
+            "global",
+            "federated",
+        }:
+            return explicit
+        return "global"
+
     def resolve_scope_id(
         self,
         scope: str,
@@ -346,6 +448,11 @@ class MemoryService:
         agent   → agent_profile
         """
         if scope == MemoryScope.GLOBAL.value:
+            return None
+
+        # ``federated`` is a single machine-wide tier with no per-id
+        # isolation — like ``global``, its scope_id is always None.
+        if scope == MemoryScope.FEDERATED.value:
             return None
 
         ctx = terminal_context or {}
@@ -470,7 +577,15 @@ class MemoryService:
         # wiki path (see get_wiki_path) for isolation, not into the
         # container directory.
         if scope == MemoryScope.PROJECT.value and scope_id:
-            return self.base_dir / scope_id
+            # ``scope_id`` is user/context-derived (project-identity slug,
+            # override, or cwd hash). Validate it as a single safe path
+            # segment and confine the container under the memory base via
+            # realpath containment so a crafted scope_id cannot escape.
+            return Path(safe_join_under_base(str(self.base_dir), scope_id, description="scope_id"))
+        # ``federated`` is a machine-wide shared tier living in its own
+        # top-level container, a sibling of ``global``.
+        if scope == MemoryScope.FEDERATED.value:
+            return self.base_dir / "federated"
         return self.base_dir / "global"
 
     def get_wiki_path(self, scope: str, scope_id: Optional[str], key: str) -> Path:
@@ -480,23 +595,40 @@ class MemoryService:
         path so that two sessions (or two agent profiles) with the same
         key do not collide on disk.
 
-        Validates the resolved path stays within MEMORY_BASE_DIR to
-        prevent path traversal.
+        Every user-derived segment (``scope``, ``scope_id``, ``key``) is
+        validated as a single safe path component and the assembled path is
+        confined under MEMORY_BASE_DIR via realpath containment, so a
+        crafted value cannot traverse out of the memory base directory.
         """
-        project_dir = self._get_project_dir(scope, scope_id)
-        if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
-            wiki_path = (project_dir / "wiki" / scope / scope_id / f"{key}.md").resolve()
+        # Validate every user-derived segment as a single safe path
+        # component up front. ``key`` is validated in its raw form (not just
+        # the ``{key}.md`` filename) so empty/``.``/``..`` keys are rejected
+        # rather than turning into benign-but-unintended filenames.
+        validate_path_component(scope, "scope")
+        validate_path_component(key, "key")
+        if scope_id is not None:
+            validate_path_component(scope_id, "scope_id")
+
+        # Container segment: ``project`` scope keys off the scope_id;
+        # session/agent memories live under the ``global`` container with
+        # scope_id nested into the wiki path; federated is its own tier.
+        if scope == MemoryScope.PROJECT.value and scope_id:
+            container = scope_id
+        elif scope == MemoryScope.FEDERATED.value:
+            container = "federated"
         else:
-            wiki_path = (project_dir / "wiki" / scope / f"{key}.md").resolve()
-        base_resolved = self.base_dir.resolve()
-        if (
-            not str(wiki_path).startswith(str(base_resolved) + os.sep)
-            and wiki_path != base_resolved
-        ):
-            raise ValueError(
-                f"Path traversal detected: resolved path escapes memory base directory"
+            container = "global"
+
+        if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
+            components = [container, "wiki", scope, scope_id, f"{key}.md"]
+        else:
+            components = [container, "wiki", scope, f"{key}.md"]
+
+        return Path(
+            safe_join_under_base(
+                str(self.base_dir), *components, description="memory path component"
             )
-        return wiki_path
+        )
 
     def get_index_path(self, scope: str, scope_id: Optional[str]) -> Path:
         """Get the path to the index.md file."""
@@ -507,6 +639,26 @@ class MemoryService:
     # Store
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _occurred_at_would_clamp(
+        occurred_at: Optional[datetime],
+        latest_section_at: Optional[datetime],
+        now: datetime,
+    ) -> bool:
+        """D5 clamp decision, shared by ``store()`` and the OKF import dry-run.
+
+        Clamp when ``occurred_at`` is in the future, or older than the
+        topic's latest section timestamp (merges only — pass ``None`` for
+        new topics). ``None`` ``occurred_at`` never clamps. Keeping this
+        rule in one place guarantees the dry-run report cannot drift from
+        what a real ``store()`` would do.
+        """
+        if occurred_at is None:
+            return False
+        return occurred_at > now or (
+            latest_section_at is not None and occurred_at < latest_section_at
+        )
+
     async def store(
         self,
         content: str,
@@ -515,11 +667,24 @@ class MemoryService:
         key: Optional[str] = None,
         tags: str = "",
         terminal_context: Optional[dict] = None,
+        occurred_at: Optional[datetime] = None,
     ) -> Memory:
         """Store or update a memory. Upserts wiki file + index.md.
 
         Declared async for compatibility with async callers (MCP server, FastAPI).
         File I/O is synchronous; a future improvement would use aiofiles.
+
+        ``occurred_at`` (archive import, #345 D5): optional original entry
+        timestamp. ``None`` keeps today's behavior byte-identical. An
+        in-order value (not in the future and, for an existing topic, not
+        older than its latest section timestamp) is used verbatim for the
+        ``## <ts>`` section heading (and ``created_at`` when the topic is
+        new). An out-of-order or future value is CLAMPED: the heading uses
+        now() — preserving the append-only contract that the last section
+        is the latest — and the original timestamp is recorded as a first
+        body line ``_Originally recorded: <ISO-ts>_``. The returned Memory
+        sets ``timestamp_clamped=True`` when clamping happened so the
+        importer can count it.
 
         Raises ``MemoryDisabledError`` when ``memory.enabled`` is False
         (U5 / SC-6) — no filesystem or SQLite writes happen.
@@ -530,6 +695,37 @@ class MemoryService:
         # Validate
         MemoryScope(scope)
         MemoryType(memory_type)
+
+        # Federated writes are credential-gated. The machine-wide shared
+        # tier rejects content matching common secret patterns. The log
+        # line carries the pattern NAME only — never content bytes.
+        if scope == MemoryScope.FEDERATED.value:
+            from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
+
+            hit = scan_for_secrets(content)
+            if hit:
+                # Do not log detector output; emit only a constant event marker.
+                logger.warning("federated_secret_rejected")
+                raise ValueError(f"federated write rejected: matched credential pattern {hit!r}")
+
+        # Store-time cross-scope write guard. A caller may
+        # only write a scope it is authorised for (SCOPE_RANK). The caller
+        # scope defaults to "global" (operator) unless terminal_context sets
+        # an explicit ``caller_scope`` — so existing CLI/operator callers are
+        # unaffected. The rejection log carries no content bytes.
+        from cli_agent_orchestrator.services.memory_scoring import scope_write_allowed
+
+        caller_scope = self.resolve_caller_scope(terminal_context)
+        if not scope_write_allowed(caller_scope, scope):
+            logger.warning(
+                "cross_scope_store_rejected caller=%s target=%s key=%s",
+                caller_scope,
+                scope,
+                key,
+            )
+            raise PermissionError(
+                f"caller scope {caller_scope!r} may not write target scope {scope!r}"
+            )
 
         scope_id = self.resolve_scope_id(scope, terminal_context)
         # Non-global scoped memories require a resolvable scope_id for
@@ -557,14 +753,21 @@ class MemoryService:
         else:
             key = self._sanitize_key(key)
 
-        # Normalize tags: strip whitespace and rejoin with commas. The
-        # index entry format expects tags to contain no spaces (the
-        # parser uses ``tags:(\S*)``), so ``"ci, deploy"`` would
-        # otherwise become unrecallable through the index.
-        tags = ",".join(t.strip() for t in tags.split(",") if t.strip())
+        tags = normalize_memory_tags(tags)
 
         now = datetime.now(timezone.utc)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Normalize occurred_at to UTC-aware for the ordering comparisons
+        # below. A future value is clamped for new topics AND merges (D5);
+        # the older-than-latest-section check needs the existing file and
+        # runs inside the topic lock.
+        if occurred_at is not None:
+            if occurred_at.tzinfo is None:
+                occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+            else:
+                occurred_at = occurred_at.astimezone(timezone.utc)
+        timestamp_clamped = False
 
         wiki_path = self.get_wiki_path(scope, scope_id, key)
         wiki_path.parent.mkdir(parents=True, exist_ok=True)
@@ -574,7 +777,7 @@ class MemoryService:
         # (scope, scope_id, key) can both read the old content and
         # then overwrite each other, losing one update. Mirrors the
         # .index.lock pattern in _update_index.
-        topic_lock_path = wiki_path.parent / f".{key}.lock"
+        topic_lock_path = wiki_path.parent / f".{wiki_path.stem}.lock"
         topic_lock_fd = open(topic_lock_path, "w")
         try:
             fcntl.flock(topic_lock_fd, fcntl.LOCK_EX)
@@ -583,6 +786,7 @@ class MemoryService:
             is_update = wiki_path.exists()
             memory_id = str(uuid.uuid4())
             created_at = now
+            latest_section_at: Optional[datetime] = None
 
             if is_update:
                 # Read existing file to get original created_at and id from comment
@@ -591,12 +795,22 @@ class MemoryService:
                 id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", existing_content)
                 if id_match:
                     memory_id = id_match.group(1)
-                # Extract original created_at
-                ts_match = re.search(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", existing_content)
-                if ts_match:
-                    created_at = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
+                # Extract original created_at (first section) and the latest
+                # section timestamp (last) for the occurred_at ordering rule.
+                # The regex is deliberately unanchored, matching
+                # _parse_wiki_file's existing behavior: a timestamp-shaped line
+                # inside an untrusted body can match. Import-time escaping
+                # (Unit 3) is the mitigation; deferred here, no behavior change.
+                existing_ts = re.findall(
+                    r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", existing_content
+                )
+                if existing_ts:
+                    created_at = datetime.strptime(existing_ts[0], "%Y-%m-%dT%H:%M:%SZ").replace(
                         tzinfo=timezone.utc
                     )
+                    latest_section_at = datetime.strptime(
+                        existing_ts[-1], "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc)
                 # Rewrite the header line so updated memory_type/tags stay
                 # in sync with index.md (recall() reads the file header).
                 new_header = (
@@ -604,24 +818,93 @@ class MemoryService:
                     f"type: {memory_type} | tags: {tags} -->"
                 )
                 existing_content = re.sub(
-                    r"<!-- id: [a-f0-9\-]+ \| scope: [^|]+ \| type: [^|]+ \| tags: [^>]*-->",
+                    r"<!-- id: [a-f0-9\-]+ \| scope: [^|]+ " r"\| type: [^|]+ \| tags: .*? -->",
                     new_header,
                     existing_content,
                     count=1,
                 )
+
+            # D5 ordering rule: an in-order, non-future occurred_at is used
+            # verbatim for the section heading; a future value (new topics
+            # AND merges) or a value older than the topic's latest section
+            # is clamped to now(), with provenance preserved as a first
+            # body line. occurred_at=None keeps the pre-#345 bytes exactly.
+            entry_body = content
+            if occurred_at is not None:
+                if self._occurred_at_would_clamp(occurred_at, latest_section_at, now):
+                    timestamp_clamped = True
+                    original_iso = occurred_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    entry_body = f"_Originally recorded: {original_iso}_\n{content}"
+                else:
+                    timestamp = occurred_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if not is_update:
+                        created_at = occurred_at
+
+            if is_update:
                 # Append new timestamped entry
-                new_content = existing_content.rstrip("\n") + f"\n\n## {timestamp}\n{content}\n"
+                new_content = existing_content.rstrip("\n") + f"\n\n## {timestamp}\n{entry_body}\n"
             else:
                 new_content = (
                     f"# {key}\n"
                     f"<!-- id: {memory_id} | scope: {scope} | type: {memory_type} | tags: {tags} -->\n"
-                    f"\n## {timestamp}\n{content}\n"
+                    f"\n## {timestamp}\n{entry_body}\n"
                 )
 
-            # Atomic write: write to tmp then os.replace
-            tmp_path = wiki_path.parent / f".{key}.tmp"
+            # Atomic write of the append version: write to tmp then os.replace.
+            # This is always the immediate, durable result of store(). LLM
+            # compaction (below) is deferred and rewrites the file later.
+            #
+            # CodeQL note (py/clear-text-storage-sensitive-data): this write is
+            # flagged only because ``new_content`` embeds the topic ``key`` and
+            # CodeQL's name-based heuristic classifies any variable named
+            # ``key`` as a secret. It is a FALSE POSITIVE, not a leak: ``key``
+            # is a user-authored topic slug (see ``_sanitize_key``), never a
+            # credential. The memory wiki is intentionally human-readable
+            # plaintext markdown — that is the product contract, and encrypting
+            # it would defeat the feature (agents and humans read these files
+            # directly). No secret is persisted here. Dismiss the alert as
+            # "won't fix / by-design" in the Security tab with this rationale;
+            # do NOT add encryption. As an additional safeguard, content
+            # written to the machine-wide federated tier is screened by the
+            # secret gate (``scan_for_secrets``) earlier in ``store()`` and
+            # rejected if it matches a credential pattern.
+            tmp_path = wiki_path.parent / f".{wiki_path.stem}.tmp"
             tmp_path.write_text(new_content, encoding="utf-8")
             os.replace(str(tmp_path), str(wiki_path))
+
+            # LLM wiki compilation, deferred. A coding-agent CLI cold-starts in
+            # tens of seconds — far too slow to block store() — so on an "llm"
+            # mode UPDATE we schedule a background task that merges the article
+            # and rewrites the file once the CLI returns. The append version
+            # just written is the safe, byte-identical baseline; the background
+            # compile only ever upgrades it (or no-ops on failure). A brand-new
+            # topic is never compiled: the LLM has nothing to merge into and
+            # would only regurgitate the canonical ``# {key}`` header.
+            last_compiled_at: Optional[datetime] = None
+            try:
+                from cli_agent_orchestrator.services.settings_service import get_compile_mode
+
+                if is_update and get_compile_mode() == "llm":
+                    self._schedule_background_compile(
+                        scope=scope,
+                        scope_id=scope_id,
+                        key=key,
+                        # Pass the clamped entry_body (not raw content) so the
+                        # LLM rewrite sees the "_Originally recorded:" provenance
+                        # line when the timestamp was clamped.
+                        new_entry=entry_body,
+                        # Compile input is the PRE-append article — the append
+                        # version just written already contains the new entry,
+                        # so merging into it would feed the LLM a duplicate.
+                        pre_append_content=existing_content,  # noqa: F821
+                        # Concurrency token: the bytes this store() wrote. If
+                        # the file differs when the compile finishes, a newer
+                        # store won the race and the result is dropped.
+                        expected_content=new_content,
+                        provider_hint=(terminal_context or {}).get("provider"),
+                    )
+            except Exception as e:  # noqa: BLE001 — scheduling is best-effort
+                logger.warning(f"wiki compile not scheduled (key={key}): {e}")
 
             # Update index.md
             action = "updated" if is_update else "created"
@@ -647,9 +930,22 @@ class MemoryService:
                     source_provider=source_provider_in_ctx,
                     source_terminal_id=source_terminal_id_in_ctx,
                     token_estimate=len(content) // 4,
+                    last_compiled_at=last_compiled_at,
                 )
             except Exception as e:
-                logger.warning(f"Memory metadata SQLite upsert failed (key={key}): {e}")
+                logger.error(
+                    "Memory metadata SQLite upsert failed after durable writes "
+                    "(key=%s scope=%s scope_id=%s)",
+                    key,
+                    scope,
+                    scope_id,
+                )
+                raise MemoryPartialWriteError(
+                    key=key,
+                    scope=scope,
+                    scope_id=scope_id,
+                    file_path=str(wiki_path),
+                ) from e
 
             logger.info(f"Memory {action}: key={key} scope={scope} scope_id={scope_id}")
         finally:
@@ -678,7 +974,733 @@ class MemoryService:
             updated_at=now,
             content=content,
             action=action,
+            timestamp_clamped=timestamp_clamped,
         )
+
+    # -------------------------------------------------------------------------
+    # Deferred LLM compaction
+    # -------------------------------------------------------------------------
+
+    def _schedule_background_compile(
+        self,
+        *,
+        scope: str,
+        scope_id: Optional[str],
+        key: str,
+        new_entry: str,
+        pre_append_content: str,
+        expected_content: str,
+        provider_hint: Optional[str],
+    ) -> None:
+        """Fire-and-forget the LLM compaction for one topic.
+
+        Runs on the event loop when store() is awaited inside one (the API
+        server), else on a worker thread for synchronous callers (CLI, tests).
+        Never blocks store() and never raises into it.
+
+        Debounce: at most one compile in flight per (scope, scope_id, key).
+        A store that arrives while one is running is skipped — its content is
+        already durable in the append version, and the racing compile's
+        stale-check will drop the old result, so nothing is lost except a
+        CLI invocation we'd have discarded anyway.
+        """
+        topic_token = (scope, scope_id, key)
+        with self._compile_inflight_lock:
+            if topic_token in self._compile_inflight:
+                logger.debug(f"compile already in flight, skipping (key={key})")
+                return
+            self._compile_inflight.add(topic_token)
+
+        async def _guarded() -> None:
+            try:
+                await self._run_background_compile(
+                    scope=scope,
+                    scope_id=scope_id,
+                    key=key,
+                    new_entry=new_entry,
+                    pre_append_content=pre_append_content,
+                    expected_content=expected_content,
+                    provider_hint=provider_hint,
+                )
+            finally:
+                with self._compile_inflight_lock:
+                    self._compile_inflight.discard(topic_token)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        coro_factory = _guarded
+        if loop is not None:
+            try:
+                task = loop.create_task(coro_factory())
+                # Hold a reference so the task is not garbage-collected mid-run.
+                self._compile_tasks.add(task)
+                task.add_done_callback(self._compile_tasks.discard)
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"background compile create_task failed (key={key}): {e}")
+        # No running loop: drain on a daemon thread so the CLI subprocess does
+        # not block the synchronous caller.
+        try:
+            threading.Thread(
+                target=lambda: asyncio.run(coro_factory()),
+                name=f"cao-compile-{key}",
+                daemon=True,
+            ).start()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"background compile thread failed (key={key}): {e}")
+
+    async def _run_background_compile(
+        self,
+        *,
+        scope: str,
+        scope_id: Optional[str],
+        key: str,
+        new_entry: str,
+        pre_append_content: str,
+        expected_content: str,
+        provider_hint: Optional[str],
+    ) -> str:
+        """Compile one topic via the CLI and write the result back if unchanged.
+
+        The LLM merges ``new_entry`` into ``pre_append_content`` (the article
+        as it stood BEFORE the append) — the on-disk file already contains the
+        appended entry, so compiling from the file would feed a duplicate.
+        The manual sweep (``compact``) passes the whole on-disk article as
+        ``pre_append_content`` with an empty ``new_entry`` instead.
+
+        Optimistic concurrency: the file must still hold ``expected_content``
+        (the bytes the scheduling store() wrote) when the compile finishes,
+        otherwise a newer store() won the race and this result is dropped.
+
+        Returns a status string ("applied", "stale", "error", or
+        "fallback:<reason>") — background callers ignore it; the sweep reports it.
+        """
+        from cli_agent_orchestrator.services import wiki_compiler
+        from cli_agent_orchestrator.services.settings_service import get_compile_timeout_s
+
+        def _audit(event_type: str, summary: str, **fields: str) -> None:
+            try:
+                from cli_agent_orchestrator.services.audit_log import write_audit_nowait
+
+                write_audit_nowait(event_type, summary, key=key, **fields)
+            except ImportError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"compile audit write failed (key={key}): {e}")
+
+        wiki_path = self.get_wiki_path(scope, scope_id, key)
+
+        try:
+            result = await wiki_compiler.compile(
+                pre_append_content,
+                new_entry,
+                topic_key=key,
+                timeout_s=get_compile_timeout_s(),
+                provider_hint=provider_hint,
+            )
+        except Exception as e:  # noqa: BLE001 — compile is best-effort
+            logger.warning(f"background wiki compile failed (key={key}): {e}")
+            _audit("compile_error", "background compile raised")
+            return "error"
+
+        if not result.used_llm:
+            _audit(
+                "compile_fallback",
+                f"compile fell back: {result.fallback_reason}",
+                fallback_reason=str(result.fallback_reason or ""),
+                elapsed_ms=str(result.elapsed_ms),
+            )
+            return f"fallback:{result.fallback_reason}"
+
+        compiled_content = result.compiled_content
+
+        # Second-pass cross-reference detection (See-Also). Only runs when
+        # the first pass actually used the LLM — append mode and fallbacks
+        # never reach this point. Failure is silent (non-blocking promise).
+        # ``related_keys_value`` stays None on never-attempted/error so the
+        # metadata upsert leaves any prior value intact; ``""`` on
+        # success-with-empty is written (prevents endless retries).
+        related_keys_value: Optional[str] = None
+        try:
+            cands = self._candidate_keys_for_topic(scope, scope_id, key)
+            related_result = await wiki_compiler.find_related(
+                compiled_content,
+                candidate_keys=cands,
+                topic_key=key,
+                timeout_s=get_compile_timeout_s(),
+                provider_hint=provider_hint,
+            )
+            if related_result.used_llm:
+                # Marker write FIRST (ADR-4 / reviewer Finding 4): related_keys
+                # stays the compiler's computation-state marker.
+                related_keys_value = ",".join(related_result.related_keys)
+                # Route the compiler's relationship set through the single service
+                # (FR-3.1), best-effort and AFTER the marker so a service failure
+                # never loses the marker. Producer-scoped: replaces only this
+                # source's (origin=compiler, type=relates_to) edges — human/lint/
+                # legacy edges are preserved (principle 6). Passes the FULL set.
+                see_also_targets = list(related_result.related_keys)
+                try:
+                    from cli_agent_orchestrator.services.memory_relationship_service import (
+                        EdgeInput,
+                        MemoryRelationshipService,
+                    )
+
+                    rel_svc = MemoryRelationshipService()
+                    rel_svc.replace_set(
+                        scope,
+                        scope_id,
+                        key,
+                        "compiler",
+                        "relates_to",
+                        [EdgeInput(target_key=t) for t in related_result.related_keys],
+                    )
+                    # ## See Also is a pure projection of ACTIVE relates_to edges
+                    # (FR-4.1) — so it reflects human-authored edges too, not just
+                    # the compiler's set. Fall back to the compiler set if the
+                    # store read fails.
+                    try:
+                        see_also_targets = rel_svc.active_targets(
+                            scope, scope_id, key, type="relates_to"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception as e:  # noqa: BLE001 — non-blocking; marker already written
+                    logger.warning(f"relationship replace_set (compiler) failed, ignoring: {e}")
+                if see_also_targets:
+                    see_also = self._render_see_also(
+                        see_also_targets,
+                        topic_scope=scope,
+                        topic_scope_id=scope_id,
+                    )
+                    stripped = self._strip_existing_see_also(compiled_content)
+                    compiled_content = stripped + "\n" + see_also if see_also else stripped
+            else:
+                logger.info("find_related_fallback reason=%s", related_result.fallback_reason)
+            _audit(
+                "find_related_completed",
+                f"related: {len(related_result.related_keys)} keys",
+                n_related=str(len(related_result.related_keys)),
+                used_llm=str(related_result.used_llm).lower(),
+            )
+        except Exception as e:  # noqa: BLE001 — non-blocking promise
+            logger.warning(f"find_related raised, ignoring: {e}")
+
+        topic_lock_path = wiki_path.parent / f".{wiki_path.stem}.lock"
+        try:
+            topic_lock_fd = open(topic_lock_path, "w")
+        except OSError:
+            return "error"
+        try:
+            fcntl.flock(topic_lock_fd, fcntl.LOCK_EX)
+            # Drop the result if a concurrent store() changed the file.
+            try:
+                current = wiki_path.read_text(encoding="utf-8")
+            except OSError:
+                return "error"
+            if current != expected_content:
+                logger.info(f"background compile stale, dropping (key={key})")
+                _audit("compile_stale_dropped", "newer store won the race")
+                return "stale"
+            tmp_path = wiki_path.parent / f".{wiki_path.stem}.compile.tmp"
+            tmp_path.write_text(compiled_content, encoding="utf-8")
+            os.replace(str(tmp_path), str(wiki_path))
+            try:
+                self._upsert_metadata(
+                    key=key,
+                    memory_type=self._memory_type_from_file(compiled_content),
+                    scope=scope,
+                    scope_id=scope_id,
+                    file_path=str(wiki_path),
+                    tags=self._tags_from_file(compiled_content),
+                    source_provider=None,
+                    source_terminal_id=None,
+                    token_estimate=len(compiled_content) // 4,
+                    last_compiled_at=datetime.now(timezone.utc),
+                    related_keys=related_keys_value,
+                    preserve_provenance=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"compile metadata stamp failed (key={key}): {e}")
+            logger.info(f"background compile applied (key={key})")
+            _audit(
+                "compile_completed",
+                "compile used_llm=true",
+                used_llm="true",
+                elapsed_ms=str(result.elapsed_ms),
+            )
+            return "applied"
+        finally:
+            try:
+                fcntl.flock(topic_lock_fd, fcntl.LOCK_UN)
+            finally:
+                topic_lock_fd.close()
+
+    async def compact(
+        self,
+        scope: str = "global",
+        scope_id: Optional[str] = None,
+        key: Optional[str] = None,
+        terminal_context: Optional[dict] = None,
+    ) -> dict:
+        """Manually compact wiki topics via the LLM compiler (repair sweep).
+
+        Catches every topic the fire-and-forget background path missed —
+        dropped daemon threads, timeouts, stale races. A topic needs
+        compaction when its metadata row has ``last_compiled_at`` NULL or
+        older than ``updated_at``. With ``key`` set, compacts that single
+        topic unconditionally.
+
+        Runs compiles sequentially (one CLI process at a time) and AWAITS
+        them — this is the explicit, interactive path, not the deferred one.
+        Returns ``{key: status}`` per topic plus a ``_summary`` count.
+        """
+        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+        valid_scopes = {s.value for s in MemoryScope}
+        if scope not in valid_scopes:
+            raise ValueError(f"scope must be one of {valid_scopes}, got '{scope}'")
+        provider_hint = (terminal_context or {}).get("provider")
+
+        candidates: list = []
+        try:
+            with self._get_db_session() as db:
+                q = db.query(MemoryMetadataModel).filter(MemoryMetadataModel.scope == scope)
+                if scope_id is not None:
+                    q = q.filter(MemoryMetadataModel.scope_id == scope_id)
+                if key is not None:
+                    q = q.filter(MemoryMetadataModel.key == self._sanitize_key(key))
+                for row in q.all():
+                    if key is None and row.last_compiled_at is not None:
+                        last_compiled = row.last_compiled_at
+                        updated = row.updated_at
+                        if last_compiled.tzinfo is None:
+                            last_compiled = last_compiled.replace(tzinfo=timezone.utc)
+                        if updated.tzinfo is None:
+                            updated = updated.replace(tzinfo=timezone.utc)
+                        if last_compiled >= updated:
+                            continue
+                    candidates.append((row.key, row.scope_id))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"compact: candidate query failed: {e}")
+            return {"_summary": {"error": str(e)}}
+
+        results: dict = {}
+        for topic_key, topic_scope_id in candidates:
+            wiki_path = self.get_wiki_path(scope, topic_scope_id, topic_key)
+            try:
+                article = wiki_path.read_text(encoding="utf-8")
+            except OSError:
+                results[topic_key] = "missing-file"
+                continue
+            # Whole-article compaction: the article is the input, no new
+            # entry. The optimistic-concurrency token is the article itself.
+            results[topic_key] = await self._run_background_compile(
+                scope=scope,
+                scope_id=topic_scope_id,
+                key=topic_key,
+                new_entry="",
+                pre_append_content=article,
+                expected_content=article,
+                provider_hint=provider_hint,
+            )
+
+        summary: dict = {}
+        for status in results.values():
+            summary[status] = summary.get(status, 0) + 1
+        results["_summary"] = summary
+        return results
+
+    @staticmethod
+    def _memory_type_from_file(content: str) -> str:
+        m = re.search(r"<!-- id: [a-f0-9\-]+ \| scope: [^|]+ \| type: ([^|]+) \|", content)
+        return m.group(1).strip() if m else "reference"
+
+    @staticmethod
+    def _tags_from_file(content: str) -> str:
+        m = re.search(r"\| tags: (.*?) -->", content)
+        return normalize_memory_tags(m.group(1)) if m else ""
+
+    # -------------------------------------------------------------------------
+    # Cross-references (See-Also)
+    # -------------------------------------------------------------------------
+
+    RELATED_FANOUT_CAP = 5
+    """Per-build fanout cap for ``get_memory_context_for_terminal``.
+
+    Tuned to ``MEMORY_MAX_PER_SCOPE * 0.5`` so related expansion never
+    exceeds 50% of any scope's slot count. ``recall(include_related=True)``
+    is NOT subject to this cap (per-primary parse cap of 3 is sufficient).
+    """
+
+    @staticmethod
+    def _parse_related_keys(raw: Optional[str], scope: str = "<unknown>") -> list:
+        """Defence-in-depth read of ``MemoryMetadataModel.related_keys``.
+
+        Short-circuit if oversized, drop any token that fails the sanitiser
+        round-trip, dedup, cap at 3. NEVER raises; returns ``[]`` for
+        NULL/empty.
+        """
+        if not raw:
+            return []
+        if len(raw) > 1024:
+            logger.warning("related_keys_oversized scope=%s len=%d", scope, len(raw))
+            raw = raw[:1024]
+        out: list = []
+        seen: set = set()
+        for part in raw.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            try:
+                canonical = MemoryService._sanitize_key(p)
+            except ValueError:
+                logger.warning("related_keys_unsanitised scope=%s", scope)
+                continue
+            if canonical != p:
+                logger.warning("related_keys_unsanitised scope=%s", scope)
+                continue
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            out.append(canonical)
+            if len(out) >= 3:
+                break
+        return out
+
+    def _candidate_keys_for_topic(
+        self, scope: str, scope_id: Optional[str], exclude_key: str
+    ) -> list:
+        """Build the candidate-key set fed to ``find_related``.
+
+        Pulls all keys from SQLite metadata for the same scope/scope_id —
+        ``index.md`` is derived state, SQLite is source of truth. Excludes
+        the topic key (self-reference). Caps at the 200 most-recently
+        updated rows.
+        """
+        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+        try:
+            with self._get_db_session() as db:
+                q = db.query(MemoryMetadataModel).filter(MemoryMetadataModel.scope == scope)
+                if scope_id is not None:
+                    q = q.filter(MemoryMetadataModel.scope_id == scope_id)
+                else:
+                    q = q.filter(MemoryMetadataModel.scope_id.is_(None))
+                rows = q.order_by(MemoryMetadataModel.updated_at.desc()).limit(200).all()
+                return [r.key for r in rows if r.key != exclude_key]
+        except Exception as e:
+            logger.warning(f"candidate-key load failed: {e}")
+            return []
+
+    def _render_see_also(
+        self,
+        related_keys: list,
+        *,
+        topic_scope: str,
+        topic_scope_id: Optional[str],
+    ) -> str:
+        """Render the ``## See Also`` block for atomic-write inclusion.
+
+        Every emitted line MUST match ``wiki_compiler.SEE_ALSO_LINK_RE``.
+        Lines failing the regex are dropped with a WARNING (defence in
+        depth). Empty input → empty string (no empty section).
+        """
+        from cli_agent_orchestrator.services.wiki_compiler import SEE_ALSO_LINK_RE
+
+        if not related_keys:
+            return ""
+
+        lines: list = ["## See Also"]
+        for k in related_keys:
+            try:
+                canonical = self._sanitize_key(k)
+            except ValueError:
+                logger.warning("see_also: dropping unsanitisable key")
+                continue
+            # The source article and its related siblings share the same
+            # scope directory because candidates are limited to the same
+            # scope. Render a relative path the caller can resolve against
+            # the source file's directory: ``../<scope_id>/<key>.md``.
+            scope_id_seg = topic_scope_id or topic_scope
+            line = f"- [{canonical}](../{scope_id_seg}/{canonical}.md)"
+            if not SEE_ALSO_LINK_RE.match(line):
+                logger.warning("see_also: dropping non-canonical line shape")
+                continue
+            lines.append(line)
+        if len(lines) == 1:
+            return ""
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _strip_existing_see_also(content: str) -> str:
+        """Remove an existing ``## See Also`` section (heading + bullet list).
+
+        Each compile rewrites the section from scratch, so any pre-existing
+        block must be excised first (idempotency). The block extends from
+        ``## See Also`` to the next ``##`` heading or EOF. Trailing
+        whitespace is normalised.
+        """
+        lines = content.splitlines(keepends=False)
+        out: list = []
+        skip = False
+        for line in lines:
+            stripped = line.rstrip()
+            if stripped == "## See Also":
+                skip = True
+                continue
+            if skip and stripped.startswith("## "):
+                skip = False
+            if skip:
+                continue
+            out.append(line)
+        # Drop trailing empty lines created by the strip; reproduce a
+        # single trailing newline shape compatible with append-mode bytes.
+        rendered = "\n".join(out).rstrip() + "\n"
+        return rendered
+
+    def _related_keys_lookup(self, keys: list, scope: str, scope_id: Optional[str]) -> dict:
+        """Return ``{key: related_keys_raw}`` for the given keys in scope.
+
+        Enriches recall/injection primaries (built from wiki files, which
+        carry no cross-reference data) with their SQLite ``related_keys``
+        cell. Missing rows are simply absent from the returned dict —
+        callers iterate via ``.get(k)``.
+        """
+        if not keys:
+            return {}
+        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+        try:
+            with self._get_db_session() as db:
+                q = db.query(MemoryMetadataModel).filter(
+                    MemoryMetadataModel.key.in_(list(set(keys))),
+                    MemoryMetadataModel.scope == scope,
+                )
+                if scope_id is not None:
+                    q = q.filter(MemoryMetadataModel.scope_id == scope_id)
+                else:
+                    q = q.filter(MemoryMetadataModel.scope_id.is_(None))
+                return {r.key: r.related_keys for r in q.all()}
+        except Exception as e:
+            logger.debug(f"_related_keys_lookup failed: {e}")
+            return {}
+
+    def _load_related_memory(
+        self, key: str, scope: str, scope_id: Optional[str]
+    ) -> "Optional[Memory]":
+        """Load a single related Memory with the same guards as primary recall.
+
+        The key is sanitised and the wiki path is resolved through
+        ``get_wiki_path`` (which enforces base-dir containment, including
+        symlink escapes). Silent skip on any failure — missing or denied
+        returns None with no differential errors. ALWAYS returns a fresh
+        Memory instance (no cache across recalls).
+        """
+        try:
+            sanitised = self._sanitize_key(key)
+        except ValueError:
+            return None
+        if sanitised != key:
+            return None
+        try:
+            wiki_path = self.get_wiki_path(scope, scope_id, sanitised)
+        except ValueError:
+            return None
+        try:
+            if not wiki_path.exists():
+                return None
+            resolved = Path(os.path.realpath(str(wiki_path)))
+            # Validate against the scope directory the key legitimately lives
+            # in, not the global memory base — a symlink planted inside one
+            # scope's tree must not leak another scope's (or project's)
+            # memory even when its target stays under the base dir. The
+            # boundary is constructed from scope/scope_id, never derived from
+            # the on-disk path (get_wiki_path resolves THROUGH a symlink, so
+            # the path's own parent would be the symlink target's directory).
+            scope_dir = self._get_project_dir(scope, scope_id) / "wiki" / scope
+            if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
+                scope_dir = scope_dir / scope_id
+            scope_dir_real = os.path.realpath(str(scope_dir))
+            if not str(resolved).startswith(scope_dir_real + os.sep):
+                return None
+            file_content = resolved.read_text(encoding="utf-8")
+            entry = {
+                "key": sanitised,
+                "scope": scope,
+                "scope_id": scope_id,
+                "memory_type": "",
+                "tags": "",
+            }
+            return self._parse_wiki_file(resolved, file_content, entry)
+        except Exception as e:
+            logger.debug(f"_load_related_memory failed key={sanitised}: {e}")
+            return None
+
+    def _effective_scope_id(self, memory: Memory) -> Optional[str]:
+        """Resolve the SQLite scope_id for a wiki-parsed Memory.
+
+        Memories built from wiki files carry ``scope_id`` only for session/
+        agent scopes (embedded in the path). Project rows in SQLite store the
+        project hash, which for a parsed Memory must be recovered from the
+        file's container directory (``<base>/<project-hash>/wiki/...``).
+        """
+        if memory.scope_id is not None:
+            return memory.scope_id
+        if memory.scope == MemoryScope.PROJECT.value and memory.file_path:
+            try:
+                rel = Path(memory.file_path).resolve().relative_to(self.base_dir.resolve())
+                container = rel.parts[0]
+                if container != "global":
+                    return container
+            except Exception:
+                return None
+        return None
+
+    def _superseded_keys(self, memories: list) -> set:
+        """Return ``{(scope, scope_id, key)}`` for memories that are the target of
+        an active supersedes edge (FR-4.6 ranking input). BATCHED per
+        (scope, scope_id) — one query per scope group, not one per memory (avoids
+        N queries on a large recall). Best-effort; empty on failure.
+
+        The identity is the FULL 3-tuple matching ``MemoryMetadataModel``'s
+        ``(key, scope, scope_id)`` uniqueness. Keying on ``(scope, key)`` alone
+        would let the same key in one project's scope_id mark a DIFFERENT,
+        non-superseded memory as superseded whenever a recall spans projects.
+
+        ``scope_id`` here is the LOGICAL value from ``_effective_scope_id`` —
+        ``None`` for global — never the ``""`` sentinel. That sentinel belongs to
+        the ``memory_relationships`` table's own NOT NULL column (it exists so
+        the dedup UNIQUE index is total); ``MemoryMetadataModel.scope_id`` is
+        genuinely nullable, and the Memory objects compared against this set
+        carry the logical value.
+        """
+        if not memories:
+            return set()
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            rel_svc = MemoryRelationshipService()
+        except Exception:  # pragma: no cover - import guard
+            return set()
+        groups: dict = {}
+        for m in memories:
+            groups.setdefault((m.scope, self._effective_scope_id(m)), []).append(m.key)
+        out: set = set()
+        for (g_scope, g_scope_id), keys in groups.items():
+            try:
+                hits = rel_svc.superseded_targets(g_scope, g_scope_id, keys)
+            except Exception:  # noqa: BLE001 — non-blocking
+                continue
+            for k in hits:
+                out.add((g_scope, g_scope_id, k))
+        return out
+
+    def _is_superseded(self, m, superseded: set) -> bool:
+        """The demotion predicate recall's sort key applies to ONE memory.
+
+        Extracted so the cross-project regression test can drive the REAL
+        predicate. A test that re-expresses this comparison locally cannot fail
+        when the production sort key is keyed too loosely — it proves only that
+        ``_superseded_keys`` is well-formed, which is a different claim.
+
+        Identity is the FULL ``(scope, scope_id, key)`` 3-tuple: a ``(scope,
+        key)`` comparison lets one project's supersedes edge demote a
+        same-named memory in a DIFFERENT project's scope_id.
+        """
+        return (m.scope, self._effective_scope_id(m), m.key) in superseded
+
+    def _expand_related(self, primaries: list) -> list:
+        """One-level cross-reference traversal for ``recall(include_related=True)``.
+
+        Appended AFTER the limit slice — the caller asked for related, we
+        deliver in addition. ``visited`` is seeded with primary keys for
+        cycle/dedup prevention. Depth = 1; no recursion. NOT subject to
+        ``RELATED_FANOUT_CAP`` (the per-primary parse cap of 3 suffices).
+        """
+        if not primaries:
+            return primaries
+        visited: set = {m.key for m in primaries}
+        extras: list = []
+        # One-level expansion follows ACTIVE relates_to edges from the
+        # relationship STORE (issue #511, FR-4.2 — the store is authoritative for
+        # typed edges: only active relates_to is traversed; proposal/rejected/
+        # superseded/deleted and contradiction/supersedes are NOT expansion edges).
+        # UNION with the legacy ``related_keys`` marker for any primary the store
+        # returns nothing for, so a related_keys value written by a route OTHER
+        # than an LLM compile (a direct write, an import, a restore, or a row that
+        # predates the one-time backfill and was modified after) is still
+        # traversable during the compatibility window S6 protects — retirement of
+        # related_keys stays gated on the loss-free proof (ADR-4/FR-7.2). Both
+        # sources dedupe against ``visited``. Best-effort throughout.
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            rel_svc: Any = MemoryRelationshipService()
+        except Exception as e:  # pragma: no cover - import guard
+            logger.debug(f"related expansion service import failed: {e}")
+            rel_svc = None
+        # Batch-load the legacy related_keys marker per (scope, scope_id) so the
+        # fallback is not N+1 (mirrors the pre-#511 grouping).
+        groups: dict = {}
+        for m in primaries:
+            groups.setdefault((m.scope, self._effective_scope_id(m)), []).append(m)
+        legacy_lookups: dict = {}
+        # Batch-load the STORE's active relates_to targets per (scope, scope_id)
+        # too — one query per group, matching the legacy lookup's grouping. A
+        # per-primary active_targets call here was an N+1 on the authoritative
+        # read path while the legacy fallback beside it was already batched.
+        store_lookups: dict = {}
+        for (g_scope, g_scope_id), members in groups.items():
+            member_keys = [m.key for m in members]
+            try:
+                legacy_lookups[(g_scope, g_scope_id)] = self._related_keys_lookup(
+                    member_keys, g_scope, g_scope_id
+                )
+            except Exception as e:  # noqa: BLE001 — non-blocking
+                logger.debug(f"related_keys lookup failed for {g_scope}: {e}")
+                legacy_lookups[(g_scope, g_scope_id)] = {}
+            if rel_svc is None:
+                store_lookups[(g_scope, g_scope_id)] = {}
+                continue
+            try:
+                store_lookups[(g_scope, g_scope_id)] = rel_svc.active_targets_for(
+                    g_scope, g_scope_id, member_keys, type="relates_to"
+                )
+            except Exception as e:  # noqa: BLE001 — non-blocking
+                logger.debug(f"active_targets_for failed for {g_scope}: {e}")
+                store_lookups[(g_scope, g_scope_id)] = {}
+
+        for primary in primaries:
+            primary_scope_id = self._effective_scope_id(primary)
+            # Absent from the map == the store has no active edges for this
+            # primary, which is exactly the condition the legacy fallback below
+            # keys on (the store stays authoritative whenever it HAS edges).
+            targets: list = list(
+                store_lookups.get((primary.scope, primary_scope_id), {}).get(primary.key) or []
+            )
+            # Legacy fallback: only when the store yielded nothing for this
+            # primary (the store is authoritative when it has edges).
+            if not targets:
+                raw = legacy_lookups.get((primary.scope, primary_scope_id), {}).get(primary.key)
+                targets = self._parse_related_keys(raw, scope=primary.scope)
+            for rk in targets:
+                if rk in visited:
+                    continue
+                visited.add(rk)
+                related_mem = self._load_related_memory(rk, primary.scope, primary_scope_id)
+                if related_mem is None:
+                    continue
+                related_mem.is_related = True
+                extras.append(related_mem)
+        return primaries + extras
 
     # -------------------------------------------------------------------------
     # Index maintenance
@@ -798,6 +1820,8 @@ class MemoryService:
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
         search_mode: str = "hybrid",
+        sort_by: str = "recency",
+        include_related: bool = False,
     ) -> list[Memory]:
         """Recall memories matching query and filters.
 
@@ -805,6 +1829,17 @@ class MemoryService:
           - ``metadata``: substring match against key/tags/content via index.md walk.
           - ``bm25``: BM25 ranking over wiki bodies (content-aware).
           - ``hybrid``: metadata results first, then BM25 fills with what metadata missed.
+
+        ``sort_by`` (orthogonal to ``search_mode``):
+          - ``recency``: Phase 1/2 ordering (``-updated_at`` + scope precedence).
+            DEFAULT — byte-identical to the pre-scoring behaviour.
+          - ``score``: composite 3-factor (BM25 + recency + usage).
+          - ``usage``: most-accessed first.
+
+        ``include_related``: when True, each result's
+        ``related_keys`` cross-references are loaded (one level, same scope)
+        and appended after the primary results, marked ``is_related=True``.
+        Default False is byte-identical to the non-expanded path.
 
         Returns ``[]`` when ``memory.enabled`` is False (U5 / SC-6).
         """
@@ -816,6 +1851,13 @@ class MemoryService:
                 f"Invalid search_mode {search_mode!r}; expected one of {VALID_SEARCH_MODES}"
             )
 
+        # Whitelist sort_by BEFORE any DB/file work so a
+        # typo surfaces to the caller (MCP tool) rather than silently
+        # falling back.
+        from cli_agent_orchestrator.services.memory_scoring import validate_sort_by
+
+        validate_sort_by(sort_by)
+
         if search_mode == "bm25":
             if not query:
                 return []
@@ -824,13 +1866,23 @@ class MemoryService:
                 if scope and scope != MemoryScope.GLOBAL.value and terminal_context
                 else None
             )
-            return self._bm25_search(
+            bm25_only = self._bm25_search(
                 query=query,
                 scope=scope,
                 scope_id=scope_id,
                 memory_type=memory_type,
                 limit=limit,
                 exclude_keys=set(),
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+            )
+            return self._apply_sort_and_increment(
+                bm25_only,
+                scope,
+                sort_by,
+                limit,
+                include_related=include_related,
+                query=query,
                 terminal_context=terminal_context,
                 scan_all=scan_all,
             )
@@ -845,13 +1897,31 @@ class MemoryService:
         )
 
         if search_mode == "metadata" or not query:
-            return metadata_results
+            return self._apply_sort_and_increment(
+                metadata_results,
+                scope,
+                sort_by,
+                limit,
+                include_related=include_related,
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+            )
 
         # hybrid: top up with BM25 hits not already in metadata results
         exclude_keys = {m.key for m in metadata_results}
         remaining = max(0, limit - len(metadata_results))
         if remaining == 0:
-            return metadata_results
+            return self._apply_sort_and_increment(
+                metadata_results,
+                scope,
+                sort_by,
+                limit,
+                include_related=include_related,
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+            )
 
         scope_id = (
             self.resolve_scope_id(scope, terminal_context)
@@ -868,7 +1938,220 @@ class MemoryService:
             terminal_context=terminal_context,
             scan_all=scan_all,
         )
-        return metadata_results + bm25_results
+        return self._apply_sort_and_increment(
+            metadata_results + bm25_results,
+            scope,
+            sort_by,
+            limit,
+            include_related=include_related,
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+        )
+
+    def _apply_sort_and_increment(
+        self,
+        results: list,
+        scope: Optional[str],
+        sort_by: str,
+        limit: int,
+        include_related: bool = False,
+        query: Optional[str] = None,
+        terminal_context: Optional[dict] = None,
+        scan_all: bool = False,
+    ) -> list:
+        """Apply sort mode, slice, then best-effort access bump.
+
+        ``recency`` is the byte-identical Phase 1/2 path: the per-source
+        sorts in ``_metadata_recall``/``_bm25_search`` already produced that
+        order, so we leave ``results`` untouched and only slice. ``score``/
+        ``usage`` enrich ``access_count`` from SQLite (recall builds Memory
+        objects from wiki files, which carry no usage data), compute the
+        composite, then apply a stable scope-precedence pass so scope
+        dominance holds in every mode.
+        """
+        from cli_agent_orchestrator.services.memory_scoring import (
+            SCOPE_PRECEDENCE,
+            normalise_bm25_scores,
+            score_memory,
+        )
+
+        if sort_by != "recency":
+            self._enrich_access_counts(results)
+            now_utc = datetime.now(timezone.utc)
+            if sort_by == "usage":
+                results.sort(
+                    key=lambda m: (
+                        -int(getattr(m, "access_count", 0) or 0),
+                        -m.updated_at.timestamp(),
+                        m.key,
+                    )
+                )
+            else:  # "score"
+                # Genuine 3-factor: score the WHOLE candidate set against the
+                # query in one corpus, normalise per-batch, and feed that into
+                # the lexical factor. Keyed by full identity so two same-slug
+                # rows in different scopes never collide. No query / no
+                # rank_bm25 → empty map → degrades to recency+usage.
+                norm_bm25 = normalise_bm25_scores(
+                    self._bm25_relevance(query, results, terminal_context, scope, scan_all)
+                )
+                composite = {
+                    self._identity(m): score_memory(
+                        norm_bm25.get(self._identity(m), 0.0),
+                        m.updated_at,
+                        int(getattr(m, "access_count", 0) or 0),
+                        now=now_utc,
+                    )
+                    for m in results
+                }
+                results.sort(
+                    key=lambda m: (
+                        -composite[self._identity(m)],
+                        -m.updated_at.timestamp(),
+                        -int(getattr(m, "access_count", 0) or 0),
+                        m.key,
+                    )
+                )
+                # FR-4.6: a memory that is the TARGET of an active supersedes edge
+                # must not outrank active guidance merely by textual similarity.
+                # Apply a stable demotion — superseded memories sink below
+                # non-superseded ones while preserving the composite order within
+                # each group. Best-effort; a store read failure leaves the order
+                # unchanged. NULL confidence is NOT used here (never treated as
+                # zero — NFR-2.3); this demotion is purely lifecycle-based.
+                try:
+                    superseded = self._superseded_keys(results)
+                    if superseded:
+                        # Full (scope, scope_id, key) identity — see
+                        # _superseded_keys. A (scope, key) comparison would
+                        # cross-project-demote a same-named memory.
+                        results.sort(key=lambda m: 1 if self._is_superseded(m, superseded) else 0)
+                except Exception as e:  # noqa: BLE001 — non-blocking
+                    logger.debug(f"superseded demotion skipped: {e}")
+            if not scope:
+                # Stable scope-precedence sort AFTER score/usage preserves
+                # within-scope ordering while enforcing scope dominance.
+                results.sort(key=lambda m: SCOPE_PRECEDENCE.get(m.scope, 99))
+
+        sliced = results[:limit]
+
+        # Best-effort access_count increment (non-blocking).
+        try:
+            self._increment_access_count(sliced)
+        except Exception as e:  # noqa: BLE001 — non-blocking promise
+            logger.warning(
+                "memory_increment_failed attempted=%d scope=%s",
+                len(sliced),
+                scope or "<all>",
+            )
+            logger.debug(f"recall increment failure detail: {e}")
+
+        # Opt-in cross-reference expansion, appended AFTER the
+        # limit slice (the caller asked for related; we deliver in addition).
+        if include_related and sliced:
+            try:
+                sliced = self._expand_related(sliced)
+            except Exception as e:  # noqa: BLE001 — non-blocking promise
+                logger.warning(f"related expansion failed, returning primaries: {e}")
+
+        return sliced
+
+    def _identity(self, m) -> tuple:
+        """Full memory identity ``(key, scope, scope_id)`` matching SQLite.
+
+        Matches the metadata table's uniqueness constraint. Used to key
+        usage enrich/increment and the composite-score dict so same-slug
+        memories in different scopes never collide.
+
+        Uses ``_effective_scope_id`` (not raw ``m.scope_id``) so PROJECT rows
+        — whose parsed Memory carries ``scope_id=None`` but whose SQLite row
+        stores the project hash — match correctly. Mirrors the recovery the
+        related-key expansion already performs.
+        """
+        return (m.key, m.scope, self._effective_scope_id(m))
+
+    def _enrich_access_counts(self, memories: list) -> None:
+        """Populate ``access_count`` on Memory objects from SQLite.
+
+        Recall builds Memory objects by parsing wiki markdown files, which do
+        not carry usage data; the scoring/usage sort needs ``access_count``
+        from the metadata table. Best-effort: on any DB error the objects keep
+        their default ``0`` and scoring degrades to recency-like behaviour.
+        """
+        if not memories:
+            return
+        try:
+            from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+            keys = list({m.key for m in memories})
+            with self._get_db_session() as db:
+                rows = db.query(MemoryMetadataModel).filter(MemoryMetadataModel.key.in_(keys)).all()
+                # Key the lookup by FULL identity (key, scope, scope_id) — the
+                # table's uniqueness constraint. A bare-key or (key, scope)
+                # match would read a same-slug row from another scope/project.
+                by_identity = {(r.key, r.scope, r.scope_id): int(r.access_count or 0) for r in rows}
+            for m in memories:
+                m.access_count = by_identity.get(self._identity(m), 0)
+        except Exception as e:  # noqa: BLE001 — best-effort enrichment
+            logger.debug(f"access_count enrichment skipped: {e}")
+
+    def _increment_access_count(self, memories: list) -> None:
+        """Batch UPDATE access_count and last_accessed_at.
+
+        60s rate-limit via server-side ``julianday("now")``,
+        not caller clock. Each row increments at most once per recall and at
+        most once per 60s. Filtered rows still appear in results — only the
+        increment is suppressed.
+
+        Re-raises on DB error so the caller's handler produces the counts-only
+        WARNING with row counts only (no content bytes).
+        """
+        if not memories:
+            return
+        from sqlalchemy import and_, func, or_, update
+
+        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+        # Match on FULL identity (key, scope, scope_id), not bare key — the
+        # table's uniqueness constraint. A key-only UPDATE would bump every
+        # same-slug row across scopes/projects (cross-scope contamination).
+        # OR-of-ANDs is used over tuple_().in_() because SQLite tuple-IN
+        # compares scope_id with ``=``, which never matches the NULL that
+        # global rows carry; ``.is_(None)`` is required for those.
+        identities = {self._identity(m) for m in memories}
+        identity_clause = or_(
+            *[
+                and_(
+                    MemoryMetadataModel.key == k,
+                    MemoryMetadataModel.scope == s,
+                    (
+                        MemoryMetadataModel.scope_id == sid
+                        if sid is not None
+                        else MemoryMetadataModel.scope_id.is_(None)
+                    ),
+                )
+                for (k, s, sid) in identities
+            ]
+        )
+        with self._get_db_session() as db:
+            stmt = (
+                update(MemoryMetadataModel)
+                .where(identity_clause)
+                .where(
+                    or_(
+                        MemoryMetadataModel.last_accessed_at.is_(None),
+                        func.julianday("now") - func.julianday(MemoryMetadataModel.last_accessed_at)
+                        >= 60.0 / 86400.0,
+                    )
+                )
+                .values(
+                    access_count=MemoryMetadataModel.access_count + 1,
+                    last_accessed_at=func.datetime("now"),
+                )
+            )
+            db.execute(stmt)
+            db.commit()
 
     async def _metadata_recall(
         self,
@@ -905,6 +2188,9 @@ class MemoryService:
             if not index_path.exists():
                 continue
 
+            wiki_dir = project_dir / "wiki"
+            wiki_resolved = os.path.realpath(str(wiki_dir))
+
             entries = self._parse_index(index_path)
 
             for entry in entries:
@@ -920,11 +2206,23 @@ class MemoryService:
                     continue
 
                 # Read the wiki file
-                wiki_file = project_dir / "wiki" / entry["relative_path"]
-                if not wiki_file.exists():
+                wiki_file = wiki_dir / entry["relative_path"]
+                resolved_wiki = Path(os.path.realpath(str(wiki_file)))
+                # Guard against a crafted/corrupted index entry (e.g.
+                # ``[x](../../../../etc/passwd)``) escaping this scope's wiki
+                # directory and leaking an arbitrary out-of-base file as a
+                # "memory". Mirrors get_memory_context_for_terminal: skip the
+                # escaping entry rather than raising, keeping recall resilient
+                # to a corrupted index.
+                if not str(resolved_wiki).startswith(wiki_resolved + os.sep):
+                    logger.warning(
+                        f"Path traversal in index entry rejected: {entry.get('relative_path')}"
+                    )
+                    continue
+                if not resolved_wiki.exists():
                     continue
 
-                file_content = wiki_file.read_text(encoding="utf-8")
+                file_content = resolved_wiki.read_text(encoding="utf-8")
 
                 # Query matching: check if query terms appear in content (case-insensitive)
                 if query:
@@ -949,6 +2247,7 @@ class MemoryService:
                 MemoryScope.PROJECT.value: 1,
                 MemoryScope.GLOBAL.value: 2,
                 MemoryScope.AGENT.value: 3,
+                MemoryScope.FEDERATED.value: 4,
             }
             results.sort(key=lambda m: (precedence.get(m.scope, 99), -m.updated_at.timestamp()))
 
@@ -962,6 +2261,100 @@ class MemoryService:
     def _bm25_tokenize(text: str) -> list[str]:
         """Lowercase, split on non-alphanumeric, drop empties."""
         return [t for t in re.split(r"[^a-zA-Z0-9]+", text.lower()) if t]
+
+    def _bm25_relevance(
+        self,
+        query: Optional[str],
+        memories: list,
+        terminal_context: Optional[dict],
+        scope: Optional[str],
+        scan_all: bool,
+    ) -> dict:
+        """Raw BM25 score per memory identity for the score-mode lexical factor.
+
+        Scores against ``query`` over the FULL wiki corpus in the search dirs
+        (the same corpus ``_bm25_search`` builds), not just the candidate
+        ``memories``. The full corpus is essential for correct IDF: a candidate-
+        only corpus collapses when every candidate contains the query term
+        (df == N → negative IDF → all-zero). Scores are returned only for the
+        identities present in ``memories``, keyed by ``(key, scope, scope_id)``,
+        so the relevance magnitude is comparable across rows regardless of
+        whether each arrived via metadata substring match or BM25 top-up.
+
+        Returns ``{}`` when not applicable (no query/candidates, ``rank_bm25``
+        absent, no corpus); callers treat a missing key as ``0.0`` so score
+        degrades to recency+usage. A document only scores when at least one
+        query token actually appears in it — BM25 IDF can go negative on tiny
+        corpora, so we cannot gate on score > 0 alone.
+        """
+        if not query or not memories:
+            return {}
+        try:
+            from rank_bm25 import BM25Okapi  # type: ignore[import-untyped]
+        except ImportError:
+            logger.debug("rank_bm25 not installed; score-mode BM25 factor disabled")
+            return {}
+
+        query_tokens = self._bm25_tokenize(query)
+        if not query_tokens:
+            return {}
+        query_token_set = set(query_tokens)
+
+        # Build the corpus over every wiki file in the search dirs so IDF is
+        # computed against the real document population, not just the matches.
+        # A candidate-only corpus collapses when every candidate contains the
+        # query term (df == N → negative IDF → all-zero).
+        search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        wanted = {self._identity(m) for m in memories}
+        identities: list[Optional[tuple]] = []  # parallel to corpus_tokens
+        corpus_tokens: list[list[str]] = []
+        seen: set[Path] = set()
+        for project_dir in search_dirs:
+            wiki_root = project_dir / "wiki"
+            if not wiki_root.exists():
+                continue
+            for wiki_file in wiki_root.rglob("*.md"):
+                if wiki_file.name == "index.md" or wiki_file in seen:
+                    continue
+                seen.add(wiki_file)
+                rel_parts = wiki_file.relative_to(wiki_root).parts
+                if not rel_parts:
+                    continue
+                try:
+                    tokens = self._bm25_tokenize(wiki_file.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                file_scope = rel_parts[0]
+                file_scope_id: Optional[str] = None
+                if (
+                    file_scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value)
+                    and len(rel_parts) >= 3
+                ):
+                    file_scope_id = rel_parts[1]
+                elif file_scope == MemoryScope.PROJECT.value:
+                    # Project rows store the project-hash container as scope_id.
+                    file_scope_id = project_dir.name if project_dir.name != "global" else None
+                corpus_tokens.append(tokens)
+                # Only track identities we'll report; others stay in the corpus
+                # (for IDF) but map to None so they're skipped on readback.
+                identity = (wiki_file.stem, file_scope, file_scope_id)
+                identities.append(identity if identity in wanted else None)
+
+        if not corpus_tokens:
+            return {}
+
+        try:
+            scores = BM25Okapi(corpus_tokens).get_scores(query_tokens)
+        except Exception as e:  # noqa: BLE001 — best-effort lexical factor
+            logger.debug(f"score-mode BM25 scoring skipped: {e}")
+            return {}
+
+        out: dict = {}
+        for i, ident in enumerate(identities):
+            # Report a wanted row only when it is a real lexical match.
+            if ident is not None and query_token_set & set(corpus_tokens[i]):
+                out[ident] = float(scores[i])
+        return out
 
     def _bm25_search(
         self,
@@ -1092,18 +2485,40 @@ class MemoryService:
         if global_dir.exists():
             dirs.append(global_dir)
 
+        # Include the machine-wide federated tier when present. The
+        # ``.exists()`` guard preserves the byte-identical search-dir
+        # invariant: with no federated memories on disk, the dir list is
+        # unchanged from pre-federation behaviour.
+        federated_dir = self.base_dir / "federated"
+        if federated_dir.exists() and federated_dir not in dirs:
+            dirs.append(federated_dir)
+
         if scan_all:
             # Enumerate all project-hash dirs (for CLI use where user owns the filesystem)
             if self.base_dir.exists():
                 for child in sorted(self.base_dir.iterdir()):
-                    if child.is_dir() and child.name != "global" and child not in dirs:
+                    if (
+                        child.is_dir()
+                        and child.name != "global"
+                        and child.name != "federated"
+                        and child not in dirs
+                    ):
                         dirs.append(child)
         elif terminal_context:
             # Include the specific project dir for this terminal's cwd
             project_scope_id = self.resolve_scope_id("project", terminal_context)
             if project_scope_id:
-                project_dir = self.base_dir / project_scope_id
-                if project_dir.exists() and project_dir not in dirs:
+                # ``project_scope_id`` is context-derived; validate + confine
+                # under the base before touching the filesystem.
+                try:
+                    project_dir = Path(
+                        safe_join_under_base(
+                            str(self.base_dir), project_scope_id, description="scope_id"
+                        )
+                    )
+                except ValueError:
+                    project_dir = None
+                if project_dir is not None and project_dir.exists() and project_dir not in dirs:
                     dirs.append(project_dir)
                 # Also include legacy cwd-hash dirs recorded as aliases so
                 # pre-U6 memories survive the canonical-id transition.
@@ -1115,7 +2530,18 @@ class MemoryService:
                     for alias in list_aliases_for_project(project_scope_id):
                         if alias.get("kind") != "cwd_hash":
                             continue
-                        alias_dir = self.base_dir / alias["alias"]
+                        # Alias names originate from stored git/cwd identities;
+                        # validate + confine each before filesystem access.
+                        try:
+                            alias_dir = Path(
+                                safe_join_under_base(
+                                    str(self.base_dir),
+                                    alias["alias"],
+                                    description="alias",
+                                )
+                            )
+                        except (ValueError, KeyError, TypeError):
+                            continue
                         if alias_dir.exists() and alias_dir not in dirs:
                             dirs.append(alias_dir)
                 except Exception as e:
@@ -1142,12 +2568,9 @@ class MemoryService:
                 continue
 
             # Parse entry lines: - [key](scope/key.md) — type:X tags:Y ~Ntok updated:Z
-            match = re.match(
-                r"^- \[([^\]]+)\]\(([^)]+)\) — type:(\S+) tags:(\S*) ~\d+tok updated:(\S+)$",
-                line,
-            )
+            match = parse_index_entry(line)
             if match and current_scope:
-                relative_path = match.group(2)
+                relative_path = match.group("path")
                 # Session/agent entries embed scope_id in the path
                 # (e.g. ``session/<scope_id>/<key>.md``). Extract it
                 # here so callers (CLI clear, recall→forget) can
@@ -1163,11 +2586,11 @@ class MemoryService:
 
                 entries.append(
                     {
-                        "key": match.group(1),
+                        "key": match.group("key"),
                         "relative_path": relative_path,
-                        "memory_type": match.group(3),
-                        "tags": match.group(4),
-                        "updated_at": match.group(5),
+                        "memory_type": match.group("type"),
+                        "tags": normalize_memory_tags(match.group("tags")),
+                        "updated_at": match.group("updated"),
                         "scope": current_scope,
                         "scope_id": entry_scope_id,
                     }
@@ -1182,8 +2605,8 @@ class MemoryService:
         memory_id = id_match.group(1) if id_match else str(uuid.uuid4())
 
         # Extract tags from comment
-        tags_match = re.search(r"tags: ([^\n|]*?)(?:\s*-->|\s*\|)", file_content)
-        tags = tags_match.group(1).strip() if tags_match else entry.get("tags", "")
+        tags_match = re.search(r"\| tags: (.*?) -->", file_content)
+        tags = normalize_memory_tags(tags_match.group(1)) if tags_match else entry.get("tags", "")
 
         # Extract scope from comment
         scope_match = re.search(r"scope: (\S+)", file_content)
@@ -1262,6 +2685,10 @@ class MemoryService:
                 self._delete_metadata(key, scope, scope_id)
             except Exception as e:
                 logger.warning(f"Memory metadata SQLite delete failed (key={key}): {e}")
+            # The relationship rows are just as stale as the metadata row was —
+            # purge them on this path too, else a file that vanished out-of-band
+            # leaves edges that a same-slug memory would later inherit.
+            self._purge_relationships(key, scope, scope_id)
             return False
 
         # Delete the wiki file
@@ -1280,7 +2707,35 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"Memory metadata SQLite delete failed (key={key}): {e}")
 
+        # Drop the typed relationship rows too (issue #511 / PR #524 review):
+        # the file, the index entry and the metadata row are all gone, so any
+        # edge touching this key is dangling.
+        self._purge_relationships(key, scope, scope_id)
+
         return True
+
+    def _purge_relationships(self, key: str, scope: str, scope_id: Optional[str]) -> None:
+        """Hard-delete relationship rows for a FORGOTTEN memory. Best-effort.
+
+        Without this, ``forget()`` left ``active`` rows pointing at a key that no
+        longer resolves, and a later memory created with the SAME slug silently
+        inherited the dead memory's edges. Non-blocking: a store failure must not
+        turn a successful forget into an exception, since the file and metadata
+        row are already gone by this point.
+        """
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            # ``scope_id`` here is already the resolved LOGICAL value (forget()
+            # resolves it before use); the store maps None to its own NOT-NULL
+            # sentinel internally, so it must NOT be pre-mapped here.
+            removed = MemoryRelationshipService().purge_for_key(scope, scope_id, key)
+            if removed:
+                logger.info(f"Purged {removed} relationship row(s) for forgotten memory: {key}")
+        except Exception as e:  # noqa: BLE001 — never fail a completed forget
+            logger.warning(f"Relationship purge failed (key={key}): {e}")
 
     # -------------------------------------------------------------------------
     # Context for terminal injection
@@ -1322,12 +2777,13 @@ class MemoryService:
         )
 
         lines: list[str] = []
+        related_added_total = 0  # global per-build fanout cap
 
         for scope_val in scopes_in_order:
             scope_id = self.resolve_scope_id(scope_val, terminal_context)
             project_dir = self._get_project_dir(scope_val, scope_id)
             wiki_dir = project_dir / "wiki"
-            wiki_resolved = wiki_dir.resolve()
+            wiki_resolved = os.path.realpath(str(wiki_dir))
             index_path = wiki_dir / "index.md"
             if not index_path.exists():
                 continue
@@ -1351,12 +2807,12 @@ class MemoryService:
                 if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
                     break
                 wiki_file = wiki_dir / entry["relative_path"]
-                resolved_wiki = wiki_file.resolve()
+                resolved_wiki = Path(os.path.realpath(str(wiki_file)))
                 # Guard against a crafted/corrupted index entry (e.g.
                 # ``../<other-project>/wiki/...``) escaping this scope's wiki
                 # directory and leaking another project's memory. Validate
                 # against the per-scope wiki dir, not the global memory base.
-                if not str(resolved_wiki).startswith(str(wiki_resolved) + os.sep):
+                if not str(resolved_wiki).startswith(wiki_resolved + os.sep):
                     logger.warning(
                         f"Path traversal in index entry rejected: {entry.get('relative_path')}"
                     )
@@ -1368,11 +2824,50 @@ class MemoryService:
                 if memory:
                     scope_memories.append(memory)
 
+            # One-level cross-reference expansion. Looks up ``related_keys``
+            # for primary entries via SQLite (source of truth, not the
+            # rendered ``## See Also`` markdown), expands within the same
+            # scope budget, dedups + cycle-blocks via ``visited``, and caps
+            # the total related articles added across this entire context
+            # build at ``RELATED_FANOUT_CAP``. Any lookup failure is silent.
+            try:
+                related_lookup = self._related_keys_lookup(
+                    [m.key for m in scope_memories], scope_val, scope_id
+                )
+            except Exception as e:  # noqa: BLE001 — non-blocking
+                logger.debug(f"related_keys lookup failed: {e}")
+                related_lookup = {}
+
+            visited: set = {m.key for m in scope_memories}
+            primary_snapshot = list(scope_memories)
+            for primary in primary_snapshot:
+                if related_added_total >= self.RELATED_FANOUT_CAP:
+                    logger.info("related_fanout_cap_reached added=%d", related_added_total)
+                    break
+                raw = related_lookup.get(primary.key)
+                for rk in self._parse_related_keys(raw, scope=scope_val):
+                    if related_added_total >= self.RELATED_FANOUT_CAP:
+                        break
+                    if rk in visited:
+                        continue
+                    visited.add(rk)
+                    related_mem = self._load_related_memory(rk, scope_val, scope_id)
+                    if related_mem is None:
+                        continue
+                    related_mem.is_related = True  # transient render label
+                    scope_memories.append(related_mem)
+                    related_added_total += 1
+
             scope_used_chars = 0
             for mem in scope_memories:
-                line = f"- [{mem.scope}] {mem.key}: {mem.content}"
+                tag = " [related]" if getattr(mem, "is_related", False) else ""
+                line = f"- [{mem.scope}] {mem.key}{tag}: {mem.content}"
                 line_len = len(line) + 1
                 if scope_used_chars + line_len > scope_char_cap:
+                    if getattr(mem, "is_related", False):
+                        # Never truncate mid-list for a related extra; skip
+                        # it and try the next (possibly shorter) one.
+                        continue
                     break
                 lines.append(line)
                 scope_used_chars += line_len
@@ -1430,6 +2925,7 @@ class MemoryService:
 
             from cli_agent_orchestrator.models.terminal import TerminalStatus
             from cli_agent_orchestrator.providers.manager import provider_manager
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
 
             provider = provider_manager.get_provider(cm["id"])
             if provider is None:
@@ -1442,7 +2938,7 @@ class MemoryService:
             if not lock.acquire(blocking=False):
                 return self.get_memory_context_for_terminal(terminal_id)
             try:
-                if provider.get_status() != TerminalStatus.IDLE:
+                if status_monitor.get_status(cm["id"]) != TerminalStatus.IDLE:
                     return self.get_memory_context_for_terminal(terminal_id)
 
                 from cli_agent_orchestrator.services.terminal_service import (
@@ -1456,7 +2952,7 @@ class MemoryService:
                 # the sleep this loop spins in microseconds and we always read
                 # stale output.
                 for _ in range(30):
-                    if provider.get_status() in (
+                    if status_monitor.get_status(cm["id"]) in (
                         TerminalStatus.COMPLETED,
                         TerminalStatus.IDLE,
                     ):
@@ -1478,6 +2974,47 @@ class MemoryService:
             logger.debug(f"get_curated_memory_context failed, falling back: {e}")
 
         return self.get_memory_context_for_terminal(terminal_id)
+
+    # -------------------------------------------------------------------------
+    # Archive export/import (#345 D6) — thin delegators, no format logic here
+    # -------------------------------------------------------------------------
+
+    def export_memories(
+        self,
+        fmt: str,
+        scope: str,
+        scope_id: Optional[str],
+        dest: Path,
+        include_history: bool = False,
+        redact: bool = False,
+        prune: bool = False,
+    ) -> ExportReport:
+        """Export one scope through the archive backend registered as ``fmt``.
+
+        Raises ``ValueError`` on unknown format names (registry contract);
+        the CLI/API boundary maps it to a user-facing error.
+        """
+        from cli_agent_orchestrator.services.memory_archive import get_backend
+
+        backend = get_backend(fmt)(self)
+        return backend.export_bundle(scope, scope_id, dest, include_history, redact, prune=prune)
+
+    def import_memories(
+        self,
+        fmt: str,
+        src: Path,
+        target_scope: str,
+        conflict_policy: str = "skip",
+        dry_run: bool = False,
+        terminal_context: Optional[dict] = None,
+    ) -> ImportReport:
+        """Import an archive bundle through the backend registered as ``fmt``."""
+        from cli_agent_orchestrator.services.memory_archive import get_backend
+
+        backend = get_backend(fmt)(self)
+        return backend.import_bundle(
+            src, target_scope, conflict_policy, dry_run, terminal_context=terminal_context
+        )
 
     def _get_terminal_context(self, terminal_id: str) -> Optional[dict]:
         """Get terminal context for scope resolution.

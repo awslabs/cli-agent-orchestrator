@@ -1,16 +1,24 @@
 """Shared fixtures for end-to-end tests.
 
 E2E tests require:
-- A running CAO server (cao-server / uvicorn on localhost:9889)
-- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, gemini, copilot)
+- The provider CLI tool installed and authenticated (for example codex,
+  claude, kiro-cli, gemini, copilot, or grok)
 - tmux available on the system
+
+The CAO server is started automatically by the ``cao_server`` fixture from
+``test.fixtures.cao_server``. New tests should consume ``cao_server`` /
+``cao_terminal`` directly. The ``API_BASE_URL`` patch loop below is a
+back-compat shim for the 12 older modules that import the constant at
+module top.
 
 Run with: uv run pytest -m e2e test/e2e/ -v
 """
 
+import os
 import shutil
-import subprocess
 import time
+from pathlib import Path
+from test.fixtures.cao_server import CaoServer, _patch_api_base_url_for_e2e
 
 import pytest
 import requests
@@ -19,40 +27,18 @@ from cli_agent_orchestrator.constants import API_BASE_URL
 
 
 @pytest.fixture(scope="session", autouse=True)
-def require_cao_server():
-    """Skip all E2E tests if CAO server is not reachable."""
-    try:
-        resp = requests.get(f"{API_BASE_URL}/health", timeout=5)
-        if resp.status_code != 200:
-            pytest.skip("CAO server not healthy")
-    except requests.ConnectionError:
-        pytest.skip("CAO server not running — start with: uv run cao-server")
+def require_cao_server(cao_server: CaoServer):
+    """Delegates to the managed ``cao_server`` subprocess fixture.
 
-
-@pytest.fixture(scope="session", autouse=True)
-def warmup_mcp_server_cache():
-    """Pre-warm the uvx cache for cao-mcp-server.
-
-    Agent profiles launch cao-mcp-server via ``uvx --from git+...``. On a cold
-    cache uvx must download and install ~80 packages, which takes ~20s and
-    exceeds Codex's default 10s MCP startup timeout. Running uvx once here
-    populates the cache so that all subsequent provider launches resolve
-    instantly (<3s).
+    Also patches ``API_BASE_URL`` everywhere it has been bound at import
+    time by the 12 older e2e modules, so their helper f-strings resolve
+    to the dynamically-allocated port. Originals are restored on teardown.
     """
+    restore = _patch_api_base_url_for_e2e(cao_server)
     try:
-        subprocess.run(
-            [
-                "uvx",
-                "--from",
-                "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
-                "cao-mcp-server",
-                "--help",
-            ],
-            capture_output=True,
-            timeout=120,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass  # Best-effort; tests may still work if cao-mcp-server is installed locally
+        yield cao_server
+    finally:
+        restore()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -128,10 +114,98 @@ def require_opencode():
 
 
 @pytest.fixture()
+def require_omp():
+    """Skip test if OMP CLI is not available."""
+    if not _cli_available("omp"):
+        pytest.skip("OMP CLI not installed")
+
+
+@pytest.fixture()
 def require_hermes():
     """Skip test if Hermes CLI is not available."""
     if not _cli_available("hermes"):
         pytest.skip("Hermes CLI not installed")
+
+
+@pytest.fixture()
+def require_cursor():
+    """Skip test if Cursor CLI (agent or cursor-agent) is not available."""
+    if _cli_available("agent") or _cli_available("cursor-agent"):
+        return
+    pytest.skip("Cursor CLI (agent / cursor-agent) not installed")
+
+
+@pytest.fixture()
+def require_grok(require_cao_server: CaoServer):
+    """Skip unless the official Grok Build CLI is installed and authenticated."""
+    if not _cli_available("grok"):
+        pytest.skip("Grok Build CLI not installed; see docs/grok-cli.md for installation")
+
+    default_home = str(Path.home() / ".grok")
+    grok_home = Path(os.environ.get("GROK_HOME", default_home)).expanduser()
+    auth_source = grok_home / "auth.json"
+    if not os.environ.get("XAI_API_KEY") and not auth_source.is_file():
+        pytest.skip(
+            "Grok Build CLI is installed but not authenticated; run `grok login` "
+            "or set XAI_API_KEY before running Grok e2e tests"
+        )
+
+    # The managed e2e server deliberately redirects HOME to isolate CAO state.
+    # Mirror production's narrow auth reuse by linking only auth.json into that
+    # disposable HOME; never copy credential contents into test artifacts.
+    if auth_source.is_file():
+        isolated_grok_home = require_cao_server.home_dir / ".grok"
+        isolated_grok_home.mkdir(mode=0o700, exist_ok=True)
+        auth_link = isolated_grok_home / "auth.json"
+        if not auth_link.exists():
+            auth_link.symlink_to(auth_source)
+
+    # Orchestration e2e tests use the repository's assign example profiles.
+    # Seed copies into the same disposable CAO home so the managed server can
+    # resolve them without reading or modifying the developer's real store.
+    repo_root = Path(__file__).resolve().parents[2]
+    isolated_store = require_cao_server.home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    isolated_store.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for profile_name in ("analysis_supervisor", "data_analyst", "report_generator"):
+        source = repo_root / "examples" / "assign" / f"{profile_name}.md"
+        target = isolated_store / f"{profile_name}.md"
+        if not target.exists():
+            shutil.copy2(source, target)
+
+
+@pytest.fixture()
+def require_minimax_code(require_cao_server: CaoServer):
+    """Skip unless MiniMax Code is installed and has reusable local authentication."""
+    if not _cli_available("mcode"):
+        pytest.skip("MiniMax Code CLI not installed; see docs/minimax-code.md for installation")
+
+    configured = os.environ.get("MINIMAX_DATA_DIR", "").strip()
+    source_home = Path(configured).expanduser() if configured else Path.home() / ".minimax"
+    auth_names = ("config.yaml", "local-runtime.auth.json", "cli-auth")
+    if not any((source_home / name).exists() for name in auth_names):
+        pytest.skip("MiniMax Code is installed but not authenticated; run `mcode login`")
+
+    isolated_home = require_cao_server.home_dir / ".minimax"
+    isolated_home.mkdir(mode=0o700, exist_ok=True)
+    for name in ("config.yaml", "local-runtime.auth.json"):
+        source = source_home / name
+        target = isolated_home / name
+        if source.is_file() and not target.exists():
+            shutil.copy2(source, target)
+            target.chmod(0o600)
+    source_cli_auth = source_home / "cli-auth"
+    target_cli_auth = isolated_home / "cli-auth"
+    if source_cli_auth.is_dir() and not target_cli_auth.exists():
+        shutil.copytree(source_cli_auth, target_cli_auth)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    isolated_store = require_cao_server.home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    isolated_store.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for profile_name in ("analysis_supervisor", "data_analyst", "report_generator"):
+        source = repo_root / "examples" / "assign" / f"{profile_name}.md"
+        target = isolated_store / f"{profile_name}.md"
+        if not target.exists():
+            shutil.copy2(source, target)
 
 
 def create_terminal(

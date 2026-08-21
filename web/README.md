@@ -80,7 +80,6 @@ Configures agent profile directories per provider. Reads and writes to `~/.aws/c
 | Provider | Default Directory |
 |----------|------------------|
 | Kiro CLI | `~/.kiro/agents` |
-| Q CLI | `~/.aws/amazonq/cli-agents` |
 | Claude Code | `~/.aws/cli-agent-orchestrator/agent-store` |
 | Codex | `~/.aws/cli-agent-orchestrator/agent-store` |
 | CAO Installed | `~/.aws/cli-agent-orchestrator/agent-context` |

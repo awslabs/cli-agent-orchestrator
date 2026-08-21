@@ -67,7 +67,7 @@ By default, CAO launches Claude Code with `--dangerously-skip-permissions` to by
 
 This is safe because CAO already confirms workspace trust during `cao launch` ("Do you trust all the actions in this folder?") or via `--yolo` flag. Without this flag, worker agents spawned via handoff/assign would block on the trust dialog with no way to accept it interactively.
 
-Profiles can opt into a stricter behavior by setting the `permissionMode` field, which causes the provider to pass `--permission-mode <value>` instead of `--dangerously-skip-permissions`. See [Permission Mode Override](#permission-mode-override) below. `cao launch --yolo` always forces `--dangerously-skip-permissions` regardless of the profile's `permissionMode`.
+Profiles can opt into a stricter behavior by setting the `permissionMode` field, which causes the provider to pass `--permission-mode <value>` instead of `--dangerously-skip-permissions`. See [Permission Mode Override](#permission-mode-override) below. `permissionMode` takes priority over `--yolo`; when set, the provider always uses `--permission-mode <value>` regardless of yolo. When running as root/sudo, `--dangerously-skip-permissions` is omitted even in yolo mode because Claude Code rejects it under root.
 
 A fallback `_handle_trust_prompt()` method also monitors for the trust dialog and sends Enter to accept it, in case the flag doesn't cover all scenarios.
 
@@ -97,7 +97,7 @@ The `permissionMode` field on an agent profile lets you replace the default `--d
 
 Allowed values: `default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions`. See the [Claude Code permission modes reference](https://code.claude.com/docs/en/permission-modes) for what each tier does.
 
-When set, the provider passes `--permission-mode <value>` instead of `--dangerously-skip-permissions`. `cao launch --yolo` always overrides this field and forces `--dangerously-skip-permissions` regardless of the profile setting.
+When set, the provider passes `--permission-mode <value>` instead of `--dangerously-skip-permissions`. `permissionMode` takes priority over `--yolo`; the provider always uses `--permission-mode <value>` when the field is set, even in yolo mode.
 
 Example — a reviewer that runs under the `auto` permission classifier instead of unconditional bypass:
 

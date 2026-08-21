@@ -1,0 +1,9 @@
+Welcome to Cursor Agent
+──────────────────────
+❯ Run the test suite
+──────────────────────
+Do you trust the files in this folder? [y/n]:
+  1. Yes
+  2. No
+──────────────────────
+❯

@@ -6,7 +6,7 @@ Skills are reusable blocks of instructional content — domain knowledge, conven
 
 Skills are loaded lazily: only the skill name and description are injected into the agent's prompt at launch. The full content is retrieved on demand when the agent decides it needs it, preserving context window budget.
 
-All skills live in a single directory: `~/.aws/cli-agent-orchestrator/skills/`. There is no distinction between built-in and user-created skills — you can edit, replace, or remove any skill, including the defaults.
+The global skill store lives at `~/.aws/cli-agent-orchestrator/skills/`. There is no distinction between built-in and user-created skills — you can edit, replace, or remove any skill, including the defaults. In addition to the global store, CAO can discover skills from extra directories you register (for example a project's own skills folder) — see [Extra Skill Directories](#extra-skill-directories) below.
 
 ## When to Use Skills
 
@@ -91,18 +91,63 @@ After removal, all providers pick up the change automatically — Copilot CLI ag
 
 Builtin skills are auto-seeded when `cao-server` starts — no manual step required. If a skill with the same name already exists, it is skipped — preserving any edits you've made. After a CAO upgrade, restarting the server will seed any new builtin skills without overwriting your changes. You can also run `cao init` to seed them manually.
 
-CAO ships with two builtin skills:
+CAO ships with built-in skills including:
 
 | Skill | Description |
 |-------|-------------|
+| `cao-agent-routing` | Finds the best installed profile for specialist work before delegation |
 | `cao-supervisor-protocols` | Multi-agent orchestration patterns for supervisors: `assign`, `handoff`, idle-based message delivery |
 | `cao-worker-protocols` | Worker-side callback and completion rules for assigned and handed-off tasks |
 
+## Extra Skill Directories
+
+Beyond the global store, CAO can discover skills from extra directories you register via the `extra_skill_dirs` setting. This mirrors `extra_agent_dirs` for agent profiles.
+
+Unlike `cao skills add`, which **copies** a skill folder into the global store, an extra directory is **scanned in place** — nothing is copied. This lets you keep a project's skills in the project repo (e.g. `<repo>/.cao/skills`) and register that directory, so the skills stay canonical in their source location: edits are picked up on the next terminal creation, there is no second copy to keep in sync, and the skills are version-controlled alongside the project rather than re-added after every change.
+
+Each registered directory is scanned one level deep — every immediate subfolder that contains a `SKILL.md` is treated as a skill, and subfolders without one are ignored. A registered path may therefore be a broad project root; only its skill subfolders are picked up.
+
+**Resolution order.** Directories are searched global store first, then `extra_skill_dirs` in the configured order. The first *valid* match for a given name wins, so a skill in the global store is never shadowed by a same-named skill in a later extra directory, and an invalid (unloadable) folder does not shadow a later valid one of the same name — `cao skills list` and `load_skill` resolve a name to the same skill.
+
+**Configuration.** Extra skill directories are stored under `skills.extra_dirs` in `~/.aws/cli-agent-orchestrator/settings.json` and managed through the `/settings/skill-dirs` API. See [configuration.md](./configuration.md#skills-skills) for the request/response format.
+
 ## How Agents Discover Skills
 
-All installed skills are available to all CAO agents — there is no per-profile skill declaration. When an agent is launched, CAO appends a catalog block to the prompt listing every installed skill's name and description, along with instructions to use the `load_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
+By default, every installed skill is available to every CAO agent. When an agent is launched, CAO appends a catalog block to the prompt listing each available skill's name and description, along with instructions to use the `load_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
 
-You can explicitly instruct the agent to load specific skills eagerly in the agent profile body:
+### Scoping the catalog per agent (`skills`)
+
+To advertise only a subset of skills to a given agent, set the `skills` field in its profile frontmatter — a list of skill-name patterns, each an exact name or a case-sensitive [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) glob. Only matching skills appear in that agent's catalog; the rest are simply not advertised to it. A pattern that matches no installed skill is logged as a warning, to catch typos and stale names.
+
+This scopes the injected **catalog** only — it controls what an agent *sees* advertised, not what it can *load*. Skill resolution is unchanged: `load_skill` still resolves any installed skill by name, so this is a prompt-relevance / noise-reduction control, not an access boundary. (If you need a hard per-agent allowlist, that would have to be enforced in the `load_skill` path — out of scope here.)
+
+This applies only to the runtime-prompt providers that receive the injected catalog (Claude Code, Codex, Antigravity CLI, Kimi CLI, MiniMax Code). Providers that deliver skills natively (Kiro CLI, OpenCode, GitHub Copilot CLI) ignore the field.
+
+```yaml
+---
+name: ads-backend-developer
+role: developer
+skills: ["ads-db", "ads-query-logs"]   # exact names
+---
+```
+
+```yaml
+---
+name: ads-cto
+role: developer
+skills: ["ads-*", "cao-*"]              # globs: this project's skills + CAO built-ins
+---
+```
+
+Semantics:
+
+- **field omitted** → the full catalog (backward-compatible default).
+- **list of patterns** → only skills matching at least one pattern.
+- **empty list `[]`** → no skill catalog is injected for this agent.
+
+This keeps each agent's catalog focused — for example so one project's agents don't see another project's skills when both register their `skills/` directories under a shared `extra_skill_dirs`.
+
+You can also explicitly instruct the agent to load specific skills eagerly in the agent profile body:
 
 ```markdown
 Before starting any task, load the python-testing and code-style skills.
@@ -116,12 +161,16 @@ Skills are delivered to agents differently depending on the provider. The table 
 |----------|-----------------|---------------------|-----------------|
 | Claude Code | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Codex | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
-| Gemini CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
+| Antigravity CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kimi CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
+| MiniMax Code | Runtime bootstrap prompt | Every terminal creation | `load_skill` MCP tool |
 | Kiro CLI | Native `skill://` resources | Every terminal creation | Kiro progressive loading |
 | Copilot CLI | Baked into `.agent.md` at install | On `cao skills add/remove` | `load_skill` MCP tool |
+| OpenCode CLI | Native `skill` tool via `OPENCODE_CONFIG_DIR/skills` symlink | Every terminal creation | OpenCode progressive loading (also via `load_skill` MCP tool) |
+| Cursor CLI | Runtime prompt (currently disabled — see [Cursor CLI provider docs](cursor-cli.md#agent-profile-integration)) | Not injected in v2026 | `load_skill` MCP tool |
+| Hermes | Not injected — configure skills in the selected Hermes profile | N/A | N/A |
 
-### Runtime Prompt Providers (Claude Code, Codex, Gemini CLI, Kimi CLI)
+### Runtime Prompt Providers (Claude Code, Codex, Antigravity CLI, Kimi CLI, MiniMax Code)
 
 For these providers, the skill catalog is built fresh each time a terminal is created. The catalog — a list of skill names and descriptions — is appended to the system prompt via the provider's native CLI flags.
 
@@ -201,4 +250,4 @@ Running `cao skills add --force` refreshes Copilot CLI agent files immediately. 
 ## Known Limitations
 
 - **No nested skill directories.** Skills must be immediate subdirectories of the skill store. Nested paths (e.g., `skills/team/python-testing/`) are not discovered by CAO's skill catalog. Kiro's `skill://` glob handles nested paths natively, but other providers do not.
-- **No per-profile skill scoping.** All installed skills are available to all agents. There is currently no way to restrict which skills a specific agent profile can see. A `skills` field in agent profile frontmatter for declaring allowed skills is a planned future addition.
+- **Catalog scoping is advertise-only.** The per-agent [`skills`](#scoping-the-catalog-per-agent-skills) field filters which skills appear in an agent's injected catalog, but it does not restrict resolution — `load_skill` still resolves any installed skill by name. It is a prompt-relevance control, not an access boundary; a hard per-agent allowlist would need enforcement in the `load_skill` path.

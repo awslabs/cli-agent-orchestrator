@@ -18,6 +18,12 @@ class CaoEvent:
     event_type: str = ""
     timestamp: datetime = field(default_factory=_utc_now)
     session_id: str | None = None
+    # W3C Trace Context (https://www.w3.org/TR/trace-context/) header value for
+    # the upstream span that produced this event. Plugin hooks can re-attach to
+    # that context to emit child spans in the right place in the trace tree.
+    # Always None when telemetry is disabled or the emitter is outside an
+    # active span. (Ported: telemetry/)
+    traceparent: str | None = None
 
 
 @dataclass

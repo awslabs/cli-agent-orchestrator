@@ -1,0 +1,21 @@
+schemaVersion: 1
+organization:
+  disposition: unknown
+  value: Unknown
+businessOutcomes:
+  disposition: unknown
+  values: []
+businessCapabilities:
+  disposition: unknown
+  values: []
+dependencies:
+  disposition: confirmed
+  ids: []
+acceptance:
+  acceptedBy: Replace with the human decision maker.
+  acceptedAt: "2026-01-01T00:00:00.000Z"
+  unknowns:
+    - organization
+    - businessOutcomes
+    - businessCapabilities
+  deferrals: []

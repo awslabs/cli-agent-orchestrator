@@ -1,0 +1,34 @@
+[
+  {
+    "input": "How do I show a progress bar to the operator from my agent?",
+    "expected": "Skill activates and instructs to use emit_ui('progress', {label, value}) with value 0.0-1.0"
+  },
+  {
+    "input": "I want the operator to approve a risky deployment before I proceed",
+    "expected": "Skill activates and instructs to use emit_ui('approval_card', {title, detail, risk: 'high'})"
+  },
+  {
+    "input": "Can I render HTML in the AG-UI dashboard from my agent?",
+    "expected": "Skill activates and explains that no HTML sink exists — only structured JSON props via the 6 allow-listed components"
+  },
+  {
+    "input": "What components can I emit with emit_ui?",
+    "expected": "Skill activates and lists all 6: approval_card, choice_prompt, diff_summary, progress, metric, agent_card"
+  },
+  {
+    "input": "How do I make my agent visible in the fleet dashboard?",
+    "expected": "Skill activates and instructs to emit an agent_card with name, provider, and status props"
+  },
+  {
+    "input": "My emit_ui call is failing with a ValueError",
+    "expected": "Skill activates and explains likely causes: off-list component name, props > 8KB, or non-serializable props"
+  },
+  {
+    "input": "How does the AG-UI run plane work?",
+    "expected": "Skill activates and describes POST /agui/v1/run, lifecycle frames, and points to references/run-plane.md"
+  },
+  {
+    "input": "What happens when I emit_ui on a server with the AG-UI surface disabled?",
+    "expected": "Skill activates and explains graceful degradation: returns {ok: false} — treat as no-op, never fatal"
+  }
+]

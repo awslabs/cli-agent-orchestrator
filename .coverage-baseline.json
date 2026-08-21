@@ -1,0 +1,11 @@
+{
+  "_comment": "Coverage ratchet floors. The ratchet (cao_mcp_apps/scripts/coverage-ratchet.mjs) fails CI if measured line coverage drops below these floors. Phase 0 seeded null placeholders (record-only); Phase V task 12.5 raised the floors to the measured values to lock in the gains. Floors sit a small margin below the measured values (python 87.21%, frontend 90.92%) to absorb cross-Python-version jitter while still blocking real regressions.",
+  "python": {
+    "floor_pct": 87.0,
+    "coverage_json": "coverage.json"
+  },
+  "frontend": {
+    "floor_pct": 90.0,
+    "coverage_summary_json": "cao_mcp_apps/coverage/coverage-summary.json"
+  }
+}

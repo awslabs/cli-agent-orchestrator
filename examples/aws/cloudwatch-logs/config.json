@@ -1,0 +1,7 @@
+{
+  "profile": "my-aws-profile",
+  "region": "us-east-1",
+  "log_group": "/aws/lambda/MyFunction",
+  "search_time_window_minutes": 60,
+  "max_events": 50
+}

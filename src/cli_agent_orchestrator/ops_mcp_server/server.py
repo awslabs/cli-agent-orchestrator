@@ -6,7 +6,7 @@ import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
+from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.ops_mcp_server.models import (
     InstallResult,
     LaunchResult,
@@ -30,10 +30,13 @@ mcp = FastMCP(
     1. list_profiles to inspect available profiles
     2. get_profile_details to review a profile's full prompt and metadata
     3. install_profile to install a profile for a target provider
-    4. launch_session to start a new CAO session
-    5. send_session_message to deliver a prompt to a running terminal
-    6. get_session_info or list_sessions to monitor progress
-    7. shutdown_session to clean up when done
+    4. launch_session to start a new CAO session, optionally with its first task
+    5. send_session_message to deliver later prompts to a running terminal
+    6. get_terminal_status to poll a worker until it finishes a task
+    7. get_terminal_output to read a worker's result (or review its files/git diff)
+    8. read_session_output to read a terminal's captured output by session name
+    9. get_session_info or list_sessions to monitor overall progress
+    10. shutdown_session to clean up when done
     """,
 )
 
@@ -96,6 +99,8 @@ async def _launch_session_impl(
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[List[str]] = None,
+    model: Optional[str] = None,
+    initial_message: Optional[str] = None,
 ) -> LaunchResult:
     """Create a new CAO session and return the session identifiers."""
     resolved_session_name = session_name or generate_session_name()
@@ -107,13 +112,16 @@ async def _launch_session_impl(
         params["provider"] = provider
     if working_directory:
         params["working_directory"] = working_directory
+    if model is not None:
+        params["model"] = model
 
     serialized_allowed_tools = _serialize_allowed_tools(allowed_tools)
     if serialized_allowed_tools:
         params["allowed_tools"] = serialized_allowed_tools
 
+    body = {"initial_message": initial_message} if initial_message is not None else None
     session_data, error = _request_json(
-        "post", "/sessions", params=params, operation="Launch session"
+        "post", "/sessions", params=params, json=body, operation="Launch session"
     )
     if error:
         return LaunchResult(
@@ -132,9 +140,14 @@ async def _launch_session_impl(
         )
 
     terminal_id = str(session_data["id"])
+    message = (
+        f"Session '{resolved_session_name}' launched; initial message delivery is in progress"
+        if initial_message is not None
+        else f"Session '{resolved_session_name}' launched successfully"
+    )
     return LaunchResult(
         success=True,
-        message=f"Session '{resolved_session_name}' launched successfully",
+        message=message,
         session_name=resolved_session_name,
         terminal_id=terminal_id,
     )
@@ -192,9 +205,14 @@ async def get_profile_details(
 async def install_profile(
     source: Annotated[str, Field(description="Agent name or https:// URL to install")],
     provider: Annotated[
-        str,
-        Field(description="Target provider for the installed profile"),
-    ] = DEFAULT_PROVIDER,
+        Optional[str],
+        Field(
+            description=(
+                "Target provider for the installed profile. Omit to honour the "
+                "profile's frontmatter provider, falling back to the default."
+            )
+        ),
+    ] = None,
     env_vars: Annotated[
         Optional[Dict[str, str]],
         Field(description="Optional environment variables to inject before install"),
@@ -216,19 +234,22 @@ async def install_profile(
 
     ## Provider Config
 
-    - q_cli, kiro_cli: JSON config written to the provider's agents directory
+    - kiro_cli: JSON config written to the provider's agents directory
     - copilot_cli: frontmatter markdown written to the Copilot agents directory
     - claude_code, codex: context file only, no provider-specific config
 
     Args:
         source: Agent name or https:// URL from an allow-listed host
-        provider: Target provider (default: kiro_cli)
+        provider: Target provider. Precedence: explicit value > the profile's
+            frontmatter ``provider:`` key > the server default (kiro_cli)
         env_vars: Optional env vars written to the managed .env before install
 
     Returns:
         InstallResult with success status, file paths, and unresolved env vars
     """
-    body: Dict[str, Any] = {"source": source, "provider": provider}
+    body: Dict[str, Any] = {"source": source}
+    if provider is not None:
+        body["provider"] = provider
     if env_vars:
         body["env_vars"] = env_vars
 
@@ -264,12 +285,32 @@ async def launch_session(
         Optional[List[str]],
         Field(description="Optional list of allowed tool restrictions"),
     ] = None,
+    model: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional per-launch model override accepted by the resolved provider; "
+                "takes precedence over the profile model"
+            )
+        ),
+    ] = None,
+    initial_message: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional first task to deliver after provider initialization; "
+                "sent in the JSON request body"
+            )
+        ),
+    ] = None,
 ) -> LaunchResult:
     """Create a new CAO session with the given provider and agent profile.
 
-    Returns immediately with session_name and terminal_id. Use
-    send_session_message to deliver an initial prompt once the session is
-    running, and get_session_info or list_sessions to monitor progress.
+    Returns immediately with session_name and terminal_id. When
+    ``initial_message`` is provided, provider initialization and delivery
+    continue in the background; use get_terminal_status or get_session_info to
+    observe the result. Without it, use send_session_message to deliver work
+    later.
 
     Args:
         agent_profile: Agent profile for the new session
@@ -277,6 +318,8 @@ async def launch_session(
         session_name: Optional custom session name (auto-generated if omitted)
         working_directory: Optional working directory for the session
         allowed_tools: Optional list of tool restrictions
+        model: Optional per-launch model override
+        initial_message: Optional first task, carried in the JSON request body
 
     Returns:
         LaunchResult with success status, session_name, and terminal_id
@@ -287,6 +330,8 @@ async def launch_session(
         session_name=session_name,
         working_directory=working_directory,
         allowed_tools=allowed_tools,
+        model=model,
+        initial_message=initial_message,
     )
 
 
@@ -321,6 +366,227 @@ async def send_session_message(
         message=f"Message queued for terminal '{terminal_id}'",
         terminal_id=terminal_id,
     )
+
+
+def _read_session_output_impl(
+    terminal_id: Optional[str],
+    session_name: Optional[str],
+    mode: Optional[str],
+    max_chars: Optional[int],
+) -> JsonDict:
+    """Resolve a terminal and return its captured output (sync; mirrors other helpers)."""
+    normalized = (mode or "full").lower()
+    if normalized not in ("full", "last"):
+        return {"success": False, "message": f"Invalid mode '{mode}'; expected 'full' or 'last'"}
+
+    resolved_terminal_id = terminal_id
+    if not resolved_terminal_id:
+        if not session_name:
+            return {"success": False, "message": "Provide either terminal_id or session_name"}
+        info, error = _request_json(
+            "get",
+            f"/sessions/{session_name}",
+            operation=f"Resolve terminals for session '{session_name}'",
+        )
+        if error:
+            return {"success": False, "message": error}
+        if not isinstance(info, dict):
+            return {
+                "success": False,
+                "message": f"Session '{session_name}' returned an invalid response payload",
+            }
+        terminals = info.get("terminals", [])
+        if not isinstance(terminals, list) or any(
+            not isinstance(terminal, dict) for terminal in terminals
+        ):
+            return {
+                "success": False,
+                "message": f"Session '{session_name}' returned an invalid terminals payload",
+            }
+        if len(terminals) == 1:
+            terminal = terminals[0]
+            if not terminal.get("id"):
+                return {
+                    "success": False,
+                    "message": f"Session '{session_name}' returned a terminal without an id",
+                }
+            resolved_terminal_id = str(terminal["id"])
+        elif not terminals:
+            return {"success": False, "message": f"Session '{session_name}' has no terminals"}
+        else:
+            return {
+                "success": False,
+                "message": (
+                    f"Session '{session_name}' has {len(terminals)} terminals; "
+                    "specify terminal_id"
+                ),
+                "terminals": terminals,
+            }
+
+    data, error = _request_json(
+        "get",
+        f"/terminals/{resolved_terminal_id}/output",
+        params={"mode": normalized},
+        operation=f"Read output for terminal '{resolved_terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if not isinstance(data, dict) or not isinstance(data.get("output"), str):
+        return {"success": False, "message": "Read output failed: invalid response payload"}
+
+    output = data["output"]
+    total_chars = len(output)
+    truncated = False
+    if max_chars is not None and max_chars > 0 and total_chars > max_chars:
+        output = output[-max_chars:]
+        truncated = True
+
+    return {
+        "success": True,
+        "terminal_id": resolved_terminal_id,
+        "mode": normalized,
+        "output": output,
+        "truncated": truncated,
+        "total_chars": total_chars,
+    }
+
+
+@mcp.tool()
+async def read_session_output(
+    terminal_id: Annotated[
+        Optional[str],
+        Field(
+            description="Target terminal ID (from list_sessions / get_session_info). "
+            "Primary key; either terminal_id or session_name is required."
+        ),
+    ] = None,
+    session_name: Annotated[
+        Optional[str],
+        Field(
+            description="CAO session name; convenience alternative to terminal_id. "
+            "Resolved to a terminal when the session has exactly one; if it has more "
+            "than one, the terminal list is returned and terminal_id is required."
+        ),
+    ] = None,
+    mode: Annotated[
+        str,
+        Field(
+            description="'full' (default) returns the raw rolling buffer: deterministic and "
+            "best for scrollback/debugging. 'last' returns the provider-extracted final "
+            "response: best for a completed worker's final message, but can be flaky on "
+            "redraw-heavy TUIs."
+        ),
+    ] = "full",
+    max_chars: Annotated[
+        Optional[int],
+        Field(
+            description="Optional cap: return only the last max_chars of output "
+            "(guards against flooding the caller's context). Truncation is flagged "
+            "in the result. Values <= 0 are treated as no cap."
+        ),
+    ] = None,
+) -> JsonDict:
+    """Read a CAO terminal's captured scrollback with a deterministic full-buffer default.
+
+    Defaults to mode='full' because raw rolling-buffer output is deterministic and
+    best for scrollback/debugging. Use get_terminal_output, which defaults to
+    mode='last', to read a completed worker's provider-extracted final message;
+    'last' can be flaky on redraw-heavy TUIs. This tool adds session_name addressing
+    (when the session has exactly one terminal) and max_chars tail-capping, which
+    get_terminal_output does not provide.
+
+    Args:
+        terminal_id: Target terminal ID (primary key)
+        session_name: Convenience alternative; resolved to a terminal when unambiguous
+        mode: 'full' (default, rolling buffer) or 'last' (provider-extracted)
+        max_chars: Optional tail cap on returned characters
+
+    Returns:
+        Dict {success, terminal_id, mode, output, truncated, total_chars}, or
+        {success: False, message[, terminals]} on error / ambiguous session
+    """
+    return _read_session_output_impl(terminal_id, session_name, mode, max_chars)
+
+
+@mcp.tool()
+async def get_terminal_status(
+    terminal_id: Annotated[str, Field(description="The terminal ID to inspect")],
+) -> JsonDict:
+    """Get a single terminal's live status and metadata.
+
+    Use this to poll a worker an external supervisor launched: it returns the
+    current status (one of unknown / idle / processing / completed /
+    waiting_user_answer / error) so the supervisor knows when a delegated task
+    has finished before reading its output.
+
+    Args:
+        terminal_id: Target terminal ID (from launch_session or get_session_info)
+
+    Returns:
+        Dict with id, name, provider, session_name, agent_profile, status,
+        last_active — or {"success": False, "message": ...} on error
+    """
+    data, error = _request_json(
+        "get",
+        f"/terminals/{terminal_id}",
+        operation=f"Get terminal status for '{terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Get terminal status failed: invalid response payload"}
+
+
+@mcp.tool()
+async def get_terminal_output(
+    terminal_id: Annotated[str, Field(description="The terminal ID to read output from")],
+    mode: Annotated[
+        str,
+        Field(
+            description=(
+                "'last' (default) returns the provider-extracted final response: best for "
+                "a completed worker's final message, but can be flaky on redraw-heavy "
+                "TUIs. 'full' returns the raw rolling buffer: deterministic and best for "
+                "scrollback/debugging."
+            )
+        ),
+    ] = "last",
+) -> JsonDict:
+    """Read a worker terminal's output with a completed-message-oriented default.
+
+    Defaults to mode='last' because this tool is optimized for reading a completed
+    worker's provider-extracted final message, though redraw-heavy TUIs can make
+    extraction flaky. For deterministic raw rolling-buffer scrollback/debugging,
+    use read_session_output, which defaults to mode='full' and also supports
+    session_name addressing and max_chars tail-capping. For code review, prefer
+    inspecting the worker's files / git diff directly rather than relying solely
+    on terminal text.
+
+    Args:
+        terminal_id: Target terminal ID
+        mode: 'last' (final response, default) or 'full' (rolling buffer)
+
+    Returns:
+        Dict with output and mode, or {"success": False, "message": ...} on error
+    """
+    normalized = (mode or "last").lower()
+    if normalized not in ("last", "full"):
+        return {
+            "success": False,
+            "message": f"Get terminal output failed: mode must be 'last' or 'full', got '{mode}'",
+        }
+    data, error = _request_json(
+        "get",
+        f"/terminals/{terminal_id}/output",
+        params={"mode": normalized},
+        operation=f"Get terminal output for '{terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Get terminal output failed: invalid response payload"}
 
 
 @mcp.tool()

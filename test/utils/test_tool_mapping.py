@@ -4,6 +4,7 @@ import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
     format_tool_summary,
+    get_allowed_tools,
     get_disallowed_tools,
     resolve_allowed_tools,
 )
@@ -33,6 +34,7 @@ class TestResolveAllowedTools:
         result = resolve_allowed_tools(None, "developer")
         assert "execute_bash" in result
         assert "fs_*" in result
+        assert "web_fetch" in result
 
     def test_developer_default_when_no_role_no_tools(self):
         """No role + no allowedTools = developer defaults (secure default)."""
@@ -81,9 +83,9 @@ class TestGetDisallowedTools:
         assert "Write" in result
 
     def test_claude_code_developer_allows_all(self):
-        """Developer with fs_* and execute_bash should not block anything."""
+        """Developer (fs_*, execute_bash, web_fetch) should not block anything."""
         result = get_disallowed_tools(
-            "claude_code", ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]
+            "claude_code", ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
         )
         assert result == []
 
@@ -104,9 +106,9 @@ class TestGetDisallowedTools:
         assert "read" in result
         assert "write" in result
 
-    def test_gemini_cli_reviewer(self):
-        """Gemini reviewer blocks write tools."""
-        result = get_disallowed_tools("gemini_cli", ["@builtin", "fs_read", "fs_list"])
+    def test_antigravity_cli_reviewer(self):
+        """Antigravity reviewer blocks write tools."""
+        result = get_disallowed_tools("antigravity_cli", ["@builtin", "fs_read", "fs_list"])
         assert "run_shell_command" in result
         assert "write_file" in result
         assert "replace" in result
@@ -116,6 +118,129 @@ class TestGetDisallowedTools:
         result = get_disallowed_tools("claude_code", ["@cao-mcp-server", "@custom"])
         # Should block all native tools since no CAO tool categories are allowed
         assert len(result) > 0
+
+
+class TestClaudeCodeWebFetch:
+    """The web_fetch category gates Claude Code's network tools.
+
+    Before this category existed, WebFetch/WebSearch were unmapped and therefore
+    never blocked — a read-only reviewer or orchestration-only supervisor could
+    still reach the network (an exfiltration/SSRF surface). web_fetch makes that
+    governable: only profiles that grant it keep network access.
+    """
+
+    def test_web_fetch_allows_network_tools(self):
+        """A profile granting web_fetch does not block WebFetch/WebSearch."""
+        disallowed = get_disallowed_tools("claude_code", ["web_fetch"])
+        assert "WebFetch" not in disallowed
+        assert "WebSearch" not in disallowed
+
+    def test_supervisor_blocks_network_tools(self):
+        """Supervisor (no web_fetch) blocks both network tools."""
+        disallowed = get_disallowed_tools("claude_code", ["@cao-mcp-server", "fs_read", "fs_list"])
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
+
+    def test_reviewer_blocks_network_tools(self):
+        """Reviewer (no web_fetch) blocks both network tools."""
+        disallowed = get_disallowed_tools(
+            "claude_code", ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]
+        )
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
+
+    def test_execute_bash_does_not_grant_network(self):
+        """Network access is its own category — execute_bash alone blocks it.
+
+        Guards against folding the network tools into execute_bash: an agent
+        allowed only shell should not silently gain web access.
+        """
+        disallowed = get_disallowed_tools("claude_code", ["execute_bash"])
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
+
+    def test_antigravity_web_fetch_mapping(self):
+        """Antigravity has the equivalent network category (web_fetch, google_web_search)."""
+        disallowed = get_disallowed_tools("antigravity_cli", ["fs_read"])
+        assert "web_fetch" in disallowed
+        assert "google_web_search" in disallowed
+        # Granting it unblocks both.
+        granted = get_disallowed_tools("antigravity_cli", ["fs_read", "web_fetch"])
+        assert "web_fetch" not in granted
+        assert "google_web_search" not in granted
+
+    def test_web_fetch_noop_for_unmapped_provider(self):
+        """For a provider with no network entry (copilot), web_fetch is a
+        harmless no-op — it maps to nothing and blocks nothing extra."""
+        assert get_disallowed_tools("copilot_cli", ["web_fetch", "fs_read"]) == sorted(
+            {"shell", "write", "list", "grep"}
+        )
+
+
+class TestGrokCliToolMapping:
+    """Grok restrictions use native deny rules, not prompt enforcement."""
+
+    def test_supervisor_blocks_execution_write_and_network(self):
+        disallowed = get_disallowed_tools("grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"])
+
+        assert "Bash" in disallowed
+        assert "Edit" in disallowed
+        assert "Write" in disallowed
+        assert "NotebookEdit" in disallowed
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
+        assert "Read" not in disallowed
+        assert "Grep" not in disallowed
+        assert "Glob" not in disallowed
+
+    def test_reviewer_keeps_read_and_search_only(self):
+        disallowed = get_disallowed_tools(
+            "grok_cli", ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]
+        )
+
+        assert "Read" not in disallowed
+        assert "NotebookRead" not in disallowed
+        assert "Grep" not in disallowed
+        assert "Glob" not in disallowed
+        assert {"Bash", "Edit", "Write", "NotebookEdit"}.issubset(disallowed)
+
+    def test_developer_mapping_allows_every_category(self):
+        assert (
+            get_disallowed_tools(
+                "grok_cli",
+                ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+            )
+            == []
+        )
+
+    def test_unrestricted_star_emits_no_deny_rules(self):
+        assert get_disallowed_tools("grok_cli", ["*"]) == []
+
+    def test_restricted_allowlist_returns_only_explicit_native_capabilities(self):
+        assert get_allowed_tools("grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"]) == [
+            "Glob",
+            "Grep",
+            "NotebookRead",
+            "Read",
+        ]
+        assert "Bash" not in get_allowed_tools(
+            "grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"]
+        )
+
+    def test_wildcard_allowlist_returns_all_native_capabilities(self):
+        assert set(get_allowed_tools("grok_cli", ["*"])) == set(
+            get_allowed_tools("grok_cli", ["fs_*", "execute_bash", "web_fetch"])
+        )
+
+    def test_each_category_remains_independently_governed(self):
+        bash_only = get_disallowed_tools("grok_cli", ["execute_bash"])
+        assert "Bash" not in bash_only
+        assert {"Read", "Edit", "Grep", "WebFetch", "WebSearch"}.issubset(bash_only)
+
+        web_only = get_disallowed_tools("grok_cli", ["web_fetch"])
+        assert "WebFetch" not in web_only
+        assert "WebSearch" not in web_only
+        assert {"Bash", "Read", "Edit", "Grep"}.issubset(web_only)
 
 
 class TestFormatToolSummary:
@@ -130,3 +255,43 @@ class TestFormatToolSummary:
 
     def test_empty_list(self):
         assert format_tool_summary([]) == ""
+
+
+class TestClaudeCodeSubagentEscape:
+    """A tool-restricted claude_code agent must not escape via subagents.
+
+    Observed in the allowed-tools e2e: a reviewer (no Bash/Write) created a
+    file anyway — first "via a delegated subagent that ran the write through
+    a shell command" (Task), then on retry via "the Monitor tool" (background
+    shell scripts). Everything execution-capable must gate with execute_bash;
+    NotebookEdit writes .ipynb files, so it must gate with fs_write.
+    """
+
+    def test_restricted_supervisor_blocks_task(self):
+        disallowed = get_disallowed_tools("claude_code", ["@cao-mcp-server"])
+        # Both the legacy (`Task`) and current (`Agent`) subagent tool names
+        # must be blocked — current Claude Code exposes only `Agent`.
+        assert "Task" in disallowed
+        assert "Agent" in disallowed
+        assert "Bash" in disallowed
+        assert "Monitor" in disallowed
+        assert "NotebookEdit" in disallowed
+
+    def test_reviewer_blocks_task_and_notebook_write(self):
+        disallowed = get_disallowed_tools("claude_code", ["fs_read", "fs_list"])
+        assert "Task" in disallowed
+        assert "Agent" in disallowed
+        assert "Monitor" in disallowed
+        assert "NotebookEdit" in disallowed
+        assert "Write" in disallowed
+
+    def test_developer_with_bash_keeps_task(self):
+        disallowed = get_disallowed_tools(
+            "claude_code", ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
+        )
+        assert "Task" not in disallowed
+        assert "Agent" not in disallowed
+        assert disallowed == []
+
+    def test_unrestricted_star_keeps_everything(self):
+        assert get_disallowed_tools("claude_code", ["*"]) == []

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "learning-proposal.schema.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "project",
+    "intent",
+    "space",
+    "destination",
+    "heading",
+    "rule",
+    "evidence",
+    "source",
+    "baseRevision"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "project": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "intent": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "space": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "destination": { "enum": ["project", "team"] },
+    "heading": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "rule": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "source": {
+      "type": "object",
+      "required": ["stage"],
+      "additionalProperties": false,
+      "properties": {
+        "stage": { "type": "string", "minLength": 1 }
+      }
+    },
+    "baseRevision": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "status": { "enum": ["pending", "applied", "rejected"] },
+    "createdAt": { "type": "string", "minLength": 1 },
+    "updatedAt": { "type": "string", "minLength": 1 },
+    "appliedAt": { "type": "string", "minLength": 1 },
+    "rejectedAt": { "type": "string", "minLength": 1 },
+    "rejectionReason": { "type": "string", "minLength": 1 },
+    "reconciliations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["note", "reconciledAt", "previousRevision"],
+        "additionalProperties": false,
+        "properties": {
+          "note": { "type": "string", "minLength": 1 },
+          "reconciledAt": { "type": "string", "minLength": 1 },
+          "previousRevision": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

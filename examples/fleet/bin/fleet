@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# fleet — run CAO control commands against one fleet node over your private network.
+#
+#   fleet list                     list node names + hosts
+#   fleet show <node>              print the resolved API base URL
+#   fleet exec <node> <cao args>   run a cao command against one node
+#                                        e.g. fleet exec node-b session list
+#
+# This is an example helper, not part of the installed `cao` CLI: it keeps the
+# fleet coordinator entirely under examples/ with no changes to core CAO. It is a
+# thin shim that resolves <node> -> host:port from the registry and runs the real
+# `cao` against that node via CAO_API_HOST / CAO_API_PORT.
+#
+# The node registry is read from $CAO_FLEET_CONFIG, defaulting to fleet.json next
+# to this example (copy fleet.example.json -> fleet.json first). A node's "host"
+# may be any address the coordinator can reach it at: a Tailscale/WireGuard IP, a
+# LAN IP, or a DNS name.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FLEET="${CAO_FLEET_CONFIG:-$HERE/../fleet.json}"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage:
+  fleet list                     list node names + hosts
+  fleet show <node>              print the resolved API base URL
+  fleet exec <node> <cao args>   run a cao command against one node
+USAGE
+}
+
+require_registry() {
+  if [ ! -f "$FLEET" ]; then
+    echo "fleet: no fleet registry at '$FLEET'" >&2
+    echo "           copy fleet.example.json -> fleet.json and edit it, or set CAO_FLEET_CONFIG." >&2
+    exit 2
+  fi
+}
+
+_resolve() { # node -> "<host> <port>"; exit 1 if unknown
+  python3 - "$FLEET" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    cfg = json.load(f)
+port = cfg.get("port", 9889)
+nodes = {x["name"]: x for x in cfg["machines"]}
+name = sys.argv[2]
+if name not in nodes:
+    sys.stderr.write(f"fleet: unknown node '{name}'\n"); sys.exit(1)
+print(nodes[name]["host"], nodes[name].get("port", port))
+PY
+}
+
+_list() { # print "<name> <host>" per node; registry path passed via argv (not interpolated)
+  python3 - "$FLEET" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    cfg = json.load(f)
+for x in cfg["machines"]:
+    print(x["name"], x["host"])
+PY
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+cmd="$1"; shift
+
+case "$cmd" in
+  list)
+    require_registry
+    _list ;;
+  show)
+    [ $# -ge 1 ] || { usage; exit 2; }
+    require_registry
+    read -r host port < <(_resolve "$1") || exit 1
+    echo "http://$host:$port" ;;
+  exec)
+    [ $# -ge 2 ] || { usage; exit 2; }
+    require_registry
+    node="$1"; shift
+    read -r host port < <(_resolve "$node") || exit 1
+    exec env CAO_API_HOST="$host" CAO_API_PORT="$port" cao "$@" ;;
+  -h|--help)
+    usage; exit 0 ;;
+  *)
+    echo "fleet: unknown command '$cmd'" >&2
+    if [ $# -ge 1 ]; then
+      echo "           did you mean:  fleet exec $cmd $*" >&2
+    fi
+    usage; exit 2 ;;
+esac

@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+
 PermissionMode = Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
 
 
@@ -17,6 +19,19 @@ class McpServer(BaseModel):
     timeout: Optional[int] = None
 
 
+class ContainerPathMap(BaseModel):
+    """Single host->guest path mapping for container environments."""
+
+    host: str
+    guest: str
+
+
+class ContainerConfig(BaseModel):
+    """Container environment configuration."""
+
+    path_maps: Optional[List[ContainerPathMap]] = None
+
+
 class AgentProfile(BaseModel):
     """Agent profile configuration with Q CLI agent fields."""
 
@@ -25,6 +40,30 @@ class AgentProfile(BaseModel):
     provider: Optional[str] = None  # Provider override (e.g. "claude_code", "kiro_cli")
     system_prompt: Optional[str] = None  # The markdown content
     role: Optional[str] = None  # "supervisor", "developer", "reviewer"
+    engine: Optional[KiroEngine] = None  # Kiro v2/KAS selection; omitted resolves to v2.
+
+    # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name
+    # matches one of these patterns (exact name or fnmatch glob, e.g. "ads-*") are
+    # injected into this agent's "## Available Skills" catalog at launch. None =
+    # the full catalog (backward-compatible); [] = no skills advertised. Consumed
+    # by CAO when composing the prompt, not passed through to provider JSON.
+    skills: Optional[List[str]] = None
+
+    # Discovery metadata used by `cao profile find` / the find_profiles MCP
+    # tool (#340). Declared here so parse paths built on this model keep the
+    # fields (pydantic silently drops undeclared keys).
+    capabilities: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+    # CAO-native. Host->guest path maps for container-backed agents. Consumed by
+    # the provider layer to translate host paths (e.g. temp prompt/MCP files)
+    # into the guest paths the containerized CLI sees; not passed to provider JSON.
+    container: Optional[ContainerConfig] = None
+
+    # CAO-native. Per-profile override for provider initialization timeout (seconds).
+    # When set, this value is used as the hard outer cap for CLI agent initialization
+    # instead of the server default (60s from settings_service). Allows containerized
+    # profiles to declare longer init times (e.g., 180s) without changing global config.
+    provider_init_timeout: Optional[int] = None
 
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None
@@ -47,6 +86,17 @@ class AgentProfile(BaseModel):
     # permission-floor knob.
     codexProfile: Optional[str] = Field(default=None, min_length=1)
 
+    # Codex-only. Inline Codex config overrides passed as `-c key=value` at
+    # launch (e.g. {"model_reasoning_effort": "xhigh", "service_tier": "fast",
+    # "features.fast_mode": True}). Keys may be dotted paths into Codex's
+    # config.toml schema; values are serialized to TOML scalars (strings are
+    # quoted, bools/numbers emitted bare). Applied in both the default --yolo
+    # path and the --profile <codexProfile> path, so per-agent knobs like
+    # reasoning effort or fast mode need no global ~/.codex/config.toml edits
+    # or named profile files. Composes with codexProfile; because Codex applies
+    # CLI overrides last, these win on key conflicts.
+    codexConfig: Optional[Dict[str, Any]] = None
+
     # Hermes-only. Optionally names a Hermes profile wrapper command (for
     # example one created by `hermes profile alias <profile>`). When omitted,
     # the Hermes provider launches the default `hermes` command.
@@ -60,3 +110,10 @@ class AgentProfile(BaseModel):
     # Claude analog of codexConfig for the codex provider; the top-level
     # `model` field still maps to `--model`.
     claudeConfig: Optional[Dict[str, Any]] = None
+
+    # Grok-only. Explicitly permits Grok's own subagents, workflows, and /goal
+    # engine in this CAO terminal. Omission remains ``None`` so existing profile
+    # API responses do not gain a new false-valued field; Grok resolves None as
+    # disabled because those workers are outside CAO's profile, callback, and
+    # terminal-accounting boundaries.
+    grokNativeWorkflows: Optional[bool] = None

@@ -1,0 +1,12 @@
+ Warning: Kiro is running in trust all tools mode
+ In this mode, Kiro will execute all tool calls — including shell commands, file operations, and MCP tools — without asking for your approval.
+
+ This mode is designed for fast iteration in safe environments. Use it with caution.
+
+ ❯ No, exit
+   Yes, I accept
+   Yes, and don't ask again
+
+ esc to cancel · ↑↓ to navigate · ↵ to select
+
+[developer] >

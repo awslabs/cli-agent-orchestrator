@@ -1,0 +1,972 @@
+"""HerdrBackend — TerminalBackend implementation using the herdr CLI.
+
+Herdr is a Rust-based terminal multiplexer with native agent-awareness.
+This backend maps CAO operations to herdr CLI commands.
+
+Design decisions:
+- One herdr session, workspaces per CAO session (labeled cao-<name>)
+- terminal_id is the stable identifier; pane_id is resolved before each operation
+- Resolution cache with 5s TTL reduces redundant herdr pane list calls
+- CAO_TERMINAL_ID and CAO_SESSION_NAME injected natively via ``--env`` at create
+"""
+
+import json
+import logging
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, cast
+
+from cli_agent_orchestrator.backends.base import (
+    TerminalBackend,
+    TerminalBackendError,
+    TerminalNotFoundError,
+)
+from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+logger = logging.getLogger(__name__)
+
+# Herdr CLI subcommands that _run_herdr is allowed to invoke.
+_HERDR_ALLOWED_SUBCOMMANDS = frozenset(
+    {
+        "workspace",
+        "tab",
+        "pane",
+        "session",
+        "api",
+    }
+)
+
+# Pattern for safe structural argument values passed to herdr.  The goal is
+# preventing argument injection (crafted --flags) under shell=False, NOT shell
+# injection (which list-form subprocess already prevents).  Rejects control
+# characters and NUL bytes; allows printable characters needed for filesystem
+# paths, UUIDs, labels, and JSON snippets.
+_SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@(){}\[\]\"'\\~+#]+$", re.UNICODE)
+
+# Flags that _run_herdr is allowed to pass to the herdr CLI.  Any argument
+# starting with "--" that is not in this set is rejected to prevent argument
+# injection (e.g. a crafted ``--session other`` overriding the backend's
+# session selection).
+_HERDR_ALLOWED_FLAGS = frozenset(
+    {
+        "--cwd",
+        "--env",
+        "--format",
+        "--label",
+        "--lines",
+        "--pane",
+        "--source",
+        "--workspace",
+    }
+)
+
+
+def _sanitize_herdr_args(args: List[str]) -> List[str]:
+    """Validate herdr CLI arguments and return a shallow copy.
+
+    Checks that all structural arguments (subcommand, flags, identifiers) are
+    safe before they reach subprocess.run().  Returns a new list so static
+    analysis tools see the subprocess receiving values that passed through
+    this validation gate rather than the original caller-provided references.
+
+    herdr is invoked with shell=False (list form) so shell injection is not
+    possible, but argument injection (e.g. injecting ``--session other``) could
+    redirect commands to unintended targets.  This sanitizer ensures that:
+    1. The first positional arg is a known herdr subcommand.
+    2. All structural arguments match a safe character set.
+    3. Any ``--flag`` is in the allowed set (``--session`` is excluded since
+       ``_run_herdr`` injects it from a trusted instance attribute).
+    Terminal input payloads (the text body of ``pane send-text`` / ``pane run``)
+    are exempt because they are literal content typed into a terminal pane, not
+    arguments that alter herdr's own behavior.
+    """
+    if not args:
+        raise ValueError("herdr args must not be empty")
+    subcommand = args[0]
+    if subcommand not in _HERDR_ALLOWED_SUBCOMMANDS:
+        raise ValueError(
+            f"herdr subcommand '{subcommand}' not in allowlist: "
+            f"{sorted(_HERDR_ALLOWED_SUBCOMMANDS)}"
+        )
+    # Determine how many args are structural (subcommand + action + flags/ids).
+    # ``pane send-text <pane_id> <text>`` and ``pane run <pane_id> <cmd>``
+    # carry a terminal-input / shell-command payload at index 3+ that is
+    # exempt from validation (it is content, not an argument that alters
+    # herdr's own routing or behavior).
+    if len(args) >= 2 and args[0] == "pane" and args[1] in ("send-text", "run"):
+        structural_args = args[:3]
+    else:
+        structural_args = args
+    prev_was_env = False
+    for arg in structural_args:
+        if not _SAFE_ARG_RE.fullmatch(arg):
+            # A rejected --env value may be a secret; redact it in the error.
+            shown = _redact_env_values(["--env", arg])[1] if prev_was_env else repr(arg)
+            raise ValueError(f"herdr argument contains unsafe characters: {shown}")
+        if arg.startswith("--") and arg not in _HERDR_ALLOWED_FLAGS:
+            raise ValueError(
+                f"herdr flag '{arg}' not in allowlist: " f"{sorted(_HERDR_ALLOWED_FLAGS)}"
+            )
+        prev_was_env = arg == "--env"
+    return list(args)
+
+
+def _redact_env_values(args: List[str]) -> List[str]:
+    """Return a display copy of herdr args with ``--env`` values redacted.
+
+    Operator-forwarded env values may be secrets. Any token immediately
+    following ``--env`` is reduced to ``KEY=<redacted>`` (or ``<redacted>`` if
+    it has no ``=``), so a create failure/timeout or sanitizer rejection never
+    surfaces the raw value in an exception, log, or HTTP error detail.
+    """
+    redacted: List[str] = []
+    prev_was_env = False
+    for arg in args:
+        if prev_was_env:
+            key = arg.split("=", 1)[0] if "=" in arg else ""
+            redacted.append(f"{key}=<redacted>" if key else "<redacted>")
+            prev_was_env = False
+        else:
+            redacted.append(arg)
+            prev_was_env = arg == "--env"
+    return redacted
+
+
+# Cache TTL for pane_id resolution (seconds).
+# Used by get_pane_id() (fast-path, reads the cache populated at create time) and
+# _resolve_workspace_id(). _resolve_pane_id_from_window() never caches pane_ids —
+# herdr renumbers panes on deletion, so it resolves the pane fresh every call.
+_PANE_CACHE_TTL = 5.0
+
+# Staleness bound for the durable pane_id map (seconds). Herdr public pane_ids
+# are stable except across a full server restart, so a generous TTL is a cheap
+# safety net: within it, map hits are instant; after it (or on a miss) a single
+# `api snapshot` refresh rebuilds the whole map, self-healing a stale entry.
+_PANE_ID_MAP_TTL = 30.0
+
+
+class HerdrBackend(TerminalBackend):
+    """TerminalBackend implementation using herdr CLI commands.
+
+    Maps CAO concepts to herdr:
+    - CAO session → herdr workspace (labeled cao-<name>)
+    - CAO terminal/window → herdr tab within workspace
+    - terminal_id → stable identifier stored in CAO DB
+    - pane_id → compact ID resolved via herdr pane list before each operation
+    """
+
+    def __init__(self, send_delay_ms: int = 0, herdr_session: str = "cao") -> None:
+        """Initialize HerdrBackend.
+
+        Args:
+            send_delay_ms: Milliseconds to sleep between send-text and send-keys Enter.
+                Configurable per-provider for bracketed paste timing.
+            herdr_session: Name of the herdr session CAO operates in.
+                Maps to ``herdr --session <name>``. Defaults to ``"cao"`` so CAO
+                runs isolated from the user's personal herdr session.
+        """
+        self._send_delay_ms = send_delay_ms
+        self._herdr_session = herdr_session
+        # Resolution cache: terminal_id → (pane_id, timestamp)
+        self._pane_cache: Dict[str, tuple[str, float]] = {}
+        # Durable map: terminal_id → pane_id, rebuilt from `api snapshot`.
+        # Public IDs are stable except across a full herdr server restart.
+        self._pane_id_map: Dict[str, str] = {}
+        # Timestamp of the last successful map rebuild; bounds map staleness
+        # against a herdr restart via _PANE_ID_MAP_TTL (0.0 => never built).
+        self._pane_id_map_ts: float = 0.0
+        # Workspace cache: session_name → (workspace_id, timestamp)
+        self._workspace_cache: Dict[str, tuple[str, float]] = {}
+        self._ensure_session_running()
+
+    @property
+    def herdr_session(self) -> str:
+        """The herdr session name this backend operates in."""
+        return self._herdr_session
+
+    def _run_herdr(self, args: List[str], check: bool = True) -> subprocess.CompletedProcess:
+        """Run a herdr CLI command and return the result.
+
+        Args:
+            args: Command arguments (without 'herdr' prefix)
+            check: If True, raise TerminalBackendError on non-zero exit
+
+        Returns:
+            CompletedProcess result
+
+        Raises:
+            TerminalBackendError: If check=True and command fails, or if args
+                contain unsafe characters or unknown subcommands.
+        """
+        try:
+            sanitized = _sanitize_herdr_args(args)
+        except ValueError as e:
+            raise TerminalBackendError(f"herdr argument validation failed: {e}") from e
+        cmd = ["herdr", "--session", self._herdr_session] + sanitized
+        # Build a redacted display form for error messages. Two sensitive
+        # sources: send-text/run payloads (terminal input) and --env values
+        # (operator-forwarded, potentially secret). Never let either reach an
+        # exception, log, or HTTP error detail.
+        has_payload = (
+            len(sanitized) >= 3 and sanitized[0] == "pane" and sanitized[1] in ("send-text", "run")
+        )
+        if has_payload:
+            cmd_display = cmd[:6] + ["<redacted>"]
+        else:
+            cmd_display = _redact_env_values(cmd)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if check and result.returncode != 0:
+                raise TerminalBackendError(
+                    f"herdr command failed: {' '.join(cmd_display)}\n"
+                    f"stderr: {result.stderr.strip()}"
+                )
+            return result
+        except subprocess.TimeoutExpired as e:
+            raise TerminalBackendError(f"herdr command timed out: {' '.join(cmd_display)}") from e
+        except FileNotFoundError as e:
+            raise TerminalBackendError(
+                "herdr CLI not found. Install herdr to use terminal_backend='herdr'."
+            ) from e
+
+    def _parse_herdr_json(self, stdout: str) -> dict:
+        """Parse herdr CLI JSON output, handling the envelope format.
+
+        Herdr wraps responses in {"id":..., "result": {...}} envelopes.
+        """
+        data = json.loads(stdout)
+        if isinstance(data, dict) and "result" in data:
+            return cast(dict, data["result"])
+        return cast(dict, data)
+
+    def _resolve_workspace_id(self, session_name: str) -> str:
+        """Resolve session_name (workspace label) to workspace ID.
+
+        Uses _workspace_cache with the same TTL as pane cache.
+
+        Args:
+            session_name: CAO session name (used as workspace label)
+
+        Returns:
+            Workspace ID
+
+        Raises:
+            TerminalBackendError: If workspace not found
+        """
+        # Check cache
+        if session_name in self._workspace_cache:
+            workspace_id, cached_at = self._workspace_cache[session_name]
+            if time.time() - cached_at < _PANE_CACHE_TTL:
+                return workspace_id
+
+        result = self._run_herdr(["workspace", "list"])
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            workspaces = data.get("workspaces", []) if isinstance(data, dict) else data
+        except json.JSONDecodeError as e:
+            raise TerminalBackendError(f"Failed to parse herdr workspace list output: {e}") from e
+
+        for ws in workspaces:
+            if ws.get("label") == session_name:
+                ws_id = str(ws["workspace_id"])
+                self._workspace_cache[session_name] = (ws_id, time.time())
+                return ws_id
+
+        raise TerminalBackendError(f"Workspace with label '{session_name}' not found")
+
+    # --- Session lifecycle ---
+
+    def create_session(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        working_directory: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Create a herdr workspace (= CAO session) with an initial tab."""
+        import os
+
+        working_directory = working_directory or os.getcwd()
+
+        args = ["workspace", "create", "--label", session_name]
+        if working_directory:
+            args.extend(["--cwd", working_directory])
+        # Inject CAO identity + operator-forwarded env natively via --env
+        # (replaces the former shell ``export`` send-text injection).
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env))
+
+        result = self._run_herdr(args)
+
+        # Parse workspace ID and root tab_id from output for cache
+        workspace_id = ""
+        root_tab_id = ""
+        try:
+            ws_data = self._parse_herdr_json(result.stdout)
+            root_pane = ws_data.get("root_pane", {})
+            workspace_id = str(root_pane.get("workspace_id", ""))
+            root_tab_id = str(root_pane.get("tab_id", ""))
+            if workspace_id:
+                self._workspace_cache[session_name] = (workspace_id, time.time())
+        except (json.JSONDecodeError, KeyError):
+            pass  # Non-fatal; we can resolve later
+
+        # Parse root pane_id from the create response to seed the pane cache.
+        new_pane_id = self._parse_new_pane_id(result.stdout)
+
+        # Label the root tab so it shows the CAO window name in herdr TUI.
+        if root_tab_id:
+            self._run_herdr(["tab", "rename", root_tab_id, window_name], check=False)
+
+        # Seed the pane cache so get_pane_id() keeps its fast path (formerly
+        # seeded via the send-text env path). R4 will replace this cache with a
+        # snapshot map.
+        if new_pane_id:
+            self._pane_cache[terminal_id] = (new_pane_id, time.time())
+
+        logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
+        return window_name
+
+    def session_exists(self, session_name: str) -> bool:
+        """Check if a workspace with the given label exists."""
+        result = self._run_herdr(["workspace", "list"], check=False)
+        if result.returncode != 0:
+            return False
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            workspaces = data.get("workspaces", []) if isinstance(data, dict) else data
+            return any(ws.get("label") == session_name for ws in workspaces)
+        except (json.JSONDecodeError, KeyError):
+            return False
+
+    def list_sessions(self) -> List[Dict[str, str]]:
+        """List all herdr workspaces as sessions."""
+        result = self._run_herdr(["workspace", "list"], check=False)
+        if result.returncode != 0:
+            return []
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            workspaces = data.get("workspaces", []) if isinstance(data, dict) else data
+            return [
+                {
+                    "id": ws.get("label", str(ws.get("workspace_id", ""))),
+                    "name": ws.get("label", str(ws.get("workspace_id", ""))),
+                    "status": "active",
+                }
+                for ws in workspaces
+            ]
+        except (json.JSONDecodeError, KeyError):
+            return []
+
+    def kill_session(self, session_name: str) -> bool:
+        """Close a herdr workspace by workspace_id (herdr only accepts id, not --label)."""
+        try:
+            workspace_id = self._resolve_workspace_id(session_name)
+        except TerminalBackendError:
+            logger.warning(f"kill_session: workspace '{session_name}' not found")
+            return False
+        result = self._run_herdr(["workspace", "close", workspace_id], check=False)
+        if result.returncode == 0:
+            self._workspace_cache.pop(session_name, None)
+            logger.info(f"Killed herdr workspace: {session_name}")
+            return True
+        return False
+
+    # --- Window/tab lifecycle ---
+
+    def create_window(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        working_directory: Optional[str] = None,
+        window_shell: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Create a new tab in the workspace."""
+        import os
+
+        working_directory = working_directory or os.getcwd()
+
+        # Resolve workspace ID
+        workspace_id = self._resolve_workspace_id(session_name)
+
+        args = ["tab", "create", "--workspace", workspace_id, "--label", window_name]
+        if working_directory:
+            args.extend(["--cwd", working_directory])
+        # Inject CAO identity + operator-forwarded env natively via --env
+        # (replaces the former shell ``export`` send-text injection).
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env))
+
+        result = self._run_herdr(args)
+
+        # Parse the new pane_id directly from the create response
+        new_pane_id = self._parse_new_pane_id(result.stdout)
+
+        # Seed the pane cache so get_pane_id() keeps its fast path (formerly
+        # seeded via the send-text env path). R4 will replace this cache with a
+        # snapshot map.
+        if new_pane_id:
+            self._pane_cache[terminal_id] = (new_pane_id, time.time())
+
+        if window_shell is not None and new_pane_id is not None:
+            # Wait for shell startup before sending the initial command.
+            time.sleep(0.5)
+            try:
+                self._run_herdr(["pane", "run", new_pane_id, window_shell])
+            except TerminalBackendError as e:
+                logger.warning(f"create_window: pane run failed for {new_pane_id} (non-fatal): {e}")
+
+        logger.info(f"Created herdr tab in workspace {session_name}")
+        return window_name
+
+    def kill_window(self, session_name: str, window_name: str) -> bool:
+        """Kill a pane by resolving session_name:window_name to its pane_id."""
+        try:
+            pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+        except TerminalBackendError:
+            logger.warning(f"kill_window: could not resolve pane for {session_name}:{window_name}")
+            return False
+
+        result = self._run_herdr(["pane", "close", pane_id], check=False)
+
+        if result.returncode == 0:
+            logger.info(f"Killed herdr pane {pane_id} for {session_name}:{window_name}")
+            return True
+        return False
+
+    # --- Input ---
+
+    def _pane_is_bracketed_paste_incompatible(self, session_name: str, window_name: str) -> bool:
+        """Whether the pane's live foreground command is a known shell.
+
+        Mirrors ``TmuxClient._pane_is_bracketed_paste_incompatible`` (clients/
+        tmux.py) -- see that method's own docstring for the failure mode this
+        guards against. Fails closed to "compatible" (returns False) on any
+        lookup failure or unrecognized command name.
+        """
+        command = self.get_pane_current_command(session_name, window_name)
+        return command is not None and command in BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+
+    def send_keys(
+        self,
+        session_name: str,
+        window_name: str,
+        keys: str,
+        enter_count: int = 1,
+        force_bracketed_paste: bool = False,
+        submit_delay: float = 0.3,
+    ) -> None:
+        """Send text to a pane via herdr pane send-text + send-keys Enter.
+
+        When force_bracketed_paste=True, wraps content in \\x1b[200~...\\x1b[201~
+        so Claude Code's Ink TUI treats it as a paste event rather than raw
+        keystrokes. Without this, multi-line prompts go into multi-line mode
+        and the final Enter adds a newline instead of submitting.
+
+        ``submit_delay`` is accepted for parity with the backend interface; herdr
+        governs its own post-paste timing below (the generous 2s bracketed wait
+        already covers Claude Code's Ink renderer), so the value is not used here.
+        """
+        # Resolve pane_id from terminal_id stored in DB metadata
+        # The window_name is used as a lookup key in CAO's DB → terminal_id mapping
+        # For herdr, we need the terminal_id. The service layer passes session:window
+        # which maps to a terminal in the DB. We'll resolve via the pane list.
+        pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+
+        # Wrap in bracketed paste sequences when requested -- UNLESS the pane's
+        # live foreground process is a known shell (see
+        # BRACKETED_PASTE_INCOMPATIBLE_SHELLS' own docstring in constants.py):
+        # a bare shell doesn't understand the escape sequences and glues them
+        # onto the first token of whatever's sent, corrupting it. Same
+        # tmux-backend fix (clients/tmux.py's
+        # _pane_is_bracketed_paste_incompatible), mirrored here since herdr's
+        # ``pane send-text`` writes raw bytes to the pty just like tmux's
+        # paste-buffer -- the same corruption is equally possible here, and
+        # herdr already exposes the same get_pane_current_command primitive.
+        # Fails closed to "compatible" (wraps, existing behavior) on a lookup
+        # failure or unrecognized command name. Only probed when
+        # force_bracketed_paste is actually requested -- an extra herdr
+        # round-trip whose result would otherwise be discarded.
+        if force_bracketed_paste and not self._pane_is_bracketed_paste_incompatible(
+            session_name, window_name
+        ):
+            text = "\x1b[200~" + keys + "\x1b[201~"
+        else:
+            text = keys
+
+        self._run_herdr(["pane", "send-text", pane_id, text])
+
+        # Allow the TUI to process the pasted content before sending Enter.
+        # For bracketed paste, the TUI needs time to process the end sequence
+        # and enter multi-line mode; 2s is intentionally generous.
+        # For non-bracketed paste, use the configurable send_delay_ms.
+        if force_bracketed_paste:
+            time.sleep(2.0)
+        elif self._send_delay_ms > 0:
+            time.sleep(self._send_delay_ms / 1000.0)
+
+        # Send Enter key(s)
+        for _ in range(enter_count):
+            self._run_herdr(["pane", "send-keys", pane_id, "Enter"])
+
+    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
+        """Send a special key to a pane."""
+        pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+
+        # Map key names
+        if not key or key.lower() == "enter":
+            self._run_herdr(["pane", "send-keys", pane_id, "Enter"])
+        elif key == "C-c":
+            self._run_herdr(["pane", "send-keys", pane_id, "C-c"])
+        elif key == "C-d":
+            self._run_herdr(["pane", "send-keys", pane_id, "C-d"])
+        else:
+            # Pass key name directly
+            self._run_herdr(["pane", "send-keys", pane_id, key])
+
+    # --- Output ---
+
+    def get_history(
+        self,
+        session_name: str,
+        window_name: str,
+        tail_lines: Optional[int] = None,
+        strip_escapes: bool = False,
+        full_history: bool = False,
+    ) -> str:
+        """Read pane output via herdr pane read."""
+        pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+
+        args = ["pane", "read", pane_id]
+        if full_history:
+            pass  # no flags — returns full scrollback
+        elif tail_lines:
+            args.extend(["--source", "recent", "--lines", str(tail_lines)])
+        else:
+            args.extend(["--source", "recent", "--lines", "500"])
+        # Honor strip_escapes via herdr's native --format text (strips ANSI).
+        # The TerminalBackend contract only requires that strip_escapes=True
+        # yields plain text; when False we leave the format unset and take
+        # herdr's default so existing provider output parsing is unchanged.
+        if strip_escapes:
+            args.extend(["--format", "text"])
+
+        result = self._run_herdr(args, check=False)
+        if result.returncode != 0:
+            logger.warning(f"herdr pane read failed: {result.stderr}")
+            return ""
+        return cast(str, result.stdout)
+
+    def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
+        """Get pane CWD via herdr pane get."""
+        pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+
+        result = self._run_herdr(["pane", "get", pane_id], check=False)
+        if result.returncode != 0:
+            return None
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            # pane get returns {"pane": {...}} inside result
+            pane_info = data.get("pane", data) if isinstance(data, dict) else data
+            return cast(Optional[str], pane_info.get("cwd"))
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
+    def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
+        """Get the pane's live foreground process name via ``herdr pane
+        process-info``.
+
+        NOT ``herdr pane get``: that command's ``foreground_process`` field
+        is null/absent across all pane states on herdr 0.7.5 (confirmed
+        live against a running herdr server), so this callable would always
+        return ``None`` and every caller that branches on it (this class's
+        own ``_pane_is_bracketed_paste_incompatible``, plus
+        ``codex``/``kiro_cli``'s ``shell_baseline`` TUI-exit detection) would
+        silently never fire on herdr. ``pane process-info`` instead reports
+        real process names (``"bash"``, ``"claude"``, etc.) via
+        ``foreground_processes``.
+        """
+        pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+
+        result = self._run_herdr(["pane", "process-info", "--pane", pane_id], check=False)
+        if result.returncode != 0:
+            return None
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            info = data.get("pane", data) if isinstance(data, dict) else data
+            processes = info.get("foreground_processes")
+            if not processes:
+                return None
+            return cast(Optional[str], processes[0].get("name"))
+        except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+            return None
+
+    # --- Attach ---
+
+    def attach_session(self, session_name: str) -> None:
+        """Attach the user's terminal to the herdr UI, focused on the CAO workspace.
+
+        Strategy:
+        1. Focus the CAO workspace in the running herdr server (so the UI opens
+           on the right workspace).
+        2. Exec `herdr` to replace the current process with the full herdr TUI.
+
+        This mirrors how `tmux attach-session -t <session>` works — it opens
+        the multiplexer UI showing the requested session.
+        """
+        import os
+
+        workspace_id = self._resolve_workspace_id(session_name)
+
+        # Focus the workspace so herdr opens on it when we attach
+        self._run_herdr(["workspace", "focus", workspace_id], check=False)
+
+        # Replace current process with herdr TUI, targeting the CAO session.
+        # Equivalent to `tmux attach-session -t <session>`.
+        os.execvp("herdr", ["herdr", "--session", self._herdr_session])
+
+    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
+        """Focus the requested Herdr tab and return the browser PTY attach command."""
+        workspace_id = self._resolve_workspace_id(session_name)
+        tab_id = self._resolve_tab_id(session_name, workspace_id, window_name)
+        self._run_herdr(["tab", "focus", tab_id])
+        return ["herdr", "--session", self._herdr_session]
+
+    # --- Capability overrides ---
+
+    def supports_event_inbox(self) -> bool:
+        """Herdr uses socket events for inbox delivery."""
+        return True
+
+    def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
+        """Query herdr's native agent_status for a pane.
+
+        Uses herdr pane get to read the agent_status field directly, avoiding
+        pane content parsing entirely when herdr knows the agent state.
+
+        Mapping (all five herdr agent states):
+        - working  -> PROCESSING
+        - blocked  -> WAITING_USER_ANSWER
+        - done     -> COMPLETED
+        - idle     -> IDLE  (caller disambiguates IDLE vs COMPLETED via _task_dispatched)
+        - unknown  -> None  (herdr has no agent registered for the pane)
+
+        "unknown" maps to None (not ERROR) because a wrapped launch command
+        (e.g. ``podman exec`` / ``docker exec``) makes herdr's foreground
+        process the wrapper, not the nested agent CLI, so herdr never registers
+        the agent and reports "unknown" indefinitely. None signals
+        "unknown/unresolvable at the backend level" and lets the caller resolve
+        status another way rather than flagging a healthy pane as ERROR.
+
+        Returns None on backend errors (command failure, parse error) and for
+        an "unknown"/unrecognized agent_status.
+        """
+        try:
+            pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+        except TerminalBackendError:
+            return None
+
+        result = self._run_herdr(["pane", "get", pane_id], check=False)
+        if result.returncode != 0:
+            return None
+
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            pane_info = data.get("pane", data) if isinstance(data, dict) else data
+            agent_status = pane_info.get("agent_status", "unknown")
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
+        if agent_status == "working":
+            return TerminalStatus.PROCESSING
+        if agent_status == "blocked":
+            return TerminalStatus.WAITING_USER_ANSWER
+        if agent_status == "done":
+            return TerminalStatus.COMPLETED
+        if agent_status == "idle":
+            return TerminalStatus.IDLE
+        # "unknown" and any unrecognized value: unresolvable at backend level.
+        return None
+
+    def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
+        """Resolve CAO terminal_id to herdr pane_id.
+
+        Prefers the durable ``_pane_id_map`` (rebuilt from ``api snapshot``).
+        Herdr 0.7.x public pane_ids are stable except across a full server
+        restart, so a hit is returned directly and a miss triggers a single
+        snapshot refresh before retrying the map. Only if the map still cannot
+        resolve the terminal does resolution fall back to the legacy
+        ``_pane_cache`` fast path and label-based window resolution
+        (``_resolve_workspace_id`` -> ``_resolve_tab_id`` -> pane list). The
+        legacy fallback is retained for reversibility and removed in a
+        follow-up once the durable map is proven.
+
+        Args:
+            terminal_id: CAO UUID terminal identifier
+            session_name: Optional session name for window-based fallback lookup
+            window_name: Optional window name for window-based fallback lookup
+
+        Returns:
+            Current herdr compact pane_id
+
+        Raises:
+            TerminalNotFoundError: If pane cannot be resolved
+        """
+        # Durable map (rebuilt from api snapshot). Trust a hit only while the map
+        # is fresh; herdr IDs are stable except across a server restart, which
+        # this TTL bounds — a stale entry expires and the next lookup refreshes.
+        if (
+            time.time() - self._pane_id_map_ts
+        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
+            return self._pane_id_map[terminal_id]
+        # Map is stale (or a miss). Rebuild, then trust it ONLY if the rebuild
+        # succeeded — _refresh_pane_id_map leaves the timestamp untouched on
+        # failure, so re-check freshness here. Without this re-gate a failed
+        # refresh would return the very entry we just judged expired, defeating
+        # the self-healing this TTL exists to provide (fall through to the
+        # label-based fallback instead).
+        self._refresh_pane_id_map()
+        if (
+            time.time() - self._pane_id_map_ts
+        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
+            return self._pane_id_map[terminal_id]
+
+        # Legacy fallback (removed in a follow-up once the map is proven):
+        if terminal_id in self._pane_cache:
+            pane_id, cached_at = self._pane_cache[terminal_id]
+            if time.time() - cached_at < _PANE_CACHE_TTL:
+                return pane_id
+        if session_name and window_name:
+            return self._resolve_pane_id_from_window(session_name, window_name)
+
+        raise TerminalNotFoundError(terminal_id)
+
+    def _refresh_pane_id_map(self) -> None:
+        """Rebuild terminal_id -> pane_id from a live `api snapshot`.
+
+        Public IDs are stable except across a full herdr server restart, so this
+        is only needed on a miss (or at reconcile time), not per-call.
+
+        On any failure — non-zero exit, a raising ``_run_herdr`` (subprocess
+        timeout / missing binary surface as ``TerminalBackendError``; other
+        ``OSError`` subtypes can surface directly), or an unparseable snapshot —
+        the map and its timestamp are left unchanged. This keeps a failed
+        refresh from marking a stale map as fresh and from propagating out of
+        ``get_pane_id`` (which would skip the legacy fallback). ``_pane_id_map_ts``
+        is stamped only after a successful rebuild.
+        """
+        try:
+            result = self._run_herdr(["api", "snapshot"], check=False)
+            if result.returncode != 0:
+                return
+            data = self._parse_herdr_json(result.stdout)
+            snapshot = data.get("snapshot", data)
+            if not isinstance(snapshot, dict):
+                return
+            self._pane_id_map = {
+                p["terminal_id"]: p["pane_id"]
+                for p in snapshot.get("panes", [])
+                if p.get("terminal_id") and p.get("pane_id")
+            }
+            self._pane_id_map_ts = time.time()
+        except (
+            TerminalBackendError,
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            AttributeError,
+            TypeError,
+        ):
+            return
+
+    # --- Pipe-pane (no-op for herdr) ---
+
+    def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
+        """No-op: herdr uses socket events for inbox delivery."""
+        logger.debug(f"pipe_pane is a no-op for herdr backend (session={session_name})")
+
+    def stop_pipe_pane(self, session_name: str, window_name: str) -> None:
+        """No-op: herdr uses socket events for inbox delivery."""
+        logger.debug(f"stop_pipe_pane is a no-op for herdr backend (session={session_name})")
+
+    # --- Internal helpers ---
+
+    def _session_socket_path(self) -> str:
+        """Return the herdr socket path for the configured session.
+
+        Mirrors HerdrInboxService._default_socket_path():
+        - ``"default"`` session: ``~/.config/herdr/herdr.sock``
+        - Named sessions:       ``~/.config/herdr/sessions/<name>/herdr.sock``
+        """
+        config_home = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        if self._herdr_session == "default":
+            return f"{config_home}/herdr/herdr.sock"
+        return f"{config_home}/herdr/sessions/{self._herdr_session}/herdr.sock"
+
+    def _ensure_session_running(self) -> None:
+        """Start the herdr session server if its socket does not exist.
+
+        Checks for the session socket file. If absent, starts the server
+        headlessly and waits up to 5 seconds for the socket to appear.
+        Logs a warning if the socket never appears but does not raise —
+        the first actual herdr operation will produce a clear error.
+        """
+        socket_path = self._session_socket_path()
+        if os.path.exists(socket_path):
+            return
+
+        logger.info(
+            f"Herdr session '{self._herdr_session}' not running "
+            f"(socket {socket_path} absent) — starting server."
+        )
+        subprocess.Popen(
+            ["herdr", "--session", self._herdr_session, "server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        # Give herdr a moment to create the socket file before polling.
+        time.sleep(0.5)
+
+        # Poll up to 15 seconds for the socket to appear.
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            if os.path.exists(socket_path):
+                logger.info(f"Herdr session '{self._herdr_session}' is ready.")
+                return
+            time.sleep(0.1)
+
+        logger.warning(
+            f"Herdr session '{self._herdr_session}' socket did not appear within 15s "
+            f"at {socket_path}. The first herdr operation will fail with a clear error."
+        )
+
+    def _parse_new_pane_id(self, stdout: str) -> Optional[str]:
+        """Extract the root pane_id from a workspace/tab create response.
+
+        Both 'herdr workspace create' and 'herdr tab create' return a
+        result.root_pane.pane_id field with the newly created pane's ID.
+        """
+        try:
+            data = self._parse_herdr_json(stdout)
+            return str(data["root_pane"]["pane_id"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+
+    def _build_env_args(
+        self,
+        terminal_id: str,
+        session_name: str,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
+        """Build ``--env KEY=VALUE`` argument pairs for a create command.
+
+        Operator-forwarded vars are merged first, filtered with the same policy
+        TmuxClient applies to its ``-e`` argv (blocked prefixes, per-value byte
+        cap). The two CAO identity vars are assigned LAST so an operator
+        ``--env CAO_TERMINAL_ID=...`` cannot override the real terminal identity
+        (mirrors TmuxClient, which forces these to win). Native ``--env``
+        replaces the former shell ``export`` injection, removing the
+        command-line injection surface.
+
+        Note: on herdr, env VALUES pass through the herdr arg sanitizer, which
+        rejects shell metacharacters and control chars. A value containing e.g.
+        ``$ ; | & ! * ? < >`` will fail terminal creation on herdr (fail-closed),
+        whereas the tmux backend accepts such values. This is an intentional,
+        safety-conservative divergence; operator env values on herdr must be
+        sanitizer-safe.
+        """
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        env: Dict[str, str] = {}
+        for key, value in (extra_env or {}).items():
+            if TmuxClient._is_blocked_env_key(key):
+                logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
+                continue
+            if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
+                logger.warning("Dropping forwarded env var %s -- exceeds byte cap", key)
+                continue
+            env[key] = value
+
+        # CAO identity vars are assigned last so operator-forwarded --env cannot
+        # override them (mirrors TmuxClient, which forces these to win).
+        env["CAO_TERMINAL_ID"] = terminal_id
+        env["CAO_SESSION_NAME"] = session_name
+
+        args: List[str] = []
+        for key, value in env.items():
+            args.extend(["--env", f"{key}={value}"])
+        return args
+
+    def _resolve_tab_id(self, session_name: str, workspace_id: str, window_name: str) -> str:
+        """Resolve window_name to its herdr tab_id in the given workspace.
+
+        Args:
+            session_name: CAO session name (used only in error messages)
+            workspace_id: Herdr workspace ID to search within
+            window_name: Tab label to match
+
+        Returns:
+            The tab_id of the matching tab
+
+        Raises:
+            TerminalBackendError: If no tab with label window_name exists in workspace_id
+        """
+        result = self._run_herdr(["tab", "list"])
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            tabs = data.get("tabs", []) if isinstance(data, dict) else data
+        except json.JSONDecodeError as e:
+            raise TerminalBackendError(f"Failed to parse herdr tab list: {e}") from e
+
+        for tab in tabs:
+            if tab.get("workspace_id") == workspace_id and tab.get("label") == window_name:
+                return str(tab["tab_id"])
+
+        raise TerminalBackendError(
+            f"No tab labeled '{window_name}' found in workspace '{session_name}'"
+        )
+
+    def _resolve_pane_id_from_window(self, session_name: str, window_name: str) -> str:
+        """Resolve a pane_id given session_name and window_name.
+
+        Performs a fresh herdr workspace + tab + pane lookup on every call. Pane
+        IDs are not stable across deletions — herdr renumbers remaining panes
+        when any pane in the workspace is removed, so a cached pane_id would go
+        stale and cause pane_not_found errors for live terminals. workspace_id
+        resolution is cached with a short TTL inside _resolve_workspace_id as a
+        latency optimization; the chain is otherwise resolved live.
+
+        Resolution chain: workspace_id (by label) → tab_id (by label within the
+        workspace) → the pane whose tab_id matches. There is no fallback: a tab
+        must exist for the window and a pane must exist for the tab.
+
+        Raises:
+            TerminalNotFoundError: If the workspace, tab, or pane cannot be
+                resolved for session_name:window_name.
+        """
+        try:
+            workspace_id = self._resolve_workspace_id(session_name)
+            tab_id = self._resolve_tab_id(session_name, workspace_id, window_name)
+
+            result = self._run_herdr(["pane", "list"])
+            try:
+                data = self._parse_herdr_json(result.stdout)
+                panes = data.get("panes", []) if isinstance(data, dict) else data
+            except json.JSONDecodeError as e:
+                raise TerminalBackendError(f"Failed to parse herdr pane list: {e}") from e
+        except TerminalBackendError as e:
+            raise TerminalNotFoundError(f"{session_name}:{window_name}") from e
+
+        for pane in panes:
+            if pane.get("tab_id") == tab_id:
+                return str(pane["pane_id"])
+
+        raise TerminalNotFoundError(f"{session_name}:{window_name}")

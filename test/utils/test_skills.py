@@ -1,5 +1,6 @@
 """Tests for skill utilities."""
 
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,6 +24,29 @@ def _write_skill(folder: Path, name: str, description: str, body: str = "# Title
         "---\n" f"name: {name}\n" f"description: {description}\n" "---\n\n" f"{body}\n"
     )
     return skill_file
+
+
+@pytest.fixture(autouse=True)
+def _default_no_extra_skill_dirs(monkeypatch):
+    """Default ``extra_skill_dirs`` to empty for every test.
+
+    Existing tests patch only ``SKILLS_DIR``; without this they would read the
+    developer's real ``settings.json``. Tests that exercise extra dirs override
+    this via ``_use_skill_dirs``.
+    """
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
+        lambda: [],
+    )
+
+
+def _use_skill_dirs(monkeypatch, global_dir, extra_dirs):
+    """Point skill resolution at a global store plus a list of extra directories."""
+    monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", global_dir)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
+        lambda: [str(d) for d in extra_dirs],
+    )
 
 
 class TestLoadSkillMetadata:
@@ -181,6 +205,129 @@ class TestListSkills:
         assert "broken-skill" in caplog.text
 
 
+class TestExtraSkillDirs:
+    """Resolving skills from ``extra_skill_dirs`` (mirrors ``extra_agent_dirs``)."""
+
+    def test_load_metadata_from_extra_dir(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task workflow")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        metadata = load_skill_metadata("task")
+
+        assert metadata == SkillMetadata(name="task", description="Project task workflow")
+
+    def test_load_content_from_extra_dir(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task", body="# Task\n\nSteps.")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        assert load_skill_content("task") == "# Task\n\nSteps."
+
+    def test_global_store_takes_precedence_over_extra_dir(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "task", "task", "Global task")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        assert load_skill_metadata("task").description == "Global task"
+
+    def test_list_includes_global_and_extra_dirs(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "alpha", "alpha", "Global alpha")
+        extra = tmp_path / "project"
+        _write_skill(extra / "beta", "beta", "Project beta")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        assert [skill.name for skill in list_skills()] == ["alpha", "beta"]
+
+    def test_list_dedups_with_global_winning_over_extra(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "task", "task", "Global task")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        skills = list_skills()
+
+        assert [skill.name for skill in skills] == ["task"]
+        assert skills[0].description == "Global task"
+
+    def test_list_skips_non_skill_subdir_silently(self, tmp_path, monkeypatch, caplog):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "alpha", "alpha", "Global alpha")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task")
+        (extra / "node_modules").mkdir(parents=True)  # unrelated folder, no SKILL.md
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        skills = list_skills()
+
+        assert [skill.name for skill in skills] == ["alpha", "task"]
+        assert "node_modules" not in caplog.text
+
+    def test_list_skips_missing_extra_dir(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "alpha", "alpha", "Global alpha")
+        missing = tmp_path / "does-not-exist"
+        _use_skill_dirs(monkeypatch, global_dir, [missing])
+
+        assert [skill.name for skill in list_skills()] == ["alpha"]
+
+    def test_missing_skill_falls_back_to_global_path_error(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        extra = tmp_path / "project"
+        extra.mkdir()
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        with pytest.raises(FileNotFoundError, match="Skill folder does not exist"):
+            load_skill_metadata("nope")
+
+    def test_invalid_earlier_skill_does_not_shadow_valid_extra(self, tmp_path, monkeypatch):
+        """A broken same-named folder in an earlier dir must not hide a valid later one.
+
+        ``list_skills`` already skips the invalid folder and advertises the
+        valid extra-dir skill; ``_resolve_skill_path`` must agree so ``load_skill``
+        succeeds for the same name ("first valid match wins").
+        """
+        global_dir = tmp_path / "global"
+        # Invalid: folder name does not match the declared skill name.
+        broken = global_dir / "task"
+        broken.mkdir(parents=True)
+        (broken / "SKILL.md").write_text("---\nname: other\ndescription: Broken\n---\n\nBody\n")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task", body="# Task\n\nSteps.")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        # list and load must agree: both resolve to the valid extra-dir skill.
+        assert "task" in [skill.name for skill in list_skills()]
+        assert load_skill_metadata("task").description == "Project task"
+        assert load_skill_content("task") == "# Task\n\nSteps."
+
+    def test_invalid_only_skill_surfaces_validation_error(self, tmp_path, monkeypatch):
+        """When the only same-named folder is invalid, the real validation error is raised.
+
+        The fallback preserves the meaningful error instead of degrading to a
+        generic "Skill folder does not exist".
+        """
+        global_dir = tmp_path / "global"
+        broken = global_dir / "task"
+        broken.mkdir(parents=True)
+        (broken / "SKILL.md").write_text("---\nname: other\ndescription: Broken\n---\n\nBody\n")
+        extra = tmp_path / "project"
+        extra.mkdir()
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        with pytest.raises(ValueError, match="does not match skill name"):
+            load_skill_metadata("task")
+
+
 class TestValidateSkillFolder:
     """Tests for validate_skill_folder."""
 
@@ -226,7 +373,12 @@ class TestDefaultBundledSkills:
         return Path(__file__).resolve().parents[2] / "src" / "cli_agent_orchestrator" / "skills"
 
     def test_default_skill_folders_exist_with_valid_metadata(self):
-        skill_names = ["cao-supervisor-protocols", "cao-worker-protocols"]
+        skill_names = [
+            "cao-agent-routing",
+            "cao-memory",
+            "cao-supervisor-protocols",
+            "cao-worker-protocols",
+        ]
 
         for skill_name in skill_names:
             metadata = validate_skill_folder(self.bundled_skills_dir / skill_name)
@@ -246,6 +398,30 @@ class TestDefaultBundledSkills:
         assert "assign" in worker_content
         assert "handoff" in worker_content
         assert "send_message" in worker_content
+
+    def test_memory_skill_covers_core_memory_tools(self):
+        memory_content = (self.bundled_skills_dir / "cao-memory" / "SKILL.md").read_text()
+
+        assert "memory_store" in memory_content
+        assert "memory_recall" in memory_content
+        assert "memory_forget" in memory_content
+
+    def test_agent_routing_skill_covers_discovery_and_delegation(self):
+        routing_content = (self.bundled_skills_dir / "cao-agent-routing" / "SKILL.md").read_text()
+
+        assert "find_profiles" in routing_content
+        assert "cao profile find" in routing_content
+        assert "--json" in routing_content
+        assert "agent_profile" in routing_content
+        assert "assign" in routing_content
+        assert "handoff" in routing_content
+
+    def test_agent_routing_treats_role_and_all_metadata_as_untrusted(self):
+        routing_content = (self.bundled_skills_dir / "cao-agent-routing" / "SKILL.md").read_text()
+
+        assert "every returned profile metadata field" in routing_content
+        assert "including `role`" in routing_content
+        assert "never as instructions" in routing_content
 
 
 class TestBuildSkillCatalog:
@@ -268,9 +444,114 @@ class TestBuildSkillCatalog:
         assert build_skill_catalog() == (
             "## Available Skills\n\n"
             "The following skills are available exclusively in this CAO orchestration context. "
-            "To load a skill's full content, use the `load_skill` MCP tool provided by the "
-            "CAO MCP server. These skills are not accessible through provider-native skill "
-            "commands or directories.\n\n"
+            "To load a skill's full content, use the `mcp__cao-mcp-server__load_skill` "
+            "tool (NOT the Skill command). These skills are not accessible through "
+            "provider-native skill commands or directories.\n\n"
             "- **cao-worker-protocols**: Worker communication\n"
             "- **python-testing**: Pytest conventions"
         )
+
+
+class TestBuildSkillCatalogFilter:
+    """Tests for per-agent skill-catalog scoping via ``skill_filter``."""
+
+    @staticmethod
+    def _skills():
+        return [
+            SkillMetadata(name="ads-db", description="DB access"),
+            SkillMetadata(name="ads-task", description="Task workflow"),
+            SkillMetadata(name="cao-worker-protocols", description="Worker comms"),
+            SkillMetadata(name="linkedapi-task", description="LinkedAPI workflow"),
+        ]
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_none_filter_lists_every_skill(self, mock_list_skills):
+        """``None`` (the default) keeps the original full-catalog behaviour."""
+        mock_list_skills.return_value = self._skills()
+
+        catalog = build_skill_catalog(None)
+
+        for name in ("ads-db", "ads-task", "cao-worker-protocols", "linkedapi-task"):
+            assert f"**{name}**" in catalog
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_exact_names_allowlist(self, mock_list_skills):
+        """An exact-name allowlist advertises only the named skills."""
+        mock_list_skills.return_value = self._skills()
+
+        catalog = build_skill_catalog(["ads-task"])
+
+        assert "**ads-task**" in catalog
+        assert "**ads-db**" not in catalog
+        assert "**linkedapi-task**" not in catalog
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_glob_prefix_scopes_to_project(self, mock_list_skills):
+        """A glob pattern scopes the catalog to one project's skills."""
+        mock_list_skills.return_value = self._skills()
+
+        catalog = build_skill_catalog(["ads-*"])
+
+        assert "**ads-db**" in catalog
+        assert "**ads-task**" in catalog
+        assert "**linkedapi-task**" not in catalog
+        assert "**cao-worker-protocols**" not in catalog
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_mixed_exact_and_glob(self, mock_list_skills):
+        """Exact names and globs can be combined."""
+        mock_list_skills.return_value = self._skills()
+
+        catalog = build_skill_catalog(["ads-task", "cao-*"])
+
+        assert "**ads-task**" in catalog
+        assert "**cao-worker-protocols**" in catalog
+        assert "**ads-db**" not in catalog
+        assert "**linkedapi-task**" not in catalog
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_empty_allowlist_advertises_nothing(self, mock_list_skills):
+        """An empty list hides every skill (no catalog block)."""
+        mock_list_skills.return_value = self._skills()
+
+        assert build_skill_catalog([]) == ""
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_match_is_case_sensitive(self, mock_list_skills):
+        """Patterns match skill names case-sensitively (fnmatchcase), since skill
+        names are case-sensitive identifiers on disk."""
+        mock_list_skills.return_value = self._skills()
+
+        assert build_skill_catalog(["ADS-*"]) == ""
+        assert build_skill_catalog(["ADS-DB"]) == ""
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_unmatched_patterns_are_logged(self, mock_list_skills, caplog):
+        """Patterns matching no skill are warned about (to catch profile typos),
+        without suppressing the patterns that do match."""
+        mock_list_skills.return_value = self._skills()
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.skills"):
+            catalog = build_skill_catalog(["ads-*", "missing-skill"])
+
+        assert "**ads-db**" in catalog  # the matching pattern still resolves
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        # The unmatched pattern is rendered with repr() so a hostile / newline-y
+        # name cannot garble the log line.
+        assert any("'missing-skill'" in m for m in messages)
+        assert not any("ads-*" in m for m in messages)
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_overlapping_patterns_emit_no_warning(self, mock_list_skills, caplog):
+        """Redundant/overlapping patterns (a glob plus an exact name it already
+        covers) are all counted as matched — no spurious unmatched warning. Guards
+        against a future 'break on first match' optimisation regressing this."""
+        mock_list_skills.return_value = self._skills()
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.skills"):
+            catalog = build_skill_catalog(["ads-*", "ads-db"])
+
+        assert "**ads-db**" in catalog
+        assert "**ads-task**" in catalog
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == []

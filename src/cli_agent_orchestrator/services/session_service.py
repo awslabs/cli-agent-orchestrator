@@ -20,21 +20,20 @@ Session Lifecycle:
 """
 
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
-from cli_agent_orchestrator.clients.database import (
-    delete_terminals_by_session,
-    list_terminals_by_session,
-)
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.base import TerminalBackend
+from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
     PostCreateSessionEvent,
     PostKillSessionEvent,
 )
-from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -43,7 +42,7 @@ from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 logger = logging.getLogger(__name__)
 
 
-def create_session(
+async def create_session(
     provider: str | None,
     agent_profile: str,
     session_name: str | None = None,
@@ -51,19 +50,42 @@ def create_session(
     allowed_tools: list[str] | None = None,
     registry: PluginRegistry | None = None,
     env_vars: dict[str, str] | None = None,
+    engine: KiroEngine | str | None = None,
+    initial_message: str | None = None,
+    initial_message_orchestration_type: OrchestrationType | None = None,
+    model: str | None = None,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
     ``env_vars`` are operator-forwarded env vars from ``cao launch --env``.
     They are persisted on the session record so every worker spawned later
     in the same session inherits them. See issue #248.
+
+    When ``initial_message`` is provided, the initial terminal uses the
+    existing deferred-init path so provider initialization and delivery can
+    continue after the session response. Omitting it preserves the synchronous
+    initialization behavior used by existing callers.
+    On the deferred path, the ``post_create_session`` plugin event is dispatched
+    before provider initialization and message delivery finish.
+
+    ``group``/``metadata`` are the #432 discovery fields, set on the initial
+    terminal at creation time (``group`` is also updatable later via
+    ``PATCH /terminals/{id}/group``, ``metadata`` via the ``update_metadata``
+    MCP tool).
     """
+    if initial_message == "":
+        raise ValueError("initial_message must not be empty")
+    if initial_message is None and initial_message_orchestration_type is not None:
+        raise ValueError("initial_message_orchestration_type requires initial_message")
+
     if provider is None:
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
     else:
         resolved_provider = provider
 
-    terminal = create_terminal(
+    terminal = await create_terminal(
         provider=resolved_provider,
         agent_profile=agent_profile,
         session_name=session_name,
@@ -72,6 +94,13 @@ def create_session(
         allowed_tools=allowed_tools,
         registry=registry,
         env_vars=env_vars,
+        engine=engine,
+        defer_init=initial_message is not None,
+        initial_message=initial_message,
+        initial_message_orchestration_type=initial_message_orchestration_type,
+        model=model,
+        group=group,
+        metadata=metadata,
     )
     dispatch_plugin_event(
         registry,
@@ -84,11 +113,70 @@ def create_session(
     return terminal
 
 
+def _enrich_session_ownership(
+    backend: TerminalBackend, session_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Add best-effort ownership metadata from the session's first known terminal."""
+    enriched = dict(session_data)
+    enriched.setdefault("working_directory", None)
+    enriched.setdefault("agent_profile", None)
+
+    # `... or ""` (not `.get("id", "")`): an explicit id=None must collapse to
+    # "" too, matching the sibling guard in list_sessions. `.get("id", "")`
+    # would yield the truthy string "None" and try to enrich a bogus session.
+    session_name = enriched.get("id") or ""
+    if not session_name:
+        return enriched
+
+    try:
+        terminals = list_terminals_by_session(session_name)
+    except Exception as e:
+        logger.warning(f"Failed to load terminal metadata for {session_name}: {e}")
+        terminals = []
+
+    ownership_terminal: Dict[str, Any] = {}
+    for terminal in terminals:
+        if terminal.get("agent_profile") or terminal.get("working_directory"):
+            ownership_terminal = terminal
+            break
+
+    if not ownership_terminal:
+        for terminal in terminals:
+            if terminal.get("tmux_window"):
+                ownership_terminal = terminal
+                break
+
+    if ownership_terminal:
+        enriched["agent_profile"] = ownership_terminal.get("agent_profile")
+        persisted_working_directory = ownership_terminal.get("working_directory")
+        if persisted_working_directory:
+            enriched["working_directory"] = persisted_working_directory
+        elif ownership_terminal.get("tmux_window"):
+            try:
+                enriched["working_directory"] = backend.get_pane_working_directory(
+                    session_name, ownership_terminal["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to resolve working directory for {session_name}: {e}")
+
+    return enriched
+
+
 def list_sessions() -> List[Dict]:
     """List all sessions from tmux."""
     try:
-        tmux_sessions = tmux_client.list_sessions()
-        return [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        backend = get_backend()
+        tmux_sessions = backend.list_sessions()
+        return [
+            _enrich_session_ownership(backend, s)
+            for s in tmux_sessions
+            # Use .get() rather than s["id"]: a backend that returns a session
+            # dict without an "id" key must not blank the entire list (KeyError
+            # in this comprehension is swallowed by the outer except and returns
+            # []). Shipped backends always populate "id"; this hardens against a
+            # future backend that does not.
+            if (s.get("id") or "").startswith(SESSION_PREFIX)
+        ]
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
         return []
@@ -97,16 +185,27 @@ def list_sessions() -> List[Dict]:
 def get_session(session_name: str) -> Dict:
     """Get session with terminals."""
     try:
-        if not tmux_client.session_exists(session_name):
+        if not get_backend().session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")
 
-        tmux_sessions = tmux_client.list_sessions()
+        tmux_sessions = get_backend().list_sessions()
         session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
 
         if not session_data:
             raise ValueError(f"Session '{session_name}' not found")
 
         terminals = list_terminals_by_session(session_name)
+        # Enrich each terminal with its live status. list_terminals_by_session
+        # reads only the DB row (no status column), but callers monitoring an
+        # orchestration — the web UI, and the cao-ops-mcp get_session_info tool
+        # an external supervisor polls — need to distinguish
+        # IDLE/PROCESSING/COMPLETED/ERROR per terminal. status_monitor is the
+        # single source of truth and is backend-aware (tmux push vs herdr
+        # native), so derive it here rather than persisting a stale column.
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        for terminal in terminals:
+            terminal["status"] = status_monitor.get_status(terminal["id"]).value
         return {"session": session_data, "terminals": terminals}
 
     except Exception as e:
@@ -122,30 +221,43 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     """
     result: Dict = {"deleted": [], "errors": []}
     try:
-        if not tmux_client.session_exists(session_name):
-            raise ValueError(f"Session '{session_name}' not found")
+        session_alive = get_backend().session_exists(session_name)
+
+        from cli_agent_orchestrator.services import terminal_service
 
         terminals = list_terminals_by_session(session_name)
 
-        # Cleanup providers (non-blocking — don't let failures stop deletion)
+        # Clean up each terminal (snapshot, kill window, FIFO reader,
+        # status buffer, provider, DB) via the event-driven teardown path.
+        cleanup_complete = True
         for terminal in terminals:
             try:
-                provider_manager.cleanup_provider(terminal["id"])
+                if terminal_service.delete_terminal(terminal["id"], registry=registry) is False:
+                    cleanup_complete = False
+                    result["errors"].append(
+                        {
+                            "terminal_id": terminal["id"],
+                            "error": "cleanup deferred; retry delete_session",
+                        }
+                    )
             except Exception as e:
-                logger.warning(f"Provider cleanup failed for {terminal['id']}: {e}")
+                logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
-        # Kill tmux session
-        tmux_client.kill_session(session_name)
-
-        # Delete terminal metadata
-        delete_terminals_by_session(session_name)
+        # Kill backend session only if it still exists
+        if session_alive:
+            get_backend().kill_session(session_name)
 
         # Drop the per-session forwarded-env mapping (issue #248). Safe
         # even when no vars were forwarded — the helper is a no-op then.
         clear_session_env(session_name)
 
-        result["deleted"].append(session_name)
-        logger.info(f"Deleted session: {session_name}")
+        if cleanup_complete:
+            result["deleted"].append(session_name)
+            logger.info(f"Deleted session: {session_name}")
+        else:
+            logger.warning(
+                "Session %s backend was removed but terminal cleanup is deferred", session_name
+            )
         dispatch_plugin_event(
             registry,
             "post_kill_session",

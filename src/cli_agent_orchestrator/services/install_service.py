@@ -1,5 +1,6 @@
 """Service helpers for installing agent profiles."""
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -13,22 +14,23 @@ from pydantic import BaseModel
 from cli_agent_orchestrator.constants import (
     AGENT_CONTEXT_DIR,
     COPILOT_AGENTS_DIR,
+    DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
-    LOCAL_AGENT_STORE_DIR,
     OPENCODE_AGENTS_DIR,
-    Q_AGENTS_DIR,
     SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.q_agent import QAgentConfig
+from cli_agent_orchestrator.services.profile_store import write_profile
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
 )
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
     ensure_skills_symlink,
     remove_agent_tools,
@@ -41,6 +43,8 @@ from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_openc
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
+logger = logging.getLogger(__name__)
+
 
 class InstallResult(BaseModel):
     """Structured result for agent profile installation."""
@@ -52,6 +56,7 @@ class InstallResult(BaseModel):
     agent_file: Optional[str] = None
     unresolved_vars: Optional[List[str]] = None
     source_kind: Optional[Literal["url", "file", "name"]] = None
+    provider: Optional[str] = None
 
 
 # Profile names are used as filesystem path segments under LOCAL_AGENT_STORE_DIR
@@ -59,6 +64,57 @@ class InstallResult(BaseModel):
 # traversal ("../etc/passwd"), separators, and absolute paths at the boundary.
 # CodeQL also recognises this regex as a path-injection sanitiser.
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# Per-MCP-server tool-call timeout (milliseconds) injected into cao-mcp-server
+# entries in kiro agent profiles. kiro-cli's default MCP tool-call timeout
+# (~120s, inherited from the Q Developer CLI) is far too short for the handoff
+# tool, which blocks until a spawned worker finishes an entire task — routinely
+# minutes. Without a raised timeout kiro cancels the handoff RPC client-side and
+# tells the supervisor the tool failed even though CAO is still running the
+# worker. 1_200_000 ms (20 min) matches CAO's default handoff/run-step budget.
+# This mirrors the kimi_cli provider's tool_call_timeout_ms override.
+_KIRO_MCP_TOOL_TIMEOUT_MS = 1_200_000
+
+
+def _inject_kiro_mcp_timeout(
+    mcp_servers: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    """Return a copy of ``mcp_servers`` with a large ``timeout`` set on every
+    cao-mcp-server entry that does not already specify one.
+
+    kiro reads the per-server ``timeout`` field (milliseconds) as its tool-call
+    timeout. We only touch entries whose name, command, or args reference the
+    bundled orchestration server so a user's other MCP servers keep their own
+    (or kiro's default) timeout. An explicit operator-set ``timeout`` is never
+    overwritten. The command/args checks cover every form the entry can take:
+    the bare console script, a resolved absolute path, the module entrypoint
+    (``<python> -m cli_agent_orchestrator.mcp_server.server``), and the legacy
+    ``uvx --from git+... cao-mcp-server`` form.
+    """
+    if not mcp_servers:
+        return mcp_servers
+
+    result: Dict[str, object] = {}
+    for name, cfg in mcp_servers.items():
+        if not isinstance(cfg, dict):
+            result[name] = cfg
+            continue
+        command = cfg.get("command")
+        args = cfg.get("args") or []
+        is_cao = (
+            name == "cao-mcp-server"
+            or (isinstance(command, str) and "cao-mcp-server" in command)
+            or any(
+                isinstance(a, str)
+                and ("cao-mcp-server" in a or a == "cli_agent_orchestrator.mcp_server.server")
+                for a in args
+            )
+        )
+        if is_cao and "timeout" not in cfg:
+            cfg = {**cfg, "timeout": _KIRO_MCP_TOOL_TIMEOUT_MS}
+        result[name] = cfg
+    return result
+
 
 # URL path component for allowlisted hosts. Each segment must start with an
 # alphanumeric, which forbids "..", "." and hidden segments — and by extension
@@ -97,11 +153,11 @@ def _download_agent(source: str) -> str:
     has legitimate filesystem trust, and keeping Path(user_input) out of the
     HTTP-reachable layer closes an entire class of py/path-injection alerts
     (CodeQL #49/#61 kept reopening while this lived here). The CLI entry point
-    copies local files into LOCAL_AGENT_STORE_DIR itself and then calls
+    resolves the local file itself and stores it via profile_store, then calls
     install_agent() with the bare stem, which flows through the "name" branch.
+    This function only ever hands profile_store a stem it has already validated,
+    never a caller-supplied path.
     """
-    LOCAL_AGENT_STORE_DIR.mkdir(parents=True, exist_ok=True)
-
     # SSRF hardening: narrow what a caller-provided URL can reach before any
     # network I/O happens. https-only rules out http://169.254.169.254/...;
     # the host allowlist rules out arbitrary internal services; the path
@@ -142,9 +198,12 @@ def _download_agent(source: str) -> str:
         raise ValueError("Redirects are not allowed for profile downloads.")
     response.raise_for_status()
 
-    dest_file = LOCAL_AGENT_STORE_DIR / filename
-    dest_file.write_text(response.text, encoding="utf-8")
-    return dest_file.stem
+    # The stem was validated against _PROFILE_NAME_RE above; profile_store owns
+    # the store join and the atomic write. overwrite=True preserves the
+    # pre-existing re-download behaviour of replacing the stored copy.
+    stem = filename[: -len(".md")]
+    write_profile(stem, response.text, overwrite=True)
+    return stem
 
 
 def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
@@ -182,10 +241,15 @@ def _build_provider_config(
 
 def install_agent(
     source: str,
-    provider: str,
+    provider: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = None,
 ) -> InstallResult:
     """Install an agent profile for the requested provider.
+
+    ``provider`` resolution follows the same precedence as launch/handoff
+    (see ``resolve_provider``): an explicit argument wins, then the profile's
+    frontmatter ``provider:`` key, then ``DEFAULT_PROVIDER``. Pass ``None``
+    to defer to the profile.
 
     ``source`` must be either an https:// URL on the allowlist or a bare
     profile name matching ``_PROFILE_NAME_RE``. Local ``.md`` file paths
@@ -197,7 +261,10 @@ def install_agent(
     """
     try:
         valid_providers = [provider_type.value for provider_type in ProviderType]
-        if provider not in valid_providers:
+        # An explicit provider is validated up front so bad input fails fast
+        # BEFORE any URL download or env-file mutation. Frontmatter providers
+        # are validated after the profile is parsed (below).
+        if provider is not None and provider not in valid_providers:
             return InstallResult(
                 success=False,
                 message=(
@@ -234,6 +301,38 @@ def install_agent(
         resolved_content = resolve_env_vars(raw_content)
         profile = parse_agent_profile_text(resolved_content, agent_name)
 
+        # No explicit provider — honour the profile's frontmatter ``provider:``
+        # key, mirroring resolve_provider() on the launch/handoff paths. Bogus
+        # frontmatter values warn and fall back to the default; built-in store
+        # profiles carry no frontmatter provider and keep the default.
+        if provider is None:
+            if profile.provider and profile.provider in valid_providers:
+                provider = profile.provider
+            else:
+                if profile.provider:
+                    logger.warning(
+                        "Agent profile '%s' has invalid provider '%s'. "
+                        "Valid providers: %s. Falling back to '%s'.",
+                        profile.name,
+                        profile.provider,
+                        valid_providers,
+                        DEFAULT_PROVIDER,
+                    )
+                provider = DEFAULT_PROVIDER
+
+        # Resolve the bundled cao-mcp-server console script to a PATH-independent
+        # invocation before materializing provider configs. The
+        # configs Kiro/Q write to disk are consumed verbatim by those CLIs, so
+        # resolution must happen here rather than at launch time. persisted=True
+        # prefers the stable PATH launcher (e.g. ~/.local/bin/cao-mcp-server)
+        # over the versioned venv-internal path, so a later `uv tool upgrade`
+        # does not leave the written config pointing at a relocated binary.
+        if profile.mcpServers:
+            profile.mcpServers = {
+                name: resolve_mcp_server_config(dict(cfg), persisted=True)
+                for name, cfg in profile.mcpServers.items()
+            }
+
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
         context_file = _write_context_file(profile.name, raw_content)
 
@@ -243,28 +342,13 @@ def install_agent(
         agent_file: Optional[Path] = None
         safe_filename = profile.name.replace("/", "__")
 
-        if provider == ProviderType.Q_CLI.value:
-            Q_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-            q_agent_config = QAgentConfig(
-                name=profile.name,
-                description=profile.description,
-                tools=profile.tools if profile.tools is not None else ["*"],
-                allowedTools=allowed_tools,
-                resources=[f"file://{context_file.absolute()}"],
-                prompt=compose_agent_prompt(profile),
-                mcpServers=profile.mcpServers,
-                toolAliases=profile.toolAliases,
-                toolsSettings=profile.toolsSettings,
-                hooks=profile.hooks,
-                model=profile.model,
-            )
-            agent_file = Q_AGENTS_DIR / f"{safe_filename}.json"
-            agent_file.write_text(
-                q_agent_config.model_dump_json(indent=2, exclude_none=True),
-                encoding="utf-8",
-            )
-
-        elif provider == ProviderType.KIRO_CLI.value:
+        if provider == ProviderType.KIRO_CLI.value:
+            if profile.engine == KiroEngine.KAS:
+                raise ValueError(
+                    "Kiro KAS profiles cannot be installed in Phase 0: CAO cannot "
+                    "render KAS profiles or translate allowedTools/toolsSettings to Cedar. "
+                    "Set engine: v2 or wait for a later migration phase."
+                )
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
             # (metadata at startup, full content on demand).
@@ -282,7 +366,9 @@ def install_agent(
                 allowedTools=allowed_tools,
                 resources=kiro_resources,
                 prompt=raw_prompt,
-                mcpServers=profile.mcpServers,
+                # Raise the cao-mcp-server tool-call timeout so kiro doesn't
+                # cancel long handoff RPCs client-side (see helper docstring).
+                mcpServers=_inject_kiro_mcp_timeout(profile.mcpServers),
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
                 hooks=profile.hooks,
@@ -367,6 +453,7 @@ def install_agent(
             agent_file=str(agent_file) if agent_file else None,
             unresolved_vars=unresolved_vars or None,
             source_kind=source_kind,
+            provider=provider,
         )
 
     except requests.RequestException as exc:

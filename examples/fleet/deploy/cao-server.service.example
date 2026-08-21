@@ -1,0 +1,42 @@
+# Example systemd unit for a CAO node, bound to your private-network address.
+# `bash bootstrap.sh` writes this for you automatically; this file is here so you
+# can install/customize it by hand if you prefer.
+#
+# SECURITY: this binds cao-server to a non-loopback address with NO API auth in
+# the default config. Anyone who can reach YOUR_BIND_HOST:9889 can launch/attach
+# agents (arbitrary command execution) on this node. CAO_ALLOWED_HOSTS below is a
+# Host-header allowlist (DNS-rebinding mitigation), NOT authentication. Keep this
+# port on your private network only — do NOT expose it to the public internet.
+# For defense-in-depth you can put CAO's OAuth layer in front of it (see
+# AUTH0_DOMAIN / CAO_AUTH_JWKS_URI in the CAO docs).
+# This example also sets CAO_MCP_APPS_ENABLED=true (the conductor/panel use it),
+# which widens the API surface — drop it if you don't need MCP Apps on the node.
+#
+#   1. Replace the placeholders below.
+#   2. Install:  sudo cp cao-server.service.example /etc/systemd/system/cao-server.service
+#   3. sudo systemctl daemon-reload && sudo systemctl enable --now cao-server.service
+#
+# Placeholders:
+#   YOUR_USER       the OS user that has your agent CLI installed + authenticated
+#   YOUR_BIND_HOST  the private-network address peers reach this node at (IP or DNS name)
+#   YOUR_HOSTNAME   this machine's short hostname (output of `hostname -s`)
+
+[Unit]
+Description=CAO server (private-network bound)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+Environment=HOME=/home/YOUR_USER
+Environment=PATH=/home/YOUR_USER/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CAO_ALLOWED_HOSTS=YOUR_BIND_HOST,YOUR_HOSTNAME,localhost,127.0.0.1
+Environment=CAO_MCP_APPS_ENABLED=true
+ExecStart=/home/YOUR_USER/.local/bin/cao-server --host YOUR_BIND_HOST --port 9889
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

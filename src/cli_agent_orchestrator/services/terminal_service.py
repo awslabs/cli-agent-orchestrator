@@ -17,32 +17,63 @@ Terminal Workflow:
 4. delete_terminal() → Cleans up provider, database record, and logging
 """
 
+import asyncio
 import logging
+import os
+import re
 import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.clients.database import (
+    create_inbox_message,
+)
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
+    delete_terminals_by_session,
     get_terminal_metadata,
+    list_siblings_by_group_prefix,
     update_last_active,
+    update_terminal_group,
+    update_terminal_metadata,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import (
+    FIFO_DIR,
+    PIPE_LIVENESS_TAIL_LINES,
+    SESSION_PREFIX,
+    TERMINAL_LOG_DIR,
+)
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    Terminal,
+    TerminalInputBlockedError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
     PostCreateTerminalEvent,
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
+from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroCapabilities,
+    KiroPhase0KASError,
+    probe_kiro_capabilities,
+    requested_kiro_capabilities,
+)
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services import worktree_service
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import (
@@ -50,23 +81,38 @@ from cli_agent_orchestrator.services.session_env import (
     get_session_env,
     set_session_env,
 )
+from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
+    wait_until_status,
 )
 
 logger = logging.getLogger(__name__)
+
+# Upper bound (bytes) on a single offset-ranged read of a terminal log
+# (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
+# caller (playback fetching output around a selected event) can never trigger
+# an unbounded read of a large log file. 1 MiB is a defensible ceiling: it is
+# far larger than any realistic per-event output window (the rolling
+# STATE_BUFFER_MAX is only 8 KiB) yet bounds the worst-case allocation and
+# response size to a fixed, predictable amount regardless of on-disk log size.
+TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
 
-
-class TerminalInputBlockedError(Exception):
-    """Raised when orchestrated input would answer an active interactive prompt."""
+# Strong references to in-flight deferred-init background tasks. asyncio keeps
+# only a WEAK reference to tasks from loop.create_task, so without this a
+# deferred provider.initialize() + input-send task could be GC'd mid-run,
+# silently leaving a worker uninitialized. Tasks drop themselves on completion.
+_deferred_init_tasks: set = set()
 
 
 def inject_memory_context(first_message: str, terminal_id: str) -> str:
@@ -108,17 +154,40 @@ class OutputMode(str, Enum):
 # Providers that accept a runtime skill_prompt kwarg and append it to the
 # system prompt at launch time.  Other providers deliver skills differently:
 # Kiro (skill:// resources) and OpenCode (OPENCODE_CONFIG_DIR/skills symlink)
-# discover skills natively; Q and Copilot receive a baked catalog at install
+# discover skills natively; Copilot receives a baked catalog at install
 # time.
 RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,
-    ProviderType.GEMINI_CLI.value,
     ProviderType.KIMI_CLI.value,
+    ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.OMP.value,
+    ProviderType.GROK_CLI.value,
+    ProviderType.MINIMAX_CODE.value,
+}
+
+# Providers whose tool restrictions are prompt-level text only (no native
+# blocking mechanism) — a restricted policy on these is advisory, not enforced.
+SOFT_ENFORCEMENT_PROVIDERS = {
+    ProviderType.KIMI_CLI.value,
+    ProviderType.CODEX.value,
+    ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.OMP.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 
-def create_terminal(
+def _resolve_working_directory(working_directory: Optional[str]) -> str:
+    """Resolve launch cwd exactly as the tmux backend does before creation."""
+    return resolve_and_validate_path(
+        working_directory if working_directory is not None else os.getcwd(),
+        allow_create=False,
+        allow_file=False,
+        description="Working directory",
+    )
+
+
+async def create_terminal(
     provider: str,
     agent_profile: str,
     session_name: Optional[str] = None,
@@ -127,6 +196,16 @@ def create_terminal(
     allowed_tools: Optional[list[str]] = None,
     registry: PluginRegistry | None = None,
     env_vars: Optional[dict[str, str]] = None,
+    caller_id: Optional[str] = None,
+    defer_init: bool = False,
+    initial_message: Optional[str] = None,
+    initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    engine: Optional[KiroEngine | str] = None,
+    kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
+    model: Optional[str] = None,
+    use_worktree: bool = False,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -147,8 +226,35 @@ def create_terminal(
             ``new_session=True``, these are stored on the session record and
             inherited by every worker spawned later in the same session. On
             ``new_session=False``, the persisted session vars are merged in
-            automatically; the explicit ``env_vars`` argument is ignored to
-            keep the per-session view consistent. See issue #248.
+            automatically and the explicit ``env_vars`` argument is merged on
+            top, winning on key conflict — per-step vars (e.g. workflow
+            routing ids) must reach the window even inside an existing
+            session. See issues #248 and #408.
+        caller_id: Terminal ID of the supervisor that created this terminal
+            via handoff/assign. Recorded so send_message can route callbacks
+            structurally instead of parsing IDs out of message text (issue #284).
+            None for operator-launched terminals.
+        engine: Explicit Kiro engine. For Kiro, it must agree with the selected
+            profile's engine when both are present; omitted resolves to v2.
+        kiro_capability_probe: Optional test seam for the bounded wrapper probe.
+        model: Explicit per-call model override, forwarded to the provider
+            (where supported -- see each provider's own __init__) ahead of
+            the agent profile's own static `model` field. Lets a caller
+            (e.g. MCP handoff/assign's own `model` parameter) pin a specific
+            model for one worker without needing a dedicated agent profile.
+            None = behavior unchanged (profile.model, if any, still applies).
+        use_worktree: If True, provision an isolated ``git worktree`` (issue
+            #100) for this terminal instead of using ``working_directory`` as
+            given -- resolves the repo root from ``working_directory`` (or the
+            server's own cwd when unset), creates a fresh worktree on its own
+            branch there, and overrides ``working_directory`` to the new
+            worktree path before the tmux session/window is created. Requires
+            the resolved directory to actually be inside a git repository.
+        group: Ordered, general-to-specific grouping array for list_siblings
+            discovery (#432). None = this terminal opts out of discovery.
+        metadata: Free-form JSON describing what this terminal is doing.
+            Also updatable later by the running agent via the
+            ``update_metadata`` MCP tool.
 
     Returns:
         Terminal object with all metadata populated
@@ -157,8 +263,78 @@ def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    terminal_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
+    # harness-control#186: tracks whether THIS call created a new WINDOW in an
+    # already-existing session (the `new_session=False` branch below — what
+    # every MCP spawn/assign-into-existing-session call does). Independent of
+    # `session_created` above: on failure, the cleanup path already tears
+    # down the whole session (window included) when THIS call created a brand
+    # new one, but had no equivalent for a window added to a session that
+    # already existed — see the `except` block.
+    window_created = False
+    # Reassigned to the resolved repo root once a worktree is actually created
+    # below (Step 1b), so the failure-cleanup path (the `except` block) knows
+    # whether there is a worktree to roll back too. Still None if Step 1b never
+    # ran (use_worktree=False) or itself failed before create_worktree returned.
+    worktree_repo_root: Optional[str] = None
     try:
+        # Resolve profile policy and Kiro engine BEFORE allocating any backend
+        # resource. A KAS request must probe then fail closed with no window,
+        # database row, FIFO, Herdr registration, or provider process.
+        try:
+            profile = load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            profile = None
+        # Production loaders return AgentProfile. Treat a test double or an
+        # otherwise malformed object as no selected profile rather than
+        # accepting arbitrary attributes as configuration.
+        if profile is not None and not isinstance(profile, AgentProfile):
+            profile = None
+
+        if provider == ProviderType.KIRO_CLI.value:
+            resolved_engine = resolve_kiro_engine(
+                explicit=engine,
+                profile=getattr(profile, "engine", None),
+            )
+            if allowed_tools is None and profile is not None:
+                from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                allowed_tools = resolve_allowed_tools(
+                    profile.allowedTools, profile.role, mcp_server_names
+                )
+            # Kiro runs headlessly, so current CAO behavior always bypasses its
+            # interactive approval prompt. Profile/MCP policy remains enforced
+            # by CAO, while unrestricted profiles additionally force legacy UI.
+            # Mirror the launch-time precedence (`model or profile.model`, see
+            # _get_profile_model): probing the profile snapshot alone would let an
+            # explicit override launch --model on a wrapper never probed for it.
+            requested = requested_kiro_capabilities(
+                resolved_engine,
+                model=model or (profile.model if profile else None),
+                yolo=True,
+            )
+            probe = kiro_capability_probe or probe_kiro_capabilities
+            await asyncio.to_thread(probe, resolved_engine, requested)
+            if resolved_engine == KiroEngine.KAS:
+                raise KiroPhase0KASError(
+                    bool(profile and (profile.allowedTools or profile.toolsSettings))
+                )
+        else:
+            if engine is not None:
+                raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+            resolved_engine = None
+
+        # Resolve tool policy before persistence for non-Kiro providers too.
+        if allowed_tools is None and profile is not None:
+            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
+
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
 
@@ -167,6 +343,35 @@ def create_terminal(
 
         window_name = generate_window_name(agent_profile)
 
+        # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
+        # the tmux session/window below consumes `working_directory` -- the
+        # worktree's own path REPLACES whatever `working_directory` was given
+        # (explicit or caller-inherited), so the terminal always launches inside
+        # its own isolated checkout rather than the shared one it would
+        # otherwise have used.
+        if use_worktree:
+            # `find_repo_root`/`create_worktree` are synchronous `subprocess.run`
+            # calls (a full worktree checkout can take seconds to tens of
+            # seconds on a large repo); `create_terminal` is awaited directly on
+            # the shared event loop, so running them in-line here would freeze
+            # every other cao-server request (status monitor ticks, inbox
+            # delivery, unrelated terminal calls) for the duration. Offload to a
+            # thread, same posture as `delete_terminal`'s own blocking subprocess
+            # work (see its `run_in_executor` call site in api/main.py).
+            worktree_repo_root = await asyncio.to_thread(
+                worktree_service.find_repo_root, working_directory or os.getcwd()
+            )
+            working_directory = await asyncio.to_thread(
+                worktree_service.create_worktree, worktree_repo_root, terminal_id
+            )
+
+        # Resolve AFTER the worktree block, not before: when `use_worktree` is set
+        # the block above REPLACES `working_directory` with the new worktree path,
+        # so resolving earlier would both launch tmux in the pre-worktree directory
+        # (defeating the isolation #100 provides) and persist that stale path as the
+        # terminal's working_directory. This is the effective launch cwd either way.
+        resolved_working_directory = _resolve_working_directory(working_directory)
+
         # Step 2: Create tmux session or window
         if new_session:
             # Ensure session name has the CAO prefix for identification
@@ -174,7 +379,7 @@ def create_terminal(
                 session_name = f"{SESSION_PREFIX}{session_name}"
 
             # Prevent duplicate sessions
-            if tmux_client.session_exists(session_name):
+            if get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
 
             # Wipe any stale mapping a prior aborted lifecycle for this name
@@ -182,14 +387,15 @@ def create_terminal(
             clear_session_env(session_name)
 
             # Create new tmux session with initial window
-            tmux_client.create_session(
+            get_backend().create_session(
                 session_name,
                 window_name,
                 terminal_id,
-                working_directory,
+                resolved_working_directory,
                 extra_env=env_vars,
             )
             session_created = True  # only set after successful creation
+            delete_terminals_by_session(session_name)
 
             # Persist forwarded env only after the tmux session actually
             # exists; the failure path below clears it if a later step
@@ -198,32 +404,41 @@ def create_terminal(
                 set_session_env(session_name, env_vars)
         else:
             # Add window to existing session
-            if not tmux_client.session_exists(session_name):
+            if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            window_name = tmux_client.create_window(
+            # Merge explicit per-step env_vars over the persisted session env
+            # (per-step wins on conflict): workflow routing ids like
+            # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
+            # existing session (issue #408).
+            window_name = get_backend().create_window(
                 session_name,
                 window_name,
                 terminal_id,
-                working_directory,
-                extra_env=get_session_env(session_name),
+                resolved_working_directory,
+                extra_env={**get_session_env(session_name), **(env_vars or {})},
             )
+            window_created = True  # only set after successful creation
 
-        # Step 3: Load the profile once for allowed tool resolution before
-        # provider initialization. The skill catalog is computed only for
-        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
-        try:
-            profile = load_agent_profile(agent_profile)
-        except FileNotFoundError:
-            profile = None
-        skill_prompt = build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
+        # Step 3: Build a runtime skill catalog only for providers that consume
+        # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
+        skill_prompt = (
+            build_skill_catalog(profile.skills if profile else None)
+            if provider in RUNTIME_SKILL_PROMPT_PROVIDERS
+            else None
+        )
 
-        # Step 3b: Resolve allowed_tools from profile if not explicitly provided
-        if allowed_tools is None and profile is not None:
-            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
-
-            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
-            allowed_tools = resolve_allowed_tools(
-                profile.allowedTools, profile.role, mcp_server_names
+        # Step 3b: Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
+        # mechanism (kimi runs --yolo; restrictions are prompt-level text
+        # only), so a restricted policy on them is advisory, not enforced.
+        # Surface that loudly at launch so operators route restricted or
+        # write-capable roles to hard-enforcement providers instead.
+        if provider in SOFT_ENFORCEMENT_PROVIDERS and allowed_tools and "*" not in allowed_tools:
+            logger.warning(
+                f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
+                f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
+                f"requests {allowed_tools}. Treat this worker as unrestricted; for "
+                f"enforced restrictions use claude_code, grok_cli, kiro_cli, or "
+                f"copilot_cli."
             )
 
         # Step 3c: Persist terminal metadata to database after restrictions
@@ -235,14 +450,55 @@ def create_terminal(
             provider,
             agent_profile,
             allowed_tools,
+            caller_id=caller_id,
+            engine=resolved_engine.value if resolved_engine is not None else None,
+            group=group,
+            metadata=metadata,
+            working_directory=resolved_working_directory,
         )
 
-        # Step 4: Create and initialize the CLI provider
+        # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
+        # backends (tmux). Event-inbox backends (herdr) deliver via their own
+        # socket events and their pipe_pane is a no-op, so skip the FIFO there and
+        # rely on the herdr inbox registration below.
+        if not get_backend().supports_event_inbox():
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+            # Reader must exist BEFORE pipe-pane starts so it captures from the
+            # start. Enroll it in the pipe-pane liveness watchdog (issue #388):
+            # supply a probe for tmux's live pane content and a re-arm that
+            # re-attaches a stalled forwarder. The re-arm does stop-then-start,
+            # NOT a bare pipe_pane() — a stalled pane still reports pane_pipe=1,
+            # so the backend's ``pipe-pane -o`` toggle would just switch the
+            # dead pipe OFF instead of restarting it.
+            def _probe_pane(s=session_name, w=window_name) -> str:
+                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                get_backend().stop_pipe_pane(s, w)
+                get_backend().pipe_pane(s, w, p)
+
+            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+
+            # Configure pipe-pane to stream output to the FIFO. This enables
+            # real-time event-driven processing via StatusMonitor and LogWriter
+            # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
+            # has a single pipe-pane target, so we pipe ONLY to the FIFO.
+            get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+
+            # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
+            # pipe-pane only captures output produced after it starts; on a fast
+            # shell the initial prompt is drawn before the pipe attaches, leaving
+            # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
+            # Enter produces a fresh prompt line that flows through the pipe.
+            get_backend().send_special_key(session_name, window_name, "Enter")
+
+        # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
-        # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
+        # Only runtime-prompt providers (Claude Code, Codex, Kimi) receive
         # the skill catalog here; Kiro (skill:// resources) and OpenCode
-        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively; Q and
-        # Copilot get the catalog baked at install time.
+        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
+        # Copilot gets the catalog baked at install time.
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,
@@ -251,33 +507,56 @@ def create_terminal(
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt,
-            model=profile.model if profile else None,
+            model=model or (profile.model if profile else None),
+            engine=resolved_engine,
         )
-        provider_instance.initialize()
 
-        # Persist shell_command baseline if the provider captured one
-        shell_command = provider_instance.shell_baseline
-        if not isinstance(shell_command, str):
-            shell_command = None
-        if shell_command:
-            update_terminal_shell_command(terminal_id, shell_command)
+        # Deferred-init path: return fast so callers (e.g. MCP assign) do not
+        # block on `provider.initialize()`. The remaining initialize + input
+        # send runs as a background task, so two concurrent assigns can each
+        # kick off their init in parallel. Kiro-cli 2.11's per-tool client
+        # timeout (~120s observed) previously cancelled assign RPCs when init
+        # took long enough to push the round-trip past that cap; deferring init
+        # keeps the tool call under 2s.
+        if defer_init:
+            shell_command = None  # unknown until initialize() runs
+            _schedule_deferred_init(
+                provider_instance,
+                terminal_id,
+                initial_message,
+                initial_message_orchestration_type,
+                registry,
+            )
+        else:
+            await provider_instance.initialize()
 
-        # Step 5: Set up terminal logging via tmux pipe-pane
-        # This captures all terminal output to a log file for inbox monitoring
-        log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
-        log_path.touch()  # Ensure file exists before watching
-        tmux_client.pipe_pane(session_name, window_name, str(log_path))
+            # Persist shell_command baseline if the provider captured one
+            shell_command = provider_instance.shell_baseline
+            if not isinstance(shell_command, str):
+                shell_command = None
+            if shell_command:
+                update_terminal_shell_command(terminal_id, shell_command)
 
-        # Build and return the Terminal object
+        # Build and return the Terminal object. In the deferred-init path the
+        # provider is still initializing on a background task, so the terminal
+        # is NOT ready for input yet — report UNKNOWN (not IDLE) so a client
+        # can't mistake it for ready and send input early. Callers poll
+        # GET /terminals/{id} for the live status once init completes. The
+        # synchronous path has already reached IDLE by here.
+        initial_status = TerminalStatus.UNKNOWN if defer_init else TerminalStatus.IDLE
         terminal = Terminal(
             id=terminal_id,
             name=window_name,
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            caller_id=caller_id,
             allowed_tools=allowed_tools,
+            engine=resolved_engine,
             shell_command=shell_command,
-            status=TerminalStatus.IDLE,
+            group=group,
+            metadata=metadata,
+            status=initial_status,
             last_active=datetime.now(),
         )
 
@@ -294,25 +573,463 @@ def create_terminal(
                 provider=provider,
             ),
         )
+
+        # Register with herdr inbox service for message delivery
+        svc = get_herdr_inbox_service()
+        if svc:
+            try:
+                pane_id = get_backend().get_pane_id(terminal_id, session_name, window_name)
+                is_kiro = provider == ProviderType.KIRO_CLI.value
+                svc.register_terminal(terminal_id, pane_id, is_kiro)
+            except Exception as e:
+                logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
         return terminal
 
     except Exception as e:
-        # Cleanup on failure: clean up provider resources and kill session
+        # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
         try:
-            provider_manager.cleanup_provider(terminal_id)
+            if terminal_id is not None:
+                fifo_manager.stop_reader(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
+        try:
+            if terminal_id is not None:
+                status_monitor.clear_terminal(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
+        # Roll back the DB terminal row so a failed create does not leave an
+        # orphan record: the stale row would still be listed for the session
+        # and report UNKNOWN status even though nothing is running. Idempotent
+        # (DELETE ... WHERE id = ?), so it is a no-op when the failure happened
+        # before the row was written. Runs regardless of session_created so a
         if session_created and session_name:
             try:
-                tmux_client.kill_session(session_name)
+                get_backend().kill_session(session_name)
             except:
                 pass  # Ignore cleanup errors
             # Session is gone, drop any forwarded env we stashed for it so
             # secrets don't linger in memory or bleed into a future reuse
             # of the same name.
             clear_session_env(session_name)
+        elif window_created and session_name and window_name:
+            # harness-control#186: a window added to an ALREADY-EXISTING session
+            # (new_session=False -- every MCP spawn/assign-into-existing-session
+            # call) has no session-level teardown to fall back on above, since
+            # `session_created` is False and the pre-existing session must stay
+            # up. Live-reproduced without this: a provider init timeout here
+            # (e.g. "Claude Code initialization timed out after 60s") rolls back
+            # the DB row and stops the FIFO/provider/status-monitor above, but
+            # the tmux WINDOW itself — the actual pane, still running whatever
+            # shell/process the provider left behind — was never torn down.
+            # Result: the caller (the spawning agent's MCP tool call) gets a
+            # hard error back, AND a permanently orphaned window is left behind:
+            # invisible to this terminal's own list/tree (the DB row is gone),
+            # never cleaned up, sitting there indefinitely.
+            try:
+                get_backend().kill_window(session_name, window_name)
+            except Exception:
+                pass  # Ignore cleanup errors
+        # The process-owning tmux session/window must be stopped before a
+        # provider releases private on-disk state.  In particular Grok can
+        # have an updater still writing $GROK_HOME while its initialization
+        # fails; its cleanup verifies that no such process remains.
+        cleanup_complete = True
+        try:
+            if terminal_id is not None:
+                cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
+        except Exception:
+            # Preserve the existing rollback contract for an unexpected
+            # provider-manager failure. Only an explicit False is a Grok
+            # cleanup deferral with enough information to retry safely.
+            cleanup_complete = True
+        # Do not erase the only retry handle before Grok has safely released
+        # its private home.  The original create error is still raised below;
+        # retaining this row makes the failed terminal discoverable and its
+        # deletion retryable rather than leaking credentials/config forever.
+        if cleanup_complete:
+            try:
+                if terminal_id is not None:
+                    db_delete_terminal(terminal_id)
+            except Exception:
+                pass  # Ignore cleanup errors
+        elif terminal_id is not None:
+            logger.warning(
+                "Create rollback deferred Grok cleanup for %s; retaining terminal metadata for retry",
+                terminal_id,
+            )
+        if worktree_repo_root is not None and terminal_id is not None:
+            # A worktree WAS created (Step 1b succeeded) before some later step
+            # failed -- roll it back too, same best-effort posture as everything
+            # else in this block. Without this, a provider-init timeout (or any
+            # later failure) on a worktree-backed terminal would leave an orphan
+            # worktree + branch behind with no CAO-side record pointing at it.
+            # Offloaded to a thread for the same reason Step 1b's create is:
+            # `git worktree remove` is a blocking subprocess call and this
+            # `except` block still runs on the shared event loop.
+            await asyncio.to_thread(
+                worktree_service.remove_worktree, worktree_repo_root, terminal_id
+            )
         raise
+
+
+def _notify_caller_of_deferred_failure(
+    terminal_id: str,
+    message: str,
+    registry: "PluginRegistry | None",
+    delete_worker: bool,
+) -> None:
+    """Make a deferred-init failure observable to the supervisor that assigned
+    the worker, then optionally tear the worker down.
+
+    Runs in a worker thread (blocking DB + tmux I/O). The supervisor is the
+    worker's ``caller_id``; we enqueue a PENDING inbox message to it so the
+    failure surfaces as the supervisor's next input instead of leaving it to
+    wait forever on a callback that will never come. Every step is best-effort
+    and independently guarded — a failure to notify must not prevent teardown,
+    and a failure to tear down must not crash the background task.
+    """
+    caller_id = None
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if metadata:
+            caller_id = metadata.get("caller_id")
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        logger.warning(
+            "Deferred-init failure notify: could not read metadata for %s: %s",
+            terminal_id,
+            exc,
+        )
+
+    if caller_id:
+        try:
+            create_inbox_message(sender_id=terminal_id, receiver_id=caller_id, message=message)
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "Deferred-init failure notify: could not enqueue inbox message to "
+                "caller %s for worker %s: %s",
+                caller_id,
+                terminal_id,
+                exc,
+            )
+    else:
+        logger.warning(
+            "Deferred-init failure for %s has no caller_id to notify; failure is " "log-only.",
+            terminal_id,
+        )
+
+    if delete_worker:
+        try:
+            # Pass registry so post_kill_terminal hooks fire — parity with the
+            # DELETE endpoint and agent_step teardown.
+            delete_terminal(terminal_id, registry=registry)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            logger.warning(
+                "Deferred-init failure: teardown of worker %s failed (zombie "
+                "window may remain): %s",
+                terminal_id,
+                exc,
+            )
+
+
+# --- deferred-init submit verification ----------------------------------------
+# send_input delivers via paste-buffer → fixed sleep → Enter (clients/tmux.py).
+# That fixed sleep only guesses when the TUI is input-ready; when it guesses
+# wrong the Enter (or the whole paste) is dropped and the message sits
+# unsubmitted in the prompt box. In the deferred-init path nobody blocks on
+# completion, so a dropped submit leaves the worker IDLE forever with the task
+# never started and NO exception raised — the supervisor then waits on a
+# callback that can never arrive. Confirm the worker actually began processing
+# and re-submit if it did not.
+_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = 8.0  # per-attempt wait for the PROCESSING edge
+_DEFERRED_SUBMIT_MAX_RESUBMITS = 3
+# Statuses proving the worker accepted the task (left the ready IDLE state).
+# WAITING_USER_ANSWER counts: the worker consumed the input and is now asking.
+_DEFERRED_STARTED_STATUSES = {
+    TerminalStatus.PROCESSING,
+    TerminalStatus.COMPLETED,
+    TerminalStatus.WAITING_USER_ANSWER,
+}
+
+
+def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+    """Direct visible-screen status check bypassing the event-driven status cache.
+
+    The deferred-init retry loop polls ``status_monitor.get_status()`` which
+    returns the **cached** status updated only by the event-driven pipeline
+    (pyte screener at rising-edge/quiescence edges). When that lags behind
+    reality the cached status stays IDLE even though the worker already
+    transitioned to PROCESSING.
+
+    This function does a live ``capture-pane`` to grab the visible screen
+    (not the 8 KB rolling buffer, which is too small to reliably hold the
+    footer) and calls ``provider.get_status()`` directly, catching the real
+    state so the retry loop doesn't re-deliver into a working terminal.
+
+    Only providers that set ``supports_direct_status_probe = True`` should
+    be passed to this function; the ``get_status()`` contract for other
+    providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
+    dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
+    rendered capture-pane snapshot.
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return False
+        session_name = metadata.get("tmux_session")
+        window_name = metadata.get("tmux_window")
+        if not session_name or not window_name:
+            return False
+        output = get_backend().get_history(session_name, window_name, tail_lines=200)
+        status = provider.get_status(output)
+    except Exception:
+        logger.debug(
+            "Direct status probe for %s failed (falling through to cached path)",
+            terminal_id,
+            exc_info=True,
+        )
+        return False
+    return status in _DEFERRED_STARTED_STATUSES
+
+
+def _message_visible_in_box(terminal_id: str, message: str) -> bool:
+    """True when the delivered message is still sitting in the input box.
+
+    Decides the resubmit action: if our text is there the paste landed and only
+    the Enter was dropped (send a bare Enter); if it is absent the paste itself
+    was dropped (re-deliver the full message). Guessing wrong the other way must
+    be avoided — a bare Enter into an EMPTY box would submit a blank prompt and
+    the real task would be lost. Collapse to [a-z0-9] so wrapping / whitespace /
+    unicode punctuation in the rendered box can't defeat the match.
+    """
+    probe = re.sub(r"[^a-z0-9]", "", message.lower())[:24]
+    if len(probe) < 8:
+        # Too short to match reliably — treat as "not shown" so we re-deliver
+        # in full rather than risk a blank submit.
+        return False
+    try:
+        rendered = get_output(terminal_id)
+    except Exception:
+        return False
+    return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+
+async def _confirm_worker_started_or_resubmit(
+    terminal_id: str,
+    message: str,
+    registry: "PluginRegistry | None",
+    sender_id: Optional[str],
+    orchestration_type: Optional[OrchestrationType],
+    provider=None,
+) -> bool:
+    """Confirm a deferred-init worker began processing; re-submit if not.
+
+    Returns True once the terminal reaches a started status, False if it is
+    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
+    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    """
+    if await wait_until_status(
+        terminal_id,
+        _DEFERRED_STARTED_STATUSES,
+        timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+        polling_interval=0.5,
+    ):
+        return True
+
+    for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
+        # The cached status_monitor status is event-driven (pyte screener at
+        # rising-edge/quiescence only) and can lag behind reality. Before
+        # re-delivering, do a direct capture-pane / visible-screen check via
+        # the provider to catch cases where the worker IS processing but the
+        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
+        # footer appearing between pyte detection edges). Only providers that
+        # opt in via ``supports_direct_status_probe = True`` take this path.
+        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
+            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
+                return True
+
+        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
+            logger.warning(
+                "Deferred assign to %s unsubmitted (Enter swallowed); "
+                "re-submitting via Enter (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
+        else:
+            logger.warning(
+                "Deferred assign to %s not accepted (paste dropped); "
+                "re-delivering message (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await asyncio.to_thread(
+                send_input,
+                terminal_id,
+                message,
+                registry=registry,
+                sender_id=sender_id,
+                orchestration_type=orchestration_type,
+            )
+        if await wait_until_status(
+            terminal_id,
+            _DEFERRED_STARTED_STATUSES,
+            timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+            polling_interval=0.5,
+        ):
+            return True
+
+    return False
+
+
+def _schedule_deferred_init(
+    provider_instance,
+    terminal_id: str,
+    initial_message: Optional[str],
+    orchestration_type: Optional[OrchestrationType],
+    registry: PluginRegistry | None,
+) -> None:
+    """Kick off provider.initialize() in the background and, on success,
+    deliver the initial message via send_input.
+
+    Runs as an asyncio task on the running event loop so it doesn't block
+    the caller. Because assign() has already returned success=True by the
+    time this runs, a failure here must be made OBSERVABLE to the supervisor
+    rather than silently swallowed — otherwise the supervisor waits forever
+    on a callback that can never arrive and a later inspect 404s. On failure
+    we notify the caller's inbox (best-effort) and then tear the worker down.
+
+    ``TerminalInputBlockedError`` (the worker is parked on a WAITING_USER_ANSWER
+    prompt right after init) is NOT a teardown case: the worker is alive and
+    answerable via answer_user_prompt, so we leave it in place and only log.
+    """
+
+    async def _run() -> None:
+        caller_id: Optional[str] = None
+        try:
+            await provider_instance.initialize()
+            shell_command = provider_instance.shell_baseline
+            if isinstance(shell_command, str) and shell_command:
+                update_terminal_shell_command(terminal_id, shell_command)
+            if initial_message:
+                # For assign/handoff the sender is the CALLER (the supervisor),
+                # not this MCP server; _assign_impl on the MCP-server side already
+                # embedded the callback instructions into initial_message. The
+                # deferred path is also reached from POST /sessions?initial_message=
+                # (session_service.create_session), which has no supervisor and no
+                # orchestration_type requirement on its caller.
+                # We still pass sender_id=caller_id if present in DB metadata
+                # so plugin events see it.
+                metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+                if metadata:
+                    caller_id = metadata.get("caller_id")
+                # Round-3 review fix (call-me-ram): a raw POST /sessions caller that
+                # supplies initial_message with no orchestration_type previously sailed
+                # straight past send_input's WAITING_USER_ANSWER guard entirely -- the
+                # guard only fires for OrchestrationType.ASSIGN/HANDOFF, so an unstated
+                # type meant no protection at all against pasting the initial task into
+                # a live choice prompt. Every call that reaches THIS function is by
+                # construction an unattended initial-task delivery (never an interactive
+                # human answer -- those go through answer_user_prompt's own separate
+                # /terminals/{id}/input call, which never routes through
+                # _schedule_deferred_init), so defaulting an unstated orchestration_type
+                # to ASSIGN here is always correct and cannot affect answer_user_prompt.
+                effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
+                # send_input is blocking tmux I/O — off the loop so it can't
+                # freeze the server for concurrent requests.
+                await asyncio.to_thread(
+                    send_input,
+                    terminal_id,
+                    initial_message,
+                    registry=registry,
+                    sender_id=caller_id,
+                    orchestration_type=effective_orchestration_type,
+                )
+                # Delivery can be silently dropped (Enter swallowed / paste lost)
+                # when the TUI isn't input-ready. Confirm the worker actually
+                # started and re-submit if not; if it never starts, surface the
+                # failure so the supervisor re-routes instead of waiting forever.
+                started = await _confirm_worker_started_or_resubmit(
+                    terminal_id,
+                    initial_message,
+                    registry,
+                    caller_id,
+                    # Same guard-eligible default as the initial send_input above --
+                    # a resubmit is still an unattended initial-task delivery, so it
+                    # must not silently drop back to the unguarded original type.
+                    effective_orchestration_type,
+                    provider=provider_instance,
+                )
+                if not started:
+                    logger.error(
+                        "Deferred init for %s: worker never started after "
+                        "resubmits; task not delivered — notifying caller and "
+                        "tearing down.",
+                        terminal_id,
+                    )
+                    await asyncio.to_thread(
+                        _notify_caller_of_deferred_failure,
+                        terminal_id,
+                        (
+                            f"Worker {terminal_id} received the assigned task but "
+                            f"never started processing (input not accepted after "
+                            f"retries). It has been deleted — re-assign the task."
+                        ),
+                        registry,
+                        True,  # delete_worker
+                    )
+                    return
+        except TerminalInputBlockedError as e:
+            # The worker initialized but is parked on an interactive prompt
+            # (WAITING_USER_ANSWER). It is alive and can be driven via
+            # answer_user_prompt — do NOT delete it. Just surface the state to
+            # the supervisor so it knows delivery is pending on a prompt.
+            logger.warning(
+                "Deferred init for terminal %s: worker is waiting on a user "
+                "prompt; task not yet delivered. Leaving worker alive for "
+                "answer_user_prompt. (%s)",
+                terminal_id,
+                e,
+            )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id} is waiting on an interactive prompt; the "
+                f"assigned task has not been delivered. Use answer_user_prompt to "
+                f"clear the prompt, then re-send the task yourself (e.g. via "
+                f"send_message) -- it is not automatically re-delivered once the "
+                f"prompt is answered.",
+                registry,
+                delete_worker=False,
+            )
+        except Exception as e:
+            # exc_info=True preserves the traceback for debugging; {e!r} avoids
+            # newline/control-character injection into logs and the inbox message
+            # (the exception text can contain provider-supplied content).
+            logger.error(
+                "Deferred init for terminal %s failed: %r. "
+                "Notifying caller and tearing down worker.",
+                terminal_id,
+                e,
+                exc_info=True,
+            )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id} failed to initialize: {e!r}. It has been "
+                f"deleted — re-assign the task or report the failure.",
+                registry,
+                delete_worker=True,
+            )
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
+        return
+    task = loop.create_task(_run())
+    _deferred_init_tasks.add(task)
+    task.add_done_callback(_deferred_init_tasks.discard)
 
 
 def get_terminal(terminal_id: str) -> Dict:
@@ -322,11 +1039,7 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        # Get status from provider
-        provider = provider_manager.get_provider(terminal_id)
-        if provider is None:
-            raise ValueError(f"Provider not found for terminal {terminal_id}")
-        status = provider.get_status().value
+        status = status_monitor.get_status(terminal_id).value
 
         return {
             "id": metadata["id"],
@@ -334,7 +1047,11 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider": metadata["provider"],
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
+            "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
+            "engine": metadata.get("engine"),
+            "group": metadata.get("group"),
+            "metadata": metadata.get("metadata"),
             "status": status,
             "last_active": metadata["last_active"],
         }
@@ -342,6 +1059,82 @@ def get_terminal(terminal_id: str) -> Dict:
     except Exception as e:
         logger.error(f"Failed to get terminal {terminal_id}: {e}")
         raise
+
+
+def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
+    """Replace a terminal's group array.
+
+    Used by consumers whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment) so ``group``
+    doesn't go stale (#432). ``None``/``[]`` opts the terminal back out of
+    discovery.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_group(terminal_id, group)
+
+
+def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
+    """Replace a terminal's free-form metadata dict.
+
+    Whole-dict replace, not a merge: concurrent calls are last-write-wins
+    (tedswinyar, PR #433 review). Acceptable for this field -- callers should
+    re-send the full intended dict each time rather than assuming a partial
+    update accumulates on top of a prior one.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_metadata(terminal_id, metadata)
+
+
+def list_siblings(
+    caller_id: str, depth: Optional[int] = None, cross_session: bool = False
+) -> List[Dict[str, Any]]:
+    """Resolve ``caller_id``'s own group and return matching sibling terminals.
+
+    Depth is clamped server-side to ``[1, len(caller_group)]`` (#432): it can
+    never be widened past the caller's own group length, and an explicit 0 is
+    rejected by the API layer's query-param validation before this is ever
+    called (never silently reinterpreted as an unscoped, all-terminals
+    query). ``depth=None`` defaults to the caller's full own group length —
+    the widest scope the caller is allowed to see.
+
+    A caller with no group set finds no siblings (participates in no
+    discovery, per #432) rather than erroring.
+
+    Session-scoped by default (issue #432 design discussion): results are
+    additionally filtered to the caller's own ``tmux_session`` unless
+    ``cross_session=True`` is explicitly passed — see
+    ``list_siblings_by_group_prefix``'s own docstring for the full rationale.
+
+    Returns:
+        List of ``{id, group, metadata, status}`` dicts for every OTHER
+        terminal whose group shares the resolved prefix. ``status`` is a
+        live, point-in-time snapshot (tedswinyar, PR #433 review): a handoff
+        terminal that has COMPLETED can still delete itself between this
+        call returning and a caller's follow-up ``send_message`` to it, so a
+        discovered sibling is never a guarantee it's still reachable --
+        ``status`` lets a caller skip an obviously-finished sibling
+        proactively, but callers should still expect sends to occasionally
+        fail against a sibling that disappeared in that window.
+    """
+    caller_metadata = get_terminal_metadata(caller_id)
+    caller_group = caller_metadata.get("group") if caller_metadata else None
+    if not caller_group:
+        return []
+    caller_session = caller_metadata.get("tmux_session") if caller_metadata else None
+    max_depth = len(caller_group)
+    effective_depth = max_depth if depth is None else depth
+    effective_depth = max(1, min(effective_depth, max_depth))
+    prefix = caller_group[:effective_depth]
+    siblings = list_siblings_by_group_prefix(
+        caller_id, prefix, caller_session=caller_session, cross_session=cross_session
+    )
+    for sibling in siblings:
+        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+    return siblings
 
 
 def get_working_directory(terminal_id: str) -> Optional[str]:
@@ -362,7 +1155,7 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        working_dir = tmux_client.get_pane_working_directory(
+        working_dir = get_backend().get_pane_working_directory(
             metadata["tmux_session"], metadata["tmux_window"]
         )
         return working_dir
@@ -391,24 +1184,42 @@ def send_input(
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        if (
+            metadata.get("provider") == ProviderType.KIRO_CLI.value
+            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
+        ):
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
+
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = (
             orchestration_type.value
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
-        if (
-            provider
-            and provider.blocks_orchestrated_input_while_waiting_user_answer is True
-            and orchestration_value
-            in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-            and provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
-        ):
-            raise TerminalInputBlockedError(
-                f"Terminal {terminal_id} is waiting for a user answer. "
-                "Use answer_user_prompt to submit a selection or approval before "
-                f"sending {orchestration_value} input."
-            )
+
+        if provider:
+            current_status = status_monitor.get_status(terminal_id)
+
+            # Guard: refuse to type into a terminal whose provider process has
+            # exited. Without this check, queued messages would be pasted into
+            # a bare shell and executed as arbitrary commands.
+            if current_status == TerminalStatus.ERROR:
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} provider is in ERROR state "
+                    "(provider process may have exited). Refusing to deliver input."
+                )
+
+            if (
+                provider.blocks_orchestrated_input_while_waiting_user_answer is True
+                and orchestration_value
+                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+                and current_status == TerminalStatus.WAITING_USER_ANSWER
+            ):
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} is waiting for a user answer. "
+                    "Use answer_user_prompt to submit a selection or approval before "
+                    f"sending {orchestration_value} input."
+                )
 
         # Inject memory context into the very first user message after init.
         # Phase 1 wires injection inline for every provider. The Kiro
@@ -424,35 +1235,81 @@ def send_input(
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
 
-        tmux_client.send_keys(
+        # Arm the StatusMonitor stickiness gate so that the next provider-
+        # detected PROCESSING transition is honored (overriding the latched
+        # IDLE/COMPLETED). Without this, sticky ready-status would block
+        # the genuine PROCESSING signal that arrives once the agent starts
+        # working on the new message.
+        if provider and provider.assume_processing_on_dispatch is True:
+            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+        else:
+            status_monitor.notify_input_sent(terminal_id)
+
+        # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
+        # prompts from BEFORE the input can't trigger a false COMPLETED
+        # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
+        # buffer, which combined with input_received=True would return COMPLETED
+        # within seconds of send_input). Clearing here — not after send_keys —
+        # avoids a race: send_keys includes a submit-delay sleep during which
+        # the agent can begin emitting output; a post-send_keys clear would wipe
+        # that newly-emitted first chunk of the turn (lost from
+        # GET /terminals/{id}/output?mode=full and from early detection). This
+        # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
+        # arm set by notify_input_sent above; reset_buffer would wipe the arm and
+        # latch-block the IDLE→PROCESSING transition for the whole turn.
+        # Give stateful providers the same explicit generation boundary as the
+        # rolling byte buffer.  Grok uses this to distinguish a new,
+        # byte-identical completion from a retained completion screen.
+        status_monitor.clear_rolling_buffer(terminal_id, provider)
+
+        # Mark the provider before send_keys rather than after it.  send_keys
+        # includes the provider-specific submit delay, during which a fast CLI
+        # can already emit its first processing and completion frames.  Those
+        # frames must be parsed as belonging to this turn, not as a stale
+        # post-clear redraw.  StatusMonitor has already armed and cleared the
+        # same dispatch boundary above.
+        if provider:
+            provider.mark_input_received()
+
+        get_backend().send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
+            submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
-
-        # Notify the provider that external input was received.
-        # This allows providers to adjust status
-        # detection — specifically to stop reporting IDLE for the post-init
-        # state and resume normal COMPLETED detection after a real task.
-        if provider:
-            provider.mark_input_received()
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
         if registry is not None and sender_id is not None and orchestration_type is not None:
-            dispatch_plugin_event(
-                registry,
-                "post_send_message",
-                PostSendMessageEvent(
-                    session_id=metadata["tmux_session"],
-                    sender=sender_id,
-                    receiver=terminal_id,
-                    message=original_message,
-                    orchestration_type=orchestration_type,
-                ),
+            # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
+            # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
+            # count it, and propagate the active trace context into the plugin
+            # event so downstream consumers can continue the trace.
+            from cli_agent_orchestrator.telemetry import (
+                execute_tool_span,
+                inject_traceparent,
+                record_orchestration_dispatch,
             )
+
+            with execute_tool_span(
+                f"send_message:{orchestration_value}",
+                conversation_id=metadata["tmux_session"],
+            ):
+                record_orchestration_dispatch(orchestration_value)
+                dispatch_plugin_event(
+                    registry,
+                    "post_send_message",
+                    PostSendMessageEvent(
+                        session_id=metadata["tmux_session"],
+                        sender=sender_id,
+                        receiver=terminal_id,
+                        message=original_message,
+                        orchestration_type=orchestration_type,
+                        traceparent=inject_traceparent(),
+                    ),
+                )
         return True
 
     except Exception as e:
@@ -481,7 +1338,12 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        tmux_client.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+        # Arm StatusMonitor stickiness: special keys (Enter on a permission
+        # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
+        # processing cycle that must be allowed to push past any latched
+        # ready status.
+        status_monitor.notify_input_sent(terminal_id)
+        get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
         update_last_active(terminal_id)
         logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
@@ -492,80 +1354,320 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         raise
 
 
+def exit_terminal_cli(terminal_id: str) -> None:
+    """Send the provider-specific exit command to gracefully shut down the CLI.
+
+    Mirrors the ``POST /terminals/{id}/exit`` endpoint: resolve the provider,
+    send ``provider.exit_cli()`` — as a tmux key sequence when it is one (e.g.
+    ``C-d``), else as literal input (e.g. ``/exit``). This is the graceful CLI
+    shutdown that should precede ``delete_terminal`` (which goes straight to
+    ``kill_window``). Both the endpoint and ``run_agent_step`` call this so the
+    exit-then-delete lifecycle is implemented once.
+
+    Raises:
+        ValueError: if no provider is registered for ``terminal_id``.
+    """
+    provider = provider_manager.get_provider(terminal_id)
+    if provider is None:
+        raise ValueError(f"Provider not found for terminal {terminal_id}")
+    exit_command = provider.exit_cli()
+    # Some providers use tmux key sequences (e.g., "C-d" for Ctrl+D) instead of
+    # text commands (e.g., "/exit"). Key sequences must be sent via
+    # send_special_key() to be interpreted by tmux, not as literal text.
+    if exit_command.startswith(("C-", "M-")):
+        send_special_key(terminal_id, exit_command)
+    else:
+        send_input(terminal_id, exit_command)
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
 
+    ``FULL`` mode returns the StatusMonitor rolling buffer (the streamed output
+    accumulated from the FIFO pipeline), which is bounded to the most recent
+    ``state_buffer_max`` bytes (server setting, see settings_service.py; 32KB
+    default); it falls back to a tmux history capture only when that buffer
+    is empty. This is a deliberate trade-off in the
+    event-driven architecture (instant, no tmux call) — it is *not* unbounded
+    scrollback, so very long sessions are truncated to the tail. Use the
+    on-disk ``{id}.log`` (LogWriter) or the delete-time ``{id}.scrollback``
+    snapshot when complete history is required.
+
     For ``LAST`` mode, if the provider declares ``extraction_retries > 0``,
     retries extraction with 10 s delays between attempts.  This handles
-    TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
+    TUI-based providers (e.g. Antigravity CLI's renderer) whose notification
     spinners can temporarily obscure response text in the tmux capture buffer.
 
-    If the provider exposes an ``extraction_tail_lines`` attribute, the
-    history capture for LAST mode uses that value instead of the default
-    ``TMUX_HISTORY_LINES``. Status-check captures are unaffected (they go
-    through get_status directly). A single capture-pane call is made per
-    get_output invocation.
+    If the provider exposes an ``extraction_tail_lines`` attribute, that
+    fixed value is used for the history capture and the escalating-fetch
+    logic below is skipped.
+
+    Otherwise, extraction uses an escalating fetch strategy: start with a
+    small capture window and widen until the response marker is found.
+    Steps: 200 -> 500 -> 1000 -> 5000.  If no marker is found at 5000 lines,
+    the raw tail is returned with a [PARTIAL RESPONSE] prefix so the caller
+    knows the output may be incomplete.
     """
+    # Escalation steps used when the provider does not declare extraction_tail_lines.
+    _ESCALATION_STEPS = [200, 500, 1000, 5000]
+
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        # Get output from StatusMonitor buffer (instant, no tmux call)
+        full_output = status_monitor.get_buffer(terminal_id)
+        if not full_output:
+            # Fallback to backend history only if buffer not available (edge case)
+            full_output = get_backend().get_history(
+                metadata["tmux_session"], metadata["tmux_window"]
+            )
+
         if mode == OutputMode.FULL:
-            return tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
+            return full_output
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
 
-            # Capability check: providers that need deeper scrollback for extraction
-            # opt in by defining ``extraction_tail_lines``. Base providers don't.
-            extract_lines = getattr(provider, "extraction_tail_lines", None)
-            full_output = tmux_client.get_history(
-                metadata["tmux_session"],
-                metadata["tmux_window"],
-                tail_lines=extract_lines,
-            )
-
-            retries = provider.extraction_retries
-            last_err: Exception | None = None
-            for attempt in range(1 + retries):
-                try:
-                    if attempt > 0:
-                        time.sleep(10.0)
-                        full_output = tmux_client.get_history(
-                            metadata["tmux_session"],
-                            metadata["tmux_window"],
-                            tail_lines=extract_lines,
+            # If the provider pins a fixed scrollback depth, honour it and skip
+            # escalation — the provider knows what it needs.
+            fixed_extract_lines = getattr(provider, "extraction_tail_lines", None)
+            if fixed_extract_lines is not None:
+                full_output = get_backend().get_history(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    tail_lines=fixed_extract_lines,
+                )
+                retries = provider.extraction_retries
+                last_err: Exception | None = None
+                for attempt in range(1 + retries):
+                    try:
+                        if attempt > 0:
+                            time.sleep(10.0)
+                            full_output = get_backend().get_history(
+                                metadata["tmux_session"],
+                                metadata["tmux_window"],
+                                tail_lines=fixed_extract_lines,
+                            )
+                        return provider.extract_last_message_from_script(full_output)
+                    except ValueError as exc:
+                        last_err = exc
+                        logger.debug(
+                            "Output extraction attempt %d/%d for %s failed: %s",
+                            attempt + 1,
+                            1 + retries,
+                            terminal_id,
+                            exc,
                         )
-                    return provider.extract_last_message_from_script(full_output)
+                # Re-raise as the narrower type: the terminal and provider both
+                # resolved, so this is a missing response marker, not a bad
+                # reference. Keeps the API boundary from reporting it as 404
+                # (issue #570).
+                raise OutputExtractionError(str(last_err)) from last_err
+
+            # Escalating fetch: try progressively larger capture windows until
+            # the response marker is found or we hit the cap.
+            last_err = None
+            full_output = ""
+            for step_lines in _ESCALATION_STEPS:
+                full_output = get_backend().get_history(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    tail_lines=step_lines,
+                )
+                try:
+                    result = provider.extract_last_message_from_script(full_output)
+                    if step_lines > _ESCALATION_STEPS[0]:
+                        logger.debug(
+                            "get_output: %s marker found at %d lines",
+                            terminal_id,
+                            step_lines,
+                        )
+                    return result
                 except ValueError as exc:
                     last_err = exc
                     logger.debug(
-                        "Output extraction attempt %d/%d for %s failed: %s",
-                        attempt + 1,
-                        1 + retries,
+                        "get_output: %s no marker at %d lines, escalating",
                         terminal_id,
-                        exc,
+                        step_lines,
                     )
-            raise last_err  # type: ignore[misc]
+
+            # All tail-based steps failed — try full scrollback before giving up.
+            logger.debug(
+                "get_output: %s escalation exhausted, trying full_history",
+                terminal_id,
+            )
+            full_output = get_backend().get_history(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                full_history=True,
+            )
+            try:
+                result = provider.extract_last_message_from_script(full_output)
+                logger.debug("get_output: %s marker found in full_history", terminal_id)
+                return result
+            except ValueError:
+                pass
+
+            # Full scrollback also failed — distinguish overflow from no response.
+            # If the buffer is close to full (>=90% of last escalation cap), the
+            # response marker was likely produced but pushed past the scrollback
+            # limit (overflow).  If the buffer is mostly empty, the agent never
+            # produced a text response (e.g. only tool calls, crash, or timeout).
+            actual_lines = full_output.count("\n") + 1
+            overflow_threshold = int(_ESCALATION_STEPS[-1] * 0.9)
+            if actual_lines >= overflow_threshold:
+                logger.warning(
+                    "get_output: %s response marker not found, buffer near-full "
+                    "(%d lines >= %d threshold) — likely overflow",
+                    terminal_id,
+                    actual_lines,
+                    overflow_threshold,
+                )
+                return (
+                    f"[PARTIAL RESPONSE - response marker not found, buffer overflow likely "
+                    f"({actual_lines} lines retrieved)]\n{full_output}"
+                )
+            else:
+                logger.warning(
+                    "get_output: %s response marker not found, buffer sparse "
+                    "(%d lines < %d threshold) — agent likely produced no text response",
+                    terminal_id,
+                    actual_lines,
+                    overflow_threshold,
+                )
+                return (
+                    f"[NO RESPONSE - agent completed without producing a text response "
+                    f"({actual_lines} lines in buffer)]\n{full_output}"
+                )
 
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")
         raise
 
 
+def read_output_range(terminal_id: str, offset: int, length: int) -> str:
+    """Read a byte range from a terminal's append-only on-disk log (U5 / #504).
+
+    This is a SEPARATE read path from ``get_output``: that function returns the
+    bounded rolling buffer / tmux tail, whereas this reads an exact byte window
+    from ``TERMINAL_LOG_DIR / f"{terminal_id}.log"`` — the append-only,
+    monotonic file LogWriter maintains (BR-1). Playback (FR-4.3 / FR-7.3) uses
+    the ``terminal_offset_start`` / ``terminal_offset_len`` an event carries to
+    fetch exactly the output produced around that event, without copying the
+    log into the journal (BR-3).
+
+    Args:
+        terminal_id: The terminal whose log to read. Validated against the
+            workflow name/id charset before it is joined into the log path, so
+            a value containing ``/`` / ``..`` / a NUL can never escape
+            ``TERMINAL_LOG_DIR`` (path-traversal defense; reuses
+            ``_validate_key_part``).
+        offset: Byte offset to seek to. Must be ``>= 0``. An offset at or beyond
+            EOF is not an error — the read simply returns the available tail
+            (empty string when nothing follows the offset) so playback degrades
+            gracefully (BR-4).
+        length: Maximum number of bytes to read. Clamped to
+            ``TERMINAL_RANGE_MAX_LENGTH`` (BR-2) to bound the read.
+
+    Returns:
+        The decoded slice, ``bytes.decode("utf-8", errors="replace")`` so a
+        range that starts or ends mid-multibyte-sequence never raises (BR-5,
+        matching LogWriter's write encoding). Returns ``""`` for a valid
+        terminal whose log does not exist yet (nothing has been logged) — a
+        missing log is NOT a playback-breaking error (BR-4).
+
+    Raises:
+        ValueError: ``terminal_id`` fails id validation, or ``offset`` is
+            negative. Translated to a 400 at the request boundary.
+        OSError: A genuine file I/O failure (e.g. a permission error, or the
+            path exists but is unreadable). Surfaced to the caller, NOT
+            swallowed into an empty string — "nothing logged yet" (return "")
+            and "the read failed" (raise) are deliberately distinct outcomes
+            (BR-4 / construction error-handling guardrail).
+    """
+    # Path-traversal defense: reject any id that is not a plain key BEFORE it is
+    # joined into the log path. Reuses the workflow key/id validator so the
+    # charset rule is defined once (rejects "/", "..", ".", NUL, whitespace).
+    _validate_key_part(terminal_id, "terminal_id")
+
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0, got {offset}")
+
+    # Clamp the read window (BR-2). A non-positive length reads nothing rather
+    # than raising — the route enforces length >= 1, so this is defense in depth.
+    capped_length = max(0, min(length, TERMINAL_RANGE_MAX_LENGTH))
+
+    log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(offset)  # seeking past EOF is legal; the read below yields b""
+            data = f.read(capped_length)
+    except FileNotFoundError:
+        # Valid terminal that has not logged anything yet (or whose log has been
+        # cleaned up): an empty range, never an error (BR-4).
+        logger.debug(
+            "read_output_range: no log file for terminal %s (offset=%d, length=%d) — "
+            "returning empty range",
+            terminal_id,
+            offset,
+            capped_length,
+        )
+        return ""
+    except OSError as e:
+        # A genuine I/O failure (permission, etc.) is NOT the same as "nothing
+        # logged" — surface it rather than masking a real fault as empty output.
+        logger.error(
+            "read_output_range: I/O error reading log for terminal %s "
+            "(offset=%d, length=%d): %s",
+            terminal_id,
+            offset,
+            capped_length,
+            e,
+        )
+        raise
+
+    return data.decode("utf-8", errors="replace")
+
+
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window."""
     try:
+        # Unregister from herdr inbox service
+        svc = get_herdr_inbox_service()
+        if svc:
+            try:
+                svc.unregister_terminal(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
+
         # Get metadata before deletion
         metadata = get_terminal_metadata(terminal_id)
 
         if metadata:
+            # Read the pane's live working directory BEFORE kill_window below
+            # destroys the pane. Single read, reused for two purposes: the
+            # scrollback snapshot below, and issue #100 Phase 1's worktree
+            # cleanup (recognizing a worktree-backed terminal from its live
+            # cwd alone -- there is no separate CAO-side record of which
+            # terminals are worktree-backed). Best-effort: a read failure
+            # means the snapshot's working_directory field is None and no
+            # worktree cleanup runs below.
+            live_working_directory = None
+            try:
+                live_working_directory = get_backend().get_pane_working_directory(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
-                scrollback = tmux_client.get_history(
+                scrollback = get_backend().get_history(
                     metadata["tmux_session"],
                     metadata["tmux_window"],
                     strip_escapes=True,
@@ -582,10 +1684,9 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                     "window_name": metadata["tmux_window"],
                     "agent_profile": metadata.get("agent_profile"),
                     "provider": metadata["provider"],
-                    "working_directory": tmux_client.get_pane_working_directory(
-                        metadata["tmux_session"], metadata["tmux_window"]
-                    ),
+                    "working_directory": live_working_directory,
                     "allowed_tools": metadata.get("allowed_tools"),
+                    "caller_id": metadata.get("caller_id"),
                 }
                 snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
                 snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
@@ -594,18 +1695,63 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
 
             # Stop pipe-pane logging
             try:
-                tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+                get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
+            # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
+            # so the reader thread (which reopens the FIFO on EOF) unblocks and
+            # joins before the pane disappears.
+            try:
+                fifo_manager.stop_reader(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+
+            # Clear state detector buffers for this terminal
+            try:
+                status_monitor.clear_terminal(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
+
             # Kill the tmux window (this terminates the agent process)
             try:
-                tmux_client.kill_window(metadata["tmux_session"], metadata["tmux_window"])
+                get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
 
-        # Cleanup provider state and database record
-        provider_manager.cleanup_provider(terminal_id)
+            # issue #100 Phase 1: if this terminal was worktree-backed (its live
+            # cwd matched the CAO-managed worktree path shape), remove the
+            # worktree + branch now that the process using it is gone.
+            # `remove_worktree` is itself best-effort/never-raises, matching
+            # every other step in this teardown.
+            #
+            # The parsed terminal_id MUST match the terminal actually being
+            # deleted here, not just "some" CAO worktree path. Without this
+            # guard: a worktree-backed terminal A (cwd
+            # .../.cao/worktrees/A) can spawn a non-worktree terminal B with
+            # working_directory explicitly set to A's cwd (handoff/assign
+            # both accept an explicit working_directory, and "here" -- the
+            # caller's own directory -- is a common choice). Deleting B --
+            # including handoff's automatic success teardown -- would then
+            # read B's pane cwd (== A's worktree path), parse terminal_id
+            # "A" out of it, and force-remove A's still-running worktree.
+            # Mismatched parses now fall through as a no-op leak (Phase 3
+            # territory) instead of destroying another terminal's checkout.
+            parsed = worktree_service.parse_worktree_path(live_working_directory)
+            if parsed is not None:
+                worktree_repo_root, worktree_terminal_id = parsed
+                if worktree_terminal_id == terminal_id:
+                    worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
+
+        # Grok cleanup can be deferred when a private-home owner cannot yet be
+        # inspected/stopped.  Keep both the provider mapping and DB metadata so
+        # a subsequent DELETE can retry; reporting success here would turn a
+        # temporary process race into a permanent private-home leak.
+        if provider_manager.cleanup_provider(terminal_id) is False:
+            logger.warning(
+                "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
+            )
+            return False
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
         # Drop any per-curator dispatch lock so the registry doesn't grow

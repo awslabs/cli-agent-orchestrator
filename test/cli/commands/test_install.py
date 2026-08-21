@@ -70,6 +70,41 @@ class TestInstallCommand:
             {"API_TOKEN": "secret-token"},
         )
 
+    def test_install_without_provider_flag_passes_none_and_echoes_resolved_provider(
+        self, runner: CliRunner
+    ) -> None:
+        """Omitting --provider should pass None so the service resolves frontmatter.
+
+        The final summary line must echo the provider the service actually
+        resolved (flag > frontmatter > default), not the CLI default.
+        """
+        service_result = InstallResult(
+            success=True,
+            message="Agent 'developer' installed successfully",
+            agent_name="developer",
+            context_file="/tmp/agent-context/developer.md",
+            agent_file="/tmp/copilot/developer.agent.md",
+            source_kind="name",
+            provider="copilot_cli",
+        )
+
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=service_result,
+        ) as mock_install:
+            result = runner.invoke(install, ["developer"])
+
+        assert result.exit_code == 0
+        assert "copilot_cli agent: /tmp/copilot/developer.agent.md" in result.output
+        mock_install.assert_called_once_with("developer", None, None)
+
+    def test_install_help_documents_provider_precedence(self, runner: CliRunner) -> None:
+        """--provider help text should document flag > frontmatter > default."""
+        result = runner.invoke(install, ["--help"])
+
+        assert result.exit_code == 0
+        assert "frontmatter" in result.output
+
     def test_install_url_source_prints_download_confirmation(self, runner: CliRunner) -> None:
         """URL installs should print a download confirmation line."""
         service_result = InstallResult(
@@ -104,7 +139,7 @@ class TestInstallCommand:
         local_store = tmp_path / "agent-store"
         local_store.mkdir()
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             local_store,
         )
         source_profile = tmp_path / "local.md"
@@ -138,7 +173,7 @@ class TestInstallCommand:
     ) -> None:
         """A `.md`-suffixed path that doesn't exist should fail before the service call."""
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             tmp_path / "agent-store",
         )
 
@@ -156,7 +191,7 @@ class TestInstallCommand:
     ) -> None:
         """A local .md file whose stem contains unsafe characters must be refused."""
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             tmp_path / "agent-store",
         )
         bad = tmp_path / "evil space.md"
@@ -219,7 +254,7 @@ class TestCopyLocalProfileToStore:
     ) -> None:
         store = tmp_path / "store"
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR", store
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store
         )
         src = tmp_path / "my-agent.md"
         src.write_text("body", encoding="utf-8")
@@ -228,3 +263,24 @@ class TestCopyLocalProfileToStore:
 
         assert stem == "my-agent"
         assert (store / "my-agent.md").read_text(encoding="utf-8") == "body"
+
+
+def test_install_omp_provider_is_accepted_by_cli():
+    runner = CliRunner()
+    service_result = InstallResult(
+        success=True,
+        message="Agent 'developer' installed successfully",
+        agent_name="developer",
+        context_file="/tmp/agent-context/developer.md",
+        agent_file=None,
+        provider="omp",
+    )
+
+    with patch(
+        "cli_agent_orchestrator.cli.commands.install.install_agent",
+        return_value=service_result,
+    ) as mock_install:
+        result = runner.invoke(install, ["developer", "--provider", "omp"])
+
+    assert result.exit_code == 0
+    mock_install.assert_called_once_with("developer", "omp", None)

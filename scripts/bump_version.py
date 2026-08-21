@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
+DEVCONTAINER_FEATURE = ROOT / ".devcontainer" / "features" / "cao" / "devcontainer-feature.json"
 
 
 def get_version() -> str:
@@ -28,8 +29,18 @@ def bump(part: str, version: str) -> str:
 
 def update_pyproject(new_version: str) -> None:
     content = PYPROJECT.read_text()
-    content = re.sub(r'version = "[^"]+"', f'version = "{new_version}"', content)
+    # Anchor to the start of a line so only the [project] ``version`` key is
+    # rewritten. An unanchored ``version = "..."`` also matches the tail of
+    # ``python_version = "..."`` under [tool.mypy], which previously clobbered
+    # the mypy target with the package version on every release.
+    content = re.sub(r'(?m)^version = "[^"]+"', f'version = "{new_version}"', content, count=1)
     PYPROJECT.write_text(content)
+
+
+def update_devcontainer_feature(new_version: str) -> None:
+    content = DEVCONTAINER_FEATURE.read_text()
+    content = re.sub(r'"version": "[^"]+"', f'"version": "{new_version}"', content, count=1)
+    DEVCONTAINER_FEATURE.write_text(content)
 
 
 def generate_changelog(new_version: str) -> None:
@@ -68,11 +79,12 @@ def main() -> None:
     new = bump(sys.argv[1], old)
 
     update_pyproject(new)
+    update_devcontainer_feature(new)
     generate_changelog(new)
 
     print(f"Bumped {old} -> {new}")
     print(f"\nNext steps:")
-    print(f"  1. git add pyproject.toml CHANGELOG.md")
+    print(f"  1. git add pyproject.toml CHANGELOG.md {DEVCONTAINER_FEATURE.relative_to(ROOT)}")
     print(f"  2. git commit -m 'chore: release v{new}'")
     print(f"  3. git tag v{new}")
     print(f"  4. git push && git push --tags")

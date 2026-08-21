@@ -1,12 +1,28 @@
 """Tests for the init CLI command."""
 
+import errno
+import shutil
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.cli.commands.init import init, seed_default_skills
+from cli_agent_orchestrator.clients import database as db_module
+from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
+from cli_agent_orchestrator.services import memory_reconciliation
+from cli_agent_orchestrator.services.memory_reconciliation import (
+    MemoryIdentity,
+    MemoryReconciliationError,
+    RepairAction,
+    RepairFinding,
+    RepairRecord,
+    RepairReport,
+)
 
 
 def _create_bundled_skill(root: Path, name: str, description: str) -> None:
@@ -19,6 +35,19 @@ def _create_bundled_skill(root: Path, name: str, description: str) -> None:
     (skill_dir / "extra.txt").write_text("extra")
 
 
+def _write_agent_topic(base: Path, key: str) -> None:
+    path = base / "global" / "wiki" / "agent" / "code_supervisor" / f"{key}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"# {key}\n"
+        f"<!-- id: {uuid.uuid4()} | scope: agent | "
+        "type: reference | tags: init repair -->\n\n"
+        "## 2026-07-16T02:00:00Z\n"
+        "surviving content\n",
+        encoding="utf-8",
+    )
+
+
 class TestInitCommand:
     """Tests for the init command."""
 
@@ -26,6 +55,15 @@ class TestInitCommand:
     def runner(self):
         """Create a CLI test runner."""
         return CliRunner()
+
+    @pytest.fixture(autouse=True)
+    def isolate_memory_reconciliation(self):
+        """Keep command tests away from the developer's configured memory root."""
+        with patch(
+            "cli_agent_orchestrator.cli.commands.init.reconcile_memory_startup",
+            return_value=None,
+        ):
+            yield
 
     @patch("cli_agent_orchestrator.cli.commands.init.init_db")
     def test_init_success(self, mock_init_db, runner):
@@ -62,6 +100,85 @@ class TestInitCommand:
 
         assert result.exit_code != 0
         assert "Permission denied" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.init.seed_default_skills")
+    @patch("cli_agent_orchestrator.cli.commands.init.reconcile_memory_startup")
+    @patch("cli_agent_orchestrator.cli.commands.init.init_db")
+    def test_init_exits_nonzero_after_reconciliation_failure(
+        self, mock_init_db, mock_reconcile, mock_seed, runner
+    ):
+        """Schema initialization remains complete when bounded repair fails."""
+        report = RepairReport(
+            records=(
+                RepairRecord(
+                    identity=MemoryIdentity("failed", "global"),
+                    file_path="/memory/failed.md",
+                    actions=(RepairAction.FAILED,),
+                    status="failed",
+                    finding=RepairFinding("unexpected_error", "injected"),
+                ),
+            ),
+            applied=True,
+        )
+        mock_reconcile.side_effect = MemoryReconciliationError(report)
+
+        result = runner.invoke(init)
+
+        assert result.exit_code != 0
+        mock_init_db.assert_called_once()
+        mock_seed.assert_not_called()
+        assert "failed=1" in result.output
+        assert "cao memory repair --apply" in result.output
+
+    def test_init_repairs_replacement_database_and_rerun_is_noop(
+        self, tmp_path, monkeypatch, runner
+    ):
+        """The command initializes schema before running the real bounded repair."""
+        base = tmp_path / "memory"
+        _write_agent_topic(base, "surviving-agent")
+        replacement_engine = create_engine(
+            f"sqlite:///{tmp_path / 'replacement.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        sessions = sessionmaker(autocommit=False, autoflush=False, bind=replacement_engine)
+        monkeypatch.setattr(db_module, "SessionLocal", sessions)
+        monkeypatch.setattr(memory_reconciliation, "MEMORY_BASE_DIR", base)
+
+        def initialize_replacement() -> None:
+            Base.metadata.create_all(bind=replacement_engine)
+
+        with (
+            patch(
+                "cli_agent_orchestrator.cli.commands.init.init_db",
+                side_effect=initialize_replacement,
+            ),
+            patch(
+                "cli_agent_orchestrator.cli.commands.init.reconcile_memory_startup",
+                side_effect=memory_reconciliation.reconcile_memory_startup,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.is_memory_enabled",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.cli.commands.init.seed_default_skills",
+                return_value=0,
+            ),
+        ):
+            first = runner.invoke(init)
+            second = runner.invoke(init)
+
+        assert first.exit_code == 0
+        assert "repaired=1" in first.output
+        assert second.exit_code == 0
+        assert "unchanged=1" in second.output
+        with sessions() as db:
+            row = db.query(MemoryMetadataModel).one()
+            assert (row.key, row.scope, row.scope_id) == (
+                "surviving-agent",
+                "agent",
+                "code_supervisor",
+            )
 
 
 class TestSeedDefaultSkills:
@@ -130,3 +247,71 @@ class TestSeedDefaultSkills:
         assert (skill_store / "beta" / "SKILL.md").exists()
         assert first_seed_count == 1
         assert second_seed_count == 1
+
+    def test_seed_default_skills_retries_after_interrupted_copy(self, tmp_path, monkeypatch):
+        """A failed staged copy must not leave a partial final destination."""
+        bundled_root = tmp_path / "bundled"
+        _create_bundled_skill(bundled_root, "alpha", "Alpha skill")
+
+        skill_store = tmp_path / "skill-store"
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.init.SKILLS_DIR", skill_store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.init.resources.files", lambda _: bundled_root
+        )
+
+        def interrupted_copy(source, destination):
+            destination.mkdir(parents=True)
+            (destination / "partial.txt").write_text("incomplete")
+            raise OSError("interrupted copy")
+
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(
+                "cli_agent_orchestrator.cli.commands.init.shutil.copytree",
+                interrupted_copy,
+            )
+            with pytest.raises(OSError, match="interrupted copy"):
+                seed_default_skills()
+
+        assert not (skill_store / "alpha").exists()
+        assert list(skill_store.iterdir()) == []
+
+        abandoned_stage = skill_store / ".alpha.abandoned" / "alpha"
+        abandoned_stage.mkdir(parents=True)
+        (abandoned_stage / "partial.txt").write_text("abandoned")
+
+        seeded_count = seed_default_skills()
+
+        assert seeded_count == 1
+        assert (skill_store / "alpha" / "SKILL.md").is_file()
+        assert (skill_store / "alpha" / "extra.txt").read_text() == "extra"
+        assert (abandoned_stage / "partial.txt").read_text() == "abandoned"
+
+    def test_seed_default_skills_preserves_concurrent_winner(self, tmp_path, monkeypatch):
+        """A completed destination that wins the publish race must be preserved."""
+        bundled_root = tmp_path / "bundled"
+        _create_bundled_skill(bundled_root, "alpha", "Bundled alpha")
+
+        skill_store = tmp_path / "skill-store"
+        destination = skill_store / "alpha"
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.init.SKILLS_DIR", skill_store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.init.resources.files", lambda _: bundled_root
+        )
+
+        def concurrent_rename(source, target):
+            assert Path(target) == destination
+            destination.mkdir()
+            (destination / "SKILL.md").write_text(
+                "---\nname: alpha\ndescription: Concurrent winner\n---\n"
+            )
+            (destination / "winner.txt").write_text("preserve me")
+            raise FileExistsError(errno.EEXIST, "destination exists", target)
+
+        monkeypatch.setattr(Path, "rename", concurrent_rename)
+
+        seeded_count = seed_default_skills()
+
+        assert seeded_count == 0
+        assert "Concurrent winner" in (destination / "SKILL.md").read_text()
+        assert (destination / "winner.txt").read_text() == "preserve me"
+        assert not (destination / "extra.txt").exists()

@@ -9,6 +9,7 @@ from typing import Optional
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
@@ -119,10 +120,13 @@ class HermesProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Explicit per-call override for profile.model, see _build_hermes_command.
+        self._model = model
         self._last_idle_timer: Optional[str] = None
         self._stable_idle_timer_count = 0
 
@@ -156,8 +160,12 @@ class HermesProvider(BaseProvider):
             "cao",
         ]
 
-        if profile and profile.model:
-            command_parts.extend(["--model", profile.model])
+        # self._model is an explicit per-call override (handoff/assign's own
+        # `model` parameter) and wins over the profile's own static model
+        # field when both are given.
+        resolved_model = self._model or (profile.model if profile else None)
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
 
         if self._skill_prompt:
             logger.warning(
@@ -173,16 +181,17 @@ class HermesProvider(BaseProvider):
 
         return shlex.join(command_parts)
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Hermes by starting the configured profile chat REPL."""
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         command = self._build_hermes_command()
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=120.0,
             polling_interval=1.0,
@@ -192,9 +201,24 @@ class HermesProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Hermes status by analyzing the tmux capture buffer."""
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+    def get_status(self, output: str) -> TerminalStatus:
+        """Get Hermes status by analyzing the terminal output buffer.
+
+        Args:
+            output: Terminal output buffer (rolling buffer, up to
+                ``state_buffer_max`` bytes -- server setting, 32KB default)
+                supplied by the StatusMonitor via the FIFO reader pipeline.
+        """
+        # Native status (herdr): trust the backend's agent state when available.
+        # Must precede the empty-buffer -> ERROR default below: on herdr the
+        # buffer is always empty, so without this every status would be ERROR.
+        native = self._resolve_native_status(output)
+        if native is not None:
+            return native
+
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.ERROR
 

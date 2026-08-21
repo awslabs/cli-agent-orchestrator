@@ -10,14 +10,13 @@ Tests the worker side of the handoff flow — validates that each provider can:
 NOTE: These tests do NOT test a supervisor agent calling the handoff() MCP tool.
 For real supervisor→worker delegation tests, see test_supervisor_orchestration.py.
 
-Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, gemini, copilot), tmux.
+Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, copilot), tmux.
 
 Run:
     uv run pytest -m e2e test/e2e/test_handoff.py -v
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k codex
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k kiro_cli
-    uv run pytest -m e2e test/e2e/test_handoff.py -v -k gemini_cli
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k copilot
 """
 
@@ -43,7 +42,7 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
     """Core handoff test logic shared across providers.
 
     Args:
-        provider: Provider name ("codex", "claude_code", "kiro_cli", "gemini_cli")
+        provider: Provider name ("codex", "claude_code", "kiro_cli")
         agent_profile: Agent profile name ("developer")
         task_message: The task to send to the agent
         content_keywords: Words expected in the output (at least one must match)
@@ -59,8 +58,8 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         assert terminal_id, "Terminal ID should not be empty"
 
         # Step 2: Wait for ready (idle or completed).
-        # Providers with initial prompts (Gemini CLI -i) reach 'completed'
-        # after processing the system prompt; others reach 'idle'.
+        # Providers with initial prompts reach 'completed' after processing
+        # the system prompt; others reach 'idle'.
         start = time.time()
         while time.time() - start < 90.0:
             s = get_terminal_status(terminal_id)
@@ -115,6 +114,63 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
             matched
         ), f"Expected at least one of {content_keywords} in output, got: {output[:200]}"
 
+    finally:
+        if terminal_id and actual_session:
+            cleanup_terminal(terminal_id, actual_session)
+
+
+def _run_second_task_same_terminal_test(provider: str, agent_profile: str):
+    """Send two independent turns to one terminal and extract only the second."""
+    session_suffix = uuid.uuid4().hex[:6]
+    session_name = f"e2e-handoff-2t-{provider}-{session_suffix}"
+    terminal_id = None
+    actual_session = None
+
+    try:
+        terminal_id, actual_session = create_terminal(provider, agent_profile, session_name)
+        assert terminal_id, "Terminal ID should not be empty"
+
+        start = time.time()
+        while time.time() - start < 90.0:
+            status = get_terminal_status(terminal_id)
+            if status in ("idle", "completed", "error"):
+                break
+            time.sleep(3)
+        assert status in (
+            "idle",
+            "completed",
+        ), f"Terminal did not become ready within 90s (provider={provider})"
+
+        first_task = (
+            "Create a Python function called 'square_first_turn' that takes n and "
+            "returns n squared. Output only the function code."
+        )
+        send_handoff_message(terminal_id, first_task, provider)
+        assert wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT)
+        first_output = extract_output(terminal_id)
+        assert "square_first_turn" in first_output.lower()
+
+        second_task = (
+            "Now create a different Python function called 'cube_second_turn' that "
+            "takes n and returns n cubed. Output only the new function code."
+        )
+        send_handoff_message(terminal_id, second_task, provider)
+        assert wait_for_status(
+            terminal_id, "completed", timeout=COMPLETION_TIMEOUT
+        ), f"Second turn did not complete within {COMPLETION_TIMEOUT}s (provider={provider})"
+
+        time.sleep(5)
+        if get_terminal_status(terminal_id) != "completed":
+            assert wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT)
+
+        second_output = extract_output(terminal_id)
+        second_lower = second_output.lower()
+        assert (
+            "cube_second_turn" in second_lower
+        ), f"Second-turn response was not extracted: {second_output[:300]}"
+        assert "square_first_turn" not in second_lower, (
+            "First-turn response leaked into second-turn extraction: " f"{second_output[:300]}"
+        )
     finally:
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
@@ -257,40 +313,6 @@ class TestKimiCliHandoff:
 
 
 # ---------------------------------------------------------------------------
-# Gemini CLI provider tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.e2e
-class TestGeminiCliHandoff:
-    """E2E handoff tests for the Gemini CLI provider."""
-
-    def test_handoff_simple_function(self, require_gemini):
-        """Gemini CLI developer creates a simple Python function and returns output."""
-        _run_handoff_test(
-            provider="gemini_cli",
-            agent_profile="developer",
-            task_message=(
-                "Create a Python function called 'greet' that takes a name parameter "
-                "and returns 'Hello, {name}!'. Output only the function code."
-            ),
-            content_keywords=["greet", "hello", "def"],
-        )
-
-    def test_handoff_second_task(self, require_gemini):
-        """Gemini CLI developer handles a second independent task."""
-        _run_handoff_test(
-            provider="gemini_cli",
-            agent_profile="developer",
-            task_message=(
-                "Create a Python function called 'square' that takes a parameter n "
-                "and returns n squared. Output only the function code."
-            ),
-            content_keywords=["square", "return", "def"],
-        )
-
-
-# ---------------------------------------------------------------------------
 # Copilot CLI provider tests
 # ---------------------------------------------------------------------------
 
@@ -322,3 +344,141 @@ class TestCopilotCliHandoff:
             ),
             content_keywords=["multiply", "product", "return", "def"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Cursor CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCursorCliHandoff:
+    """E2E handoff tests for the Cursor CLI provider.
+
+    Requires the ``agent`` (or legacy ``cursor-agent``) binary on PATH.
+    Skip otherwise via the ``require_cursor`` fixture.
+    """
+
+    def test_handoff_simple_function(self, require_cursor):
+        """Cursor CLI developer creates a simple Python function and returns output."""
+        _run_handoff_test(
+            provider="cursor_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_cursor):
+        """Cursor CLI developer handles a second independent task."""
+        _run_handoff_test(
+            provider="cursor_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'multiply' that takes two parameters "
+                "a and b and returns their product. Output only the function code."
+            ),
+            content_keywords=["multiply", "product", "return", "def"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestAntigravityCliHandoff:
+    """E2E handoff tests for the Antigravity CLI provider."""
+
+    def test_handoff_simple_function(self, require_antigravity):
+        """Antigravity CLI developer creates a simple Python function and returns output."""
+        _run_handoff_test(
+            provider="antigravity_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_antigravity):
+        """Antigravity CLI developer handles a second independent task."""
+        _run_handoff_test(
+            provider="antigravity_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'square' that takes a parameter n "
+                "and returns n squared. Output only the function code."
+            ),
+            content_keywords=["square", "return", "def"],
+        )
+
+
+@pytest.mark.e2e
+class TestOmpHandoff:
+    """OMP reaches completed state and returns only each latest response."""
+
+    def test_handoff_simple_function(self, require_omp):
+        _run_handoff_test(
+            provider="omp",
+            agent_profile="developer",
+            task_message="Create a Python function greet(name). Output only the function code.",
+            content_keywords=["greet", "def"],
+        )
+
+    def test_handoff_second_task(self, require_omp):
+        _run_handoff_test(
+            provider="omp",
+            agent_profile="developer",
+            task_message="Create a Python function square(n). Output only the function code.",
+            content_keywords=["square", "def"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Grok Build CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGrokCliHandoff:
+    """E2E lifecycle tests for the official xAI Grok Build CLI provider."""
+
+    def test_handoff_simple_function(self, require_grok):
+        """Grok creates a simple Python function and returns its output."""
+        _run_handoff_test(
+            provider="grok_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_grok):
+        """Grok returns the second independent response from the same TUI session."""
+        _run_second_task_same_terminal_test(provider="grok_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeHandoff:
+    """E2E lifecycle tests for the MiniMax Code provider."""
+
+    def test_handoff_simple_function(self, require_minimax_code):
+        _run_handoff_test(
+            provider="mcode",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_minimax_code):
+        _run_second_task_same_terminal_test(provider="mcode", agent_profile="developer")

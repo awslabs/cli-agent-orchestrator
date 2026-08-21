@@ -1,5 +1,6 @@
 """Flow service for scheduled agent sessions."""
 
+import asyncio
 import json
 import logging
 import re
@@ -11,6 +12,7 @@ from typing import Any, Dict, List, Tuple, cast
 import frontmatter  # type: ignore
 from apscheduler.triggers.cron import CronTrigger  # type: ignore
 
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
 from cli_agent_orchestrator.clients.database import (
@@ -26,11 +28,13 @@ from cli_agent_orchestrator.clients.database import update_flow_enabled as db_up
 from cli_agent_orchestrator.clients.database import (
     update_flow_run_times as db_update_flow_run_times,
 )
-from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
+from cli_agent_orchestrator.models.kiro_engine import parse_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
 from cli_agent_orchestrator.utils.template import render_template
 
@@ -91,6 +95,22 @@ def add_flow(file_path: str) -> Flow:
         except Exception as e:
             raise ValueError(f"Invalid cron expression '{schedule}': {e}")
 
+        # Construct the model before persisting the registration so front-matter
+        # engine values receive Pydantic's canonical v2/kas validation.
+        validated_flow = Flow(
+            name=name,
+            file_path=str(path),
+            schedule=schedule,
+            agent_profile=agent_profile,
+            provider=provider,
+            engine=metadata.get("engine"),
+            script=script,
+            last_run=None,
+            next_run=next_run,
+            enabled=True,
+            prompt_template=None,
+        )
+
         # Create flow in database
         flow = db_create_flow(
             name=name,
@@ -101,6 +121,7 @@ def add_flow(file_path: str) -> Flow:
             script=script,
             next_run=next_run,
         )
+        flow = Flow.model_validate({**flow.model_dump(), "engine": validated_flow.engine})
 
         logger.info(f"Added flow: {name}")
         return flow
@@ -113,11 +134,26 @@ def add_flow(file_path: str) -> Flow:
 def _enrich_flow_with_prompt(flow: Flow) -> Flow:
     """Read the prompt template from the flow file and attach it."""
     try:
-        _, prompt = _parse_flow_file(Path(flow.file_path))
-        flow.prompt_template = prompt.strip()
+        metadata, prompt = _parse_flow_file(Path(flow.file_path))
     except Exception:
-        flow.prompt_template = None
-    return flow
+        return Flow.model_validate({**flow.model_dump(), "prompt_template": None})
+
+    enriched_flow = {
+        **flow.model_dump(),
+        "engine": metadata.get("engine"),
+        "prompt_template": prompt.strip(),
+    }
+    try:
+        return Flow.model_validate(enriched_flow)
+    except ValueError:
+        # Flow files can be edited after registration. Do not let an invalid
+        # engine value in one file prevent callers from reading other flows.
+        logger.warning(
+            "Ignoring invalid engine metadata for flow %s in %s",
+            flow.name,
+            flow.file_path,
+        )
+        return Flow.model_validate({**enriched_flow, "engine": None})
 
 
 def list_flows() -> List[Flow]:
@@ -167,13 +203,12 @@ def enable_flow(name: str) -> bool:
 
 def _is_terminal_busy(terminal_id: str) -> bool:
     try:
-        provider = provider_manager.get_provider(terminal_id)
-        return provider is not None and provider.get_status() == TerminalStatus.PROCESSING
+        return status_monitor.get_status(terminal_id) == TerminalStatus.PROCESSING
     except Exception:
         return False
 
 
-def execute_flow(name: str) -> bool:
+async def execute_flow(name: str) -> bool:
     """Execute flow: run script, render prompt, launch session."""
     try:
         logger.info(f"Executing flow: {name}")
@@ -181,7 +216,13 @@ def execute_flow(name: str) -> bool:
 
         # Read flow file
         file_path = Path(flow.file_path)
-        _, prompt_template = _parse_flow_file(file_path)
+        metadata, prompt_template = _parse_flow_file(file_path)
+
+        # get_flow degrades an invalid engine to None so one bad file cannot
+        # break listing. Executing on that None would silently launch v2, so
+        # re-validate the raw value here: at the execution boundary a rejected
+        # engine must fail rather than fall back to the default.
+        parse_kiro_engine(metadata.get("engine"))
 
         # If no script, always execute with empty output
         if not flow.script:
@@ -233,8 +274,8 @@ def execute_flow(name: str) -> bool:
 
         # Launch session
         session_name = f"cao-flow-{flow.name}"
-        if tmux_client.session_exists(session_name):
-            terminals = list_terminals_by_session(session_name)
+        terminals = list_terminals_by_session(session_name)
+        if get_backend().session_exists(session_name):
             # Only check the first (conductor) terminal for busy status.
             # Worker terminals spawned by the conductor may have stale status
             # after /exit and should not block flow recycling.
@@ -243,18 +284,66 @@ def execute_flow(name: str) -> bool:
                 logger.info(f"Flow {name}: session {session_name} is busy, skipping")
                 return False
             for t in terminals:
-                provider_manager.cleanup_provider(t["id"])
-            tmux_client.kill_session(session_name)
+                # Tear down the event-driven pipeline for each recycled terminal:
+                # stop the FIFO reader thread (and unlink its *.fifo file) and clear
+                # the StatusMonitor buffers. Without this, repeated flow runs leak
+                # background reader threads and stale FIFO files / status entries.
+                try:
+                    fifo_manager.stop_reader(t["id"])
+                except Exception as e:
+                    logger.warning(f"Failed to stop FIFO reader for {t['id']}: {e}")
+                try:
+                    status_monitor.clear_terminal(t["id"])
+                except Exception as e:
+                    logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
+            get_backend().kill_session(session_name)
+            # A provider's private state must outlive the process that owns
+            # it.  Grok cleanup confirms any escaped updater has stopped
+            # before recursively deleting its private GROK_HOME.
+            cleanup_complete = True
+            for t in terminals:
+                # Do not bulk-delete DB rows if a Grok private home is still
+                # owned by a process we cannot safely inspect. Retained rows
+                # are the retry handle for a later terminal cleanup.
+                if provider_manager.cleanup_provider(t["id"]) is False:
+                    cleanup_complete = False
+            if not cleanup_complete:
+                logger.warning(
+                    "Flow %s recycling cleanup deferred; retaining terminal metadata for retry",
+                    name,
+                )
+                return False
             delete_terminals_by_session(session_name)
-        terminal = create_terminal(
+        elif terminals:
+            # A previous recycle can have killed the backend session but safely
+            # retained its terminal rows because a Grok-owned private home was
+            # still in use.  Do not create a same-named flow session until those
+            # rows have been retried: doing so would abandon their only cleanup
+            # handle and could collide with the deterministic GROK_HOME path.
+            cleanup_complete = True
+            for terminal_metadata in terminals:
+                if provider_manager.cleanup_provider(terminal_metadata["id"]) is False:
+                    cleanup_complete = False
+            if not cleanup_complete:
+                logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
+                return False
+            delete_terminals_by_session(session_name)
+        terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,
             agent_profile=flow.agent_profile,
             new_session=True,
+            engine=flow.engine,
         )
 
-        # Send rendered prompt to terminal
-        send_input(terminal.id, rendered_prompt)
+        # Send rendered prompt to terminal. send_input is blocking tmux I/O
+        # (now additionally a pane-foreground-command probe on top of the
+        # existing bracketed-paste delivery, see clients/tmux.py's
+        # _pane_is_bracketed_paste_incompatible) -- run it off the event loop
+        # so a slow tmux call can't freeze every other request (same hazard
+        # class as issue #382, already fixed for POST /terminals/{id}/input
+        # in api/main.py's send_terminal_input; this call site was missed).
+        await asyncio.to_thread(send_input, terminal.id, rendered_prompt)
 
         logger.info(f"Flow {name}: launched session {session_name}")
         return True

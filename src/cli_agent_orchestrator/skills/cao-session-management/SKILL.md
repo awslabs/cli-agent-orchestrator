@@ -18,12 +18,68 @@ session orchestrates the work.
 - **Conductor**: The supervisor terminal — receives instructions, delegates to workers
 - **Provider**: LLM backend. Default `kiro_cli`, override with `--provider`
 
+## Prerequisites
+
+Before launching a session, verify:
+
+- **`cao-server` is running** at `localhost:9889`. Quick check:
+  ```bash
+  curl -sf http://localhost:9889/sessions >/dev/null && echo OK || echo "start cao-server"
+  ```
+  If not running, start it in a separate terminal: `cao-server`.
+- **The agent profile is installed.** `cao launch --agents <profile>` fails if the profile is unknown. Install built-ins or custom files with `cao install <profile|path|url>`.
+
+## Discovering Available Profiles
+
+Profiles are CAO-level entities, installed with `cao install` regardless of which CLI provider runs them. To find available profiles:
+
+| Source | Command |
+|--------|---------|
+| All available profiles across built-in store + local store + provider directories | `curl -sf http://localhost:9889/agents/profiles` — canonical, provider-agnostic |
+| Custom/local profile files only | `ls ~/.aws/cli-agent-orchestrator/agent-store/` |
+| Built-in profiles installed via `cao install <name>` | `ls ~/.aws/cli-agent-orchestrator/agent-context/` |
+| Profile installation and keyword discovery | see [Agent profile installation](../../docs/agent-profile.md#installation) and [profile discovery](../../docs/agent-profile.md#profile-discovery) |
+| Provider-native list (`kiro_cli` only) | `kiro-cli agent list` — useful because CAO mirrors profiles into `~/.kiro/agents/` |
+
+The HTTP endpoint is the recommended check: it scans the built-in packaged store, the local store (`agent-store/`), and provider-specific directories (including `agent-context/`), then returns a deduplicated list (by profile name, built-in wins) with a `source` label on each entry.
+
+If unsure which profile to use, ask the user rather than guessing.
+
+## Quick Example
+
+A complete, copy-pasteable supervisor launch. The default provider is `kiro_cli`; pass `--provider <name>` to use another (`claude_code`, `codex`, `antigravity_cli`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`).
+
+This example assumes a configured CAO setup (server running, profiles installed). On an already-configured host you can skip straight to `cao launch`. The `cao install` lines below are only for first-time setup; remove them if your CAO is already configured.
+
+```bash
+# Optional — skip if your CAO is already configured with these profiles.
+# Provider-agnostic: `cao install` works for any provider.
+cao install code_supervisor
+cao install developer
+cao install reviewer
+
+# Launch headlessly (assumes cao-server is already running)
+cao launch --agents code_supervisor --headless --yolo \
+  --session-name my-task --working-directory '/path/to/project' \
+  "Build a hello-world Python script. Delegate to developer, then reviewer."
+
+# Same launch on a different provider
+# cao launch --agents code_supervisor --provider claude_code --headless --yolo \
+#   --session-name my-task --working-directory '/path/to/project' "..."
+
+# Check progress / final output
+cao session status cao-my-task
+cao session status cao-my-task --workers
+
+# Clean up
+cao shutdown --session cao-my-task
+```
+
 ## Launching a Session
 
 Every `cao launch` MUST include:
 
-- `--agents PROFILE` — for `kiro_cli` provider, run `kiro-cli agent list` to discover
-  profiles; otherwise ask the user
+- `--agents PROFILE` — see [Discovering Available Profiles](#discovering-available-profiles) above; if unclear, ask the user
 - `--headless` — required from an LLM agent; without it cao tries to attach tmux
 - `--session-name NAME` — cao adds `cao-` prefix automatically
 - `--working-directory DIR` — a wrong path silently breaks the session with no
@@ -62,6 +118,11 @@ polling for `completed` status.
 
 > `cao session send` waits for completion and returns output inline by default. With `--async`, it sends and returns immediately without waiting. With `--timeout N`, it waits up to N seconds — if the timeout expires, the agent is still running; check status later.
 > Session names in commands use the `cao-` prefixed form (e.g. `--session-name mywork` → use `cao-mywork`).
+
+A reported status is inferred from the rendered terminal screen, not from a
+structured protocol, so it can disagree with reality. Before reporting readiness,
+progress, or completion to a user, corroborate the status with an output read —
+see [cao-session-liveness](../cao-session-liveness/SKILL.md).
 
 ## Worker Communication
 

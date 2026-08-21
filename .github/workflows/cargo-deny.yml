@@ -1,0 +1,106 @@
+name: cargo-deny
+
+# Rust supply-chain gate for the `cao-tui` crate (issue #321, unit `rust-ci`).
+# Requirements SR-1 and SR-2, affirmed at interview Q1: `cargo-deny` is a HARD gate covering
+# advisories, licenses, bans, and sources. The policy itself — and the reasoning behind every
+# non-default setting — lives in `tui/deny.toml`.
+#
+# WHY A SEPARATE WORKFLOW RATHER THAN A JOB IN ci.yml
+# --------------------------------------------------
+# Two triggers with two different purposes, and the schedule is what forces the split:
+#
+#   - pull_request: gate the change under review.
+#   - schedule: a weekly sweep, because THE GRAPH CAN GO STALE WITHOUT THE CODE CHANGING.
+#     A new RustSec advisory against an already-pinned dependency is the normal case, and a
+#     PR-only gate would not notice it until someone happened to open a PR. `Cargo.lock` is
+#     committed and CI runs `--locked`, so a vulnerable version stays pinned until something
+#     looks.
+#
+# Adding `schedule` to ci.yml would drag that entire workflow — the 3-version Python matrix,
+# the Playwright E2E job, the two ag-ui recording jobs that install ffmpeg and Chromium, the
+# stock-client live job, and the new two-platform Rust matrix — onto a cron timer to answer
+# one question about the Rust dependency graph. secret-scan.yml was split from ci.yml for
+# exactly this reason, in its own words: "so the weekly full-history sweep does not drag the
+# entire CI matrix (unit/web/e2e/lint/Trivy) onto a schedule." This follows that precedent
+# rather than inventing a second pattern.
+#
+# The `rust` job in ci.yml carries an INDEPENDENT no-FFI check on both platforms
+# (`scripts/assert_no_ffi.py`), so the FR-5.2 boundary is not left resting on this
+# Linux-only Docker action alone.
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays 07:30 UTC — half an hour after secret-scan.yml's 07:00 gitleaks sweep, so the
+    # two weekly jobs do not contend for runners.
+    - cron: "30 7 * * 1"
+  # A vulnerability disclosure does not wait for Monday.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    # A Docker action, so Linux only — this is not a platform choice. The checks are over the
+    # resolved dependency GRAPH, which is platform-independent: `tui/deny.toml` leaves
+    # `[graph] targets` empty precisely so the Windows-only and unix-only crates are all in
+    # view from a single runner.
+    runs-on: ubuntu-latest
+    # team.md / TS-2: no job in this repo carried a timeout before unit `wheel-matrix`.
+    # Nothing here is slow (the local full run is seconds plus an advisory-db fetch), so a
+    # 15-minute bound is generous while still failing a hung network fetch fast rather than
+    # burning the 6-hour default.
+    timeout-minutes: 15
+    steps:
+      # SHA-pinned (SR-5, interview Q10). Reuses the exact pin `wheel-matrix` resolved rather
+      # than re-resolving to a possibly different version.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # SHA-pinned to a COMMIT (SR-5). Worth stating how this one was resolved, because the
+      # obvious route gives the wrong object: v2.1.1 is an ANNOTATED tag, so
+      # `git/ref/tags/v2.1.1` returns the tag object's own SHA (c3bbe7e4…), not a commit.
+      # Dereferencing it via `git/tags/c3bbe7e4…` yields commit 3c6349835b2b…, which is what
+      # is pinned here. Pinning the tag object's SHA would not have been a commit pin at all.
+      #
+      # The action's Dockerfile at this commit bundles cargo-deny 0.20.2 — the same version
+      # `tui/deny.toml` was validated against locally, so a config-schema difference cannot
+      # make CI disagree with the local result. (cargo-deny rejects unknown config keys, so a
+      # version skew would surface as a hard `error[unexpected-keys]` rather than a silently
+      # disabled check.)
+      #
+      # INPUTS, all three deliberate:
+      #   `arguments` REPLACES the action's default of `--all-features`, so `--locked` must be
+      #     passed explicitly (TS-2, interview Q7) — the gate has to inspect the COMMITTED
+      #     lockfile, not a fresh resolution that might resolve a problem away.
+      #   `manifest-path` is the action's OWN input and must be used for the path — it is NOT
+      #     free-form, and this is the bug the first CI run caught. The action's `action.yml`
+      #     unconditionally appends `--manifest-path ${{ inputs.manifest-path }}` (defaulting to
+      #     `./Cargo.toml`) to the container args, so also naming `--manifest-path` inside
+      #     `arguments` passed the flag TWICE and cargo-deny rejected the invocation outright:
+      #     "error: the argument '--manifest-path <MANIFEST_PATH>' cannot be used multiple
+      #     times". A hard gate that cannot start is worse than one that fails, because the
+      #     usage error looks like a broken pin rather than a policy violation. The path stays
+      #     repo-root-relative: cargo-deny resolves its config next to the MANIFEST rather than
+      #     the cwd, so `tui/deny.toml` is what gets read. Verified by planting a
+      #     deliberately-failing config at that path and confirming a root-invoked run picked
+      #     it up and failed.
+      #   `command-arguments: --show-stats` prints per-check tallies. That is what makes a pass
+      #     LEGIBLE rather than merely green: "licenses ok: 0 errors, 0 warnings, 39 notes"
+      #     attests that 39 crates were examined. Without it, a pass over a truncated graph
+      #     reads identically to a pass over the real one — and this crate has a measured
+      #     instance of that hazard, since `[licenses] include-dev` defaults to false and would
+      #     silently check only 10 of the 39. (#321)
+      #
+      # No `exit-code`-style input is needed: cargo-deny exits non-zero on any error, and the
+      # action surfaces that directly (measured locally: exit 2 with a banned crate present,
+      # exit 0 on the clean graph). The job is a hard gate by default.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --locked
+          manifest-path: tui/Cargo.toml
+          command-arguments: --show-stats
+          log-level: warn

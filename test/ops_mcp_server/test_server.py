@@ -17,6 +17,8 @@ from cli_agent_orchestrator.ops_mcp_server.server import (
     _launch_session_impl,
     get_profile_details,
     get_session_info,
+    get_terminal_output,
+    get_terminal_status,
     install_profile,
     launch_session,
     list_profiles,
@@ -172,14 +174,39 @@ class TestProfileTools:
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(json_data=payload),
         ) as mock_request:
-            result = await install_profile("https://example.com/remote.md", provider="q_cli")
+            result = await install_profile("https://example.com/remote.md", provider="kiro_cli")
 
         assert result == InstallResult(**payload)
         mock_request.assert_called_once_with(
             "post",
             "http://127.0.0.1:9889/agents/profiles/install",
             params=None,
-            json={"source": "https://example.com/remote.md", "provider": "q_cli"},
+            json={"source": "https://example.com/remote.md", "provider": "kiro_cli"},
+        )
+
+    async def test_install_profile_omits_provider_when_not_explicit(self) -> None:
+        """Omitted provider should be left out of the body so the install API
+        resolves the profile's frontmatter provider (GH #414)."""
+        payload: InstallPayload = {
+            "success": True,
+            "message": "Agent 'developer' installed successfully",
+            "agent_name": "developer",
+            "context_file": "/tmp/developer.md",
+            "agent_file": None,
+            "unresolved_vars": None,
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await install_profile("developer")
+
+        assert result == InstallResult(**payload)
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/agents/profiles/install",
+            params=None,
+            json={"source": "developer"},
         )
 
     async def test_install_profile_forwards_env_vars(self) -> None:
@@ -319,6 +346,63 @@ class TestSessionLifecycleTools:
             json=None,
         )
 
+    async def test_launch_session_passes_model_and_initial_message(self) -> None:
+        """The model stays in routing params and the first task stays in JSON."""
+        initial_message = "Review the current change"
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"id": "term-789"}),
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                provider="codex",
+                session_name="model-session",
+                model="gpt-5.1-codex",
+                initial_message=initial_message,
+            )
+
+        assert result == LaunchResult(
+            success=True,
+            message=(
+                "Session 'model-session' launched; " "initial message delivery is in progress"
+            ),
+            session_name="model-session",
+            terminal_id="term-789",
+        )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/sessions",
+            params={
+                "provider": "codex",
+                "agent_profile": "developer",
+                "session_name": "model-session",
+                "model": "gpt-5.1-codex",
+            },
+            json={"initial_message": initial_message},
+        )
+        request_url = mock_request.call_args.args[1]
+        request_params = mock_request.call_args.kwargs["params"]
+        assert initial_message not in request_url
+        assert initial_message not in str(request_params)
+
+    async def test_launch_session_returns_invalid_model_error(self) -> None:
+        """Request-boundary model errors are returned instead of ignored."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(
+                status_code=400,
+                json_data={"detail": "model 'invalid;model' is invalid"},
+            ),
+        ):
+            result = await launch_session(
+                agent_profile="developer",
+                model="invalid;model",
+            )
+
+        assert result.success is False
+        assert result.message == ("Launch session failed: model 'invalid;model' is invalid")
+        assert result.terminal_id is None
+
     async def test_launch_session_returns_failure_on_api_error(self) -> None:
         """Session API errors should return failed LaunchResults."""
         with patch(
@@ -424,6 +508,10 @@ class TestSessionLifecycleTools:
             result = await list_sessions()
 
         assert result == SessionListResult(success=True, sessions=sessions)
+        dumped_session = result.model_dump()["sessions"][0]
+        assert dumped_session["session_name"] == "cao-123"
+        assert dumped_session["terminal_count"] == 2
+        assert "working_directory" in dumped_session
 
     async def test_list_sessions_returns_empty_list(self) -> None:
         """Empty session lists should still be a successful result."""
@@ -521,6 +609,100 @@ class TestSessionLifecycleTools:
         assert result == {
             "success": False,
             "message": "Shutdown session 'cao-123' failed: delete failed",
+        }
+
+
+@pytest.mark.asyncio
+class TestTerminalMonitoringTools:
+    """Tests for the worker-monitoring tools used by an external supervisor."""
+
+    async def test_get_terminal_status_returns_terminal_payload(self) -> None:
+        """A successful status read returns the terminal dict including status."""
+        payload = {
+            "id": "term-123",
+            "name": "developer-0",
+            "provider": "claude_code",
+            "session_name": "cao-abc",
+            "agent_profile": "dev-sonnet",
+            "status": "processing",
+            "last_active": "2026-06-11T00:00:00",
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await get_terminal_status(terminal_id="term-123")
+
+        assert result == payload
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/terminals/term-123",
+            params=None,
+            json=None,
+        )
+
+    async def test_get_terminal_status_returns_failure_for_not_found(self) -> None:
+        """A 404 surfaces as a failure dict, not an exception."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Terminal not found"}),
+        ):
+            result = await get_terminal_status(terminal_id="missing")
+
+        assert result == {
+            "success": False,
+            "message": "Get terminal status for 'missing' failed: Terminal not found",
+        }
+
+    async def test_get_terminal_output_defaults_to_last_mode(self) -> None:
+        """Output defaults to the provider-extracted last response."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"output": "done: added foo()", "mode": "last"}),
+        ) as mock_request:
+            result = await get_terminal_output(terminal_id="term-123")
+
+        assert result == {"output": "done: added foo()", "mode": "last"}
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/terminals/term-123/output",
+            params={"mode": "last"},
+            json=None,
+        )
+
+    async def test_get_terminal_output_passes_full_mode(self) -> None:
+        """mode='full' is forwarded as a query param (case-insensitive)."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"output": "buffer...", "mode": "full"}),
+        ) as mock_request:
+            result = await get_terminal_output(terminal_id="term-123", mode="FULL")
+
+        assert result["mode"] == "full"
+        assert mock_request.call_args.kwargs["params"] == {"mode": "full"}
+
+    async def test_get_terminal_output_rejects_invalid_mode_without_calling_api(self) -> None:
+        """An unsupported mode fails fast and never hits the API."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await get_terminal_output(terminal_id="term-123", mode="tail")
+
+        assert result["success"] is False
+        assert "must be 'last' or 'full'" in result["message"]
+        mock_request.assert_not_called()
+
+    async def test_get_terminal_output_returns_failure_on_api_error(self) -> None:
+        """Transport errors surface as a failure dict."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("api offline"),
+        ):
+            result = await get_terminal_output(terminal_id="term-123")
+
+        assert result == {
+            "success": False,
+            "message": "Get terminal output for 'term-123' failed: api offline",
         }
 
 

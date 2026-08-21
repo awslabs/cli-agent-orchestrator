@@ -13,9 +13,11 @@ Run:
     uv run pytest -m e2e test/e2e/test_skills.py -v -k ClaudeCode
 """
 
+import re
 import subprocess
 import time
 import uuid
+from pathlib import Path
 from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
@@ -26,7 +28,7 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
-from cli_agent_orchestrator.constants import API_BASE_URL, GEMINI_WORKSPACES_DIR
+from cli_agent_orchestrator.constants import API_BASE_URL
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -35,22 +37,82 @@ def ensure_skills_seeded():
     seed_default_skills()
 
 
-def _capture_full_scrollback(session_name: str, window_name: str) -> str:
+def _capture_full_scrollback(
+    session_name: str, window_name: str, join_wrapped: bool = False
+) -> str:
     """Capture the full tmux scrollback buffer for a pane.
 
     Uses ``tmux capture-pane -p -S -`` to capture from the very start of
     the scrollback buffer, not just the last N lines. This ensures the
     initial CLI command (which contains the injected skill catalog) is
     included even if the agent's output has pushed it far up.
+
+    With ``join_wrapped=True``, adds ``-J`` so lines the terminal soft-wrapped
+    are rejoined — required when parsing paths out of a long launch command,
+    which the pane width otherwise splits mid-token.
     """
     target = f"{session_name}:{window_name}"
+    cmd = ["tmux", "capture-pane", "-p"]
+    if join_wrapped:
+        cmd.append("-J")
+    cmd.extend(["-S", "-", "-t", target])
     result = subprocess.run(
-        ["tmux", "capture-pane", "-p", "-S", "-", "-t", target],
+        cmd,
         capture_output=True,
         text=True,
         timeout=10,
     )
     return result.stdout
+
+
+def _grok_rules_from_live_process(session_name: str, window_name: str) -> str:
+    """Read Grok's live ``--rules`` argument from the pane process tree.
+
+    Grok receives the full rule catalog as a single CLI argument.  A narrow
+    pane can truncate that argument in tmux scrollback, so inspect the live
+    process argv instead: this verifies what the running Grok process actually
+    received, rather than an in-memory provider command or LLM response.
+    """
+    target = f"{session_name}:{window_name}"
+    pane_pid = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    ).stdout.strip()
+    assert pane_pid.isdigit(), f"Could not resolve pane PID for {target}: {pane_pid!r}"
+
+    process_table = subprocess.run(
+        ["ps", "-eo", "pid=,ppid="],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    ).stdout
+    children: dict[int, list[int]] = {}
+    for line in process_table.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdigit() for field in fields):
+            pid, parent_pid = map(int, fields)
+            children.setdefault(parent_pid, []).append(pid)
+
+    pending = [int(pane_pid)]
+    while pending:
+        pid = pending.pop()
+        pending.extend(children.get(pid, []))
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except FileNotFoundError:
+            continue
+        args = [arg.decode("utf-8", errors="replace") for arg in argv if arg]
+        if Path(args[0]).name != "grok" or "--rules" not in args:
+            continue
+        rules_index = args.index("--rules")
+        assert rules_index + 1 < len(args), "Grok process has --rules without a payload"
+        return args[rules_index + 1]
+
+    raise AssertionError(f"Live Grok process with --rules was not found below pane {target}")
 
 
 def _run_skill_injection_test(provider: str, agent_profile: str):
@@ -61,10 +123,6 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
 
     For most providers the catalog is embedded in the CLI command string
     sent via tmux send-keys and is therefore visible in tmux scrollback.
-    Gemini CLI is an exception: its system prompt is written to
-    ``GEMINI.md`` in the working directory because passing the catalog via
-    ``-i`` causes Gemini to treat it as a task to execute. For Gemini we
-    assert against the on-disk ``GEMINI.md`` instead.
 
     This is a deterministic assertion — it checks the injected payload,
     not LLM output.
@@ -95,14 +153,50 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
 
         # Step 3: Assert skill catalog markers are present in the injection payload.
         # The catalog is global in Phase 1, so any installed skill should appear.
-        if provider == "gemini_cli":
-            # Gemini writes the full system prompt (including the skill catalog)
-            # to GEMINI.md inside a per-terminal workspace under
-            # GEMINI_WORKSPACES_DIR / <terminal_id>/. The CLI command carries
-            # only a short role-acknowledge prompt via -i. Read the workspace
-            # GEMINI.md directly.
-            payload = _read_gemini_md(terminal_id)
-            source = "GEMINI.md"
+        if provider == "kimi_cli":
+            # Kimi writes the system prompt (including the skill catalog) to
+            # <temp_dir>/system.md, referenced by the agent.yaml passed via
+            # --agent-file. The launch command in scrollback carries only the
+            # temp-dir path: parse it (capture with -J so the pane's soft
+            # wrapping can't split the path mid-token) and read the payload
+            # from disk. The full-screen Kimi Code TUI also clears the visible
+            # screen on startup, so the command itself is the only reliable
+            # scrollback artifact.
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            assert resp.status_code == 200
+            window_name = resp.json()["name"]
+            scrollback = _capture_full_scrollback(actual_session, window_name, join_wrapped=True)
+            m = re.search(r"cd (\S*/cao_kimi_\w+)", scrollback)
+            assert m, (
+                "kimi launch command with cao_kimi_* temp dir not found in "
+                f"tmux scrollback. First 500 chars: {scrollback[:500]}"
+            )
+            payload = Path(m.group(1), "system.md").read_text(encoding="utf-8")
+            source = f"kimi system.md ({m.group(1)})"
+        elif provider == "omp":
+            # OMP receives CAO context from a private --append-system-prompt
+            # file. The launch command exposes the path, while its contents do
+            # not appear in TUI scrollback after startup.
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            assert resp.status_code == 200
+            window_name = resp.json()["name"]
+            scrollback = _capture_full_scrollback(actual_session, window_name, join_wrapped=True)
+            match = re.search(r"--append-system-prompt\s+(\S+)", scrollback)
+            assert match, (
+                "OMP --append-system-prompt file not found in tmux scrollback. "
+                f"First 500 chars: {scrollback[:500]}"
+            )
+            payload = Path(match.group(1)).read_text(encoding="utf-8")
+            source = f"OMP context file ({match.group(1)})"
+        elif provider == "grok_cli":
+            # Grok's rules payload is larger than the configured tmux
+            # scrollback in a 220-column e2e pane.  Read the running process
+            # argv, which is the exact provider-to-CLI handoff.
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            assert resp.status_code == 200
+            window_name = resp.json()["name"]
+            payload = _grok_rules_from_live_process(actual_session, window_name)
+            source = "live Grok --rules argument"
         else:
             # Capture the full tmux scrollback (capture-pane -S - reads from the
             # very start of the buffer so the initial CLI command with the
@@ -127,23 +221,6 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
     finally:
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
-
-
-def _read_gemini_md(terminal_id: str) -> str:
-    """Read GEMINI.md from the per-terminal Gemini workspace.
-
-    The Gemini CLI provider writes its system prompt (including the injected
-    skill catalog) into an isolated per-terminal workspace under
-    ``GEMINI_WORKSPACES_DIR / <terminal_id>/GEMINI.md`` to avoid races with
-    parallel gemini sessions sharing the project cwd. Returns an empty string
-    if the file does not exist so the caller can produce a useful assertion
-    error.
-    """
-    path = GEMINI_WORKSPACES_DIR / terminal_id / "GEMINI.md"
-    try:
-        return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -178,12 +255,26 @@ class TestKimiCliSkills:
 
 
 @pytest.mark.e2e
-class TestGeminiCliSkills:
-    """E2E skill injection tests for the Gemini CLI provider."""
+class TestAntigravityCliSkills:
+    """E2E skill injection tests for the Antigravity CLI provider."""
 
-    def test_skill_catalog_injected(self, require_gemini):
-        """Gemini CLI terminal command contains the injected skill catalog."""
-        _run_skill_injection_test(provider="gemini_cli", agent_profile="developer")
+    def test_skill_catalog_injected(self, require_antigravity):
+        """Antigravity CLI terminal command contains the injected skill catalog."""
+        _run_skill_injection_test(provider="antigravity_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestOmpSkills:
+    def test_skill_catalog_is_appended(self, require_omp):
+        _run_skill_injection_test(provider="omp", agent_profile="developer")
+
+
+class TestGrokCliSkills:
+    """E2E runtime skill-catalog injection test for Grok Build CLI."""
+
+    def test_skill_catalog_injected(self, require_grok):
+        """Grok's additive rules contain the CAO worker protocol catalog."""
+        _run_skill_injection_test(provider="grok_cli", agent_profile="developer")
 
 
 # ---------------------------------------------------------------------------

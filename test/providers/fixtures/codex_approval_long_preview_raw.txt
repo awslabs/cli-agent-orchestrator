@@ -1,0 +1,50 @@
+╭───────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.147.0)                            │
+│                                                       │
+│ model:     openai.gpt-5.6-sol high   /model to change │
+│ directory: /private/tmp/codex-cap-567                 │
+╰───────────────────────────────────────────────────────╯
+
+  Tip: New Build faster with the Desktop app. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true
+
+
+› Create the file migrate.sh in the current directory containing a bash script with a shebang, set -euo pipefail, and a psql heredoc holding five SQL statements. Use ONE single bash -lc command with
+  a heredoc to write it. Do it now, no explanation first.
+
+
+• Running bash -lc 'cat > migrate.sh <<'"'"'SCRIPT'"'"'
+  │ #!/usr/bin/env bash
+  │ set -euo pipefail
+  │ … +9 lines
+
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  $ bash -lc 'cat > migrate.sh <<'"'"'SCRIPT'"'"'
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  psql <<'"'"'SQL'"'"'
+  BEGIN;
+  CREATE TABLE IF NOT EXISTS schema_migrations (version bigint PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
+  INSERT INTO schema_migrations (version) VALUES (1) ON CONFLICT (version) DO NOTHING;
+  ANALYZE schema_migrations;
+  COMMIT;
+  SQL
+  SCRIPT'
+
+› 1. Yes, proceed (y)
+  2. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel
+
+
+
+
+
+
+
+
+

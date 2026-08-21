@@ -25,23 +25,39 @@ Status Detection Strategy:
     - ERROR: Error message patterns or empty output
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import stat
 import tempfile
+import threading
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# Serializes concurrent _ensure_mcp_timeout() read-modify-writes to
+# ~/.kimi/config.toml -- after the async conversion (issue #494),
+# _build_kimi_command runs inside asyncio.to_thread, so N concurrent inits can
+# enter this method in N threads at once. Without a lock, the check-then-act
+# on _mcp_timeout_configured races (two threads both pass the "not configured
+# yet" check) and the read-modify-write itself races (one thread's write can
+# clobber content another thread already read).
+_KIMI_CONFIG_WRITE_LOCK = threading.Lock()
 
 
 # Custom exception for provider errors
@@ -81,6 +97,14 @@ IDLE_PROMPT_PATTERN_LOG = r"[✨💫]"
 # Used to detect successful initialization without needing to wait for prompt.
 WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code CLI!"
 
+# Startup upgrade-reminder dialog. When a newer kimi-cli is available, kimi
+# renders an interactive menu ("[Enter] Upgrade now  [q] Not now  [s] Skip
+# reminders for version X") BEFORE the REPL and blocks on a keypress. Left
+# unanswered, kimi never reaches its ready prompt and init times out (the boot
+# gate holds it PROCESSING). We answer 's' to skip reminders for this version
+# (persisted, so it does not recur until the next release).
+UPGRADE_PROMPT_PATTERN = r"Skip reminders for version|Upgrade now"
+
 # User input box boundaries (pre-v1.20.0). Kimi displayed user messages in a bordered box:
 #   ╭──────────────────────────────╮
 #   │ user message text             │
@@ -113,6 +137,48 @@ THINKING_BULLET_RAW_PATTERN = r"\x1b\[38;5;244m\s*•"
 # Used to identify TUI chrome that should be excluded from content analysis.
 STATUS_BAR_PATTERN = r"\d+:\d+\s+.*(?:agent|shell)\s*\("
 
+# ---------------------------------------------------------------------------
+# Newest "Kimi Code" TUI (the redesigned CLI). Older builds rendered an emoji
+# prompt (✨/💫) at the input line; the redesign instead shows a boxed input
+# area ("── input ──"), a bottom status bar ("yolo  agent (<model> ●) …"), and a
+# "context: 12.3% (n/Nk)" usage line — with NO bare emoji prompt. Detection that
+# keyed on the emoji therefore never observed IDLE and timed out at init.
+# ---------------------------------------------------------------------------
+# Either of these confirms the new TUI is up at its prompt: the context-usage
+# footer, or the status bar's "agent (<model> ●)" segment (● = U+25CF).
+NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)]*●"
+# Live working indicator: the new TUI animates a braille spinner
+# ("⠧ Thinking… 5s · 220 tokens", "⠹ Using handoff({...})") and a moon-phase
+# thinking glyph (🌑…🌘) that are cleared when the turn finishes. Any such
+# glyph means a turn-in-flight FRAME was rendered; freshness relative to the
+# last response bullet decides whether the turn is still going (see
+# get_status).
+NEW_TUI_SPINNER_PATTERN = r"[⠁-⣿]|[🌑🌒🌓🌔🌕🌖🌗🌘]"
+# Boot/MCP chrome also renders braille glyphs while the terminal is genuinely
+# idle at the welcome screen ("⠧ MCP Servers: 0/1 connected", "⠦ cao-mcp-server
+# (connecting)", "⠋ Resolving dependencies..."). Those must NOT count as a
+# live turn-in-flight spinner or a freshly-booted terminal would never read
+# IDLE.
+NEW_TUI_BOOT_CHROME_PATTERN = re.compile(
+    r"MCP Servers|\(connecting\)|Resolving dependencies|connecting to mcp servers"
+    r"|Loading configuration|Loading agent|Restoring conversation",
+    re.IGNORECASE,
+)
+
+
+def _is_live_turn_spinner_line(line: str) -> bool:
+    """True when ``line`` carries a live turn-in-flight spinner glyph."""
+    return bool(
+        re.search(NEW_TUI_SPINNER_PATTERN, line) and not NEW_TUI_BOOT_CHROME_PATTERN.search(line)
+    )
+
+
+# A response/thinking bullet ("• …") at line start. Its presence means a turn
+# has produced output — used to latch "input received" on the new TUI (the
+# welcome banner / update nag contain no "•", so this won't false-trigger at
+# init).
+ANY_BULLET_PATTERN = r"(?m)^\s*•"
+
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
     r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|ConnectionError:|APIError:)"
@@ -134,6 +200,18 @@ class KimiCliProvider(BaseProvider):
     # the config file causes race conditions and file corruption.
     _mcp_timeout_configured = False
 
+    # Class-level prompt regex shared between status detection
+    # and ``extract_session_context``. Bounded quantifiers
+    # (no unbounded ``*`` / ``+`` — defeats ReDoS on pathological pane bytes).
+    # Matches the v1.20+ idle-line shape ``[user@host]💫 message`` AND the
+    # bare-emoji ``💫 message`` form. The optional ``\S`` tail matches "user
+    # text follows on the same line" — used to slice the message off after
+    # the prompt marker.
+    _KIMI_PROMPT_RE = re.compile(r"(?:\w{1,32}@[\w.\-]{1,64})?[✨💫][^\S\n]{1,4}\S")
+    # Response/thinking markers used to bound a user message line. Matches
+    # the same ``• `` bullet the IDLE/PROCESSING path uses.
+    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^•\s")
+
     def __init__(
         self,
         terminal_id: str,
@@ -142,11 +220,14 @@ class KimiCliProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Explicit per-call override for profile.model, see initialize().
+        self._model = model
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
         # Latching flag: set True when user input box (╭─) is detected in ANY
@@ -157,11 +238,51 @@ class KimiCliProvider(BaseProvider):
         # Without this, get_status() returns IDLE instead of COMPLETED after
         # the agent finishes processing, causing handoff to time out.
         self._has_received_input = False
+        # Wallclock of the last send_input() dispatch (terminal_service calls
+        # mark_input_received). Used by the newest-TUI status path: right
+        # after a paste, the TUI repaints the ready chrome (status bar) before
+        # the spinner's first frame, so a position-based spinner-vs-ready
+        # compare reads COMPLETED ~100ms into the new turn. With the
+        # StatusMonitor ready-latch, that false COMPLETED is pinned for the
+        # whole turn (observed: supervisor-assign e2e extracting mid-flight
+        # output). A short dispatch grace bridges the gap until the first
+        # spinner frame arrives.
+        self._last_dispatch_time = 0.0
 
     @property
     def paste_enter_count(self) -> int:
         """Kimi CLI's prompt_toolkit submits on single Enter after bracketed paste."""
         return 1
+
+    def mark_input_received(self) -> None:
+        """Record a dispatched task (called by terminal_service after send_input).
+
+        Latches ``_has_received_input`` (the buffer-evidence latch can miss it
+        when a long paste scrolls the echo out of the rolling window). The
+        ``_last_dispatch_time`` stamp (used by the newest-TUI dispatch-grace
+        check in get_status()) and the shared native-status tracking come from
+        ``super().mark_input_received()``.
+        """
+        super().mark_input_received()
+        self._has_received_input = True
+
+    def _try_load_profile(self):
+        """Best-effort profile load for timeout resolution only.
+
+        Returns None on any load failure instead of raising -- unlike
+        ``_build_kimi_command``'s inline load, which legitimately raises
+        ``ProviderError`` on a broken profile. This helper only feeds
+        ``BaseProvider.get_init_timeout``, so a missing/unloadable profile
+        should fall back to the server default here, not abort init before
+        the real (error-raising) load in ``_build_kimi_command`` gets a chance
+        to report the actual problem.
+        """
+        if self._agent_profile is None:
+            return None
+        try:
+            return load_agent_profile(self._agent_profile)
+        except Exception:
+            return None
 
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
@@ -190,13 +311,23 @@ class KimiCliProvider(BaseProvider):
         if not self._temp_dir:
             self._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_")
 
+        profile = None
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
+            except Exception as e:
+                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-                if profile.model:
-                    command_parts.extend(["--model", profile.model])
+        # self._model is an explicit per-call override (handoff/assign's own
+        # `model` parameter) and wins over the profile's own static model
+        # field when both are given; applies even with no profile at all
+        # (matches codex.py/hermes.py's own resolution shape).
+        resolved_model = self._model or (profile.model if profile else None)
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
 
+        if profile is not None:
+            try:
                 # Build agent file from profile's system prompt.
                 # Kimi uses YAML agent files with a system_prompt_path pointing
                 # to a markdown file. We create both in the temp directory.
@@ -251,6 +382,10 @@ class KimiCliProvider(BaseProvider):
                         else:
                             mcp_config[server_name] = server_config.model_dump(exclude_none=True)
 
+                        # Resolve the bundled cao-mcp-server console script to a
+                        # PATH-independent invocation.
+                        mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
+
                         # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                         # can identify the current terminal for handoff/assign operations.
                         # Kimi CLI does not automatically forward parent shell env vars
@@ -263,7 +398,10 @@ class KimiCliProvider(BaseProvider):
                     command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
 
             except Exception as e:
-                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+                raise ProviderError(
+                    f"Failed to build kimi command from agent profile "
+                    f"'{self._agent_profile}': {e}"
+                )
 
         # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
         kimi_cmd = shlex.join(command_parts)
@@ -283,43 +421,153 @@ class KimiCliProvider(BaseProvider):
         1. Multiple Kimi instances may share the config file concurrently
         2. 600s is a strictly better default for anyone using MCP tools
         3. Restoring while other instances are running causes race conditions
+
+        issue #494: ``_build_kimi_command`` (the sole caller) now runs inside
+        ``asyncio.to_thread``, so N concurrent inits can enter this method in N
+        threads at once. ``_KIMI_CONFIG_WRITE_LOCK`` serializes the whole
+        check-then-act (class flag + read-modify-write) so only one thread ever
+        touches ``config.toml`` at a time -- in-process only: a second
+        cao-server process, or the ``kimi`` CLI itself, writing between our read
+        and ``os.replace`` is still a last-writer-wins lost update. The write
+        itself is atomic (tmp file + ``os.replace``) so a concurrent reader
+        (e.g. a ``kimi`` process starting up) never sees a torn/partial file.
         """
-        if cls._mcp_timeout_configured:
-            return
+        with _KIMI_CONFIG_WRITE_LOCK:
+            if cls._mcp_timeout_configured:
+                return
 
-        config_path = Path.home() / ".kimi" / "config.toml"
-        if not config_path.exists():
-            logger.warning(f"Kimi config not found at {config_path}, skipping MCP timeout override")
-            cls._mcp_timeout_configured = True
-            return
-
-        try:
-            content = config_path.read_text()
-
-            # Match the existing timeout line under [mcp.client] section
-            # Format: tool_call_timeout_ms = 60000
-            pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
-            match = re.search(pattern, content)
-            if match:
-                current_value = int(match.group(2))
-                if current_value < 600000:
-                    new_content = re.sub(pattern, r"\g<1>600000", content)
-                    config_path.write_text(new_content)
-                    logger.info(
-                        f"Set MCP tool_call_timeout_ms to 600000 "
-                        f"(was {current_value}) in {config_path}"
-                    )
-            else:
+            config_path = Path.home() / ".kimi" / "config.toml"
+            if not config_path.exists():
                 logger.warning(
-                    f"tool_call_timeout_ms not found in {config_path}, "
-                    "MCP tool calls may time out during handoff"
+                    f"Kimi config not found at {config_path}, skipping MCP timeout override"
                 )
-        except Exception as e:
-            logger.warning(f"Failed to set MCP timeout in {config_path}: {e}")
+                cls._mcp_timeout_configured = True
+                return
 
-        cls._mcp_timeout_configured = True
+            try:
+                content = config_path.read_text()
 
-    def initialize(self) -> bool:
+                # Match the existing timeout line under [mcp.client] section
+                # Format: tool_call_timeout_ms = 60000
+                pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
+                match = re.search(pattern, content)
+                if match:
+                    current_value = int(match.group(2))
+                    if current_value < 600000:
+                        new_content = re.sub(pattern, r"\g<1>600000", content)
+                        existing_mode = stat.S_IMODE(os.stat(config_path).st_mode)
+                        tmp_path = config_path.with_suffix(".toml.tmp")
+                        with open(tmp_path, "w") as f:
+                            f.write(new_content)
+                        os.chmod(tmp_path, existing_mode)
+                        os.replace(tmp_path, config_path)
+                        logger.info(
+                            f"Set MCP tool_call_timeout_ms to 600000 "
+                            f"(was {current_value}) in {config_path}"
+                        )
+                else:
+                    logger.warning(
+                        f"tool_call_timeout_ms not found in {config_path}, "
+                        "MCP tool calls may time out during handoff"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to set MCP timeout in {config_path}: {e}")
+
+            cls._mcp_timeout_configured = True
+
+    async def _handle_startup_dialog(
+        self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
+    ) -> None:
+        """Dismiss kimi's startup upgrade-reminder dialog if it appears.
+
+        Mirrors ClaudeCodeProvider._handle_startup_prompts (once PR #451 lands):
+        polls the pane for the interactive "[s] Skip reminders for version X"
+        menu and answers 's' so kimi can proceed to its ready prompt. Exits
+        early if kimi is already ready (no newer version → no dialog), so a
+        no-update start isn't delayed.
+
+        issue #494: this is a real coroutine, not sync code called from an
+        async caller. This method is awaited directly from initialize(), which
+        runs on cao-server's single asyncio event loop. Every tmux-backed call
+        here (``get_history``/``send_keys``) is a blocking subprocess exec, and
+        a plain ``time.sleep`` would block the WHOLE OS thread -- freezing every
+        other in-flight request -- for as long as this loop runs. All blocking
+        calls are offloaded to a worker thread via ``asyncio.to_thread`` and all
+        sleeps are ``asyncio.sleep``, so this coroutine yields the event loop
+        instead of freezing it (see PR #451 for the ClaudeCodeProvider fix this
+        mirrors, and issue #494 for why this method and its Antigravity/Copilot
+        counterparts needed the same fix).
+
+        Idle-gap semantics (see issue #400): a cold or containerized start can
+        render the dialog LATE, past the old fixed ~20s window. Rather than a
+        total-window budget, ``idle_gap`` is the maximum quiet stretch tolerated
+        with no new prompt: answering the dialog resets the idle timer, and the
+        loop exits once no prompt appears for ``idle_gap`` seconds (or kimi is
+        ready). Total runtime is hard-capped by ``outer_timeout``.
+
+        The idle-gap exit only starts counting once the first dialog has been
+        handled -- until then, a first dialog arriving later than ``idle_gap``
+        (the scenario issue #400 itself reports) would otherwise be missed: the
+        loop would exit at the idle-gap boundary having never seen it. Before
+        any dialog is observed, only ``outer_timeout`` can end the loop.
+
+        Args:
+            idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
+                to the ``startup_prompt_handler_timeout`` setting.
+            outer_timeout: Hard cap (seconds) on total handler runtime. Defaults
+                to the ``provider_init_timeout`` setting; initialize() passes the
+                per-profile-resolved value so a containerized profile's longer
+                init budget also governs this handler (mirrors ClaudeCodeProvider).
+        """
+        if idle_gap is None:
+            idle_gap = get_server_settings()["startup_prompt_handler_timeout"]
+        if outer_timeout is None:
+            outer_timeout = get_server_settings()["provider_init_timeout"]
+        outer_deadline = time.monotonic() + outer_timeout
+        last_prompt_time = time.monotonic()
+        any_prompt_handled = False
+        upgrade_dismissed = False
+        while True:
+            now = time.monotonic()
+            if now >= outer_deadline:
+                logger.warning("Kimi startup dialog handler hit provider_init_timeout outer cap")
+                return
+            if any_prompt_handled and now - last_prompt_time >= idle_gap:
+                return  # no new prompt within the idle gap — startup settled
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
+            if output:
+                clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+                # Answer the upgrade dialog once; its text lingers in the buffer
+                # after dismissal, so the flag stops a re-answer on later polls.
+                if not upgrade_dismissed and re.search(UPGRADE_PROMPT_PATTERN, clean_output):
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    logger.info("Kimi upgrade-reminder dialog detected, skipping reminders")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    # 's' = "Skip reminders for version X"; single-key menu, no Enter.
+                    await asyncio.to_thread(
+                        get_backend().send_keys,
+                        self.session_name,
+                        self.window_name,
+                        "s",
+                        enter_count=0,
+                    )
+                    upgrade_dismissed = True
+                    any_prompt_handled = True
+                    last_prompt_time = time.monotonic()  # reset idle timer
+                    await asyncio.sleep(1.0)
+                    continue
+                # Already at a ready prompt → no dialog to handle, stop early.
+                if self.get_status(output) in (
+                    TerminalStatus.IDLE,
+                    TerminalStatus.COMPLETED,
+                ):
+                    return
+            await asyncio.sleep(1.0)
+
+    async def initialize(self) -> bool:
         """Initialize Kimi CLI provider by starting the kimi command.
 
         Steps:
@@ -332,45 +580,73 @@ class KimiCliProvider(BaseProvider):
 
         Raises:
             TimeoutError: If shell or Kimi CLI doesn't start within timeout
+
+        issue #494: ``_build_kimi_command`` does blocking file I/O (mkdtemp,
+        writing system.md/agent.yaml, and the ~/.kimi/config.toml
+        read-modify-write via ``_ensure_mcp_timeout``) and ``get_backend().
+        send_keys`` is a blocking subprocess exec -- both offloaded to a
+        worker thread via ``asyncio.to_thread`` for the same reason as
+        ``_handle_startup_dialog`` (see its docstring): so nothing in
+        initialize() blocks the shared event loop under concurrent session
+        creation.
         """
+        # Resolve the per-profile provider_init_timeout override (if any) so it
+        # governs the startup-dialog handler's outer cap too, mirroring
+        # ClaudeCodeProvider. Best-effort: a missing/unloadable profile falls
+        # back to the server default here; _build_kimi_command below still
+        # raises its own ProviderError on a genuine load failure.
+        init_timeout = self.get_init_timeout(self._try_load_profile())
+        # The readiness wait (dialog handler + wait_until_status) keeps its
+        # existing 120s floor above the server's provider_init_timeout default
+        # (60s) -- first-run setup / concurrent launches routinely exceed 60s.
+        # A profile override raises this further for containerized launches.
+        # Both waits MUST share this value: before this fix the dialog handler
+        # capped at the (shorter) server default while wait_until_status used
+        # a hardcoded 120s, so a dialog appearing after 60s but before 120s
+        # was never dismissed.
+        ready_timeout = max(120.0, init_timeout)
+
         # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Build properly escaped command string
-        command = self._build_kimi_command()
+        command = await asyncio.to_thread(self._build_kimi_command)
 
         # Send Kimi command to the tmux window
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
+
+        # Dismiss the startup upgrade-reminder dialog before waiting for ready:
+        # unanswered it blocks kimi from reaching its prompt (init would time out).
+        await self._handle_startup_dialog(outer_timeout=ready_timeout)
 
         # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        # Longer timeout (120s) to account for first-run setup and when
-        # multiple Kimi instances are starting concurrently (e.g. assign flow).
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=120.0,
+            timeout=ready_timeout,
             polling_interval=1.0,
         ):
-            raise TimeoutError("Kimi CLI initialization timed out after 120 seconds")
+            raise TimeoutError(f"Kimi CLI initialization timed out after {ready_timeout} seconds")
 
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
+    def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
 
         Status detection logic:
-        1. Capture tmux pane output (full or tail)
-        2. Strip ANSI codes for reliable text matching
-        3. Latch ``_has_received_input`` when user input box (╭─) is detected
-        4. Check bottom N lines for the idle prompt pattern
-        5. If prompt found + input was received → COMPLETED
-        6. If prompt found + no input yet → IDLE
-        7. If no prompt: agent is PROCESSING (streaming response)
-        8. Check for ERROR patterns as fallback
+        1. Strip ANSI codes for reliable text matching
+        2. Latch ``_has_received_input`` when user input box (╭─) is detected
+        3. Check bottom N lines for the idle prompt pattern
+        4. If prompt found + input was received → COMPLETED
+        5. If prompt found + no input yet → IDLE
+        6. If no prompt: agent is PROCESSING (streaming response)
+        7. Check for ERROR patterns as fallback
 
         The latching flag approach is necessary because:
         - Long responses (>200 lines) push the user input box out of the
@@ -381,19 +657,118 @@ class KimiCliProvider(BaseProvider):
           IS still visible in the capture, and persists through completion
 
         Args:
-            tail_lines: Optional number of lines to capture from bottom
+            output: Terminal output buffer (rolling buffer, up to
+                ``state_buffer_max`` bytes -- server setting, 32KB default)
 
         Returns:
             TerminalStatus indicating current state
         """
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        # Native status (herdr): trust the backend's agent state when available;
+        # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
+        native = self._resolve_native_status(output)
+        if native is not None:
+            return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
-        # Strip ANSI codes for reliable pattern matching
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
+        # not just SGR colour codes, so the bottom-anchored prompt/processing
+        # checks see clean, line-oriented text on the raw stream.
+        clean_output = strip_terminal_escapes(output)
 
+        # --- Newest "Kimi Code" TUI (redesigned CLI) ---
+        # This build has no bare ✨/💫 prompt; readiness is the bottom status bar
+        # ("agent (<model> ●)") / "context: N%" footer with the empty "── input ──"
+        # box, and a turn-in-flight is a braille spinner ("⠧ Thinking… Ns · N
+        # tokens") that is cleared on completion. Gate on the new-TUI markers so
+        # legacy (emoji-prompt) builds keep the path below unchanged.
+        if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
+            # A "•" bullet appears only once a turn produces output (thinking or
+            # response); the welcome banner / update nag have none. Latch it so a
+            # long response that scrolls the bullets out of the rolling buffer
+            # still reads COMPLETED rather than IDLE. Crucially, nothing latches
+            # at init, so a freshly-launched terminal reads IDLE (not COMPLETED),
+            # avoiding a premature-completion race when the first task is sent.
+            if re.search(ANY_BULLET_PATTERN, clean_output):
+                self._has_received_input = True
+
+            # PROCESSING vs ready. A spinner-vs-status-bar position compare is
+            # unreliable here: the TUI renders the live spinner BETWEEN the
+            # "── input ──" rule and the status bar and repaints the status
+            # bar with every frame, so the ready chrome is the freshest
+            # content even mid-turn (observed: a supervisor turn flapping
+            # completed↔processing 29 times in one 57KB stream, which the
+            # StatusMonitor ready-latch then pinned at a false COMPLETED).
+            # Two in-flight signals, validated by replaying captured live
+            # streams; either one means a turn is running:
+            # - spinner glyph (braille/moon, incl. tool-call lines like
+            #   "⠹ Using handoff({…})") within the freshest tail lines —
+            #   frames land every ~100ms while the agent works, and the
+            #   turn-finished repaint (input rule + ~12 blank box lines +
+            #   separator + status bar + context footer) pushes stale frames
+            #   beyond this window;
+            # - the last spinner glyph rendered AFTER the last "•" bullet —
+            #   catches chunk boundaries mid-repaint where streamed thinking
+            #   text has temporarily pushed the spinner out of the tail
+            #   window (a finished turn always ends with bullets as the
+            #   freshest non-chrome content).
+            lines = clean_output.splitlines()
+            last_spinner = max(
+                (i for i, line in enumerate(lines) if _is_live_turn_spinner_line(line)),
+                default=-1,
+            )
+            last_bullet = max(
+                (i for i, line in enumerate(lines) if re.match(r"\s*•", line)),
+                default=-1,
+            )
+            spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
+            if spinner_in_tail or last_spinner > last_bullet:
+                return TerminalStatus.PROCESSING
+
+            # Dispatch grace: for a few seconds after send_input(), trust the
+            # dispatch over the chrome. The paste repaints the status bar
+            # (ready chrome lands LAST in the stream) before the turn's first
+            # spinner frame, so the checks above briefly read "ready" ~100ms
+            # into a new turn — and the StatusMonitor ready-latch would pin
+            # that false COMPLETED until the next input.
+            if self._last_dispatch_time and time.time() - self._last_dispatch_time < 5.0:
+                return TerminalStatus.PROCESSING
+
+            # The stream looks ready — confirm against the RENDERED pane.
+            # A ready-looking chunk boundary is byte-identical mid-turn vs at
+            # real completion (measured on captured streams: stale spinner
+            # ~21 lines back, bullets 2-3 from the end in BOTH), so the raw
+            # stream alone cannot split them. The rendered pane can: tmux's
+            # compositor has resolved every in-place redraw, so a spinner
+            # glyph visible in the pane tail is live, not stale. Gated to
+            # post-dispatch only (boot screens legitimately show braille
+            # like '⠧ MCP Servers: 0/1' while idle at the welcome screen,
+            # and init readiness is already handled by the stream path).
+            if self._last_dispatch_time:
+                try:
+                    pane_tail = get_backend().get_history(
+                        self.session_name,
+                        self.window_name,
+                        tail_lines=25,
+                        strip_escapes=True,
+                    )
+                    if any(_is_live_turn_spinner_line(line) for line in pane_tail.splitlines()):
+                        return TerminalStatus.PROCESSING
+                except Exception:
+                    # Pane unavailable (deleted window, backend hiccup) —
+                    # fall through to the stream-derived ready status.
+                    pass
+
+            if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
+                return TerminalStatus.ERROR
+
+            return TerminalStatus.COMPLETED if self._has_received_input else TerminalStatus.IDLE
+
+        # --- Legacy emoji-prompt TUI ---
         # Check the bottom lines for the idle prompt.
         # Kimi's TUI has padding lines between prompt and status bar.
         # Use end-of-line anchor (\s*$) to distinguish a bare prompt ("user@dir💫")
@@ -452,13 +827,77 @@ class KimiCliProvider(BaseProvider):
         # No prompt visible and no error: Kimi is actively processing/streaming
         return TerminalStatus.PROCESSING
 
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Kimi CLI idle prompt pattern for log file monitoring.
+    # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS).
+    supports_screen_detection = True
 
-        Used by the inbox service for quick IDLE state detection in pipe-pane
-        log files before calling the full get_status() method.
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        """Detect status from a pyte-composited viewport (escape-free rows).
+
+        The composited screen removes the need for the raw-stream hacks the
+        buffer path carries (the get_history re-capture and the dispatch-grace
+        window): a spinner visible in the rendered pane tail is unambiguously
+        live, and the response bullets are present without eviction. Called by
+        the StatusMonitor only on settled / rising-edge frames.
         """
-        return IDLE_PROMPT_PATTERN_LOG
+        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        if not rows:
+            return TerminalStatus.UNKNOWN
+        joined = "\n".join(rows)
+        tail = rows[-18:]
+
+        # Boot gate: Kimi draws its status bar BEFORE it can accept input —
+        # while MCP servers are still connecting it shows "connecting to mcp
+        # servers" / "cao-mcp-server (connecting)". Reporting IDLE here is
+        # premature: a message delivered in this window is pasted into the boot
+        # screen and silently absorbed (observed live — an inbox message
+        # delivered 1.3s after a premature IDLE left the receiver stuck). Treat
+        # the connecting state as PROCESSING so init waits for a real ready
+        # prompt.
+        #
+        # Scan only NON-bullet lines. This boot chrome renders in the status-bar
+        # / spinner region (braille-prefixed status lines, the "connecting to mcp
+        # servers" progress line), never as a "•" response bullet. Searching the
+        # whole composited screen would re-strand a genuinely COMPLETED turn as
+        # PROCESSING whenever its response text merely MENTIONS "(connecting)" /
+        # "connecting to mcp servers" — plausible in an MCP orchestrator — and
+        # since the boot gate precedes the ready check and re-fires on every
+        # settled frame, the inbox (delivers only on IDLE/COMPLETED) would then
+        # never deliver to that terminal.
+        if any(
+            re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
+            for ln in rows
+            if not re.match(r"\s*•", ln)
+        ):
+            return TerminalStatus.PROCESSING
+
+        # Newest "Kimi Code" TUI: readiness is the status bar / context footer.
+        if re.search(NEW_TUI_STATUS_PATTERN, joined):
+            if any(_is_live_turn_spinner_line(ln) for ln in tail):
+                return TerminalStatus.PROCESSING
+            if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+                return TerminalStatus.ERROR
+            return (
+                TerminalStatus.COMPLETED
+                if re.search(ANY_BULLET_PATTERN, joined)
+                else TerminalStatus.IDLE
+            )
+
+        # Legacy emoji-prompt TUI: bare ✨/💫 prompt visible at the bottom.
+        if any(re.search(IDLE_PROMPT_PATTERN, ln) for ln in tail):
+            return (
+                TerminalStatus.COMPLETED
+                if re.search(ANY_BULLET_PATTERN, joined)
+                else TerminalStatus.IDLE
+            )
+
+        if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+            return TerminalStatus.ERROR
+        # No Kimi TUI chrome on the composited screen at all (boot screen, or a
+        # torn-down pane back at the shell). On the RAW path "no prompt = still
+        # streaming" is a safe default, but on a fully rendered screen the
+        # absence of all TUI chrome means we are NOT looking at an active Kimi
+        # turn — so report UNKNOWN rather than a false PROCESSING.
+        return TerminalStatus.UNKNOWN
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Kimi's final response from terminal output.
@@ -513,8 +952,16 @@ class KimiCliProvider(BaseProvider):
             if re.search(PROMPT_WITH_INPUT_PATTERN, line):
                 prompt_input_idx = i
 
-        # Choose the best anchor: prefer input box (more precise), fall back to prompt-with-input
-        if box_end_idx is not None:
+        # Choose the best anchor: the LATEST marker wins. The newest "Kimi
+        # Code" TUI draws decorative ╰─ boxes during boot (its own welcome box
+        # and MCP-server banners like FastMCP's) but renders user messages as
+        # ✨-prefixed prompt lines — so a box-end can match boot chrome ABOVE
+        # the real message and box-first priority would slice the response
+        # from the boot screen. The response always follows the LAST user
+        # input, whichever marker style rendered it.
+        if box_end_idx is not None and prompt_input_idx is not None:
+            response_start = max(box_end_idx, prompt_input_idx) + 1
+        elif box_end_idx is not None:
             response_start = box_end_idx + 1
         elif prompt_input_idx is not None:
             response_start = prompt_input_idx + 1
@@ -522,11 +969,22 @@ class KimiCliProvider(BaseProvider):
             # Neither marker found — long response scrolled everything out
             return self._extract_without_input_box(raw_lines, clean_lines)
 
-        # Find the next idle prompt line (bare prompt, no text after it)
+        # Find where the response ends: the next bare idle prompt
+        # (legacy/v1.20 TUIs), or the newest-TUI footer chrome — the
+        # "── input ──" box rule or the status bar / context footer
+        # (NEW_TUI_STATUS_PATTERN). Without the footer stops, a newest-TUI
+        # response would run to end-of-capture and drag the empty input box
+        # and status bar into the extracted message.
         idle_prompt_eol = IDLE_PROMPT_PATTERN + r"\s*$"
+        new_tui_input_rule = r"^\s*─{2,}\s*input\s*─{2,}"
         prompt_idx = len(clean_lines)  # default: end of output
         for i in range(response_start, len(clean_lines)):
-            if re.search(idle_prompt_eol, clean_lines[i]):
+            line = clean_lines[i]
+            if (
+                re.search(idle_prompt_eol, line)
+                or re.match(new_tui_input_rule, line)
+                or re.search(NEW_TUI_STATUS_PATTERN, line)
+            ):
                 prompt_idx = i
                 break
 
@@ -631,6 +1089,80 @@ class KimiCliProvider(BaseProvider):
         We use /exit as it's the most reliable and consistent.
         """
         return "/exit"
+
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Tmux-primary session extraction for Kimi.
+
+        Mirrors the universal pattern used by the other providers
+        (Claude Code / Codex / Kiro / Copilot). Returns the locked
+        6-field shape from ``_build_context_dict``. Empty tmux history
+        returns the LITERAL empty dict ``{}``. All
+        emitted strings flow through ``_sanitize_for_log`` at this
+        producer layer (sanitised at both produce and consume). Never raises
+        out — top-level ``except Exception`` returns ``{}`` with a
+        sanitised WARNING. ``KeyboardInterrupt`` and ``SystemExit``
+        propagate.
+        """
+        from cli_agent_orchestrator.services.wiki_compiler import _sanitize_for_log
+
+        try:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if not output:
+                return {}  # literal empty dict, not a populated-empty one
+
+            clean = re.sub(ANSI_CODE_PATTERN, "", output)
+
+            user_messages: list = []
+            lines = clean.splitlines()
+            i = 0
+            while i < len(lines):
+                m = self._KIMI_PROMPT_RE.search(lines[i])
+                if not m:
+                    i += 1
+                    continue
+                msg_lines: list = []
+                # Text after the prompt emoji on the same line.
+                after = lines[i][m.end() - 1 :].strip()
+                if after:
+                    msg_lines.append(after)
+                i += 1
+                while i < len(lines):
+                    if self._KIMI_PROMPT_RE.search(lines[i]) or self._KIMI_RESPONSE_MARKER_RE.match(
+                        lines[i]
+                    ):
+                        break
+                    if lines[i].strip():
+                        msg_lines.append(lines[i].strip())
+                    i += 1
+                if msg_lines:
+                    user_messages.append(" ".join(msg_lines))
+
+            last_response = ""
+            try:
+                last_response = self.extract_last_message_from_script(output)
+            except ValueError:
+                pass
+
+            return self._build_context_dict(
+                provider_name="kimi_cli",
+                last_task=_sanitize_for_log(user_messages[-1] if user_messages else ""),
+                key_decisions=[
+                    _sanitize_for_log(s) for s in self._extract_decisions(last_response)
+                ],
+                open_questions=[
+                    _sanitize_for_log(s) for s in self._extract_questions(user_messages)
+                ],
+                files_changed=[_sanitize_for_log(s) for s in self._extract_file_paths(clean)],
+            )
+        except (KeyboardInterrupt, SystemExit):
+            # Control flow MUST propagate.
+            raise
+        except Exception as e:
+            logger.warning(
+                "kimi_extract_session_context_failed reason=%s",
+                _sanitize_for_log(str(e))[:200],
+            )
+            return {}
 
     def cleanup(self) -> None:
         """Clean up Kimi CLI provider resources.

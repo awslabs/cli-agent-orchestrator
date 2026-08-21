@@ -12,14 +12,13 @@ NOTE: These tests send messages via the CAO API, not via an agent calling
 the send_message() MCP tool. For real agent-to-agent communication via
 MCP tools, see test_supervisor_orchestration.py.
 
-Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, gemini, copilot), tmux.
+Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, copilot), tmux.
 
 Run:
     uv run pytest -m e2e test/e2e/test_send_message.py -v
     uv run pytest -m e2e test/e2e/test_send_message.py -v -k codex
     uv run pytest -m e2e test/e2e/test_send_message.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_send_message.py -v -k kiro_cli
-    uv run pytest -m e2e test/e2e/test_send_message.py -v -k gemini_cli
     uv run pytest -m e2e test/e2e/test_send_message.py -v -k copilot
 """
 
@@ -258,20 +257,6 @@ class TestKimiCliSendMessage:
 
 
 # ---------------------------------------------------------------------------
-# Gemini CLI provider
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.e2e
-class TestGeminiCliSendMessage:
-    """E2E send_message tests for the Gemini CLI provider."""
-
-    def test_send_message_to_inbox(self, require_gemini):
-        """Send a message to another Gemini CLI terminal's inbox and verify delivery."""
-        _run_send_message_test(provider="gemini_cli", agent_profile="developer")
-
-
-# ---------------------------------------------------------------------------
 # Copilot CLI provider
 # ---------------------------------------------------------------------------
 
@@ -283,3 +268,63 @@ class TestCopilotCliSendMessage:
     def test_send_message_to_inbox(self, require_copilot):
         """Send a message to another Copilot CLI terminal's inbox and verify delivery."""
         _run_send_message_test(provider="copilot_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Cursor CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCursorCliSendMessage:
+    """E2E send_message tests for the Cursor CLI provider.
+
+    Requires the ``agent`` (or legacy ``cursor-agent``) binary on PATH.
+    Skip otherwise via the ``require_cursor`` fixture.
+    """
+
+    def test_send_message_to_inbox(self, require_cursor):
+        """Send a message to another Cursor CLI terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="cursor_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestAntigravityCliSendMessage:
+    """E2E send_message tests for the Antigravity CLI provider."""
+
+    def test_send_message_to_inbox(self, require_antigravity):
+        """Send a message to another Antigravity CLI terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="antigravity_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestOmpSendMessage:
+    def test_send_message_to_inbox(self, require_omp):
+        _run_send_message_test(provider="omp", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Grok Build CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGrokCliSendMessage:
+    """E2E inbox delivery test for the official xAI Grok Build CLI."""
+
+    def test_send_message_to_inbox(self, require_grok):
+        """Deliver an inbox message to an idle Grok terminal and process it."""
+        _run_send_message_test(provider="grok_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeSendMessage:
+    """E2E inbox delivery test for MiniMax Code."""
+
+    def test_send_message_to_inbox(self, require_minimax_code):
+        _run_send_message_test(provider="mcode", agent_profile="developer")

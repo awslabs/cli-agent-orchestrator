@@ -1,0 +1,24 @@
+[32m@ThePlenkov [39m➜ [1m[34m/workspaces/cli-agent-orchestrator [0m[36m([1m[31mfeat/cursor-cli-provider[0m[36m) [39m$ ag
+ent --force
+
+
+  Cursor Agent
+  [2mv2026.06.15-03-48-54-da23e37[0m
+  [2mHit shift+tab to enable Plan Mode for large or complex changes.[0m
+
+
+
+ [48;5;233m                                                                              [49m
+ [48;5;233m [2m→ [0;7m[48;5;233mP[0;2m[48;5;233mlan, search, build anything[0m[48;5;233m                                               [49m
+ [48;5;233m                                                                              [49m
+
+  [2mComposer 2.5 Fast[0m                                             [35mRun Everything[39m
+  [2m/workspaces/cli-agent-orchestrator · feat/cursor-cli-provider · ]8;;https://github.com/awslabs/cli-agent-orchestrator/pull/296\#296[0m]8;;\
+
+
+
+
+
+
+
+

@@ -1,0 +1,203 @@
+<section class="module" id="module-2">
+  <div class="module-content">
+
+    <!-- Module Header -->
+    <div class="module-header animate-in">
+      <span class="module-number">02</span>
+      <h1 class="module-title">Workflows</h1>
+      <p class="module-subtitle">Declarative YAML pipelines that turn multi-step agent tasks into repeatable, validated, resumable sequences.</p>
+    </div>
+
+    <!-- SCREEN 1 — Why Workflows? -->
+    <div class="screen" id="screen-2-1">
+      <h2 class="screen-heading animate-in">Why Workflows?</h2>
+
+      <p class="animate-in">
+        The supervisor pattern with <code>assign()</code> is powerful — it lets a creative agent decompose
+        problems on the fly, delegate to workers in parallel, and adapt to unexpected results.
+        But sometimes you do not want creativity. You want a <strong>fixed pipeline</strong> that runs the
+        same steps, in the same order, every time.
+      </p>
+
+      <p class="animate-in">
+        Workflows give you exactly that: a declarative YAML spec that defines each step, its inputs,
+        its outputs, and how data flows between them. No improvisation, no skipped steps, no
+        variation between runs.
+      </p>
+
+      <div class="pattern-cards stagger-children">
+        <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5);">
+          <h3>Supervisor + assign()</h3>
+          <p><strong>Flexible and creative.</strong> The supervisor decides what to do next based on results. Great for novel, open-ended tasks.</p>
+        </div>
+        <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-accent);">
+          <h3>Workflows</h3>
+          <p><strong>Deterministic and repeatable.</strong> Steps are fixed in advance. Inputs are typed (string, int, bool, path) and step outputs can declare a JSON Schema. Runs are journaled and resumable.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- SCREEN 2 — Anatomy of a Workflow -->
+    <div class="screen" id="screen-2-2">
+      <h2 class="screen-heading animate-in">Anatomy of a Workflow</h2>
+
+      <p class="animate-in">
+        A workflow spec is a flat YAML file with top-level metadata and a list of steps.
+        Specs live in <code>~/.aws/cli-agent-orchestrator/workflows/</code>.
+      </p>
+
+      <div class="translation-block animate-in">
+        <div class="translation-code">
+          <span class="translation-label">workflow spec (YAML)</span>
+<pre><span class="code-keyword">name:</span> <span class="code-string">code-review-pipeline</span>
+<span class="code-keyword">description:</span> <span class="code-string">Automated PR review pipeline</span>
+<span class="code-keyword">inputs:</span>
+  <span class="code-keyword">pr_url:</span>
+    <span class="code-keyword">type:</span> <span class="code-string">string</span>
+    <span class="code-keyword">required:</span> <span class="code-string">true</span>
+<span class="code-keyword">steps:</span>
+  - <span class="code-keyword">id:</span> <span class="code-string">fetch-diff</span>
+    <span class="code-keyword">provider:</span> <span class="code-string">claude_code</span>
+    <span class="code-keyword">agent:</span> <span class="code-string">developer</span>
+    <span class="code-keyword">prompt:</span> <span class="code-string">"Fetch the diff from {{workflow.inputs.pr_url}} and summarize"</span>
+    <span class="code-keyword">output_schema:</span>
+      <span class="code-keyword">type:</span> <span class="code-string">object</span>
+      <span class="code-keyword">properties:</span>
+        <span class="code-keyword">summary:</span> {<span class="code-keyword">type:</span> <span class="code-string">string</span>}
+
+  - <span class="code-keyword">id:</span> <span class="code-string">review-security</span>
+    <span class="code-keyword">provider:</span> <span class="code-string">claude_code</span>
+    <span class="code-keyword">agent:</span> <span class="code-string">reviewer</span>
+    <span class="code-keyword">prompt:</span> <span class="code-string">"Review for security issues: {{steps.fetch-diff.output.summary}}"</span>
+
+  - <span class="code-keyword">id:</span> <span class="code-string">review-quality</span>
+    <span class="code-keyword">provider:</span> <span class="code-string">kiro_cli</span>
+    <span class="code-keyword">agent:</span> <span class="code-string">reviewer</span>
+    <span class="code-keyword">prompt:</span> <span class="code-string">"Review for code quality: {{steps.fetch-diff.output.summary}}"</span></pre>
+        </div>
+        <div class="translation-english">
+          <span class="translation-label">Plain English</span>
+          <div class="translation-lines">
+            <div class="tl"><code>name:</code> — workflow identifier used to run it</div>
+            <div class="tl"><code>description:</code> — human-readable summary</div>
+            <div class="tl"><code>inputs:</code> — dictionary of typed parameters</div>
+            <div class="tl">Each input key has <code>type</code> and <code>required</code> fields</div>
+            <div class="tl">&nbsp;</div>
+            <div class="tl">&nbsp;</div>
+            <div class="tl"><code>steps:</code> — sequential list of steps to execute</div>
+            <div class="tl"><code>id:</code> — unique step identifier used to reference outputs</div>
+            <div class="tl"><code>provider:</code> — which AI CLI runs this step (required)</div>
+            <div class="tl"><code>agent:</code> — agent profile for this step</div>
+            <div class="tl"><code>prompt:</code> — message sent to the agent; supports <code>{{}}</code> interpolation</div>
+            <div class="tl"><code>output_schema:</code> — required if later steps reference this step's output; the agent returns it via <code>workflow_return</code></div>
+            <div class="tl">&nbsp;</div>
+            <div class="tl">Step 2: <code>id:</code> gives it a unique name for later reference</div>
+            <div class="tl"><code>provider:</code> can differ per step (here claude_code)</div>
+            <div class="tl"><code>{{steps.fetch-diff.output.summary}}</code> — references a field from a previous step's output (full path required: <code>{{steps.STEP_ID.output.FIELD}}</code>)</div>
+            <div class="tl">&nbsp;</div>
+            <div class="tl">Step 3: uses a different provider (kiro_cli)</div>
+            <div class="tl">Same <code>agent</code> profile but different <code>provider</code></div>
+            <div class="tl">Template syntax: <code>{{workflow.inputs.NAME}}</code> for inputs, <code>{{steps.STEP_ID.output.FIELD}}</code> for step outputs</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SCREEN 3 — Running a Workflow -->
+    <div class="screen" id="screen-2-3">
+      <h2 class="screen-heading animate-in">Running a Workflow</h2>
+
+      <p class="animate-in">
+        From authoring to monitoring — the lifecycle of a workflow run:
+      </p>
+
+      <div class="stagger-children">
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">1</div>
+          <div>
+            <strong>Validate the spec</strong>
+            <p><code>cao workflow validate my-pipeline.yaml</code> — catches grammar errors, duplicate step ids, and constraint violations (max 100 steps, 256KB limit) before you run anything. Template references are resolved at run time, so validate will not catch a typo in <code>{{steps.…}}</code>.</p>
+          </div>
+        </div>
+
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">2</div>
+          <div>
+            <strong>Start the run</strong>
+            <p><code>cao workflow run code-review-pipeline --input pr_url=https://...</code> — launches the workflow with the required inputs. This blocks until the run finishes, then prints the run id and per-step results. Pass <code>--run-id</code> to pre-assign an id you can poll from another shell.</p>
+          </div>
+        </div>
+
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">3</div>
+          <div>
+            <strong>Steps execute sequentially</strong>
+            <p>Each step launches an agent via <code>run_agent_step</code> (same substrate as handoff). Steps run one at a time, each with a 600-second timeout and up to 3 retries.</p>
+          </div>
+        </div>
+
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">4</div>
+          <div>
+            <strong>Data flows between steps</strong>
+            <p>Step outputs are captured and available to later steps via <code>{{steps.STEP_ID.output.FIELD}}</code> template expressions (the full path is required: <code>{{workflow.inputs.NAME}}</code> for inputs, <code>{{steps.STEP_ID.output.FIELD}}</code> for step outputs). Outputs are validated against JSON Schema if defined.</p>
+          </div>
+        </div>
+
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">5</div>
+          <div>
+            <strong>Monitor progress</strong>
+            <p><code>cao workflow status RUN_ID</code> — see which step is currently executing, which have completed, and the overall run state.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Callout: Resume -->
+      <div class="callout callout-accent animate-in">
+        <div class="callout-icon">&#9889;</div>
+        <div class="callout-content">
+          <span class="callout-title">Resume from crash</span>
+          <p>CAO journals every step completion. If a run is interrupted — process killed, machine reboots, network drops — <code>cao workflow resume RUN_ID</code> keeps every completed step and re-runs the interrupted step and anything after it on a fresh terminal.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- QUIZ -->
+    <div class="screen" id="screen-2-4">
+      <h2 class="screen-heading animate-in">Check Your Understanding</h2>
+
+      <div class="quiz-container" id="quiz-workflows">
+
+        <div class="quiz-question-block" data-correct="repeatable" data-explanation-right="Workflows are for fixed, repeatable pipelines with validated I/O. When you need the same steps every time with structured data flowing between them, a workflow is the right choice." data-explanation-wrong="A supervisor with assign is flexible and creative — great for novel tasks. But when you need a repeatable, validated pipeline with structured inputs/outputs and crash recovery, use a workflow.">
+          <p class="quiz-question"><strong>1.</strong> When would you choose a workflow over a supervisor with <code>assign()</code>?</p>
+          <div class="quiz-options">
+            <button class="quiz-option" data-value="creative" onclick="selectOption(this)">
+              <span class="quiz-option-radio"></span>
+              <span>When you need the agent to creatively decompose a novel problem</span>
+            </button>
+            <button class="quiz-option" data-value="repeatable" onclick="selectOption(this)">
+              <span class="quiz-option-radio"></span>
+              <span>When you need a repeatable, validated pipeline with structured I/O between steps</span>
+            </button>
+            <button class="quiz-option" data-value="single" onclick="selectOption(this)">
+              <span class="quiz-option-radio"></span>
+              <span>When you only have a single step to execute</span>
+            </button>
+            <button class="quiz-option" data-value="parallel" onclick="selectOption(this)">
+              <span class="quiz-option-radio"></span>
+              <span>When you want maximum parallelism across independent tasks</span>
+            </button>
+          </div>
+          <div class="quiz-feedback"></div>
+        </div>
+
+        <div style="margin-top: var(--space-6);">
+          <button class="btn btn-primary quiz-check-btn" onclick="checkQuiz('quiz-workflows')">Check Answer</button>
+          <button class="btn quiz-reset-btn" onclick="resetQuiz('quiz-workflows')">Try Again</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>

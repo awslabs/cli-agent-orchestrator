@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
-from cli_agent_orchestrator.mcp_server.server import MAX_USER_PROMPT_ANSWER_LENGTH
+from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.mcp_server.server import MAX_USER_PROMPT_ANSWER_LENGTH, _mcp_timeout
 
 
 class TestAnswerUserPrompt:
@@ -25,7 +25,7 @@ class TestAnswerUserPrompt:
 
         assert result["success"] is True
         mock_requests.get.assert_called_once_with(
-            f"{API_BASE_URL}/terminals/abcd1234", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/terminals/abcd1234", timeout=_mcp_timeout()
         )
         mock_requests.post.assert_called_once_with(
             f"{API_BASE_URL}/terminals/abcd1234/input",
@@ -33,7 +33,7 @@ class TestAnswerUserPrompt:
                 "message": "1",
                 "sender_id": "supervisor",
             },
-            timeout=MCP_REQUEST_TIMEOUT,
+            timeout=_mcp_timeout(),
         )
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests")

@@ -1,7 +1,7 @@
 """Tool mapping from CAO vocabulary to provider-native tool names.
 
 CAO defines a universal tool vocabulary (execute_bash, fs_read, fs_write, fs_list, fs_*,
-@builtin, @cao-mcp-server) that is translated to each provider's native tool names.
+web_fetch, @builtin, @cao-mcp-server) that is translated to each provider's native tool names.
 This module provides the mapping and a function to compute which native tools to BLOCK
 given a set of allowed CAO tools.
 """
@@ -15,11 +15,34 @@ logger = logging.getLogger(__name__)
 # Keys are provider names, values map CAO tool names to lists of native tool names.
 TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
     "claude_code": {
-        "execute_bash": ["Bash"],
+        # Everything execution-capable gates with execute_bash — a restricted
+        # agent escapes otherwise (observed live in the allowed-tools e2e):
+        # - the native subagent tool spawns a subagent with its own full
+        #   toolset ("the file was created via a delegated subagent that ran
+        #   the write through a shell command"). Claude Code renamed this tool
+        #   `Task` -> `Agent`; both names are denied so the block holds across
+        #   CLI versions (current builds expose only `Agent`, so denying just
+        #   `Task` is a silent no-op);
+        # - Monitor runs arbitrary shell scripts in the background ("I used
+        #   the Monitor tool" to write the forbidden file);
+        # - BashOutput/KillShell are the Bash family's companions.
+        # Privilege-equivalence: anything these can do, Bash can too, so
+        # profiles allowed execute_bash lose nothing by keeping them.
+        "execute_bash": ["Bash", "BashOutput", "KillShell", "Task", "Agent", "Monitor"],
         "fs_read": ["Read"],
-        "fs_write": ["Edit", "Write"],
+        # NotebookEdit writes .ipynb files — it must gate with fs_write or a
+        # write-restricted agent keeps a file-modification path.
+        "fs_write": ["Edit", "Write", "NotebookEdit"],
         "fs_list": ["Glob", "Grep"],
-        "fs_*": ["Read", "Edit", "Write", "Glob", "Grep"],
+        "fs_*": ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep"],
+        # Network access. WebSearch gates here too: both reach the network and
+        # are the agent's exfiltration/SSRF surface, so a profile without
+        # web_fetch loses both. Note: the subagent tool (`Task`/`Agent`) is
+        # deliberately NOT a separate category — it folds into execute_bash
+        # above, because a subagent spawns with its own full toolset and can run
+        # shell; exposing it standalone would let a profile grant subagent
+        # without execute_bash and re-open that escape.
+        "web_fetch": ["WebFetch", "WebSearch"],
     },
     "copilot_cli": {
         "execute_bash": ["shell"],
@@ -28,7 +51,29 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
     },
-    "gemini_cli": {
+    # Official xAI Grok Build CLI permission-rule prefixes. These rules work
+    # in the interactive TUI and remain enforced under --always-approve.
+    # Grok-native subagents are disabled separately with --no-subagents.
+    "grok_cli": {
+        "execute_bash": ["Bash"],
+        "fs_read": ["Read", "NotebookRead"],
+        "fs_write": ["Edit", "Write", "NotebookEdit"],
+        "fs_list": ["Grep", "Glob"],
+        "fs_*": [
+            "Read",
+            "NotebookRead",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Grep",
+            "Glob",
+        ],
+        "web_fetch": ["WebFetch", "WebSearch"],
+    },
+    # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
+    # (write_file/read_file/run_shell_command/...). Restrictions are enforced
+    # softly via the injected security prompt (see SOFT_ENFORCEMENT_PROVIDERS).
+    "antigravity_cli": {
         "execute_bash": ["run_shell_command"],
         "fs_read": ["read_file", "list_directory", "search_file_content", "glob"],
         "fs_write": ["write_file", "replace"],
@@ -41,6 +86,7 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
             "search_file_content",
             "glob",
         ],
+        "web_fetch": ["web_fetch", "google_web_search"],
     },
 }
 
@@ -65,7 +111,13 @@ def _get_role_defaults(role: str) -> List[str] | None:
     from cli_agent_orchestrator.services.settings_service import _load
 
     settings = _load()
-    custom_roles = settings.get("roles", {})
+    # Nested format: {"agents": {"roles": {...}}}
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and "roles" in nested and isinstance(nested["roles"], dict):
+        custom_roles = nested["roles"]
+    else:
+        # Legacy flat format: {"roles": {...}}
+        custom_roles = settings.get("roles", {})
     if role in custom_roles:
         return list(custom_roles[role])
 
@@ -119,7 +171,7 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
     """Given CAO allowedTools, return provider-native tool names to BLOCK.
 
     Args:
-        provider: Provider name (e.g., "claude_code", "copilot_cli", "gemini_cli")
+        provider: Provider name (e.g., "claude_code", "copilot_cli", "kiro_cli")
         allowed: List of CAO tool names that are ALLOWED
 
     Returns:
@@ -145,6 +197,27 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
     all_tools = ALL_NATIVE_TOOLS.get(provider, set())
     disallowed = sorted(all_tools - allowed_native)
     return disallowed
+
+
+def get_allowed_tools(provider: str, allowed: List[str]) -> List[str]:
+    """Return native tools explicitly granted by a CAO allowlist.
+
+    Unlike :func:`get_disallowed_tools`, this is used where a provider has a
+    deny-by-default permission mode and must receive affirmative native rules
+    for every CAO capability it is allowed to use.
+    """
+    if "*" in allowed:
+        return sorted(ALL_NATIVE_TOOLS.get(provider, set()))
+
+    mapping = TOOL_MAPPING.get(provider)
+    if not mapping:
+        return []
+
+    allowed_native: Set[str] = set()
+    for cao_tool in allowed:
+        if cao_tool in mapping:
+            allowed_native.update(mapping[cao_tool])
+    return sorted(allowed_native)
 
 
 def format_tool_summary(allowed: List[str]) -> str:

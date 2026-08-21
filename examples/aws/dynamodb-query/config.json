@@ -1,0 +1,9 @@
+{
+  "profile": "my-aws-profile",
+  "region": "us-east-1",
+  "table_name": "MyTable",
+  "partition_key_name": "pk",
+  "partition_key_value": "my-key-value",
+  "partition_key_type": "S",
+  "limit": 1
+}

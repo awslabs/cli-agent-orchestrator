@@ -20,7 +20,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from cli_agent_orchestrator.services.memory_service import MemoryService
+
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 
 VICTIM_CONTENT = "TOP SECRET cross-project content"
 

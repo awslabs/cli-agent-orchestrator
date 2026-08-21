@@ -1,0 +1,13 @@
+{
+  "name": "cao-skill-aidlc-portfolio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "yaml": "^2.8.1"
+  },
+  "overrides": {
+    "fast-uri": "^3.1.5"
+  }
+}

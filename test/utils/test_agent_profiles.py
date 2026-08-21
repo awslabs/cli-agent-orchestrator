@@ -7,7 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import (
+    load_agent_profile,
+    parse_agent_profile_text,
+    resolve_provider,
+)
 
 
 class TestLoadAgentProfile:
@@ -153,9 +157,9 @@ class TestResolveProvider:
         """Missing profile should fall back without raising."""
         mock_load.side_effect = RuntimeError("Failed to load agent profile 'ghost'")
 
-        result = resolve_provider("ghost", fallback_provider="q_cli")
+        result = resolve_provider("ghost", fallback_provider="kiro_cli")
 
-        assert result == "q_cli"
+        assert result == "kiro_cli"
 
     @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
     def test_all_valid_provider_types_accepted(self, mock_load):
@@ -214,7 +218,9 @@ class TestListAgentProfiles:
             "kiro_cli": "/home/user/.kiro/agents",
         }
 
-        def fake_scan(directory, source_label, profiles):
+        def fake_scan(
+            directory, source_label, profiles, name_sources=None, dir_profiles_loadable=True
+        ):
             if source_label == "local":
                 profiles["local-agent"] = {
                     "name": "local-agent",
@@ -246,7 +252,8 @@ class TestListAgentProfiles:
     def test_list_agent_profiles_deduplicates_profiles_with_same_name(
         self, mock_resources, mock_local_dir, mock_scan, mock_get_agent_dirs, mock_get_extra_dirs
     ):
-        """Test that profiles with the same name are deduplicated (first wins)."""
+        """Same-named profile in built-in + on-disk: the on-disk copy wins, because
+        built-in is scanned last to match the loader (_read_agent_profile_source)."""
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
 
         # Built-in store has "developer" profile
@@ -259,15 +266,19 @@ class TestListAgentProfiles:
         mock_agent_store.iterdir.return_value = [mock_builtin_file]
         mock_resources.files.return_value = mock_agent_store
 
-        # Local store also has "developer" profile — should be skipped (built-in scanned first)
+        # Local store also has "developer" profile — this WINS; built-in is scanned last.
         mock_local_dir.exists.return_value = True
         mock_local_dir.resolve.return_value = Path(
             "/home/user/.aws/cli-agent-orchestrator/agent-store"
         )
 
-        def fake_scan(directory, source_label, profiles):
+        def fake_scan(
+            directory, source_label, profiles, name_sources=None, dir_profiles_loadable=True
+        ):
             if source_label == "local":
-                # _scan_directory respects dedup: only adds if not present
+                # Mirror _scan_directory: record the source AND keep first-found.
+                if name_sources is not None:
+                    name_sources.setdefault("developer", []).append("local")
                 if "developer" not in profiles:
                     profiles["developer"] = {
                         "name": "developer",
@@ -279,10 +290,12 @@ class TestListAgentProfiles:
 
         result = list_agent_profiles()
 
-        # Should have exactly one "developer" profile, from built-in (scanned first)
+        # Exactly one "developer", and it's the on-disk (local) copy — matches what loads.
         developer_profiles = [p for p in result if p["name"] == "developer"]
         assert len(developer_profiles) == 1
-        assert developer_profiles[0]["source"] == "built-in"
+        assert developer_profiles[0]["source"] == "local"
+        # built-in is scanned last, so it lands in duplicated_in — not as the winner.
+        assert developer_profiles[0]["duplicated_in"] == ["built-in"]
 
     @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
@@ -338,7 +351,7 @@ class TestListAgentProfiles:
         # Provider dirs point to nonexistent paths
         mock_get_agent_dirs.return_value = {
             "kiro_cli": "/nonexistent/kiro/agents",
-            "q_cli": "/nonexistent/q/agents",
+            "cao_installed": "/nonexistent/cao/agents",
         }
         mock_get_extra_dirs.return_value = ["/nonexistent/extra/dir"]
 
@@ -374,7 +387,9 @@ class TestListAgentProfiles:
 
         scan_calls = []
 
-        def track_scan(directory, source_label, profiles):
+        def track_scan(
+            directory, source_label, profiles, name_sources=None, dir_profiles_loadable=True
+        ):
             scan_calls.append((str(directory), source_label))
             if str(directory) == "/custom/agents/dir1":
                 profiles["custom-agent1"] = {
@@ -622,3 +637,67 @@ class TestLoadAgentProfileEnvResolution:
         assert profile.system_prompt == "Body token: builtin-secret"
         assert profile.mcpServers is not None
         assert profile.mcpServers["service"]["env"]["API_TOKEN"] == "builtin-secret"
+
+
+class TestCodexConfigParsing:
+    """codexConfig frontmatter parses into the AgentProfile field."""
+
+    def test_codex_config_parses_dotted_keys_and_mixed_value_types(self):
+        text = (
+            "---\n"
+            "name: codex-agent\n"
+            "description: Codex agent with inline config\n"
+            "provider: codex\n"
+            "codexConfig:\n"
+            '  model_reasoning_effort: "xhigh"\n'
+            '  service_tier: "fast"\n'
+            "  features.fast_mode: true\n"
+            "---\n"
+            "System prompt content"
+        )
+
+        profile = parse_agent_profile_text(text, "codex-agent")
+
+        assert profile.codexConfig == {
+            "model_reasoning_effort": "xhigh",
+            "service_tier": "fast",
+            "features.fast_mode": True,
+        }
+
+    def test_codex_config_defaults_to_none_when_absent(self):
+        text = (
+            "---\n"
+            "name: codex-agent\n"
+            "description: Codex agent without inline config\n"
+            "provider: codex\n"
+            "---\n"
+            "System prompt content"
+        )
+
+        profile = parse_agent_profile_text(text, "codex-agent")
+
+        assert profile.codexConfig is None
+
+
+class TestGrokNativeWorkflowsParsing:
+    """Grok's native-workflow opt-in is a typed profile setting."""
+
+    def test_grok_native_workflows_is_opt_in(self):
+        text = (
+            "---\n"
+            "name: grok-native\n"
+            "description: Grok agent with native workers\n"
+            "provider: grok_cli\n"
+            "grokNativeWorkflows: true\n"
+            "---\n"
+            "System prompt content"
+        )
+
+        profile = parse_agent_profile_text(text, "grok-native")
+
+        assert profile.grokNativeWorkflows is True
+
+    def test_omitted_grok_native_workflows_preserves_profile_api_compatibility(self):
+        profile = AgentProfile(name="grok-default", description="Grok agent")
+
+        assert profile.grokNativeWorkflows is None

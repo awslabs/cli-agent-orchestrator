@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +109,13 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     - ``"enabled": true`` added
     - ``env`` → ``environment`` (OpenCode's key for process env vars)
     """
-    command_str: str = cao_config.get("command", "")
-    args: List[str] = cao_config.get("args", [])
+    # Resolve the bundled cao-mcp-server console script to a PATH-independent
+    # invocation before flattening into OpenCode's command list.
+    # persisted=True: OpenCode reads this from opencode.json at launch, so prefer
+    # the stable PATH launcher over a versioned venv path that upgrades relocate.
+    command_str, args = resolve_cao_mcp_command(
+        cao_config.get("command", ""), cao_config.get("args", []) or [], persisted=True
+    )
     full_command: List[str] = ([command_str] if command_str else []) + list(args)
 
     result: Dict[str, Any] = {

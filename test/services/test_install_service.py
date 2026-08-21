@@ -1,6 +1,7 @@
 """Tests for the install service."""
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -8,18 +9,21 @@ import frontmatter
 import pytest
 import requests  # type: ignore[import-untyped]
 
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
-from cli_agent_orchestrator.utils.skill_injection import refresh_agent_json_prompt
+from cli_agent_orchestrator.utils.skill_injection import refresh_agent_md_prompt
 
 
-def _profile_text(*, name: str, include_prompt: bool = True) -> str:
+def _profile_text(*, name: str, include_prompt: bool = True, provider: str | None = None) -> str:
     """Build a profile fixture with env placeholders in prompt and MCP config."""
     prompt_lines = "Fallback prompt\n" if include_prompt else ""
+    provider_line = f"provider: {provider}\n" if provider else ""
     return (
         "---\n"
         f"name: {name}\n"
         "description: Test agent\n"
+        f"{provider_line}"
         "role: developer\n"
         "mcpServers:\n"
         "  service:\n"
@@ -39,7 +43,6 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
     local_store_dir = tmp_path / "agent-store"
     context_dir = tmp_path / "agent-context"
     kiro_dir = tmp_path / "kiro"
-    q_dir = tmp_path / "q"
     copilot_dir = tmp_path / "copilot"
     provider_dir = tmp_path / "provider"
     extra_dir = tmp_path / "extra"
@@ -49,7 +52,6 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         local_store_dir,
         context_dir,
         kiro_dir,
-        q_dir,
         copilot_dir,
         provider_dir,
         extra_dir,
@@ -57,7 +59,7 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         path.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+        "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
         local_store_dir,
     )
     monkeypatch.setattr(
@@ -69,7 +71,6 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         context_dir,
     )
     monkeypatch.setattr("cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", kiro_dir)
-    monkeypatch.setattr("cli_agent_orchestrator.services.install_service.Q_AGENTS_DIR", q_dir)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.install_service.COPILOT_AGENTS_DIR",
         copilot_dir,
@@ -88,7 +89,6 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         "local_store_dir": local_store_dir,
         "context_dir": context_dir,
         "kiro_dir": kiro_dir,
-        "q_dir": q_dir,
         "copilot_dir": copilot_dir,
         "provider_dir": provider_dir,
         "extra_dir": extra_dir,
@@ -152,10 +152,10 @@ class TestInstallAgent:
         assert result.success is True
         assert result.agent_name == "nested-agent"
 
-    def test_install_from_url_downloads_and_writes_q_config(
+    def test_install_from_url_downloads_and_writes_kiro_config(
         self, install_paths: dict[str, Path]
     ) -> None:
-        """URL sources should be downloaded into the local store and installed for Q CLI."""
+        """URL sources should be downloaded into the local store and installed for Kiro CLI."""
         mock_response = MagicMock()
         mock_response.text = _profile_text(name="downloaded-agent")
         mock_response.is_redirect = False
@@ -167,7 +167,7 @@ class TestInstallAgent:
         ) as mock_get:
             result = install_agent(
                 "https://raw.githubusercontent.com/org/repo/main/downloaded-agent.md",
-                "q_cli",
+                "kiro_cli",
                 {"API_TOKEN": "secret-token"},
             )
 
@@ -182,9 +182,9 @@ class TestInstallAgent:
         )
         assert (install_paths["local_store_dir"] / "downloaded-agent.md").exists()
 
-        q_config = json.loads((install_paths["q_dir"] / "downloaded-agent.json").read_text())
-        assert q_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
-        assert q_config["mcpServers"]["service"]["env"]["BASE_URL"] == "${BASE_URL}"
+        kiro_config = json.loads((install_paths["kiro_dir"] / "downloaded-agent.json").read_text())
+        assert kiro_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
+        assert kiro_config["mcpServers"]["service"]["env"]["BASE_URL"] == "${BASE_URL}"
 
     def test_install_from_local_store_writes_copilot_config(
         self, install_paths: dict[str, Path]
@@ -229,6 +229,64 @@ class TestInstallAgent:
         kiro_config = json.loads((install_paths["kiro_dir"] / "developer.json").read_text())
         assert kiro_config["name"] == "developer"
         assert kiro_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
+
+    def test_install_kiro_resolves_bundled_mcp_command_persisted(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """The bare cao-mcp-server command in a profile is resolved with
+        persisted=True (PATH launcher preferred over the versioned venv
+        sibling) in the written Kiro agent JSON — the config is consumed
+        verbatim by kiro at later launches, so resolution must happen here.
+        Wiring guard: dropping the resolve call in install_agent fails this."""
+        profile_text = (
+            "---\n"
+            "name: cao-agent\n"
+            "description: Test agent\n"
+            "role: developer\n"
+            "mcpServers:\n"
+            "  cao-mcp-server:\n"
+            "    command: cao-mcp-server\n"
+            "    args: []\n"
+            "prompt: |\n  Do work\n"
+            "---\n"
+            "Body.\n"
+        )
+        local_profile = install_paths["local_store_dir"] / "cao-agent.md"
+        local_profile.write_text(profile_text, encoding="utf-8")
+
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/versioned/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value="/home/u/.local/bin/cao-mcp-server"),
+        ):
+            result = install_agent("cao-agent", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "cao-agent.json").read_text())
+        entry = kiro_config["mcpServers"]["cao-mcp-server"]
+        # persisted=True prefers the stable PATH launcher.
+        assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
+
+    def test_install_rejects_kas_profile_before_writing_kiro_config(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        profile_path = install_paths["local_store_dir"] / "kas-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-agent\n"
+            "description: KAS agent\n"
+            "engine: kas\n"
+            "allowedTools: [fs_read]\n"
+            "---\n"
+            "KAS profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-agent", "kiro_cli")
+
+        assert result.success is False
+        assert "Cedar" in result.message
+        assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
 
     def test_install_sets_env_vars_before_profile_loading(
         self, install_paths: dict[str, Path]
@@ -294,7 +352,7 @@ class TestInstallAgent:
         ):
             result = install_agent(
                 "https://raw.githubusercontent.com/org/repo/main/missing-agent.md",
-                "q_cli",
+                "kiro_cli",
             )
 
         assert result.success is False
@@ -354,6 +412,107 @@ class TestInstallAgent:
         assert result.success is False
         assert "Failed to install agent" in result.message
         assert "Unexpected error" in result.message
+
+
+class TestInstallProviderResolution:
+    """Tests for provider precedence: explicit flag > frontmatter > default (GH #414)."""
+
+    def test_explicit_provider_wins_over_frontmatter(self, install_paths: dict[str, Path]) -> None:
+        """An explicit provider argument should override the profile's frontmatter."""
+        local_profile = install_paths["local_store_dir"] / "fm-agent.md"
+        local_profile.write_text(
+            _profile_text(name="fm-agent", provider="claude_code"), encoding="utf-8"
+        )
+
+        result = install_agent("fm-agent", "kiro_cli")
+
+        assert result.success is True
+        assert result.provider == "kiro_cli"
+        assert (install_paths["kiro_dir"] / "fm-agent.json").exists()
+
+    def test_frontmatter_provider_used_when_flag_absent(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """Without an explicit provider, the profile's frontmatter provider wins."""
+        local_profile = install_paths["local_store_dir"] / "fm-agent.md"
+        local_profile.write_text(
+            _profile_text(name="fm-agent", provider="claude_code"), encoding="utf-8"
+        )
+
+        result = install_agent("fm-agent")
+
+        assert result.success is True
+        assert result.provider == "claude_code"
+        # claude_code installs write a context file only — no kiro config,
+        # which is exactly what the pre-fix behaviour would have produced.
+        assert result.agent_file is None
+        assert not (install_paths["kiro_dir"] / "fm-agent.json").exists()
+
+    def test_default_provider_used_when_flag_and_frontmatter_absent(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """No flag and no frontmatter provider should fall back to DEFAULT_PROVIDER."""
+        local_profile = install_paths["local_store_dir"] / "plain-agent.md"
+        local_profile.write_text(_profile_text(name="plain-agent"), encoding="utf-8")
+
+        result = install_agent("plain-agent")
+
+        assert result.success is True
+        assert result.provider == DEFAULT_PROVIDER
+        assert (install_paths["kiro_dir"] / "plain-agent.json").exists()
+
+    def test_invalid_frontmatter_provider_warns_and_falls_back(
+        self, install_paths: dict[str, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A bogus frontmatter provider should log a warning and use the default."""
+        local_profile = install_paths["local_store_dir"] / "bogus-agent.md"
+        local_profile.write_text(
+            _profile_text(name="bogus-agent", provider="bogus_provider"), encoding="utf-8"
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.services.install_service"
+        ):
+            result = install_agent("bogus-agent")
+
+        assert result.success is True
+        assert result.provider == DEFAULT_PROVIDER
+        assert (install_paths["kiro_dir"] / "bogus-agent.json").exists()
+        assert "invalid provider 'bogus_provider'" in caplog.text
+
+    def test_explicit_invalid_provider_fails_before_download(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """An explicit bad provider must fail fast BEFORE any URL download."""
+        with patch("cli_agent_orchestrator.services.install_service.requests.get") as mock_get:
+            result = install_agent(
+                "https://raw.githubusercontent.com/org/repo/main/agent.md",
+                "bad_provider",
+            )
+
+        assert result.success is False
+        assert result.message.startswith("Invalid provider 'bad_provider'.")
+        mock_get.assert_not_called()
+
+    def test_builtin_profile_without_frontmatter_provider_uses_default(
+        self, install_paths: dict[str, Path], tmp_path: Path
+    ) -> None:
+        """Built-in store profiles carry no frontmatter provider — bare installs keep the default."""
+        built_in_dir = tmp_path / "builtin-agent-store"
+        built_in_dir.mkdir()
+        (built_in_dir / "developer.md").write_text(
+            _profile_text(name="developer"), encoding="utf-8"
+        )
+
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            return_value=built_in_dir,
+        ):
+            result = install_agent("developer")
+
+        assert result.success is True
+        assert result.provider == DEFAULT_PROVIDER
+        assert (install_paths["kiro_dir"] / "developer.json").exists()
 
 
 class TestInstallAgentHardening:
@@ -471,14 +630,14 @@ class TestInstallSkillCatalogBaking:
         local_store_dir = tmp_path / "agent-store"
         context_dir = tmp_path / "agent-context"
         kiro_dir = tmp_path / "kiro"
-        q_dir = tmp_path / "q"
+        copilot_dir = tmp_path / "copilot"
         skills_dir = tmp_path / "skills"
 
-        for d in (local_store_dir, context_dir, kiro_dir, q_dir, skills_dir):
+        for d in (local_store_dir, context_dir, kiro_dir, copilot_dir, skills_dir):
             d.mkdir()
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             local_store_dir,
         )
         monkeypatch.setattr(
@@ -491,7 +650,9 @@ class TestInstallSkillCatalogBaking:
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", kiro_dir
         )
-        monkeypatch.setattr("cli_agent_orchestrator.services.install_service.Q_AGENTS_DIR", q_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.COPILOT_AGENTS_DIR", copilot_dir
+        )
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.install_service.SKILLS_DIR", skills_dir
         )
@@ -507,7 +668,7 @@ class TestInstallSkillCatalogBaking:
             "local_store_dir": local_store_dir,
             "context_dir": context_dir,
             "kiro_dir": kiro_dir,
-            "q_dir": q_dir,
+            "copilot_dir": copilot_dir,
             "skills_dir": skills_dir,
         }
 
@@ -540,8 +701,10 @@ class TestInstallSkillCatalogBaking:
         assert len(skill_resources) == 1
         assert skill_resources[0].endswith("/**/SKILL.md")
 
-    def test_install_q_bakes_catalog_into_prompt(self, install_workspace: dict) -> None:
-        """Q installs should bake the global skill catalog into the JSON prompt."""
+    def test_install_kiro_keeps_prompt_clean_with_skill_resources(
+        self, install_workspace: dict
+    ) -> None:
+        """Kiro installs keep the profile prompt clean and expose skills via resources."""
         _create_skill(
             install_workspace["skills_dir"] / "python-testing",
             "python-testing",
@@ -553,12 +716,14 @@ class TestInstallSkillCatalogBaking:
             "System prompt",
         )
 
-        result = install_agent("test-agent", "q_cli")
+        result = install_agent("test-agent", "kiro_cli")
 
         assert result.success is True
-        agent_json = json.loads((install_workspace["q_dir"] / "test-agent.json").read_text())
-        assert agent_json["prompt"].startswith("Build things\n\n## Available Skills")
-        assert "python-testing" in agent_json["prompt"]
+        agent_json = json.loads((install_workspace["kiro_dir"] / "test-agent.json").read_text())
+        assert agent_json["prompt"] == "Build things"
+        assert "Available Skills" not in agent_json["prompt"]
+        skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
+        assert len(skill_resources) == 1
 
     def test_install_kiro_omits_prompt_field_when_profile_prompt_is_empty(
         self, install_workspace: dict
@@ -582,7 +747,7 @@ class TestInstallSkillCatalogBaking:
     def test_install_non_ascii_prompt_round_trips_through_refresh_without_byte_drift(
         self, install_workspace: dict
     ) -> None:
-        """Non-ASCII prompt content should survive install and refresh with byte-identical JSON."""
+        """Non-ASCII prompt content should survive install and refresh with byte-identical output."""
         _create_skill(
             install_workspace["skills_dir"] / "unicode-skill",
             "unicode-skill",
@@ -591,16 +756,16 @@ class TestInstallSkillCatalogBaking:
         self._write_profile(
             install_workspace["local_store_dir"] / "unicode-agent.md",
             "name: unicode-agent\ndescription: Test agent\nprompt: こんにちは 🚀\n",
-            "System prompt",
+            "こんにちは 🚀",
         )
 
-        result = install_agent("unicode-agent", "q_cli")
+        result = install_agent("unicode-agent", "copilot_cli")
 
         assert result.success is True
-        agent_path = install_workspace["q_dir"] / "unicode-agent.json"
+        agent_path = install_workspace["copilot_dir"] / "unicode-agent.agent.md"
         before_refresh = agent_path.read_bytes()
 
-        refreshed = refresh_agent_json_prompt(
+        refreshed = refresh_agent_md_prompt(
             agent_path,
             AgentProfile(name="unicode-agent", description="Test agent", prompt="こんにちは 🚀"),
         )
@@ -681,11 +846,11 @@ class TestInstallAgentEnvBehaviour:
         """The first '=' splits the assignment; subsequent '=' chars remain in the value."""
         self._write_profile(install_paths["local_store_dir"] / "test-agent.md", body="URL: ${URL}")
 
-        result = install_agent("test-agent", "q_cli", {"URL": "http://host?a=b"})
+        result = install_agent("test-agent", "kiro_cli", {"URL": "http://host?a=b"})
 
         assert result.success is True
-        q_config = json.loads((install_paths["q_dir"] / "test-agent.json").read_text())
-        assert q_config["mcpServers"]["service"]["env"]["URL"] == "http://host?a=b"
+        kiro_config = json.loads((install_paths["kiro_dir"] / "test-agent.json").read_text())
+        assert kiro_config["mcpServers"]["service"]["env"]["URL"] == "http://host?a=b"
 
     def test_install_without_env_does_not_create_env_file(
         self, install_paths: dict[str, Path]
@@ -778,3 +943,106 @@ class TestInstallAgentEnvBehaviour:
         assert "${API_TOKEN}" in installed_text
         assert "${SERVICE_URL}" in installed_text
         assert "integration-secret" not in installed_text
+
+
+class TestInjectKiroMcpTimeout:
+    """Tests for _inject_kiro_mcp_timeout — raising kiro's per-server tool-call
+    timeout for cao-mcp-server so long handoff RPCs are not cancelled client-side.
+    """
+
+    def test_injects_timeout_on_cao_mcp_server(self):
+        from cli_agent_orchestrator.services.install_service import (
+            _KIRO_MCP_TOOL_TIMEOUT_MS,
+            _inject_kiro_mcp_timeout,
+        )
+
+        servers = {
+            "cao-mcp-server": {
+                "type": "stdio",
+                "command": "uvx",
+                "args": [
+                    "--from",
+                    "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                    "cao-mcp-server",
+                ],
+            }
+        }
+        out = _inject_kiro_mcp_timeout(servers)
+        assert out["cao-mcp-server"]["timeout"] == _KIRO_MCP_TOOL_TIMEOUT_MS
+        # Original dict must not be mutated
+        assert "timeout" not in servers["cao-mcp-server"]
+
+    def test_detects_cao_by_args_even_with_different_key(self):
+        from cli_agent_orchestrator.services.install_service import (
+            _KIRO_MCP_TOOL_TIMEOUT_MS,
+            _inject_kiro_mcp_timeout,
+        )
+
+        servers = {"orchestrator": {"command": "uvx", "args": ["--from", "x", "cao-mcp-server"]}}
+        out = _inject_kiro_mcp_timeout(servers)
+        assert out["orchestrator"]["timeout"] == _KIRO_MCP_TOOL_TIMEOUT_MS
+
+    def test_detects_cao_by_command_even_with_different_key(self):
+        from cli_agent_orchestrator.services.install_service import (
+            _KIRO_MCP_TOOL_TIMEOUT_MS,
+            _inject_kiro_mcp_timeout,
+        )
+
+        # Bare console script (bundled profile form) and a resolved absolute
+        # path (what resolve_mcp_server_config writes) both carry the marker
+        # in the command, not the args.
+        for command in ("cao-mcp-server", "/home/u/.local/bin/cao-mcp-server"):
+            servers = {"orchestrator": {"command": command, "args": []}}
+            out = _inject_kiro_mcp_timeout(servers)
+            assert out["orchestrator"]["timeout"] == _KIRO_MCP_TOOL_TIMEOUT_MS
+
+    def test_detects_cao_module_entrypoint_fallback(self):
+        from cli_agent_orchestrator.services.install_service import (
+            _KIRO_MCP_TOOL_TIMEOUT_MS,
+            _inject_kiro_mcp_timeout,
+        )
+
+        # The resolver's last-resort form: <python> -m <module>.
+        servers = {
+            "orchestrator": {
+                "command": "/venv/bin/python3",
+                "args": ["-m", "cli_agent_orchestrator.mcp_server.server"],
+            }
+        }
+        out = _inject_kiro_mcp_timeout(servers)
+        assert out["orchestrator"]["timeout"] == _KIRO_MCP_TOOL_TIMEOUT_MS
+
+    def test_leaves_non_cao_servers_untouched(self):
+        from cli_agent_orchestrator.services.install_service import _inject_kiro_mcp_timeout
+
+        servers = {"tavily": {"command": "npx", "args": ["-y", "tavily-mcp@latest"]}}
+        out = _inject_kiro_mcp_timeout(servers)
+        assert "timeout" not in out["tavily"]
+
+    def test_respects_operator_set_timeout(self):
+        from cli_agent_orchestrator.services.install_service import _inject_kiro_mcp_timeout
+
+        servers = {
+            "cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"], "timeout": 5000}
+        }
+        out = _inject_kiro_mcp_timeout(servers)
+        # Explicit operator value is never overwritten
+        assert out["cao-mcp-server"]["timeout"] == 5000
+
+    def test_none_and_empty_are_passthrough(self):
+        from cli_agent_orchestrator.services.install_service import _inject_kiro_mcp_timeout
+
+        assert _inject_kiro_mcp_timeout(None) is None
+        assert _inject_kiro_mcp_timeout({}) == {}
+
+
+def test_install_omp_writes_context_only(install_paths: dict[str, Path]) -> None:
+    profile = install_paths["local_store_dir"] / "omp-agent.md"
+    profile.write_text(_profile_text(name="omp-agent"), encoding="utf-8")
+
+    result = install_agent("omp-agent", "omp")
+
+    assert result.success is True
+    assert result.provider == "omp"
+    assert result.agent_file is None
+    assert (install_paths["context_dir"] / "omp-agent.md").exists()

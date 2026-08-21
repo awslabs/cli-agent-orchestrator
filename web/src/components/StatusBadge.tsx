@@ -1,53 +1,13 @@
+// StatusBadge — terminal status pill for the web dashboard.
+//
+// STATUS_CONFIG / UNKNOWN_CONFIG are generated from the shared design-token SSOT
+// (design-tokens/status.json + tokens.json) via `node design-tokens/gen.mjs`.
+// Do not hand-edit the status taxonomy here — edit the JSON and regenerate.
+import { STATUS_CONFIG, UNKNOWN_CONFIG } from '../status.generated'
+
+export { STATUS_CONFIG }
+
 type TerminalStatus = 'IDLE' | 'PROCESSING' | 'COMPLETED' | 'WAITING_USER_ANSWER' | 'ERROR' | string | null
-
-interface StatusStyle {
-  label: string
-  dotClass: string
-  bgClass: string
-  textClass: string
-  pulse?: boolean
-}
-
-export const STATUS_CONFIG: Record<string, StatusStyle> = {
-  IDLE: {
-    label: 'Idle',
-    dotClass: 'bg-emerald-400',
-    bgClass: 'bg-emerald-400/10',
-    textClass: 'text-emerald-400',
-  },
-  PROCESSING: {
-    label: 'Processing',
-    dotClass: 'bg-blue-400',
-    bgClass: 'bg-blue-400/10',
-    textClass: 'text-blue-400',
-    pulse: true,
-  },
-  COMPLETED: {
-    label: 'Completed',
-    dotClass: 'bg-purple-400',
-    bgClass: 'bg-purple-400/10',
-    textClass: 'text-purple-400',
-  },
-  WAITING_USER_ANSWER: {
-    label: 'Awaiting Input',
-    dotClass: 'bg-amber-400',
-    bgClass: 'bg-amber-400/10',
-    textClass: 'text-amber-400',
-  },
-  ERROR: {
-    label: 'Error',
-    dotClass: 'bg-red-400',
-    bgClass: 'bg-red-400/10',
-    textClass: 'text-red-400',
-  },
-}
-
-const UNKNOWN_CONFIG: StatusStyle = {
-  label: 'Unknown',
-  dotClass: 'bg-gray-500',
-  bgClass: 'bg-gray-500/10',
-  textClass: 'text-gray-500',
-}
 
 export function StatusBadge({ status }: { status: TerminalStatus }) {
   const normalized = status ? status.toUpperCase() : null

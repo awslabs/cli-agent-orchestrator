@@ -1,7 +1,6 @@
 """Cleanup service for old terminals, messages, and logs."""
 
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -12,6 +11,11 @@ from cli_agent_orchestrator.constants import (
     RETENTION_DAYS,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.memory_format import parse_index_entry
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +28,33 @@ def cleanup_old_data():
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )
 
-        # Clean up old terminals
+        # Clean up old terminals (stop FIFO readers and clear state first)
         with SessionLocal() as db:
-            deleted_terminals = (
-                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).delete()
+            old_terminals = (
+                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
             )
+            retained_terminal_ids: set[str] = set()
+            for terminal in old_terminals:
+                fifo_manager.stop_reader(terminal.id)
+                status_monitor.clear_terminal(terminal.id)
+                # A stale Grok terminal can still own a private GROK_HOME. An
+                # explicit deferred cleanup is its retry handle, so retention
+                # housekeeping must not bulk-delete that row underneath it.
+                if (
+                    terminal.provider == ProviderType.GROK_CLI.value
+                    and provider_manager.cleanup_provider(terminal.id) is False
+                ):
+                    retained_terminal_ids.add(terminal.id)
+                    logger.warning(
+                        "Retaining stale Grok terminal %s while cleanup is deferred", terminal.id
+                    )
+            terminal_query = db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date)
+            if retained_terminal_ids:
+                deleted_terminals = terminal_query.filter(
+                    ~TerminalModel.id.in_(retained_terminal_ids)
+                ).delete()
+            else:
+                deleted_terminals = terminal_query.delete()
             db.commit()
             logger.info(f"Deleted {deleted_terminals} old terminals from database")
 
@@ -77,6 +103,7 @@ SCOPE_RETENTION_DAYS: dict[str, int | None] = {
     "agent": None,
     "project": 90,
     "session": 14,
+    "federated": None,
 }
 PERMANENT_MEMORY_TYPES: frozenset[str] = frozenset({"user", "feedback"})
 
@@ -116,9 +143,10 @@ async def cleanup_expired_memories() -> None:
                 continue
 
             # Extract scope_id from path: .../memory/{scope_id}/wiki/index.md
-            # "global" dir → scope_id=None, project hash dirs → scope_id=hash
+            # "global"/"federated" dirs → scope_id=None (flat, machine-wide),
+            # project hash dirs → scope_id=hash
             project_dir_name = index_path.parent.parent.name
-            scope_id = None if project_dir_name == "global" else project_dir_name
+            scope_id = None if project_dir_name in ("global", "federated") else project_dir_name
 
             for entry in expired_entries:
                 try:
@@ -182,7 +210,7 @@ def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
         # Detect scope section headers: ## global, ## session, etc.
         if line.startswith("## "):
             section = line[3:].strip()
-            if section in ("global", "project", "session", "agent"):
+            if section in ("global", "project", "session", "agent", "federated"):
                 current_scope = section
             continue
 
@@ -190,17 +218,14 @@ def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
             continue
 
         # Parse entry: - [key](scope/key.md) — type:X tags:Y ~Ntok updated:Z
-        match = re.match(
-            r"^- \[([^\]]+)\]\(([^)]+)\) — type:(\S+) tags:\S* ~\d+tok updated:(\S+)$",
-            line,
-        )
+        match = parse_index_entry(line)
         if not match:
             continue
 
-        key = match.group(1)
-        relative_path = match.group(2)
-        memory_type = match.group(3)
-        updated_str = match.group(4)
+        key = match.group("key")
+        relative_path = match.group("path")
+        memory_type = match.group("type")
+        updated_str = match.group("updated")
 
         # Extract scope_id from nested path for session/agent scopes:
         #   session/<scope_id>/<key>.md  →  scope_id

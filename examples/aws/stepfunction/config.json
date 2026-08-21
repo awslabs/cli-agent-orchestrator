@@ -1,0 +1,9 @@
+{
+  "profile": "my-aws-profile",
+  "region": "us-east-1",
+  "state_machine_arn": "arn:aws:states:us-east-1:123456789012:stateMachine:MyStateMachine",
+  "execution_name_prefix": "cao-exec",
+  "input_payload": "{}",
+  "poll_interval_seconds": 15,
+  "timeout_seconds": 600
+}

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "cloudwatch-logs",
+  "description": "Search and tail CloudWatch log groups",
+  "type": "object",
+  "properties": {
+    "profile": {
+      "type": "string",
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "region": {
+      "type": "string",
+      "description": "AWS region",
+      "pattern": "^[a-z]{2}-[a-z]+-[0-9]+$"
+    },
+    "log_group": {
+      "type": "string",
+      "description": "CloudWatch log group name",
+      "pattern": "^[a-zA-Z0-9/_#.:-]+$"
+    },
+    "search_time_window_minutes": {
+      "type": "integer",
+      "description": "How far back to search (minutes)",
+      "minimum": 1,
+      "default": 60
+    },
+    "max_events": {
+      "type": "integer",
+      "description": "Maximum events to return",
+      "minimum": 1,
+      "default": 50
+    }
+  },
+  "required": ["profile", "region", "log_group"],
+  "additionalProperties": false
+}

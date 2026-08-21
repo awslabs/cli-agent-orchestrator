@@ -1,0 +1,15 @@
+  Cursor Agent
+  v2026.06.15-03-48-54-da23e37
+  Use subagents to parallelize work and preserve context.
+
+  $ sleep 10 10s
+
+  1 + 1 = 2
+
+
+
+  → Add a follow-up
+
+
+  Composer 2.5 Fast                                             Run Everything
+  /workspaces/cli-agent-orchestrator · feat/cursor-cli-provider · #296

@@ -1,0 +1,11 @@
+# Node toolchain
+node_modules/
+
+# Vitest / coverage output
+coverage/
+.vitest/
+
+# Build output is emitted into the Python package tree
+# (src/cli_agent_orchestrator/ext_apps/apps_static/) and shipped via the wheel
+# artifacts rule, not from here.
+dist/

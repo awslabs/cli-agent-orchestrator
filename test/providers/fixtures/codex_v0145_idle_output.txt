@@ -1,0 +1,14 @@
+╭──────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.145.0)                   │
+│                                              │
+│ model:       gpt-5.6-sol medium              │
+│ directory:   ~/project                       │
+│ permissions: YOLO mode                       │
+╰──────────────────────────────────────────────╯
+
+  Tip: Build faster with the Desktop app.
+
+
+› Write tests for @filename
+
+  gpt-5.6-sol medium · Context 100% left
