@@ -314,6 +314,9 @@ def init_db() -> None:
     # #504 also migrates, so registry order is immaterial — never reorder the
     # entries above.
     _migrate_memory_relationships()
+    # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
+    # its own new table, no shared columns — so registry order is immaterial here too.
+    _migrate_workflow_plan_approval()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -539,6 +542,52 @@ def _migrate_memory_relationships() -> None:
         logger.debug(f"memory_relationships migration skipped: {e}")
 
 
+def _migrate_workflow_plan_approval() -> None:
+    """Create the durable ``workflow_plan_approval`` table if missing (issue #583 Bolt 2, ``approval-store``).
+
+    FR-8's re-approval mechanism: one row per APPROVED PLAN, keyed by the ``plan_id`` that
+    ``plan_identifier.compute`` derives from a run's execution-affecting fields. A changed plan produces a
+    different ``plan_id``, finds no row, and is refused until it is approved in its own right.
+
+    ``plan_id`` IS THE PRIMARY KEY, so one-approval-per-plan is enforced by the database rather than by code
+    remembering to check. Combined with ``INSERT OR IGNORE`` in ``services/approval_store.py``, that makes an
+    approval WRITE-ONCE: a repeated grant cannot overwrite the original ``approved_at`` / ``approved_by``, and
+    there is no update path at all. That absence is deliberate and is the unit's central control — an update
+    would let an existing approval be pointed at a changed plan, so the row would read as approved while the
+    work behind it had never been reviewed.
+
+    KEYED BY PLAN, NOT BY RUN, and deliberately carrying NO foreign key to ``workflow_run``: an approval's
+    lifetime is independent of any run, so deleting a run must not be able to revoke one.
+
+    Idempotent, zero-arg, self-connecting; failure logged at debug and never propagated (B4-BR-1 / B4-RD-4),
+    same precedent as every migrator above. Because that failure is SILENT, the table's existence is VERIFIED
+    rather than assumed: see ``test/services/test_approval_store.py`` for the ``PRAGMA table_info`` assertion on
+    a fresh database. A missing table makes every approval lookup answer False, which refuses every run —
+    fail-closed, but diagnosed far from its cause.
+
+    NOT registered in ``workflow_journal``'s ``_REQUIRED_RUN_COLUMNS`` / ``_REQUIRED_STEP_COLUMNS``. That
+    verification is scoped to the columns the JOURNAL's own SQL reads, and this table is read by neither, so
+    coupling the journal's connection cache to it would be wrong. The consequence is that this table gets no
+    runtime self-healing the way ``manifest_json`` does; ``approval_store._connect`` runs this migrator on every
+    connect instead, so a transient failure is retried on the next operation.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_plan_approval ("
+                "plan_id TEXT PRIMARY KEY, "
+                "approved_at TEXT NOT NULL, "
+                "approved_by TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
+        logger.debug(f"workflow_plan_approval migration skipped: {e}")
+
+
 def _backfill_legacy_related_keys(conn: Any) -> None:
     """One-time, idempotent backfill of ``memory_metadata.related_keys`` into
     ``memory_relationships`` as ``type=relates_to, origin=legacy_related_keys,
@@ -731,6 +780,28 @@ def _migrate_workflow_run() -> None:
     rows back-fill to ``tier='yaml'``, ``generation='1'``. ``generation`` is TEXT,
     not INTEGER, so it compares byte-identically against the env-var-transported
     string generation value (domain-entities B4 fix).
+
+    ``manifest-column`` (issue #583 Bolt 2, ADR-583-12) additively appends ONE
+    column, ``manifest_json``, through the same PRAGMA-gated idiom — the frozen
+    execution manifest envelope, carrying source hash, inputs, repository and
+    worktree baseline, provider, model, profile, permissions, limits, retry
+    policy, the resolved-memory record, and the ``plan_id`` derived from them.
+    ``DEFAULT NULL`` means "manifest absent", which every pre-Bolt-2 row is, so
+    such a row reads back observably identical to its pre-extension form
+    (INV-1/INV-2) and no back-fill is attempted — a manifest records how a run was
+    LAUNCHED, which is not recoverable for a run that already started.
+
+    Because this body's failure is silent (see the ``except`` below), the column's
+    existence is VERIFIED rather than assumed: ``test_workflow_run_columns`` in
+    ``test/clients/test_workflow_run_migration.py`` asserts it on a fresh database,
+    with its TEXT type and NULL default. A silent failure would otherwise surface
+    far from its cause, as every run losing its manifest — which the Bolt 2
+    approval gate reads as "never approved" and refuses. That direction is
+    fail-closed, but the diagnosis is still remote, hence the assertion.
+
+    This column is NOT indexed (ADR-583-12: re-approval compares a ``plan_id``
+    read out of the envelope and no query filters on it). Writing and reading it
+    belong to the ``manifest-freeze`` unit, not to this migrator.
     """
     import sqlite3
 
@@ -761,6 +832,9 @@ def _migrate_workflow_run() -> None:
                     "ALTER TABLE workflow_run ADD COLUMN generation TEXT NOT NULL DEFAULT '1'"
                 )
                 logger.info("Migration: added generation column to workflow_run")
+            if "manifest_json" not in columns:
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN manifest_json TEXT DEFAULT NULL")
+                logger.info("Migration: added manifest_json column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -812,8 +886,22 @@ def _migrate_workflow_run_step() -> None:
     block, so the combined body now issues FOUR guarded ``ALTER`` statements, not
     one. The risk #583 minimised is materially larger than either change assumed
     alone. #583's mitigation (assert the column exists on a fresh database) is
-    therefore MORE load-bearing after this merge, and #504's three columns have no
-    equivalent assertion. Flagged rather than silently reconciled.
+    therefore MORE load-bearing after this merge. Flagged rather than silently
+    reconciled.
+
+    CORRECTION (2026-08-18, issue #583 Bolt 2, unit ``manifest-column``). The
+    sentence above previously ended by claiming that "#504's three columns have no
+    equivalent assertion". **That claim was false and has been removed.** All three
+    ARE asserted, in ``test/clients/test_workflow_run_migration.py``: ``terminal_id``,
+    ``reprompted`` and ``error_kind`` appear in ``test_workflow_run_step_columns``'s
+    exact ``set(cols) == {...}`` column set, and each carries a nullable check
+    (``[3] == 0``) plus a default check (``[4] == "NULL"``) in the same test. The
+    locations are named here so the denial cannot rot back: a reader who believed it
+    would add a duplicate assertion to close a gap that does not exist. What DOES
+    survive from the note above is the crowding itself — four guarded ``ALTER``
+    statements under one silent ``except`` is a real and growing risk, and adopting a
+    migration framework for it is recorded as a candidate decision (out of scope for
+    a single additive column).
     """
     import sqlite3
 

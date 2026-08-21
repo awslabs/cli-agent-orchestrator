@@ -172,6 +172,66 @@ def get_cmd(name, as_json):
         click.echo(f"  - {step['id']} ({step['provider']}/{step['agent']})")
 
 
+@workflow.command(name="approve")
+@click.argument("plan_id")
+@click.option(
+    "--json", "as_json", is_flag=True, default=False, help="Emit the approval record as JSON."
+)
+def approve_cmd(plan_id, as_json):
+    """Approve a PLAN_ID so runs of that plan may start (issue #583 FR-8).
+
+    A plan identifier is computed at RUN START from the workflow's execution-affecting fields, so a
+    NEW OR CHANGED PLAN IS REFUSED ONCE before it can be approved: run it, copy the plan_id from the
+    refusal, approve it here, run again. Approval enforcement is off by default — this command is
+    only consequential once ``workflow.require_approval`` is enabled.
+
+    Approving twice is harmless and changes nothing: the original approver and timestamp are kept and
+    reported back, so "already approved" is distinguishable from "just approved by me".
+
+    THERE IS NO WAY TO REVOKE AN APPROVAL, deliberately. An update path could point an existing
+    approval at a changed plan, which would let work nobody reviewed execute with a genuine approval
+    behind it.
+
+    The recorded approver is the local OS account. It is PROVENANCE, NOT IDENTITY — nothing verifies
+    it, and CAO runs as the invoking user.
+
+    Exit codes:
+      0  the plan is approved (whether this call approved it or found it already approved)
+      1  the request was rejected or the server could not be reached
+    """
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/plans/approve",
+            # plan_id rides the BODY, never the path: it contains a ':' and must reach the server
+            # verbatim, because a normalisation is how two distinct plans could share one approval.
+            json={"plan_id": plan_id},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 400:
+        raise click.ClickException(_extract_detail(response, "invalid request"))
+    if response.status_code == 403:
+        raise click.ClickException(
+            _extract_detail(response, "forbidden: approving a plan requires the cao:admin scope")
+        )
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    record = response.json()
+    if as_json:
+        click.echo(_json.dumps(record, indent=2))
+        return
+
+    if record.get("changed"):
+        click.echo(f"approved {record['plan_id']}")
+    else:
+        click.echo(f"{record['plan_id']} was already approved (no change)")
+    click.echo(f"  at: {record.get('approved_at')}")
+    click.echo(f"  by: {record.get('approved_by')}  (local account; provenance, not identity)")
+
+
 @workflow.command(name="delete")
 @click.argument("name")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
