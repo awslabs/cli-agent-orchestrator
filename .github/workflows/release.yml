@@ -11,6 +11,11 @@ on:
           - patch
           - minor
           - major
+  schedule:
+    # Weekly patch release, Monday 09:00 UTC. Skipped automatically if
+    # nothing merged to main since the last tag (see "Check for unreleased
+    # commits" below).
+    - cron: '0 9 * * 1'
 
 permissions:
   contents: read
@@ -26,26 +31,41 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
+      - name: Check for unreleased commits
+        id: unreleased
+        if: github.event_name == 'schedule'
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0)
+          COUNT=$(git rev-list "${LAST_TAG}..HEAD" --count)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No commits since $LAST_TAG - skipping scheduled release."
+          fi
+
       - name: Install git-cliff
+        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
         uses: taiki-e/install-action@v2
         with:
           tool: git-cliff
 
       - name: Set up Python
+        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Bump version and generate changelog
         id: bump
+        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/bump_version.py ${{ inputs.bump }}
+          python scripts/bump_version.py ${{ inputs.bump || 'patch' }}
           VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Commit and tag
+        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -55,6 +75,7 @@ jobs:
           git push && git push --tags
 
       - name: Create GitHub Release
+        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.bump.outputs.version }}
