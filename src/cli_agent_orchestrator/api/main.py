@@ -4370,8 +4370,10 @@ async def submit_workflow_run_endpoint(
     else:
         # Step 4 — reserved-mode guard (OR-3): the prepared YAML entry skips the
         # blocking path's pre-drive reserved-mode rejection, so the handler runs it
-        # here and maps NotBuiltYetError -> 501 pre-journal.
-        if spec.mode != "sequential":
+        # here and maps NotBuiltYetError -> 501 pre-journal. Only ``loop`` (N8)
+        # remains reserved; ``parallel``/``pipeline`` (N7) are shipped and reach
+        # the wave driver via the same prepared drive as sequential.
+        if spec.mode == "loop":
             try:
                 workflow_service._dispatch_reserved_mode(spec)
             except NotBuiltYetError as e:

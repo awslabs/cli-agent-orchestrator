@@ -211,8 +211,10 @@ class TestValidateOnly:
         body = _GOOD_SPEC.format(name="par").replace("mode: sequential", "mode: parallel")
         path = _write_spec(spec_dir, "par", body)
         result = svc.validate_only(str(path), base_dir=str(spec_dir))
-        assert result.status == "pass_reserved"
-        assert any("reserved" in n for n in result.reserved_notes)
+        # N7 shipped parallel execution: a parallel spec is executable (pass),
+        # not pass_reserved. The loop mode remains the reserved one.
+        assert result.status == "pass"
+        assert result.reserved_notes == []
 
     def test_fail_does_not_raise(self, spec_dir):
         path = _write_spec(spec_dir, "broken", "name: broken\nsteps: []\n")
