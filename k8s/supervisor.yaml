@@ -72,6 +72,17 @@ spec:
                 secretKeyRef:
                   name: cao-elastic-broker-token
                   key: token
+            # How long assign_elastic polls a NEW worker's /health through its
+            # Service before giving up on it. The broker hands the lease back as
+            # soon as the Job and Service exist, so this is where the worker's boot
+            # is waited out - on the address the task is about to be posted to,
+            # which is the only check that covers both "the pod came up" and "the
+            # Service in front of it routes". Generous on purpose: the failure it
+            # replaces was a 10s connect timeout destroying a worker that was three
+            # seconds from usable. Only assign_elastic reads it; a plain `assign`
+            # to a long-running node still fails fast.
+            - name: CAO_ELASTIC_WORKER_READY_WAIT
+              value: "120"
             # SigV4 against Bedrock, credentials from Pod Identity. Note this is
             # NOT CLAUDE_CODE_USE_ANTHROPIC_AWS, which is a different product
             # and needs a workspace ID a vended account does not have.

@@ -46,18 +46,27 @@ k8s_config.load_incluster_config = lambda: None
 
 STATE = {"jobs": {}, "services": {}, "pods": {}, "deleted_jobs": [], "deleted_svcs": []}
 
+# What the fake API server hands back for the NEXT pod it creates. Readiness used
+# to be irrelevant to the fake (the broker waited for it, so a pod that was never
+# Ready just hung), but the lease is now returned before readiness and the reaper
+# owns the deadline - so both "came up" and "never came up" have to be expressible.
+STATE["new_pods_ready"] = True
+STATE["new_pods_phase"] = "Running"
+
 
 class FakeBatch:
     def create_namespaced_job(self, ns, body):
         body.metadata.uid = "uid-" + body.metadata.name
         STATE["jobs"][body.metadata.name] = body
         wid = body.metadata.labels["cao.aws/worker-id"]
+        conditions = ([k8s.V1PodCondition(type="Ready", status="True")]
+                      if STATE["new_pods_ready"] else [])
         pod = k8s.V1Pod(
             metadata=k8s.V1ObjectMeta(name=body.metadata.name + "-abcde",
                                       labels=dict(body.metadata.labels)),
             status=k8s.V1PodStatus(
-                phase="Running",
-                conditions=[k8s.V1PodCondition(type="Ready", status="True")],
+                phase=STATE["new_pods_phase"],
+                conditions=conditions,
             ),
         )
         STATE["pods"][wid] = pod
@@ -123,6 +132,8 @@ check("all four model tiers pinned",
 check("both timeouts forwarded",
       env.get("CAO_PROVIDER_INIT_TIMEOUT") == "180" and env.get("CAO_MCP_REQUEST_TIMEOUT") == "240")
 check("max terminals still 1", env.get("CAO_MAX_TERMINALS") == "1")
+check("worker warms its providers in the background",
+      env.get("CAO_WARM_PROVIDER") == "background", env.get("CAO_WARM_PROVIDER"))
 check("worker SA is cao-elastic-worker", spec["serviceAccountName"] == "cao-elastic-worker")
 check("SA token not automounted", spec["automountServiceAccountToken"] is False)
 
@@ -142,8 +153,14 @@ check("term 2 spreads workers",
 check("topologyKey is hostname on both",
       all(t["podAffinityTerm"]["topologyKey"] == "kubernetes.io/hostname" for t in terms))
 probe = spec["containers"][0]["readinessProbe"]
-check("readiness initialDelay lowered to 5", probe["initialDelaySeconds"] == 5,
+# The probe is the only thing standing between "the server answered" and "the
+# Service has an endpoint", and every second of initialDelay is a second of every
+# delegation a participant watches. /health is a constant-time dict return, so
+# probing from t=0 every second costs the pod nothing it can measure.
+check("readiness probe starts immediately", probe["initialDelaySeconds"] == 0,
       str(probe.get("initialDelaySeconds")))
+check("readiness probe polls every second", probe["periodSeconds"] == 1,
+      str(probe.get("periodSeconds")))
 
 # --- 2. the Service is owned by the Job ----------------------------------
 try:
@@ -161,7 +178,83 @@ check("owner is the Job by uid",
       owners and owners[0]["kind"] == "Job" and owners[0]["uid"] == "uid-cao-worker-deadbeef",
       json.dumps(owners))
 
-# --- 3. lease lifecycle over HTTP ---------------------------------------
+# --- 3. the lease returns before readiness; the reaper owns the deadline --
+#
+# Deliberately ABOVE the TestClient block: the reaper only runs as a thread once
+# lifespan has started, so calling _reap_once() by hand here is the one place
+# these transitions can be driven a tick at a time instead of waited for.
+check("readiness gating is off by default", broker.GATE_ON_READY is False)
+
+STATE["new_pods_ready"] = False
+_t0 = time.monotonic()
+lease0 = broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+_elapsed = time.monotonic() - _t0
+w0 = lease0.worker_id
+# Under the old gate this call could not return at all until the pod was Ready,
+# so a pod that never is would have hung here for READY_TIMEOUT.
+check("create does not wait on a pod that is not Ready", _elapsed < 0.5, f"{_elapsed:.2f}s")
+check("the lease is handed back regardless",
+      lease0.target_host == f"cao-worker-{w0}.cao-cluster.svc.cluster.local",
+      lease0.target_host)
+check("readiness is unrecorded until something observes it",
+      broker._leases[w0]["ready_at"] is None)
+
+broker._reap_once()
+check("a not-yet-Ready worker is left alone inside READY_TIMEOUT",
+      broker._leases[w0]["state"] == "leased", json.dumps(broker._leases[w0], default=str))
+
+with broker._leases_lock:
+    broker._leases[w0]["leased_at"] = time.monotonic() - (broker.READY_TIMEOUT + 1)
+broker._reap_once()
+check("reaper fails a worker that never reported Ready",
+      broker._leases[w0]["state"] == "failed", broker._leases[w0]["state"])
+check("failed reason names never-Ready, not a completion timeout",
+      "never reported Ready" in (broker._leases[w0]["reason"] or ""),
+      str(broker._leases[w0]["reason"])[:200])
+check("failed worker's job is released", f"cao-worker-{w0}" in STATE["deleted_jobs"],
+      str(STATE["deleted_jobs"]))
+
+# Once Ready has been SEEN, the readiness deadline is spent: a worker that goes
+# NotReady later is a completion problem, and must expire rather than fail.
+STATE["new_pods_ready"] = True
+lease1 = broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+w1 = lease1.worker_id
+broker._reap_once()
+check("reaper records the first Ready sighting", broker._leases[w1]["ready_at"] is not None)
+STATE["pods"][w1].status.conditions = []
+with broker._leases_lock:
+    broker._leases[w1]["leased_at"] = time.monotonic() - (broker.READY_TIMEOUT + 1)
+broker._reap_once()
+check("a worker that was once Ready expires rather than fails",
+      broker._leases[w1]["state"] == "expired", broker._leases[w1]["state"])
+
+# The old behaviour is still reachable for a fleet whose workers may be the first
+# caller of a model in the account.
+broker.GATE_ON_READY = True
+try:
+    lease2 = broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+    check("GATE_ON_READY=1 returns a lease with readiness already recorded",
+          broker._leases[lease2.worker_id]["ready_at"] is not None)
+
+    STATE["new_pods_ready"] = False
+    STATE["new_pods_phase"] = "Succeeded"
+    try:
+        broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+        check("GATE_ON_READY=1 surfaces a pod that dies before readiness", False,
+              "no error raised")
+    except RuntimeError as exc:
+        check("GATE_ON_READY=1 surfaces a pod that dies before readiness",
+              "ended before readiness" in str(exc), str(exc))
+        _dead = [wid for wid, l in broker._leases.items()
+                 if l["state"] == "failed" and "ended before readiness" in (l["reason"] or "")]
+        check("...and settles that lease failed rather than leaking it", len(_dead) == 1,
+              str(_dead))
+finally:
+    broker.GATE_ON_READY = False
+    STATE["new_pods_ready"] = True
+    STATE["new_pods_phase"] = "Running"
+
+# --- 4. lease lifecycle over HTTP ---------------------------------------
 with TestClient(broker.app) as c:
     r = c.post("/workers", json={"agent_profile": "developer"})
     check("unauthenticated create is rejected", r.status_code == 401, str(r.status_code))
@@ -194,7 +287,7 @@ with TestClient(broker.app) as c:
     check("ledger records completion",
           any(w["worker_id"] == wid and w["state"] == "completed" for w in r.json()), r.text[:300])
 
-    # --- 4. the false-success race: pod dies, complete never arrives ------
+    # --- 5. the false-success race: pod dies, complete never arrives ------
     r = c.post("/workers", json={"agent_profile": "developer"}, headers=H)
     wid2 = r.json()["worker_id"]
     STATE["pods"][wid2].status.phase = "Succeeded"
@@ -213,7 +306,7 @@ with TestClient(broker.app) as c:
     check("reaper released the squatting job", f"cao-worker-{wid2}" in STATE["deleted_jobs"],
           str(STATE["deleted_jobs"]))
 
-    # --- 5. completion deadline on a still-healthy pod --------------------
+    # --- 6. completion deadline on a still-healthy pod --------------------
     r = c.post("/workers", json={"agent_profile": "developer"}, headers=H)
     wid3 = r.json()["worker_id"]
     deadline = time.time() + 12
@@ -226,7 +319,7 @@ with TestClient(broker.app) as c:
     check("a healthy pod that never completes expires", st["state"] == "expired", json.dumps(st))
     check("expired job is released", f"cao-worker-{wid3}" in STATE["deleted_jobs"])
 
-    # --- 6. input validation still bounded -------------------------------
+    # --- 7. input validation still bounded -------------------------------
     r = c.post("/workers", json={"agent_profile": "../../etc/passwd"}, headers=H)
     check("path-ish profile rejected", r.status_code == 422, str(r.status_code))
     r = c.post("/workers", json={"agent_profile": "developer", "provider": "a b"}, headers=H)
@@ -240,7 +333,7 @@ with TestClient(broker.app) as c:
                .spec.template.spec.containers[0].image == os.environ["CAO_ELASTIC_WORKER_IMAGE"]),
           r.text[:200])
 
-# --- 7. a missing model pin must stop the broker, not the first task -----
+# --- 8. a missing model pin must stop the broker, not the first task -----
 import subprocess
 
 _env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_DEFAULT_HAIKU_MODEL"}

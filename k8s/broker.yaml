@@ -73,6 +73,14 @@ spec:
             # say WHY it reaped.
             - name: CAO_ELASTIC_COMPLETION_TIMEOUT
               value: "900"
+            # A lease whose pod has not reported Ready inside this window is
+            # reaped and marked `failed`. This is a REAPER deadline, not a wait:
+            # POST /workers returns as soon as the Job and Service exist, and the
+            # supervisor then waits on the worker's /health through the Service —
+            # which is the address it actually uses, and which a pod-level
+            # readiness probe cannot speak for. Set CAO_ELASTIC_GATE_ON_READY=1
+            # to restore the old behaviour, where this window was spent inside
+            # POST /workers on every single delegation.
             - name: CAO_ELASTIC_READY_TIMEOUT
               value: "300"
             # ---- forwarded verbatim into every worker Job ----

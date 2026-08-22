@@ -54,6 +54,34 @@ WORKER_SERVICE_ACCOUNT = os.environ.get(
 # dies before it can reap.
 WORKER_TIMEOUT = int(os.environ.get("CAO_ELASTIC_WORKER_TIMEOUT", "3600"))
 READY_TIMEOUT = int(os.environ.get("CAO_ELASTIC_READY_TIMEOUT", "300"))
+# Does POST /workers block until the worker pod reports Ready?
+#
+# It used to, unconditionally, and that single `await` was the largest term in
+# placement latency: 22s of a 22s call, of which 16s was the worker's own boot.
+# Worse, readiness was never the condition the caller actually needed. The caller
+# reaches the worker through its SERVICE, and a pod passing its readiness probe
+# is not yet a Service with a published endpoint and every node's rules
+# programmed - so the gate was simultaneously slow AND too weak, and a
+# five-way fan-out reliably lost a worker to `connect timeout=10.0` on a pod that
+# `kubectl` showed as 1/1 Running.
+#
+# So the lease is now returned as soon as the Job and Service exist, and the
+# CALLER waits - on the thing it actually depends on, by polling the worker's
+# /health through the Service until it answers (see _wait_remote_ready in
+# mcp_server/server.py). One wait instead of two, on the correct predicate.
+#
+# What the synchronous gate did usefully was fail a worker that never came up at
+# all, inside READY_TIMEOUT. That has not been dropped - it moved into the
+# reaper, which now settles a lease whose pod has not reported Ready in
+# READY_TIMEOUT as `failed`. Same deadline, same terminal state, detected within
+# one REAPER_INTERVAL of it instead of exactly at it.
+#
+# Set to 1/true to restore the old blocking behaviour.
+GATE_ON_READY = os.environ.get("CAO_ELASTIC_GATE_ON_READY", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 # The real deadline. A leased worker that has not called /complete within this
 # many seconds is reaped and marked `expired`. Set well above the slowest task a
 # participant will delegate and well below WORKER_TIMEOUT, so the broker reaps
@@ -171,6 +199,15 @@ def _worker_job(
             name="CAO_INSTALL_PROFILES",
             value=f"{request.agent_profile}:{request.provider}",
         ),
+        # Warm Bedrock AFTER the server is listening, not before.
+        #
+        # The two throwaway model calls the entrypoint makes measured 8.3s of an
+        # 18s pod readiness, and on a worker they buy very little: marketplace
+        # activation is per ACCOUNT and the supervisor already paid it at
+        # provisioning, warming the same pinned model ids. The supervisor keeps
+        # the blocking default, so the account is still activated by something
+        # whose startup nobody is timing.
+        client.V1EnvVar(name="CAO_WARM_PROVIDER", value="background"),
         client.V1EnvVar(name="CAO_MEMORY_API_URL", value=MEMORY_API_URL),
         client.V1EnvVar(name="CAO_PROJECT_ID", value=PROJECT_ID),
         client.V1EnvVar(name="CAO_ELASTIC_WORKER_ID", value=worker_id),
@@ -217,12 +254,23 @@ def _worker_job(
                 port=9889,
                 http_headers=[client.V1HTTPHeader(name="Host", value="localhost")],
             ),
-            # initialDelaySeconds is a hard floor on how fast a lease can be
-            # issued, and it is paid on EVERY task in this topology. CAO's own
-            # boot is 12-14s, so 5s costs one wasted probe and saves 5s of the
-            # ~24s a participant spends watching an apply become Ready.
-            initial_delay_seconds=5,
-            period_seconds=3,
+            # Both values are a floor on how fast this pod can be USED, and both
+            # are paid on every task in this topology rather than once at startup.
+            #
+            # They were 5 and 3, chosen when CAO's boot was 12-14s: at that scale
+            # an initial delay of 5s was free and a 3s period cost at most 3s.
+            # Moving the Bedrock warm-up off this path and seeding the state
+            # directory takes boot to roughly 2-3s, at which point the OLD numbers
+            # dominate what is left - a 5s delay against a 2.5s boot is 2.5s of
+            # pure idle, and then up to 3s more waiting for a probe to come round.
+            # A saving elsewhere turns into a floor here, so they move together.
+            #
+            # 0 rather than 1 on the delay: the first probe then fires immediately
+            # and simply fails, which costs one connection refused in the events
+            # and never costs a second of latency. `period_seconds=1` makes the
+            # worst-case wait after the server binds 1s instead of 3s.
+            initial_delay_seconds=0,
+            period_seconds=1,
         ),
     )
     pod_spec = client.V1PodSpec(
@@ -343,18 +391,35 @@ def _worker_service(worker_id: str, job: client.V1Job) -> client.V1Service:
     )
 
 
+def _pod_ready(pod: client.V1Pod) -> bool:
+    conditions = (pod.status.conditions if pod.status else None) or []
+    return any(c.type == "Ready" and c.status == "True" for c in conditions)
+
+
+# Poll interval while waiting for readiness, and how long the fast interval
+# lasts. A worker becomes Ready in single-digit seconds, so a flat 1s poll spent
+# up to a second of every lease waiting on its own timer - but a flat 0.25s poll
+# would issue 1200 list calls against the API server for a worker that is never
+# coming up, times however many are stuck. Fast while the answer is plausibly
+# imminent, then back off.
+_READY_POLL_FAST = 0.25
+_READY_POLL_SLOW = 1.0
+_READY_POLL_FAST_WINDOW = 10.0
+
+
 def _wait_ready(worker_id: str) -> None:
-    deadline = time.monotonic() + READY_TIMEOUT
+    started = time.monotonic()
+    deadline = started + READY_TIMEOUT
     selector = f"cao.aws/worker-id={worker_id}"
     while time.monotonic() < deadline:
         pods = core_api.list_namespaced_pod(NAMESPACE, label_selector=selector).items
         for pod in pods:
-            conditions = pod.status.conditions or []
-            if any(c.type == "Ready" and c.status == "True" for c in conditions):
+            if _pod_ready(pod):
                 return
             if pod.status.phase in {"Failed", "Succeeded"}:
                 raise RuntimeError(f"worker pod ended before readiness: {pod.status.phase}")
-        time.sleep(1)
+        elapsed = time.monotonic() - started
+        time.sleep(_READY_POLL_FAST if elapsed < _READY_POLL_FAST_WINDOW else _READY_POLL_SLOW)
     raise TimeoutError(f"worker {worker_id} did not become ready in {READY_TIMEOUT}s")
 
 
@@ -401,12 +466,17 @@ def _release_and_settle(worker_id: str, state: str, reason: Optional[str] = None
 def _reap_once() -> None:
     """Release leases that will never be completed, and say why.
 
-    Two distinct failures land here, and neither one is visible to the caller:
+    Three distinct failures land here, and none of them is visible to the caller:
 
     - `terminated`: the worker's pod ended while the lease was still open. The
       usual cause is the TUI-watching turn detector firing on a preamble, which
       kills the agent's window; `assign_elastic` has already reported success by
       then, so nothing upstream knows the work did not happen.
+    - `failed`: the pod never reported Ready within READY_TIMEOUT - unschedulable,
+      ImagePullBackOff, a crash-looping entrypoint. This case used to be caught
+      synchronously inside POST /workers, which is why the lease could be handed
+      back only after a wait nobody wanted; see GATE_ON_READY. Moving it here
+      keeps the deadline and gives up only exactness about when it is noticed.
     - `expired`: the pod is still Ready but /complete never arrived within
       COMPLETION_TIMEOUT. Without this the Job squats a whole node's worth of
       memory until activeDeadlineSeconds, an hour later.
@@ -430,6 +500,7 @@ def _reap_once() -> None:
             if lease is None or lease["state"] != "leased":
                 continue
             age = now - lease["leased_at"]
+            ever_ready = lease.get("ready_at") is not None
 
         selector = f"cao.aws/worker-id={worker_id}"
         try:
@@ -457,6 +528,33 @@ def _reap_once() -> None:
             log.warning("worker %s: pod %s while leased, released", worker_id, phase)
             continue
 
+        # Readiness is observed here rather than waited on, so record the first
+        # sighting. It is what separates "never came up" from "came up and then
+        # stopped talking", which are the same age but different bugs - and it
+        # keeps the deadline one-way: a worker that goes NotReady later is a
+        # completion problem, and COMPLETION_TIMEOUT owns it.
+        if not ever_ready:
+            if _pod_ready(pods[0]):
+                with _leases_lock:
+                    lease = _leases.get(worker_id)
+                    if lease is not None and lease["ready_at"] is None:
+                        lease["ready_at"] = now
+            elif age > READY_TIMEOUT:
+                _release_and_settle(
+                    worker_id,
+                    "failed",
+                    f"worker pod never reported Ready within {READY_TIMEOUT}s "
+                    f"(phase {phase}) - it was leased but never usable; check "
+                    f"scheduling, the image pull, and the pod's events",
+                )
+                log.warning(
+                    "worker %s: not ready after %ss (phase %s), released",
+                    worker_id,
+                    int(age),
+                    phase,
+                )
+                continue
+
         if age > COMPLETION_TIMEOUT:
             _release_and_settle(
                 worker_id,
@@ -480,10 +578,15 @@ async def lifespan(_app: FastAPI):
     thread = threading.Thread(target=_reaper, name="cao-lease-reaper", daemon=True)
     thread.start()
     log.info(
-        "broker up: namespace=%s image=%s completion_timeout=%ss forwarding=%s",
+        "broker up: namespace=%s image=%s completion_timeout=%ss "
+        "lease_returns=%s forwarding=%s",
         NAMESPACE,
         WORKER_IMAGE,
         COMPLETION_TIMEOUT,
+        # Worth one field in the startup line: it is the difference between a
+        # 22-second POST /workers and a 1-second one, and the symptom of having
+        # it wrong is "the broker got slow again" with nothing else to look at.
+        "after-ready" if GATE_ON_READY else "on-create",
         ",".join(WORKER_ENV_PASSTHROUGH),
     )
     yield
@@ -551,6 +654,7 @@ def create_worker(
             "reason": None,
             "leased_at": time.monotonic(),
             "settled_at": None,
+            "ready_at": None,
             "agent_profile": request.agent_profile,
             "provider": request.provider,
         }
@@ -564,7 +668,17 @@ def create_worker(
             _worker_job(worker_id, release_token, request),
         )
         core_api.create_namespaced_service(NAMESPACE, _worker_service(worker_id, job))
-        _wait_ready(worker_id)
+        # Both objects now exist, which is the whole of what a lease asserts:
+        # this worker_id is yours, here is where it will answer, here is the
+        # token that releases it. Whether it is answering YET is the caller's
+        # question to ask, of the Service it will actually use. See
+        # GATE_ON_READY above for why waiting here was both slow and wrong.
+        if GATE_ON_READY:
+            _wait_ready(worker_id)
+            with _leases_lock:
+                lease = _leases.get(worker_id)
+                if lease is not None:
+                    lease["ready_at"] = time.monotonic()
     except Exception as exc:
         _release_and_settle(worker_id, "failed", f"{type(exc).__name__}: {exc}")
         raise

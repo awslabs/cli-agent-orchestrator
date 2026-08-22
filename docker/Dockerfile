@@ -106,6 +106,51 @@ RUN mkdir -p /home/cao/workspace
 RUN printf '{\n  "hasCompletedOnboarding": true\n}\n' > /home/cao/.claude.json \
     && chmod 600 /home/cao/.claude.json
 
+# --- Pre-initialized state seed ------------------------------------------------
+#
+# `cao init` plus one `cao install` costs ~3.8s and produces a byte-identical
+# tree every time. In the elastic k8s topology the state directory is a fresh
+# emptyDir per TASK, so that 3.8s is paid on every delegation a participant
+# watches — not once at startup. Do the work here instead, and let the entrypoint
+# extract it.
+#
+# A tarball rather than a baked-in directory, because the runtime mounts a volume
+# over /home/cao/.cao: anything this layer leaves at CAO_STATE_SEED_ROOT is
+# invisible the moment a PVC or emptyDir is mounted there. The seed therefore
+# lives OUTSIDE that path and is unpacked into it at start.
+#
+# Built at the real runtime path rather than a staging dir. Verified that the
+# result is relocatable as it stands — the DB is schema-only and no file in the
+# seed contains an absolute path — so this costs nothing and means the entrypoint
+# never has to care. It is then removed, so the image ships no state at the mount
+# point and the entrypoint's "is the state dir empty" check means what it says.
+#
+# MUST stay above the VOLUME instruction below. Docker discards filesystem
+# changes made to a declared VOLUME path in LATER layers, so moving this down
+# would silently produce an image whose seed tar exists and whose contents were
+# thrown away — the extract then succeeds and seeds nothing.
+ENV CAO_STATE_SEED=/home/cao/cao-state-seed.tar \
+    CAO_STATE_SEED_ROOT=/home/cao/.cao/state
+
+# Every built-in profile, pinned to claude_code — the only provider this image
+# contains. The broker accepts any profile name, so seeding just `developer`
+# would leave the others paying the runtime install; seeding all six costs a few
+# hundred KB. A profile the seed does not carry, or one requested for another
+# provider, still installs at start: the entrypoint matches on the resolved
+# `provider:` line, not on mere presence.
+RUN set -eux; \
+    export CAO_HOME_DIR="${CAO_STATE_SEED_ROOT}"; \
+    cao init; \
+    for profile in code_supervisor developer memory_manager retrospector reviewer workflow_scout; do \
+        cao install "$profile" --provider claude_code; \
+    done; \
+    tar -cf "${CAO_STATE_SEED}" \
+        -C "$(dirname "${CAO_STATE_SEED_ROOT}")" "$(basename "${CAO_STATE_SEED_ROOT}")"; \
+    rm -rf "${CAO_STATE_SEED_ROOT}"; \
+    # Fail the build here rather than shipping an image whose entrypoint quietly
+    # falls back to the slow path on every pod.
+    tar -tf "${CAO_STATE_SEED}" | grep -q '^state/agent-store/developer.md$'
+
 # ~/.cao holds SQLite state, logs, and installed profiles — mount a volume/PVC
 # here for persistence across container restarts.
 VOLUME ["/home/cao/.cao"]
