@@ -13,11 +13,26 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.profile_validator import (
+    _MAX_FINDING_CHARS,
+    _MAX_RENDERED_BYTES,
     ValidationMessage,
+    _capped,
     load_profile_schema,
     validate_frontmatter,
     validate_profile_text,
 )
+
+
+class TestFindingMessageCap:
+    """Schema finding text, including its marker, must fit the declared cap."""
+
+    def test_truncation_suffix_counts_toward_the_cap(self) -> None:
+        message = "x" * (_MAX_FINDING_CHARS + 1)
+
+        capped = _capped(message)
+
+        assert len(capped) == _MAX_FINDING_CHARS
+        assert capped.endswith(f"... (message truncated, {len(message)} chars)")
 
 
 class TestLoadProfileSchema:
@@ -278,3 +293,387 @@ class TestSchemaModelParity:
             f"The schema declares {sorted(extra)} but AgentProfile has no such "
             "field, so a client filling them in would have them silently dropped."
         )
+
+
+class TestMalformedButParseableInput:
+    """Schema-invalid values must be *reported*, never raise.
+
+    Regression guard for the P3 finding on #575. The advisory checks test set
+    membership, which hashes the value, so an unhashable one (a list) raised
+    ``TypeError``; and the schema-error sort key used raw path components, so
+    mixed-type mapping keys could not be ordered. Both escaped the endpoint's
+    ``except ValueError`` and surfaced as HTTP 500 from a route whose entire
+    purpose is reporting what is wrong with a document.
+
+    Every case below is syntactically valid YAML that the schema already rejects,
+    so the correct outcome is an error finding rather than an exception.
+    """
+
+    def test_unhashable_allowed_tools_entry_is_reported(self) -> None:
+        findings = validate_frontmatter({"name": "x", "allowedTools": [["Read"]]})
+
+        assert any(f.severity == "error" for f in findings)
+
+    def test_unhashable_role_is_reported(self) -> None:
+        findings = validate_frontmatter({"name": "x", "role": ["developer"]})
+
+        assert any(f.severity == "error" for f in findings)
+
+    def test_mixed_type_mapping_keys_are_reported(self) -> None:
+        """Path components of different types must not break the error sort."""
+        findings = validate_frontmatter({"name": "x", "mcpServers": {1: {}, "x": {}}})
+
+        assert any(f.severity == "error" for f in findings)
+
+    def test_non_string_role_does_not_produce_a_spurious_warning(self) -> None:
+        """The advisory role check stands aside; the schema owns the type error."""
+        findings = validate_frontmatter({"name": "x", "role": 7})
+
+        assert any(f.severity == "error" for f in findings)
+        assert not any(f.severity == "warning" for f in findings)
+
+    def test_non_string_allowed_tool_does_not_produce_a_spurious_warning(self) -> None:
+        findings = validate_frontmatter({"name": "x", "allowedTools": [{"a": 1}]})
+
+        assert any(f.severity == "error" for f in findings)
+        assert not any(f.severity == "warning" for f in findings)
+
+    def test_well_formed_values_still_warn(self) -> None:
+        """The type guards must not silence the checks they protect."""
+        tool_findings = validate_frontmatter({"name": "x", "allowedTools": ["not_a_real_tool"]})
+        role_findings = validate_frontmatter({"name": "x", "role": "archaeologist"})
+
+        assert any(f.severity == "warning" for f in tool_findings)
+        assert any(f.severity == "warning" for f in role_findings)
+
+
+def _alias_amplified_yaml(levels: int, leaf: str = "{k: v}", tail: str = "") -> str:
+    """A profile whose *expanded* value count is exponential in ``levels``.
+
+    Each anchor references the previous one twice, so ``yaml.safe_load`` returns
+    ``levels + 1`` dicts while a full expansion of them contains ~2**levels
+    values. Nested under ``toolsSettings``/``hooks`` because those fields are
+    free-form objects, which keeps the document otherwise *valid*: a document
+    rejected on its own merits would never reach the expensive steps anyway.
+
+    ``tail`` appends a final line, used to plant a schema error whose offending
+    instance is the amplified node.
+    """
+    lines = ["---", "name: bomb", "description: A profile.", "hooks:", f"  a0: &a0 {leaf}"]
+    for level in range(1, levels + 1):
+        lines.append(f"  a{level}: &a{level} {{x: *a{level - 1}, y: *a{level - 1}}}")
+    if tail:
+        lines.append(tail)
+    return "\n".join(lines) + "\n---\n\nBody.\n"
+
+
+class TestAliasAmplificationIsBounded:
+    """A YAML-anchor bomb must not reach anything that pays for its expansion.
+
+    Two rounds of review on #585 landed here. Round 2 added a non-string mapping
+    key check whose only bound was a recursion depth cap, which bounded the wrong
+    dimension: aliases resolve to repeated references to the *same* object, so the
+    walk revisited shared subtrees exponentially while the document stayed tiny. A
+    640-byte body took ~1s, doubling per anchor level. Reported by @haofeif.
+
+    Further testing found the larger half. jsonschema builds each error
+    message eagerly, interpolating ``repr`` of the offending instance, so an
+    amplified value that trips one ``type`` error produced a 25 MB message at 20
+    levels and 101 MB at 22, which is an allocation ceiling rather than a stall and
+    was reachable on merged ``main`` independently of this PR.
+
+    Both are now closed ahead of either step, by rejecting a document whose
+    expansion exceeds a ceiling. Every assertion below is deterministic: a
+    regression fails on a count or a length rather than hanging until CI's job
+    timeout, which is what the earlier timing-only assertions would have done.
+    """
+
+    def test_an_anchor_bomb_is_rejected_rather_than_traversed(self) -> None:
+        document = _alias_amplified_yaml(40)
+        assert len(document) < 1500  # the whole point: tiny input, huge expansion
+
+        findings = validate_profile_text(document)
+        errors = [f for f in findings if f.severity == "error"]
+
+        assert len(errors) == 1
+        assert "renders to more than" in errors[0].message
+
+    def test_the_rejection_does_not_grow_with_the_bomb(self) -> None:
+        """Rejecting must not itself render the document.
+
+        This is the regression guard for the jsonschema message vector: the
+        offending instance below is the amplified node, so before the ceiling
+        existed the returned message *was* its full ``repr``. Asserting a bound on
+        the response size catches that without measuring time.
+        """
+        for levels in (20, 22, 30):
+            document = _alias_amplified_yaml(levels, tail="toolsSettings: [*a%d]" % levels)
+
+            findings = validate_profile_text(document)
+
+            assert len(findings) == 1, levels
+            assert len(findings[0].message) < 1000, (
+                f"{levels} levels produced a {len(findings[0].message)}-char message; "
+                f"the offending instance is being rendered"
+            )
+
+    CYCLIC = "---\nname: cyc\ndescription: cyclic\ntoolsSettings: &c {self: *c}\n---\n\nB.\n"
+
+    def test_a_cyclic_document_is_rejected(self) -> None:
+        """A cycle is not merely small, it is unrenderable.
+
+        The first version of this guard gave a back-edge a provisional size of 1,
+        which made a cycle look finite, and an earlier revision of this test
+        asserted the resulting document was *valid*. Reported by @haofeif.
+        """
+        findings = validate_profile_text(self.CYCLIC)
+        errors = [f for f in findings if f.severity == "error"]
+
+        assert len(errors) == 1
+        assert "circular" in errors[0].message
+
+    @pytest.mark.parametrize(
+        "frontmatter",
+        [
+            "hooks:\n  a: &a {b: {c: {d: *a}}}",
+            "hooks: &a [*a]",
+            "hooks: &a [{inner: *a}]",
+        ],
+        ids=["indirect through mappings", "sequence self-reference", "sequence to mapping"],
+    )
+    def test_a_cycle_is_rejected_whatever_shape_it_takes(self, frontmatter: str) -> None:
+        """The back-edge need not be a top-level self-reference in a mapping.
+
+        Only the mapping form was reported. Tracking in-progress identities catches
+        any of these, and pinning the shapes keeps a later refactor from narrowing
+        the check to the one case that was raised.
+        """
+        document = f"---\nname: c\ndescription: d\n{frontmatter}\n---\n\nB.\n"
+
+        errors = [f for f in validate_profile_text(document) if f.severity == "error"]
+
+        assert len(errors) == 1
+        assert "circular" in errors[0].message
+
+    def test_merge_keys_cannot_amplify_either(self) -> None:
+        """``<<`` is a second alias mechanism, and renders its target in each copy.
+
+        Not reported, found while probing the fix. A merge key copies the target's
+        entries into the merging mapping, so the values are shared but rendered
+        again per copy, which is the same content multiplication as an aliased
+        scalar reached by a different route.
+        """
+        blob = "y" * 60_000
+        copies = "\n".join(f"  d{index}: {{<<: *s}}" for index in range(3_000))
+        document = (
+            f"---\nname: t\ndescription: d\nhooks:\n  s: &s {{k: {blob}}}\n"
+            f"{copies}\n---\n\nB.\n"
+        )
+
+        errors = [f for f in validate_profile_text(document) if f.severity == "error"]
+
+        assert len(errors) == 1
+        assert "renders to more than" in errors[0].message
+
+    def test_ordinary_merge_keys_still_pass(self) -> None:
+        """``<<`` is also a normal YAML convenience and must not be rejected."""
+        document = (
+            "---\nname: t\ndescription: d\nhooks:\n  base: &b {timeout: 30}\n"
+            "  a: {<<: *b}\n  b: {<<: *b}\n---\n\nB.\n"
+        )
+
+        assert [f for f in validate_profile_text(document) if f.severity == "error"] == []
+
+    def test_the_rejected_cycle_is_indeed_unusable(self) -> None:
+        """Anchors the reason for rejecting, so the rule is not arbitrary.
+
+        A cyclic profile parses, so nothing before this guard objects, but the Kiro
+        materialization path serializes ``toolsSettings`` and Pydantic refuses. The
+        write gate accepting it would persist a profile the runtime cannot install,
+        which is the same failure mode the non-string key rule exists for.
+        """
+        import pytest as _pytest
+
+        from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+        from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
+
+        profile = parse_agent_profile_text(self.CYCLIC, "cyc")
+        config = KiroAgentConfig(
+            name="cyc", description="cyclic", toolsSettings=profile.toolsSettings
+        )
+
+        with _pytest.raises(Exception) as excinfo:
+            config.model_dump_json(indent=2, exclude_none=True)
+
+        assert "Circular reference" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "scalar_length, alias_count",
+        [(2_048, 5_000), (190_000, 15_000)],
+        ids=["2KB scalar x5000", "190KB scalar x15000"],
+    )
+    def test_an_aliased_scalar_cannot_amplify_the_response(
+        self, scalar_length: int, alias_count: int
+    ) -> None:
+        """Counting occurrences missed this; counting rendered bytes catches it.
+
+        Every scalar used to contribute 1 regardless of length, so a single large
+        scalar referenced thousands of times passed the ceiling while the one
+        jsonschema instance rendering ran to megabytes, and at the larger size to a
+        2.85 GB lower bound from a request under the 256 KB cap. Both cases here are
+        @haofeif's, and the assertion is on the response size rather than a clock.
+        """
+        scalar = "x" * scalar_length
+        aliases = ", ".join(["*s"] * alias_count)
+        document = (
+            f"---\nname: t\ndescription: d\nhooks:\n  s: &s {scalar}\n"
+            f"toolsSettings: [{aliases}]\n---\n\nB.\n"
+        )
+
+        findings = validate_profile_text(document)
+
+        assert len(findings) == 1
+        assert "renders to more than" in findings[0].message
+        assert len(findings[0].message) < 1000, (
+            f"a {len(document)}-byte request produced a " f"{len(findings[0].message)}-char message"
+        )
+
+    def test_a_bad_key_in_a_shared_subtree_is_reported_exactly_once(self) -> None:
+        """Deterministic proof of the memoization, with no reliance on a clock.
+
+        Ten levels is 1024 paths to the single node every alias resolves to, and
+        expands to well under the ceiling so the walk still runs. One finding
+        confirms shared nodes are visited once; the unmemoized walk emitted 1024
+        copies of it.
+        """
+        document = _alias_amplified_yaml(10, leaf="{1: one}")
+
+        findings = validate_profile_text(document)
+        key_errors = [f for f in findings if "not a string" in f.message]
+
+        assert len(key_errors) == 1
+        assert key_errors[0].severity == "error"
+        assert key_errors[0].path == "hooks.a0.1"
+
+    def test_legitimate_anchor_reuse_still_validates_clean(self) -> None:
+        """Anchors are a normal YAML convenience, not inherently suspect.
+
+        The ceiling is on expansion, not on aliasing, so ordinary reuse has to
+        pass. Without this, satisfying the bound by rejecting anchors outright
+        would look like a fix.
+        """
+        document = (
+            "---\nname: shared\ndescription: A profile.\ntoolsSettings:\n"
+            "  common: &common {timeout: 30}\n  fs: *common\n  web: *common\n---\n\nBody.\n"
+        )
+
+        assert validate_profile_text(document) == []
+
+    def test_exceeding_a_ceiling_is_an_error_not_silence(self) -> None:
+        """A document past a ceiling is rejected, not called valid.
+
+        Reporting nothing would present an uninspected document as clean, which is
+        the failure mode of the depth cap this replaced: it returned an empty list.
+
+        The oversized case is a document that is simply large rather than aliased,
+        which is why it has to exceed a megabyte to trip the ceiling. Over HTTP the
+        256 KB cap on ``content`` gets there first, so the reachable caller for this
+        branch is ``cao profile validate`` on a local file, which has no such cap.
+        """
+        deep: dict = {"name": "deep", "description": "A profile."}
+        node = deep
+        for _ in range(70):
+            node["toolsSettings"] = {}
+            node = node["toolsSettings"]
+        oversized = {
+            "name": "big",
+            "description": "A profile.",
+            "toolsSettings": {"blob": "x" * (_MAX_RENDERED_BYTES + 1)},
+        }
+
+        for metadata, expected in ((deep, "nests more than"), (oversized, "renders to more")):
+            errors = [f for f in validate_frontmatter(metadata) if f.severity == "error"]
+            assert len(errors) == 1
+            assert expected in errors[0].message
+
+    def test_a_large_but_unaliased_document_still_passes(self) -> None:
+        """The ceiling is on rendering, so size alone below it must not reject.
+
+        Guards against tightening the bound into something that rejects ordinary
+        large profiles, which is the opposite failure from the one above.
+        """
+        metadata = {
+            "name": "big",
+            "description": "A profile.",
+            "toolsSettings": {f"k{index}": "v" * 20 for index in range(2_000)},
+        }
+        assert len(repr(metadata)) > 50_000  # genuinely large, still under the ceiling
+
+        assert [f for f in validate_frontmatter(metadata) if f.severity == "error"] == []
+
+
+class TestMcpServerTransports:
+    """``mcpServers`` entries may be command-launched *or* url-based.
+
+    The schema required ``command`` unconditionally, which made the write routes
+    reject a form CAO supports: ``resolve_mcp_server_config`` documents entries
+    without a ``command`` (``{"type": "http", "url": ...}``) as passing through
+    untouched, and providers forward them to their own MCP config. Because
+    #585 made this schema the blocking gate in front of persistence, a latent
+    description gap became a broken save path. Reported by @haofeif.
+    """
+
+    ACCEPTED = {
+        "http url": {"docs": {"type": "http", "url": "https://example.test/mcp"}},
+        "sse url": {"docs": {"type": "sse", "url": "https://example.test/sse"}},
+        "url with headers": {
+            "docs": {"type": "http", "url": "https://example.test/mcp", "headers": {"A": "b"}}
+        },
+        "command": {"fs": {"command": "npx", "args": ["-y", "server"]}},
+        "bundled cao server": {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}},
+        "command and url together": {"z": {"command": "npx", "url": "https://example.test/mcp"}},
+    }
+
+    @pytest.mark.parametrize("label", sorted(ACCEPTED))
+    def test_supported_forms_validate(self, label: str) -> None:
+        findings = validate_frontmatter(
+            {"name": "x", "description": "d", "mcpServers": self.ACCEPTED[label]}
+        )
+
+        assert [f for f in findings if f.severity == "error"] == []
+
+    @pytest.mark.parametrize(
+        "entry", [{"type": "http"}, {}, {"args": ["-y"]}], ids=["type only", "empty", "args only"]
+    )
+    def test_an_entry_with_neither_command_nor_url_is_rejected(self, entry: dict) -> None:
+        """Widening the rule must not widen it into accepting anything.
+
+        An entry naming no transport cannot be launched or reached, so the gate
+        still has to catch it -- the fix is a second permitted shape, not the
+        removal of the requirement.
+        """
+        findings = validate_frontmatter(
+            {"name": "x", "description": "d", "mcpServers": {"broken": entry}}
+        )
+        errors = [f for f in findings if f.severity == "error"]
+
+        assert len(errors) == 1
+        assert errors[0].path == "mcpServers.broken"
+
+    def test_url_is_described_rather_than_merely_tolerated(self) -> None:
+        """The field is typed, so a form generator can render it and catch a typo.
+
+        The inner object does not set ``additionalProperties: false``, so a url
+        entry would pass even with no ``url`` property declared. Declaring it is
+        what makes ``GET /agents/profiles/schema`` describe the shape, and what
+        makes a wrong type a finding.
+        """
+        inner = load_profile_schema()["properties"]["mcpServers"]["additionalProperties"]
+        assert inner["properties"]["url"] == {"type": "string"}
+        assert inner["anyOf"] == [{"required": ["command"]}, {"required": ["url"]}]
+
+        findings = validate_frontmatter(
+            {"name": "x", "description": "d", "mcpServers": {"docs": {"url": 7}}}
+        )
+
+        assert any(f.severity == "error" and f.path == "mcpServers.docs.url" for f in findings)
