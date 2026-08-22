@@ -999,7 +999,9 @@ async def run_lint(
         base_resolved = svc.base_dir.resolve()
         session = _open_readonly_session(db_engine)
         try:
-            q = session.query(MemoryMetadataModel)
+            q = session.query(MemoryMetadataModel).filter(
+                MemoryMetadataModel.source_kind == "native"
+            )
             if scope is not None:
                 q = q.filter(MemoryMetadataModel.scope == scope)
             for r in q.all():

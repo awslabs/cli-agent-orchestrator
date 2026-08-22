@@ -89,6 +89,9 @@ class MemoryMetadataModel(Base):
     memory_type = Column(String, nullable=False)
     scope = Column(String, nullable=False)
     scope_id = Column(String, nullable=True)
+    # A NOT NULL discriminator keeps the widened unique constraint total:
+    # SQLite considers NULL values distinct inside UNIQUE indexes.
+    source_kind = Column(String, nullable=False, default="native", server_default="native")
     file_path = Column(String, nullable=False)
     tags = Column(String, nullable=False, default="")
     source_provider = Column(String, nullable=True)
@@ -115,12 +118,77 @@ class MemoryMetadataModel(Base):
     related_keys = Column(Text, nullable=True, default=None)
 
     __table_args__ = (
-        UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),
+        UniqueConstraint("key", "scope", "scope_id", "source_kind", name="uq_memory_key_scope"),
         CheckConstraint(
             "related_keys IS NULL OR length(related_keys) < 1024",
             name="ck_related_keys_length",
         ),
     )
+
+
+# Vault-note identity needs a non-null scope id for global mappings: SQLite
+# considers NULL values distinct inside UNIQUE indexes. This is table-local;
+# memory_metadata keeps its historical nullable global scope_id convention.
+VAULT_NOTE_SCOPE_ID_SENTINEL = ""
+
+
+class VaultNoteModel(Base):
+    """Durable projection metadata for a note indexed from an Obsidian vault."""
+
+    __tablename__ = "vault_note"
+
+    note_uid = Column(String, primary_key=True)
+    vault_id = Column(String, nullable=False)
+    scope = Column(String, nullable=False)
+    scope_id = Column(
+        String,
+        nullable=False,
+        default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+        server_default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+    )
+    cao_key = Column(String, nullable=False)
+    vault_relpath = Column(String, nullable=False)
+    managed = Column(Boolean, nullable=False)
+    content_sha256 = Column(String, nullable=True)
+    frontmatter_sha256 = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    mtime_ns = Column(Integer, nullable=True)
+    status = Column(String, nullable=False)
+    last_reconciled_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("vault_id", "scope", "scope_id", "cao_key", name="uq_vault_note_key"),
+        UniqueConstraint("vault_id", "vault_relpath", name="uq_vault_note_path"),
+    )
+
+
+class VaultFindingModel(Base):
+    """Content-free finding emitted while reconciling a vault."""
+
+    __tablename__ = "vault_finding"
+
+    id = Column(String, primary_key=True)
+    vault_id = Column(String, nullable=False)
+    vault_relpath = Column(String, nullable=False)
+    code = Column(String, nullable=False)
+    severity = Column(String, nullable=False)
+    detail = Column(String, nullable=False)
+    reconcile_run_id = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class VaultNoteAliasModel(Base):
+    """Former vault paths retained to make note renames observable."""
+
+    __tablename__ = "vault_note_alias"
+
+    vault_id = Column(String, primary_key=True)
+    former_relpath = Column(String, primary_key=True)
+    cao_key = Column(String, nullable=False)
+    scope = Column(String, nullable=True)
+    scope_id = Column(String, nullable=True)
+    content_sha256 = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 # Relationship-store sentinel: ``memory_relationships.scope_id`` is NOT NULL and
@@ -299,10 +367,13 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
-    _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
     _migrate_add_related_keys()
+    # Must run after additive legacy-column migrations and before the separate
+    # index migrator, which recreates the three secondary indexes after a rebuild.
+    _migrate_memory_source_kind()
+    _migrate_memory_indexes()
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_indexes()
@@ -393,6 +464,92 @@ def _migrate_memory_indexes() -> None:
             )
     except Exception as e:
         logger.debug(f"Memory index migration skipped: {e}")
+
+
+def _migrate_memory_source_kind() -> None:
+    """Widen memory identity with a non-null source discriminator.
+
+    SQLite cannot alter a UNIQUE constraint, so installed databases require a
+    transactional table rebuild.  The gate compares UNIQUE-index column lists,
+    not index names: SQLite discards names given to table-level constraints.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    expected_unique_columns = ("key", "scope", "scope_id", "source_kind")
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_metadata'"
+            ).fetchone()
+            if table_exists is None:
+                return
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_metadata)")}
+            unique_indexes = [
+                row[1]
+                for row in conn.execute("PRAGMA index_list(memory_metadata)").fetchall()
+                if row[3] == "u"
+            ]
+            if any(
+                tuple(
+                    column[2]
+                    for column in conn.execute(
+                        f'PRAGMA index_info("{index_name.replace(chr(34), chr(34) * 2)}")'
+                    ).fetchall()
+                )
+                == expected_unique_columns
+                for index_name in unique_indexes
+            ):
+                if "source_kind" not in columns:
+                    raise RuntimeError("memory_metadata unique index references missing source_kind")
+                return
+
+            conn.execute("BEGIN")
+            conn.execute("""
+                CREATE TABLE memory_metadata_new (
+                    id VARCHAR NOT NULL PRIMARY KEY,
+                    key VARCHAR NOT NULL,
+                    memory_type VARCHAR NOT NULL,
+                    scope VARCHAR NOT NULL,
+                    scope_id VARCHAR,
+                    source_kind VARCHAR NOT NULL DEFAULT 'native',
+                    file_path VARCHAR NOT NULL,
+                    tags VARCHAR NOT NULL,
+                    source_provider VARCHAR,
+                    source_terminal_id VARCHAR,
+                    token_estimate INTEGER,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    access_count INTEGER NOT NULL DEFAULT 0,
+                    last_accessed_at DATETIME,
+                    last_compiled_at DATETIME,
+                    related_keys TEXT,
+                    CONSTRAINT uq_memory_key_scope UNIQUE (key, scope, scope_id, source_kind)
+                )
+                """)
+            conn.execute("""
+                INSERT INTO memory_metadata_new (
+                    id, key, memory_type, scope, scope_id, source_kind, file_path, tags,
+                    source_provider, source_terminal_id, token_estimate, created_at, updated_at,
+                    access_count, last_accessed_at, last_compiled_at, related_keys
+                )
+                SELECT
+                    id, key, memory_type, scope, scope_id, 'native', file_path, tags,
+                    source_provider, source_terminal_id, token_estimate, created_at, updated_at,
+                    access_count, last_accessed_at, last_compiled_at, related_keys
+                FROM memory_metadata
+                """)
+            conn.execute("DROP TABLE memory_metadata")
+            conn.execute("ALTER TABLE memory_metadata_new RENAME TO memory_metadata")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_metadata)")}
+            if "source_kind" not in columns:
+                raise RuntimeError("memory_metadata rebuild did not add source_kind")
+            conn.commit()
+            logger.info("Migration: widened memory_metadata identity with source_kind")
+    except Exception as e:
+        logger.error(f"Memory source_kind migration failed: {e}")
+        raise
 
 
 def _migrate_add_access_count() -> None:

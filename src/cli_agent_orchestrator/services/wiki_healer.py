@@ -269,6 +269,7 @@ def _row_exists(db: Any, key: str, scope: str, scope_id: Optional[str]) -> bool:
         .filter(
             MemoryMetadataModel.key == key,
             MemoryMetadataModel.scope == scope,
+            MemoryMetadataModel.source_kind == "native",
             (
                 MemoryMetadataModel.scope_id == scope_id
                 if scope_id is not None
@@ -316,6 +317,7 @@ def _delete_row(db: Any, key: str, scope: str, scope_id: Optional[str]) -> int:
         .filter(
             MemoryMetadataModel.key == key,
             MemoryMetadataModel.scope == scope,
+            MemoryMetadataModel.source_kind == "native",
             (
                 MemoryMetadataModel.scope_id == scope_id
                 if scope_id is not None
@@ -452,6 +454,7 @@ async def _heal_contradiction(
             .filter(
                 MemoryMetadataModel.key == k,
                 MemoryMetadataModel.scope == scope,
+                MemoryMetadataModel.source_kind == "native",
                 (
                     MemoryMetadataModel.scope_id == scope_id
                     if scope_id is not None
@@ -680,6 +683,7 @@ async def _heal_poison(
             .filter(
                 MemoryMetadataModel.key == key,
                 MemoryMetadataModel.scope == scope,
+                MemoryMetadataModel.source_kind == "native",
                 (
                     MemoryMetadataModel.scope_id == scope_id
                     if scope_id is not None

@@ -274,7 +274,13 @@ class MemoryRelationshipService:
         return src, tgt
 
     def _assert_endpoint_exists(
-        self, db: Any, scope: str, scope_id: Optional[str], key: str
+        self,
+        db: Any,
+        scope: str,
+        scope_id: Optional[str],
+        key: str,
+        *,
+        source_kind: str = "native",
     ) -> None:
         """Assert a memory with ``key`` exists in the SAME (scope, scope_id).
 
@@ -285,6 +291,7 @@ class MemoryRelationshipService:
         q = db.query(MemoryMetadataModel).filter(
             MemoryMetadataModel.key == key,
             MemoryMetadataModel.scope == scope,
+            MemoryMetadataModel.source_kind == source_kind,
         )
         if scope_id is not None:
             q = q.filter(MemoryMetadataModel.scope_id == scope_id)
@@ -795,7 +802,13 @@ class MemoryRelationshipService:
     # read operations
     # ------------------------------------------------------------------ #
     def _source_updated_map(
-        self, db: Any, scope: str, scope_id: Optional[str], source_keys: set
+        self,
+        db: Any,
+        scope: str,
+        scope_id: Optional[str],
+        source_keys: set,
+        *,
+        source_kind: str = "native",
     ) -> Dict[str, datetime]:
         """Batch-load source memories' updated_at for staleness (avoid N+1)."""
         if not source_keys:
@@ -803,6 +816,7 @@ class MemoryRelationshipService:
         q = db.query(MemoryMetadataModel).filter(
             MemoryMetadataModel.scope == scope,
             MemoryMetadataModel.key.in_(list(source_keys)),
+            MemoryMetadataModel.source_kind == source_kind,
         )
         if scope_id is not None:
             q = q.filter(MemoryMetadataModel.scope_id == scope_id)

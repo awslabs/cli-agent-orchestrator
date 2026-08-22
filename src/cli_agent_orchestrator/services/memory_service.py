@@ -310,6 +310,8 @@ class MemoryService:
         last_compiled_at: Optional[datetime] = None,
         related_keys: Optional[str] = None,
         preserve_provenance: bool = False,
+        *,
+        source_kind: str = "native",
     ) -> None:
         """Insert or update the metadata row for (key, scope, scope_id).
 
@@ -340,6 +342,7 @@ class MemoryService:
                 .filter(
                     MemoryMetadataModel.key == key,
                     MemoryMetadataModel.scope == scope,
+                    MemoryMetadataModel.source_kind == source_kind,
                     (
                         MemoryMetadataModel.scope_id == scope_id
                         if scope_id is not None
@@ -375,6 +378,7 @@ class MemoryService:
                     memory_type=memory_type,
                     scope=scope,
                     scope_id=scope_id,
+                    source_kind=source_kind,
                     file_path=file_path,
                     tags=tags,
                     source_provider=source_provider,
@@ -386,7 +390,9 @@ class MemoryService:
                 db.add(row)
                 db.commit()
 
-    def _delete_metadata(self, key: str, scope: str, scope_id: Optional[str]) -> bool:
+    def _delete_metadata(
+        self, key: str, scope: str, scope_id: Optional[str], *, source_kind: str = "native"
+    ) -> bool:
         """Delete the metadata row for (key, scope, scope_id). Returns True if removed."""
         from cli_agent_orchestrator.clients.database import MemoryMetadataModel
 
@@ -394,6 +400,7 @@ class MemoryService:
             q = db.query(MemoryMetadataModel).filter(
                 MemoryMetadataModel.key == key,
                 MemoryMetadataModel.scope == scope,
+                MemoryMetadataModel.source_kind == source_kind,
             )
             if scope_id is not None:
                 q = q.filter(MemoryMetadataModel.scope_id == scope_id)
@@ -1245,6 +1252,8 @@ class MemoryService:
         scope_id: Optional[str] = None,
         key: Optional[str] = None,
         terminal_context: Optional[dict] = None,
+        *,
+        source_kind: str = "native",
     ) -> dict:
         """Manually compact wiki topics via the LLM compiler (repair sweep).
 
@@ -1268,7 +1277,10 @@ class MemoryService:
         candidates: list = []
         try:
             with self._get_db_session() as db:
-                q = db.query(MemoryMetadataModel).filter(MemoryMetadataModel.scope == scope)
+                q = db.query(MemoryMetadataModel).filter(
+                    MemoryMetadataModel.scope == scope,
+                    MemoryMetadataModel.source_kind == source_kind,
+                )
                 if scope_id is not None:
                     q = q.filter(MemoryMetadataModel.scope_id == scope_id)
                 if key is not None:
@@ -1372,7 +1384,12 @@ class MemoryService:
         return out
 
     def _candidate_keys_for_topic(
-        self, scope: str, scope_id: Optional[str], exclude_key: str
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        exclude_key: str,
+        *,
+        source_kind: str = "native",
     ) -> list:
         """Build the candidate-key set fed to ``find_related``.
 
@@ -1385,7 +1402,10 @@ class MemoryService:
 
         try:
             with self._get_db_session() as db:
-                q = db.query(MemoryMetadataModel).filter(MemoryMetadataModel.scope == scope)
+                q = db.query(MemoryMetadataModel).filter(
+                    MemoryMetadataModel.scope == scope,
+                    MemoryMetadataModel.source_kind == source_kind,
+                )
                 if scope_id is not None:
                     q = q.filter(MemoryMetadataModel.scope_id == scope_id)
                 else:
@@ -1462,7 +1482,9 @@ class MemoryService:
         rendered = "\n".join(out).rstrip() + "\n"
         return rendered
 
-    def _related_keys_lookup(self, keys: list, scope: str, scope_id: Optional[str]) -> dict:
+    def _related_keys_lookup(
+        self, keys: list, scope: str, scope_id: Optional[str], *, source_kind: str = "native"
+    ) -> dict:
         """Return ``{key: related_keys_raw}`` for the given keys in scope.
 
         Enriches recall/injection primaries (built from wiki files, which
@@ -1479,6 +1501,7 @@ class MemoryService:
                 q = db.query(MemoryMetadataModel).filter(
                     MemoryMetadataModel.key.in_(list(set(keys))),
                     MemoryMetadataModel.scope == scope,
+                    MemoryMetadataModel.source_kind == source_kind,
                 )
                 if scope_id is not None:
                     q = q.filter(MemoryMetadataModel.scope_id == scope_id)
@@ -2058,18 +2081,18 @@ class MemoryService:
         return sliced
 
     def _identity(self, m) -> tuple:
-        """Full memory identity ``(key, scope, scope_id)`` matching SQLite.
+        """Full memory identity ``(key, scope, scope_id, source_kind)`` matching SQLite.
 
-        Matches the metadata table's uniqueness constraint. Used to key
-        usage enrich/increment and the composite-score dict so same-slug
-        memories in different scopes never collide.
+        Matches the metadata table's uniqueness constraint. Used to key usage
+        enrich/increment and the composite-score dict so same-slug memories
+        from different scopes or backends never collide.
 
         Uses ``_effective_scope_id`` (not raw ``m.scope_id``) so PROJECT rows
         — whose parsed Memory carries ``scope_id=None`` but whose SQLite row
         stores the project hash — match correctly. Mirrors the recovery the
         related-key expansion already performs.
         """
-        return (m.key, m.scope, self._effective_scope_id(m))
+        return (m.key, m.scope, self._effective_scope_id(m), getattr(m, "source_kind", "native"))
 
     def _enrich_access_counts(self, memories: list) -> None:
         """Populate ``access_count`` on Memory objects from SQLite.
@@ -2086,11 +2109,18 @@ class MemoryService:
 
             keys = list({m.key for m in memories})
             with self._get_db_session() as db:
-                rows = db.query(MemoryMetadataModel).filter(MemoryMetadataModel.key.in_(keys)).all()
-                # Key the lookup by FULL identity (key, scope, scope_id) — the
-                # table's uniqueness constraint. A bare-key or (key, scope)
-                # match would read a same-slug row from another scope/project.
-                by_identity = {(r.key, r.scope, r.scope_id): int(r.access_count or 0) for r in rows}
+                rows = (
+                    db.query(MemoryMetadataModel)
+                    .filter(MemoryMetadataModel.key.in_(keys))
+                    .all()
+                )
+                # Key the lookup by full identity including source_kind. A
+                # bare-key or partial identity would cross-contaminate native
+                # and vault rows which share a key and scope.
+                by_identity = {
+                    (r.key, r.scope, r.scope_id, r.source_kind): int(r.access_count or 0)
+                    for r in rows
+                }
             for m in memories:
                 m.access_count = by_identity.get(self._identity(m), 0)
         except Exception as e:  # noqa: BLE001 — best-effort enrichment
@@ -2113,9 +2143,9 @@ class MemoryService:
 
         from cli_agent_orchestrator.clients.database import MemoryMetadataModel
 
-        # Match on FULL identity (key, scope, scope_id), not bare key — the
-        # table's uniqueness constraint. A key-only UPDATE would bump every
-        # same-slug row across scopes/projects (cross-scope contamination).
+        # Match on full identity including source_kind, not bare key — the
+        # table's uniqueness constraint. A partial UPDATE would bump rows
+        # from another backend with the same key and scope.
         # OR-of-ANDs is used over tuple_().in_() because SQLite tuple-IN
         # compares scope_id with ``=``, which never matches the NULL that
         # global rows carry; ``.is_(None)`` is required for those.
@@ -2125,13 +2155,14 @@ class MemoryService:
                 and_(
                     MemoryMetadataModel.key == k,
                     MemoryMetadataModel.scope == s,
+                    MemoryMetadataModel.source_kind == source_kind,
                     (
                         MemoryMetadataModel.scope_id == sid
                         if sid is not None
                         else MemoryMetadataModel.scope_id.is_(None)
                     ),
                 )
-                for (k, s, sid) in identities
+                for (k, s, sid, source_kind) in identities
             ]
         )
         with self._get_db_session() as db:
@@ -2277,9 +2308,9 @@ class MemoryService:
         ``memories``. The full corpus is essential for correct IDF: a candidate-
         only corpus collapses when every candidate contains the query term
         (df == N → negative IDF → all-zero). Scores are returned only for the
-        identities present in ``memories``, keyed by ``(key, scope, scope_id)``,
-        so the relevance magnitude is comparable across rows regardless of
-        whether each arrived via metadata substring match or BM25 top-up.
+        identities present in ``memories``, keyed by the full metadata
+        identity. The wiki corpus represents native memories, so its source
+        discriminator is explicitly ``"native"``.
 
         Returns ``{}`` when not applicable (no query/candidates, ``rank_bm25``
         absent, no corpus); callers treat a missing key as ``0.0`` so score
@@ -2337,7 +2368,7 @@ class MemoryService:
                 corpus_tokens.append(tokens)
                 # Only track identities we'll report; others stay in the corpus
                 # (for IDF) but map to None so they're skipped on readback.
-                identity = (wiki_file.stem, file_scope, file_scope_id)
+                identity = (wiki_file.stem, file_scope, file_scope_id, "native")
                 identities.append(identity if identity in wanted else None)
 
         if not corpus_tokens:

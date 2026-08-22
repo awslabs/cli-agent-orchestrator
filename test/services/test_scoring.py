@@ -1063,6 +1063,30 @@ class TestUsageIdentityIsolation:
 
 
 class TestScoreUsesBm25:
+    def test_global_native_access_identity_enriches_and_increments(self, svc, db_engine):
+        """Global native rows use NULL scope_id but retain the native discriminator."""
+        op = _ctx(caller_scope="global")
+        _run(
+            svc.store(
+                content="global access identity",
+                scope="global",
+                memory_type="reference",
+                key="global-access",
+                tags="t",
+                terminal_context=op,
+            )
+        )
+
+        memories = _run(svc._metadata_recall(scope="global", terminal_context=op))
+        target = next(memory for memory in memories if memory.key == "global-access")
+
+        assert svc._identity(target) == ("global-access", "global", None, "native")
+        svc._increment_access_count([target])
+        svc._enrich_access_counts([target])
+
+        assert target.access_count == 1
+        assert _row(db_engine, "global-access").access_count == 1
+
     def test_strong_bm25_outranks_recency_under_score(self, svc, db_engine):
         """Haofei's repro, inverted: an OLDER article with strong query-term
         density and a NEWER weak match. Under sort_by="score" the strong-BM25
