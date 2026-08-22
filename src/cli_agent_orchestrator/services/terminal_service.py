@@ -63,7 +63,7 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
-from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.providers.base import BaseProvider, OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroPhase0KASError,
@@ -90,7 +90,6 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
-    wait_until_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -752,44 +751,47 @@ _DEFERRED_STARTED_STATUSES = {
 }
 
 
-def _worker_is_started_direct(terminal_id: str, provider) -> bool:
-    """Direct visible-screen status check bypassing the event-driven status cache.
+def _get_direct_rendered_status(terminal_id: str, provider: BaseProvider) -> TerminalStatus:
+    """Read the current tmux pane and detect its status without the cache.
 
-    The deferred-init retry loop polls ``status_monitor.get_status()`` which
-    returns the **cached** status updated only by the event-driven pipeline
-    (pyte screener at rising-edge/quiescence edges). When that lags behind
-    reality the cached status stays IDLE even though the worker already
-    transitioned to PROCESSING.
-
-    This function does a live ``capture-pane`` to grab the visible screen
-    (not the 8 KB rolling buffer, which is too small to reliably hold the
-    footer) and calls ``provider.get_status()`` directly, catching the real
-    state so the retry loop doesn't re-deliver into a working terminal.
-
-    Only providers that set ``supports_direct_status_probe = True`` should
-    be passed to this function; the ``get_status()`` contract for other
-    providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
-    dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
-    rendered capture-pane snapshot.
+    Providers with a screen detector receive the rendered lines directly.
+    The older direct-probe capability remains as a fallback for line-oriented
+    providers such as OpenCode. Unsupported providers and probe failures
+    return UNKNOWN, which callers must never treat as permission to send.
     """
+    use_screen_detector = getattr(provider, "supports_screen_detection", False) is True
+    use_direct_detector = getattr(provider, "supports_direct_status_probe", False) is True
+    if not use_screen_detector and not use_direct_detector:
+        return TerminalStatus.UNKNOWN
+
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            return False
+            return TerminalStatus.UNKNOWN
         session_name = metadata.get("tmux_session")
         window_name = metadata.get("tmux_window")
         if not session_name or not window_name:
-            return False
-        output = get_backend().get_history(session_name, window_name, tail_lines=200)
-        status = provider.get_status(output)
+            return TerminalStatus.UNKNOWN
+        backend = get_backend()
+        if backend.supports_event_inbox() is True:
+            return TerminalStatus.UNKNOWN
+        output = backend.get_history(session_name, window_name, tail_lines=200)
+        if use_screen_detector:
+            return provider.get_status_from_screen(output.splitlines())
+        if use_direct_detector:
+            return provider.get_status(output)
     except Exception:
         logger.debug(
             "Direct status probe for %s failed (falling through to cached path)",
             terminal_id,
             exc_info=True,
         )
-        return False
-    return status in _DEFERRED_STARTED_STATUSES
+    return TerminalStatus.UNKNOWN
+
+
+def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+    """Return whether a live rendered-pane probe shows accepted input."""
+    return _get_direct_rendered_status(terminal_id, provider) in _DEFERRED_STARTED_STATUSES
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
@@ -814,6 +816,90 @@ def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
 
 
+def _wait_for_input_acceptance(
+    terminal_id: str,
+    provider=None,
+    initial_cached_status: Optional[TerminalStatus] = None,
+    initial_rendered_status: Optional[TerminalStatus] = None,
+) -> bool:
+    """Poll cached and rendered status for evidence that input was accepted."""
+    deadline = time.monotonic() + _DEFERRED_SUBMIT_CONFIRM_TIMEOUT
+    while time.monotonic() < deadline:
+        cached_status = status_monitor.get_status(terminal_id)
+        if cached_status in _DEFERRED_STARTED_STATUSES and cached_status != initial_cached_status:
+            return True
+        if provider is not None and (
+            getattr(provider, "supports_screen_detection", False) is True
+            or getattr(provider, "supports_direct_status_probe", False) is True
+        ):
+            rendered_status = _get_direct_rendered_status(terminal_id, provider)
+            if (
+                rendered_status in _DEFERRED_STARTED_STATUSES
+                and rendered_status != initial_rendered_status
+            ):
+                return True
+        time.sleep(0.5)
+    return False
+
+
+def _confirm_input_accepted_or_resubmit(
+    terminal_id: str,
+    message: str,
+    registry: "PluginRegistry | None",
+    sender_id: Optional[str],
+    orchestration_type: Optional[OrchestrationType],
+    provider=None,
+    initial_cached_status: Optional[TerminalStatus] = None,
+    initial_rendered_status: Optional[TerminalStatus] = None,
+    delivery_name: str = "Deferred assign",
+) -> bool:
+    """Confirm input acceptance and retry the existing tmux delivery path.
+
+    Returns True once the terminal reaches a started status, False if it remains
+    ready after all resubmit attempts.
+    """
+    if _wait_for_input_acceptance(
+        terminal_id,
+        provider,
+        initial_cached_status,
+        initial_rendered_status,
+    ):
+        return True
+
+    for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
+        if _message_visible_in_box(terminal_id, message):
+            logger.warning(
+                "%s to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
+                delivery_name,
+                terminal_id,
+                attempt,
+            )
+            send_special_key(terminal_id, "Enter")
+        else:
+            logger.warning(
+                "%s to %s not accepted (paste dropped); " "re-delivering message (attempt %d)",
+                delivery_name,
+                terminal_id,
+                attempt,
+            )
+            send_input(
+                terminal_id,
+                message,
+                registry=registry,
+                sender_id=sender_id,
+                orchestration_type=orchestration_type,
+            )
+        if _wait_for_input_acceptance(
+            terminal_id,
+            provider,
+            initial_cached_status,
+            initial_rendered_status,
+        ):
+            return True
+
+    return False
+
+
 async def _confirm_worker_started_or_resubmit(
     terminal_id: str,
     message: str,
@@ -822,64 +908,16 @@ async def _confirm_worker_started_or_resubmit(
     orchestration_type: Optional[OrchestrationType],
     provider=None,
 ) -> bool:
-    """Confirm a deferred-init worker began processing; re-submit if not.
-
-    Returns True once the terminal reaches a started status, False if it is
-    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
-    off the loop via to_thread so concurrent deferred inits aren't frozen.
-    """
-    if await wait_until_status(
+    """Run shared submit confirmation off the deferred-init event loop."""
+    return await asyncio.to_thread(
+        _confirm_input_accepted_or_resubmit,
         terminal_id,
-        _DEFERRED_STARTED_STATUSES,
-        timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-        polling_interval=0.5,
-    ):
-        return True
-
-    for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
-        # The cached status_monitor status is event-driven (pyte screener at
-        # rising-edge/quiescence only) and can lag behind reality. Before
-        # re-delivering, do a direct capture-pane / visible-screen check via
-        # the provider to catch cases where the worker IS processing but the
-        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
-        # footer appearing between pyte detection edges). Only providers that
-        # opt in via ``supports_direct_status_probe = True`` take this path.
-        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
-            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
-                return True
-
-        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
-            logger.warning(
-                "Deferred assign to %s unsubmitted (Enter swallowed); "
-                "re-submitting via Enter (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
-        else:
-            logger.warning(
-                "Deferred assign to %s not accepted (paste dropped); "
-                "re-delivering message (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(
-                send_input,
-                terminal_id,
-                message,
-                registry=registry,
-                sender_id=sender_id,
-                orchestration_type=orchestration_type,
-            )
-        if await wait_until_status(
-            terminal_id,
-            _DEFERRED_STARTED_STATUSES,
-            timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-            polling_interval=0.5,
-        ):
-            return True
-
-    return False
+        message,
+        registry,
+        sender_id,
+        orchestration_type,
+        provider,
+    )
 
 
 def _schedule_deferred_init(
