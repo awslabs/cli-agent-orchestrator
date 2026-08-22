@@ -329,12 +329,61 @@ def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult
 # Index machinery (derived, droppable — B2-BR-2/B2-BR-3)
 # ---------------------------------------------------------------------------
 def _connect():
-    """Open a short-lived SQLite connection to the shared DB file."""
+    """Open a short-lived SQLite connection to the shared DB file.
+
+    Every connection carries an explicit ``busy_timeout`` (BR-3A1-1). At the
+    configured value this pragma is a runtime NO-OP — CPython's
+    ``sqlite3.connect()`` already applies a 5000 ms busy timeout through its
+    ``timeout=5.0`` default, so this module's effective posture was ALREADY
+    identical to the journal's before this statement existed. It is set anyway
+    for the two reasons ``workflow_journal._connect`` records for its own: the
+    value gets one named home that can be revised without editing this module,
+    and the guarantee survives a future caller passing ``timeout=0`` or a change
+    to that stdlib default. Neither is a present defect; both are regressions
+    this makes impossible.
+
+    The timeout is interpolated from ``WORKFLOW_SPEC_INDEX_BUSY_TIMEOUT_MS`` and
+    from nothing else (BR-3A1-2, SR-3A1-1): SQLite accepts no bound parameter for
+    ``PRAGMA busy_timeout``, so this is this module's one interpolated statement
+    and its source must stay a trusted constant. There is deliberately no
+    environment override — one would restore the ``timeout=0`` hole this closes.
+
+    A failing pragma DEGRADES rather than denying service (SR-3A1-3): it is logged
+    at ``warning`` and the connection is returned anyway, because the connection is
+    still usable and still carries the stdlib default. Propagating would convert an
+    unobserved pragma failure into a hard failure of every ``list`` / ``get`` /
+    ``delete`` and index write in this module — a self-inflicted outage in exchange
+    for defending a guarantee the connection still has. Only the pragma is guarded;
+    a ``connect`` that fails is a real failure and still propagates.
+
+    WAL is NOT set here (BR-3A1-5). ``busy_timeout`` is per-connection, but WAL is a
+    property of the shared database file and would change the journal mode for every
+    other CAO subsystem using it (ADR-583-10 defers it to ``nfr-design``).
+
+    This factory runs NO migrators, so the migrator-memoisation half of ADR-583-10
+    does not transfer (BR-3A1-6): there is nothing to memoise and no per-call DDL to
+    remove.
+    """
     import sqlite3
 
-    from cli_agent_orchestrator.constants import DATABASE_FILE
+    from cli_agent_orchestrator.constants import (
+        DATABASE_FILE,
+        WORKFLOW_SPEC_INDEX_BUSY_TIMEOUT_MS,
+    )
 
-    return sqlite3.connect(str(DATABASE_FILE))
+    conn = sqlite3.connect(str(DATABASE_FILE))
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {WORKFLOW_SPEC_INDEX_BUSY_TIMEOUT_MS}")
+    except sqlite3.Error as exc:
+        # Degrade, never deny (SR-3A1-3). The message names the failure and the
+        # intended value only — never the database path or arbitrary context
+        # (SR-3A1-6).
+        logger.warning(
+            "could not set busy_timeout=%d on the workflow spec-index connection: %s",
+            WORKFLOW_SPEC_INDEX_BUSY_TIMEOUT_MS,
+            exc,
+        )
+    return conn
 
 
 def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: str) -> None:
