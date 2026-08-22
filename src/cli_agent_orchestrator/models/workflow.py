@@ -388,6 +388,37 @@ class TierCollisionError(ValueError):
         self.stem = stem
 
 
+class StaleSpecError(ValueError):
+    """An update presented a source hash that no longer matches the spec on disk.
+
+    Closes FR-8's second criterion (issue #583, Bolt 3, unit 4): "an update
+    presenting a stale source hash is rejected".
+
+    A ``ValueError`` subclass so existing broad handlers still catch it, but a
+    DISTINCT type so the API boundary can map it to **409** — a resource conflict,
+    not a malformed request — before any bare ``ValueError`` catch, exactly as
+    :class:`TierCollisionError` above is mapped.
+
+    The distinction is actionable rather than cosmetic: "your content is wrong"
+    (400) and "someone else changed this" (409) demand different responses — fix
+    the source, versus re-read and re-apply. A caller that cannot tell them apart
+    will retry the same overwrite, which is the behaviour the check exists to
+    prevent.
+
+    Carries BOTH hashes so a diagnostician can see which values disagreed.
+    """
+
+    def __init__(self, name: str, expected: str, actual: str) -> None:
+        super().__init__(
+            f"workflow '{name}' has changed on disk since it was read "
+            f"(expected source hash {expected}, found {actual}); "
+            "re-read the spec and re-apply your changes"
+        )
+        self.name = name
+        self.expected = expected
+        self.actual = actual
+
+
 class ScriptSpec(BaseModel):
     """The ``.py`` counterpart to ``WorkflowSpec`` (U5, E1, C4).
 

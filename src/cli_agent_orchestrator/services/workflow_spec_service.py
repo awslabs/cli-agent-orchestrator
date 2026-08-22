@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import glob
 import hashlib
+import hmac
 import logging
 import os
 import re
@@ -48,6 +49,7 @@ from cli_agent_orchestrator.models.workflow import (
     InputDecl,
     LintFinding,
     ScriptSpec,
+    StaleSpecError,
     TierCollisionError,
     ValidationResult,
     WorkflowIndexRow,
@@ -1024,17 +1026,55 @@ def create_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> S
     return _persist_spec(spec, target_path, safe_base)
 
 
-def update_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> ScriptSpec:
+def _current_source_hash(target_path: str, safe_base: str) -> str:
+    """Hash the spec currently on disk, the SAME way the read path hashes it.
+
+    ``sha256`` of the UTF-8 source, matching ``_read_script_spec``'s
+    ``content_hash`` exactly (issue #583, Bolt 3, unit 4, BR-3A4-5). Two definitions
+    would make this control fail open in the worst way: a caller's hash obtained
+    from ``get_workflow`` would never match, every update would be refused, and the
+    natural "fix" would be to weaken or delete the check.
+
+    Reads via ``_read_contained_spec_bytes`` — ONE read, containment already
+    guarded — deliberately NOT via ``get_workflow(name)``, whose bare-name arm calls
+    ``_resolve_source_path`` and rebuilds the WHOLE index (:492). That cost is
+    warned about in this module at :460-464 and would make updating one spec scale
+    with the number of specs present, on a path an agent may drive repeatedly.
+    """
+    _real, raw = _read_contained_spec_bytes(target_path, safe_base)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def update_workflow(
+    name: str, source: str, expected_hash: str, scan_dir: Optional[str] = None
+) -> ScriptSpec:
     """Update an EXISTING Python workflow spec, refusing to create one (FR-10).
 
     The mirror of :func:`create_workflow`: same ordered preconditions, opposite
     existence requirement, so an agent that means "edit this workflow" cannot silently
-    create one. See that function for why the existence check is racy and why that is
-    accepted.
+    create one.
+
+    **``expected_hash`` is REQUIRED, and that is what closes FR-8** (issue #583, Bolt
+    3, unit 4). FR-8's second criterion — "an update presenting a stale source hash is
+    rejected" — had no unit in Bolt 2, whose Definition of Done had to declare it
+    unsatisfied. An OPTIONAL parameter would have made the guarantee opt-in, and an
+    omitted-by-default argument is exactly what a caller leaves out; requiring it means
+    there is no unguarded path to leave available. Bolt 2's default-OFF choice for
+    approval enforcement deliberately does not transfer: that gate could be tripped by
+    a *transient* freeze failure, whereas here the hash either matches or it does not.
+
+    **What the check catches, and what it does not** (SR-3A4-6). It reliably catches
+    the realistic case: an agent read a spec, reasoned for a while, and submitted an
+    update against content that has since changed. It does NOT make concurrent writes
+    safe — there is a window between the comparison and the write in which another
+    writer could act, and closing it needs locking, which was considered and declined
+    (a lock adds a failure mode no other CAO path takes and still cannot constrain an
+    external editor). The comparison is placed as late as it can be without one.
 
     Args:
         name: bare workflow name, no extension and no path separators.
         source: the spec's new Python source, written verbatim.
+        expected_hash: the ``content_hash`` the caller last read for this spec.
         scan_dir: target directory. Internal/test use only (SR-3A3-5).
 
     Returns:
@@ -1044,11 +1084,25 @@ def update_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> S
         ValueError: invalid name, unwritable tier, lint errors, or malformed ``INPUTS``.
         FileNotFoundError: no spec with that name exists.
         TierCollisionError: a same-stem sibling exists in the other tier.
+        StaleSpecError: the spec changed on disk since ``expected_hash`` was read.
     """
     safe_base, target_path = _validate_write_target(name, scan_dir)
     if not os.path.exists(target_path):
         raise FileNotFoundError(f"workflow '{name}' does not exist; use create to add it")
     _check_tier_collision(name, safe_base)
+
+    # Placed AFTER existence and collision (each has a clearer error of its own) and
+    # BEFORE validation and the write (so a stale update is refused without paying for
+    # a lint pass, and the window to the write is as small as it can be) — BR-3A4-6.
+    actual_hash = _current_source_hash(target_path, safe_base)
+    # ``compare_digest`` rather than ``==``. NOT because a timing attack is a live
+    # threat here — the compared value hashes a file the caller can simply read, and an
+    # in-process call in a local tool is no practical oracle. It is used because ``==``
+    # on a digest is a recognised review flag, and this costs one import to remove the
+    # question a reader would otherwise have to answer from context (TS-3A4-1).
+    if not hmac.compare_digest(actual_hash, expected_hash):
+        raise StaleSpecError(name, expected_hash, actual_hash)
+
     spec = _validated_script_spec(name, source, target_path)
     return _persist_spec(spec, target_path, safe_base)
 
