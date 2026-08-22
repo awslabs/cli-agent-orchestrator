@@ -12,60 +12,159 @@ on:
           - minor
           - major
   schedule:
-    # Weekly patch release, Monday 09:00 UTC. Skipped automatically if
-    # nothing merged to main since the last tag (see "Check for unreleased
-    # commits" below).
-    - cron: '0 9 * * 1'
+    # Weekly release, Monday 09:17 UTC. Scheduled runs fail closed if CI for
+    # the exact release SHA is missing or incomplete, or if the prior release
+    # did not reach both GitHub Releases and PyPI. A post-tag publishing failure
+    # requires maintainer recovery of that exact version; a later schedule will
+    # not skip over it.
+    - cron: '17 9 * * 1'
 
 permissions:
   contents: read
 
+# Never cancel an in-flight release; queue manual and scheduled releases.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  preflight:
+    if: github.repository == 'awslabs/cli-agent-orchestrator'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      bump: ${{ steps.policy.outputs.bump }}
+      count: ${{ steps.policy.outputs.count }}
+      last_tag: ${{ steps.policy.outputs.last_tag }}
+      should_release: ${{ steps.policy.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Evaluate scheduled release policy
+        id: policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" != "schedule" ]; then
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+            echo "count=manual" >> "$GITHUB_OUTPUT"
+            echo "last_tag=manual" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LAST_TAG=$(
+            git tag --merged "$GITHUB_SHA" --list 'v[0-9]*' --sort=-v:refname |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              head -n 1
+          )
+          if [ -z "$LAST_TAG" ]; then
+            echo "No stable v<major>.<minor>.<patch> tag is reachable from $GITHUB_SHA"
+            exit 1
+          fi
+
+          COUNT=$(git rev-list "${LAST_TAG}..${GITHUB_SHA}" --count)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No commits since $LAST_TAG; skipping this scheduled release."
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh release view "$LAST_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          VERSION=${LAST_TAG#v}
+          python - "$VERSION" <<'PY'
+          import json
+          import sys
+          import urllib.error
+          import urllib.request
+
+          version = sys.argv[1]
+          url = f"https://pypi.org/pypi/cli-agent-orchestrator/{version}/json"
+          try:
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  json.load(response)
+          except (urllib.error.URLError, json.JSONDecodeError) as exc:
+              raise SystemExit(
+                  f"Prior release v{version} is not verifiably published on PyPI: {exc}"
+              )
+          PY
+
+          # Maintained allow-list of release-blocking workflows. Add another
+          # workflow file here only when release policy requires it.
+          REQUIRED_WORKFLOWS=(ci.yml)
+          for workflow in "${REQUIRED_WORKFLOWS[@]}"; do
+            STATE=$(
+              gh run list \
+                --repo "$GITHUB_REPOSITORY" \
+                --commit "$GITHUB_SHA" \
+                --workflow "$workflow" \
+                --limit 10 \
+                --json conclusion,headSha,status \
+                --jq 'map(select(.headSha == env.GITHUB_SHA)) | first |
+                  if . == null then "missing"
+                  else "\(.status):\(.conclusion // "none")"
+                  end'
+            )
+            if [ "$STATE" != "completed:success" ]; then
+              echo "$workflow is '$STATE' at $GITHUB_SHA; refusing to release"
+              exit 1
+            fi
+          done
+
+          COMMITS=$(git log "${LAST_TAG}..${GITHUB_SHA}" --format='%s%n%b')
+          if grep -Eq '(^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)' <<<"$COMMITS"; then
+            BUMP=major
+          elif grep -Eq '^feat(\([^)]*\))?:' <<<"$COMMITS"; then
+            BUMP=minor
+          else
+            BUMP=patch
+          fi
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
   release:
+    needs: preflight
+    if: >-
+      github.repository == 'awslabs/cli-agent-orchestrator' &&
+      needs.preflight.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
-      - name: Check for unreleased commits
-        id: unreleased
-        if: github.event_name == 'schedule'
-        run: |
-          LAST_TAG=$(git describe --tags --abbrev=0)
-          COUNT=$(git rev-list "${LAST_TAG}..HEAD" --count)
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          if [ "$COUNT" -eq 0 ]; then
-            echo "No commits since $LAST_TAG - skipping scheduled release."
-          fi
-
       - name: Install git-cliff
-        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518  # v2
         with:
           tool: git-cliff
 
       - name: Set up Python
-        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: '3.12'
 
       - name: Bump version and generate changelog
         id: bump
-        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/bump_version.py ${{ inputs.bump || 'patch' }}
+          python scripts/bump_version.py ${{ inputs.bump || needs.preflight.outputs.bump }}
           VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Commit and tag
-        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -75,8 +174,7 @@ jobs:
           git push && git push --tags
 
       - name: Create GitHub Release
-        if: github.event_name != 'schedule' || steps.unreleased.outputs.count != '0'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           tag_name: v${{ steps.bump.outputs.version }}
           generate_release_notes: true
