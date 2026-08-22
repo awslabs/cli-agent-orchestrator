@@ -466,7 +466,14 @@ def _origin_authority(origin: str) -> "str | None":
     ``"null"`` origin, a ``file://``/``data:`` scheme, or a malformed value —
     so those never satisfy the same-origin match below.
     """
-    parts = urlsplit(origin)
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        # A malformed bracketed host (e.g. ``http://[``) makes ``urlsplit``
+        # raise instead of returning an unparsed result. Both callers sit on
+        # request paths that must fail closed with a 403, not propagate a 500
+        # from an unguarded parse error.
+        return None
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return None
     # ``netloc`` may carry userinfo (user:pass@host); the authority a browser
