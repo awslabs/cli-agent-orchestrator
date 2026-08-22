@@ -646,6 +646,23 @@ WORKFLOW_MAX_INPUTS = 64
 # ADR-583-10).
 WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS = 5000
 
+# SQLite busy-timeout for workflow SPEC-INDEX connections, in milliseconds
+# (issue #583, Bolt 3, NFR-4). Deliberately a SEPARATE constant from the journal's
+# above rather than a shared one: the two subsystems are tuned independently, and a
+# single name covering both would either lie about its scope or couple them so that
+# retuning the journal silently retunes the index. The duplicated 5000 is accepted
+# for that reason (TS-3A1-1).
+#
+# At this value the pragma is a runtime NO-OP: CPython's ``sqlite3.connect()``
+# already applies a 5000 ms busy timeout via its ``timeout=5.0`` default. It is set
+# explicitly anyway for the two reasons the journal's own factory records — the value
+# gets one named home that can be revised without editing the module, and the
+# guarantee survives a future caller passing ``timeout=0`` or a change to that stdlib
+# default. There is deliberately NO environment override: one would hand a deployment
+# a way to set this to 0, which is the exact regression the explicit pragma exists to
+# make impossible (TS-3A1-2, SR-3A1-1).
+WORKFLOW_SPEC_INDEX_BUSY_TIMEOUT_MS = 5000
+
 # Max size (bytes) of the compact-JSON resolved inputs map delivered to a script
 # run via the CAO_WORKFLOW_INPUTS spawn-env key. Enforced at the run route, on
 # the RESOLVED map, BEFORE any journal write or registry registration (ADR-5) —
