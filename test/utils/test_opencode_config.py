@@ -299,6 +299,45 @@ class TestUpsertAgentTools:
         assert "supervisor" in data["agent"]
 
 
+class TestUpsertAgentToolsRoleAllowlist:
+    """Per-role cao-mcp-server tool allowlists (token-efficiency grant)."""
+
+    def test_known_role_grants_only_role_tools(self, tmp_config: Path):
+        upsert_agent_tools("developer", ["cao-mcp-server"], role="developer")
+        data = json.loads(tmp_config.read_text())
+        tools = data["agent"]["developer"]["tools"]
+        # Per-tool grants, never the server-wide wildcard.
+        assert "cao-mcp-server*" not in tools
+        assert tools["cao-mcp-server_send_message"] is True
+        assert tools["cao-mcp-server_memory_recall"] is True
+        # Tools the role must NOT see are absent (not advertised to the agent).
+        assert "cao-mcp-server_handoff" not in tools
+        assert "cao-mcp-server_assign" not in tools
+        assert "cao-mcp-server_emit_ui" not in tools
+
+    def test_supervisor_role_keeps_orchestration(self, tmp_config: Path):
+        upsert_agent_tools("supervisor", ["cao-mcp-server"], role="supervisor")
+        data = json.loads(tmp_config.read_text())
+        tools = data["agent"]["supervisor"]["tools"]
+        assert "cao-mcp-server*" not in tools
+        assert tools["cao-mcp-server_handoff"] is True
+        assert tools["cao-mcp-server_assign"] is True
+        assert tools["cao-mcp-server_send_message"] is True
+
+    def test_unknown_role_falls_back_to_wildcard(self, tmp_config: Path):
+        upsert_agent_tools("odd-agent", ["cao-mcp-server"], role="mystery-role")
+        data = json.loads(tmp_config.read_text())
+        assert data["agent"]["odd-agent"]["tools"] == {"cao-mcp-server*": True}
+
+    def test_other_mcp_servers_stay_server_wide(self, tmp_config: Path):
+        upsert_agent_tools("developer", ["cao-mcp-server", "jira"], role="developer")
+        data = json.loads(tmp_config.read_text())
+        tools = data["agent"]["developer"]["tools"]
+        assert tools["cao-mcp-server_send_message"] is True
+        # Third-party server: no per-tool knowledge -> server-wide grant.
+        assert tools["jira*"] is True
+
+
 class TestRemoveAgentTools:
     def test_removes_existing_agent(self, tmp_config: Path):
         upsert_agent_tools("developer", ["cao-mcp-server"])
