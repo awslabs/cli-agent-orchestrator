@@ -29,6 +29,8 @@ import hashlib
 import logging
 import os
 import re
+import stat
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Union, cast
@@ -58,6 +60,14 @@ from cli_agent_orchestrator.services.script_lint import lint_script
 logger = logging.getLogger(__name__)
 
 _NAME_RE = re.compile(WORKFLOW_NAME_RE)
+
+# Mode applied to a NEWLY created spec file (issue #583, Bolt 3, SR-3A2-6).
+# A workflow spec is ordinary user-authored source, so a CAO-written file should be
+# indistinguishable from a hand-written one. This constant is required rather than
+# optional: ``tempfile.mkstemp`` creates 0600 and ``os.replace`` preserves the temp
+# file's mode, so WITHOUT an explicit chmod every CAO-created spec would silently be
+# owner-only. An UPDATE preserves whatever mode the existing file had instead.
+_SPEC_FILE_CREATE_MODE = 0o644
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +253,139 @@ def _contained_spec_file(path: Union[str, Path], base_dir: Optional[str] = None)
     if not real_path.startswith(safe_base + os.sep):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
     return real_path if os.path.isfile(real_path) else None
+
+
+def _write_contained_spec_bytes(
+    path: Union[str, Path], data: bytes, base_dir: Optional[str] = None
+) -> str:
+    """Resolve + contain + atomically WRITE a spec file, guard colocated with the sinks.
+
+    The single guarded entry that writes bytes to a spec path, and the only one
+    (issue #583, Bolt 3, ADR-583-11). Companion to ``_read_contained_spec_bytes``
+    and ``_contained_spec_file`` above, and it exists for the same reason they do:
+    CodeQL's ``py/path-injection`` barrier for ``str.startswith`` is
+    **flow-sensitive and function-local**, so the "contained" state
+    ``_safe_spec_path`` establishes is NOT carried across its ``return``. Every
+    filesystem sink below therefore sits in THIS function, after the containment
+    ``startswith`` check written HERE — alerts 166/167/168 were caused by exactly
+    the alternative.
+
+    Three shapes are forbidden because they defeat the query rather than because
+    they are logically wrong (see the block comment above ``_resolve_contained_spec_path``):
+
+    - a COMPOUND ``!= base and not startswith`` guard, which leaves the
+      ``real_path == base`` branch reaching a sink un-guarded;
+    - wrapping the checked string in ``Path(...)`` before any sink or on the
+      return, which the query does not track through;
+    - delegating the check to a helper and trusting its return.
+
+    Ordering is load-bearing and every step is placed deliberately:
+
+    1. **Reject a symlink target BEFORE resolution** (SR-3A2-2). ``realpath``
+       collapses links, so a check after it can never see one — and following a
+       link on a WRITE means the caller's bytes land in a spec it did not name,
+       which containment cannot catch because both paths are inside the base.
+       This is the one operation here that legitimately reads the caller's own
+       string rather than the resolved path; it neither opens nor writes.
+    2. **Containment guard.** The SafeAccessCheck, dominating every sink below.
+    3. **Size cap BEFORE any file is created** (SR-3A2-3). An oversized payload
+       must not leave a temp file behind, and the bound is the SAME constant the
+       read path enforces so this cannot write a spec ``load_and_validate``
+       would then refuse.
+    4. **Read the existing mode while the original inode still exists**
+       (SR-3A2-6). ``mkstemp`` creates 0600, so without re-applying the previous
+       mode every CAO write would silently make a spec owner-only.
+    5. **Temp file inside the validated base** (BR-3A2-7) — required so
+       ``os.replace`` is same-filesystem (hence atomic) and so the intermediate
+       artefact stays inside the containment argument. Its name comes from
+       ``mkstemp`` with a LEADING-DOT prefix, which cannot match the
+       ``*.yaml``/``*.yml``/``*.py`` globs ``rebuild_index_from_files`` runs on
+       every list/get/delete — a matching name would be indexed while
+       half-written (SR-3A2-5).
+    6. **flush + fsync before the rename** (TS-3A2-4). The index is a derived
+       projection rebuilt from the files (B2-BR-3), so a crash leaving an index
+       row pointing at content that never reached disk inverts the
+       file-is-canonical invariant.
+    7. **``os.replace``**, never in-place ``open(target, "w")`` (which truncates
+       and exposes an empty file) and never ``shutil.move`` (which copies across
+       filesystems, non-atomically).
+    8. **Unlink the temp file on ANY failure**, or a chmod/disk-full error
+       orphans it indefinitely.
+
+    NOT done here, both deliberate with named owners (SR-3A2-8): no grammar
+    validation — the caller validates the in-memory text and passes THOSE bytes,
+    keeping validate-and-write on one read (the TOCTOU window
+    ``load_and_validate`` closed); and no redaction — a spec is source the user
+    expects back verbatim, and NFR-1's redaction obligation attaches to the
+    manifest, not to user source.
+
+    Lost updates are NOT prevented (SR-3A2-7): ``os.replace`` stops a reader
+    seeing a partial file, but two writers that both read v1 and both write leave
+    the last one, silently. The mitigation is the caller's expected-source-hash
+    check, not a lock here.
+
+    Returns:
+        The resolved, contained realpath ``str`` the bytes were written to — the
+        same bare-``str`` shape the read helpers return.
+
+    Raises:
+        ValueError: the base directory is blocked, the resolved path escapes it,
+            the target is a symlink, or the payload exceeds the cap.
+        OSError: the write itself failed (the temp file is cleaned up first).
+    """
+    if not path or (isinstance(path, str) and not path.strip()):
+        raise ValueError("workflow spec path is required")
+
+    safe_base = _safe_dir(base_dir)
+
+    # (1) Symlink check on the CALLER's path, before realpath collapses it.
+    user_path = os.fspath(path)
+    if os.path.islink(user_path):
+        raise ValueError(f"workflow spec path '{path}' is a symlink; refusing to write through it")
+
+    real_path = _resolve_contained_spec_path(path, safe_base)
+    # (2) SafeAccessCheck — single positive containment guard, colocated with every
+    # sink below. A spec FILE is always strictly UNDER its base dir.
+    if not real_path.startswith(safe_base + os.sep):
+        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+
+    # (3) Bound the payload before anything touches the filesystem.
+    if len(data) > WORKFLOW_MAX_SPEC_BYTES:
+        raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)")
+
+    # (4) Capture the existing mode while the original inode is still there.
+    #
+    # CORRECTED during this unit's own tests: doing nothing here does NOT yield the
+    # process umask. ``mkstemp`` creates 0600 and ``os.replace`` preserves the temp
+    # file's mode, so a freshly-created spec would land owner-only — the exact
+    # outcome SR-3A2-6 rejects. A new file therefore gets an EXPLICIT mode.
+    #
+    # 0644 is used rather than a umask-derived value deliberately: reading the umask
+    # requires the ``os.umask(0)``-then-restore idiom, and ``os.umask`` is
+    # process-global, so that read-restore window is a genuine race inside a
+    # FastAPI server. A deterministic mode is worth more than honouring a
+    # restrictive umask here, and the trade is recorded rather than hidden.
+    existing_mode: int = _SPEC_FILE_CREATE_MODE
+    if os.path.isfile(real_path):
+        existing_mode = stat.S_IMODE(os.stat(real_path).st_mode)
+
+    # (5) Temp file inside the validated base, with a name no index glob can match.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{os.path.basename(real_path)}.", dir=safe_base)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())  # (6) durable before the name points at it
+        os.chmod(tmp_name, existing_mode)
+        os.replace(tmp_name, real_path)  # (7) atomic for readers
+    except BaseException:
+        # (8) Never orphan the temp file.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            logger.debug("could not remove temp spec file after a failed write")
+        raise
+    return real_path
 
 
 # ---------------------------------------------------------------------------
