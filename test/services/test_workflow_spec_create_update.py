@@ -72,10 +72,12 @@ def test_a_created_spec_is_gettable_and_listable(tmp_path: Path) -> None:
 
 
 def test_update_replaces_the_content_verbatim(tmp_path: Path) -> None:
-    svc.create_workflow("edit-me", GOOD, scan_dir=str(tmp_path))
+    # ``expected_hash`` is required (unit 4, BR-3A4-1) — the create's returned hash is
+    # exactly what a caller presents on the following update.
+    created = svc.create_workflow("edit-me", GOOD, scan_dir=str(tmp_path))
     new_source = "# rewritten, no trailing newline and a © char\nINPUTS = {}"
 
-    spec = svc.update_workflow("edit-me", new_source, scan_dir=str(tmp_path))
+    spec = svc.update_workflow("edit-me", new_source, created.content_hash, scan_dir=str(tmp_path))
 
     assert (tmp_path / "edit-me.py").read_text() == new_source
     assert spec.source == new_source
@@ -124,8 +126,10 @@ def test_create_refuses_an_existing_spec_and_leaves_it_byte_identical(
 
 
 def test_update_refuses_a_missing_spec_and_creates_nothing(tmp_path: Path) -> None:
+    # Any hash will do: the existence check precedes the stale-hash comparison
+    # (BR-3A4-6), so a missing spec is a FileNotFoundError and never a StaleSpecError.
     with pytest.raises(FileNotFoundError, match="does not exist"):
-        svc.update_workflow("absent", GOOD, scan_dir=str(tmp_path))
+        svc.update_workflow("absent", GOOD, "0" * 64, scan_dir=str(tmp_path))
     assert _entries(tmp_path) == []
 
 
