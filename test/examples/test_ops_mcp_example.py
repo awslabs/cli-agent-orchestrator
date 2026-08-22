@@ -73,6 +73,7 @@ class FakeOps:
         read_succeeds: bool = True,
         shutdown_succeeds: bool = True,
         session_absent: bool = True,
+        session_info_failure_message: Optional[str] = None,
     ) -> None:
         self._profiles = profiles
         self._statuses = statuses
@@ -84,6 +85,7 @@ class FakeOps:
         self._read_succeeds = read_succeeds
         self._shutdown_succeeds = shutdown_succeeds
         self._session_absent = session_absent
+        self._session_info_failure_message = session_info_failure_message
         self.calls: List[Dict[str, Any]] = []
 
     def _nth(self, name: str) -> int:
@@ -129,8 +131,16 @@ class FakeOps:
             return _text_result('{"success": true}')
 
         if name == "get_session_info":
+            if self._session_info_failure_message is not None:
+                return _text_result(
+                    '{"success": false, "message": %s}'
+                    % json_or_null(self._session_info_failure_message)
+                )
             if self._session_absent:
-                return _text_result('{"success": false, "message": "session not found"}')
+                return _text_result(
+                    '{"success": false, "message": '
+                    "\"Get session info for 'cao-demo' failed: Session not found\"}"
+                )
             return _text_result('{"name": "cao-demo", "terminals": [{"id": "abc123"}]}')
 
         raise AssertionError(f"unexpected tool call: {name}")
@@ -334,6 +344,14 @@ class TestVerifiedCleanup:
         assert report["cleanup_verified"] is True
         assert ops.call_names[-1] == "get_session_info"
 
+    @pytest.mark.asyncio
+    async def test_failed_cleanup_lookup_is_not_accepted_as_absence(self) -> None:
+        ops = FakeOps(
+            session_info_failure_message="Get session info for 'cao-demo' failed: HTTP 503"
+        )
+        with pytest.raises(RuntimeError, match="cleanup verification lookup failed: .*HTTP 503"):
+            await run.run_lifecycle(ops, profile="ops_mcp_worker", task="x", sleep=_no_sleep)
+
 
 class TestRunLifecycle:
     @pytest.mark.asyncio
@@ -373,7 +391,7 @@ class TestRunLifecycle:
         assert launch["arguments"]["agent_profile"] == "ops_mcp_worker"
 
     @pytest.mark.asyncio
-    async def test_follow_up_records_the_turn_boundary_before_sending(self) -> None:
+    async def test_follow_up_captures_current_output_before_sending(self) -> None:
         ops = FakeOps(statuses=("processing", "completed", "processing", "completed"))
         await run.run_lifecycle(
             ops,
@@ -383,9 +401,29 @@ class TestRunLifecycle:
             sleep=_no_sleep,
         )
         names = ops.call_names
-        # The baseline read must precede the dispatch it is a baseline for.
-        baseline_read = names.index("read_session_output")
-        assert baseline_read < names.index("send_session_message")
+        # The pre-dispatch output snapshot is recorded before delivery clears it.
+        snapshot_read = names.index("read_session_output")
+        assert snapshot_read < names.index("send_session_message")
+
+    @pytest.mark.asyncio
+    async def test_follow_up_uses_the_post_dispatch_output_generation(self) -> None:
+        ops = FakeOps(
+            statuses=("processing", "completed", "completed"),
+            output_sizes=(200, 20),
+        )
+        clock = iter([0.0, 1.0, 2.0, 3.0, 4.0, 124.0])
+        report = await run.run_lifecycle(
+            ops,
+            profile="ops_mcp_worker",
+            task="first",
+            follow_up="second",
+            sleep=_no_sleep,
+            now=lambda: next(clock),
+        )
+        waits = [step for step in report["steps"] if step["step"] == "wait_for_turn"]
+        follow_up_wait = waits[-1]
+        assert follow_up_wait["detail"]["evidence"] == "follow-up turn"
+        assert follow_up_wait["detail"]["status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_failed_follow_up_send_is_reported(self) -> None:

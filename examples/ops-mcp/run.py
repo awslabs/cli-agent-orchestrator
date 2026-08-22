@@ -178,11 +178,16 @@ async def session_is_absent(session: Any, session_name: str) -> bool:
     """Whether CAO no longer has this session.
 
     An already-absent session counts as verified cleanup: the goal is that no
-    session is left running, not that this process performed the removal.
+    session is left running, not that this process performed the removal. The
+    ops-MCP server currently identifies this case with its canonical not-found
+    message; every other failed lookup leaves cleanup unverified.
     """
     payload = await call_tool(session, "get_session_info", session_name=session_name)
     if _failed(payload):
-        return True
+        expected = f"Get session info for '{session_name}' failed: Session not found"
+        if payload.get("message") == expected:
+            return True
+        raise RuntimeError(f"cleanup verification lookup failed: {payload.get('message')}")
     return not isinstance(payload, dict)
 
 
@@ -265,9 +270,9 @@ async def run_lifecycle(
         record("wait_for_turn", {"status": status, "evidence": "launch turn"})
 
         if follow_up:
-            # Record the turn boundary BEFORE dispatching, so a stale ready
-            # status cannot be mistaken for this turn finishing.
-            baseline = await output_size(session, terminal_id)
+            # Capture the current output for reporting. Dispatch clears the
+            # rolling output buffer, so zero is the new turn's boundary.
+            previous_output_size = await output_size(session, terminal_id)
 
             sent = await call_tool(
                 session,
@@ -277,7 +282,15 @@ async def run_lifecycle(
             )
             if _failed(sent):
                 raise RuntimeError(f"follow-up failed: {sent.get('message')}")
-            record("send_session_message", {"queued": True, "baseline_chars": baseline})
+            baseline = 0
+            record(
+                "send_session_message",
+                {
+                    "queued": True,
+                    "previous_output_chars": previous_output_size,
+                    "baseline_chars": baseline,
+                },
+            )
 
             status = await wait_for_turn(
                 session,
