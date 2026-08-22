@@ -63,6 +63,7 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroPhase0KASError,
@@ -162,6 +163,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.ANTIGRAVITY_CLI.value,
     ProviderType.OMP.value,
     ProviderType.GROK_CLI.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native
@@ -171,6 +173,7 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
     ProviderType.OMP.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 
@@ -1237,7 +1240,10 @@ def send_input(
         # IDLE/COMPLETED). Without this, sticky ready-status would block
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
-        status_monitor.notify_input_sent(terminal_id)
+        if provider and provider.assume_processing_on_dispatch is True:
+            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+        else:
+            status_monitor.notify_input_sent(terminal_id)
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED
@@ -1455,7 +1461,11 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                             terminal_id,
                             exc,
                         )
-                raise last_err  # type: ignore[misc]
+                # Re-raise as the narrower type: the terminal and provider both
+                # resolved, so this is a missing response marker, not a bad
+                # reference. Keeps the API boundary from reporting it as 404
+                # (issue #570).
+                raise OutputExtractionError(str(last_err)) from last_err
 
             # Escalating fetch: try progressively larger capture windows until
             # the response marker is found or we hit the cap.

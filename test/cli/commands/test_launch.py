@@ -994,3 +994,11 @@ def test_grok_cli_requires_workspace_access_confirmation():
     )
 
     assert "grok_cli" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+
+
+def test_minimax_code_requires_workspace_access_confirmation():
+    from cli_agent_orchestrator.cli.commands.launch import (
+        PROVIDERS_REQUIRING_WORKSPACE_ACCESS,
+    )
+
+    assert "mcode" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS

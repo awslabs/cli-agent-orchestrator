@@ -400,6 +400,33 @@ class TestIsWsOriginAllowed:
                 )
 
 
+class TestOriginAuthorityMalformedInput:
+    """Regression for #653: ``_origin_authority`` fed a malformed bracketed
+    Origin (e.g. ``http://[``) must not raise. ``urlsplit`` propagates
+    ``ValueError: Invalid IPv6 URL`` for such input, and both callers sit on
+    request paths (HTTP middleware, WS handshake) that must fail closed with
+    a 403, not a 500 from an unguarded exception.
+    """
+
+    def test_malformed_bracketed_origin_returns_none(self):
+        from cli_agent_orchestrator.constants import _origin_authority
+
+        assert _origin_authority("http://[") is None
+
+    def test_malformed_origin_is_rejected_not_raised_by_ws_guard(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://[", "localhost:9889") is False
+
+    def test_malformed_origin_is_rejected_not_raised_by_http_guard(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert constants.is_http_origin_allowed("http://[", "localhost:9889") is False
+
+
 class TestPipeLivenessCheckIntervalClamp:
     """Regression for the round-3 Copilot review on #397: PIPE_LIVENESS_CHECK_INTERVAL_S
     feeds ``threading.Event.wait(timeout)`` in the watchdog's poll loop

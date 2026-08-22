@@ -22,6 +22,16 @@ def test_grok_uses_runtime_skills_with_native_tool_enforcement():
     assert "grok_cli" not in SOFT_ENFORCEMENT_PROVIDERS
 
 
+def test_minimax_code_uses_runtime_skills_with_soft_tool_enforcement():
+    from cli_agent_orchestrator.services.terminal_service import (
+        RUNTIME_SKILL_PROMPT_PROVIDERS,
+        SOFT_ENFORCEMENT_PROVIDERS,
+    )
+
+    assert "mcode" in RUNTIME_SKILL_PROMPT_PROVIDERS
+    assert "mcode" in SOFT_ENFORCEMENT_PROVIDERS
+
+
 _TS = "cli_agent_orchestrator.services.terminal_service"
 
 

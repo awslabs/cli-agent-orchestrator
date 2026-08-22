@@ -33,6 +33,7 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "hermes",
     "kimi_cli",
     "kiro_cli",
+    "mcode",
     "opencode_cli",
     "omp",
 }

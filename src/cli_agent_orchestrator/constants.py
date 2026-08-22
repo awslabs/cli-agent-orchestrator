@@ -466,7 +466,14 @@ def _origin_authority(origin: str) -> "str | None":
     ``"null"`` origin, a ``file://``/``data:`` scheme, or a malformed value —
     so those never satisfy the same-origin match below.
     """
-    parts = urlsplit(origin)
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        # A malformed bracketed host (e.g. ``http://[``) makes ``urlsplit``
+        # raise instead of returning an unparsed result. Both callers sit on
+        # request paths that must fail closed with a 403, not propagate a 500
+        # from an unguarded parse error.
+        return None
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return None
     # ``netloc`` may carry userinfo (user:pass@host); the authority a browser
@@ -532,6 +539,50 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
     # literal string "*" in this list and matches ONLY a literal "*" Origin
     # (which no browser sends), so it never widens PTY trust. See docstring.
     return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
+
+
+def is_http_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
+    """Whether a state-changing HTTP request ``Origin`` header is trusted.
+
+    CSRF / CWE-352 guard for the default-unauthenticated HTTP surface, mirroring
+    ``is_ws_origin_allowed`` on the read/mutation HTTP split:
+
+    * A missing / empty ``Origin`` is allowed. Browsers always attach one on a
+      cross-site state-changing request (``fetch``, XHR, and form posts alike),
+      so its absence means a non-browser client (curl, ``requests``, MCP, the
+      ``cao`` CLI) — one with no ambient credentials a foreign page could use.
+    * A literal ``*`` in ``CORS_ORIGINS`` (i.e. ``CAO_CORS_ORIGINS="*"``) allows
+      every origin — the operator-visible wildcard that ``CORSMiddleware``
+      already honors for the read surface, so a ``"*"``-configured deployment
+      behaves consistently for writes too.
+    * **Same-origin**: the ``Origin`` authority equals the request ``Host``.
+      This is the request the bundled Web UI makes when served by cao-server
+      itself, and it is exactly what a cross-site attacker CANNOT forge —
+      script-set ``Host`` is forbidden and the real ``Host`` is the CAO server
+      the request was made to, not the attacker's page. Matching on the live
+      ``Host`` lets the imported-app deployment and dynamic reverse-proxy /
+      Codespaces hostnames work without pre-registering every origin.
+
+      Like the WebSocket branch, this trusts ``Host`` and is only as safe as
+      ``Host`` itself: ``TrustedHostMiddleware`` validates ``Host`` against
+      ``ALLOWED_HOSTS`` on the same scope BEFORE the HTTP origin check runs,
+      which keeps the match DNS-rebinding-safe in the default loopback config.
+      ``CAO_ALLOWED_HOSTS="*"`` opts out of that protection, matching the WS
+      guard's documented tradeoff.
+    * Otherwise the ``Origin`` must be in ``CORS_ORIGINS``. Exact-string match
+      mirrors how the browser serializes ``Origin`` and how ``CORSMiddleware``
+      compares it, so anything the CORS layer already trusts for reads is
+      trusted for writes too.
+    """
+    if not origin:
+        return True
+    if "*" in CORS_ORIGINS:
+        return True
+    if host:
+        authority = _origin_authority(origin)
+        if authority is not None and authority == host:
+            return True
+    return origin in CORS_ORIGINS
 
 
 # Trusted upstream IP allowlist for uvicorn's ``proxy_headers`` and
@@ -638,11 +689,28 @@ WORKFLOW_MAX_SPEC_BYTES = 256 * 1024
 WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH = 8
 WORKFLOW_MAX_INPUTS = 64
 
+# SQLite busy-timeout for journal connections, in milliseconds (issue #583, NFR-4).
+# Journal writes are single-row upserts in one short transaction, so the realistic
+# contention window is milliseconds; 5000 gives ~3 orders of magnitude of headroom, which
+# makes "database is locked" mean a genuinely stuck writer rather than ordinary collision.
+# Per-connection (unlike WAL, which is per-database and deliberately out of scope,
+# ADR-583-10).
+WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS = 5000
+
 # Max size (bytes) of the compact-JSON resolved inputs map delivered to a script
 # run via the CAO_WORKFLOW_INPUTS spawn-env key. Enforced at the run route, on
 # the RESOLVED map, BEFORE any journal write or registry registration (ADR-5) —
 # never inside _build_env. An oversized payload is rejected as ValueError -> 400.
 WORKFLOW_INPUTS_MAX_BYTES = 32768
+
+# Byte bound on the persisted step result text (issue #583, NFR-1 / TD-2). Applied to
+# ``last_message`` AFTER redaction (never before — SR-1), on the UTF-8 encoding rather
+# than the character count, because the bound is a storage limit. Matches
+# WORKFLOW_INPUTS_MAX_BYTES rather than inventing a fourth magnitude: being slightly
+# tight is VISIBLE (``truncated=True`` on the envelope) and cheap to revise from a named
+# constant, while being loose accumulates SILENTLY in a shared database that has no
+# eviction for this column.
+WORKFLOW_JOURNAL_RESULT_MAX_BYTES = 32768
 
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every

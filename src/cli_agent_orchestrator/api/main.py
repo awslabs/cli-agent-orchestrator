@@ -82,6 +82,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
+    is_http_origin_allowed,
     is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
@@ -101,7 +102,9 @@ from cli_agent_orchestrator.models.memory import (
     MemoryType,
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
@@ -124,7 +127,11 @@ from cli_agent_orchestrator.services import (
     session_service,
     terminal_service,
 )
-from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
+from cli_agent_orchestrator.services.agent_step import (
+    StepExecutionError,
+    resolve_effective_working_directory,
+    run_agent_step,
+)
 from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
@@ -446,6 +453,19 @@ class RunStepRequest(BaseModel):
             "model for one worker without a dedicated agent profile."
         ),
     )
+    recovery: Optional[RecoveryPolicy] = Field(
+        default=None,
+        description=(
+            "What this step's author declares about re-running it (issue #583, "
+            "FR-5/FR-7), passed to the replay gate as the declared policy. "
+            "Absent means UNDECLARED, which is a distinct state and never "
+            "coerced to 'manual': the two differ at the gate's rule 2 and at its "
+            "catch-all. "
+            "Typed as the enum so an unknown value is REJECTED with 422 at the "
+            "boundary rather than silently downgraded to undeclared, which "
+            "would change the verdict (SR-6)."
+        ),
+    )
 
     @field_validator("env_vars")
     @classmethod
@@ -540,11 +560,28 @@ class RunStepRequest(BaseModel):
 
 
 class RunStepResponse(BaseModel):
-    """Response wrapping an ``AgentStepResult`` from ``run_agent_step``."""
+    """Response wrapping an ``AgentStepResult`` from ``run_agent_step``.
+
+    ``replayed`` is the one exception to that wrapping: a replayed response is
+    built from a STORED ``StepResultEnvelope``, and no ``run_agent_step`` call
+    happened at all (issue #583, FR-1).
+    """
 
     terminal_id: str
     last_message: str
     status: str
+    replayed: bool = Field(
+        default=False,
+        description=(
+            "True when this result was REPLAYED from the workflow journal "
+            "instead of executed (issue #583, FR-1). Defaulted to False, so "
+            "every existing response and consumer is unchanged. It is "
+            "load-bearing rather than cosmetic: a replayed response carries the "
+            "ORIGINAL terminal_id, which names a terminal that no longer "
+            "exists, and this flag is the only thing that stops a consumer "
+            "reading, writing to, or waiting on a dead id."
+        ),
+    )
 
 
 class WorkflowValidateRequest(BaseModel):
@@ -577,6 +614,33 @@ class WorkflowRunRequest(BaseModel):
     run_id: Optional[str] = Field(
         default=None,
         description="Optional run id (matches WORKFLOW_NAME_RE); auto-generated if omitted",
+    )
+
+
+class ResumeRunRequest(BaseModel):
+    """Request body for ``POST /workflows/runs/{run_id}/resume`` (issue #583, FR-7).
+
+    The route had no body before this unit; it stays OPTIONAL so every existing
+    caller — the CLI, the MCP tool, an operator with ``curl`` — keeps working
+    unchanged with no body at all.
+
+    ``decisions`` is typed ``Dict[str, str]`` and NOT ``Dict[str, RecoveryDecision]``
+    ON PURPOSE (SR-4/BR-10). Pydantic would reject an unknown value at the boundary
+    with a 422 and a schema-shaped message, while a mistyped decision must land on
+    **400** with a message naming the offending ``step_id``, produced by the ONE
+    validator all three surfaces share (``parse_decision``, reached through
+    ``workflow_journal.apply_decisions``). Validating here as well would put a second
+    implementation of the closed set on the path that must agree with it.
+    """
+
+    decisions: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Per-step recovery decisions for a halted script run: "
+            "step_id -> 'rerun' (re-execute) | 'skip' (use the stored result). "
+            "Applied before the script is spawned; an unknown step id or value is a "
+            "400 and applies nothing at all."
+        ),
     )
 
 
@@ -1324,6 +1388,56 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
+
+# Methods whose request could change server state. The Origin check only
+# guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and
+# OPTIONS preflights must reach CORSMiddleware unchanged).
+_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+class OriginCheckMiddleware:
+    """Reject state-changing HTTP requests with a disallowed ``Origin``.
+
+    CSRF / CWE-352 guard for the default-unauthenticated surface. Browsers
+    attach an ``Origin`` header on every cross-site state-changing request
+    (fetch, XHR, and form POST alike — the simple-request paths CORS can't
+    preflight-block), while non-browser clients (curl, ``requests``, MCP, the
+    ``cao`` CLI) send none, so a present-but-untrusted ``Origin`` is exactly
+    the browser-only signal this rejects. Reads and OPTIONS preflights always
+    pass through. Registered FIRST so it runs inside ``TrustedHostMiddleware``:
+    Host is validated against ``ALLOWED_HOSTS`` on the same scope before the
+    same-origin branch below can trust it (see ``is_http_origin_allowed``).
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope["method"] in _STATE_CHANGING_METHODS:
+            headers = {
+                name.decode("latin-1").lower(): value.decode("latin-1")
+                for name, value in scope.get("headers", [])
+            }
+            origin = headers.get("origin")
+            if origin and not is_http_origin_allowed(origin, headers.get("host")):
+                logger.warning(
+                    "Rejected cross-origin %s request: disallowed Origin %r",
+                    scope["method"],
+                    origin,
+                )
+                response = JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Cross-origin request blocked"},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# Security: CSRF / Cross-Origin Request Forgery (CWE-352). See the middleware
+# docstring; the guard must sit INSIDE TrustedHostMiddleware's Host validation
+# (add_middleware stacks last-added outermost), hence it is registered first.
+app.add_middleware(OriginCheckMiddleware)
 
 # Security: DNS Rebinding Protection
 # Validate Host header to prevent DNS rebinding attacks (CVE mitigation)
@@ -2571,6 +2685,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "antigravity_cli": "agy",
         "omp": "omp",
         "grok_cli": "grok",
+        "mcode": "mcode",
     }
     result = []
     for provider, binary in provider_binaries.items():
@@ -3360,6 +3475,13 @@ async def get_terminal_output(
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
+    except OutputExtractionError as e:
+        # Ordered before the ValueError arm it subclasses, same as run_step: the
+        # terminal and the route both resolved -- only the response marker was
+        # missing from the scrollback -- so this is a server-side extraction
+        # failure, not a bad terminal reference. Keep it a 500, not a 404
+        # (issue #570), and a plain-string detail like the run-step arm.
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3482,37 +3604,77 @@ async def run_step(
     The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
     fire (parity with the DELETE endpoint).
     """
-    # BR-31: for a script-tier run-step call, record the created terminal into the
-    # shared ScriptRunRecord's step_states AT creation time, so U4's orphan sweep
+    # BR-31: for a script-tier run-step call, record the live terminal into the
+    # shared ScriptRunRecord's step_states as soon as it exists, so U4's orphan sweep
     # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
     # callers (no run/step env or no script record in the registry).
-    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services import step_replay, workflow_service
     from cli_agent_orchestrator.services.script_runner import (
         make_step_terminal_recorder,
         record_step_completion,
+        record_step_replay,
+    )
+    from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
+    from cli_agent_orchestrator.services.workflow_errors import (
+        RecoveryDecisionRequired,
+        ReplayDivergenceError,
     )
     from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
 
-    on_terminal_created = make_step_terminal_recorder(body.env_vars)
-    # BR-31 companion: the recorder above seeds a step RUNNING at terminal
-    # creation, but nothing transitions it — so a completed script run reports
+    # Issue #583, unit ``settlement-rewire``: the recorder now also publishes the
+    # step's call fingerprint (computed inside ``run_agent_step``, in the one window
+    # BR-5 permits) and writes the durable RUNNING row — on BOTH the create and the
+    # reuse path, which is why it is no longer named for terminal creation (BR-3/BR-4).
+    on_step_terminal_ready = make_step_terminal_recorder(body.env_vars)
+    # Its companion: the recorder above seeds a step RUNNING when its terminal
+    # appears, but nothing transitions it — so a completed script run would report
     # every step frozen at running/attempts=0/output=null. ``on_step_settled``
     # transitions the shared ScriptRunRecord's step RUNNING->COMPLETED on success
-    # (or ->FAILED on a StepExecutionError), matching the YAML tier. No-op for
-    # YAML/handoff callers (same guard as the recorder). Settling is best-effort:
-    # it must never turn a successful step into an HTTP error, so ``_settle_step``
-    # swallows + logs any bookkeeping failure.
-    on_step_settled = record_step_completion(
-        body.env_vars, provider=body.provider, agent=body.agent, prompt=body.prompt
-    )
+    # (or ->FAILED on a StepExecutionError), matching the YAML tier, and settles the
+    # durable row in ONE write carrying the result envelope, the redacted+bounded
+    # output and error. No-op for YAML/handoff callers (same guard as the recorder).
+    # Settling is best-effort: it must never turn a successful step into an HTTP
+    # error, so ``_settle_step`` swallows + logs any bookkeeping failure.
+    on_step_settled = record_step_completion(body.env_vars)
 
-    def _settle_step(terminal_id: Optional[str], error: Optional[str]) -> None:
+    def _settle_step(
+        terminal_id: Optional[str],
+        error: Optional[str],
+        last_message: Optional[str] = None,
+        response_status: Optional[str] = None,
+    ) -> None:
+        # ``last_message`` is the step's own text result and defaults to None because
+        # every FAILURE arm below has none to give: the step never produced one. Only
+        # the success arm passes it, and it is what the durable result envelope is
+        # built from — an envelope built without it would satisfy FR-4 guard 1's
+        # letter (a settled row DOES carry an envelope) while leaving every future
+        # replay serving an empty result.
         if on_step_settled is None:
             return
         try:
-            on_step_settled(terminal_id, error)
+            on_step_settled(terminal_id, error, last_message, response_status)
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
+
+    # The THIRD sibling of the two callbacks above, called on the REPLAY arm only (PR #628
+    # review, Copilot F4). The replay branch returns before ``run_agent_step``, so neither
+    # callback above fires — correct, and the only way to create no terminal and write no
+    # durable row (BR-4) — but ``_finalize`` builds ``WorkflowRunResult.steps`` from
+    # ``ScriptRunRecord.step_states`` ALONE and ``resume_script_run`` rebuilds that map empty,
+    # so a fully replayed resume reported ``steps=[]`` while every journal row was intact.
+    # This records the step IN MEMORY, hydrated from its durable row; it writes nothing, so
+    # BR-4 is unchanged. Same guard as its siblings — None for every non-script-tier call.
+    on_step_replayed = record_step_replay(body.env_vars)
+
+    def _record_replayed_step() -> None:
+        if on_step_replayed is None:
+            return
+        try:
+            on_step_replayed()
+        except Exception:  # noqa: BLE001 — bookkeeping is best-effort; never fail the step
+            # A reporting loss (the step is absent from the run's step list), never a failed
+            # step: nothing ran, and there is a correct stored result to hand back regardless.
+            logger.warning("run_step: script step replay bookkeeping failed", exc_info=True)
 
     # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
     # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
@@ -3533,7 +3695,161 @@ async def run_step(
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
+    # ---- issue #583, unit ``run-step-replay-branch``: the replay branch ----------
+    #
+    # THE BRANCH ENGAGES FOR SCRIPT-TIER CALLS ONLY (BR-2/SR-5): both
+    # CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_STEP_ID present AND a live
+    # ``ScriptRunRecord`` in the registry. That last term is not re-implemented
+    # here — ``make_step_terminal_recorder`` returns None on exactly that
+    # condition, so ``on_step_terminal_ready is not None`` IS the callbacks' own
+    # guard rather than a second copy of it that could drift from them. YAML and
+    # handoff callers therefore reach no gate call at all, which is a security
+    # property as much as a compatibility one: no other tier can be handed a
+    # script run's stored result.
+    replay_run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    replay_step_id = env_vars.get("CAO_WORKFLOW_STEP_ID")
+
+    # The three values the gate needs, or None for a non-script-tier call. They
+    # travel as ONE optional triple rather than three separate Optionals so the
+    # tier test exists in one place and the branch below cannot be reached with a
+    # half-populated context.
+    replay_context: Optional[Tuple[str, str, str]] = None
+
+    # BR-10/TD-1: the effective working directory is resolved HERE, and the
+    # resolved value is what both the fingerprint and ``run_agent_step`` receive.
+    # For every non-script-tier call this stays the posted value and
+    # ``run_agent_step`` resolves exactly as it always did — no behaviour change.
+    effective_working_directory = body.working_directory
+    if replay_run_id and replay_step_id and on_step_terminal_ready is not None:
+        effective_working_directory = await resolve_effective_working_directory(
+            body.working_directory, body.caller_id
+        )
+        # TD-2: the SAME ``compute`` over the SAME effective directory that
+        # ``settlement-rewire`` hashed and ``begin_step`` stored. That is what makes
+        # the gate's comparison meaningful. Computing from the POSTED
+        # ``working_directory`` instead would not match the stored value, so rule 6
+        # would fire and every ``caller_id``-inherited step would get a false
+        # ``DIVERGED`` — a bug, not a trade-off (BR-10).
+        replay_context = (
+            replay_run_id,
+            replay_step_id,
+            compute(
+                StepCallFields(
+                    provider=body.provider,
+                    agent=body.agent,
+                    prompt=body.prompt,
+                    model=body.model,
+                    # ``StepCallFields.engine`` is the enum's ``value`` by contract —
+                    # the CALLER normalises, mirroring ``run_agent_step``.
+                    engine=(
+                        body.engine.value if isinstance(body.engine, KiroEngine) else body.engine
+                    ),
+                    allowed_tools=(
+                        None if body.allowed_tools is None else tuple(body.allowed_tools)
+                    ),
+                    effective_working_directory=effective_working_directory,
+                    use_worktree=body.use_worktree,
+                    # DERIVED, never the raw id (``step-fingerprint`` BR-6). Always
+                    # False on this tier today, because ``env_vars`` with a
+                    # ``reuse_terminal_id`` is already a 422 — computed rather than
+                    # hardcoded so it stays correct if that ever changes.
+                    reused_terminal=body.reuse_terminal_id is not None,
+                    timeout=body.timeout,
+                )
+            ),
+        )
+
     try:
+        # The branch sits AFTER the generation fence and BEFORE ``run_agent_step``,
+        # and both directions are load-bearing (BR-1). After the fence: a
+        # stale-generation zombie must get the fence's 409 rather than a cached
+        # result. Before ``run_agent_step``: not entering it is the only way to
+        # create no terminal, fire no callback and write no durable row (BR-4).
+        #
+        # It sits INSIDE this ``try`` for one reason (BR-9/SR-8): a database failure
+        # inside ``decide`` must reach the EXISTING 500 arm below and must never fall
+        # through to execution. An unreadable journal degrading to "just run it"
+        # re-runs completed work under exactly the conditions FR-1 exists to prevent.
+        # ``decide``'s ``ValueError`` precondition (a non-``v2`` fingerprint) is
+        # unreachable from here because the fingerprint above came from ``compute``,
+        # which only ever emits ``v2:``.
+        #
+        # The two halting verdicts are raised as ``workflow-errors``' two exception
+        # types and mapped in two dedicated ``except`` arms rather than raised as
+        # ``HTTPException`` here: ``HTTPException`` IS an ``Exception``, so a 409
+        # raised in this block would be swallowed by the ``except Exception`` arm,
+        # returned as a 500, and — worse — would settle a step that never ran.
+        if replay_context is not None:
+            decide_run_id, decide_step_id, call_fingerprint = replay_context
+            decision = step_replay.decide(
+                decide_run_id, decide_step_id, call_fingerprint, body.recovery
+            )
+            if decision.verdict is step_replay.ReplayVerdict.REPLAY:
+                # FR-1. The envelope is returned VERBATIM (SR-3): it was redacted and
+                # then bounded by ``build_envelope`` before it reached SQLite, and a
+                # second redaction pass could match its own ``[REDACTED:<name>]``
+                # marker. Reading ``result_json`` raw would bypass that pipeline
+                # entirely; ``decision.envelope`` is the only sanctioned payload.
+                envelope = decision.envelope
+                if envelope is None:  # pragma: no cover — see comment
+                    # Unreachable: ``ReplayDecision.envelope`` is set iff the verdict
+                    # is REPLAY and ``decide`` is its only construction site
+                    # (``replay-gate`` BR-6). Raised rather than executed, because
+                    # falling through here would re-run a completed step.
+                    raise RuntimeError(
+                        f"step '{decide_step_id}': the replay gate returned REPLAY "
+                        f"with no result envelope"
+                    )
+                if envelope.terminal_id is None:  # pragma: no cover — see comment
+                    # Unreachable through the shipped writers: a REPLAY verdict
+                    # requires a current-scheme ``call_fingerprint`` on the row, only
+                    # ``begin_step`` writes that column, and its one caller sets
+                    # ``StepRunState.terminal_id`` in the same statement — so a row
+                    # that can replay always carries the id its envelope was built
+                    # with. Raised rather than substituting a fake id, because
+                    # ``RunStepResponse.terminal_id`` is a non-optional ``str`` and
+                    # inventing one would be worse than failing.
+                    raise RuntimeError(
+                        f"step '{decide_step_id}': the stored result envelope carries "
+                        f"no terminal id, so no replayed response can be built"
+                    )
+                # Make the replayed step visible in the run's step list before answering
+                # (F4). In memory only — no terminal, no journal write, so BR-4 holds. Before
+                # the return rather than after it for the obvious reason, and best-effort so a
+                # bookkeeping failure cannot turn a correct replay into an HTTP error.
+                _record_replayed_step()
+                # ``replayed=True`` is the mitigation for the dead id (SR-4): the
+                # terminal named here no longer exists, and the flag is the only
+                # thing that stops a consumer probing it.
+                return RunStepResponse(
+                    terminal_id=envelope.terminal_id,
+                    last_message=envelope.last_message,
+                    status=envelope.status,
+                    replayed=True,
+                )
+            if decision.verdict is step_replay.ReplayVerdict.DIVERGED:
+                # FR-3's surfacing. NO fingerprint travels with it, and none can be
+                # added later (SR-2): only a digest is persisted, and
+                # ``step-fingerprint``'s SR-2 forbids echoing a digest into a message,
+                # a log or an exception — a 409 body is the most exposed of the three.
+                raise ReplayDivergenceError(step_id=decide_step_id, reason=decision.reason)
+            if decision.verdict is step_replay.ReplayVerdict.DECISION_REQUIRED:
+                # FR-7's surfacing. ``rule`` is set iff the verdict is
+                # DECISION_REQUIRED (``replay-gate`` BR-6), and this is where it
+                # reaches a human: without it an operator cannot tell which of six
+                # conditions halted the run.
+                halt_rule = decision.rule
+                if halt_rule is None:  # pragma: no cover — see comment
+                    # Unreachable for the same reason as the envelope guard above.
+                    raise RuntimeError(
+                        f"step '{decide_step_id}': the replay gate returned "
+                        f"DECISION_REQUIRED with no halting rule"
+                    )
+                raise RecoveryDecisionRequired(
+                    step_id=decide_step_id, rule=halt_rule, reason=decision.reason
+                )
+            # EXECUTE falls through — the step runs normally.
+
         result = await run_agent_step(
             provider=body.provider,
             agent=body.agent,
@@ -3542,24 +3858,70 @@ async def run_step(
             reuse_terminal_id=body.reuse_terminal_id,
             teardown=body.teardown,
             timeout=body.timeout,
-            working_directory=body.working_directory,
+            # BR-10: the ALREADY-RESOLVED directory rides the existing parameter, so
+            # ``run_agent_step``'s own ``working_directory is None and caller_id is
+            # not None`` guard simply does not fire and the resolution never runs
+            # twice. Identical to ``body.working_directory`` for every
+            # non-script-tier call.
+            working_directory=effective_working_directory,
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
             engine=body.engine,
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
-            on_terminal_created=on_terminal_created,
+            on_step_terminal_ready=on_step_terminal_ready,
             model=body.model,
             use_worktree=body.use_worktree,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
-        # is logged, not raised.
-        _settle_step(result.terminal_id, None)
+        # is logged, not raised. ``last_message`` is passed here and nowhere else:
+        # this is the only arm where the step produced one.
+        response_status = (
+            result.status.value if hasattr(result.status, "value") else str(result.status)
+        )
+        _settle_step(result.terminal_id, None, result.last_message, response_status)
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
-            status=(result.status.value if hasattr(result.status, "value") else str(result.status)),
+            status=response_status,
+        )
+    except ReplayDivergenceError as e:
+        # FR-3's surfacing (BR-6/BR-7, TD-3/TD-4). 409 rather than 502/504 because
+        # neither is a worker outcome — NOTHING RAN. ``kind`` is authoritative and
+        # three 409s are now reachable from this route (the generation fence's,
+        # this, and "decision_required"), so all three must stay distinguishable.
+        #
+        # TWO ARMS, NEVER ONE, AND NEVER A SHARED HANDLER. ``workflow-errors``' TD-1
+        # gave these two exception types no common base SPECIFICALLY so one ``except``
+        # cannot collapse two remedies FR-3 and FR-6 exist to keep apart: a divergence
+        # is reconciled by a human looking at what changed in the script, a halt by a
+        # human authorising a rerun. Parametrising them into one arm would undo that.
+        #
+        # NO ``rule`` KEY HERE — ``replay-gate`` BR-6 sets ``rule`` only on
+        # DECISION_REQUIRED, because a divergence is always the same condition and a
+        # constant attribute is the inert-field trap this issue has removed three
+        # times. NO FINGERPRINT EITHER, not even truncated (SR-2).
+        #
+        # The step is NOT settled: it never ran, so there is no outcome to record.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(e), "kind": "diverged", "step_id": e.step_id},
+        )
+    except RecoveryDecisionRequired as e:
+        # FR-7's surfacing — the second of the two arms above. ``rule`` completes a
+        # chain three units long: unit 1 built ``HaltRule``, unit 7 put it on
+        # ``ReplayDecision`` so the condition could travel, unit 12 consumes it to
+        # resolve the halt — and this is where it reaches a HUMAN. Omitting it would
+        # leave an operator guessing which of six conditions halted their run.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(e),
+                "kind": "decision_required",
+                "step_id": e.step_id,
+                "rule": e.rule.value,
+            },
         )
     except StepExecutionError as e:
         # The step did not complete successfully. Distinguish a worker that
@@ -3605,6 +3967,14 @@ async def run_step(
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OutputExtractionError as e:
+        # Also ordered before the ValueError arm it subclasses. The terminal and
+        # the route both resolved and the step ran -- only the response marker
+        # was missing -- so this is not a bad terminal reference. 500 per this
+        # endpoint's documented contract above ("any other failure -> 500",
+        # plain-string detail, no ``kind``), not 404 (issue #570).
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -5576,6 +5946,7 @@ async def cancel_workflow_run_endpoint(
 @app.post("/workflows/runs/{run_id}/resume")
 async def resume_workflow_run_endpoint(
     run_id: str,
+    body: Optional[ResumeRunRequest] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Resume a crashed/failed run from its durable journal (FR-6.2, N6, U5 A4).
@@ -5588,8 +5959,34 @@ async def resume_workflow_run_endpoint(
     script arm's typed-error catch order matches the boundary table: narrower
     ``ResumeNotAllowedError``/``ResumeCorruptError`` (both ``ValueError``
     subclasses) are caught BEFORE the bare ``ValueError`` arm.
+
+    ``recovery-decision-intake`` (issue #583, FR-7) adds the optional
+    ``decisions`` body field — the human's answer to a halted step. Three
+    properties of how it is wired here are requirements, not preferences:
+
+    * **Authorisation is INHERITED and not weakened** (SR-1). The scope
+      dependency below is untouched: a decision travels ON this request, so
+      supplying one already requires ``cao:write`` or ``cao:admin``. This unit
+      adds no second path in.
+    * **The decisions travel INTO the script arm's resume**, which applies them
+      after its own admission gates and before the spawn (SC-3/BR-7). They are
+      deliberately NOT applied here ahead of the call: this route cannot reject a
+      live run — ``resume_script_run``'s gate 2 does — so a decision written here
+      would be durable consent granted by a request that then returns 409.
+    * **A ``ValueError`` from that call still lands on 400** (SR-4), because the
+      call is inside the existing ``try`` and a bare ``ValueError`` is that arm. A
+      mistyped ``step_id`` is a client error; a 500 would tell the operator to
+      file a bug instead of fixing a typo.
+
+    Decisions are rejected for a non-script run rather than applied (INV-3, "a
+    decision never silently fails"): the replay gate that reads these states is
+    consulted by the script tier alone, and the YAML resume unconditionally resets
+    every non-completed step to ``PENDING`` and re-runs it — so a ``skip`` there
+    would re-execute the very step the operator asked to skip, silently.
     """
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    decisions = body.decisions if body is not None else None
 
     row = workflow_journal.get_run(run_id)
     if row is None:
@@ -5597,7 +5994,12 @@ async def resume_workflow_run_endpoint(
 
     if row.tier == "script":
         try:
-            result = await script_runner.resume_script_run(run_id)
+            if decisions:
+                result = await script_runner.resume_script_run(run_id, decisions=decisions)
+            else:
+                # Byte-identical to the pre-#583 call, so an ordinary resume cannot
+                # regress on a code path it never enters.
+                result = await script_runner.resume_script_run(run_id)
         except KeyError:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
@@ -5609,6 +6011,17 @@ async def resume_workflow_run_endpoint(
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         return result.model_dump()
+
+    if decisions:
+        # The YAML arm honours no decision, so it refuses one instead of accepting it
+        # and doing something else (see the docstring). Nothing is written on this path.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"run '{run_id}' is tier '{row.tier}'; recovery decisions apply to "
+                f"script-tier runs only"
+            ),
+        )
 
     try:
         result = await workflow_service.resume_from_last_completed(run_id)

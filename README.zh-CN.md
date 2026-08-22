@@ -6,7 +6,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
 
-**CLI Agent Orchestrator (CAO)** 是一个开源的多 Agent 编排框架，面向 Claude Code、Kiro CLI、Codex CLI、Antigravity CLI、Hermes Agent、Kimi CLI、GitHub Copilot CLI、OpenCode、Oh My Pi 和 Cursor CLI 等 AI 编程 CLI。CAO 会把每个 Agent 运行在隔离的 tmux 会话中，并通过 Model Context Protocol (MCP) 以 supervisor-worker 模式协调它们。一个 supervisor Agent 可以并行、串行，或以 swarm 方式把任务分派给多个专长不同的 Agent。
+**CLI Agent Orchestrator (CAO)** 是一个开源的多 Agent 编排框架，面向 Claude Code、Kiro CLI、Codex CLI、Antigravity CLI、Hermes Agent、Kimi CLI、MiniMax Code、GitHub Copilot CLI、OpenCode、Oh My Pi 和 Cursor CLI 等 AI 编程 CLI。CAO 会把每个 Agent 运行在隔离的 tmux 会话中，并通过 Model Context Protocol (MCP) 以 supervisor-worker 模式协调它们。一个 supervisor Agent 可以并行、串行，或以 swarm 方式把任务分派给多个专长不同的 Agent。
 
 📚 **[文档站点](https://awslabs.github.io/cli-agent-orchestrator/)** —— 指南、参考文档，以及两门交互式课程（英文）。
 
@@ -130,6 +130,7 @@ CAO 驱动的是已有 CLI Agent 工具，它并不会替代这些工具。使�
 | **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
 | **Hermes Agent** | [Provider docs](docs/hermes.md) | Hermes auth；可选 `hermesProfile` wrapper；在选中的 Hermes profile 中配置 `cao-mcp-server` 以启用编排工具 |
 | **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://platform.moonshot.cn/docs/kimi-cli) | Moonshot API key |
+| **MiniMax Code** | [Provider docs](docs/minimax-code.md) · [Installation](https://www.npmjs.com/package/@minimax-ai/code) | `mcode login` 或 BYOK 配置 |
 | **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
 | **OpenCode CLI**（实验性；多 Agent callback 暂时使用 inbox polling fallback，见 [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203)） | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
 | **Oh My Pi** | [Provider docs](docs/omp-cli.md) · [Installation](https://github.com/can1357/oh-my-pi) | OMP authenticated model account |
@@ -181,7 +182,7 @@ cao launch --agents code_supervisor
 
 # 或指定 provider
 cao launch --agents code_supervisor --provider claude_code
-# 可选值：kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | copilot_cli | opencode_cli | omp | cursor_cli
+# 可选值：kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | mcode | copilot_cli | opencode_cli | omp | cursor_cli
 
 # 不限制访问、跳过确认（危险）
 cao launch --agents code_supervisor --yolo
@@ -293,7 +294,7 @@ provider: claude_code
 ---
 ```
 
-有效值包括：`kiro_cli`、`claude_code`、`codex`、`antigravity_cli`、`hermes`、`kimi_cli`、`copilot_cli`、`opencode_cli`、`omp`、`cursor_cli`。初始会话始终以 `cao launch --provider` 参数为准。详见 [`examples/cross-provider/`](examples/cross-provider/)。
+有效值包括：`kiro_cli`、`claude_code`、`codex`、`antigravity_cli`、`hermes`、`kimi_cli`、`mcode`、`copilot_cli`、`opencode_cli`、`omp`、`cursor_cli`。初始会话始终以 `cao launch --provider` 参数为准。详见 [`examples/cross-provider/`](examples/cross-provider/)。
 
 ### Tool Restrictions
 
@@ -400,7 +401,7 @@ cao skills add ./my-coding-standards --force   # 覆盖
 cao skills remove my-coding-standards
 ```
 
-Skills 会自动投递给 provider（Kiro CLI 使用原生 `skill://` resources；Claude Code / Codex / Kimi 使用运行时 prompt injection；Copilot 则烘焙进 `.agent.md`）。
+Skills 会自动投递给 provider（Kiro CLI 使用原生 `skill://` resources；Claude Code / Codex / Kimi / MiniMax Code 使用运行时 prompt injection；Copilot 则烘焙进 `.agent.md`）。
 
 完整参考，包括 authoring、loading 和 delivery mechanics，请查看 [docs/skills.md](docs/skills.md)。与 OpenClaw 或其他外部工具集成，请参考 [docs/external-tool-integration.md](docs/external-tool-integration.md)。
 

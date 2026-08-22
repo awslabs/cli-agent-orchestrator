@@ -320,3 +320,11 @@ class TestGrokCliSendMessage:
     def test_send_message_to_inbox(self, require_grok):
         """Deliver an inbox message to an idle Grok terminal and process it."""
         _run_send_message_test(provider="grok_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeSendMessage:
+    """E2E inbox delivery test for MiniMax Code."""
+
+    def test_send_message_to_inbox(self, require_minimax_code):
+        _run_send_message_test(provider="mcode", agent_profile="developer")

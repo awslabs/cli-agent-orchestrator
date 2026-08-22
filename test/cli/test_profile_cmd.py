@@ -145,6 +145,10 @@ class TestValidateFrontmatter:
         meta = {"name": "x", "allowedTools": ["execute_bash", "@cao-mcp-server"]}
         assert _validate_frontmatter(meta) == []
 
+    def test_claude_config_accepted(self):
+        meta = {"name": "x", "claudeConfig": {"effort": "high"}}
+        assert _validate_frontmatter(meta) == []
+
 
 class TestAgentsListCommand:
     """Tests for cao agents list."""

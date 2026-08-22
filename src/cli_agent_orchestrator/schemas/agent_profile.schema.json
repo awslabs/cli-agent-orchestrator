@@ -93,6 +93,9 @@
     "codexConfig": {
       "type": "object"
     },
+    "claudeConfig": {
+      "type": "object"
+    },
     "hermesProfile": {
       "type": "string",
       "minLength": 1

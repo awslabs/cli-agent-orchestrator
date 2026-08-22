@@ -123,7 +123,7 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 11
+        assert len(data) == 12
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
@@ -136,6 +136,7 @@ class TestAgentProviders:
         assert "antigravity_cli" in names
         assert "omp" in names
         assert "grok_cli" in names
+        assert "mcode" in names
         for p in data:
             assert p["installed"] is True
 
@@ -168,6 +169,7 @@ class TestAgentProviders:
         assert providers_dict["copilot_cli"]["installed"] is False
         assert providers_dict["opencode_cli"]["installed"] is False
         assert providers_dict["grok_cli"]["installed"] is False
+        assert providers_dict["mcode"]["installed"] is False
 
     def test_list_providers_has_binary_field(self, client):
         """Each provider entry has correct binary name."""
@@ -185,6 +187,7 @@ class TestAgentProviders:
         assert providers_dict["antigravity_cli"]["binary"] == "agy"
         assert providers_dict["omp"]["binary"] == "omp"
         assert providers_dict["grok_cli"]["binary"] == "grok"
+        assert providers_dict["mcode"]["binary"] == "mcode"
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────
@@ -1108,6 +1111,26 @@ class TestGetTerminalOutput:
 
         assert response.status_code == 500
         assert "Failed to get output" in response.json()["detail"]
+
+    def test_get_output_last_mode_extraction_failure_is_500(self, client):
+        """A missing response marker is a 500, not a 404 (issue #570).
+
+        mode=last takes the pinned-depth retry path that re-raises as
+        OutputExtractionError; it subclasses ValueError, so without an arm
+        ordered before the ValueError catch below it collapsed back into this
+        route's 404. Same boundary mapping as POST /terminals/run-step.
+        """
+        from cli_agent_orchestrator.providers.base import OutputExtractionError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.side_effect = OutputExtractionError(
+                "No completion marker found after last user message"
+            )
+
+            response = client.get("/terminals/abcd1234/output?mode=last")
+
+        assert response.status_code == 500
+        assert "No completion marker" in response.json()["detail"]
 
 
 class TestDeleteTerminal:

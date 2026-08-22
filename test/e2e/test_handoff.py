@@ -463,3 +463,22 @@ class TestGrokCliHandoff:
     def test_handoff_second_task(self, require_grok):
         """Grok returns the second independent response from the same TUI session."""
         _run_second_task_same_terminal_test(provider="grok_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeHandoff:
+    """E2E lifecycle tests for the MiniMax Code provider."""
+
+    def test_handoff_simple_function(self, require_minimax_code):
+        _run_handoff_test(
+            provider="mcode",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_minimax_code):
+        _run_second_task_same_terminal_test(provider="mcode", agent_profile="developer")

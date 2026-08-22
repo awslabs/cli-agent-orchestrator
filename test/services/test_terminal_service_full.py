@@ -9,6 +9,7 @@ import pytest
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
     TerminalInputBlockedError,
@@ -1697,6 +1698,58 @@ class TestGetOutput:
         mock_pm.get_provider.return_value = None
 
         with pytest.raises(ValueError, match="Provider not found"):
+            get_output("test1234", OutputMode.LAST)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_pinned_depth_extraction_failure_raises_output_extraction_error(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_pm
+    ):
+        """A missing response marker is not a bad reference (issue #570).
+
+        Providers that pin ``extraction_tail_lines`` (opencode_cli, kiro_cli)
+        take the retry path, which re-raises once the attempts are spent. That
+        must surface as OutputExtractionError so the API boundary can tell it
+        apart from an unknown-terminal ValueError and stop returning 404.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "full output"
+        mock_provider = MagicMock()
+        mock_provider.extraction_tail_lines = 200
+        mock_provider.extraction_retries = 0
+        mock_provider.extract_last_message_from_script.side_effect = ValueError(
+            "No completion marker found after last user message"
+        )
+        mock_pm.get_provider.return_value = mock_provider
+
+        with pytest.raises(OutputExtractionError, match="No completion marker"):
+            get_output("test1234", OutputMode.LAST)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_extraction_error_is_still_a_value_error(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_pm
+    ):
+        """Callers that catch ValueError keep working (issue #570)."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "full output"
+        mock_provider = MagicMock()
+        mock_provider.extraction_tail_lines = 200
+        mock_provider.extraction_retries = 0
+        mock_provider.extract_last_message_from_script.side_effect = ValueError("no marker")
+        mock_pm.get_provider.return_value = mock_provider
+
+        with pytest.raises(ValueError):
             get_output("test1234", OutputMode.LAST)
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")

@@ -911,3 +911,14 @@ class TestGrokCliSupervisorOrchestration:
     def test_supervisor_assign_three_analysts(self, require_grok):
         """Grok runs the maintainer-required three-analyst workflow."""
         _run_supervisor_assign_three_analysts_test(provider="grok_cli")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeSupervisorOrchestration:
+    """E2E MCP orchestration tests for MiniMax Code."""
+
+    def test_supervisor_handoff(self, require_minimax_code):
+        _run_supervisor_handoff_test(provider="mcode")
+
+    def test_supervisor_assign_and_handoff(self, require_minimax_code):
+        _run_supervisor_assign_test(provider="mcode")

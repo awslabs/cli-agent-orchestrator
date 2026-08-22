@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- MiniMax Code (`mcode`) provider with per-terminal authentication and profile
+  isolation, model and MCP configuration, multi-turn TUI orchestration,
+  supervisor/worker E2E coverage, and provider documentation (#624)
 - Oh My Pi (`omp`) provider with additive native configuration, profile MCP extension wiring, lifecycle detection, and supervisor/worker orchestration support (#559)
 - Add the official xAI Grok Build CLI as the `grok_cli` provider, including
   isolated per-terminal MCP configuration, native hard tool restrictions,
@@ -850,4 +853,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
