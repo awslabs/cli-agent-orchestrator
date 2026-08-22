@@ -1706,12 +1706,18 @@ def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
     migration. The ``workflow_run_step`` column set is unchanged after a failed run's
     result is assembled (the envelope never writes a column).
 
-    The expected set below gained ``terminal_id``/``reprompted``/``error_kind`` at the
-    #504 merge: those three are #504's U1 additive columns, created by
-    ``_migrate_workflow_run_step`` at init_db time — NOT by envelope assembly. The
-    assertion still carries its full force, because what it guards is that assembling
-    an envelope adds no column: the set is captured AFTER the result call and must
-    equal the migrated schema exactly, so an envelope-driven write would still fail it.
+    The expected set below gained ``terminal_id``/``reprompted``/``error_kind`` from
+    #504's U1 additive columns and ``result_json`` from #583's ``result-envelope`` —
+    all four created by ``_migrate_workflow_run_step`` at init_db time, NOT by envelope
+    assembly. The assertion still carries its full force, because what it guards is
+    that assembling an envelope adds no column: the set is captured AFTER the result
+    call and must equal the migrated schema exactly, so an envelope-driven write would
+    still fail it.
+
+    NB the FAILURE envelope of U9 (a presentation projection, no column) is a different
+    thing from the #583 step RESULT envelope, which is persisted and did add exactly one
+    column, ``result_json``. This test's teeth are unchanged — assembling the U9 failure
+    envelope must still add nothing of its own.
     """
     _seed_run(
         "nocol",
@@ -1738,6 +1744,7 @@ def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
         "terminal_id",
         "reprompted",
         "error_kind",
+        "result_json",  # issue #583, result-envelope (BR-7) — not U9's
     }
 
 

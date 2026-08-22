@@ -1,0 +1,15 @@
+Use the shell to run exactly: echo APPROVAL_TEST. Then reply exactly APPROVAL_TEST.
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ $ echo APPROVAL_TEST                                                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+⠴ Running approval command ⟨esc⟩
+
+Allow tool: bash
+Command: echo APPROVAL_TEST
+
+❯ Approve
+  Deny
+
+up/down navigate  enter select  esc cancel

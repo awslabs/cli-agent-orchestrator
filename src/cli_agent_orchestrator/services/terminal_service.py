@@ -69,6 +69,7 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroPhase0KASError,
@@ -185,6 +186,9 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.OMP.value,
+    ProviderType.GROK_CLI.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native
@@ -193,6 +197,8 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.OMP.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 
@@ -474,7 +480,7 @@ async def create_terminal(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
                 f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
                 f"requests {allowed_tools}. Treat this worker as unrestricted; for "
-                f"enforced restrictions use claude_code, kiro_cli, or "
+                f"enforced restrictions use claude_code, grok_cli, kiro_cli, or "
                 f"copilot_cli."
             )
 
@@ -635,22 +641,11 @@ async def create_terminal(
                 status_monitor.clear_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        try:
-            if terminal_id is not None:
-                provider_manager.cleanup_provider(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
         # Roll back the DB terminal row so a failed create does not leave an
         # orphan record: the stale row would still be listed for the session
         # and report UNKNOWN status even though nothing is running. Idempotent
         # (DELETE ... WHERE id = ?), so it is a no-op when the failure happened
         # before the row was written. Runs regardless of session_created so a
-        # pre-existing session keeps its live terminals but loses the dead row.
-        try:
-            if terminal_id is not None:
-                db_delete_terminal(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
                 get_backend().kill_session(session_name)
@@ -678,7 +673,35 @@ async def create_terminal(
                 get_backend().kill_window(session_name, window_name)
             except Exception:
                 pass  # Ignore cleanup errors
-        if worktree_repo_root is not None:
+        # The process-owning tmux session/window must be stopped before a
+        # provider releases private on-disk state.  In particular Grok can
+        # have an updater still writing $GROK_HOME while its initialization
+        # fails; its cleanup verifies that no such process remains.
+        cleanup_complete = True
+        try:
+            if terminal_id is not None:
+                cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
+        except Exception:
+            # Preserve the existing rollback contract for an unexpected
+            # provider-manager failure. Only an explicit False is a Grok
+            # cleanup deferral with enough information to retry safely.
+            cleanup_complete = True
+        # Do not erase the only retry handle before Grok has safely released
+        # its private home.  The original create error is still raised below;
+        # retaining this row makes the failed terminal discoverable and its
+        # deletion retryable rather than leaking credentials/config forever.
+        if cleanup_complete:
+            try:
+                if terminal_id is not None:
+                    db_delete_terminal(terminal_id)
+            except Exception:
+                pass  # Ignore cleanup errors
+        elif terminal_id is not None:
+            logger.warning(
+                "Create rollback deferred Grok cleanup for %s; retaining terminal metadata for retry",
+                terminal_id,
+            )
+        if worktree_repo_root is not None and terminal_id is not None:
             # A worktree WAS created (Step 1b succeeded) before some later step
             # failed -- roll it back too, same best-effort posture as everything
             # else in this block. Without this, a provider-init timeout (or any
@@ -1302,7 +1325,10 @@ def send_input(
         # IDLE/COMPLETED). Without this, sticky ready-status would block
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
-        status_monitor.notify_input_sent(terminal_id)
+        if provider and provider.assume_processing_on_dispatch is True:
+            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+        else:
+            status_monitor.notify_input_sent(terminal_id)
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED
@@ -1316,7 +1342,19 @@ def send_input(
         # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
         # arm set by notify_input_sent above; reset_buffer would wipe the arm and
         # latch-block the IDLE→PROCESSING transition for the whole turn.
-        status_monitor.clear_rolling_buffer(terminal_id)
+        # Give stateful providers the same explicit generation boundary as the
+        # rolling byte buffer.  Grok uses this to distinguish a new,
+        # byte-identical completion from a retained completion screen.
+        status_monitor.clear_rolling_buffer(terminal_id, provider)
+
+        # Mark the provider before send_keys rather than after it.  send_keys
+        # includes the provider-specific submit delay, during which a fast CLI
+        # can already emit its first processing and completion frames.  Those
+        # frames must be parsed as belonging to this turn, not as a stale
+        # post-clear redraw.  StatusMonitor has already armed and cleared the
+        # same dispatch boundary above.
+        if provider:
+            provider.mark_input_received()
 
         get_backend().send_keys(
             metadata["tmux_session"],
@@ -1326,13 +1364,6 @@ def send_input(
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
-
-        # Notify the provider that external input was received.
-        # This allows providers to adjust status
-        # detection — specifically to stop reporting IDLE for the post-init
-        # state and resume normal COMPLETED detection after a real task.
-        if provider:
-            provider.mark_input_received()
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
@@ -1515,7 +1546,11 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                             terminal_id,
                             exc,
                         )
-                raise last_err  # type: ignore[misc]
+                # Re-raise as the narrower type: the terminal and provider both
+                # resolved, so this is a missing response marker, not a bad
+                # reference. Keeps the API boundary from reporting it as 404
+                # (issue #570).
+                raise OutputExtractionError(str(last_err)) from last_err
 
             # Escalating fetch: try progressively larger capture windows until
             # the response marker is found or we hit the cap.
@@ -1793,8 +1828,15 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 if worktree_terminal_id == terminal_id:
                     worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
-        # Cleanup provider state and database record
-        provider_manager.cleanup_provider(terminal_id)
+        # Grok cleanup can be deferred when a private-home owner cannot yet be
+        # inspected/stopped.  Keep both the provider mapping and DB metadata so
+        # a subsequent DELETE can retry; reporting success here would turn a
+        # temporary process race into a permanent private-home leak.
+        if provider_manager.cleanup_provider(terminal_id) is False:
+            logger.warning(
+                "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
+            )
+            return False
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
         # Drop any per-curator dispatch lock so the registry doesn't grow

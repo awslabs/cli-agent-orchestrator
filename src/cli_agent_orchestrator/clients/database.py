@@ -790,6 +790,30 @@ def _migrate_workflow_run_step() -> None:
     ``error_kind`` (structured error kind). All default to ``NULL`` so a
     pre-U1 row reads back observably identical to its pre-extension form
     (additive-only, C-1/C-4). ``workflow_run`` itself is untouched.
+
+    ``result-envelope`` (issue #583, BR-7) then additively appends ONE column,
+    ``result_json``, through the same gate — the serialised ``StepResultEnvelope``
+    that replay returns (FR-1). ``DEFAULT NULL`` means every pre-#583 row reads as
+    "envelope absent" (BR-10), which is safe rather than a gap: such a row's
+    fingerprint is legacy-scheme or NULL, so FR-6 already keeps it off the replay
+    path and the two guards agree instead of disagreeing.
+
+    Because the failure is silent, the column's existence is VERIFIED rather than
+    assumed (BR-8): see ``test/services/test_step_result.py`` for the
+    ``PRAGMA table_info`` assertion on a fresh database. A silent failure would
+    otherwise surface far away as every settle losing its envelope, which the
+    replay gate would read as crash-window rows and halt on.
+
+    MERGE NOTE (2026-08-17, #583 x #504). #583's original rationale for adding ONE
+    column rather than three read: "three statements would triple the chance of a
+    partial, silent migration", because this body is wrapped in
+    ``except Exception`` -> ``logger.debug``. **That argument is overtaken by the
+    merge** — #504 independently added three columns to the same silently-failing
+    block, so the combined body now issues FOUR guarded ``ALTER`` statements, not
+    one. The risk #583 minimised is materially larger than either change assumed
+    alone. #583's mitigation (assert the column exists on a fresh database) is
+    therefore MORE load-bearing after this merge, and #504's three columns have no
+    equivalent assertion. Flagged rather than silently reconciled.
     """
     import sqlite3
 
@@ -830,6 +854,11 @@ def _migrate_workflow_run_step() -> None:
                     "ALTER TABLE workflow_run_step ADD COLUMN error_kind TEXT DEFAULT NULL"
                 )
                 logger.info("Migration: added error_kind column to workflow_run_step")
+            if "result_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN result_json TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added result_json column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
 

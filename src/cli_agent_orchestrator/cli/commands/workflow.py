@@ -214,6 +214,47 @@ def _parse_inputs(pairs):
     return inputs
 
 
+# The decisions ``cao workflow resume --decide`` accepts (issue #583, FR-7, BR-10).
+# Mirrors ``RecoveryDecision``'s members WITHOUT importing the model, exactly as
+# ``_TERMINAL_RUN_STATES`` above mirrors ``RunState`` — C-2 keeps this a thin HTTP
+# client. ``test_recovery_decision_intake.py`` pins this tuple against the enum, so a
+# rename or a third member fails loudly instead of leaving the CLI rejecting a value
+# the server accepts (or worse, accepting one the server rejects).
+_RECOVERY_DECISIONS = ("rerun", "skip")
+
+
+def _parse_decisions(pairs):
+    """Parse ``--decide <step_id>=<rerun|skip>`` pairs into a decisions dict (FR-7).
+
+    Rejected locally rather than round-tripped, so a typo costs no request and the
+    operator is told the accepted values. The server re-validates and remains the
+    authority — this check exists to agree with it, never to replace it (BR-10).
+
+    A REPEATED ``step_id`` is an error rather than last-wins: two decisions for one
+    step is an operator mistake, and silently dropping one would apply a permission
+    the operator did not think they were granting.
+    """
+    decisions = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise click.ClickException(f"--decide must be <step_id>=<decision> (got '{pair}')")
+        step_id, _, raw = pair.partition("=")
+        step_id = step_id.strip()
+        value = raw.strip()
+        if not step_id:
+            raise click.ClickException(f"--decide step id is empty (got '{pair}')")
+        if value not in _RECOVERY_DECISIONS:
+            accepted = " | ".join(_RECOVERY_DECISIONS)
+            raise click.ClickException(
+                f"--decide {step_id}: '{value[:40]}' is not a recovery decision "
+                f"(accepted: {accepted})"
+            )
+        if step_id in decisions:
+            raise click.ClickException(f"--decide names step '{step_id}' more than once")
+        decisions[step_id] = value
+    return decisions
+
+
 def _coerce(raw):
     """Coerce a raw ``--input`` value string to bool / int / str."""
     low = raw.strip().lower()
@@ -642,19 +683,43 @@ def result_cmd(run_id, as_json):
 
 @workflow.command(name="resume")
 @click.argument("run_id")
+@click.option(
+    "--decide",
+    "decide",
+    multiple=True,
+    metavar="STEP_ID=DECISION",
+    help=(
+        "Resolve a halted step: --decide <step_id>=rerun|skip. 'rerun' authorises "
+        "re-executing it; 'skip' authorises using its stored result. Repeatable."
+    ),
+)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
-def resume_cmd(run_id, as_json):
+def resume_cmd(run_id, decide, as_json):
     """Resume a crashed/failed run from its durable journal (blocks until done).
 
-    Skips already-completed steps and re-runs the rest. Exit codes:
+    A script-tier resume RE-EXECUTES THE SCRIPT TOP-TO-BOTTOM; completed steps are
+    NOT skipped. Each step is decided as it arrives and is either REPLAYED (its
+    stored result is returned and nothing runs), EXECUTED (it runs again), or HALTED
+    (CAO will not decide alone, so the run stops there and waits for a --decide).
+    A step whose script changed at the same key DIVERGES and fails the run instead.
+
+    Exit codes:
       0  run reached COMPLETED
       1  run reached FAILED / CANCELLED, or the request errored
+
+    ``--decide`` carries a decision for a step the run halted on (issue #583, FR-7).
+    Each decision authorises exactly ONE attempt: if that attempt crashes before it
+    settles, the next resume asks again rather than re-executing on old consent.
     """
+    decisions = _parse_decisions(decide)
     try:
         # Resume re-drives the run inline (the server awaits it), so use the
         # worst-case-covering run timeout, not the flat MCP_REQUEST_TIMEOUT.
+        # ``json=None`` sends NO body, so a decision-free resume is byte-identical to
+        # the pre-#583 request.
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
+            json={"decisions": decisions} if decisions else None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
     except requests.exceptions.RequestException as e:

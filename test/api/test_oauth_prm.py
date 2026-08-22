@@ -81,7 +81,7 @@ def test_mutation_accepts_valid_token_when_enabled(client, monkeypatch) -> None:
     monkeypatch.setattr(auth, "extract_scopes_from_token", lambda t: ["cao:admin"])
     with patch(
         "cli_agent_orchestrator.api.main.session_service.delete_session",
-        return_value={"deleted": True},
+        return_value={"deleted": ["cao-x"], "errors": []},
     ):
         response = client.delete("/sessions/cao-x", headers={"Authorization": "Bearer good-token"})
     assert response.status_code == 200

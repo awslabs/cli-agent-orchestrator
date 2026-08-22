@@ -30,9 +30,11 @@ Install:
   [Kiro CLI](docs/kiro-cli.md), [Claude Code](docs/claude-code.md),
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
+  [MiniMax Code](docs/minimax-code.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
-  [OpenCode CLI](docs/opencode-cli.md), or
-  [Cursor CLI](docs/cursor-cli.md)
+  [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),
+  [Cursor CLI](docs/cursor-cli.md), or
+  [Grok Build CLI](docs/grok-cli.md)
 
 The focused provider guides contain installation, authentication, and
 provider-specific behavior.
@@ -131,9 +133,11 @@ provider override while keeping the same sequence.
   [Kiro CLI](docs/kiro-cli.md), [Claude Code](docs/claude-code.md),
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
+  [MiniMax Code](docs/minimax-code.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
-  [OpenCode CLI](docs/opencode-cli.md), and
-  [Cursor CLI](docs/cursor-cli.md).
+  [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),
+  [Cursor CLI](docs/cursor-cli.md), and
+  [Grok Build CLI](docs/grok-cli.md).
 - [Security policy](SECURITY.md): vulnerability reporting and deployment
   guidance.
 

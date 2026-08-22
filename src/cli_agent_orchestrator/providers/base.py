@@ -33,6 +33,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class OutputExtractionError(ValueError):
+    """A provider ran but no usable message could be extracted from its output.
+
+    Distinct from the ``ValueError``s that name a bad terminal or provider
+    reference, which are genuine lookup failures. This one means the terminal
+    exists and the step ran; only the response marker was missing from the
+    scrollback.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
+    working; the API boundary catches this narrower type first so an extraction
+    failure is not reported as 404 Not Found (issue #570).
+    """
+
+
 class BaseProvider(ABC):
     """Abstract base class for CLI tool providers.
 
@@ -237,6 +251,17 @@ class BaseProvider(ABC):
         return False
 
     @property
+    def assume_processing_on_dispatch(self) -> bool:
+        """Publish PROCESSING immediately when a task is dispatched.
+
+        Most CLIs repaint quickly enough for their first activity frame to
+        drive the transition. Full-screen TUIs that can remain visually
+        unchanged just after submission opt in so callers cannot observe the
+        previous turn's cached COMPLETED state as the new turn's result.
+        """
+        return False
+
+    @property
     def extraction_retries(self) -> int:
         """Number of extraction retries for transient TUI rendering issues.
 
@@ -269,8 +294,13 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    def cleanup(self) -> None:
-        """Clean up provider resources."""
+    def cleanup(self) -> bool | None:
+        """Clean up provider resources.
+
+        Providers may return ``False`` when cleanup is intentionally deferred
+        and lifecycle metadata must be retained for a retry. Existing providers
+        that return ``None`` are treated as successfully cleaned up.
+        """
         pass
 
     def mark_input_received(self) -> None:
@@ -290,6 +320,26 @@ class BaseProvider(ABC):
         self._last_dispatch_time = time.time()
         self._done_first_detected = 0.0
         self._idle_first_detected = 0.0
+
+    def notify_status_buffer_reset(self, epoch: int) -> None:
+        """Notify the provider that StatusMonitor started a fresh byte buffer.
+
+        ``StatusMonitor.clear_rolling_buffer()`` is used immediately before a
+        new prompt is pasted.  Providers that carry state across observations
+        (for example a completion fingerprint plus a monotonic stream offset)
+        must not infer continuity through that explicit boundary.  The monitor
+        supplies a monotonically increasing per-terminal ``epoch`` so a
+        provider can retain stale-screen protections while recognising output
+        from the newly-dispatched turn.
+
+        Implementations must be synchronous, cheap, and must not call back
+        into ``StatusMonitor``: the notification is delivered while its lock is
+        held to make the clear and reset atomic relative to output processing.
+        """
+
+        # Most providers only inspect their current rolling buffer and have no
+        # cross-observation state, so the default is intentionally a no-op.
+        del epoch
 
     def _resolve_native_status(self, buffer: Optional[str] = None) -> Optional[TerminalStatus]:
         """Resolve status from the backend's native agent state, if available.

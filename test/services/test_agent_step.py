@@ -514,18 +514,24 @@ class TestTeardownIsBestEffort:
         # Exit failed but delete still ran.
         m_delete.assert_called_once_with("abc12345", registry=None)
 
-    def test_on_terminal_created_callback_failure_does_not_fail_step(self):
-        """F9(b): a raising ``on_terminal_created`` callback (BR-31 sweep
-        bookkeeping) must never propagate into ``run_agent_step`` — it is
-        best-effort, logged and swallowed, and the step still completes."""
+    def test_on_step_terminal_ready_callback_failure_does_not_fail_step(self):
+        """F9(b): a raising ``on_step_terminal_ready`` callback (BR-31 sweep
+        bookkeeping + issue #583's durable RUNNING row) must never propagate into
+        ``run_agent_step`` — it is best-effort, logged and swallowed, and the step
+        still completes.
+
+        Renamed from ``on_terminal_created`` by issue #583's ``settlement-rewire``:
+        the hook now fires on the terminal-REUSE path too, which made the old name
+        false, and it now carries a second argument (the call fingerprint).
+        """
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
 
-        def _boom_callback(terminal_id):
+        def _boom_callback(terminal_id, call_fingerprint):
             raise RuntimeError("sweep bookkeeping boom")
 
         with create, send, delete, get_output, exit_cli, wait, status:
             result = asyncio.run(
-                run_agent_step("kiro_cli", "dev", "x", on_terminal_created=_boom_callback)
+                run_agent_step("kiro_cli", "dev", "x", on_step_terminal_ready=_boom_callback)
             )
         assert result.status == TerminalStatus.COMPLETED
         assert result.last_message == "the answer"

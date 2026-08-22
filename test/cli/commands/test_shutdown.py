@@ -130,6 +130,33 @@ class TestShutdownCommand:
         assert "Failed to connect to cao-server" in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
+    def test_shutdown_session_deferred_cleanup_is_failure(self, mock_delete, runner):
+        """HTTP 409 or success:false must not be reported as shutdown complete."""
+        mock_delete.return_value = MagicMock(status_code=409)
+
+        result = runner.invoke(shutdown, ["--session", "cao-test"])
+
+        assert result.exit_code != 0
+        assert "cleanup is pending" in result.output
+        assert "Shutdown session" not in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
+    def test_shutdown_session_payload_errors_are_failure(self, mock_delete, runner):
+        mock_delete.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "success": True,
+                "deleted": [],
+                "errors": [{"terminal_id": "t1", "error": "cleanup deferred"}],
+            },
+        )
+
+        result = runner.invoke(shutdown, ["--session", "cao-test"])
+
+        assert result.exit_code != 0
+        assert "cleanup is pending" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
     def test_shutdown_session_http_error(self, mock_delete, runner):
         """Test delete returns 500 — raises ClickException."""
         mock_response = MagicMock(status_code=500)

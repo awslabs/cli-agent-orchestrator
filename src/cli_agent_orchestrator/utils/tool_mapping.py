@@ -51,6 +51,25 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
     },
+    # Official xAI Grok Build CLI permission-rule prefixes. These rules work
+    # in the interactive TUI and remain enforced under --always-approve.
+    # Grok-native subagents are disabled separately with --no-subagents.
+    "grok_cli": {
+        "execute_bash": ["Bash"],
+        "fs_read": ["Read", "NotebookRead"],
+        "fs_write": ["Edit", "Write", "NotebookEdit"],
+        "fs_list": ["Grep", "Glob"],
+        "fs_*": [
+            "Read",
+            "NotebookRead",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Grep",
+            "Glob",
+        ],
+        "web_fetch": ["WebFetch", "WebSearch"],
+    },
     # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
     # (write_file/read_file/run_shell_command/...). Restrictions are enforced
     # softly via the injected security prompt (see SOFT_ENFORCEMENT_PROVIDERS).
@@ -178,6 +197,27 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
     all_tools = ALL_NATIVE_TOOLS.get(provider, set())
     disallowed = sorted(all_tools - allowed_native)
     return disallowed
+
+
+def get_allowed_tools(provider: str, allowed: List[str]) -> List[str]:
+    """Return native tools explicitly granted by a CAO allowlist.
+
+    Unlike :func:`get_disallowed_tools`, this is used where a provider has a
+    deny-by-default permission mode and must receive affirmative native rules
+    for every CAO capability it is allowed to use.
+    """
+    if "*" in allowed:
+        return sorted(ALL_NATIVE_TOOLS.get(provider, set()))
+
+    mapping = TOOL_MAPPING.get(provider)
+    if not mapping:
+        return []
+
+    allowed_native: Set[str] = set()
+    for cao_tool in allowed:
+        if cao_tool in mapping:
+            allowed_native.update(mapping[cao_tool])
+    return sorted(allowed_native)
 
 
 def format_tool_summary(allowed: List[str]) -> str:

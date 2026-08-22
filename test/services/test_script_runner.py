@@ -48,7 +48,6 @@ from cli_agent_orchestrator.services.script_runner import (
     _bump,
     _RingBuffer,
     _scan_sentinel,
-    _step_call_fingerprint,
     build_env,
     cancel_script_run,
     make_step_terminal_recorder,
@@ -878,7 +877,7 @@ def test_terminal_recorder_records_into_step_states():
         {"CAO_WORKFLOW_RUN_ID": "run-rec", "CAO_WORKFLOW_STEP_ID": "s1"}
     )
     assert recorder is not None
-    recorder("term-created")
+    recorder("term-created", "v2:" + "0" * 64)
     assert record.step_states["s1"].terminal_id == "term-created"
     assert record.step_states["s1"].state == StepState.RUNNING
 
@@ -897,7 +896,7 @@ def test_terminal_recorder_updates_already_present_step_state():
         {"CAO_WORKFLOW_RUN_ID": "run-rec2", "CAO_WORKFLOW_STEP_ID": "s1"}
     )
     assert recorder is not None
-    recorder("term-new")
+    recorder("term-new", "v2:" + "0" * 64)
     assert record.step_states["s1"].terminal_id == "term-new"
     assert record.step_states["s1"].attempts == 2  # untouched, only terminal_id updates
 
@@ -946,26 +945,21 @@ def _kw(run_id: str, step_id: str) -> dict:
     return {"CAO_WORKFLOW_RUN_ID": run_id, "CAO_WORKFLOW_STEP_ID": step_id}
 
 
-def test_step_call_fingerprint_stable_and_field_separated():
-    """The fingerprint is deterministic and its fields cannot collide across the
-    boundary (``a|b`` must differ from ``ab|``)."""
-    fp1 = _step_call_fingerprint("kiro_cli", "dev", "go")
-    fp2 = _step_call_fingerprint("kiro_cli", "dev", "go")
-    assert fp1 == fp2 and len(fp1) == 64  # sha256 hexdigest
-    # A field-boundary shift must change the digest (NUL separation).
-    assert _step_call_fingerprint("a", "b", "c") != _step_call_fingerprint("ab", "", "c")
+# ``test_step_call_fingerprint_stable_and_field_separated`` lived here until issue #583's
+# ``step-fingerprint`` unit DELETED ``_step_call_fingerprint`` (BR-10/INV-7: two fingerprint
+# functions in one codebase is the defect FR-2 exists to prevent). Its two properties —
+# determinism and NUL field-boundary separation — are now asserted against the replacement in
+# ``test_step_fingerprint.py::TestReturnedForm``, and the journal round-trip it pinned is
+# preserved below in ``test_completion_transitions_running_to_completed``.
 
 
 def test_completion_guard_none_without_script_record():
     """Same BR-31 guard as the recorder: no run/step env or no live script
     record -> None (YAML/handoff callers untouched)."""
-    assert record_step_completion(None, provider="p", agent="a", prompt="x") is None
-    assert (
-        record_step_completion({"CAO_WORKFLOW_RUN_ID": "x"}, provider="p", agent="a", prompt="x")
-        is None
-    )
+    assert record_step_completion(None) is None
+    assert record_step_completion({"CAO_WORKFLOW_RUN_ID": "x"}) is None
     # run/step present but no record in the registry.
-    assert record_step_completion(_kw("ghost", "s1"), provider="p", agent="a", prompt="x") is None
+    assert record_step_completion(_kw("ghost", "s1")) is None
 
 
 def test_completion_transitions_running_to_completed(_patched_journal):
@@ -979,24 +973,27 @@ def test_completion_transitions_running_to_completed(_patched_journal):
     )
     workflow_service.run_registry["run-c"] = record
 
-    settle = record_step_completion(
-        _kw("run-c", "s1"), provider="kiro_cli", agent="dev", prompt="go"
-    )
+    settle = record_step_completion(_kw("run-c", "s1"))
     assert settle is not None
-    settle("term-1", None)
+    settle("term-1", None, "the answer")
 
     st = record.step_states["s1"]
     assert st.state == StepState.COMPLETED
     assert st.attempts == 1
     assert st.error is None
-    # The completed step is written through to the journal with a stable
-    # fingerprint AND its attempts persisted (so a resume's lookup_replay /
-    # rebuild sees the real state, not append_step's hardcoded attempts=0).
+    # The completed step is written through to the journal with its attempts
+    # persisted (so a resume's lookup_replay / rebuild sees the real state).
     row = workflow_journal.get_step("run-c", "s1")
     assert row is not None
     assert row.state == "completed"
     assert row.attempts == 1
-    assert row.call_fingerprint == _step_call_fingerprint("kiro_cli", "dev", "go")
+    # Issue #583's ``settlement-rewire``: one ``settle_step`` write, which carries the result
+    # envelope and NEVER the fingerprint (unit 6 BR-9 — ``begin_step`` owns that column). This
+    # test drives the settle callback directly with no preceding ``begin_step``, so the row is
+    # the documented no-begin RESCUE: settled, with absent provenance.
+    assert row.call_fingerprint is None
+    assert row.result_json is not None
+    assert json.loads(row.result_json)["last_message"] == "the answer"
 
 
 def test_completion_adopts_validated_structured_output(_patched_journal):
@@ -1011,8 +1008,8 @@ def test_completion_adopts_validated_structured_output(_patched_journal):
     # Worker emitted a valid output (no schema -> validated=True).
     record_step_output("run-out", "s1", {"answer": 42})
 
-    settle = record_step_completion(_kw("run-out", "s1"), provider="p", agent="a", prompt="go")
-    settle("term-1", None)
+    settle = record_step_completion(_kw("run-out", "s1"))
+    settle("term-1", None, "done")
 
     st = record.step_states["s1"]
     assert st.state == StepState.COMPLETED
@@ -1041,8 +1038,8 @@ def test_completion_unvalidated_output_settles_completed_unvalidated(_patched_jo
         {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]},
     )
 
-    settle = record_step_completion(_kw("run-inv", "s1"), provider="p", agent="a", prompt="go")
-    settle("term-1", None)
+    settle = record_step_completion(_kw("run-inv", "s1"))
+    settle("term-1", None, "done")
 
     st = record.step_states["s1"]
     assert st.state == StepState.COMPLETED_UNVALIDATED
@@ -1058,8 +1055,8 @@ def test_completion_error_transitions_running_to_failed(_patched_journal):
     record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
     workflow_service.run_registry["run-f"] = record
 
-    settle = record_step_completion(_kw("run-f", "s1"), provider="p", agent="a", prompt="go")
-    settle("term-1", "terminal term-1 reached ERROR status")
+    settle = record_step_completion(_kw("run-f", "s1"))
+    settle("term-1", "terminal term-1 reached ERROR status", None)
 
     st = record.step_states["s1"]
     assert st.state == StepState.FAILED
@@ -1079,8 +1076,8 @@ def test_completion_creates_step_state_when_missing(_patched_journal):
     record = _make_record("run-m", process=None, generation="1")  # empty step_states
     workflow_service.run_registry["run-m"] = record
 
-    settle = record_step_completion(_kw("run-m", "s1"), provider="p", agent="a", prompt="go")
-    settle(None, None)
+    settle = record_step_completion(_kw("run-m", "s1"))
+    settle(None, None, "done")
 
     assert "s1" in record.step_states
     assert record.step_states["s1"].state == StepState.COMPLETED
@@ -1099,10 +1096,10 @@ def test_completion_journal_failure_never_raises(monkeypatch, _patched_journal):
     def _boom(*a, **k):
         raise RuntimeError("db gone")
 
-    monkeypatch.setattr(workflow_journal, "append_step", _boom)
+    monkeypatch.setattr(workflow_journal, "settle_step", _boom)
 
-    settle = record_step_completion(_kw("run-j", "s1"), provider="p", agent="a", prompt="go")
-    settle("term-1", None)  # must not raise
+    settle = record_step_completion(_kw("run-j", "s1"))
+    settle("term-1", None, "done")  # must not raise
     # In-memory transition still applied despite the journal write failing.
     assert record.step_states["s1"].state == StepState.COMPLETED
 

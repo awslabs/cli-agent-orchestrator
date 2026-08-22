@@ -33,6 +33,7 @@ from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.terminal import wait_until_status
 
@@ -240,6 +241,76 @@ async def _wait_for_completion(
             await asyncio.sleep(_COMPLETION_POLL_INTERVAL)
 
 
+async def resolve_effective_working_directory(
+    working_directory: Optional[str],
+    caller_id: Optional[str],
+) -> Optional[str]:
+    """Resolve the directory a freshly created terminal will ACTUALLY run in.
+
+    Extracted verbatim from ``run_agent_step``'s create path (issue #583, unit
+    ``run-step-replay-branch`` BR-10/TD-1) because two callers now need the same
+    answer and there must be exactly ONE computation of it:
+
+    * ``run_agent_step`` itself, which forwards the result to
+      ``terminal_service.create_terminal`` and hashes it as
+      ``StepCallFields.effective_working_directory``;
+    * the ``POST /terminals/run-step`` route, which must compute a script step's
+      call fingerprint BEFORE it decides whether to execute at all — and
+      ``step-fingerprint``'s BR-5 permits only the EFFECTIVE directory in that
+      hash. Hashing the POSTED value would not match what ``begin_step`` stored,
+      so every ``caller_id``-inherited step would read as a false ``DIVERGED``.
+
+    The route passes its answer back in through ``run_agent_step``'s existing
+    ``working_directory`` parameter, so the call below simply returns it
+    unchanged and no resolution happens twice. There is deliberately NO
+    ``skip_resolution`` flag: a parameter whose only purpose is to disable a
+    branch is the inert-parameter shape this issue has removed three times.
+
+    BEST-EFFORT, AND THAT IS THE CONTRACT (unchanged by the extraction).
+    ``asyncio.CancelledError`` is re-raised so a cancelled step stays cancelled;
+    any other failure is logged and the caller falls back to the server default,
+    because CWD inheritance must never fail a step that could otherwise run.
+
+    ``caller_id`` is not authenticated/authorized (it arrives via an HTTP body);
+    this is consistent with its existing use for callback routing (#284). The
+    resolved path still passes ``_resolve_and_validate_working_directory`` inside
+    ``create_terminal``, so risk is confined to inheriting a real existing pane's
+    CWD in a single-user trust model.
+
+    Args:
+        working_directory: the explicitly requested directory, or None.
+        caller_id: the supervisor terminal whose pane CWD is inherited when
+            ``working_directory`` is None.
+
+    Returns:
+        ``working_directory`` when it was supplied or there is no caller to
+        inherit from; the caller terminal's CWD when resolution succeeds and
+        returns a non-empty path; otherwise ``working_directory`` unchanged
+        (i.e. None — the server default).
+    """
+    # The guard is the extracted block's own condition, inverted into an early
+    # return. An explicit directory always wins, and with no caller_id there is
+    # nothing to inherit from.
+    if working_directory is not None or caller_id is None:
+        return working_directory
+    try:
+        resolved = await asyncio.to_thread(terminal_service.get_working_directory, caller_id)
+        if resolved:
+            return resolved
+    except asyncio.CancelledError:
+        raise
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 — CWD inheritance is best-effort; step must not fail on it
+        logger.warning(
+            "resolve_effective_working_directory: failed to resolve working directory "
+            "from caller %r, falling back to server default: %r",
+            caller_id,
+            exc,
+        )
+    return working_directory
+
+
 async def run_agent_step(
     provider: str,
     agent: str,
@@ -254,7 +325,7 @@ async def run_agent_step(
     allowed_tools: Optional[list[str]] = None,
     registry: Optional[PluginRegistry] = None,
     env_vars: Optional[dict[str, str]] = None,
-    on_terminal_created: Optional[Callable[[str], None]] = None,
+    on_step_terminal_ready: Optional[Callable[[str, str], None]] = None,
     cancel_event: Optional[asyncio.Event] = None,
     engine: Optional[KiroEngine | str] = None,
     model: Optional[str] = None,
@@ -316,16 +387,29 @@ async def run_agent_step(
             the substrate creates a fresh session per step, so the per-step env is
             injected cleanly (no stale step_id from a shared session). Default None
             = behavior unchanged (the handoff caller passes nothing).
-        on_terminal_created: Optional callback invoked with the ``terminal_id``
-            IMMEDIATELY after a freshly created terminal exists (before the
-            readiness wait / input). U4's script-tier orphan sweep (BR-31) uses
-            this to record the live terminal into the shared ``ScriptRunRecord``
-            ``step_states`` map AT terminal-creation time — so a subprocess that
-            crashes/times out while a run-step call is mid-flight still leaves the
-            in-flight terminal visible to ``_reconcile_orphans``. Not called for a
-            reused terminal (the caller already owns it). A callback exception is
-            logged and swallowed — recording a terminal for the sweep must never
-            fail the step. Default None = behavior unchanged.
+        on_step_terminal_ready: Optional callback invoked with
+            ``(terminal_id, call_fingerprint)`` as soon as the terminal this step
+            will run on EXISTS and before the prompt is sent. It fires on BOTH
+            paths (issue #583, unit ``settlement-rewire`` BR-3): on the
+            create path immediately after ``terminal_service.create_terminal``
+            returns and BEFORE the readiness wait; on the reuse path immediately
+            after the reused terminal is validated. Firing on the reuse path too
+            is what gives every script step a durable ``running`` row before it
+            executes — without it, a terminal-reuse call would have none and
+            FR-4's guard would cover only steps that made their own terminal.
+            THIS PARAMETER WAS RENAMED BECAUSE FIRING IT ON THE REUSE PATH MADE
+            ITS FORMER NAME — which spoke only of terminal creation — FALSE
+            (BR-4). The former name is deliberately not spelled here: a test
+            greps the whole of ``src/`` for it, so the one place it survives must
+            be the changelog, not the code.
+            Two consumers today, both in ``script_runner``: U4's orphan sweep
+            (BR-31) records the live terminal into the shared ``ScriptRunRecord``
+            ``step_states`` map, so a subprocess that crashes/times out while a
+            run-step call is mid-flight still leaves the in-flight terminal
+            visible to ``_reconcile_orphans``; and the journal's ``begin_step``
+            writes the durable ``running`` row carrying ``call_fingerprint``. A
+            callback exception is logged and swallowed — step bookkeeping must
+            never fail a live step. Default None = behavior unchanged.
         cancel_event: Optional ``asyncio.Event`` the engine sets to interrupt an
             in-flight completion wait (issue #409b). When set mid-wait, the step
             wait is abandoned promptly (not at the next natural boundary) and a
@@ -371,30 +455,82 @@ async def run_agent_step(
         # instead of the supervisor's project directory. Best-effort: if
         # resolution fails, fall back to the server default.
         #
-        # caller_id is not authenticated/authorized (arrives via HTTP body);
-        # this is consistent with its existing use for callback routing (#284).
-        # The resolved path still passes _resolve_and_validate_working_directory
-        # so risk is confined to inheriting a real existing pane's CWD in a
-        # single-user trust model.
-        if working_directory is None and caller_id is not None:
-            try:
-                resolved = await asyncio.to_thread(
-                    terminal_service.get_working_directory, caller_id
-                )
-                if resolved:
-                    working_directory = resolved
-            except asyncio.CancelledError:
-                raise
-            except (
-                Exception
-            ) as exc:  # noqa: BLE001 — CWD inheritance is best-effort; step must not fail on it
-                logger.warning(
-                    "run_agent_step: failed to resolve working directory from "
-                    "caller %r, falling back to server default: %r",
-                    caller_id,
-                    exc,
-                )
+        # THE COMPUTATION LIVES IN ``resolve_effective_working_directory`` (issue
+        # #583, unit ``run-step-replay-branch`` BR-10/TD-1) because the run-step
+        # route must know this answer BEFORE it calls this function — it needs the
+        # effective directory to compute the call fingerprint the replay gate
+        # compares. When the route has already resolved, it passes the result in
+        # as ``working_directory`` and the helper returns it unchanged, so the
+        # resolution never runs twice and no flag is needed. Duplicating the
+        # computation instead would be the "two implementations of one
+        # security-relevant value" defect FR-2 exists to prevent.
+        working_directory = await resolve_effective_working_directory(working_directory, caller_id)
 
+    # The step's ``v2`` call identity (issue #583, unit ``settlement-rewire`` BR-1), computed
+    # in the ONE window ``step-fingerprint``'s BR-5 permits: AFTER the working-directory
+    # resolution above and BEFORE terminal creation below.
+    #
+    # THE WINDOW IS THE WHOLE REASON THIS LIVES HERE rather than in either callback. Both
+    # callback factories are built in the route (``api/main.py``) before ``run_agent_step`` is
+    # called at all — hence before resolution — and the settle callback runs later still, once
+    # the step has already executed. ``effective_working_directory`` must be the directory the
+    # step ACTUALLY ran in: when ``working_directory is None and caller_id is not None`` the
+    # block above replaces it with the caller terminal's CWD, so hashing the POSTED value
+    # would give two runs that executed in genuinely different directories one identity, and
+    # one would replay the other's result.
+    #
+    # ONE STATEMENT, UNCONDITIONAL — computed exactly once per step (INV-1). The
+    # ``if created_here:`` test is repeated below rather than folding this into either branch,
+    # because a per-branch computation would duplicate the field assembly and the two copies
+    # could drift.
+    #
+    # On the reuse path the four creation-only components are sentinel-ised by ``compute``
+    # itself (BR-1a/BR-5), which is CORRECT and must not be "fixed": the resolution block
+    # above is inside ``if created_here:``, so on a reuse call those fields describe a
+    # terminal this call did not make and the implementation discards them. The tuple is never
+    # shortened — ten components on both paths.
+    #
+    # The digest is NEVER logged, echoed or put in an exception (SR-7).
+    call_fingerprint = compute(
+        StepCallFields(
+            provider=provider,
+            agent=agent,
+            prompt=prompt,
+            model=model,
+            # ``StepCallFields.engine`` is the enum's ``value`` by contract — the CALLER
+            # normalises, so ``step_fingerprint`` can stay a stdlib-only leaf module.
+            engine=engine.value if isinstance(engine, KiroEngine) else engine,
+            allowed_tools=None if allowed_tools is None else tuple(allowed_tools),
+            effective_working_directory=working_directory,
+            use_worktree=use_worktree,
+            reused_terminal=not created_here,
+            timeout=timeout,
+        )
+    )
+
+    def _notify_terminal_ready(ready_terminal_id: str) -> None:
+        """Fire ``on_step_terminal_ready`` best-effort — bookkeeping never fails a step.
+
+        Called from BOTH paths (BR-3). Kept as one nested helper with one ``try`` so the
+        two call sites cannot diverge in their error posture, while each keeps its own
+        position guarantee: on the create path this must run BEFORE the readiness wait
+        (BR-31's window), which is why the invocation is not simply hoisted below the
+        create/reuse branch.
+        """
+        if on_step_terminal_ready is None:
+            return
+        try:
+            on_step_terminal_ready(ready_terminal_id, call_fingerprint)
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 — step bookkeeping is best-effort; step must not fail on it
+            logger.warning(
+                "run_agent_step: on_step_terminal_ready callback failed for terminal %s: %s",
+                ready_terminal_id,
+                exc,
+            )
+
+    if created_here:
         # When no session_name is supplied we must CREATE a fresh tmux session
         # (new_session=True): create_terminal auto-names it. Leaving the default
         # new_session=False here would auto-generate a name and then immediately
@@ -421,23 +557,15 @@ async def run_agent_step(
         )
         terminal_id = terminal.id
 
-        # BR-31: make the just-created terminal visible to U4's orphan sweep
-        # BEFORE the readiness wait / input send — the dangerous edge is a
-        # subprocess that dies while this call is mid-flight, between create and
-        # the journal write. Recording it now (into the shared record's
-        # step_states) closes that window. Best-effort: a callback failure must
-        # never turn a live step into a failure.
-        if on_terminal_created is not None:
-            try:
-                on_terminal_created(terminal_id)
-            except (
-                Exception
-            ) as exc:  # noqa: BLE001 — sweep bookkeeping is best-effort; step must not fail on it
-                logger.warning(
-                    "run_agent_step: on_terminal_created callback failed for terminal %s: %s",
-                    terminal_id,
-                    exc,
-                )
+        # BR-31: make the terminal this call just made visible to U4's orphan
+        # sweep, and (issue #583, BR-3) write its durable ``running`` row, BEFORE
+        # the readiness wait / input send — the dangerous edge is a subprocess
+        # that dies while this call is mid-flight, between the terminal
+        # appearing and the journal write. Doing both now closes that window,
+        # and the position matters: the readiness wait below can run for
+        # ``ready_timeout`` seconds, so notifying after it would reopen exactly
+        # the gap BR-31 was added to close.
+        _notify_terminal_ready(terminal_id)
 
         # Secondary in-process readiness wait: provider.initialize() can return a
         # false-positive on the shell prompt before the CLI is truly ready, so we
@@ -455,6 +583,14 @@ async def run_agent_step(
     else:
         assert terminal_id is not None
         await _validate_reused_terminal(terminal_id, provider, engine)
+        # BR-3: the reuse path notifies too. Until this unit the hook fired only
+        # inside the create branch, so a terminal-reuse call wrote NO durable
+        # ``running`` row and FR-4's guard covered only steps that made their own
+        # terminal, leaving reuse to depend on the journal's no-begin rescue
+        # instead. Notifying after validation rather than before it keeps the
+        # order honest: a call rejected by ``_validate_reused_terminal`` never
+        # ran, so it must not leave a ``running`` row behind.
+        _notify_terminal_ready(terminal_id)
 
     assert terminal_id is not None  # for type-checkers: set in both branches
 

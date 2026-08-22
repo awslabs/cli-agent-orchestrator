@@ -29,10 +29,13 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "codex",
     "copilot_cli",
     "cursor_cli",
+    "grok_cli",
     "hermes",
     "kimi_cli",
     "kiro_cli",
+    "mcode",
     "opencode_cli",
+    "omp",
 }
 
 # Validation constraints for ``--env`` forwarded vars (mirrored server-side

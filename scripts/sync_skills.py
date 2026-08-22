@@ -38,6 +38,7 @@ SHIPPED_SKILLS: List[str] = [
     "cao-mcp-apps",
     "mcp-apps-builder",
     "cao-session-management",
+    "cao-session-liveness",
     "cao-supervisor-protocols",
     "cao-worker-protocols",
     "cao-memory",

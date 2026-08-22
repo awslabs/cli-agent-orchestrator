@@ -22,7 +22,23 @@ from pydantic import BaseModel, Field
 
 
 class StepState(str, Enum):
-    """Per-step run state. Defined in Bolt 1; instantiated by the engine (N5)."""
+    """Per-step run state. Defined in Bolt 1; instantiated by the engine (N5).
+
+    ``recovery-decision-intake`` (issue #583, unit 12) appends the two AUTHORISED
+    states — the durable form of a human's decision at a halted step (TD-2). They
+    are the only members no engine writes: ``apply_decisions`` writes them and the
+    replay gate reads them, one at rule 1 and one at rule 7's exclusion.
+
+    **Additive and verified safe:** nothing in ``src/`` or ``test/`` iterates or
+    asserts this member set (no ``for … in StepState``, no ``list(StepState)``, no
+    ``__members__``), so appending breaks no exhaustive match.
+
+    **``SKIPPED`` was NOT reused for the ``skip`` decision** (BR-3/TD-2). It already
+    means "the engine did not run this step", and mechanically it could not serve:
+    the gate treats anything that is not absent, ``rerun_authorized`` or ``running``
+    as settled, so a ``SKIPPED`` row still reaches rule 7 and halts again — the very
+    loop ``REPLAY_AUTHORIZED`` exists to close.
+    """
 
     PENDING = "pending"
     RUNNING = "running"
@@ -30,6 +46,16 @@ class StepState(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     COMPLETED_UNVALIDATED = "completed_unvalidated"
+    # issue #583, recovery-decision-intake (unit 12) — consent to re-execute. Rule 1
+    # of the replay gate already admits this literal as ``EXECUTE`` (BR-2), and
+    # ``begin_step`` consumes it by flipping the row to ``running`` (BR-9), which is
+    # what bounds one decision to one attempt.
+    RERUN_AUTHORIZED = "rerun_authorized"
+    # issue #583, recovery-decision-intake (unit 12) — consent to use the STORED
+    # result. Excluded from rule 7 ONLY (BR-4), so the row still needs an envelope
+    # (rule 3), verifiable provenance (rules 4-5) and a matching fingerprint (rule 6)
+    # before it falls to the catch-all and replays.
+    REPLAY_AUTHORIZED = "replay_authorized"
 
 
 class RunState(str, Enum):
@@ -45,6 +71,73 @@ class RunState(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# recovery-decision-intake (issue #583, unit 12) — FR-7's escape hatch vocabulary
+# ---------------------------------------------------------------------------
+class RecoveryDecision(str, Enum):
+    """What a human OPERATOR chooses at a halted step (issue #583, FR-7, BR-1).
+
+    **This is NOT ``RecoveryPolicy``, and the one shared word is why the distinction
+    is written down** (domain-entities):
+
+    * ``RecoveryPolicy`` (``models/workflow.py``) is a DECLARATION by the step's
+      author, made at authoring time in the script — "never a permission and never
+      inferred". Its members are ``idempotent``, ``reconcile``, ``manual``.
+    * ``RecoveryDecision`` is a PERMISSION from an operator, given at a halt on the
+      resume command, and good for exactly ONE attempt (BR-9).
+
+    TWO MEMBERS, NOT THREE. ``reconcile`` is deliberately absent (BR-1/TD-1): no
+    reconciliation operation exists anywhere in ``src/`` and #583's frozen scope
+    defers generic external-system reconciliation, so a third member would be a
+    value the closed set cannot act on — the same trap that removed
+    ``diverged_fields`` and ``attempts`` elsewhere in this Bolt. It also removes the
+    name collision with ``RecoveryPolicy.RECONCILE``, which means something adjacent
+    but different. When the operation ships, BR-1 is where the third member starts.
+
+    It lives in THIS light module rather than beside ``RecoveryPolicy`` in
+    ``models/workflow.py`` for the reason stated at the top of the file: the MCP
+    server imports this module and must not pull ``jsonschema``/``yaml`` onto the
+    HTTP seam, and ``workflow_resume`` needs this vocabulary to validate its
+    ``decisions`` argument (BR-10). ``models/workflow.py`` re-exports both names, so
+    ``from ...models.workflow import RecoveryDecision`` also resolves. A policy is
+    spec GRAMMAR (authored in the file); a decision is RUNTIME input (typed at a
+    halt), so the split also follows what each module is for.
+    """
+
+    RERUN = "rerun"  # consent to re-execute the step -> state ``rerun_authorized``
+    SKIP = "skip"  # consent to use the stored result -> state ``replay_authorized``
+
+
+def parse_decision(value: str) -> RecoveryDecision:
+    """Parse one operator-supplied decision value. Total: returns or raises (BR-6).
+
+    THE SINGLE VALIDATION IMPLEMENTATION for the closed set, shared by all three
+    surfaces and by ``workflow_journal.apply_decisions`` (BR-10/TD-7) — the CLI's
+    ``--decide``, the MCP ``workflow_resume(decisions=...)`` argument and the resume
+    route must accept exactly the same values, and one function is how that stays
+    true rather than being asserted three times.
+
+    Mirrors ``parse_policy``'s shape (``models/workflow.py``) with one deliberate
+    difference: there is no "undeclared" case here. A policy may legitimately be
+    absent; a decision that is absent is simply not supplied, and an empty string is
+    a typo like any other. No case-folding, no stripping, no aliasing.
+
+    Raises:
+        ValueError: naming the accepted values, because the caller is a human who
+            has just mistyped one. The offending value is echoed TRUNCATED — the
+            operator needs to see their own typo, and the bound keeps an abusive
+            value from becoming an unbounded response body. It is never logged
+            (SR-6 logs the success path only).
+    """
+    try:
+        return RecoveryDecision(value)
+    except ValueError as e:
+        accepted = ", ".join(sorted(member.value for member in RecoveryDecision))
+        raise ValueError(
+            f"'{str(value)[:40]}' is not a recovery decision (accepted: {accepted})"
+        ) from e
 
 
 # ---------------------------------------------------------------------------

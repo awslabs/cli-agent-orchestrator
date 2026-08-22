@@ -10,6 +10,7 @@ from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.manager import ProviderManager
+from cli_agent_orchestrator.providers.omp import OmpProvider
 
 
 def test_create_provider_codex_stores_mapping():
@@ -51,6 +52,55 @@ def test_create_provider_hermes_stores_mapping():
     )
 
     assert isinstance(provider, HermesProvider)
+    assert manager.get_provider("t1") is provider
+
+
+def test_create_provider_grok_forwards_launch_configuration():
+    manager = ProviderManager()
+    provider = MagicMock()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.GrokCliProvider", return_value=provider
+    ) as provider_cls:
+        result = manager.create_provider(
+            ProviderType.GROK_CLI.value,
+            terminal_id="t1",
+            tmux_session="s1",
+            tmux_window="w1",
+            agent_profile="reviewer",
+            allowed_tools=["fs_read", "fs_list"],
+            skill_prompt="runtime skill catalog",
+            model="grok-4.5",
+        )
+
+    assert result is provider
+    assert manager.get_provider("t1") is provider
+    provider_cls.assert_called_once_with(
+        "t1",
+        "s1",
+        "w1",
+        "reviewer",
+        ["fs_read", "fs_list"],
+        skill_prompt="runtime skill catalog",
+        model="grok-4.5",
+    )
+
+
+def test_create_provider_minimax_code_forwards_launch_configuration():
+    from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.MINIMAX_CODE.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile="developer",
+        allowed_tools=["fs_read", "fs_list"],
+        skill_prompt="runtime skill catalog",
+    )
+
+    assert isinstance(provider, MiniMaxCodeProvider)
     assert manager.get_provider("t1") is provider
 
 
@@ -166,8 +216,22 @@ def test_cleanup_provider_handles_exception():
     manager.cleanup_provider("t1")
 
     provider.cleanup.assert_called_once()
-    # Provider should still be removed even if cleanup fails
-    assert manager._providers.get("t1") is None
+    # Preserve the provider as a retry handle; silently dropping it would make
+    # a deferred Grok private-home cleanup permanent.
+    assert manager._providers["t1"] is provider
+
+
+def test_cleanup_provider_retains_retryable_provider_until_cleanup_succeeds():
+    manager = ProviderManager()
+    provider = MagicMock()
+    provider.cleanup.side_effect = [False, True]
+    manager._providers["grok-terminal"] = provider
+
+    assert manager.cleanup_provider("grok-terminal") is False
+    assert manager._providers["grok-terminal"] is provider
+
+    assert manager.cleanup_provider("grok-terminal") is True
+    assert "grok-terminal" not in manager._providers
 
 
 def test_cleanup_provider_nonexistent_terminal():
@@ -176,6 +240,79 @@ def test_cleanup_provider_nonexistent_terminal():
 
     # Should not raise
     manager.cleanup_provider("nonexistent")
+
+
+def test_cleanup_provider_recovers_grok_home_after_restart():
+    """A restart leaves no provider map entry but terminal metadata survives."""
+    manager = ProviderManager()
+    cleanup_only_provider = MagicMock()
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.GROK_CLI.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "developer",
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.GrokCliProvider",
+            return_value=cleanup_only_provider,
+        ) as provider_cls,
+    ):
+        manager.cleanup_provider("restored-grok")
+
+    provider_cls.assert_called_once_with("restored-grok", "s1", "w1", "developer")
+    cleanup_only_provider.cleanup.assert_called_once()
+
+
+def test_cleanup_provider_recovers_minimax_code_data_after_restart():
+    manager = ProviderManager()
+    cleanup_only_provider = MagicMock()
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.MINIMAX_CODE.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "developer",
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.MiniMaxCodeProvider",
+            return_value=cleanup_only_provider,
+        ) as provider_cls,
+    ):
+        manager.cleanup_provider("restored-mcode")
+
+    provider_cls.assert_called_once_with("restored-mcode", "s1", "w1", "developer")
+    cleanup_only_provider.cleanup.assert_called_once()
+
+
+def test_cleanup_provider_retains_restored_grok_metadata_when_cleanup_is_deferred():
+    """After restart, the DB row remains the retry handle for a private home."""
+
+    manager = ProviderManager()
+    cleanup_only_provider = MagicMock()
+    cleanup_only_provider.cleanup.return_value = False
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.GROK_CLI.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "developer",
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.GrokCliProvider",
+            return_value=cleanup_only_provider,
+        ),
+    ):
+        assert manager.cleanup_provider("restored-grok") is False
 
 
 def test_list_providers():
@@ -308,4 +445,19 @@ def test_create_provider_mock_cli_stores_mapping():
     )
 
     assert isinstance(provider, MockCliProvider)
+    assert manager.get_provider("t1") is provider
+
+
+def test_create_provider_omp_stores_mapping():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.OMP.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile="developer",
+        skill_prompt="skill catalog",
+    )
+
+    assert isinstance(provider, OmpProvider)
     assert manager.get_provider("t1") is provider

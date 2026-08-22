@@ -119,6 +119,63 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
             cleanup_terminal(terminal_id, actual_session)
 
 
+def _run_second_task_same_terminal_test(provider: str, agent_profile: str):
+    """Send two independent turns to one terminal and extract only the second."""
+    session_suffix = uuid.uuid4().hex[:6]
+    session_name = f"e2e-handoff-2t-{provider}-{session_suffix}"
+    terminal_id = None
+    actual_session = None
+
+    try:
+        terminal_id, actual_session = create_terminal(provider, agent_profile, session_name)
+        assert terminal_id, "Terminal ID should not be empty"
+
+        start = time.time()
+        while time.time() - start < 90.0:
+            status = get_terminal_status(terminal_id)
+            if status in ("idle", "completed", "error"):
+                break
+            time.sleep(3)
+        assert status in (
+            "idle",
+            "completed",
+        ), f"Terminal did not become ready within 90s (provider={provider})"
+
+        first_task = (
+            "Create a Python function called 'square_first_turn' that takes n and "
+            "returns n squared. Output only the function code."
+        )
+        send_handoff_message(terminal_id, first_task, provider)
+        assert wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT)
+        first_output = extract_output(terminal_id)
+        assert "square_first_turn" in first_output.lower()
+
+        second_task = (
+            "Now create a different Python function called 'cube_second_turn' that "
+            "takes n and returns n cubed. Output only the new function code."
+        )
+        send_handoff_message(terminal_id, second_task, provider)
+        assert wait_for_status(
+            terminal_id, "completed", timeout=COMPLETION_TIMEOUT
+        ), f"Second turn did not complete within {COMPLETION_TIMEOUT}s (provider={provider})"
+
+        time.sleep(5)
+        if get_terminal_status(terminal_id) != "completed":
+            assert wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT)
+
+        second_output = extract_output(terminal_id)
+        second_lower = second_output.lower()
+        assert (
+            "cube_second_turn" in second_lower
+        ), f"Second-turn response was not extracted: {second_output[:300]}"
+        assert "square_first_turn" not in second_lower, (
+            "First-turn response leaked into second-turn extraction: " f"{second_output[:300]}"
+        )
+    finally:
+        if terminal_id and actual_session:
+            cleanup_terminal(terminal_id, actual_session)
+
+
 # ---------------------------------------------------------------------------
 # Codex provider tests
 # ---------------------------------------------------------------------------
@@ -359,3 +416,69 @@ class TestAntigravityCliHandoff:
             ),
             content_keywords=["square", "return", "def"],
         )
+
+
+@pytest.mark.e2e
+class TestOmpHandoff:
+    """OMP reaches completed state and returns only each latest response."""
+
+    def test_handoff_simple_function(self, require_omp):
+        _run_handoff_test(
+            provider="omp",
+            agent_profile="developer",
+            task_message="Create a Python function greet(name). Output only the function code.",
+            content_keywords=["greet", "def"],
+        )
+
+    def test_handoff_second_task(self, require_omp):
+        _run_handoff_test(
+            provider="omp",
+            agent_profile="developer",
+            task_message="Create a Python function square(n). Output only the function code.",
+            content_keywords=["square", "def"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Grok Build CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGrokCliHandoff:
+    """E2E lifecycle tests for the official xAI Grok Build CLI provider."""
+
+    def test_handoff_simple_function(self, require_grok):
+        """Grok creates a simple Python function and returns its output."""
+        _run_handoff_test(
+            provider="grok_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_grok):
+        """Grok returns the second independent response from the same TUI session."""
+        _run_second_task_same_terminal_test(provider="grok_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeHandoff:
+    """E2E lifecycle tests for the MiniMax Code provider."""
+
+    def test_handoff_simple_function(self, require_minimax_code):
+        _run_handoff_test(
+            provider="mcode",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_minimax_code):
+        _run_second_task_same_terminal_test(provider="mcode", agent_profile="developer")
