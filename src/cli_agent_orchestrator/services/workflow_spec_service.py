@@ -869,6 +869,190 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
     )
 
 
+def _validate_write_target(name: str, scan_dir: Optional[str]) -> tuple[str, str]:
+    """Validate a write target and return ``(safe_base, target_path)``.
+
+    Shared preconditions of ``create_workflow`` and ``update_workflow``, in the order
+    the design fixes (issue #583, Bolt 3, unit 3). NOTHING here touches the
+    filesystem for writing, so every rejection below leaves it byte-identical.
+
+    ``name`` is a BARE name, never a path (TS-3A3-2): it is what
+    ``WORKFLOW_NAME_RE`` constrains, what the index is keyed on, and what the
+    tier-collision check needs. The ``.py`` extension is supplied HERE and never by
+    the caller, which is what makes the Python-only rule enforceable rather than
+    advisory.
+
+    Raises:
+        ValueError: the name is invalid, or names a tier this service cannot write.
+    """
+    # A name carrying an extension is a caller asking for a tier. Answer that
+    # question explicitly rather than letting _validate_name reject the dot as a
+    # charset error (BR-3A3-2): an agent that reasonably tried YAML should learn the
+    # rule, not debug a message that reads like a typo.
+    lowered = name.lower()
+    if lowered.endswith((".yaml", ".yml")):
+        raise ValueError(
+            f"workflow '{name}': YAML specs cannot be created or updated through this "
+            "service (issue #583 scope is Python workflows only). YAML specs remain "
+            "readable, listable and deletable."
+        )
+    if lowered.endswith(".py"):
+        raise ValueError(
+            f"workflow '{name}': pass a bare workflow name without the '.py' extension"
+        )
+
+    _validate_name(name)  # BR-3A3-1 — never reimplemented
+    safe_base = _safe_dir(scan_dir)
+    return safe_base, os.path.join(safe_base, f"{name}.py")
+
+
+def _validated_script_spec(name: str, source: str, target_path: str) -> ScriptSpec:
+    """Lint + parse ``source`` into a ``ScriptSpec``, refusing anything unrunnable.
+
+    The write path's validation gate (BR-3A3-5, SR-3A3-3). Reuses the read path's own
+    tools verbatim (TS-3A3-5) so the write path agrees with the RUN path about what is
+    runnable: a spec whose lint ``status == "fail"`` is **loadable but unrunnable**
+    (the load-time lint is informational, ``script_runner`` is fail-closed), and Bolt 1
+    made ``missing-recovery-policy`` an ERROR — so a ``step()`` without ``recovery=``
+    lands in exactly that state. CAO must not write a spec it would refuse to run.
+
+    Unlike ``_read_script_spec``, this does NOT skip ``_extract_inputs`` on a syntax
+    finding: that graceful degradation exists so a broken file on disk still loads with
+    its finding intact, and it is unreachable here because a syntax error is an ERROR
+    finding that the gate refuses first (TS-3A3-5).
+
+    Raises:
+        ValueError: a lint ERROR, or a malformed ``INPUTS`` literal. Lint findings
+            travel on the message rather than in a new exception type (TS-3A3-6).
+    """
+    result = lint_script(source, target_path)
+    if result.status == "fail":
+        errors = "; ".join(
+            f"{f.rule_id} (line {f.line})" for f in result.findings if f.severity == "error"
+        )
+        raise ValueError(f"workflow '{name}' has lint errors and would not be runnable: {errors}")
+    inputs = _extract_inputs(source)  # AST-only; never executes the module (SR-3A3-8)
+    return ScriptSpec(
+        name=name,
+        path=target_path,
+        source=source,
+        content_hash=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        findings=result.findings,
+        inputs=inputs,
+    )
+
+
+def _persist_spec(spec: ScriptSpec, target_path: str, safe_base: str) -> ScriptSpec:
+    """Write ``spec.source`` through the guarded writer, then index it.
+
+    The bytes written are the bytes validated (BR-3A3-8, SR-3A3-7) — the same in-memory
+    text, encoded once, never re-read. That is what makes ``spec.content_hash`` describe
+    exactly what landed, which is the contract unit 4's stale-update check depends on.
+
+    A failed index upsert is logged and the operation still SUCCEEDS (BR-3A3-12,
+    SR-3A3-9): the file is canonical and ``workflow_index`` is a derived, droppable
+    projection rebuilt from the files on every ``list_workflows``, so the failure is
+    self-healing. Raising would report failure for an operation that succeeded, and
+    deleting the just-written file to force atomicity would destroy the user's content
+    because a cache write failed.
+    """
+    real_path = _write_contained_spec_bytes(
+        target_path, spec.source.encode("utf-8"), base_dir=safe_base
+    )
+    written = spec.model_copy(update={"path": real_path})
+    try:
+        # real_path is passed through UNMODIFIED — upsert_index requires the resolved
+        # realpath with no re-derivation (:344-349, BR-3A3-11).
+        upsert_index(written, real_path)
+    except Exception as exc:
+        logger.warning(
+            "workflow '%s' was written but its index row could not be updated (%s); "
+            "the next list/get will rebuild it from disk",
+            spec.name,
+            exc,
+        )
+    return written
+
+
+def create_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> ScriptSpec:
+    """Create a NEW Python workflow spec, refusing to overwrite an existing one (FR-10).
+
+    Separate from :func:`update_workflow` rather than a mode flag because the two have
+    genuinely different preconditions (TS-3A3-1): an agent that means "make a new
+    workflow" must not silently clobber one.
+
+    Order is load-bearing — every check precedes any write, so a refusal leaves the
+    filesystem byte-identical (SR-3A3-2):
+
+    1. name + tier (``_validate_write_target``);
+    2. the target must NOT already exist;
+    3. no cross-tier collision — ``_check_tier_collision`` runs at ACCESS time and at
+       scan time but NEVER at write time, so without this a ``foo.py`` created beside an
+       existing ``foo.yaml`` succeeds and then every ``get_workflow("foo")`` raises
+       ``TierCollisionError``: a file unreachable the moment it lands (BR-3A3-4,
+       SR-3A3-4);
+    4. lint + ``INPUTS`` validation;
+    5. write, then index.
+
+    The existence check in step 2 is a ``stat`` and is therefore racy — a concurrent
+    writer could create the file between the check and the write. ``O_EXCL`` would make
+    it atomic and was deliberately declined at unit 2 to keep that finished primitive's
+    surface closed. This narrows a LIKELY mistake to a RARE one; it does not eliminate
+    it. Lost updates are a separate problem, mitigated by the caller's
+    expected-source-hash check, not here.
+
+    Args:
+        name: bare workflow name, no extension and no path separators.
+        source: the spec's Python source, written verbatim.
+        scan_dir: target directory. Internal/test use only — the pass 3B CLI and MCP
+            surfaces MUST NOT expose this to an agent (SR-3A3-5).
+
+    Returns:
+        The parsed ``ScriptSpec``, carrying any WARNING-level findings and the
+        ``content_hash`` of exactly what was written.
+
+    Raises:
+        ValueError: invalid name, unwritable tier, lint errors, or malformed ``INPUTS``.
+        FileExistsError: a spec with that name already exists.
+        TierCollisionError: a same-stem sibling exists in the other tier.
+    """
+    safe_base, target_path = _validate_write_target(name, scan_dir)
+    if os.path.exists(target_path):
+        raise FileExistsError(f"workflow '{name}' already exists; use update to change it")
+    _check_tier_collision(name, safe_base)  # -> TierCollisionError (409)
+    spec = _validated_script_spec(name, source, target_path)
+    return _persist_spec(spec, target_path, safe_base)
+
+
+def update_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> ScriptSpec:
+    """Update an EXISTING Python workflow spec, refusing to create one (FR-10).
+
+    The mirror of :func:`create_workflow`: same ordered preconditions, opposite
+    existence requirement, so an agent that means "edit this workflow" cannot silently
+    create one. See that function for why the existence check is racy and why that is
+    accepted.
+
+    Args:
+        name: bare workflow name, no extension and no path separators.
+        source: the spec's new Python source, written verbatim.
+        scan_dir: target directory. Internal/test use only (SR-3A3-5).
+
+    Returns:
+        The parsed ``ScriptSpec`` for the new content.
+
+    Raises:
+        ValueError: invalid name, unwritable tier, lint errors, or malformed ``INPUTS``.
+        FileNotFoundError: no spec with that name exists.
+        TierCollisionError: a same-stem sibling exists in the other tier.
+    """
+    safe_base, target_path = _validate_write_target(name, scan_dir)
+    if not os.path.exists(target_path):
+        raise FileNotFoundError(f"workflow '{name}' does not exist; use create to add it")
+    _check_tier_collision(name, safe_base)
+    spec = _validated_script_spec(name, source, target_path)
+    return _persist_spec(spec, target_path, safe_base)
+
+
 def get_workflow(
     name_or_path: str, scan_dir: Optional[str] = None
 ) -> Union[WorkflowSpec, ScriptSpec]:
