@@ -207,11 +207,12 @@ case "${warm_mode}" in
     #
     # `&` before `exec`: the subshell outlives the shell that spawned it, and
     # inherits this container's stdout, so its lines still land in `kubectl logs`.
-    # Its parent PID becomes cao-server, which does not reap children it did not
-    # create — so each finished warm-up leaves a zombie holding one PID slot for
-    # the life of the pod. Two of them, bounded, and the alternative is keeping a
-    # shell as PID 1, which would change what `kill 1` means in a container whose
-    # shutdown path deliberately relies on cao-server being PID 1.
+    # It is reparented to cao-server, which does not reap children it did not
+    # create, so it lingers as a zombie holding one PID slot for the life of the
+    # pod. Exactly one: warm_all waits on its own two children, so only warm_all
+    # itself is left unreaped (verified by `ps` in a running container). The
+    # alternative is keeping a shell as PID 1, which would change what `kill 1`
+    # means in a container whose shutdown path relies on cao-server being PID 1.
     echo "[cao-entrypoint] warming providers in the background (readiness will not wait)"
     warm_all &
     ;;
