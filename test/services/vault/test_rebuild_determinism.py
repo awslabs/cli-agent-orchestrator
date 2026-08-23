@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime
 from test.fixtures.vault_factory import build_vault_fixture
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -87,6 +88,18 @@ STRUCTURAL_COLUMNS = {
 }
 
 
+@pytest.fixture
+def deterministic_vaults(tmp_path):
+    forward = build_vault_fixture(tmp_path / "forward", fixed_mtimes=True)
+    reverse = build_vault_fixture(tmp_path / "reverse", creation_order="reverse", fixed_mtimes=True)
+    for fixture in (forward, reverse):
+        _assert_fixed_mtimes(fixture)
+        linked = fixture.root / "Projects/CAO Design/Linked.md"
+        linked.write_text("[[Design]]", encoding="utf-8")
+        os.utime(linked, ns=(1_700_000_000_999_999_999,) * 2)
+    return forward, reverse
+
+
 def test_live_schema_columns_are_completely_classified(tmp_path, monkeypatch):
     from cli_agent_orchestrator.services import memory_relationship_service
     from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
@@ -98,30 +111,18 @@ def test_live_schema_columns_are_completely_classified(tmp_path, monkeypatch):
 
 
 def test_rename_alias_is_retained_incrementally_but_rebuild_derives_current_path(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, deterministic_vaults
 ):
     from cli_agent_orchestrator.services import memory_relationship_service
     from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
-    forward = build_vault_fixture(tmp_path / "forward", fixed_mtimes=True)
-    _assert_fixed_mtimes(forward)
+    forward, _reverse = deterministic_vaults
     engine = _database(
         tmp_path / "rename.db", monkeypatch, reconcile_module, memory_relationship_service
     )
-
-    reconcile(forward.vault, apply=True, run_id="first-run")
-    old_path = forward.root / "Projects/CAO Design/Don't Panic.md"
-    new_path = old_path.with_name("Renamed.md")
-    old_path.rename(new_path)
-    reconcile(forward.vault, apply=True, run_id="rename-run")
+    incremental_key = _stage_incremental_rename(engine, forward)
     with sessionmaker(bind=engine)() as db:
         alias = db.query(VaultNoteAliasModel).one()
-        incremental_key = (
-            db.query(VaultNoteModel)
-            .filter_by(vault_relpath="Projects/CAO Design/Renamed.md")
-            .one()
-            .cao_key
-        )
     assert (alias.former_relpath, alias.cao_key, alias.created_at is not None) == (
         "Projects/CAO Design/Don't Panic.md",
         incremental_key,
@@ -142,51 +143,117 @@ def test_rename_alias_is_retained_incrementally_but_rebuild_derives_current_path
     assert rebuilt_key != incremental_key
 
 
-def test_two_rebuilds_are_byte_deterministic_and_refresh_structural_columns(tmp_path, monkeypatch):
+def test_two_rebuilds_are_byte_deterministic_with_rename_in_place(
+    tmp_path, monkeypatch, deterministic_vaults
+):
     from cli_agent_orchestrator.services import memory_relationship_service
     from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
-    fixture = build_vault_fixture(tmp_path / "vault", fixed_mtimes=True)
-    _assert_fixed_mtimes(fixture)
+    forward, _reverse = deterministic_vaults
     engine = _database(
         tmp_path / "rebuild.db", monkeypatch, reconcile_module, memory_relationship_service
     )
-    rebuild(fixture.vault, run_id="rebuild-one")
+    _stage_incremental_rename(engine, forward)
+    rebuild(forward.vault, run_id="rebuild-one")
     byte_equal = _dump(engine, BYTE_EQUAL_COLUMNS)
-    structural_before = _dump(engine, STRUCTURAL_COLUMNS)
-    rebuild(fixture.vault, run_id="rebuild-two")
+    rebuild(forward.vault, run_id="rebuild-two")
     assert _dump(engine, BYTE_EQUAL_COLUMNS) == byte_equal
-    _assert_structural_group(engine, structural_before, run_id="rebuild-two")
 
 
-def test_reverse_creation_order_rebuild_preserves_native_rows_and_byte_state(tmp_path, monkeypatch):
+def test_two_rebuilds_refresh_every_structural_column(tmp_path, monkeypatch, deterministic_vaults):
     from cli_agent_orchestrator.services import memory_relationship_service
     from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
-    forward = build_vault_fixture(tmp_path / "forward", fixed_mtimes=True)
-    reverse = build_vault_fixture(tmp_path / "reverse", creation_order="reverse", fixed_mtimes=True)
+    forward, _reverse = deterministic_vaults
+    engine = _database(
+        tmp_path / "structural.db", monkeypatch, reconcile_module, memory_relationship_service
+    )
+    _stage_incremental_rename(engine, forward)
+    rebuild(forward.vault, run_id="rebuild-one")
+    structural_before = _dump(engine, STRUCTURAL_COLUMNS)
+    rebuild(forward.vault, run_id="rebuild-two")
+    # ADR-006 requires rebuild to delete aliases, so its absence is intentional
+    # here and alias freshness is asserted by the incremental pairing below.
+    _assert_structural_group(
+        engine,
+        structural_before,
+        run_id="rebuild-two",
+        allow_empty_tables={"vault_note_alias"},
+    )
+
+
+def test_unchanged_incremental_reconcile_is_byte_deterministic_and_refreshes_all_structural_columns(
+    tmp_path, monkeypatch, deterministic_vaults
+):
+    from cli_agent_orchestrator.services import memory_relationship_service
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+
+    forward, _reverse = deterministic_vaults
+    engine = _database(
+        tmp_path / "incremental.db", monkeypatch, reconcile_module, memory_relationship_service
+    )
+    _stage_incremental_rename(engine, forward)
+    byte_equal = _dump(engine, BYTE_EQUAL_COLUMNS)
+    structural_before = _dump(engine, STRUCTURAL_COLUMNS)
+    assert len(structural_before["vault_note_alias"]) == 1
+
+    reconcile(forward.vault, apply=True, run_id="unchanged-run")
+
+    assert _dump(engine, BYTE_EQUAL_COLUMNS) == byte_equal
+    _assert_structural_group(engine, structural_before, run_id="unchanged-run")
+
+
+def test_reverse_creation_order_rebuild_matches_forward_byte_state(
+    tmp_path, monkeypatch, deterministic_vaults
+):
+    from cli_agent_orchestrator.services import memory_relationship_service
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+
+    forward, reverse = deterministic_vaults
     for fixture in (forward, reverse):
-        _assert_fixed_mtimes(fixture)
-        linked = fixture.root / "Projects/CAO Design/Linked.md"
-        linked.write_text("[[Design]]", encoding="utf-8")
-        os.utime(linked, ns=(1_700_000_000_999_999_999,) * 2)
         old_path = fixture.root / "Projects/CAO Design/Don't Panic.md"
         old_path.rename(old_path.with_name("Renamed.md"))
 
     first = _database(
         tmp_path / "forward.db", monkeypatch, reconcile_module, memory_relationship_service
     )
-    _seed_native_rows(first)
-    native_before = _native_dump(first)
     rebuild(forward.vault, run_id="forward-rebuild")
     forward_byte = _dump(first, BYTE_EQUAL_COLUMNS)
-    assert _native_dump(first) == native_before
 
     second = _database(
         tmp_path / "reverse.db", monkeypatch, reconcile_module, memory_relationship_service
     )
     rebuild(reverse.vault, run_id="reverse-rebuild")
     assert _dump(second, BYTE_EQUAL_COLUMNS) == forward_byte
+
+
+def test_rebuild_leaves_native_rows_untouched(tmp_path, monkeypatch, deterministic_vaults):
+    from cli_agent_orchestrator.services import memory_relationship_service
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+
+    forward, _reverse = deterministic_vaults
+    engine = _database(
+        tmp_path / "native.db", monkeypatch, reconcile_module, memory_relationship_service
+    )
+    _seed_native_rows(engine)
+    native_before = _native_dump(engine)
+    rebuild(forward.vault, run_id="rebuild-native")
+    assert _native_dump(engine) == native_before
+
+
+def _stage_incremental_rename(engine, fixture) -> str:
+    reconcile(fixture.vault, apply=True, run_id="first-run")
+    old_path = fixture.root / "Projects/CAO Design/Don't Panic.md"
+    new_path = old_path.with_name("Renamed.md")
+    old_path.rename(new_path)
+    reconcile(fixture.vault, apply=True, run_id="rename-run")
+    with sessionmaker(bind=engine)() as db:
+        return (
+            db.query(VaultNoteModel)
+            .filter_by(vault_relpath="Projects/CAO Design/Renamed.md")
+            .one()
+            .cao_key
+        )
 
 
 def _assert_fixed_mtimes(fixture) -> None:
@@ -238,18 +305,21 @@ def _dump(engine, columns_by_table):
     return dump
 
 
-def _assert_structural_group(engine, before, *, run_id: str) -> None:
+def _assert_structural_group(
+    engine, before, *, run_id: str, allow_empty_tables=frozenset()
+) -> None:
     after = _dump(engine, STRUCTURAL_COLUMNS)
     assert {table: len(rows) for table, rows in after.items()} == {
         table: len(rows) for table, rows in before.items()
     }
     for table, columns in STRUCTURAL_COLUMNS.items():
+        if columns and table not in allow_empty_tables:
+            assert before[table], f"{table} must have rows to prove its structural columns change"
         ordered_columns = sorted(columns)
         for index, column in enumerate(ordered_columns):
-            if before[table]:
-                assert {row[index] for row in before[table]}.isdisjoint(
-                    {row[index] for row in after[table]}
-                ), f"{table}.{column} is structural and must change across rebuilds"
+            assert {row[index] for row in before[table]}.isdisjoint(
+                {row[index] for row in after[table]}
+            ), f"{table}.{column} is structural and must change across runs"
     with engine.connect() as connection:
         for (last_reconciled_at,) in connection.exec_driver_sql(
             "SELECT last_reconciled_at FROM vault_note WHERE vault_id = 'fixture'"
