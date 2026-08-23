@@ -1353,7 +1353,9 @@ class OriginCheckMiddleware:
                 for name, value in scope.get("headers", [])
             }
             origin = headers.get("origin")
-            if origin and not is_http_origin_allowed(origin, headers.get("host")):
+            if origin and not is_http_origin_allowed(
+                origin, headers.get("host"), scope.get("scheme")
+            ):
                 logger.warning(
                     "Rejected cross-origin %s request: disallowed Origin %r",
                     scope["method"],
@@ -6079,7 +6081,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # WebSocket scope first (CAO_ALLOWED_HOSTS="*" opts out of that; see
     # is_ws_origin_allowed).
     origin = websocket.headers.get("origin")
-    if not is_ws_origin_allowed(origin, websocket.headers.get("host")):
+    if not is_ws_origin_allowed(
+        origin, websocket.headers.get("host"), websocket.scope.get("scheme")
+    ):
         logger.warning(
             "Rejected WebSocket attach for terminal %r: disallowed Origin %r",
             terminal_id,

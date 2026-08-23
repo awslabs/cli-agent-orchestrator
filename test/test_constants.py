@@ -427,6 +427,120 @@ class TestOriginAuthorityMalformedInput:
             assert constants.is_http_origin_allowed("http://[", "localhost:9889") is False
 
 
+class TestSchemeAwareSameOrigin:
+    """Regression for #653 item 2: the same-origin branch compared authority
+    (``host[:port]``) only, so a request that arrived over HTTPS accepted a
+    plain-``http`` Origin as same-origin. Under RFC 6454 an origin is the
+    (scheme, host, port) triple, so ``http://h`` and ``https://h`` are
+    different origins and the downgrade should not match.
+
+    The check is deliberately one-directional. It rejects an ``http`` Origin on
+    an ``https`` request, which is unambiguous. It does NOT reject an ``https``
+    Origin on a request that merely *looks* plain-http to the server, because
+    that is the shape produced by an HTTPS-terminating proxy whose address is
+    not in ``TRUSTED_FORWARDER_IPS`` — uvicorn then ignores
+    ``X-Forwarded-Proto`` and reports ``scheme='http'`` for a request the
+    browser genuinely made over TLS. Rejecting that direction would break
+    working reverse-proxy and Codespaces deployments without closing a real
+    hole, since forging it requires already controlling the victim's own
+    origin over TLS.
+    """
+
+    def test_https_request_rejects_http_origin(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed(
+                    "http://localhost:8765", "localhost:8765", scheme="https"
+                )
+                is False
+            )
+
+    def test_https_request_accepts_https_origin(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed(
+                    "https://localhost:8765", "localhost:8765", scheme="https"
+                )
+                is True
+            )
+
+    def test_http_request_accepts_http_origin(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed(
+                    "http://localhost:8765", "localhost:8765", scheme="http"
+                )
+                is True
+            )
+
+    def test_untrusted_proxy_shape_still_allowed(self):
+        """``scheme='http'`` + an ``https`` Origin is the untrusted-proxy shape;
+        allowed deliberately so TLS-terminating deployments keep working."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed(
+                    "https://localhost:8765", "localhost:8765", scheme="http"
+                )
+                is True
+            )
+
+    def test_omitting_scheme_preserves_previous_behaviour(self):
+        """Callers that do not pass a scheme keep the pre-#653 semantics."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed("http://localhost:8765", "localhost:8765") is True
+            )
+
+    def test_explicit_allowlist_entry_is_not_scheme_gated(self):
+        """The scheme check guards the same-origin branch only; an operator who
+        lists an origin explicitly still gets it, as before."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:8765"]):
+            assert (
+                constants.is_http_origin_allowed(
+                    "http://localhost:8765", "localhost:8765", scheme="https"
+                )
+                is True
+            )
+
+    def test_ws_handshake_rejects_http_origin_over_wss(self):
+        """The WS scope reports ``wss``/``ws``, which map onto the ``https``/
+        ``http`` origin schemes the browser serializes."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "http://localhost:8765", "localhost:8765", scheme="wss"
+                    )
+                    is False
+                )
+
+    def test_ws_handshake_accepts_https_origin_over_wss(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "https://localhost:8765", "localhost:8765", scheme="wss"
+                    )
+                    is True
+                )
+
+
 class TestPipeLivenessCheckIntervalClamp:
     """Regression for the round-3 Copilot review on #397: PIPE_LIVENESS_CHECK_INTERVAL_S
     feeds ``threading.Event.wait(timeout)`` in the watchdog's poll loop
