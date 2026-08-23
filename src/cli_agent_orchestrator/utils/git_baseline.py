@@ -28,6 +28,7 @@ decided on.
 import hashlib
 import logging
 import os
+import stat
 import subprocess
 from typing import Any, Dict, Optional
 
@@ -36,6 +37,46 @@ logger = logging.getLogger(__name__)
 # Bounded so a hung git process cannot delay run start. Generous relative to the work — two local
 # invocations that read refs — because the point is to fail eventually, not quickly.
 _GIT_TIMEOUT_SECONDS = 10
+_HASH_CHUNK_BYTES = 64 * 1024
+
+_TRACKED_DIFF_ARGS = [
+    "-c",
+    "core.abbrev=40",
+    "-c",
+    "core.quotePath=true",
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "color.ui=false",
+    "-c",
+    "color.diff=false",
+    "-c",
+    "diff.renames=false",
+    "-c",
+    "diff.algorithm=myers",
+    "-c",
+    "diff.indentHeuristic=false",
+    "-c",
+    "diff.context=3",
+    "-c",
+    "diff.interHunkContext=0",
+    "-c",
+    "diff.submodule=short",
+    "diff",
+    "--binary",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--no-prefix",
+    "--no-renames",
+    "--diff-algorithm=myers",
+    "--no-indent-heuristic",
+    "--unified=3",
+    "--inter-hunk-context=0",
+    "--ignore-submodules=none",
+    "HEAD",
+    "--",
+]
 
 
 def _run_git(
@@ -74,7 +115,7 @@ def _run_git(
 
 def _worktree_state(cwd: str) -> Dict[str, str]:
     """Capture tracked and untracked changes without recording an absolute worktree path."""
-    tracked = _run_git(["diff", "--binary", "--no-ext-diff", "HEAD", "--"], cwd, text=False)
+    tracked = _run_git(_TRACKED_DIFF_ARGS, cwd, text=False)
     untracked = _run_git(["ls-files", "--others", "--exclude-standard", "-z"], cwd, text=False)
     if tracked is None or untracked is None:
         return {"status": "unavailable"}
@@ -92,15 +133,59 @@ def _worktree_state(cwd: str) -> Dict[str, str]:
             # ``git ls-files`` yields repository-relative paths. Refuse an unexpected path rather than
             # hashing outside the worktree if a repository changes beneath this snapshot operation.
             if relative_path.startswith(b"/") or b".." in relative_path.split(b"/"):
+                logger.debug(
+                    "git_baseline: invalid untracked path (baseline recorded absent): %r",
+                    relative_path,
+                )
                 return {"status": "unavailable"}
-            contents_path = os.path.join(os.fsencode(cwd), relative_path)
-            with open(contents_path, "rb") as untracked_file:
-                contents = untracked_file.read()
+
+            contents_path = os.fsencode(cwd)
+            path_components = relative_path.split(b"/")
+            for index, component in enumerate(path_components):
+                contents_path = os.path.join(contents_path, component)
+                if stat.S_ISLNK(os.lstat(contents_path).st_mode):
+                    if index != len(path_components) - 1:
+                        logger.debug(
+                            "git_baseline: untracked path has a symlinked parent "
+                            "(baseline recorded absent): %r",
+                            relative_path,
+                        )
+                        return {"status": "unavailable"}
+                    break
+
             digest.update(len(relative_path).to_bytes(8, "big"))
             digest.update(relative_path)
-            digest.update(len(contents).to_bytes(8, "big"))
-            digest.update(contents)
-    except OSError:
+            entry_mode = os.lstat(contents_path).st_mode
+            if stat.S_ISLNK(entry_mode):
+                link_payload = os.readlink(contents_path)
+                digest.update(b"S")
+                digest.update(len(link_payload).to_bytes(8, "big"))
+                digest.update(link_payload)
+                continue
+            if not stat.S_ISREG(entry_mode):
+                logger.debug(
+                    "git_baseline: invalid untracked entry (baseline recorded absent): %r",
+                    relative_path,
+                )
+                return {"status": "unavailable"}
+
+            digest.update(b"F")
+            content_length = 0
+            with open(contents_path, "rb") as untracked_file:
+                content_length = os.fstat(untracked_file.fileno()).st_size
+                digest.update(content_length.to_bytes(8, "big"))
+                while chunk := untracked_file.read(_HASH_CHUNK_BYTES):
+                    digest.update(chunk)
+                    content_length -= len(chunk)
+            if content_length != 0:
+                logger.debug(
+                    "git_baseline: untracked file changed while reading "
+                    "(baseline recorded absent): %r",
+                    relative_path,
+                )
+                return {"status": "unavailable"}
+    except OSError as e:
+        logger.debug("git_baseline: untracked entry unavailable (baseline recorded absent): %s", e)
         return {"status": "unavailable"}
 
     return {"status": "dirty", "digest": f"sha256:{digest.hexdigest()}"}

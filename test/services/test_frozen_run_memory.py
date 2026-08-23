@@ -262,7 +262,12 @@ def test_an_unknown_run_resolves_nothing(journalled_run, resolves):
 
 
 def test_an_unreadable_manifest_resolves_nothing(journalled_run, resolves):
-    workflow_journal.update_run_manifest(journalled_run, "{not json")
+    row = workflow_journal.get_run(journalled_run)
+    assert row is not None and row.manifest_json is not None
+    assert workflow_journal.compare_and_set_run_manifest(
+        journalled_run, row.manifest_json, "{not json"
+    )
+    assert not hasattr(workflow_journal, "update_run_manifest")
     assert frozen_run_memory.frozen_memory_for(journalled_run, "term-1", "task") is None
     assert resolves == []
 

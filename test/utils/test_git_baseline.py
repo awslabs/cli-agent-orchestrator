@@ -5,6 +5,8 @@ every failure mode — not a repository, ``git`` absent, unreadable directory, h
 recorded absence rather than raise or block. Four of the six tests here exist for that alone.
 """
 
+import builtins
+import os
 import subprocess
 
 from cli_agent_orchestrator.utils import git_baseline
@@ -69,12 +71,115 @@ def test_untracked_file_contents_affect_worktree_state(tmp_path):
     assert baseline_a["worktree_state"] != baseline_b["worktree_state"]
 
 
+def test_untracked_file_is_hashed_in_bounded_chunks(monkeypatch, tmp_path):
+    _initialise_repository(tmp_path)
+    hash_chunk_bytes = 64 * 1024
+    contents = b"x" * (hash_chunk_bytes * 2 + 1)
+    untracked_path = tmp_path / "untracked.bin"
+    untracked_path.write_bytes(contents)
+    read_sizes = []
+    actual_open = builtins.open
+
+    class _TrackingFile:
+        def __init__(self, file):
+            self._file = file
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return self._file.read(size)
+
+        def __getattr__(self, name):
+            return getattr(self._file, name)
+
+        def __enter__(self):
+            self._file.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._file.__exit__(*args)
+
+    def _track_untracked_open(path, *args, **kwargs):
+        opened = actual_open(path, *args, **kwargs)
+        if os.fsencode(path) == os.fsencode(untracked_path):
+            return _TrackingFile(opened)
+        return opened
+
+    monkeypatch.setattr(builtins, "open", _track_untracked_open)
+
+    baseline = git_baseline.derive_baseline(str(tmp_path))
+
+    assert baseline["worktree_state"]["status"] == "dirty"
+    assert read_sizes
+    assert -1 not in read_sizes
+    assert all(read_size == hash_chunk_bytes for read_size in read_sizes)
+
+
+def test_untracked_file_symlink_hashes_link_payload_without_dereferencing(tmp_path):
+    _initialise_repository(tmp_path)
+    external = tmp_path.parent / "external.txt"
+    external.write_text("one", encoding="utf-8")
+    link = tmp_path / "untracked-link"
+    link.symlink_to(external)
+
+    before = git_baseline.derive_baseline(str(tmp_path))
+    external.write_text("two", encoding="utf-8")
+    after_external_target_change = git_baseline.derive_baseline(str(tmp_path))
+
+    replacement = tmp_path.parent / "replacement.txt"
+    replacement.write_text("two", encoding="utf-8")
+    link.unlink()
+    link.symlink_to(replacement)
+    after_link_retarget = git_baseline.derive_baseline(str(tmp_path))
+
+    assert before["worktree_state"] == after_external_target_change["worktree_state"]
+    assert before["worktree_state"] != after_link_retarget["worktree_state"]
+
+
+def test_untracked_directory_symlink_does_not_collapse_dirty_state(tmp_path):
+    _initialise_repository(tmp_path)
+    external_directory = tmp_path.parent / "external-directory"
+    external_directory.mkdir()
+    (tmp_path / "untracked-directory").symlink_to(external_directory, target_is_directory=True)
+    (tmp_path / "dirty.txt").write_text("one", encoding="utf-8")
+
+    first = git_baseline.derive_baseline(str(tmp_path))
+    (tmp_path / "dirty.txt").write_text("two", encoding="utf-8")
+    second = git_baseline.derive_baseline(str(tmp_path))
+
+    assert first["worktree_state"]["status"] == "dirty"
+    assert first["worktree_state"] != second["worktree_state"]
+
+
+def test_worktree_state_ignores_local_diff_presentation_settings(tmp_path):
+    _initialise_repository(tmp_path)
+    (tmp_path / "f.txt").write_text("two\nthree\nfour\n", encoding="utf-8")
+
+    baseline_without_settings = git_baseline.derive_baseline(str(tmp_path))
+    for key, value in (
+        ("diff.context", "0"),
+        ("diff.interHunkContext", "99"),
+        ("diff.algorithm", "histogram"),
+        ("diff.indentHeuristic", "true"),
+        ("diff.noprefix", "true"),
+        ("diff.mnemonicPrefix", "true"),
+        ("diff.renames", "true"),
+        ("diff.submodule", "log"),
+        ("core.quotePath", "false"),
+        ("core.autocrlf", "true"),
+        ("color.diff", "always"),
+    ):
+        subprocess.run(["git", "config", key, value], cwd=tmp_path, check=True)
+    baseline_with_settings = git_baseline.derive_baseline(str(tmp_path))
+
+    assert baseline_with_settings["worktree_state"] == baseline_without_settings["worktree_state"]
+
+
 def test_records_an_unavailable_worktree_state_explicitly(monkeypatch, tmp_path):
     _initialise_repository(tmp_path)
     actual_run_git = git_baseline._run_git
 
     def _unavailable_after_head(args, cwd, **kwargs):
-        if args[:2] == ["diff", "--binary"]:
+        if "diff" in args:
             return None
         return actual_run_git(args, cwd, **kwargs)
 
