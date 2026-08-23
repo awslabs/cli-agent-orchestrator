@@ -61,7 +61,9 @@ def _validate_relative_posix_path(value: str, *, key: str, charset: bool) -> str
     if "\x00" in value:
         raise ValueError(f"{key} must not contain a NUL byte")
     if "\\" in value or value.startswith("/") or value.endswith("/"):
-        raise ValueError(f"{key} must be a relative POSIX path without a trailing separator")
+        raise ValueError(
+            f"{key} must be a relative POSIX path without a trailing separator"
+        )
 
     segments = value.split("/")
     if any(not segment for segment in segments):
@@ -76,7 +78,9 @@ def _validate_relative_posix_path(value: str, *, key: str, charset: bool) -> str
 
 def _comparison_key(path: str) -> str:
     """Return a conservative textual fallback for paths without usable stats."""
-    return unicodedata.normalize("NFC", os.path.normcase(os.path.normpath(path))).casefold()
+    return unicodedata.normalize(
+        "NFC", os.path.normcase(os.path.normpath(path))
+    ).casefold()
 
 
 def _same_path(left: str, right: str) -> bool:
@@ -86,7 +90,10 @@ def _same_path(left: str, right: str) -> bool:
         right_stat = os.stat(right)
     except OSError:
         return _comparison_key(left) == _comparison_key(right)
-    return (left_stat.st_dev, left_stat.st_ino) == (right_stat.st_dev, right_stat.st_ino)
+    return (left_stat.st_dev, left_stat.st_ino) == (
+        right_stat.st_dev,
+        right_stat.st_ino,
+    )
 
 
 def _is_path_prefix(prefix: str, candidate: str) -> bool:
@@ -137,7 +144,9 @@ class FolderMapping(BaseModel):
         if value is None:
             return value
         if not _SCOPE_ID_RE.fullmatch(value) or set(value) == {"."}:
-            raise ValueError("scope_id must match ^[a-zA-Z0-9._-]{1,128}$ and not be only dots")
+            raise ValueError(
+                "scope_id must match ^[a-zA-Z0-9._-]{1,128}$ and not be only dots"
+            )
         return value
 
     @model_validator(mode="after")
@@ -188,8 +197,14 @@ class VaultSpec(BaseModel):
         for pattern in value:
             if not isinstance(pattern, str) or not pattern:
                 raise ValueError("exclude patterns must be non-empty strings")
-            if pattern.startswith("/") or "\\" in pattern or ".." in pattern.split("/"):
-                raise ValueError("exclude patterns must be relative and not contain '..'")
+            if (
+                pattern.startswith("/")
+                or "\\" in pattern
+                or any(segment in (".", "..") for segment in pattern.split("/"))
+            ):
+                raise ValueError(
+                    "exclude patterns must be relative and not contain '.' or '..' path segments"
+                )
         return value
 
     @field_validator("max_note_bytes")
@@ -205,7 +220,9 @@ class VaultSpec(BaseModel):
     @field_validator("max_frontmatter_bytes")
     @classmethod
     def validate_max_frontmatter_bytes(cls, value: int) -> int:
-        return _validate_bounded_int(value, "max_frontmatter_bytes", MAX_FRONTMATTER_BYTES_LIMIT)
+        return _validate_bounded_int(
+            value, "max_frontmatter_bytes", MAX_FRONTMATTER_BYTES_LIMIT
+        )
 
     @model_validator(mode="after")
     def validate_vault_rules(self) -> "VaultSpec":
@@ -233,7 +250,9 @@ class VaultSpec(BaseModel):
         ]
         writable = [mapping for mapping in self.mappings if mapping.writable]
         if len(containing) != 1 or not containing[0].writable:
-            raise ValueError("managed_folder must lie inside exactly one writable mapping")
+            raise ValueError(
+                "managed_folder must lie inside exactly one writable mapping"
+            )
         if len(writable) != 1:
             raise ValueError("only the managed_folder mapping may be writable")
 
@@ -244,7 +263,11 @@ class VaultSpec(BaseModel):
 
 
 def _validate_bounded_int(value: int, key: str, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= maximum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 < value <= maximum
+    ):
         raise ValueError(f"{key} must be a positive integer no greater than {maximum}")
     return value
 
@@ -262,7 +285,9 @@ class VaultConfig(BaseModel):
     @field_validator("max_recall_body_chars")
     @classmethod
     def validate_max_recall_body_chars(cls, value: int) -> int:
-        return _validate_bounded_int(value, "max_recall_body_chars", MAX_RECALL_BODY_CHARS_LIMIT)
+        return _validate_bounded_int(
+            value, "max_recall_body_chars", MAX_RECALL_BODY_CHARS_LIMIT
+        )
 
     @model_validator(mode="after")
     def validate_config_rules(self) -> "VaultConfig":

@@ -31,9 +31,12 @@ attachments, duplicate titles, plugin metadata — each fail differently:
 ## Decision
 
 **Every construct is classified into exactly one of three buckets — supported,
-degraded-with-a-finding, or refused-with-a-finding — and every non-supported
-construct emits a typed finding code that surfaces in
-`cao memory vault status --format json`. Nothing is dropped without a code.**
+degraded-with-a-finding, or refused-with-a-finding. Every non-supported construct
+that reaches parsing, scanning, or reconciliation emits a typed finding code that
+surfaces in `cao memory vault status --format json`. Candidate filters that never
+reach those stages — `http(s)` Markdown links, `.canvas` files, and
+always-excluded paths — are intentionally refused without a finding because CAO
+does not treat them as notes or link-resolution inputs.**
 
 The classification is data, not scattered conditionals: it lives in
 `vault/findings.py` as the single table below, so the parser, the link resolver, the
@@ -49,10 +52,10 @@ status view and the documentation cannot drift.
 | `[[Note#Heading]]` | Degraded | Note-level edge; heading recorded in `attributes_json` as `{"fragment": "Heading"}`; not resolved to a block | `heading_fragment_ignored` (info) |
 | `[[Note#^blockid]]` | Refused | No edge | `block_reference_unsupported` (info) |
 | `![[Note]]` embed | Degraded | `relates_to` edge with `{"embed": true}`; embedded body **not** inlined into indexed content | `embed_not_inlined` (info) |
-| `![[image.png]]` and any non-`.md` embed | Refused | No edge, not indexed | `attachment_ignored` (info) |
+| `![[image.png]]` and any non-`.md` embed with no matching note candidate | Refused | No edge, not indexed. Attachment classification runs only after note-candidate matching, so a real note named `Node.js Notes.md` remains resolvable. | `attachment_ignored` (info) |
 | `aliases:` frontmatter | Supported, resolution only | Read as link-resolution input; **never** identity, never a CAO key | — |
 | Alias matching two notes in one scope | Refused | No edge | `alias_ambiguous` (warn) |
-| Duplicate note basenames | Supported for identity, refused for bare links | `cao.key` (or the path-derived fallback) disambiguates identity; a bare `[[Basename]]` with more than one candidate produces no edge; a path-qualified link still resolves | `link_ambiguous` (warn) |
+| Duplicate note basenames | Refused | A bare `[[Basename]]` with more than one candidate produces no edge; a path-qualified link still resolves | `link_ambiguous` (warn) |
 | Duplicate `cao.key` in one scope | Refused, both notes | Both quarantined, neither indexed | `key_collision` (error) |
 | Link to a note in no mapped folder or an excluded path | Refused | No edge | `link_excluded` (info) |
 | Link to a nonexistent note | Refused | No edge | `link_dangling` (info) |
@@ -70,14 +73,21 @@ status view and the documentation cannot drift.
 | `.canvas` files | Refused | Not a `.md` file; never a candidate | — |
 | `.obsidian/`, `.trash/`, `.git/`, `_cao-*` | Refused | Never scanned; not configurable | — |
 | Any symlinked path component below the root | Refused | Not indexed | `symlink_refused` (error) |
-| Sync-conflict filenames (`*.sync-conflict-*`, `* conflicted copy *`, `*.icloud`, `.~lock.*`) | Refused | Never a candidate | `sync_artifact_skipped` (info) |
+| Sync-conflict filenames (`*.sync-conflict-*`, `*conflicted copy*`, `*.icloud`, `.~lock.*`) | Refused | Never a candidate; this includes Dropbox names such as `A (conflicted copy 2024).md` | `sync_artifact_skipped` (info) |
 | Two paths differing only by case, on a case-insensitive filesystem | Refused, both | Both quarantined | `path_case_collision` (error) |
 | A candidate whose `st_nlink > 1` (hardlink) | Refused unless the mapping sets `allow_hardlinks` | Not indexed | `hardlink_refused` (warn) |
 | A `memory_metadata.file_path` that does not resolve under the vault root | Refused at the sink | Row skipped, recall continues | `path_escapes_root` (warn) |
 | Note whose bytes are not valid UTF-8 | Refused | Quarantined, never lossily decoded | `note_not_utf8` (error) |
-| Note body matching a `secret_gate` pattern, at reconcile | Refused under `secret_gate: "reject"` (the **default**); reported-only under `"warn"` | `reject` quarantines; `warn` indexes and records the finding. **The finding is reported in BOTH modes** — the mode changes whether the note is indexed, never whether the operator is told. The finding carries the matched **pattern name** only, never the matched bytes | `secret_detected` (error under `reject`, warn under `warn`) |
+| Note frontmatter or body matching a `secret_gate` pattern, at reconcile | Refused under `secret_gate: "reject"` (the **default**); reported-only under `"warn"` | `reject` quarantines; `warn` indexes and records the finding. **The finding is reported in BOTH modes** — the mode changes whether the note is indexed, never whether the operator is told. The finding carries the matched **pattern name** only, never the matched bytes | `secret_detected` (error under `reject`, warn under `warn`) |
 | Two distinct paths producing the same derived key | Refused, both | Both quarantined; `detail` flags `derived` to distinguish it from an authored duplicate | `key_collision` (error) |
 | Note whose size or mtime changes across the stability check | Deferred | Skipped this run; the prior row is left intact | `unstable_skipped` (warn) |
+| More than 1000 body wikilinks | Degraded | First 1000 links retained | `link_limit_exceeded` (warn) |
+| Oversize or control-character link target | Refused | No edge | `link_target_invalid` (warn) |
+| Aggregate scan byte budget exceeded | Deferred | Remaining candidates skipped | `byte_budget_exceeded` (warn) |
+| Configured note-count limit exceeded | Deferred | Remaining candidates skipped | `note_limit_exceeded` (warn) |
+| Missing mapping folder | Deferred | Mapping skipped | `mapping_folder_missing` (warn) |
+| Unreadable mapping folder | Deferred | Mapping skipped | `mapping_folder_unreadable` (warn) |
+| NUL byte in otherwise-valid UTF-8 note text | Refused | Note quarantined | `note_contains_nul` (error) |
 
 ### Rules that generalize the table
 

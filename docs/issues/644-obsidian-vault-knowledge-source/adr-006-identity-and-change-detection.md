@@ -43,8 +43,11 @@ changed key silently orphans edges rather than failing loudly.
 ### Identity
 
 **`cao.key` in frontmatter is canonical. Absent it, the key is derived deterministically
-from the mapping-relative path with a stable digest suffix. Rename is absorbed by a
-content-hash alias table, never by writing to an unmanaged note.**
+from the filename stem with a digest of the complete mapping-relative path. This is a
+decided divergence from the earlier path-prefix design: the key is a graph-node label
+rendered in the dashboard and MCP Apps views, so a stem leaks less vault structure while
+the digest preserves uniqueness and determinism. Rename is absorbed by a content-hash alias
+table, never by writing to an unmanaged note.**
 
 1. **`cao.key` present** — that is the key. It survives any rename, any move between
    folders in the same mapping, and any title change, because nothing about the path
@@ -53,8 +56,8 @@ content-hash alias table, never by writing to an unmanaged note.**
 2. **`cao.key` absent** — the key is derived as:
 
    ```
-   stem   = sanitize(mapping_relative_path_without_extension)   # separators -> '-'
-   digest = sha256(mapping_relative_path_bytes) hex [:8]
+   stem   = sanitize(filename_stem_without_extension)
+   digest = sha256(NFC_normalized_mapping_relative_path_bytes) hex [:8]
    key    = stem[:51] + '-' + digest
    ```
 
@@ -70,10 +73,10 @@ content-hash alias table, never by writing to an unmanaged note.**
      later. That is what distinguishes it from the arbitrary disambiguating suffix this
      ADR rejects for user-authored `cao.key` duplicates below, and it is why applying a
      digest here is not inconsistent with refusing one there.
-   - **It is mapping-relative, not vault-relative**, so the key does not encode the
-     mapping's own folder prefix. Renaming a mapped folder in configuration therefore
-     does not rewrite every key beneath it, and the stem has more of its 51 characters
-     available for the part that distinguishes notes.
+   - **Its digest is mapping-relative, not vault-relative**, so renaming a mapped folder
+     in configuration does not rewrite every key beneath it. The readable prefix is the
+     filename stem rather than the relative path, deliberately avoiding directory-structure
+     disclosure through graph labels while retaining the full path in the digest.
 
    The cost is readability: `retrieval-path-a1b2c3d4` rather than `retrieval-path`. That
    is the intended incentive — a user who wants a clean, stable, readable key sets
@@ -140,6 +143,13 @@ Three signals, cheapest first:
 3. `content_sha256` — authoritative. `frontmatter_sha256` is recorded separately so a
    metadata-only change can skip body re-tokenization.
 
+**Text preparation is part of identity, not merely presentation.** A single leading UTF-8
+BOM is stripped before frontmatter recognition, parsing, and hashing. Line endings are
+normalized to `\n` before parsing as well as before hashing; otherwise a CRLF frontmatter
+delimiter can be missed and the same note acquires different parsed metadata on different
+platforms. Consequently `content_sha256` and `frontmatter_sha256` are calculated from the
+same normalized, BOM-free text seen by the parser.
+
 **Stability check, for partial and half-synced files.** Before hashing: `stat`, read,
 `stat` again. If `(size_bytes, mtime_ns)` changed across the read, retry up to three
 times with a short backoff, then mark `unstable_skipped` (warn) and leave the prior row
@@ -165,9 +175,11 @@ check are designed against each other rather than by accident.
 `memory_relationships WHERE origin = 'vault'`, then runs a full reconcile. Six conditions
 must hold, each with a named test:
 
-1. **Traversal order is sorted, never filesystem order.** `scan.py` collects paths then
-   sorts by the POSIX relative path as bytes. `os.scandir` order varies by filesystem, by
-   inode allocation and by creation sequence.
+1. **Traversal order is sorted, never filesystem order.** `scan.py` NFC-normalizes each
+   POSIX relative path before sorting its UTF-8 bytes. This is load-bearing: `readdir`
+   commonly returns NFD on macOS and NFC on Linux, so sorting before NFC normalization
+   would reconcile the same vault in a different order on the two platforms. `os.scandir`
+   order also varies by filesystem, inode allocation, and creation sequence.
 2. **Every identifier this design controls is derived, not minted.** `note_uid`, vault
    `memory_metadata.id`, and `vault_finding.id` (=
    `sha256(reconcile_run_id \0 code \0 vault_relpath)`) are digests. No `uuid4` on the
@@ -180,10 +192,11 @@ must hold, each with a named test:
    and never case-folded. Two paths differing only by case are both quarantined with
    `path_case_collision`. Case-folding would silently merge two distinct notes on a
    case-sensitive filesystem.
-5. **Text normalization is fixed before hashing.** Content is read as UTF-8 with errors
-   surfaced (a non-UTF-8 note is quarantined, not lossily decoded), and line endings are
-   normalized to `\n` before hashing, so the same note produces the same hash after a
-   checkout on another platform.
+5. **Text normalization is fixed before parsing and hashing.** Content is read as UTF-8
+   with errors surfaced (a non-UTF-8 note is quarantined, not lossily decoded); one leading
+   BOM is stripped and line endings are normalized to `\n` before both operations, so the
+   same note produces the same parsed frontmatter and hashes after a checkout on another
+   platform.
 6. **Findings are sorted by `(code, vault_relpath)`** before insertion.
 
 **What this design does not control, and therefore cannot make byte-deterministic.**

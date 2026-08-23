@@ -70,7 +70,9 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             2,
-            lambda document, root: document["vaults"].append(deepcopy(document["vaults"][0])),
+            lambda document, root: document["vaults"].append(
+                deepcopy(document["vaults"][0])
+            ),
             "only one vault",
         ),
         (
@@ -80,7 +82,9 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             4,
-            lambda document, root: document["vaults"][0].update(root=str(root / "missing")),
+            lambda document, root: document["vaults"][0].update(
+                root=str(root / "missing")
+            ),
             "root",
         ),
         (
@@ -90,7 +94,9 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             7,
-            lambda document, root: document["vaults"][0]["mappings"][1].update(folder="../escape"),
+            lambda document, root: document["vaults"][0]["mappings"][1].update(
+                folder="../escape"
+            ),
             "folder",
         ),
         (
@@ -100,22 +106,30 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             9,
-            lambda document, root: document["vaults"][0]["mappings"][1].update(folder="CAO/nested"),
+            lambda document, root: document["vaults"][0]["mappings"][1].update(
+                folder="CAO/nested"
+            ),
             "must not overlap",
         ),
         (
             10,
-            lambda document, root: document["vaults"][0].update(managed_folder="Unmapped"),
+            lambda document, root: document["vaults"][0].update(
+                managed_folder="Unmapped"
+            ),
             "managed_folder",
         ),
         (
             11,
-            lambda document, root: document["vaults"][0]["mappings"][1].update(scope="federated"),
+            lambda document, root: document["vaults"][0]["mappings"][1].update(
+                scope="federated"
+            ),
             "scope",
         ),
         (
             12,
-            lambda document, root: document["vaults"][0]["mappings"][0].update(scope_id="..."),
+            lambda document, root: document["vaults"][0]["mappings"][0].update(
+                scope_id="..."
+            ),
             "scope_id",
         ),
         (
@@ -127,7 +141,9 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             14,
-            lambda document, root: document["vaults"][0].update(exclude=["../Private/**"]),
+            lambda document, root: document["vaults"][0].update(
+                exclude=["../Private/**"]
+            ),
             "exclude",
         ),
         (
@@ -187,6 +203,28 @@ def test_rule_7_rejects_dot_segments_that_bypass_mapping_overlap(tmp_path, folde
 def test_rule_9_casefolds_mapping_paths_before_prefix_comparison():
     assert vault_config._is_path_prefix("CAO", "cao")
     assert vault_config._is_path_prefix("Références", "Références")
+
+
+@pytest.mark.parametrize("pattern", ["./Private/**", "Private/./**", "."])
+def test_rule_14_rejects_dot_segments_in_exclude_patterns(tmp_path, pattern):
+    document = _document(str(tmp_path))
+    document["vaults"][0]["exclude"] = [pattern]
+
+    with pytest.raises(ValidationError) as exc_info:
+        _load(document)
+
+    assert exc_info.value.errors()[0]["msg"] == (
+        "Value error, exclude patterns must be relative and not contain '.' or '..' path segments"
+    )
+
+
+def test_rule_14_accepts_normal_relative_exclude_pattern(tmp_path):
+    document = _document(str(tmp_path))
+    document["vaults"][0]["exclude"] = ["Private/**"]
+
+    config = _load(document)
+
+    assert config.vaults[0].exclude == ["Private/**"]
 
 
 def test_rule_6_rejects_graph_export_root_overlap(tmp_path, monkeypatch):
@@ -270,11 +308,15 @@ def test_rule_20_warn_and_inject_loads_with_persistent_warning(tmp_path, caplog)
 
     config = _load(document)
 
-    assert config.warnings == ("mapping 'References' has secret_gate='warn' with inject=true",)
+    assert config.warnings == (
+        "mapping 'References' has secret_gate='warn' with inject=true",
+    )
     assert "secret_gate='warn' with inject=true" in caplog.text
 
 
-def test_recall_budget_warns_when_it_exceeds_the_injection_scope_budget(tmp_path, caplog):
+def test_recall_budget_warns_when_it_exceeds_the_injection_scope_budget(
+    tmp_path, caplog
+):
     _load(_document(str(tmp_path)))
 
     assert "exceeds the injection scope budget" in caplog.text

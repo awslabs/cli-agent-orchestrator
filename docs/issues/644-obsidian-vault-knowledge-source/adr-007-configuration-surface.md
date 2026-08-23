@@ -109,11 +109,14 @@ Every rule raises with a message naming the offending key. None sanitizes and co
 5. `root` must not be, contain, or be contained by `MEMORY_BASE_DIR` or `CAO_HOME_DIR`.
    Overlap would make the native store and the vault the same bytes — the
    two-writable-replicas outcome the issue forbids — and would let a reconcile treat
-   CAO's own wiki as user notes.
+   CAO's own wiki as user notes. This check walks existing parent paths through
+   `_same_path`, comparing `(st_dev, st_ino)` when both paths can be statted and falling
+   back to NFC-normalized, casefolded text only when they cannot.
 6. `root` must not be the user's home directory itself, and must not resolve under
    `graph_export_root()`. The latter closes the loop where the Obsidian graph sink's
    output directory is also a read source, so a one-way projection cannot be mistaken for
-   canonical content.
+   canonical content. The home-directory prohibition is a direct comparison with the
+   resolved home path; graph-export overlap uses the rule-5 `_same_path` walk.
 7. **`mappings[].folder` — shape and containment, no charset allowlist.** Each is a
    relative POSIX path. Rejected: absolute paths, any `..` segment, any NUL byte, any
    empty segment, and a trailing separator. Accepted: spaces, apostrophes, commas,
@@ -135,6 +138,9 @@ Every rule raises with a message naming the offending key. None sanitizes and co
    to pick a name from `[A-Za-z0-9._-]`, which is a one-time cost on a folder CAO creates,
    not a restriction on their existing vault.
 9. **No mapping folder may be a prefix of another.** Overlap gives a note two scopes.
+   This is a mapping-relative textual comparison: both paths are normalized, then NFC
+   normalized and casefolded by `_is_path_prefix`; it does not use filesystem inode
+   identity.
 10. `managed_folder` must lie inside exactly one mapping, and that mapping must have
     `writable: true`. In release one no other mapping may set `writable: true`.
 11. `mappings[].scope` is restricted to `global`, `project` and `agent`. `federated` and
@@ -143,9 +149,13 @@ Every rule raises with a message naming the offending key. None sanitizes and co
     `MemoryScopeId` pattern `^[a-zA-Z0-9._-]{1,128}$`, and must not consist solely of
     dots. It is forbidden for `global`, which resolves to `None` by contract.
 13. Two mappings may not resolve to the same `(scope, scope_id)`.
-14. `exclude` patterns are POSIX globs matched against the vault-relative path. A pattern
-    containing `..` or an absolute prefix is rejected. Character content is otherwise
-    unrestricted, for the same reason as rule 7.
+14. `exclude` patterns use casefolded `fnmatch` semantics against the vault-relative path,
+    rather than POSIX-glob semantics. A `**/`-prefixed pattern also matches at the vault
+    root (so `**/*.excalidraw.md` excludes both root-level and nested matches), where plain
+    `fnmatch` would require a separator. Casefolding is deliberate: over-exclusion fails
+    safe, while under-exclusion is a confidentiality failure. A pattern with an absolute
+    prefix, a backslash, a `.` path segment, or a `..` path segment is rejected. Character
+    content is otherwise unrestricted, for the same reason as rule 7.
 15. `index: false` with `inject: true` is an error
     ([adr-005-index-vs-injection-policies.md](adr-005-index-vs-injection-policies.md)).
 16. `secret_gate` is **per mapping**, is `"reject"` (the default) or `"warn"`, and
@@ -173,10 +183,12 @@ Every rule raises with a message naming the offending key. None sanitizes and co
     fires at load and `status` names it for as long as it holds. Full reasoning in rule 20.
 17. `allow_hardlinks` is a bool, default `false`.
 18. `max_note_bytes`, `max_notes`, `max_frontmatter_bytes` and `max_recall_body_chars`
-    are positive integers with documented defaults, and are capped so a configuration
-    cannot disable the denial-of-service protections or the recall body budget.
-19. Always-excluded paths — `.obsidian/`, `.trash/`, `.git/`, `_cao-*` — are applied
-    unconditionally and are not expressible in, or removable by, `exclude`.
+    are positive integers with documented defaults and finite shipped ceilings:
+    `1,048,576`, `100,000`, `65,536`, and `65,536` respectively. A configuration cannot
+    disable the denial-of-service protections or the recall body budget.
+19. U1 ships always-excluded paths — `.obsidian/`, `.trash/`, `.git/`, `_cao-*` — as
+    immutable configuration data; U4 applies that data during candidate traversal. They are
+    unconditional and are not expressible in, or removable by, `exclude`.
 20. **`secret_gate: "warn"` together with `inject: true` is a config-load WARNING, not an
     error, and is named permanently in `status`.** That pairing is the maximal-exposure
     combination in the schema: a note the gate flagged as credential-shaped, indexed anyway,
@@ -218,6 +230,9 @@ Three changes, of which only the first is a code rule and the other two are surf
    `status`-visible `unmapped_project_write` counter. It is **not** a hard error: a second,
    legitimately-native project is indistinguishable from a churned id, so refusing would
    break ordinary multi-project use. Removing the silence is what satisfies the Non-Goal.
+   The shipped counter is process-local only, so a separate CLI `status` process cannot
+   present it as a durable count. U8 owns both the write-path call site and the decision
+   about a durable record.
 
 **Documented recommendation, not a rule:** a mapping with `scope: project` should pin
 `memory.project_id` (or rely on a git remote), because cwd-hash identity breaks on folder
