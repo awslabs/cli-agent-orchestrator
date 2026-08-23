@@ -571,7 +571,9 @@ class TestPipeLivenessWatchdog:
 
         def gone_probe():
             probe_calls.append(True)
-            raise RuntimeError("No objects found: session gone")  # mimics libtmux ObjectDoesNotExist
+            raise RuntimeError(
+                "No objects found: session gone"
+            )  # mimics libtmux ObjectDoesNotExist
 
         manager._pane_probe["term"] = gone_probe
         manager._rearm["term"] = lambda: None
@@ -583,7 +585,9 @@ class TestPipeLivenessWatchdog:
             manager._check_pipe_liveness("term")  # must not raise
 
         assert len(probe_calls) == 3
-        assert "term" not in manager._pane_probe, "gone terminal must be dropped after the probe-failure cap"
+        assert (
+            "term" not in manager._pane_probe
+        ), "gone terminal must be dropped after the probe-failure cap"
         assert "term" not in manager._rearm
         assert "term" not in manager._probe_failures
 
