@@ -234,7 +234,7 @@ class MemoryRelationshipModel(Base):
     target_key = Column(String, nullable=False)
     # Closed taxonomy reusing the graph EdgeType values.
     type = Column(String, nullable=False)  # relates_to | contradiction | supersedes
-    # compiler | wiki_lint | human | legacy_related_keys | external_import(reserved)
+    # compiler | wiki_lint | human | legacy_related_keys | external_import(reserved) | vault
     origin = Column(String, nullable=False)
     # active | proposal | rejected | superseded | deleted (auditable soft-delete)
     status = Column(String, nullable=False, default="active")

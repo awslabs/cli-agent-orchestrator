@@ -86,6 +86,10 @@ class HealConflictError(HealError):
     """Raised when the ``.heal.lock`` cannot be acquired (another heal runs)."""
 
 
+class VaultBoundScopeError(HealError):
+    """Raised when native maintenance is asked to mutate a vault-backed scope."""
+
+
 # -----------------------------------------------------------------------------
 # Frozen dataclasses
 # -----------------------------------------------------------------------------
@@ -779,6 +783,13 @@ async def heal(
     if not _is_memory_enabled():
         raise MemoryDisabledError(
             "memory is disabled (memory.enabled=false); refusing to heal wiki"
+        )
+
+    from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+    if isinstance(resolve(scope, scope_id), VaultBinding):
+        raise VaultBoundScopeError(
+            "vault-bound scope cannot be healed; reconcile the vault instead"
         )
 
     if svc is None:

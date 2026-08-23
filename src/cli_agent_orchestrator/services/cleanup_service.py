@@ -4,7 +4,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
+from cli_agent_orchestrator.clients.database import (
+    InboxModel,
+    SessionLocal,
+    TerminalModel,
+)
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
     MEMORY_BASE_DIR,
@@ -31,7 +35,9 @@ def cleanup_old_data():
         # Clean up old terminals (stop FIFO readers and clear state first)
         with SessionLocal() as db:
             old_terminals = (
-                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
+                db.query(TerminalModel)
+                .filter(TerminalModel.last_active < cutoff_date)
+                .all()
             )
             retained_terminal_ids: set[str] = set()
             for terminal in old_terminals:
@@ -46,9 +52,12 @@ def cleanup_old_data():
                 ):
                     retained_terminal_ids.add(terminal.id)
                     logger.warning(
-                        "Retaining stale Grok terminal %s while cleanup is deferred", terminal.id
+                        "Retaining stale Grok terminal %s while cleanup is deferred",
+                        terminal.id,
                     )
-            terminal_query = db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date)
+            terminal_query = db.query(TerminalModel).filter(
+                TerminalModel.last_active < cutoff_date
+            )
             if retained_terminal_ids:
                 deleted_terminals = terminal_query.filter(
                     ~TerminalModel.id.in_(retained_terminal_ids)
@@ -61,7 +70,9 @@ def cleanup_old_data():
         # Clean up old inbox messages
         with SessionLocal() as db:
             deleted_messages = (
-                db.query(InboxModel).filter(InboxModel.created_at < cutoff_date).delete()
+                db.query(InboxModel)
+                .filter(InboxModel.created_at < cutoff_date)
+                .delete()
             )
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")
@@ -130,15 +141,33 @@ async def cleanup_expired_memories() -> None:
 
         # Lazy-import to avoid circular imports at module level
         from cli_agent_orchestrator.services.memory_service import MemoryService
+        from cli_agent_orchestrator.services.vault.binding import (
+            ScopeBinding,
+            VaultBinding,
+            VaultConfigUnavailableError,
+            _load_vault_config,
+            resolve,
+        )
 
         memory_service = MemoryService(base_dir=MEMORY_BASE_DIR)
+        try:
+            vault_config = _load_vault_config()
+        except VaultConfigUnavailableError as exc:
+            logger.warning("vault-bound memory retention refused: %s", exc)
+            return
+        resolved_bindings: dict[tuple[str, str | None], ScopeBinding] = {}
+        refused_bindings: set[tuple[str, str | None]] = set()
 
         # Walk project dirs: {MEMORY_BASE_DIR}/{project_dir}/wiki/index.md
         # Glob and parse are sync I/O; offload to a thread so the event
         # loop stays responsive when there are many projects.
-        index_paths = await asyncio.to_thread(lambda: list(MEMORY_BASE_DIR.glob("*/wiki/index.md")))
+        index_paths = await asyncio.to_thread(
+            lambda: list(MEMORY_BASE_DIR.glob("*/wiki/index.md"))
+        )
         for index_path in index_paths:
-            expired_entries = await asyncio.to_thread(_find_expired_entries, index_path, now)
+            expired_entries = await asyncio.to_thread(
+                _find_expired_entries, index_path, now
+            )
             if not expired_entries:
                 continue
 
@@ -146,7 +175,11 @@ async def cleanup_expired_memories() -> None:
             # "global"/"federated" dirs → scope_id=None (flat, machine-wide),
             # project hash dirs → scope_id=hash
             project_dir_name = index_path.parent.parent.name
-            scope_id = None if project_dir_name in ("global", "federated") else project_dir_name
+            scope_id = (
+                None
+                if project_dir_name in ("global", "federated")
+                else project_dir_name
+            )
 
             for entry in expired_entries:
                 try:
@@ -155,6 +188,25 @@ async def cleanup_expired_memories() -> None:
                     # files resolve correctly. Fall back to the
                     # container's scope_id otherwise.
                     effective_scope_id = entry.get("scope_id") or scope_id
+                    binding_key = (entry["scope"], effective_scope_id)
+                    resolved_binding = resolved_bindings.get(binding_key)
+                    if resolved_binding is None:
+                        resolved_binding = resolve(
+                            entry["scope"],
+                            effective_scope_id,
+                            vault_config=vault_config,
+                        )
+                        resolved_bindings[binding_key] = resolved_binding
+
+                    if isinstance(resolved_binding, VaultBinding):
+                        if binding_key not in refused_bindings:
+                            logger.warning(
+                                "vault-bound memory retention refused scope=%s scope_id=%s",
+                                entry["scope"],
+                                effective_scope_id,
+                            )
+                            refused_bindings.add(binding_key)
+                        continue
                     # ``forget()`` is declared async but its body is
                     # sync FS work (unlink + flock + index rewrite).
                     # Offload to a thread so the event loop stays

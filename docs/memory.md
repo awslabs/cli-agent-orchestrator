@@ -298,7 +298,7 @@ cao memory relationships reject <relationship-id>     # -> rejected (survives re
 Memories are linked by typed, provenance-tagged edges (`relates_to`,
 `contradiction`, `supersedes`) held in a durable store rather than inferred at
 read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
-`legacy_related_keys`, or `external_import` — and a `status`.
+`legacy_related_keys`, `external_import`, or `vault` — and a `status`.
 
 Writes are **producer-scoped**: when the compiler or linter recomputes its edges
 for a source memory, it replaces only rows carrying its own origin and type, so a
