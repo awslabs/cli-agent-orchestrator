@@ -39,22 +39,23 @@ from cli_agent_orchestrator.clients.database import (
     SessionLocal,
     _utcnow,
 )
+from cli_agent_orchestrator.models.relationship import (
+    VALID_ORIGINS,
+    VALID_STATUSES,
+    VALID_TYPES,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
-# Closed taxonomies (reuse the graph EdgeType string values, ADR-5).
-VALID_TYPES = frozenset({"relates_to", "contradiction", "supersedes"})
-VALID_STATUSES = frozenset({"active", "proposal", "rejected", "superseded", "deleted"})
+# Closed taxonomies are imported and re-exported from the side-effect-free leaf
+# module so existing callers retain this public import path.
 # Statuses an OPERATOR reached through an explicit command (`relationships
 # reject` / `relationships delete`). A producer recompute must never overwrite
 # one: re-creation is the documented way back, exactly as ``promote()`` refuses
 # these two. ``superseded`` is excluded on purpose — it is lifecycle-derived, not
 # operator-authored.
 CURATION_TERMINAL_STATUSES = frozenset({"rejected", "deleted"})
-VALID_ORIGINS = frozenset(
-    {"compiler", "wiki_lint", "human", "legacy_related_keys", "external_import"}
-)
 
 # Bounds (NFR-1.6). Final numeric values.
 MAX_EDGES_PER_MUTATION = 64

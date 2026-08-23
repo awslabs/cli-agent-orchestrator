@@ -35,6 +35,10 @@ class FindingCode(str, Enum):
     NOTE_NOT_UTF8 = "note_not_utf8"
     SECRET_DETECTED = "secret_detected"
     UNSTABLE_SKIPPED = "unstable_skipped"
+    LINK_LIMIT_EXCEEDED = "link_limit_exceeded"
+    LINK_TARGET_INVALID = "link_target_invalid"
+    BYTE_BUDGET_EXCEEDED = "byte_budget_exceeded"
+    NOTE_LIMIT_EXCEEDED = "note_limit_exceeded"
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,10 @@ FINDING_SEVERITIES: Mapping[FindingCode, Severity] = MappingProxyType(
         FindingCode.PATH_ESCAPES_ROOT: "warn",
         FindingCode.NOTE_NOT_UTF8: "error",
         FindingCode.UNSTABLE_SKIPPED: "warn",
+        FindingCode.LINK_LIMIT_EXCEEDED: "warn",
+        FindingCode.LINK_TARGET_INVALID: "warn",
+        FindingCode.BYTE_BUDGET_EXCEEDED: "warn",
+        FindingCode.NOTE_LIMIT_EXCEEDED: "warn",
     }
 )
 
@@ -154,4 +162,28 @@ SUPPORTED_BOUNDARY: tuple[BoundaryRule, ...] = (
     ),
     BoundaryRule("derived-key collision", "refused", "both quarantined", FindingCode.KEY_COLLISION),
     BoundaryRule("unstable note", "deferred", "skipped this run", FindingCode.UNSTABLE_SKIPPED),
+    BoundaryRule(
+        "more than 1000 body wikilinks",
+        "degraded",
+        "first 1000 retained",
+        FindingCode.LINK_LIMIT_EXCEEDED,
+    ),
+    BoundaryRule(
+        "oversize or control-character link target",
+        "refused",
+        "no edge",
+        FindingCode.LINK_TARGET_INVALID,
+    ),
+    BoundaryRule(
+        "aggregate scan byte budget exceeded",
+        "deferred",
+        "remaining candidates skipped",
+        FindingCode.BYTE_BUDGET_EXCEEDED,
+    ),
+    BoundaryRule(
+        "configured note count limit exceeded",
+        "deferred",
+        "remaining candidates skipped",
+        FindingCode.NOTE_LIMIT_EXCEEDED,
+    ),
 )
