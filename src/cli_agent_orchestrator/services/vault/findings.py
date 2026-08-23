@@ -39,6 +39,11 @@ class FindingCode(str, Enum):
     LINK_TARGET_INVALID = "link_target_invalid"
     BYTE_BUDGET_EXCEEDED = "byte_budget_exceeded"
     NOTE_LIMIT_EXCEEDED = "note_limit_exceeded"
+    MAPPING_FOLDER_MISSING = "mapping_folder_missing"
+    MAPPING_FOLDER_UNREADABLE = "mapping_folder_unreadable"
+    NOTE_CONTAINS_NUL = "note_contains_nul"
+    RENAME_WITH_EDIT_UNRESOLVED = "rename_with_edit_unresolved"
+    RENAME_AMBIGUOUS = "rename_ambiguous"
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,11 @@ FINDING_SEVERITIES: Mapping[FindingCode, Severity] = MappingProxyType(
         FindingCode.LINK_TARGET_INVALID: "warn",
         FindingCode.BYTE_BUDGET_EXCEEDED: "warn",
         FindingCode.NOTE_LIMIT_EXCEEDED: "warn",
+        FindingCode.MAPPING_FOLDER_MISSING: "warn",
+        FindingCode.MAPPING_FOLDER_UNREADABLE: "warn",
+        FindingCode.NOTE_CONTAINS_NUL: "error",
+        FindingCode.RENAME_WITH_EDIT_UNRESOLVED: "warn",
+        FindingCode.RENAME_AMBIGUOUS: "warn",
     }
 )
 
@@ -185,5 +195,32 @@ SUPPORTED_BOUNDARY: tuple[BoundaryRule, ...] = (
         "deferred",
         "remaining candidates skipped",
         FindingCode.NOTE_LIMIT_EXCEEDED,
+    ),
+    BoundaryRule(
+        "missing mapping folder",
+        "deferred",
+        "mapping skipped",
+        FindingCode.MAPPING_FOLDER_MISSING,
+    ),
+    BoundaryRule(
+        "unreadable mapping folder",
+        "deferred",
+        "mapping skipped",
+        FindingCode.MAPPING_FOLDER_UNREADABLE,
+    ),
+    BoundaryRule(
+        "NUL-containing note", "refused", "note quarantined", FindingCode.NOTE_CONTAINS_NUL
+    ),
+    BoundaryRule(
+        "rename plus edit without cao.key",
+        "deferred",
+        "delete-plus-create; no identity guess",
+        FindingCode.RENAME_WITH_EDIT_UNRESOLVED,
+    ),
+    BoundaryRule(
+        "ambiguous content-hash rename",
+        "deferred",
+        "treated as new; no identity guess",
+        FindingCode.RENAME_AMBIGUOUS,
     ),
 )
