@@ -2109,11 +2109,7 @@ class MemoryService:
 
             keys = list({m.key for m in memories})
             with self._get_db_session() as db:
-                rows = (
-                    db.query(MemoryMetadataModel)
-                    .filter(MemoryMetadataModel.key.in_(keys))
-                    .all()
-                )
+                rows = db.query(MemoryMetadataModel).filter(MemoryMetadataModel.key.in_(keys)).all()
                 # Key the lookup by full identity including source_kind. A
                 # bare-key or partial identity would cross-contaminate native
                 # and vault rows which share a key and scope.
@@ -2716,9 +2712,8 @@ class MemoryService:
                 self._delete_metadata(key, scope, scope_id)
             except Exception as e:
                 logger.warning(f"Memory metadata SQLite delete failed (key={key}): {e}")
-            # The relationship rows are just as stale as the metadata row was —
-            # purge them on this path too, else a file that vanished out-of-band
-            # leaves edges that a same-slug memory would later inherit.
+            # Purge only native-produced relationships. Vault-origin rows are
+            # deliberately retained with their vault metadata projection.
             self._purge_relationships(key, scope, scope_id)
             return False
 
