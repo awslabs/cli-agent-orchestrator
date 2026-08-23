@@ -1,0 +1,157 @@
+"""Closed vocabulary and supported-boundary data for vault findings."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from types import MappingProxyType
+from typing import Literal, Mapping
+
+Severity = Literal["info", "warn", "error"]
+
+
+class FindingCode(str, Enum):
+    HEADING_FRAGMENT_IGNORED = "heading_fragment_ignored"
+    BLOCK_REFERENCE_UNSUPPORTED = "block_reference_unsupported"
+    EMBED_NOT_INLINED = "embed_not_inlined"
+    ATTACHMENT_IGNORED = "attachment_ignored"
+    ALIAS_AMBIGUOUS = "alias_ambiguous"
+    LINK_AMBIGUOUS = "link_ambiguous"
+    KEY_COLLISION = "key_collision"
+    LINK_EXCLUDED = "link_excluded"
+    LINK_DANGLING = "link_dangling"
+    FRONTMATTER_MALFORMED = "frontmatter_malformed"
+    FRONTMATTER_UNSAFE = "frontmatter_unsafe"
+    FRONTMATTER_TOO_LARGE = "frontmatter_too_large"
+    INVALID_CAO_BLOCK = "invalid_cao_block"
+    KEY_INVALID = "key_invalid"
+    NOTE_TOO_LARGE = "note_too_large"
+    PLUGIN_FORMAT_EXCLUDED = "plugin_format_excluded"
+    SYMLINK_REFUSED = "symlink_refused"
+    SYNC_ARTIFACT_SKIPPED = "sync_artifact_skipped"
+    PATH_CASE_COLLISION = "path_case_collision"
+    HARDLINK_REFUSED = "hardlink_refused"
+    PATH_ESCAPES_ROOT = "path_escapes_root"
+    NOTE_NOT_UTF8 = "note_not_utf8"
+    SECRET_DETECTED = "secret_detected"
+    UNSTABLE_SKIPPED = "unstable_skipped"
+
+
+@dataclass(frozen=True)
+class BoundaryRule:
+    construct: str
+    classification: str
+    behavior: str
+    finding_code: FindingCode | None = None
+
+
+FINDING_SEVERITIES: Mapping[FindingCode, Severity] = MappingProxyType(
+    {
+        FindingCode.HEADING_FRAGMENT_IGNORED: "info",
+        FindingCode.BLOCK_REFERENCE_UNSUPPORTED: "info",
+        FindingCode.EMBED_NOT_INLINED: "info",
+        FindingCode.ATTACHMENT_IGNORED: "info",
+        FindingCode.ALIAS_AMBIGUOUS: "warn",
+        FindingCode.LINK_AMBIGUOUS: "warn",
+        FindingCode.KEY_COLLISION: "error",
+        FindingCode.LINK_EXCLUDED: "info",
+        FindingCode.LINK_DANGLING: "info",
+        FindingCode.FRONTMATTER_MALFORMED: "error",
+        FindingCode.FRONTMATTER_UNSAFE: "error",
+        FindingCode.FRONTMATTER_TOO_LARGE: "error",
+        FindingCode.INVALID_CAO_BLOCK: "error",
+        FindingCode.KEY_INVALID: "error",
+        FindingCode.NOTE_TOO_LARGE: "warn",
+        FindingCode.PLUGIN_FORMAT_EXCLUDED: "info",
+        FindingCode.SYMLINK_REFUSED: "error",
+        FindingCode.SYNC_ARTIFACT_SKIPPED: "info",
+        FindingCode.PATH_CASE_COLLISION: "error",
+        FindingCode.HARDLINK_REFUSED: "warn",
+        FindingCode.PATH_ESCAPES_ROOT: "warn",
+        FindingCode.NOTE_NOT_UTF8: "error",
+        FindingCode.UNSTABLE_SKIPPED: "warn",
+    }
+)
+
+
+def finding_severity(code: FindingCode, *, secret_gate: str) -> Severity:
+    """Return a finding severity, including the mapping-dependent secret rule."""
+    if code == FindingCode.SECRET_DETECTED:
+        if secret_gate == "reject":
+            return "error"
+        if secret_gate == "warn":
+            return "warn"
+        raise ValueError("secret_gate must be 'reject' or 'warn'")
+    return FINDING_SEVERITIES[code]
+
+
+SUPPORTED_BOUNDARY: tuple[BoundaryRule, ...] = (
+    BoundaryRule("[[Note]]", "supported", 'relates_to edge, origin = "vault"'),
+    BoundaryRule("[[Note|Display]]", "supported", "same edge; display text discarded"),
+    BoundaryRule("[[folder/Note]]", "supported", "path-qualified match preferred"),
+    BoundaryRule(
+        "[[Note#Heading]]",
+        "degraded",
+        "note-level edge; fragment retained",
+        FindingCode.HEADING_FRAGMENT_IGNORED,
+    ),
+    BoundaryRule(
+        "[[Note#^blockid]]", "refused", "no edge", FindingCode.BLOCK_REFERENCE_UNSUPPORTED
+    ),
+    BoundaryRule(
+        "![[Note]] embed", "degraded", "edge only; body not inlined", FindingCode.EMBED_NOT_INLINED
+    ),
+    BoundaryRule(
+        "non-Markdown embed", "refused", "no edge or indexing", FindingCode.ATTACHMENT_IGNORED
+    ),
+    BoundaryRule("aliases frontmatter", "supported", "resolution input only"),
+    BoundaryRule("ambiguous alias", "refused", "no edge", FindingCode.ALIAS_AMBIGUOUS),
+    BoundaryRule("duplicate basenames", "refused", "no bare-link edge", FindingCode.LINK_AMBIGUOUS),
+    BoundaryRule(
+        "duplicate cao.key", "refused", "both notes quarantined", FindingCode.KEY_COLLISION
+    ),
+    BoundaryRule("link to excluded note", "refused", "no edge", FindingCode.LINK_EXCLUDED),
+    BoundaryRule("link to nonexistent note", "refused", "no edge", FindingCode.LINK_DANGLING),
+    BoundaryRule("relative Markdown .md link", "supported", "treated as a wikilink"),
+    BoundaryRule("http(s) Markdown link", "refused", "no edge or fetch"),
+    BoundaryRule(
+        "malformed frontmatter", "refused", "note quarantined", FindingCode.FRONTMATTER_MALFORMED
+    ),
+    BoundaryRule(
+        "unsafe YAML anchors or aliases",
+        "refused",
+        "note quarantined",
+        FindingCode.FRONTMATTER_UNSAFE,
+    ),
+    BoundaryRule(
+        "oversize frontmatter", "refused", "note quarantined", FindingCode.FRONTMATTER_TOO_LARGE
+    ),
+    BoundaryRule("invalid cao block", "refused", "note quarantined", FindingCode.INVALID_CAO_BLOCK),
+    BoundaryRule("invalid cao.key", "refused", "note quarantined", FindingCode.KEY_INVALID),
+    BoundaryRule("oversize note", "refused", "not indexed", FindingCode.NOTE_TOO_LARGE),
+    BoundaryRule("Dataview inline fields", "not interpreted", "preserved as prose"),
+    BoundaryRule("Templater, Kanban, similar syntax", "not interpreted", "preserved as prose"),
+    BoundaryRule("Excalidraw note", "refused", "not indexed", FindingCode.PLUGIN_FORMAT_EXCLUDED),
+    BoundaryRule(".canvas", "refused", "never a candidate"),
+    BoundaryRule("always-excluded paths", "refused", "never scanned"),
+    BoundaryRule("symlinked path component", "refused", "not indexed", FindingCode.SYMLINK_REFUSED),
+    BoundaryRule(
+        "sync-conflict filename", "refused", "never a candidate", FindingCode.SYNC_ARTIFACT_SKIPPED
+    ),
+    BoundaryRule(
+        "case-collision path", "refused", "both quarantined", FindingCode.PATH_CASE_COLLISION
+    ),
+    BoundaryRule("hardlink", "refused unless enabled", "not indexed", FindingCode.HARDLINK_REFUSED),
+    BoundaryRule(
+        "metadata path escapes root", "refused", "row skipped", FindingCode.PATH_ESCAPES_ROOT
+    ),
+    BoundaryRule("non-UTF-8 note", "refused", "quarantined", FindingCode.NOTE_NOT_UTF8),
+    BoundaryRule(
+        "secret-bearing note",
+        "configuration-dependent",
+        "reported in both modes",
+        FindingCode.SECRET_DETECTED,
+    ),
+    BoundaryRule("derived-key collision", "refused", "both quarantined", FindingCode.KEY_COLLISION),
+    BoundaryRule("unstable note", "deferred", "skipped this run", FindingCode.UNSTABLE_SKIPPED),
+)

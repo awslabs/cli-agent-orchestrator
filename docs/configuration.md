@@ -150,6 +150,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |
+| `vault` | `{}` | Validated Obsidian vault source configuration. `CAO_MEMORY_VAULT_ENABLED=false` can disable it but cannot enable an absent or file-disabled configuration. |
 | `learning_enabled` | `false` | Opt-in switch for workflow self-learning (outcome capture via `report_outcome` / `/outcomes`). Requires `enabled=true` — a disabled memory subsystem forces learning off. Env override: `CAO_MEMORY_LEARNING_ENABLED`. See [Self-Learning](self-learning.md). |
 | `instruction_promotion_enabled` | `false` | Opt-in switch for promoting reinforced lessons into agent profile files (`cao memory promote --apply`). Requires `learning_enabled=true` (promotion ⊂ learning ⊂ memory). Env override: `CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED`. ⚠️ Promoted lesson text is agent-generated: review every promote diff as an untrusted-instruction change before applying — see [Self-Learning](self-learning.md#phase-2--instruction-promotion). |
 | `workflow_journal_capture_output` | `false` | ⚠️ **Security-relevant opt-in, but narrower than it sounds — read the note below this table.** Governs exactly two surfaces: the **event log's** output digest, and the **diagnostics bundle's** output excerpts. Turning it ON adds step output text to those two. It does **not** control the `workflow_run_step` projection, which retains output unconditionally either way. Retained text is size-capped (below) and cleaned through the shared `audit_log` sanitizer — transport hygiene (control-character stripping, size limiting), **not** secret redaction: a credential in a step's output is retained verbatim. |
@@ -270,6 +271,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_MEMORY_ENABLED` | `memory.enabled` | bool |
 | `CAO_MEMORY_COMPILE_MODE` | `memory.compile_mode` | str (`llm`/`append`) |
 | `CAO_MEMORY_FLUSH_THRESHOLD` | `memory.flush_threshold` | float |
+| `CAO_MEMORY_VAULT_ENABLED` | `memory.vault.enabled` | bool (disable-only) |
 | `CAO_MCP_REQUEST_TIMEOUT` | `server.mcp_request_timeout` | int |
 | `CAO_EVENT_BUS_MAX_QUEUE_SIZE` | `server.event_bus_max_queue_size` | int |
 | `CAO_PROVIDER_INIT_TIMEOUT` | `server.provider_init_timeout` | int |
