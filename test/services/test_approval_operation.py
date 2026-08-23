@@ -206,9 +206,18 @@ def test_the_mcp_report_description_names_the_stale_hash_gap():
     from cli_agent_orchestrator.mcp_server.server import workflow_plan_approval
 
     doc = workflow_plan_approval.__doc__ or ""
+    # NOTE (issue #583): this assertion pins a statement that pass 3A's ``stale-update-rejection``
+    # (commit for Bolt 3 unit 4) made FALSE -- stale-hash rejection IS now implemented, while this
+    # description still says it is not. The falsehood predates this unit and fixing it means editing
+    # both the description and this assertion together, which is ``authoring-docs-truth``'s assigned
+    # work. Recorded here so the next reader knows it is a known stale claim rather than a live one.
     assert "stale" in doc.lower() and "not" in doc.lower()
     assert "NO TOOL THAT GRANTS" in doc.upper() or "no tool that grants" in doc.lower()
-    assert "off by default" in doc.lower(), "enforcement's default must not be left to be guessed"
+    assert "on by default" in doc.lower(), (
+        "enforcement's default must not be left to be guessed. Updated at Bolt 3: the default "
+        "flipped from off to on, and a description carrying the stale default would tell an agent "
+        "that approved:false is merely informational when it now predicts a refusal"
+    )
 
 
 # ---------------------------------------------------------------------------

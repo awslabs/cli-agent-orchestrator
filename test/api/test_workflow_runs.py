@@ -321,6 +321,49 @@ def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
     assert "plan-v1:blocked" in response.json()["detail"]
 
 
+def test_script_start_returns_503_when_the_plan_identity_is_unavailable(client, monkeypatch):
+    """Issue #583 Bolt 3: a failed freeze is a CAO fault, not a permission problem.
+
+    The status is the deliverable. Enforcement now defaults on, so this path is reachable in a default
+    installation, and an operator or agent that reads 403 here will go looking for an approval to
+    grant when the identifier they would approve was never readable.
+    """
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import approval_gate, script_runner
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="def main():\n    pass\n",
+        content_hash="deadbeef",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+        lambda name_or_path, scan_dir=None: spec,
+    )
+
+    async def _refuse(spec_arg, inputs, run_id):
+        raise approval_gate.PlanIdentityUnavailableError(
+            "This script-tier run has no readable plan identifier in its frozen execution manifest."
+        )
+
+    monkeypatch.setattr(script_runner, "run_script_workflow", _refuse)
+
+    response = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "identity-unavailable"},
+    )
+
+    assert response.status_code == 503, (
+        f"expected 503, got {response.status_code}: 403 would assert the caller lacked permission "
+        "for a freeze that CAO itself failed to complete"
+    )
+    assert isinstance(response.json()["detail"], str), (
+        "detail stays a string — this unit deliberately does not change the response shape, so the "
+        "CLI's _extract_detail and any external client keep working unmodified"
+    )
+
+
 @pytest.mark.asyncio
 async def test_blocking_script_manifest_freeze_is_offloaded_from_event_loop(monkeypatch):
     """The blocking script start leaves the event loop schedulable while freezing."""
@@ -821,6 +864,19 @@ def async_script_env(client, monkeypatch, tmp_path):
     _migrate_workflow_run_step()
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
+
+    # issue #583 Bolt 3 (``approval-enforcement-default``): approval enforcement now defaults ON, so
+    # a script-tier submit is refused with 403 unless the plan is approved. Every test on this fixture
+    # exercises SUBMIT MECHANICS -- 202-and-drives, a 409 integrity error, manifest freezing, a 422
+    # lint failure -- and none of them is about approval. Turned off through the REAL setting rather
+    # than by patching ``ensure_plan_approved`` out, so the gate's disabled path is still genuinely
+    # exercised here and a regression in it would surface rather than be hidden.
+    from cli_agent_orchestrator.services import settings_service
+
+    gate_off = tmp_path / "settings.json"
+    gate_off.write_text(json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
 
     spec = ScriptSpec(
         name="scr",

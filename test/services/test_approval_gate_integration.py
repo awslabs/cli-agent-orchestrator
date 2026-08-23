@@ -172,6 +172,70 @@ def test_the_resume_endpoint_answers_403_and_not_400_or_409():
     assert PLAN_ID in json.dumps(response.json()), "the refusal must carry the plan_id"
 
 
+def test_the_resume_endpoint_answers_503_when_the_manifest_carries_no_identity():
+    """Issue #583 Bolt 3: a CAO-side freeze failure is not the caller's fault.
+
+    Driven over HTTP rather than by asserting on the raise, because the status code is the whole
+    deliverable here — the exception was already distinguishable in Python before this unit, and what
+    was missing was any way for a client to tell the two apart. A run row whose ``manifest_json`` is
+    NULL is exactly the shape a failed freeze leaves behind.
+    """
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api.main import app
+
+    workflow_journal.insert_run(
+        "run-503",
+        "wf",
+        json.dumps({"source": "print(1)", "path": None, "content_hash": "sha256:abc"}),
+        "{}",
+        "failed",
+        "2026-08-19T00:00:00+00:00",
+        "script",
+        "1",
+        None,  # the freeze failed, so no manifest was written
+    )
+    client = TestClient(app, base_url="http://localhost")
+
+    response = client.post("/workflows/runs/run-503/resume")
+
+    assert response.status_code == 503, (
+        f"expected 503, got {response.status_code}: reporting a failed freeze as 403 tells the "
+        "operator to approve a plan whose identifier was never readable, when the correct action "
+        "is to retry"
+    )
+
+
+def test_the_two_causes_do_not_share_a_status_on_the_resume_arm():
+    """The pair, asserted together, because either alone permits the collapsed implementation.
+
+    A test that only checked 403-for-unapproved would pass if BOTH causes returned 403, and a test
+    that only checked 503-for-unreadable would pass if both returned 503.
+    """
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api.main import app
+
+    _insert_failed_script_run("run-pair-403")
+    workflow_journal.insert_run(
+        "run-pair-503",
+        "wf",
+        json.dumps({"source": "print(1)", "path": None, "content_hash": "sha256:abc"}),
+        "{}",
+        "failed",
+        "2026-08-19T00:00:00+00:00",
+        "script",
+        "1",
+        None,
+    )
+    client = TestClient(app, base_url="http://localhost")
+
+    unapproved = client.post("/workflows/runs/run-pair-403/resume").status_code
+    unreadable = client.post("/workflows/runs/run-pair-503/resume").status_code
+
+    assert (unapproved, unreadable) == (403, 503)
+
+
 # ---------------------------------------------------------------------------
 # 4. Both start arms agree
 # ---------------------------------------------------------------------------

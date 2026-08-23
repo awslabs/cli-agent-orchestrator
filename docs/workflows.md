@@ -387,20 +387,56 @@ resolved inputs, and the repository/worktree baseline — and derives a **plan i
 of the form `plan-v1:<digest>`) from the execution-affecting fields. Change any of them and the
 `plan_id` changes, which is the mechanism by which a changed plan needs its own approval.
 
-### Enabling it
+### It is on by default
 
-Approval enforcement is **off by default**. With it off, `plan_id`s are still computed and frozen, and
-runs start regardless of whether an approval exists.
+Approval enforcement is **on by default**.
+
+> **This is a behaviour change, not a fix.** A script-tier plan that ran yesterday under no approval
+> is refused today. If you run script-tier workflows non-interactively, approve each plan first with
+> `cao workflow approve <plan_id>`, or opt out as shown below. YAML-tier workflows are unaffected.
+
+Nothing is required to enable it. The environment variable still works and is now useful for
+re-asserting the default rather than switching it on:
 
 ```bash
-# start the CAO server with approval enforcement enabled
+# the default -- the gate is already on
+cao-server
+
+# re-assert it explicitly (for example in a script whose settings.json you do not control)
 CAO_WORKFLOW_REQUIRE_APPROVAL=1 cao-server
 
 # invoke the CLI client normally
 cao workflow run my-script
-
-# alternatively, persist workflow.require_approval = true in the server's settings.json
 ```
+
+#### Opting out
+
+Only the server's `settings.json` can turn the gate off:
+
+```json
+{
+  "workflow": {
+    "require_approval": false
+  }
+}
+```
+
+#### What a refusal looks like
+
+The two refusals are deliberately different, because the operator's next action differs:
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `403` | The plan's `plan_id` has no approval. The message carries the identifier. | `cao workflow approve <plan_id>`, then run again. |
+| `503` | No plan identifier could be read from the run's frozen manifest — CAO's own freeze failed. Nothing about your request was wrong. | Retry. No approval will help. |
+
+Note that a `plan_id` is computed at run start, so the **first run of a new or changed plan is
+refused by design** — that is the mechanism by which a changed plan needs its own approval.
+
+> **Known limitation.** If the approval database itself cannot be read, the run is refused (never
+> admitted) but is reported as `403` — "this plan has not been approved" — rather than as a database
+> fault. The refusal is safe; the message is misleading. If you see a `403` for a plan you are certain
+> you approved, check the server log for a SQLite error before re-approving.
 
 > **The variable configures the server, not the CLI client.** Setting
 > `CAO_WORKFLOW_REQUIRE_APPROVAL=1` only on a short-lived `cao workflow run` invocation does not

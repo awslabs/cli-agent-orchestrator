@@ -35,6 +35,17 @@ def isolated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     _migrate_workflow_index()
     _migrate_workflow_run()
+    # issue #583 Bolt 3 (``approval-enforcement-default``): enforcement defaults ON, so a script-tier
+    # submit is refused with 403 before it reaches the tier dispatch these tests assert. Turned off
+    # through the real setting, since the env var may only turn the gate on.
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service as _settings
+
+    gate_off = tmp_path / "settings.json"
+    gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(_settings, "SETTINGS_FILE", gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     return db_path
 
 
@@ -595,6 +606,17 @@ class TestCancellationLifecycle:
         db_path = tmp_path / "wf.db"
         monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
         monkeypatch.setattr(workflow_service, "run_registry", {})
+        # issue #583 Bolt 3 (``approval-enforcement-default``): enforcement defaults ON, so a
+        # script-tier submit is refused with 403 before it reaches the tier dispatch these tests
+        # assert. Turned off through the real setting, since the env var may only turn it on.
+        import json as _json
+
+        from cli_agent_orchestrator.services import settings_service as _settings
+
+        gate_off = tmp_path / "settings.json"
+        gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+        monkeypatch.setattr(_settings, "SETTINGS_FILE", gate_off)
+        monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
         return db_path
 
     def _live_yaml_record(self, run_id, state):

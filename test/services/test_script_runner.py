@@ -73,6 +73,20 @@ def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    # issue #583 Bolt 3 (``approval-enforcement-default``): the approval gate now defaults ON, and
+    # every test in this module drives a script run whose plan is not approved. These are tests of the
+    # RUNNER -- spawn, reap, sentinel scanning, resume admission, TOCTOU -- not of approval, so the
+    # gate is turned off here through the real setting. Doing it in the fixture rather than per test
+    # keeps the runner's own behaviour the only variable, and using the setting rather than patching
+    # ``ensure_plan_approved`` out means the gate's disabled path stays genuinely exercised.
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service as _settings
+
+    _gate_off = tmp_path / "settings.json"
+    _gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(_settings, "SETTINGS_FILE", _gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     # Isolate the process-local registry between tests.
     from cli_agent_orchestrator.services import workflow_service
 

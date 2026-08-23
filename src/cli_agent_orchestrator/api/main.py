@@ -129,6 +129,7 @@ from cli_agent_orchestrator.services import (
     manifest_freeze,
     secret_gate,
     session_service,
+    settings_service,
     terminal_service,
 )
 from cli_agent_orchestrator.services.agent_step import (
@@ -1225,6 +1226,26 @@ async def lifespan(app: FastAPI):
     # only in ``main()`` — so the imported-app deployment path
     # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
     install_access_log_redaction()
+    # issue #583 Bolt 3 (``approval-enforcement-default``): report the approval gate's RESOLVED state
+    # AND the mechanism that decided it. The source is the point, not decoration: enforcement now
+    # defaults ON, but an unreadable settings.json resolves it OFF, and a line saying only "off" would
+    # leave that silent weakening as invisible as it was before. Logs only the boolean and a member of
+    # the closed source set -- never a settings value or file contents. Failure-isolated like the
+    # telemetry init below so it can never block boot.
+    try:
+        _posture = settings_service.resolve_workflow_approval_posture()
+        if _posture.source == settings_service.GATE_SOURCE_READ_FAILURE:
+            logger.warning(
+                "workflow approval gate: OFF (settings.json unreadable; the default is ON)"
+            )
+        else:
+            logger.info(
+                "workflow approval gate: %s (source: %s)",
+                "ON" if _posture.required else "OFF",
+                _posture.source,
+            )
+    except Exception:
+        logger.warning("could not resolve the workflow approval posture at startup", exc_info=True)
     # OpenTelemetry (ported): opt-in — no-op unless OTEL_SDK_DISABLED=false.
     # Safe to call unconditionally; failure-isolated so it never blocks boot.
     try:
@@ -4645,6 +4666,11 @@ async def start_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(e.findings)},
             )
+        except approval_gate.PlanIdentityUnavailableError as e:
+            # MUST precede the PlanApprovalRequiredError arm below: it is a subclass, and Python
+            # matches except clauses in order, so the broad-first ordering would silently return 403
+            # for a failed freeze -- a wrong answer that reads as a correct one.
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except KeyError as e:
@@ -4814,6 +4840,11 @@ async def submit_workflow_run_endpoint(
         )
         try:
             approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+        except approval_gate.PlanIdentityUnavailableError as e:
+            # 503, not 403: the freeze above returned None, so CAO could not complete its own work and
+            # nothing about the caller was wrong. MUST precede the arm below, which is its base class
+            # -- a broad-first ordering returns 403 and reads as correct.
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
             # caller can tell "needs approval" from "the run broke".
@@ -6202,6 +6233,12 @@ async def resume_workflow_run_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
             )
+        except approval_gate.PlanIdentityUnavailableError as e:
+            # issue #583 Bolt 3, ``approval-enforcement-default``: 503, because the manifest already
+            # on the row carries no readable identifier -- a CAO-side failure, not a permission
+            # problem. MUST precede the base-class arm below for the same ordering reason as the two
+            # start arms.
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
             # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
