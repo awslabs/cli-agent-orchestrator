@@ -304,12 +304,14 @@ def _apply_plan(
         for resolution in resolutions:
             item = resolution.item
             if resolution.alias_from is not None:
-                _record_rename_alias(db, vault.id, resolution.alias_from)
+                _record_rename_alias(db, vault.id, resolution.alias_from, plan.run_started_at)
             _upsert_note(db, vault.id, item, plan.run_started_at)
             if item.note.status == "indexed":
                 _upsert_metadata(db, item)
             else:
                 _delete_metadata_for_item(db, item)
+        db.flush()
+        _refresh_alias_provenance(db, vault.id, projected, plan.run_started_at)
         for code, path, severity, detail in findings:
             db.add(
                 VaultFindingModel(
@@ -398,6 +400,20 @@ def _resolve_renames(
     resolutions: list[_RenameResolution] = []
     for item in projected:
         if item.note.vault_relpath not in appeared_paths:
+            existing = prior_by_path[item.note.vault_relpath]
+            has_authored_key = item.note.parsed is not None and "key" in item.note.parsed.cao
+            # A prior pure rename retained a path-derived key through the
+            # alias table. Subsequent unchanged (or edited) scans must retain
+            # that established identity instead of deriving a second one from
+            # the new path and colliding on vault_relpath.
+            if not has_authored_key:
+                item = replace(
+                    item,
+                    key=existing.cao_key,
+                    canonical_key=existing.cao_key,
+                    note_uid=existing.note_uid,
+                    memory_id=_digest("memory", existing.note_uid),
+                )
             resolutions.append(_RenameResolution(item))
             continue
         same_scope = tuple(
@@ -461,7 +477,7 @@ def _resolve_renames(
     return tuple(resolutions)
 
 
-def _record_rename_alias(db, vault_id: str, old: VaultNoteModel) -> None:
+def _record_rename_alias(db, vault_id: str, old: VaultNoteModel, created_at: datetime) -> None:
     db.add(
         VaultNoteAliasModel(
             vault_id=vault_id,
@@ -470,8 +486,33 @@ def _record_rename_alias(db, vault_id: str, old: VaultNoteModel) -> None:
             scope=old.scope,
             scope_id=None if old.scope_id == "" else old.scope_id,
             content_sha256=old.content_sha256,
+            created_at=created_at,
         )
     )
+
+
+def _refresh_alias_provenance(
+    db, vault_id: str, projected: Iterable[_ProjectedNote], reconciled_at: datetime
+) -> None:
+    """Refresh run-minted provenance without changing alias identity columns."""
+    refreshed = set()
+    for item in projected:
+        alias_scope_id = item.note.scope_id
+        identity = (item.key, item.note.scope, alias_scope_id)
+        if identity in refreshed:
+            continue
+        refreshed.add(identity)
+        scope_filter = (
+            VaultNoteAliasModel.scope_id.is_(None)
+            if alias_scope_id is None
+            else VaultNoteAliasModel.scope_id == alias_scope_id
+        )
+        db.query(VaultNoteAliasModel).filter(
+            VaultNoteAliasModel.vault_id == vault_id,
+            VaultNoteAliasModel.cao_key == item.key,
+            VaultNoteAliasModel.scope == item.note.scope,
+            scope_filter,
+        ).update({"created_at": reconciled_at}, synchronize_session=False)
 
 
 def _rename_finding(code: FindingCode, relpath: str) -> tuple[str, str, str, str]:
@@ -624,6 +665,18 @@ def _replace_vault_edges(projected: Iterable[_ProjectedNote]) -> None:
     )
     service = MemoryRelationshipService()
     for item in indexed:
+        # Vault edges are derived projection rows. Retire this producer's active
+        # set before replacing it so service-minted IDs and provenance describe
+        # the current reconcile run rather than a prior vault snapshot.
+        service.replace_set(
+            item.note.scope,
+            item.note.scope_id,
+            item.key,
+            "vault",
+            "relates_to",
+            [],
+            source_kind="vault",
+        )
         if item.note.parsed is None:
             continue
         edges = []
