@@ -184,7 +184,9 @@ async def session_is_absent(session: Any, session_name: str) -> bool:
     """
     payload = await call_tool(session, "get_session_info", session_name=session_name)
     if _failed(payload):
-        expected = f"Get session info for '{session_name}' failed: Session not found"
+        expected = (
+            f"Get session info for '{session_name}' failed: Session '{session_name}' not found"
+        )
         if payload.get("message") == expected:
             return True
         raise RuntimeError(f"cleanup verification lookup failed: {payload.get('message')}")
@@ -270,8 +272,8 @@ async def run_lifecycle(
         record("wait_for_turn", {"status": status, "evidence": "launch turn"})
 
         if follow_up:
-            # Capture the current output for reporting. Dispatch clears the
-            # rolling output buffer, so zero is the new turn's boundary.
+            # Retain the pre-dispatch size for reporting. Follow-up completion
+            # requires observed activity because rolling output can be reset.
             previous_output_size = await output_size(session, terminal_id)
 
             sent = await call_tool(
@@ -282,13 +284,12 @@ async def run_lifecycle(
             )
             if _failed(sent):
                 raise RuntimeError(f"follow-up failed: {sent.get('message')}")
-            baseline = 0
             record(
                 "send_session_message",
                 {
                     "queued": True,
                     "previous_output_chars": previous_output_size,
-                    "baseline_chars": baseline,
+                    "baseline_chars": previous_output_size,
                 },
             )
 
@@ -296,8 +297,9 @@ async def run_lifecycle(
                 session,
                 terminal_id,
                 baseline_status=status,
-                baseline_output_size=baseline,
+                baseline_output_size=None,
                 timeout=timeout,
+                interval=0.5,
                 sleep=sleep,
                 now=now,
             )

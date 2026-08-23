@@ -139,7 +139,7 @@ class FakeOps:
             if self._session_absent:
                 return _text_result(
                     '{"success": false, "message": '
-                    "\"Get session info for 'cao-demo' failed: Session not found\"}"
+                    "\"Get session info for 'cao-demo' failed: Session 'cao-demo' not found\"}"
                 )
             return _text_result('{"name": "cao-demo", "terminals": [{"id": "abc123"}]}')
 
@@ -401,29 +401,26 @@ class TestRunLifecycle:
             sleep=_no_sleep,
         )
         names = ops.call_names
-        # The pre-dispatch output snapshot is recorded before delivery clears it.
+        # The pre-dispatch output snapshot is recorded before delivery.
         snapshot_read = names.index("read_session_output")
         assert snapshot_read < names.index("send_session_message")
 
     @pytest.mark.asyncio
-    async def test_follow_up_uses_the_post_dispatch_output_generation(self) -> None:
+    async def test_follow_up_waits_past_stale_completed_status(self) -> None:
         ops = FakeOps(
-            statuses=("processing", "completed", "completed"),
-            output_sizes=(200, 20),
+            statuses=("completed", "completed", "processing", "completed"),
+            output_sizes=(200,),
         )
-        clock = iter([0.0, 1.0, 2.0, 3.0, 4.0, 124.0])
         report = await run.run_lifecycle(
             ops,
             profile="ops_mcp_worker",
             task="first",
             follow_up="second",
             sleep=_no_sleep,
-            now=lambda: next(clock),
         )
-        waits = [step for step in report["steps"] if step["step"] == "wait_for_turn"]
-        follow_up_wait = waits[-1]
-        assert follow_up_wait["detail"]["evidence"] == "follow-up turn"
-        assert follow_up_wait["detail"]["status"] == "completed"
+        send_step = next(step for step in report["steps"] if step["step"] == "send_session_message")
+        assert ops.count("get_terminal_status") == 4
+        assert send_step["detail"]["baseline_chars"] == 200
 
     @pytest.mark.asyncio
     async def test_failed_follow_up_send_is_reported(self) -> None:
