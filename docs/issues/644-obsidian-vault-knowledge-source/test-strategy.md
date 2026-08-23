@@ -54,7 +54,7 @@ your vault" as a first step. The suggested first step is
 | New teeth test for **N1**: remove `promotion_service`'s predicate, plant a vault note with `cao.type: project` and three recalls, confirm its content reaches a profile's learned-patterns section | N1 |
 | New test for **N3** cross-backend contamination of `related_keys` | N3 |
 | **U5's identity diff becomes a gate**, with the baseline identities **and the exact invocation** recorded. CI is the arbiter; a red local run is a local-environment artifact to be diagnosed, never "fixed" in a vault PR | supervisor baseline, amended |
-| Each of U5's four refusal guards gets **its own test green on the current tree**, never an assertion inside an already-red class | self-identified |
+| The three U5 behavioural refusals and the overlapping U2 native predicates each get **their own test green on the current tree**, never an assertion inside an already-red class | R15 |
 | The determinism **completeness check is a hard test failure** for an unclassified column, never a warning | ruling R6 |
 | New U2 tests: no second rebuild on a second `init_db()` (N5), all three secondary indexes survive (N6), no data truncated and no CHECK on the rebuilt table (R12) | N5, N6, R12 |
 
@@ -63,9 +63,9 @@ your vault" as a first step. The suggested first step is
 | Change | Driver |
 | --- | --- |
 | The fixture corpus gains **names with spaces, apostrophes, commas, parentheses and non-ASCII characters** in both folders and notes. Revision 1's corpus was all-ASCII-safe, which is exactly why it would have passed while the design's `safe_join_under_base` choice rejected real vaults | directed fix D1 |
-| `build_fixture_vault` gains a **`fixed_mtimes` parameter** applying `os.utime` from a constant table, and the unstable case gains an explicit **mid-read mutation hook** rather than relying on natural mtime drift | directed fix D2 |
+| `build_vault_fixture` gains a **`fixed_mtimes` parameter** applying `os.utime` from a constant table, and the unstable case gains an explicit **mid-read mutation hook** rather than relying on natural mtime drift | directed fix D2 |
 | The determinism dump **splits** into byte-equal and structural column groups. Revision 1's "the canonical dump excludes nothing" made the test unpassable — `MemoryRelationshipModel.id` is a service-minted `uuid4` — and an unpassable absolute invites the vacuous repair of filtering columns out | F5, directed fix D2 |
-| New tests for the vault `Memory` builder (F2), gated related-expansion (F8), the three F9 refusal guards, both `SKILL.md` copies (F10), the `ForgetResult` contract (F11), the body budget (F15), hardlinks (T5-gap), and the U2 nullable-discriminator trap | F2, F8, F9, F10, F11, F15, T5-gap, F3 |
+| New tests for the vault `Memory` builder (F2), gated related-expansion (F8), the maintenance-boundary guards split by R15, both `SKILL.md` copies (F10), the `ForgetResult` contract (F11), the body budget (F15), hardlinks (T5-gap), and the U2 nullable-discriminator trap | F2, F8, F9, F10, F11, F15, T5-gap, F3 |
 | Two teeth tests added, one removed as superseded | F1, F12 |
 
 ## Why the fixture vault is built in code
@@ -96,7 +96,7 @@ Five reasons this beats a committed fixture tree:
 Factory shape:
 
 ```python
-build_fixture_vault(
+build_vault_fixture(
     root: Path,
     *,
     cases: frozenset[str] = ALL_CASES,
@@ -161,15 +161,17 @@ the D1 correction, and a corpus without them would let a charset-restrictive des
   Projects/CAO Design/casea.md                case-only difference
   Projects/CAO Design/diagram.png             attachment
   Private/Secret.md                           excluded by pattern
-  Reference/Glossary.md                       mapped to the global scope
-  Injectable/Team Handbook.md                 mapped with inject: true
+  Reference/Glossary.md                       mapped to the fixture-reference agent scope
+  Injectable/Team Handbook.md                 mapped to the fixture-agent scope with inject: true
   Unmapped/Loose.md                           in no mapping
 ```
 
 Configuration the factory returns: one vault, `managed_folder: "CAO"`, and four mappings —
 `Projects/CAO Design` to `(project, <fixture scope_id>)` writable with `inject: false`,
-`Reference` to `global` non-writable, `Injectable` to `global` with **`inject: true`** (so
-the two-policy tests have both arms), and `exclude: ["Private/**"]`. All bounds set low
+`Reference` to `(agent, fixture-reference)` non-writable, `Injectable` to
+`(agent, fixture-agent)` with **`inject: true`** (so the two-policy tests have both arms),
+and `exclude: ["Private/**"]`. Distinct agent scope ids are required: mapping both folders
+to `global` would violate the duplicate `(scope, scope_id)` binding rule. All bounds set low
 enough that `Big.md`, `Long-Body.md` and `Huge-Frontmatter.md` trip them without
 megabyte files.
 
@@ -203,14 +205,14 @@ reads as a platform fact rather than as absent coverage.
 | `test/services/vault/test_scan_exclusions.py` | U4 | Mapped, excluded, always-excluded, unmapped, attachments, plugin formats, caps |
 | `test/services/vault/test_scan_symlinks.py` | U4 | Symlinked file, symlinked directory, **hardlink refused**, `allow_hardlinks` escape hatch, symlinked root permitted |
 | `test/services/vault/test_scan_stability.py` | U4 | Two-stat retry via `on_read_mutate`, `unstable_skipped`, sync-conflict names, zero-byte-with-prior-hash, non-UTF-8, line-ending normalization |
-| `test/services/vault/test_reconcile.py` | U5 | Create, edit, delete, quarantine, findings persistence, report counts, both audit events present in the closed whitelist |
+| `test/services/vault/test_reconcile.py` | U5 | Create, edit, delete, quarantine, findings persistence, report counts, all three audit events present in the closed whitelist |
 | `test/services/vault/test_rename_detection.py` | U5 | Pure rename absorbed; rename-plus-edit reported; ambiguous rename reported; a `cao.key` note survives any move |
 | `test/services/vault/test_rebuild_determinism.py` | U5 | The proof, below |
-| `test/services/vault/test_native_maintenance_guards.py` | U5 | **All four guards, each as its own test function green on the current tree**: `wiki_lint` sees no vault rows; `cao memory heal --apply` refuses a vault scope; the retention sweep refuses a vault scope; `promotion_service.plan()` excludes vault rows. **This file is new and must not extend `TestMemoryHeal` or `test_wiki_lint.py`**, both of which are already failing on `main` — an assertion added to a red class can appear covered while never executing |
+| `test/services/vault/test_native_maintenance_guards.py` | U2, U5 | **All four maintenance boundaries, each as its own test function green on the current tree**: U2's `wiki_lint` predicate sees no vault rows; U5's `cao memory heal --apply` and retention sweep refuse a vault scope; U2's `promotion_service.plan()` excludes vault rows. **This file is new and must not extend `TestMemoryHeal` or `test_wiki_lint.py`**, both of which are already failing on `main` — an assertion added to a red class can appear covered while never executing |
 | `test/services/vault/test_vault_memory_builder.py` | U6 | **An ordinary Obsidian note with NO `## <ISO>` heading becomes a `Memory`**, with the full field mapping; `_parse_wiki_file` is never called on a vault arm |
 | `test/services/vault/test_recall_source_fields.py` | U6 | `source_kind`, `source_path`, `indexed_at`, `index_freshness` fresh and stale, `content_truncated` |
 | `test/services/vault/test_recall_body_budget.py` | U6 | `Long-Body.md` is capped; `token_estimate` populated; the injection render never sees an oversized line |
-| `test/services/vault/test_recall_scope_isolation.py` | U6 | `Reference` global versus `Projects/CAO Design` project; quarantined notes never candidates; **no directory enumeration during recall** |
+| `test/services/vault/test_recall_scope_isolation.py` | U6 | `Reference` fixture-agent scope versus `Projects/CAO Design` project; quarantined notes never candidates; **no directory enumeration during recall** |
 | `test/services/vault/test_recall_native_unchanged.py` | U6 | Native recall byte-identical with no vault configured; `_get_search_dirs` unchanged |
 | `test/services/vault/test_export_refuses_vault.py` | U6 | `export_memories` on a vault scope raises rather than emitting an empty bundle |
 | `test/services/vault/test_injection_gate.py` | U7 | Indexed-yes-injected-no; the `Injectable` mapping appears; unresolvable binding excluded; `memory.enabled=false` short-circuit; **the related fan-out at line 2854 is gated** |
@@ -327,20 +329,51 @@ so nobody later runs the proof without it and concludes the design is non-determ
 (`sha256(reconcile_run_id \0 code \0 vault_relpath)`) and would be byte-equal but for its
 `reconcile_run_id` input, which is per-run by design; hence structural.
 
-### The three assertions
+### The proof assertions
 
-1. **Idempotence.** Build the fixture vault with `fixed_mtimes=True`.
-   `reconcile --apply`. Dump both groups. `rebuild --apply`. Dump again. Byte-equal group
-   compares byte-identical; structural group compares structurally.
-2. **Order independence.** Build a second fixture vault in a different `tmp_path` with
+The proof is seven named test functions. Every fixture path passes `fixed_mtimes=True` and
+asserts the fixed mtime precondition before comparing state.
+
+1. **Repeated rebuild determinism.** Stage an incremental rename, then run
+   `rebuild --apply` twice. The byte-equal group is identical; the structural group has the
+   same rows while every populated structural column changes. This is deliberately **not**
+   `reconcile ≡ rebuild`: ADR-006 makes rebuild alias-free, so the rebuilt path-derived key
+   may legitimately differ from the incremental rename key that retained its alias history.
+2. **Unchanged incremental determinism.** After the same staged rename, run an unchanged
+   `reconcile --apply` and compare it with the preceding incremental state. The byte-equal
+   group is identical and the structural group refreshes, including the retained alias.
+3. **Order independence.** Build a second fixture vault in a different `tmp_path` with
    `creation_order="reverse"` and the same fixed mtimes. Reconcile against a fresh
    database. Assert its byte-equal dump equals the first, modulo the vault root path.
    **This is the assertion that catches a dependence on filesystem enumeration order**;
-   assertion 1 alone would pass on a system that happens to enumerate consistently.
-3. **Native isolation.** Store several native memories first. `rebuild --apply`. Assert
+   the repeated-run assertions alone would pass on a system that happens to enumerate
+   consistently.
+4. **Native isolation.** Store several native memories first. `rebuild --apply`. Assert
    every native `memory_metadata` row and every non-`vault` relationship row is unchanged,
    **by identity comparison rather than by count** — a count is ambiguous exactly when it
    matters.
+
+`_assert_structural_group` refuses to pass on an empty structural table, and asserts that
+every populated structural column changes between runs. The sole documented exception is
+`vault_note_alias` in the rebuild-only comparison: ADR-006 requires rebuild to remove
+aliases, while the unchanged-reconcile pairing proves alias freshness.
+
+### Finding vocabulary
+
+The vocabulary has three axes. ADR-004's 35 rows close the **Obsidian Markdown surface**
+only. The nine later codes are **CAO operational** outcomes: resource exhaustion,
+validation of CAO-derived values, and identity decisions. U6 adds a third,
+**recall-operational** axis whose cardinality does not fit a `vault_finding` row: it may
+have no run id and no single note path, so it uses counters keyed to a vault.
+
+`test/services/vault/test_findings.py` asserts that every `FindingCode` has a live emit site
+under `src/`. `key_collision` appeared twice in the ADR table (authored and derived forms)
+but was not emitted until U5-B, where one reconciliation collision rule covers both forms.
+
+**Surface heuristic for remaining units.** State the operator question as a sentence, then
+verify that the proposed surface can answer it before allocating a counter or report field.
+This prevents a bare count where a rate is needed, or a rate where the operator needs a
+magnitude.
 
 ## Concurrency tests
 

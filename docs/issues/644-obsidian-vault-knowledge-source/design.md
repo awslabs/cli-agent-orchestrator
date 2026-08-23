@@ -327,8 +327,9 @@ Four modules assume the native layout and are reached by ordinary commands:
 unrecognized nested key passes through. `set_memory_setting()` line 520 has a closed key
 whitelist. `config_service.py` exposes `CAOConfig` with a `MemoryConfig` section, an
 `ENV_REGISTRY`, and the chain `CLI flag > CAO_* env var > config file > built-in
-default`. Verified present: `docs/settings.md` and `docs/configuration.md`, whose
-env-var table sits at lines 266-276. Neither is created by this feature.
+default`. `docs/configuration.md` owns the Memory configuration surface and U1 updates that
+section. `docs/settings.md` is a three-line "this document has moved" stub, not a vault
+documentation target; U12 owns the full user-facing vault document.
 
 ### Enumerated sets that live outside Python
 
@@ -580,11 +581,12 @@ wrong line number is a missed predicate.
 
 Where the correct behavior is "this native-only code must not see vault rows at all" —
 `memory_reconciliation` (both sites), all four `wiki_healer` sites, `wiki_lint`'s row load
-and `promotion_service` — the predicate is `source_kind = 'native'`, which is
-simultaneously the F9 refusal guard. Where the caller is binding-aware, the predicate is
-the binding's kind. `_candidate_keys_for_topic` is the one site that is neither: it must
-filter to the **same** backend as the topic it is computing candidates for, because its
-purpose is intra-corpus relatedness.
+and `promotion_service` — the predicate is `source_kind = 'native'`. **R15 assigns all
+seventeen predicates to U2**, including those overlapping the later U5 maintenance work.
+Where the caller is binding-aware, the predicate is the binding's kind.
+`_candidate_keys_for_topic` is the one site that is neither: it must filter to the **same**
+backend as the topic it is computing candidates for, because its purpose is intra-corpus
+relatedness.
 
 **`promotion_service` is native-only by intent** — a learned lesson is CAO-authored, not
 user-authored — so `source_kind = 'native'` is the correct fix rather than a temporary
@@ -880,8 +882,10 @@ store just wrote.
 6. Diff against `vault_note`: unchanged, created, updated, renamed, deleted,
    quarantined, excluded, unstable-skipped.
 7. Apply: upsert `vault_note` and `memory_metadata` (`source_kind='vault'`), insert
-   `vault_finding` rows, `replace_set` the `origin="vault"` edges per source note,
-   delete rows for notes that disappeared.
+   `vault_finding` rows, `replace_set` the `origin="vault"` edges per source note, and
+   delete rows for notes that disappeared. **U5 also retracts a note's projection whenever
+   it leaves `indexed`**: delete its vault `memory_metadata` row and clear its
+   `origin="vault"` edges; the reverse transition restores both.
 8. Emit `vault_reconcile_completed`, `vault_note_quarantined` and
    `vault_secret_quarantined`, all of which **must** be added to `NOWAIT_AUDIT_EVENTS` —
    the whitelist is closed and an unlisted event is dropped silently, which would make a
@@ -925,9 +929,9 @@ is in [test-strategy.md](test-strategy.md).
 | `clients/database.py` | Three tables, one NOT NULL column, one table-rebuild constraint widening, all wired into `init_db()` |
 | `memory_relationship_service.py` | One new `VALID_ORIGINS` value; `_assert_endpoint_exists` (286) and `_source_updated_map` (805) gain the `source_kind` predicate |
 | `graph/providers/memory.py` | Node set from the chokepoint (`status='indexed'` only); `is_vault` attr; **no path attribute and no `quarantined` node** — see below. Preserve the existing constraint that the relationship read happens **after** `run_lint` |
-| `wiki_lint.py` | Its metadata row load (`:1002-1004`) gains `source_kind = 'native'`. Today vault rows are dropped silently by the `base_resolved` containment check at lines 1047-1053, so every detector sees an empty corpus. U9 reports this through `GraphView.meta` with **three distinguishable causes**, not one — see below |
-| `promotion_service.py` | **N1.** `plan()` (`:136`) gains `source_kind = 'native'`. Without it, a vault note carrying an explicit `cao.type: project` or `feedback` and three recalls is read with **no path confinement** and promoted into a profile's learned-patterns section — a persistent agent system prompt. Native-only by intent, so the predicate is the correct fix rather than a temporary guard |
-| `wiki_healer.py` | **Refuses** vault-bound scopes early, and its four metadata queries gain `source_kind = 'native'`. Otherwise `cao memory heal --apply` deletes the metadata row at `_delete_row` (line 306) for a note whose native path does not exist — a silent de-index of a user's vault note on an LLM's judgement |
+| `wiki_lint.py` | U2's `source_kind = 'native'` metadata predicate makes the native-only boundary explicit; without it vault rows are dropped incidentally by `base_resolved` containment and every detector sees an empty corpus. U9 reports the boundary through `GraphView.meta` with **three distinguishable causes**, not one — see below |
+| `promotion_service.py` | U2's `source_kind = 'native'` predicate excludes vault rows. Without it, a vault note carrying an explicit `cao.type: project` or `feedback` and three recalls is read with **no path confinement** and promoted into a profile's learned-patterns section — a persistent agent system prompt. Native-only by intent, so the predicate is the correct fix rather than a temporary guard |
+| `wiki_healer.py` | U2 owns its four `source_kind = 'native'` metadata predicates; U5 separately refuses vault-bound scopes early. Otherwise `cao memory heal --apply` deletes the metadata row at `_delete_row` (line 306) for a note whose native path does not exist — a silent de-index of a user's vault note on an LLM's judgement |
 | `cleanup_service.py` | **Refuses** vault-bound scopes. Otherwise the retention sweep parses a stale native `index.md` and calls `forget()` at line 195, de-indexing vault rows unattended at 90-day retention for a scope that used to be native |
 | `memory_reconciliation.py` | `discover_canonical_scope_dirs` skips vault-bound scopes, and its metadata query (948) gains `source_kind = 'native'` |
 | `graph/sinks/obsidian.py` | Unchanged, plus one validation rule: an export `dest` resolving under a configured vault root is refused, so a projection can never be mistaken for a source |
@@ -937,7 +941,7 @@ is in [test-strategy.md](test-strategy.md).
 | `mcp_server/server.py` | `memory_recall` result gains the source fields; `memory_forget` gains `action`/`path` and its docstring is corrected. No new MCP tool |
 | `api/main.py` | `MemorySummary`/`MemoryDetail` gain the source fields; read-only `GET /memory/vault/status` |
 | `skills/cao-memory/SKILL.md` **and** `src/cli_agent_orchestrator/skills/cao-memory/SKILL.md` | Forget wording corrected; vault section added. Byte-identical via `python scripts/sync_skills.py` |
-| `docs/settings.md`, `docs/configuration.md` (lines 266-276), `docs/memory.md` | `CAO_MEMORY_VAULT_ENABLED` row, the `memory.vault` block, the `vault` origin. **All three already exist — none is created** |
+| `docs/configuration.md`, `docs/memory.md`, new `docs/obsidian-vault.md` | U1 owns the `docs/configuration.md` Memory section, including the `CAO_MEMORY_VAULT_ENABLED` row and `memory.vault` block; U12 owns the full user-facing vault document; `docs/memory.md` records the `vault` origin. `docs/settings.md` is only a moved-document stub |
 
 ### Graph exposure equals recall exposure
 
@@ -1067,11 +1071,12 @@ Non-Goal. Three changes close it:
   remainder — a mapping that has gone genuinely stale, or an identity that was never
   aliased in the first place.
 - A native write to a `project` scope, when a vault mapping for `project` exists and the
-  resolved `scope_id` is not among the mapped ones, emits a named warning and a
-  `status`-visible `unmapped_project_write` counter. It is **not** a hard error, because
-  a second legitimately-native project is indistinguishable from a churned id; removing
-  the silence is what satisfies the Non-Goal. `docs/obsidian-vault.md` states that a
-  vault-mapped `project` scope should pin `memory.project_id` or rely on a git remote,
+  resolved `scope_id` is not among the mapped ones, emits a named warning and increments
+  `unmapped_project_write`. It is **not** a hard error, because a second legitimately-native
+  project is indistinguishable from a churned id; removing the silence is what satisfies the
+  Non-Goal. The counter is process-local today, not a durable `status` value; U8 owns both
+  the `store()` call site and the durable-record decision. `docs/obsidian-vault.md` states
+  that a vault-mapped `project` scope should pin `memory.project_id` or rely on a git remote,
   since cwd-hash identity breaks on folder rename.
 
 **Compliance.** Nothing is read until a folder is mapped, nothing is injected until a
@@ -1098,7 +1103,7 @@ paths-and-scopes artifact before any row is written.
 | Poisoned `memory_metadata.file_path` row | Inline sink guard skips it; `warn` finding | Defence in depth; the teeth test proves it |
 | Curator terminal unidentifiable | Injection falls back to the gated deterministic builder | Fail closed |
 | Note body matches a secret-gate pattern at reconcile | `reject` (default) quarantines with `secret_detected`, pattern **name** only; `warn` indexes and reports | Ruling R5. Index time is a pure function of content, so it is free per read and deterministic under rebuild |
-| Secret added to an already-indexed note | Exposed until the next reconcile; `index_freshness` reports staleness | Reconcile-time enforcement is a consequence of the no-watcher non-goal, named rather than hidden |
+| Secret added to an already-indexed note | Exposed until the next reconcile; `index_freshness` reports staleness. At that reconcile U5 retracts the vault projection: it deletes `memory_metadata` and clears `origin="vault"` edges when the note leaves `indexed`; an indexed reverse transition restores both | Reconcile-time enforcement is a consequence of the no-watcher non-goal, named rather than hidden; a quarantined note is never projected |
 | A vault note carries `cao.type: project` and reaches three recalls | `promotion_service.plan()`'s `source_kind = 'native'` predicate excludes it | Without it the note is read unconfined and promoted into a persistent agent system prompt (N1) |
 | A native memory's compile requests related candidates | `_candidate_keys_for_topic` filters to the same backend | Without it native and vault keys cross-contaminate each other's `related_keys` (N3) |
 | `cao memory heal --apply` on a vault scope | Refused with a named error | It would otherwise de-index a vault note silently |

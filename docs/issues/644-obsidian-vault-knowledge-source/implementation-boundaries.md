@@ -58,7 +58,7 @@ Unit names are the branch-name stems.
 | Change | Driver |
 | --- | --- |
 | U2 grows substantially: the R2 constraint widening is a **SQLite table rebuild**, `source_kind` must be **NOT NULL DEFAULT 'native'**, and a list of query sites gains a predicate (thirteen as of revision 2; seventeen as of revision 3). U2 is the highest-risk unit in the plan and ships alone | F3, ruling R2 |
-| U5 gains the three F9 **refusal guards** (`wiki_lint`, `wiki_healer`, `cleanup_service`), because U5 is the unit that ships `binding.py` | F9 |
+| U2 owns all seventeen `source_kind` predicates, including `wiki_lint`, `wiki_healer`, and `promotion_service`; U5 owns the separate behavioural refusals in `wiki_healer`, `cleanup_service`, and `binding.py` | R15 |
 | U6 gains the **vault `Memory` builder** — without it AC3 and AC4 are unreachable — plus the OKF export refusal, and its byte-identical claim is restated honestly | F2, F6, F7, F9 |
 | U7 gains the **curator recall gate** and becomes the unit that closes F1 | F1, ruling R1 |
 | U8 gains the **`ForgetResult`** return shape and both `SKILL.md` copies | F11, F10, ruling R3 |
@@ -161,7 +161,7 @@ and with what error". Tests are table-driven over valid and invalid documents.
 
 **Ships.** Three tables (`vault_note`, `vault_finding`, `vault_note_alias`), one column
 (`memory_metadata.source_kind`), one **widened unique constraint**, and the
-`source_kind` predicate on **thirteen** existing queries.
+`source_kind` predicate on **seventeen** existing queries.
 
 **Why this is now the largest-risk unit.** Three things compound:
 
@@ -286,17 +286,18 @@ taking and returning bare `str`.
 **Ships.** `reconcile.py`, `binding.py`, `status.py`. Plan and apply. Rename absorption.
 Upserts into `vault_note`, `vault_finding`, `vault_note_alias`, `memory_metadata`
 (`source_kind='vault'`), and `replace_set` of `origin="vault"` edges. The full-rebuild
-path with scoped deletes. The frozen report. Two audit events added to
-`NOWAIT_AUDIT_EVENTS`. `origin = "vault"` in `VALID_ORIGINS` and its two other enumerating
-sites. **Alias-aware `scope_id` canonicalisation** in `binding.resolve()` plus the
-orphaned-mapping and `unmapped_project_write` warnings (F13).
+path with scoped deletes. The frozen report. Three audit events added to
+`NOWAIT_AUDIT_EVENTS`: `vault_reconcile_completed`, `vault_note_quarantined`, and
+`vault_secret_quarantined`. Registration deliberately precedes emission: the closed audit
+whitelist otherwise drops an event silently. `origin = "vault"` in `VALID_ORIGINS` and its
+two other enumerating sites. **Alias-aware `scope_id` canonicalisation** in
+`binding.resolve()` plus the orphaned-mapping and `unmapped_project_write` warnings (F13).
 
-**Plus the three F9 refusal guards**, which belong here because this is the unit that
-ships `binding.py`:
+**R15 ownership split.** U2 owns every `source_kind` predicate at all seventeen sites,
+including the predicates in `wiki_lint.py`, `wiki_healer.py`, and
+`promotion_service.py`. U5 owns the distinct behavioural refusals below and `binding.py`.
+`cleanup_service.py` is not a predicate site.
 
-- `wiki_lint.py` — its metadata row load gains `source_kind = 'native'`. Today vault rows
-  are dropped silently by the `base_resolved` containment check at lines 1047-1053, so
-  every detector sees an empty corpus for that scope.
 - `wiki_healer.py` — refuses vault-bound scopes early. Otherwise
   `cao memory heal --apply` reaches `_delete_row` (line 306) for a note whose native path
   does not exist: no file is unlinked, but the **metadata row is deleted** — a silent
@@ -305,15 +306,8 @@ ships `binding.py`:
 - `cleanup_service.py` — refuses vault-bound scopes. Otherwise the retention sweep parses
   a stale native `index.md` and calls `forget()` at line 195, de-indexing vault rows
   unattended at 90-day retention for a scope that used to be native.
-- **`promotion_service.py` — `plan()` (`:136`) gains `source_kind = 'native'` (N1).** This
-  is the fourth guard and the most consequential. `plan()` filtered only on
-  `scope=='agent'`, `scope_id`, `memory_type.in_(PROMOTABLE_TYPES)` and
-  `access_count >= min`; took `file_path` straight off the row; `_lesson_text` then read it
-  with **no confinement at all**; and the section parser is `if line.startswith("## ")`, so
-  **any** h2 matches and an ordinary Obsidian note parses cleanly rather than failing safe
-  on the absent `## <ISO8601Z>` heading. The destination is `apply_deltas` into a profile's
-  learned-patterns section — a **persistent system prompt on disk**. Native-only by intent
-  (a learned lesson is CAO-authored), so the predicate is the correct fix, not a stopgap.
+- `binding.py` — resolves mappings alias-aware and supplies content-free warnings for
+  orphaned mappings, cwd-hash project scope ids, and unmapped project writes.
 
 **Placement note.** The review said "fix N1 before U7"; it lands in U5 instead, which is
 strictly earlier. U5 is where vault `memory_metadata` rows first exist, so any later
@@ -359,10 +353,11 @@ repairing an unrelated subsystem there makes the diff unreviewable, and if the f
 environmental there is nothing to repair.
 
 **Watch items.** `AUDIT_EVENT_WHITELIST` is closed — an unlisted event is dropped silently,
-which would make a content-free-audit assertion pass vacuously; add all three events
-(`vault_reconcile_completed`, `vault_note_quarantined`, `vault_secret_quarantined`) in the
-same commit as their emit sites. The rebuild determinism test lands here, with the two-group
-dump split from [test-strategy.md](test-strategy.md).
+which would make a content-free-audit assertion pass vacuously. Register all three events
+(`vault_reconcile_completed`, `vault_note_quarantined`, `vault_secret_quarantined`) before
+their U5-B emission sites; registration and emission need not land in the same commit. The
+rebuild determinism test lands here, with the two-group dump split from
+[test-strategy.md](test-strategy.md).
 
 ### U6 — `vault-recall`
 
@@ -477,6 +472,10 @@ edited via `python scripts/sync_skills.py`.
 
 **Constraint.** The native `store()` arm stays byte-identical.
 
+**F13 follow-through.** U8 owns the `record_unmapped_project_write()` call site and the
+decision on a durable record. The U5 counter is intentionally process-local today, so it
+cannot be presented as a durable value by a separate `cao memory vault status` process.
+
 **F16 obligation.** `writer.py` owns every write sink with the guard inline.
 
 ### U9 — `vault-graph`
@@ -541,11 +540,13 @@ files on a schedule the operator did not choose.
 **Ships.** A new `docs/obsidian-vault.md` carrying the supported-boundary table verbatim,
 the two-policy explanation, the full annotated settings example, the `project_id` pinning
 recommendation, and the documented behavioral differences (`forget()` de-indexes;
-`rebuild` resets vault access counts; export refuses vault scopes). Edits to
-**existing** files: `docs/memory.md` (the `vault` origin, a pointer to the new page),
-`docs/settings.md` (the `memory.vault` block), `docs/configuration.md` (a
-`CAO_MEMORY_VAULT_ENABLED` row in the env-var table at lines 266-276). A vault section in
-**both** `SKILL.md` copies via `scripts/sync_skills.py`.
+`rebuild` resets vault access counts; export refuses vault scopes). Edits to existing
+`docs/memory.md` (the `vault` origin and a pointer to the new page) and
+`docs/configuration.md` (the `memory.vault` block and a `CAO_MEMORY_VAULT_ENABLED` row).
+U1 owns the `docs/configuration.md` **Memory** section and its configuration surface; U12
+owns the full user-facing vault document. `docs/settings.md` is a three-line "this document
+has moved" stub, not a vault-documentation target. A vault section in both `SKILL.md` copies
+is synchronized via `scripts/sync_skills.py`.
 
 **Correction to the review:** `docs/settings.md` and `docs/configuration.md` were verified
 present in this worktree. Neither is created.
@@ -562,7 +563,7 @@ resolve once committed.
 | --- | --- |
 | U1 `vault-config` | `root` passes `resolve_and_validate_path`; no overlap with `MEMORY_BASE_DIR`, `CAO_HOME_DIR` or the graph export root; mappings cannot overlap; `federated`/`session` unmappable; `inject` without `index` refused; **`secret_gate` defaults to `reject` when absent, and `warn` + `inject: true` warns rather than passing silently** (R14); no path env-settable; every rule rejects rather than sanitizes; bounds not disableable; **and that read-mapping folders are NOT charset-restricted while `managed_folder` is** |
 | U2 `vault-schema` | `source_kind` is NOT NULL with a server default, so the widened UNIQUE index is total; a duplicate **native** key is still rejected after the widening; the table rebuild is transactional; **the idempotence gate compares index COLUMN LISTS, not constraint names** (N5), and a second `init_db()` performs no second rebuild; all three secondary indexes survive (N6); `ck_related_keys_length` is absent and no data was truncated (R12); all **seventeen** sites carry the predicate; native-only consumers filter `source_kind = 'native'` |
-| U5 `vault-reconcile` | **The four refusal guards are present and effective** — `wiki_lint` row load, `wiki_healer` early refusal, `cleanup_service` refusal, and `promotion_service.plan()`'s `source_kind = 'native'` (N1); each has its **own** test that is green on the current tree rather than an assertion inside an already-red class; the rebuild's deletes are scoped by `source_kind`/`origin`; all three audit events are in `NOWAIT_AUDIT_EVENTS`; the index-time secret gate quarantines under `reject` and its finding carries the pattern name only |
+| U5 `vault-reconcile` | **The three behavioural refusals are present and effective** — `wiki_healer` early refusal, `cleanup_service` refusal, and the `binding.py` warning/refusal surface. U2 owns the native predicates at the overlapping `wiki_lint`, `wiki_healer`, and `promotion_service` sites; each guard test is green on the current tree rather than an assertion inside an already-red class. The rebuild's deletes are scoped by `source_kind`/`origin`; all three audit events are in `NOWAIT_AUDIT_EVENTS`; the index-time secret gate quarantines under `reject` and its finding carries the pattern name only |
 | U3 `vault-parse` | Frontmatter size-capped **before** parsing; safe loader; YAML anchors and aliases refused; `cao.links` capped; taxonomies imported not re-declared; invalid values quarantine rather than default; `cao.key` failing the shipped charset refused; the derived key is length-bounded by construction so truncation cannot decide identity; no parsed value interpolated into a prompt |
 | U4 `vault-scan` | Symlinked components refused; **hardlinks refused**; always-excluded paths unconditional; exclusions applied **before** any open; the stability check not defeatable by a same-size write; non-UTF-8 quarantined; caps enforced; **F16 — this module owns its open sinks with the guard inline in the single positive form, passing bare `str`** |
 | U6 `vault-recall` | Confinement re-asserted **inline at the sink**, independent of the row; a failing row is skipped and recorded, not raised; quarantined notes cannot become candidates; scope filtering unchanged; the API carries the vault-relative path only; `require_injectable` has no default; the body budget is enforced in the builder; **F16 as above** |
@@ -583,11 +584,11 @@ The specific teeth tests are in [test-strategy.md](test-strategy.md).
 | **Agent-facing memory contract** | **`skills/cao-memory/SKILL.md` AND `src/cli_agent_orchestrator/skills/cao-memory/SKILL.md`** | Both copies exist and are held **byte-identical** by `test/test_skill_packaging_parity.py` via `filecmp.cmp`; sync with `python scripts/sync_skills.py`. Editing one copy turns the suite red. Its Forget section documents `memory_forget` as removing the topic file, which ruling R3 makes wrong — U8 corrects it, U12 adds the vault section. Revision 1 never mentioned skills at all |
 | Relationship origins | `memory_relationship_service.py:55`; the comment at `database.py:169`; `docs/memory.md:301` | U5 adds `vault` to all three. It must **not** touch `_backfill_legacy_related_keys`, whose source text is hashed at `test/clients/test_memory_relationships_migration.py:119` |
 | Edge types | `graph/models.py` `EdgeType`; `cao_mcp_apps/src/graph/types.ts:13`; web and MCP-apps graph tests | **No change.** An origin, not a type. Stated so nobody adds one helpfully |
-| Audit events | `audit_log.py` `SYNC_AUDIT_EVENTS` / `NOWAIT_AUDIT_EVENTS`, unioned into the closed `AUDIT_EVENT_WHITELIST` | U5 adds two. An unlisted event is dropped silently, so an audit assertion would pass vacuously |
+| Audit events | `audit_log.py` `SYNC_AUDIT_EVENTS` / `NOWAIT_AUDIT_EVENTS`, unioned into the closed `AUDIT_EVENT_WHITELIST` | U5 registers three: `vault_reconcile_completed`, `vault_note_quarantined`, and `vault_secret_quarantined`. Registration precedes U5-B emission because an unlisted event is dropped silently, so an audit assertion would pass vacuously |
 | `memory_metadata` columns and constraints | The model; the three `PRAGMA table_info(memory_metadata)` gates; `docs/memory.md`; **and the seventeen key-plus-scope query sites** across `memory_service.py`, `memory_reconciliation.py`, `memory_relationship_service.py`, `wiki_healer.py`, `promotion_service.py` and `wiki_lint.py` | U2. Verified: **no** `_REQUIRED_*_COLUMNS` equality guard on this table, so nothing fails loudly if a site is missed. Revision 2's list was 13 and mis-cited one line; four sites were added and one corrected in revision 3 |
 | Secret-gate enforcement points | `store()`'s federated branch (existing); OKF export (existing); **and now reconcile** (ruling R5). One `mappings[].secret_gate` key governs the write and index points | U3 defines the finding, U4 applies it during the scan, U1 validates the enum |
 | `forget()` return contract | `memory_service.py:2658`; seven call sites; `mcp_server/server.py:2047-2076` docstring and response; both `SKILL.md` copies | U8. `__bool__` is what keeps the seven call sites unedited |
-| Memory settings keys | `get_memory_settings()` defaults; `set_memory_setting()`'s closed whitelist; `config_service.MemoryConfig`; `ENV_REGISTRY`; `docs/settings.md`; `docs/configuration.md` | U1 adds the nested `vault` object and one env var. `set_memory_setting()` deliberately gains no vault key |
+| Memory settings keys | `get_memory_settings()` defaults; `set_memory_setting()`'s closed whitelist; `config_service.MemoryConfig`; `ENV_REGISTRY`; `docs/configuration.md` | U1 adds the nested `vault` object, one env var, and the `docs/configuration.md` Memory section. `set_memory_setting()` deliberately gains no vault key; U12 owns the user-facing vault document |
 | Findings vocabulary | `services/vault/findings.py` only | One module, so parser, resolver, status view and documentation cannot drift |
 
 ## Suggested pull-request sequence
@@ -599,8 +600,8 @@ The specific teeth tests are in [test-strategy.md](test-strategy.md).
 3. **U3 `vault-parse`** — untrusted parsing, no I/O in the diff.
 4. **U4 `vault-scan`** — traversal, symlink and hardlink review.
 5. **U5 `vault-reconcile`** — after this, derived state builds and rebuilds
-   deterministically and nothing reads it. Carries the three F9 refusal guards, so the
-   native maintenance paths are safe before any vault row is readable. First
+   deterministically and nothing reads it. Carries the behavioural maintenance refusals,
+   while U2's predicates keep native-only paths isolated before any vault row is readable. First
    demonstration-of-value checkpoint.
 6. **U6 `vault-recall`** — the first unit that changes behavior for a configured user. AC3
    and AC4 become true here, and only because of the vault `Memory` builder.
