@@ -1,5 +1,8 @@
 """Tests for the closed vault finding vocabulary."""
 
+import inspect
+from pathlib import Path
+
 import pytest
 
 from cli_agent_orchestrator.services.vault.findings import (
@@ -55,9 +58,40 @@ def test_every_non_secret_finding_has_its_adr_severity():
         FindingCode.LINK_TARGET_INVALID: "warn",
         FindingCode.BYTE_BUDGET_EXCEEDED: "warn",
         FindingCode.NOTE_LIMIT_EXCEEDED: "warn",
+        FindingCode.MAPPING_FOLDER_MISSING: "warn",
+        FindingCode.MAPPING_FOLDER_UNREADABLE: "warn",
+        FindingCode.NOTE_CONTAINS_NUL: "error",
+        FindingCode.RENAME_WITH_EDIT_UNRESOLVED: "warn",
+        FindingCode.RENAME_AMBIGUOUS: "warn",
     }
 
     assert dict(FINDING_SEVERITIES) == expected
     assert set(FINDING_SEVERITIES) == set(FindingCode) - {FindingCode.SECRET_DETECTED}
     with pytest.raises(TypeError):
         FINDING_SEVERITIES[FindingCode.SYMLINK_REFUSED] = "info"  # type: ignore[index]
+
+
+def test_scan_findings_delegate_severity_to_the_closed_vocabulary():
+    from cli_agent_orchestrator.services.vault import scan
+
+    source = inspect.getsource(scan)
+
+    assert "finding_severity(" in source
+    assert ', "info")' not in source
+    assert ', "warn")' not in source
+    assert ', "error")' not in source
+
+
+def test_every_finding_code_has_a_live_emit_site():
+    source_root = Path("src/cli_agent_orchestrator/services/vault")
+    implementation = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in source_root.glob("*.py")
+        if path.name != "findings.py"
+    )
+
+    missing = {
+        code.value for code in FindingCode if f"FindingCode.{code.name}" not in implementation
+    }
+
+    assert missing == set()

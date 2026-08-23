@@ -59,7 +59,15 @@ def bound(monkeypatch, db_engine):
     return Session
 
 
-def _seed_memory(db_engine, key, scope="global", scope_id=None, body=None, body_dir=None):
+def _seed_memory(
+    db_engine,
+    key,
+    scope="global",
+    scope_id=None,
+    body=None,
+    body_dir=None,
+    source_kind="native",
+):
     """Seed a memory_metadata row.
 
     ``body`` is the memory's CONTENT. Memory bodies live in files, not in
@@ -94,6 +102,7 @@ def _seed_memory(db_engine, key, scope="global", scope_id=None, body=None, body_
                 memory_type="project",
                 scope=scope,
                 scope_id=scope_id,
+                source_kind=source_kind,
                 file_path=file_path,
                 tags="t",
             )
@@ -1140,6 +1149,51 @@ def test_forget_purges_relationships_when_the_file_already_vanished(
     assert (
         rel.list_relationships("global", None, "ghost") == []
     ), "the vanished-file path must purge relationships too"
+
+
+def test_forget_spares_vault_edges_and_metadata_while_purging_native_edges(
+    bound, db_engine, tmp_path, monkeypatch
+):
+    """The native forget predicate must not half-delete a vault projection."""
+    import asyncio
+
+    from cli_agent_orchestrator.clients import database as db_mod
+    from cli_agent_orchestrator.services import memory_service as ms_mod
+
+    scope = "project"
+    scope_id = "vault-bound"
+    for key, source_kind in (
+        ("shared", "native"),
+        ("shared", "vault"),
+        ("native-target", "native"),
+        ("vault-source", "vault"),
+    ):
+        _seed_memory(db_engine, key, scope, scope_id, source_kind=source_kind)
+    svc = ms_mod.MemoryService(base_dir=tmp_path, db_engine=db_engine)
+    monkeypatch.setattr(ms_mod, "MEMORY_BASE_DIR", tmp_path)
+    Session = sessionmaker(bind=db_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", Session)
+    rel = _svc()
+    rel.create(scope, scope_id, "shared", "native-target", "relates_to", "compiler")
+    rel.replace_set(
+        scope,
+        scope_id,
+        "vault-source",
+        "vault",
+        "relates_to",
+        [EdgeInput("shared")],
+        source_kind="vault",
+    )
+
+    assert asyncio.run(svc.forget("shared", scope=scope, scope_id=scope_id)) is False
+
+    with Session() as db:
+        assert (db.query(MemoryRelationshipModel).filter_by(origin="compiler").count()) == 0
+        assert db.query(MemoryRelationshipModel).filter_by(origin="vault").count() == 1
+        assert (
+            db.query(MemoryMetadataModel).filter_by(key="shared", source_kind="native").count()
+        ) == 0
+        assert (db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()) == 2
 
 
 def test_stale_flag_is_live_after_the_source_is_edited(bound, db_engine):

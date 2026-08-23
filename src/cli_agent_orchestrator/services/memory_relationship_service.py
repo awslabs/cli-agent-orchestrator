@@ -484,6 +484,8 @@ class MemoryRelationshipService:
         origin: str,
         type: str,
         edges: List[EdgeInput],
+        *,
+        source_kind: str = "native",
     ) -> ReplaceReport:
         """Producer-scoped replacement (principle 6, FR-2.5).
 
@@ -532,13 +534,13 @@ class MemoryRelationshipService:
                     report.rejected.append({"target": tgt, "reason": "invalid_attrs_or_confidence"})
                     continue
                 try:
-                    self._assert_endpoint_exists(db, scope, scope_id, tgt)
+                    self._assert_endpoint_exists(db, scope, scope_id, tgt, source_kind=source_kind)
                 except ValueError:
                     report.rejected.append({"target": tgt, "reason": "dangling"})
                     continue
                 valid[tgt] = edge
             # Source must exist too.
-            self._assert_endpoint_exists(db, scope, scope_id, src)
+            self._assert_endpoint_exists(db, scope, scope_id, src, source_kind=source_kind)
 
             existing_rows = (
                 db.query(MemoryRelationshipModel)
@@ -575,7 +577,9 @@ class MemoryRelationshipService:
             # could only ever report False (human review, PR #524). One batched
             # lookup for the whole set; None when the source has no updated_at,
             # which simply leaves staleness unknown as before.
-            src_updated = self._source_updated_map(db, scope, scope_id, {src}).get(src)
+            src_updated = self._source_updated_map(
+                db, scope, scope_id, {src}, source_kind=source_kind
+            ).get(src)
             for tgt, edge in valid.items():
                 r = existing_by_target.get(tgt)
                 attrs_json = self._validate_attributes(edge.attributes)
@@ -753,15 +757,27 @@ class MemoryRelationshipService:
             self._audit("soft_delete", row)
             return self._to_dto(row)
 
-    def purge_for_key(self, scope: str, scope_id: Optional[str], key: str) -> int:
-        """HARD-delete every row touching ``key`` in either direction.
+    def purge_for_key(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        key: str,
+        *,
+        spare_origins: tuple[str, ...] = ("vault",),
+    ) -> int:
+        """HARD-delete non-spared rows touching ``key`` in either direction.
 
         Called when the underlying memory is FORGOTTEN (human review, PR #524).
-        ``forget()`` removes the wiki file, the index entry and the
-        memory_metadata row, but used to leave these rows behind still ``active``
+        Native ``forget()`` removes the wiki file, the index entry and its
+        native memory_metadata row, but used to leave these rows behind still ``active``
         — so a later memory created with the SAME slug silently inherited the
         dead memory's edges, and every read path had to tolerate endpoints that
         no longer resolve.
+
+        ``spare_origins`` defaults to ``("vault",)`` to match
+        ``MemoryService._delete_metadata``'s source-kind predicate: native
+        forget must not half-delete a vault-backed memory by removing its
+        relationship projection while preserving its metadata.
 
         This is a HARD delete, not the ``soft_delete`` status transition: a
         soft-deleted row is a curation record ABOUT a live memory, whereas here
@@ -788,6 +804,7 @@ class MemoryRelationshipService:
                         MemoryRelationshipModel.source_key == k,
                         MemoryRelationshipModel.target_key == k,
                     ),
+                    MemoryRelationshipModel.origin.notin_(spare_origins),
                 )
                 .all()
             )

@@ -14,9 +14,9 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
+    VAULT_NOTE_SCOPE_ID_SENTINEL,
     MemoryMetadataModel,
     VaultNoteModel,
-    VAULT_NOTE_SCOPE_ID_SENTINEL,
 )
 
 
@@ -363,9 +363,39 @@ def test_binding_aware_query_helpers_default_to_native_without_call_site_changes
         },
     }.items():
         tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             if not isinstance(node.func, ast.Attribute) or node.func.attr not in helper_names:
                 continue
-            assert not any(keyword.arg == "source_kind" for keyword in node.keywords)
+            source_kind_keywords = [
+                keyword for keyword in node.keywords if keyword.arg == "source_kind"
+            ]
+            if not source_kind_keywords:
+                continue
+            current = parents[node]
+            while not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                current = parents[current]
+            kwonly_names = {argument.arg for argument in current.args.kwonlyargs}
+            # A source-aware wrapper may only forward its own keyword-only
+            # value. Literal or unrelated overrides would weaken the native
+            # default at an existing call site.
+            assert len(source_kind_keywords) == 1
+            assert isinstance(source_kind_keywords[0].value, ast.Name)
+            assert source_kind_keywords[0].value.id == "source_kind"
+            assert "source_kind" in kwonly_names
+
+    relationship_tree = ast.parse(
+        Path("src/cli_agent_orchestrator/services/memory_relationship_service.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    for node in ast.walk(relationship_tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "purge_for_key":
+            continue
+        assert not any(keyword.arg == "spare_origins" for keyword in node.keywords)
