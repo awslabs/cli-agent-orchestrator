@@ -81,7 +81,7 @@ def _insert_failed_script_run(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_refused_start_leaves_no_workflow_run_row():
+def test_unapproved_plan_is_refused_before_any_run_row_is_written():
     """Asserted against the journal rather than inferred from the raise.
 
     Every first run of every new plan is refused by design, so if a refusal wrote a row the table would

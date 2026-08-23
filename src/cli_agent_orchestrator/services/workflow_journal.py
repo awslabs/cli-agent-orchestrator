@@ -505,6 +505,23 @@ def update_run_manifest(run_id: str, manifest_json: str) -> None:
         )
 
 
+def compare_and_set_run_manifest(
+    run_id: str, expected_manifest_json: str, manifest_json: str
+) -> bool:
+    """Replace a run manifest only when it still equals the contender's snapshot.
+
+    The memory filler is the sole concurrent manifest writer. A false return is
+    a normal lost race, distinct from a SQLite exception, which callers must
+    surface as a failed persistence rather than overwrite the winner.
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE workflow_run SET manifest_json = ? " "WHERE run_id = ? AND manifest_json = ?",
+            (manifest_json, run_id, expected_manifest_json),
+        )
+        return cursor.rowcount == 1
+
+
 def insert_steps(run_id: str, steps: Sequence[Tuple[str, str]], updated_at: str) -> None:
     """INSERT one ``workflow_run_step`` row per ``(step_id, state)`` (E2).
 

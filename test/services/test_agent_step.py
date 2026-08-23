@@ -70,6 +70,29 @@ def _patch_terminal_layer(
 
 
 class TestHappyPath:
+    def test_an_empty_frozen_block_is_passed_to_suppress_live_memory(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}.frozen_run_memory.frozen_memory_for", return_value=""),
+        ):
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    env_vars={"CAO_WORKFLOW_RUN_ID": "run-frozen"},
+                )
+            )
+
+        m_send.assert_called_once_with("abc12345", "x", frozen_memory="")
+
     def test_frozen_memory_resolution_is_offloaded_from_the_event_loop(self):
         """A polling frozen-memory resolver must leave the server loop schedulable."""
         block = "<cao-memory>frozen</cao-memory>"

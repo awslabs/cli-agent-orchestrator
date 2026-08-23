@@ -10,7 +10,7 @@ import subprocess
 from cli_agent_orchestrator.utils import git_baseline
 
 
-def test_returns_commit_and_dirty_inside_a_repository(tmp_path):
+def _initialise_repository(tmp_path):
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True)
@@ -18,14 +18,71 @@ def test_returns_commit_and_dirty_inside_a_repository(tmp_path):
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
 
+
+def test_returns_commit_and_worktree_state_inside_a_repository(tmp_path):
+    _initialise_repository(tmp_path)
+
     baseline = git_baseline.derive_baseline(str(tmp_path))
 
     assert baseline["available"] is True
     assert len(baseline["commit"]) == 40
-    assert baseline["dirty"] is False
+    assert baseline["worktree_state"] == {"status": "clean"}
+
+
+def test_dirty_worktree_state_depends_on_the_uncommitted_contents(tmp_path):
+    _initialise_repository(tmp_path)
 
     (tmp_path / "f.txt").write_text("two", encoding="utf-8")
-    assert git_baseline.derive_baseline(str(tmp_path))["dirty"] is True
+    baseline_a = git_baseline.derive_baseline(str(tmp_path))
+
+    (tmp_path / "f.txt").write_text("three", encoding="utf-8")
+    baseline_b = git_baseline.derive_baseline(str(tmp_path))
+
+    assert baseline_a["commit"] == baseline_b["commit"]
+    assert baseline_a["worktree_state"] != baseline_b["worktree_state"]
+
+
+def test_staged_changes_and_deletions_are_dirty_worktree_states(tmp_path):
+    _initialise_repository(tmp_path)
+    clean = git_baseline.derive_baseline(str(tmp_path))
+
+    (tmp_path / "f.txt").write_text("staged", encoding="utf-8")
+    subprocess.run(["git", "add", "f.txt"], cwd=tmp_path, check=True)
+    staged = git_baseline.derive_baseline(str(tmp_path))
+
+    subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=tmp_path, check=True)
+    (tmp_path / "f.txt").unlink()
+    deleted = git_baseline.derive_baseline(str(tmp_path))
+
+    assert staged["worktree_state"] != clean["worktree_state"]
+    assert deleted["worktree_state"] != clean["worktree_state"]
+
+
+def test_untracked_file_contents_affect_worktree_state(tmp_path):
+    _initialise_repository(tmp_path)
+    (tmp_path / "untracked.txt").write_text("one", encoding="utf-8")
+    baseline_a = git_baseline.derive_baseline(str(tmp_path))
+
+    (tmp_path / "untracked.txt").write_text("two", encoding="utf-8")
+    baseline_b = git_baseline.derive_baseline(str(tmp_path))
+
+    assert baseline_a["worktree_state"] != baseline_b["worktree_state"]
+
+
+def test_records_an_unavailable_worktree_state_explicitly(monkeypatch, tmp_path):
+    _initialise_repository(tmp_path)
+    actual_run_git = git_baseline._run_git
+
+    def _unavailable_after_head(args, cwd, **kwargs):
+        if args[:2] == ["diff", "--binary"]:
+            return None
+        return actual_run_git(args, cwd, **kwargs)
+
+    monkeypatch.setattr(git_baseline, "_run_git", _unavailable_after_head)
+
+    baseline = git_baseline.derive_baseline(str(tmp_path))
+
+    assert baseline["worktree_state"] == {"status": "unavailable"}
 
 
 def test_records_absence_outside_a_repository(tmp_path):
@@ -59,19 +116,14 @@ def test_records_absence_on_unreadable_directory():
 
 
 def test_captures_no_branch_and_no_path(tmp_path):
-    """Only commit and dirty. A path is environment-specific and would make plan_id machine-dependent.
+    """Only commit and worktree state. A path is environment-specific and would make plan_id machine-dependent.
 
     Including a branch or path would mean two machines running an identical plan derived different
     ``plan_id`` values, forcing a spurious re-approval on every machine change.
     """
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True)
-    (tmp_path / "f.txt").write_text("x", encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+    _initialise_repository(tmp_path)
 
     baseline = git_baseline.derive_baseline(str(tmp_path))
 
-    assert set(baseline) == {"available", "commit", "dirty"}
+    assert set(baseline) == {"available", "commit", "worktree_state"}
     assert str(tmp_path) not in str(baseline)

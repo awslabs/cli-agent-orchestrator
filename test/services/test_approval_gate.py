@@ -183,6 +183,7 @@ def test_plan_id_extraction_is_total():
 
 
 def test_the_env_var_can_turn_the_gate_on(monkeypatch, tmp_path):
+    """The environment belongs to the CAO server process that resolves this setting."""
     monkeypatch.setattr(settings_service, "SETTINGS_FILE", tmp_path / "absent.json")
     for enabling_value in ("1", "true", "yes", "TRUE", " 1 "):
         monkeypatch.setenv("CAO_WORKFLOW_REQUIRE_APPROVAL", enabling_value)

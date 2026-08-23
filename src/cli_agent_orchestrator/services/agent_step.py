@@ -712,8 +712,9 @@ async def run_agent_step(
     # optimisation: a run that never creates a terminal must resolve nothing, because an unresolved
     # block is sensitive text that would be stored for no reason (NFR-1).
     #
-    # ``None`` — a non-workflow caller, a YAML run, a run with no manifest, or a persist that failed —
-    # means "pass nothing", and ``send_input`` then behaves exactly as it always has.
+    # ``None`` means there is no workflow manifest to honour, so use the historical live-memory path.
+    # ``""`` is different: it means an existing manifest's memory fill could not persist and MUST be
+    # passed through explicitly, suppressing ``send_input``'s live-memory fallback.
     frozen_memory = await asyncio.to_thread(
         frozen_run_memory.frozen_memory_for,
         (env_vars or {}).get("CAO_WORKFLOW_RUN_ID"),

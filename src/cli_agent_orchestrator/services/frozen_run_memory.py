@@ -86,8 +86,9 @@ def frozen_memory_for(
     """The memory block this run's terminals must be given, or ``None`` for "resolve live".
 
     ``None`` means the caller should pass nothing to ``send_input`` and let today's live path run —
-    which is the correct answer for a non-workflow terminal, for a YAML run, for a run with no
-    manifest, and for a run whose memory record could not be persisted.
+    which is the correct answer for a non-workflow terminal, for a YAML run, or for a run with no
+    readable manifest. ``""`` means a manifest existed but its memory block could not be persisted;
+    the caller must supply that empty block to prevent the terminal's live-memory fallback.
 
     TOTAL: never raises. A workflow step must not fail because a memory block could not be frozen;
     the worst outcome here is a run that proceeds without memory, which is visible in the manifest.
@@ -114,41 +115,55 @@ def frozen_memory_for(
         )
         return None
 
-    if envelope.memory.source:
-        # ALREADY RESOLVED, and ``source`` is the flag for a reason worth stating, because the two
-        # obvious alternatives are both wrong:
-        #
-        #   * NOT the content's truthiness. A run that legitimately resolved no memories stores "",
-        #     and a truthiness flag would re-resolve it at every terminal and again on every resume,
-        #     each time reading the LIVE store — the drift FR-9 exists to prevent.
-        #   * NOT ``content_hash`` either, which looks like the natural "was anything recorded"
-        #     probe and is NEVER empty: the freeze calls ``build(memory_content="")``, and
-        #     ``sha256("")`` is a perfectly ordinary 64-character digest. Reading the hash would make
-        #     every run look already-resolved and nothing would ever resolve at all.
-        #
-        # ``source`` is empty at freeze time and a fixed non-empty token once filled, so it says
-        # exactly "this record has a provenance", which is what "resolved" means here. This is the
-        # branch a resume takes, and it is why a resume resolves nothing.
-        return envelope.memory.content
+    while True:
+        if envelope.memory.source:
+            # ``source`` is the durable resolved flag. Content may legitimately be "", and the
+            # hash is always populated even before the lazy fill, so neither can identify a fill.
+            return envelope.memory.content
 
-    resolved = _resolve_live(terminal_id, task_description)
-
-    filled = execution_manifest.with_memory(
-        envelope, content=resolved, source=MEMORY_SOURCE_CURATED
-    )
-
-    try:
-        # PERSIST FIRST. If this raises, we must NOT return a block: see the module docstring.
-        workflow_journal.update_run_manifest(run_id, execution_manifest.serialise(filled))
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "frozen memory: could not record the resolved block for run '%s'; the run proceeds "
-            "with NO memory rather than using memory the manifest does not record: %s",
-            run_id,
-            e,
+        resolved = _resolve_live(terminal_id, task_description)
+        filled = execution_manifest.with_memory(
+            envelope, content=resolved, source=MEMORY_SOURCE_CURATED
         )
-        return None
 
-    # The STORED copy — redacted, possibly truncated — so this run and every replay of it see the
-    # same bytes. Not `resolved`, which is the raw resolution.
-    return filled.memory.content
+        try:
+            persisted = workflow_journal.compare_and_set_run_manifest(
+                run_id, row.manifest_json, execution_manifest.serialise(filled)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "frozen memory: could not record the resolved block for run '%s'; the run proceeds "
+                "with NO memory rather than using memory the manifest does not record: %s",
+                run_id,
+                e,
+            )
+            return ""
+
+        if persisted:
+            # The STORED copy — redacted, possibly truncated — so this run and every replay sees
+            # the same bytes. Not `resolved`, which is the raw resolution.
+            return filled.memory.content
+
+        try:
+            row = workflow_journal.get_run(run_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "frozen memory: could not reload run '%s' after a competing fill; "
+                "the run proceeds with NO memory: %s",
+                run_id,
+                e,
+            )
+            return ""
+
+        if row is None or row.manifest_json is None:
+            logger.warning(
+                "frozen memory: run '%s' disappeared after a competing fill; "
+                "the run proceeds with NO memory",
+                run_id,
+            )
+            return ""
+
+        envelope = execution_manifest.parse(row.manifest_json)
+        if envelope is None:
+            logger.warning("frozen memory: run '%s' has an unreadable manifest", run_id)
+            return ""

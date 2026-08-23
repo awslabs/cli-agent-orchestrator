@@ -9,6 +9,7 @@ unknown run/spec, 400 invalid inputs, 409 cancel-of-finished, 501 reserved mode,
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
@@ -865,6 +866,45 @@ def test_submit_script_tier_202_and_drives(client, async_script_env):
             break
     assert final == "completed"
     assert async_script_env["prepared"]["called"] is True
+
+
+def test_submit_script_manifest_freezes_resolved_inputs(client, async_script_env, monkeypatch):
+    """The async script manifest, journal, and drive share resolved inputs."""
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.models.workflow import InputDecl
+    from cli_agent_orchestrator.services import manifest_freeze, workflow_spec_service
+
+    resolved_inputs = {"topic": "default topic"}
+    spec = async_script_env["spec"].model_copy(
+        update={"inputs": {"topic": InputDecl(type="string", default="default topic")}}
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        workflow_spec_service, "get_workflow", lambda name_or_path, scan_dir=None: spec
+    )
+
+    def _capture_manifest(*, source_hash, inputs):
+        captured["manifest_inputs"] = inputs
+        return '{"plan_id":"plan-v1:resolved-inputs"}'
+
+    def _capture_schedule(record, spec_arg, run_id, tier, inputs):
+        captured["scheduled_inputs"] = inputs
+
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", _capture_manifest)
+    monkeypatch.setattr(api_main, "_schedule_background_drive", _capture_schedule)
+
+    response = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "async-resolved-inputs"},
+    )
+
+    assert response.status_code == 202
+    assert captured["manifest_inputs"] == resolved_inputs
+    assert (
+        json.loads(workflow_journal.get_run("async-resolved-inputs").inputs_json) == resolved_inputs
+    )
+    assert captured["scheduled_inputs"] == resolved_inputs
 
 
 @pytest.mark.asyncio

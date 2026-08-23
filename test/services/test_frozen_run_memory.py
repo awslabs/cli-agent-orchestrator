@@ -15,6 +15,8 @@ Four carry the unit's load:
 """
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -82,13 +84,13 @@ def test_the_record_is_persisted_before_the_block_is_returned(
     """ORDERING. A crash after using and before persisting loses the FR-9 evidence, silently."""
     events = []
 
-    real_update = workflow_journal.update_run_manifest
+    real_compare_and_set = workflow_journal.compare_and_set_run_manifest
 
-    def _tracked(run_id, manifest_json):
+    def _tracked(run_id, expected_manifest_json, manifest_json):
         events.append("persisted")
-        return real_update(run_id, manifest_json)
+        return real_compare_and_set(run_id, expected_manifest_json, manifest_json)
 
-    monkeypatch.setattr(workflow_journal, "update_run_manifest", _tracked)
+    monkeypatch.setattr(workflow_journal, "compare_and_set_run_manifest", _tracked)
 
     block = frozen_run_memory.frozen_memory_for(journalled_run, "term-1", "do the task")
     events.append("returned")
@@ -100,15 +102,15 @@ def test_the_record_is_persisted_before_the_block_is_returned(
     assert block is not None
 
 
-def test_a_failed_persist_returns_no_block(journalled_run, resolves, monkeypatch):
+def test_a_failed_persist_returns_an_explicit_empty_block(journalled_run, resolves, monkeypatch):
     """No block rather than an unrecorded one. The run proceeds with NO memory, visibly."""
 
-    def _boom(run_id, manifest_json):
+    def _boom(run_id, expected_manifest_json, manifest_json):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(workflow_journal, "update_run_manifest", _boom)
+    monkeypatch.setattr(workflow_journal, "compare_and_set_run_manifest", _boom)
 
-    assert frozen_run_memory.frozen_memory_for(journalled_run, "term-1", "task") is None
+    assert frozen_run_memory.frozen_memory_for(journalled_run, "term-1", "task") == ""
 
 
 def test_a_run_that_resolved_no_memory_does_not_re_resolve(journalled_run, monkeypatch):
@@ -177,6 +179,49 @@ def test_a_second_terminal_reuses_the_record(journalled_run, resolves):
 
     assert first == second
     assert len(resolves) == 1, "resolution happens once per RUN, not once per terminal"
+
+
+def test_concurrent_first_fills_return_the_persisted_winner(journalled_run, monkeypatch):
+    """A CAS loss reloads the winner instead of overwriting it with this terminal's block."""
+    both_resolvers_started = threading.Barrier(2)
+
+    def _resolve(terminal_id, task_description):
+        both_resolvers_started.wait(timeout=2)
+        return f"<cao-memory>{terminal_id}</cao-memory>"
+
+    monkeypatch.setattr(frozen_run_memory, "_resolve_live", _resolve)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            frozen_run_memory.frozen_memory_for, journalled_run, "term-first", "task"
+        )
+        second_future = executor.submit(
+            frozen_run_memory.frozen_memory_for, journalled_run, "term-second", "task"
+        )
+        first = first_future.result(timeout=5)
+        second = second_future.result(timeout=5)
+
+    stored = execution_manifest.parse(workflow_journal.get_run(journalled_run).manifest_json)
+    assert stored is not None
+    assert first == second == stored.memory.content
+    assert stored.memory.source == frozen_run_memory.MEMORY_SOURCE_CURATED
+
+
+def test_an_unreadable_manifest_after_cas_loss_suppresses_live_memory(
+    journalled_run, resolves, monkeypatch
+):
+    real_parse = execution_manifest.parse
+    parse_calls = 0
+
+    def _parse_then_fail(manifest_json):
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_parse(manifest_json) if parse_calls == 1 else None
+
+    monkeypatch.setattr(workflow_journal, "compare_and_set_run_manifest", lambda *_args: False)
+    monkeypatch.setattr(execution_manifest, "parse", _parse_then_fail)
+
+    assert frozen_run_memory.frozen_memory_for(journalled_run, "term-1", "task") == ""
 
 
 def test_a_resume_reads_the_record_and_never_resolves(journalled_run, resolves):

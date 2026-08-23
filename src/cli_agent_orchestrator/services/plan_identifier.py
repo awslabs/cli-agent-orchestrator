@@ -126,16 +126,20 @@ def _text(value: Optional[str]) -> str:
 
 
 def _number(value: Any) -> Any:
-    """Render a numeric leaf at fixed precision so ``600`` and ``600.0`` agree (BR-2A3-7).
+    """Render numeric leaves exactly while keeping integral int/float spellings equivalent (BR-2A3-7).
 
     Applied through :func:`_canonicalise` to the leaves of the structured fields. ``bool`` is checked
-    FIRST because ``bool`` is a subclass of ``int`` in Python, and normalising ``True`` to ``"1.000000"``
+    FIRST because ``bool`` is a subclass of ``int`` in Python, and normalising ``True`` to ``"1"``
     would erase the distinction between a flag and a count.
     """
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
-        return f"{float(value):.{_NUMBER_PRECISION}f}"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.{_NUMBER_PRECISION}f}"
     return value
 
 

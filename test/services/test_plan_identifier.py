@@ -45,7 +45,7 @@ def test_the_digest_of_a_known_field_set_is_pinned():
     just been invalidated. Update the literal ONLY together with a scheme-version bump.
     """
     assert compute(_fields()) == (
-        "plan-v1:8bcf384e8c5ba8faeb3c1aa1fd5ff5bc63bf523c5d8893d1978797e5c97b716a"
+        "plan-v1:0743b0b78d9c2a75c770a6aad22caa4681d5e4705d155e0ab98482bb2cf728d0"
     )
 
 
@@ -115,6 +115,14 @@ def test_absence_in_different_positions_is_distinct():
 def test_integer_and_float_spellings_agree():
     """``600`` and ``600.0`` are one identity: an int in a float-typed field is ordinary in Python."""
     assert compute(_fields(limits={"timeout": 600})) == compute(_fields(limits={"timeout": 600.0}))
+
+
+def test_distinct_large_integers_have_distinct_plan_ids():
+    assert compute(_fields(inputs={"n": 2**53})) != compute(_fields(inputs={"n": 2**53 + 1}))
+
+
+def test_an_oversized_integer_can_be_hashed():
+    assert compute(_fields(inputs={"n": 10**400})).startswith("plan-v1:")
 
 
 def test_booleans_are_not_normalised_into_numbers():

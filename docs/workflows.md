@@ -393,11 +393,19 @@ Approval enforcement is **off by default**. With it off, `plan_id`s are still co
 runs start regardless of whether an approval exists.
 
 ```bash
-# per-invocation, e.g. to try it out
-CAO_WORKFLOW_REQUIRE_APPROVAL=1 cao workflow run my-script
+# start the CAO server with approval enforcement enabled
+CAO_WORKFLOW_REQUIRE_APPROVAL=1 cao-server
 
-# persistently: set workflow.require_approval = true in settings.json
+# invoke the CLI client normally
+cao workflow run my-script
+
+# alternatively, persist workflow.require_approval = true in the server's settings.json
 ```
+
+> **The variable configures the server, not the CLI client.** Setting
+> `CAO_WORKFLOW_REQUIRE_APPROVAL=1` only on a short-lived `cao workflow run` invocation does not
+> configure an already-running CAO server. Set it in the environment that launches that server, or use
+> `settings.json`.
 
 > **The environment variable can only turn enforcement ON.** Setting it to `0`/`false` does **not**
 > disable a gate that `settings.json` has enabled — only `settings.json` can turn it off. This departs

@@ -4810,7 +4810,7 @@ async def submit_workflow_run_endpoint(
         manifest_json = await asyncio.to_thread(
             manifest_freeze.build_manifest_json,
             source_hash=spec.content_hash,
-            inputs=body.inputs,
+            inputs=resolved,
         )
         try:
             approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)

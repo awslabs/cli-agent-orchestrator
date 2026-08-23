@@ -10,7 +10,7 @@ be the reason a run cannot start, so every failure — not a repository, ``git``
 unreadable directory, a hung process — is reported as a RECORDED ABSENCE rather than an exception. Absence is
 a representable state, not an error.
 
-COMMIT AND DIRTY FLAG ONLY, AND THE OMISSIONS ARE DELIBERATE. No branch name, and above all NO PATH: a path
+COMMIT AND WORKTREE STATE ONLY, AND THE OMISSIONS ARE DELIBERATE. No branch name, and above all NO PATH: a path
 is environment-specific, so including it would make the ``plan_id`` derived from this baseline differ between
 two machines running an identical plan — a spurious re-approval on every machine change, which is the same
 false positive that sorting dict keys in ``plan_identifier`` exists to prevent. Normalise away what does not
@@ -25,7 +25,9 @@ overlooked. **IF A THIRD CALLER EVER NEEDS A NEVER-RAISES GIT WRAPPER, CONSOLIDA
 decided on.
 """
 
+import hashlib
 import logging
+import os
 import subprocess
 from typing import Any, Dict, Optional
 
@@ -36,7 +38,9 @@ logger = logging.getLogger(__name__)
 _GIT_TIMEOUT_SECONDS = 10
 
 
-def _run_git(args: list[str], cwd: str) -> Optional[subprocess.CompletedProcess]:
+def _run_git(
+    args: list[str], cwd: str, *, text: bool = True
+) -> Optional[subprocess.CompletedProcess[Any]]:
     """Run ``git <args>`` in ``cwd``, returning ``None`` when it could not run or did not succeed.
 
     LIST-ARGV, NEVER A SHELL STRING, and no value is interpolated into the arguments — every element is an
@@ -53,7 +57,7 @@ def _run_git(args: list[str], cwd: str) -> Optional[subprocess.CompletedProcess]
             ["git", *args],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=text,
             timeout=_GIT_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -68,11 +72,45 @@ def _run_git(args: list[str], cwd: str) -> Optional[subprocess.CompletedProcess]
     return completed
 
 
+def _worktree_state(cwd: str) -> Dict[str, str]:
+    """Capture tracked and untracked changes without recording an absolute worktree path."""
+    tracked = _run_git(["diff", "--binary", "--no-ext-diff", "HEAD", "--"], cwd, text=False)
+    untracked = _run_git(["ls-files", "--others", "--exclude-standard", "-z"], cwd, text=False)
+    if tracked is None or untracked is None:
+        return {"status": "unavailable"}
+
+    tracked_bytes = tracked.stdout
+    untracked_paths = [path for path in untracked.stdout.split(b"\0") if path]
+    if not tracked_bytes and not untracked_paths:
+        return {"status": "clean"}
+
+    digest = hashlib.sha256()
+    digest.update(len(tracked_bytes).to_bytes(8, "big"))
+    digest.update(tracked_bytes)
+    try:
+        for relative_path in sorted(untracked_paths):
+            # ``git ls-files`` yields repository-relative paths. Refuse an unexpected path rather than
+            # hashing outside the worktree if a repository changes beneath this snapshot operation.
+            if relative_path.startswith(b"/") or b".." in relative_path.split(b"/"):
+                return {"status": "unavailable"}
+            contents_path = os.path.join(os.fsencode(cwd), relative_path)
+            with open(contents_path, "rb") as untracked_file:
+                contents = untracked_file.read()
+            digest.update(len(relative_path).to_bytes(8, "big"))
+            digest.update(relative_path)
+            digest.update(len(contents).to_bytes(8, "big"))
+            digest.update(contents)
+    except OSError:
+        return {"status": "unavailable"}
+
+    return {"status": "dirty", "digest": f"sha256:{digest.hexdigest()}"}
+
+
 def derive_baseline(cwd: str) -> Dict[str, Any]:
     """The repository baseline for a run starting in ``cwd``. Never raises.
 
     Returns ``{"available": False}`` when no baseline could be read, and
-    ``{"available": True, "commit": <sha>, "dirty": <bool>}`` when one could.
+    ``{"available": True, "commit": <sha>, "worktree_state": <state>}`` when one could.
 
     ``available`` IS AN EXPLICIT FIELD rather than an absent key or a ``None`` commit, because the manifest
     is a durable record read later by an agent diagnosing a failed run: "we could not determine the
@@ -87,12 +125,4 @@ def derive_baseline(cwd: str) -> Dict[str, Any]:
     if not commit:
         return {"available": False}
 
-    # A repository with no commits yet, or any other state where the porcelain read fails, still yields a
-    # usable commit-less answer rather than discarding the commit we already have.
-    status = _run_git(["status", "--porcelain"], cwd)
-    dirty = bool(status.stdout.strip()) if status is not None else None
-
-    baseline: Dict[str, Any] = {"available": True, "commit": commit}
-    if dirty is not None:
-        baseline["dirty"] = dirty
-    return baseline
+    return {"available": True, "commit": commit, "worktree_state": _worktree_state(cwd)}
