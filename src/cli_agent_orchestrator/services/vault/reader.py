@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import logging
 import errno
+import logging
 import os
 import stat
 from dataclasses import dataclass
@@ -15,8 +15,8 @@ from sqlalchemy import and_, func
 from cli_agent_orchestrator.clients.database import (
     MemoryMetadataModel,
     SessionLocal,
-    VaultRecallCounterModel,
     VaultNoteModel,
+    VaultRecallCounterModel,
 )
 from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services.memory_format import normalize_memory_tags
@@ -80,8 +80,7 @@ def resolve_candidates(
             query = query.filter(MemoryMetadataModel.key.in_(key_list))
         rows = query.order_by(MemoryMetadataModel.updated_at.desc(), MemoryMetadataModel.key).all()
         return [
-            VaultCandidate(binding=binding, metadata=metadata, note=note)
-            for metadata, note in rows
+            VaultCandidate(binding=binding, metadata=metadata, note=note) for metadata, note in rows
         ]
 
 

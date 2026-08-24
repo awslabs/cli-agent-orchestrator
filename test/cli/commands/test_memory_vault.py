@@ -52,7 +52,9 @@ def test_vault_status_labels_unmapped_writes_as_process_local(monkeypatch) -> No
     result = CliRunner().invoke(memory, ["vault", "status"])
 
     assert result.exit_code == 0
-    assert "process_local_unmapped_project_writes: unavailable in a fresh CLI process" in result.output
+    assert (
+        "process_local_unmapped_project_writes: unavailable in a fresh CLI process" in result.output
+    )
     assert "7" not in result.output
 
 
@@ -109,8 +111,7 @@ def test_vault_rebuild_requires_apply_and_names_access_count_reset(monkeypatch) 
     monkeypatch.setattr(
         reconcile,
         "rebuild",
-        lambda vault: rebuilt.append(vault)
-        or ReconcileReport("vault", "run", 0, 0, 0, 0, 0, True),
+        lambda vault: rebuilt.append(vault) or ReconcileReport("vault", "run", 0, 0, 0, 0, 0, True),
     )
 
     refused = CliRunner().invoke(memory, ["vault", "rebuild"])
@@ -137,7 +138,8 @@ def test_vault_migrate_forwards_dry_run_apply_and_confirmed_delete(monkeypatch) 
     monkeypatch.setattr(
         migrate,
         "migrate_scope",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or MigrationReport(dry_run=not kwargs["apply"]),
+        lambda *args, **kwargs: calls.append((args, kwargs))
+        or MigrationReport(dry_run=not kwargs["apply"]),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.cli.commands.memory._get_memory_service",

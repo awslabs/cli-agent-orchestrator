@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from test.fixtures.vault_factory import build_vault_fixture
 
 import pytest
 from sqlalchemy import create_engine
@@ -15,7 +16,6 @@ from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.vault import migrate
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.parser import parse_note
-from test.fixtures.vault_factory import build_vault_fixture
 
 
 class _Relationships:
@@ -108,7 +108,9 @@ def test_delete_source_requires_apply_and_second_confirmation(tmp_path, svc) -> 
         _migrate(svc, fixture, apply=True, delete_source=True)
 
 
-def test_confirmed_delete_source_removes_native_only_after_a_successful_write(tmp_path, svc) -> None:
+def test_confirmed_delete_source_removes_native_only_after_a_successful_write(
+    tmp_path, svc
+) -> None:
     fixture = build_vault_fixture(tmp_path)
     _store(svc, "delete-me")
 
@@ -132,9 +134,7 @@ def test_migration_reports_each_named_lossy_field(tmp_path, svc) -> None:
     source = svc.get_wiki_path("global", None, "lossy")
     source.write_text(
         "# lossy\n<!-- id: native | scope: global | type: reference | tags:  -->\n\n"
-        "## 2025-01-01T00:00:00Z\n"
-        + ("a" * 3900)
-        + "\n\n## 2025-01-02T00:00:00Z\nsecond\n",
+        "## 2025-01-01T00:00:00Z\n" + ("a" * 3900) + "\n\n## 2025-01-02T00:00:00Z\nsecond\n",
         encoding="utf-8",
     )
     with svc._get_db_session() as db:

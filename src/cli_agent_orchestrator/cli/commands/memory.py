@@ -170,7 +170,9 @@ def vault_status(out_format):
         payload = dataclasses.asdict(item)
         # A CLI invocation is a fresh process. Do not present this observation
         # as durable status retained from earlier processes.
-        payload["process_local_unmapped_project_writes"] = "process-local; unavailable in a fresh CLI process"
+        payload["process_local_unmapped_project_writes"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
         if out_format == "json":
             click.echo(json.dumps(payload, indent=2, sort_keys=True))
             continue

@@ -11,6 +11,7 @@ import re
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
+from test.fixtures.vault_factory import build_vault_fixture
 
 import pytest
 import yaml
@@ -19,7 +20,6 @@ from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteErr
 from cli_agent_orchestrator.services.vault import writer
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.parser import parse_note, split_frontmatter
-from test.fixtures.vault_factory import build_vault_fixture
 
 
 def _binding(fixture) -> VaultBinding:
@@ -58,11 +58,7 @@ def test_write_preserves_user_frontmatter_bytes_except_cao_block(tmp_path) -> No
         "aliases: ['One', \"Two\"] # preserve comment\n"
         "custom_field: value\n"
     )
-    original = (
-        "---\n"
-        + user_frontmatter
-        + "cao:\n  key: old-key\n  type: project\n---\nold body\n"
-    )
+    original = "---\n" + user_frontmatter + "cao:\n  key: old-key\n  type: project\n---\nold body\n"
     target.write_text(original, encoding="utf-8")
 
     _write(fixture, expected_content_sha256=_sha256(original))
@@ -148,10 +144,7 @@ def test_write_preserves_bom_crlf_and_unusual_user_frontmatter_bytes(tmp_path) -
     written = target.read_bytes().decode("utf-8")
     assert written.startswith("\ufeff---\r\n")
     assert user_frontmatter in written
-    assert (
-        "cao:\r\n  type: reference\r\n  key: managed-note\r\n  managed: true\r\n"
-        in written
-    )
+    assert "cao:\r\n  type: reference\r\n  key: managed-note\r\n  managed: true\r\n" in written
     assert "old-key" not in written
     assert written.endswith("new body\r\n")
     assert "\n" not in written.replace("\r\n", "")
@@ -238,16 +231,7 @@ def test_writer_output_round_trips_through_shared_frontmatter_boundary(
 ) -> None:
     fixture = build_vault_fixture(tmp_path)
     target = fixture.root / "CAO" / "managed-note.md"
-    original = (
-        bom
-        + "---"
-        + newline
-        + user_frontmatter
-        + cao_block
-        + "---"
-        + newline
-        + "old body"
-    )
+    original = bom + "---" + newline + user_frontmatter + cao_block + "---" + newline + "old body"
     target.write_bytes(original.encode("utf-8"))
 
     _write(
@@ -291,15 +275,11 @@ def test_writer_output_round_trips_through_shared_frontmatter_boundary(
         "!!str cao:\n  key: stale\ntitle: keep\n",
     ],
 )
-def test_write_preserves_every_non_cao_frontmatter_value(
-    tmp_path, user_frontmatter
-) -> None:
+def test_write_preserves_every_non_cao_frontmatter_value(tmp_path, user_frontmatter) -> None:
     fixture = build_vault_fixture(tmp_path)
     target = fixture.root / "CAO" / "managed-note.md"
     original = f"---\n{user_frontmatter}---\nold body\n"
-    parsed_before = parse_note(
-        original, max_frontmatter_bytes=8192, secret_gate="reject"
-    )
+    parsed_before = parse_note(original, max_frontmatter_bytes=8192, secret_gate="reject")
     assert parsed_before.finding_code is None
     user_values_before = dict(parsed_before.frontmatter)
     user_values_before.pop("cao", None)
@@ -389,8 +369,7 @@ def test_write_rejects_secret_rendered_in_cao_frontmatter(tmp_path) -> None:
         _write(fixture, cao={"note": "Authorization: Bearer " + "a" * 16})
 
     assert (
-        str(caught.value)
-        == "vault write rejected: cao matched credential pattern 'bearer_token'"
+        str(caught.value) == "vault write rejected: cao matched credential pattern 'bearer_token'"
     )
     assert not (fixture.root / "CAO" / "managed-note.md").exists()
 
@@ -399,11 +378,7 @@ def test_write_preserves_blank_line_after_cao_block(tmp_path) -> None:
     fixture = build_vault_fixture(tmp_path)
     target = fixture.root / "CAO" / "managed-note.md"
     user_frontmatter = "title: keep\n"
-    original = (
-        "---\n"
-        + user_frontmatter
-        + "cao:\n  key: old-key\n\nother: retained\n---\nbody\n"
-    )
+    original = "---\n" + user_frontmatter + "cao:\n  key: old-key\n\nother: retained\n---\nbody\n"
     target.write_text(original, encoding="utf-8")
 
     _write(fixture, expected_content_sha256=writer._sha256(original))
@@ -421,9 +396,7 @@ def test_write_never_touches_an_unmanaged_note(tmp_path) -> None:
     assert unmanaged.read_bytes() == before
 
 
-def test_write_detects_modification_after_lock_acquisition(
-    tmp_path, monkeypatch
-) -> None:
+def test_write_detects_modification_after_lock_acquisition(tmp_path, monkeypatch) -> None:
     fixture = build_vault_fixture(tmp_path)
     target = fixture.root / "CAO" / "managed-note.md"
     original = "---\ntitle: before\n---\nbody\n"
@@ -455,8 +428,7 @@ def test_reject_secret_gate_refuses_without_creating_note(tmp_path) -> None:
         _write(fixture, body=secret_body)
 
     assert (
-        str(caught.value)
-        == "vault write rejected: body matched credential pattern 'bearer_token'"
+        str(caught.value) == "vault write rejected: body matched credential pattern 'bearer_token'"
     )
     assert not (fixture.root / "CAO" / "managed-note.md").exists()
 
@@ -540,9 +512,7 @@ def test_write_refuses_read_only_mapping(tmp_path) -> None:
         ),
     ],
 )
-def test_write_rejects_every_key_path_escape_before_writing(
-    tmp_path, key, message
-) -> None:
+def test_write_rejects_every_key_path_escape_before_writing(tmp_path, key, message) -> None:
     fixture = build_vault_fixture(tmp_path)
 
     with pytest.raises(ValueError) as caught:
@@ -578,9 +548,7 @@ def test_write_refuses_symlinked_managed_folder_ancestor(tmp_path) -> None:
     with pytest.raises(ValueError) as caught:
         _write(
             fixture,
-            vault=fixture.vault.model_copy(
-                update={"managed_folder": "managed-link/CAO"}
-            ),
+            vault=fixture.vault.model_copy(update={"managed_folder": "managed-link/CAO"}),
         )
 
     assert "escapes base directory" in str(caught.value)
@@ -611,9 +579,7 @@ def test_mkstemp_sink_guard_raises_writer_containment_error(tmp_path) -> None:
         )
 
 
-def test_temp_open_sink_guard_raises_writer_containment_error(
-    tmp_path, monkeypatch
-) -> None:
+def test_temp_open_sink_guard_raises_writer_containment_error(tmp_path, monkeypatch) -> None:
     fixture = build_vault_fixture(tmp_path)
     outside = tmp_path / "outside.tmp"
     outside.write_text("", encoding="utf-8")
@@ -788,11 +754,7 @@ def test_write_preserves_existing_mode_and_uses_umask_for_new_note(tmp_path) -> 
 
 def test_vault_writer_owns_nonempty_vault_write_sink_set() -> None:
     source_root = (
-        Path(__file__).parents[3]
-        / "src"
-        / "cli_agent_orchestrator"
-        / "services"
-        / "vault"
+        Path(__file__).parents[3] / "src" / "cli_agent_orchestrator" / "services" / "vault"
     )
     violations: list[str] = []
     writer_sinks: list[str] = []
@@ -816,11 +778,7 @@ def test_vault_writer_owns_nonempty_vault_write_sink_set() -> None:
                 node.args[1]
                 if len(node.args) > 1
                 else next(
-                    (
-                        keyword.value
-                        for keyword in node.keywords
-                        if keyword.arg == "mode"
-                    ),
+                    (keyword.value for keyword in node.keywords if keyword.arg == "mode"),
                     None,
                 )
             )
@@ -836,10 +794,7 @@ def test_vault_writer_owns_nonempty_vault_write_sink_set() -> None:
                 # intentionally does not classify every stdlib write helper:
                 # shutil.copy, os.symlink, os.truncate and Path.open are outside
                 # this direct-sink allowlist.
-                or (
-                    qualified_owner == "os"
-                    and name in {"makedirs", "rename", "replace", "unlink"}
-                )
+                or (qualified_owner == "os" and name in {"makedirs", "rename", "replace", "unlink"})
                 or (qualified_owner == "tempfile" and name == "mkstemp")
             )
             if not known_write_sink and not writes_via_open:

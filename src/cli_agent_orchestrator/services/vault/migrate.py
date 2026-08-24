@@ -119,9 +119,7 @@ def migrate_scope(
         report.migrated += 1
         if delete_source:
             try:
-                if asyncio.run(
-                    memory_service.forget(row.key, scope=scope, scope_id=scope_id)
-                ):
+                if asyncio.run(memory_service.forget(row.key, scope=scope, scope_id=scope_id)):
                     report.deleted_source += 1
             except Exception as exc:  # Durable vault note remains observable as an item failure.
                 report.failed += 1
@@ -129,9 +127,7 @@ def migrate_scope(
     return report
 
 
-def _validate_delete_options(
-    apply: bool, delete_source: bool, confirm_delete_source: bool
-) -> None:
+def _validate_delete_options(apply: bool, delete_source: bool, confirm_delete_source: bool) -> None:
     if delete_source and not apply:
         raise ValueError("--delete-source requires --apply")
     if delete_source and not confirm_delete_source:
@@ -157,9 +153,7 @@ def _native_history(
     memory_service: MemoryService, row: MemoryMetadataModel, *, max_body_bytes: int
 ) -> tuple[str, int]:
     """Return native append-only history, reporting complete sections that do not fit."""
-    source = os.path.realpath(
-        str(memory_service.get_wiki_path(row.scope, row.scope_id, row.key))
-    )
+    source = os.path.realpath(str(memory_service.get_wiki_path(row.scope, row.scope_id, row.key)))
     memory_base = os.path.realpath(str(MEMORY_BASE_DIR))
     if not source.startswith(memory_base + os.sep):
         raise ValueError("native migration source escapes memory base")
@@ -207,9 +201,7 @@ def _link_from(dto: RelationshipDTO) -> dict[str, Any]:
     return link
 
 
-def _losses_for(
-    row: MemoryMetadataModel, history_loss: int, link_count: int
-) -> dict[str, int]:
+def _losses_for(row: MemoryMetadataModel, history_loss: int, link_count: int) -> dict[str, int]:
     losses: dict[str, int] = {}
     for name in _LOSSY_FIELDS:
         value = getattr(row, name)

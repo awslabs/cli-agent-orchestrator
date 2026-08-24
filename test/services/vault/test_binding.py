@@ -37,9 +37,7 @@ def _config(tmp_path) -> VaultConfig:
     )
 
 
-def test_resolve_canonicalises_project_alias_before_matching(
-    tmp_path, monkeypatch
-) -> None:
+def test_resolve_canonicalises_project_alias_before_matching(tmp_path, monkeypatch) -> None:
     config = _config(tmp_path)
     monkeypatch.setattr(
         binding,
@@ -58,9 +56,7 @@ def test_resolve_canonicalises_configured_project_alias_and_case_variant(
     tmp_path, monkeypatch
 ) -> None:
     config = _config(tmp_path)
-    stale_mapping = (
-        config.vaults[0].mappings[0].model_copy(update={"scope_id": "old-project"})
-    )
+    stale_mapping = config.vaults[0].mappings[0].model_copy(update={"scope_id": "old-project"})
     config.vaults[0].mappings[0] = stale_mapping
     monkeypatch.setattr(
         binding,
@@ -75,15 +71,11 @@ def test_resolve_canonicalises_configured_project_alias_and_case_variant(
     assert resolved.mapping.scope_id == "old-project"
 
 
-def test_load_vault_config_refuses_when_configuration_is_unavailable(
-    monkeypatch, caplog
-) -> None:
+def test_load_vault_config_refuses_when_configuration_is_unavailable(monkeypatch, caplog) -> None:
     monkeypatch.setattr(
         settings_service,
         "get_vault_config",
-        lambda: (_ for _ in ()).throw(
-            ValueError("vault root 'missing' does not exist")
-        ),
+        lambda: (_ for _ in ()).throw(ValueError("vault root 'missing' does not exist")),
     )
 
     with pytest.raises(
@@ -157,9 +149,7 @@ def test_collect_binding_warnings_are_complete_deterministic_and_content_free(
     monkeypatch.setattr(
         binding,
         "get_project_id_by_alias",
-        lambda scope_id: (
-            "github-com-acme-widgets" if scope_id == "deadbeefcafe" else None
-        ),
+        lambda scope_id: ("github-com-acme-widgets" if scope_id == "deadbeefcafe" else None),
     )
     monkeypatch.setattr(
         binding,

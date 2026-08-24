@@ -49,9 +49,7 @@ class ParseResult:
     finding_detail: Optional[str] = None
 
 
-def _quarantined(
-    region: FrontmatterRegion, code: FindingCode, detail: str
-) -> ParseResult:
+def _quarantined(region: FrontmatterRegion, code: FindingCode, detail: str) -> ParseResult:
     return ParseResult({}, {}, region, code, detail)
 
 
@@ -68,9 +66,7 @@ def frontmatter_boundary(text: str) -> Optional[tuple[FrontmatterRegion, str]]:
     opening = f"---{newline}"
     if not source.startswith(opening):
         return None
-    closing_pattern = (
-        r"(?m)^---(?:\r\n|\Z)" if newline == "\r\n" else r"(?m)^---(?:\n|\Z)"
-    )
+    closing_pattern = r"(?m)^---(?:\r\n|\Z)" if newline == "\r\n" else r"(?m)^---(?:\n|\Z)"
     closing_match = next(
         (match for match in re.finditer(closing_pattern, source[len(opening) :])),
         None,
@@ -80,9 +76,7 @@ def frontmatter_boundary(text: str) -> Optional[tuple[FrontmatterRegion, str]]:
     closing = len(opening) + closing_match.start()
     end = len(opening) + closing_match.end()
     raw_end = (
-        closing - len(newline)
-        if source[closing - len(newline) : closing] == newline
-        else closing
+        closing - len(newline) if source[closing - len(newline) : closing] == newline else closing
     )
     raw = source[len(opening) : raw_end]
     return FrontmatterRegion(raw, source[end:], offset, offset + end), newline
@@ -156,44 +150,32 @@ def _mapping_entry_span(raw: str, key: yaml.Node, value: yaml.Node) -> tuple[int
     return start, end
 
 
-def parse_note(
-    text: str, *, max_frontmatter_bytes: int, secret_gate: str
-) -> ParseResult:
+def parse_note(text: str, *, max_frontmatter_bytes: int, secret_gate: str) -> ParseResult:
     """Parse text only; invalid frontmatter is represented as a quarantine finding."""
     try:
         region = split_frontmatter(text, max_frontmatter_bytes)
     except ValueError as exc:
         region = FrontmatterRegion("", text, 0, 0)
         if str(exc) == "frontmatter_too_large":
-            return _quarantined(
-                region, FindingCode.FRONTMATTER_TOO_LARGE, "frontmatter byte cap"
-            )
-        return _quarantined(
-            region, FindingCode.FRONTMATTER_MALFORMED, "unterminated frontmatter"
-        )
+            return _quarantined(region, FindingCode.FRONTMATTER_TOO_LARGE, "frontmatter byte cap")
+        return _quarantined(region, FindingCode.FRONTMATTER_MALFORMED, "unterminated frontmatter")
     if not region.raw:
         return ParseResult({}, {}, region)
     try:
         if _has_yaml_anchor_or_alias(region.raw):
-            return _quarantined(
-                region, FindingCode.FRONTMATTER_UNSAFE, "YAML anchor or alias"
-            )
+            return _quarantined(region, FindingCode.FRONTMATTER_UNSAFE, "YAML anchor or alias")
         loaded = yaml.safe_load(region.raw)
     except (yaml.YAMLError, RecursionError):
         return _quarantined(region, FindingCode.FRONTMATTER_MALFORMED, "invalid YAML")
     if loaded is None:
         loaded = {}
     if not isinstance(loaded, dict):
-        return _quarantined(
-            region, FindingCode.INVALID_CAO_BLOCK, "frontmatter must be an object"
-        )
+        return _quarantined(region, FindingCode.INVALID_CAO_BLOCK, "frontmatter must be an object")
     cao = loaded.get("cao", {})
     if cao is None:
         cao = {}
     if not isinstance(cao, dict):
-        return _quarantined(
-            region, FindingCode.INVALID_CAO_BLOCK, "cao must be an object"
-        )
+        return _quarantined(region, FindingCode.INVALID_CAO_BLOCK, "cao must be an object")
     try:
         _validate_cao(cao)
     except ValueError as exc:
@@ -217,9 +199,7 @@ def _validate_cao(cao: dict[str, Any]) -> None:
     if "managed" in cao and not isinstance(cao["managed"], bool):
         raise ValueError("cao.managed must be a boolean")
     links = cao.get("links")
-    if links is not None and (
-        not isinstance(links, list) or len(links) > MAX_CAO_LINKS
-    ):
+    if links is not None and (not isinstance(links, list) or len(links) > MAX_CAO_LINKS):
         raise ValueError("cao.links must be a list of at most 64 objects")
     for link in links or ():
         _validate_cao_link(link)
@@ -236,9 +216,7 @@ def _validate_cao_link(link: Any) -> None:
     if len(link["to"]) > MAX_CAO_LINK_TARGET_CHARS or any(
         ord(character) < 32 or ord(character) == 127 for character in link["to"]
     ):
-        raise ValueError(
-            "cao.links[].to contains unsupported characters or exceeds 256 characters"
-        )
+        raise ValueError("cao.links[].to contains unsupported characters or exceeds 256 characters")
     for key, values in (
         ("type", VALID_TYPES),
         ("status", VALID_STATUSES),
@@ -254,9 +232,7 @@ def _validate_cao_link(link: Any) -> None:
         raise ValueError("cao.links[].confidence must be between 0 and 1")
 
 
-def classify_secret(
-    body: str, *, secret_gate: str
-) -> Optional[tuple[FindingCode, str, str]]:
+def classify_secret(body: str, *, secret_gate: str) -> Optional[tuple[FindingCode, str, str]]:
     """Return the content-free secret finding with explicit mapping gate severity."""
     pattern = scan_for_secrets(body)
     if pattern is None:

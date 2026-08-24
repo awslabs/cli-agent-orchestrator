@@ -44,9 +44,7 @@ async def test_lint_enrichment_cause_disabled_by_setting(tmp_path, monkeypatch) 
     provider = MemoryGraphProvider(
         memory_service=_IndexService(tmp_path / "index.md"),
         lint_enabled=lambda: False,
-        binding_resolver=lambda scope, scope_id: pytest.fail(
-            "binding must not be resolved"
-        ),
+        binding_resolver=lambda scope, scope_id: pytest.fail("binding must not be resolved"),
     )
 
     view = await provider._build("global", None, lint_enabled=False)
@@ -72,9 +70,7 @@ async def test_lint_enrichment_cause_unavailable_vault(tmp_path, monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_lint_enrichment_cause_failed_for_native_scope(
-    tmp_path, monkeypatch
-) -> None:
+async def test_lint_enrichment_cause_failed_for_native_scope(tmp_path, monkeypatch) -> None:
     async def fail_lint(project_hash, *, scope=None, **kwargs):
         raise RuntimeError("lint backend unavailable")
 

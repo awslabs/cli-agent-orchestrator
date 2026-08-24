@@ -512,7 +512,9 @@ def _migrate_memory_source_kind() -> None:
                 for index_name in unique_indexes
             ):
                 if "source_kind" not in columns:
-                    raise RuntimeError("memory_metadata unique index references missing source_kind")
+                    raise RuntimeError(
+                        "memory_metadata unique index references missing source_kind"
+                    )
                 return
 
             conn.execute("BEGIN")

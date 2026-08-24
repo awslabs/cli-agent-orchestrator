@@ -387,9 +387,7 @@ def test_binding_aware_query_helpers_default_to_native_without_call_site_changes
             assert len(source_kind_keywords) == 1
             assert isinstance(source_kind_keywords[0].value, ast.Name)
             source_kind_name = source_kind_keywords[0].value.id
-            forwards_kwonly = (
-                source_kind_name == "source_kind" and "source_kind" in kwonly_names
-            )
+            forwards_kwonly = source_kind_name == "source_kind" and "source_kind" in kwonly_names
             derives_from_memory = any(
                 isinstance(assignment, (ast.Assign, ast.AnnAssign))
                 and source_kind_name

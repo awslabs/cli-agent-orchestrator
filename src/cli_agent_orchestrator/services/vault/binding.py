@@ -88,9 +88,7 @@ def resolve(
 
     for vault in config.vaults:
         for mapping in vault.mappings:
-            canonical_mapping_scope_id = _canonical_scope_id(
-                mapping.scope, mapping.scope_id
-            )
+            canonical_mapping_scope_id = _canonical_scope_id(mapping.scope, mapping.scope_id)
             if mapping.scope == scope and _scope_ids_match(
                 scope,
                 canonical_mapping_scope_id,
@@ -237,14 +235,8 @@ def _load_vault_config() -> VaultConfig:
             "vault binding configuration unavailable: %s",
             str(exc),
         )
-        raise VaultConfigUnavailableError(
-            f"vault configuration unavailable: {exc}"
-        ) from exc
+        raise VaultConfigUnavailableError(f"vault configuration unavailable: {exc}") from exc
 
 
 def _has_project_mapping(config: VaultConfig) -> bool:
-    return any(
-        mapping.scope == "project"
-        for vault in config.vaults
-        for mapping in vault.mappings
-    )
+    return any(mapping.scope == "project" for vault in config.vaults for mapping in vault.mappings)

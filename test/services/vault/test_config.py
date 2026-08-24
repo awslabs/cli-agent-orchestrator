@@ -70,9 +70,7 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             2,
-            lambda document, root: document["vaults"].append(
-                deepcopy(document["vaults"][0])
-            ),
+            lambda document, root: document["vaults"].append(deepcopy(document["vaults"][0])),
             "only one vault",
         ),
         (
@@ -82,9 +80,7 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             4,
-            lambda document, root: document["vaults"][0].update(
-                root=str(root / "missing")
-            ),
+            lambda document, root: document["vaults"][0].update(root=str(root / "missing")),
             "root",
         ),
         (
@@ -94,9 +90,7 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             7,
-            lambda document, root: document["vaults"][0]["mappings"][1].update(
-                folder="../escape"
-            ),
+            lambda document, root: document["vaults"][0]["mappings"][1].update(folder="../escape"),
             "folder",
         ),
         (
@@ -106,30 +100,22 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             9,
-            lambda document, root: document["vaults"][0]["mappings"][1].update(
-                folder="CAO/nested"
-            ),
+            lambda document, root: document["vaults"][0]["mappings"][1].update(folder="CAO/nested"),
             "must not overlap",
         ),
         (
             10,
-            lambda document, root: document["vaults"][0].update(
-                managed_folder="Unmapped"
-            ),
+            lambda document, root: document["vaults"][0].update(managed_folder="Unmapped"),
             "managed_folder",
         ),
         (
             11,
-            lambda document, root: document["vaults"][0]["mappings"][1].update(
-                scope="federated"
-            ),
+            lambda document, root: document["vaults"][0]["mappings"][1].update(scope="federated"),
             "scope",
         ),
         (
             12,
-            lambda document, root: document["vaults"][0]["mappings"][0].update(
-                scope_id="..."
-            ),
+            lambda document, root: document["vaults"][0]["mappings"][0].update(scope_id="..."),
             "scope_id",
         ),
         (
@@ -141,9 +127,7 @@ def test_folder_accepts_real_vault_characters(tmp_path):
         ),
         (
             14,
-            lambda document, root: document["vaults"][0].update(
-                exclude=["../Private/**"]
-            ),
+            lambda document, root: document["vaults"][0].update(exclude=["../Private/**"]),
             "exclude",
         ),
         (
@@ -308,15 +292,11 @@ def test_rule_20_warn_and_inject_loads_with_persistent_warning(tmp_path, caplog)
 
     config = _load(document)
 
-    assert config.warnings == (
-        "mapping 'References' has secret_gate='warn' with inject=true",
-    )
+    assert config.warnings == ("mapping 'References' has secret_gate='warn' with inject=true",)
     assert "secret_gate='warn' with inject=true" in caplog.text
 
 
-def test_recall_budget_warns_when_it_exceeds_the_injection_scope_budget(
-    tmp_path, caplog
-):
+def test_recall_budget_warns_when_it_exceeds_the_injection_scope_budget(tmp_path, caplog):
     _load(_document(str(tmp_path)))
 
     assert "exceeds the injection scope budget" in caplog.text

@@ -91,9 +91,7 @@ def write_managed_note(
             )
         except ValueError as exc:
             raise _conflict(target) from exc
-        rendered_cao = _render_cao(
-            key, cao, boundary[1] if boundary is not None else "\n"
-        )
+        rendered_cao = _render_cao(key, cao, boundary[1] if boundary is not None else "\n")
         _check_secret_gate(body, rendered_cao, binding)
         mode = _target_mode(target)
         _publish_managed_note(vault.root, managed_base, target, rendered, mode)
@@ -127,9 +125,7 @@ def _managed_target(vault: VaultSpec, key: str) -> tuple[str, str]:
     managed_base = safe_join_under_base(
         vault.root, *components, description="managed_folder component"
     )
-    target = safe_join_under_base(
-        vault.root, *components, f"{key}.md", description="vault key"
-    )
+    target = safe_join_under_base(vault.root, *components, f"{key}.md", description="vault key")
     return managed_base, target
 
 
@@ -265,9 +261,7 @@ def _remove_cao_block(raw: str) -> tuple[str, str]:
     return retained, locations.indentation
 
 
-def _render_cao(
-    key: str, cao: Mapping[str, Any], newline: str, *, indentation: str = ""
-) -> str:
+def _render_cao(key: str, cao: Mapping[str, Any], newline: str, *, indentation: str = "") -> str:
     value = dict(cao)
     value["key"] = key
     value["managed"] = True
@@ -297,9 +291,7 @@ def _check_secret_gate(body: str, rendered_cao: str, binding: VaultBinding) -> N
             raise VaultSecretWriteError(
                 f"vault write rejected: {region} matched credential pattern {secret_pattern!r}"
             )
-        logger.warning(
-            "vault_write_secret_warn pattern=%s region=%s", secret_pattern, region
-        )
+        logger.warning("vault_write_secret_warn pattern=%s region=%s", secret_pattern, region)
         continue
 
 
@@ -362,9 +354,7 @@ def _publish_managed_note(
                 # F16: bare str and a single-positive guard immediately above this sink.
                 os.unlink(temp_path)
             else:
-                logger.warning(
-                    "vault_write_temp_cleanup_skipped_outside_managed_folder"
-                )
+                logger.warning("vault_write_temp_cleanup_skipped_outside_managed_folder")
         except FileNotFoundError:
             pass
         except OSError:

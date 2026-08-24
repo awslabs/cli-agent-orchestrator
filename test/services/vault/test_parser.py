@@ -132,8 +132,7 @@ def test_unterminated_frontmatter_is_malformed():
         (
             "cao:\n  links:\n"
             + "\n".join(
-                "    - {to: invalid, type: wrong}"
-                for _ in range(parser.MAX_CAO_LINKS + 1)
+                "    - {to: invalid, type: wrong}" for _ in range(parser.MAX_CAO_LINKS + 1)
             ),
             FindingCode.INVALID_CAO_BLOCK,
             "cao.links must be a list of at most 64 objects",
@@ -195,9 +194,7 @@ def test_unterminated_frontmatter_is_malformed():
         ),
     ],
 )
-def test_invalid_cao_values_are_quarantined_without_defaulting(
-    frontmatter, code, detail
-):
+def test_invalid_cao_values_are_quarantined_without_defaulting(frontmatter, code, detail):
     result = _parse(frontmatter)
 
     assert result.finding_code == code

@@ -2395,9 +2395,7 @@ class MemoryService:
                         MemoryScope.SESSION.value,
                     }:
                         continue
-                    binding = resolve(
-                        mapping.scope, mapping.scope_id, vault_config=config
-                    )
+                    binding = resolve(mapping.scope, mapping.scope_id, vault_config=config)
                     if isinstance(binding, VaultBinding) and binding not in bindings:
                         bindings.append(binding)
             return native_dirs, bindings, config.max_recall_body_chars
@@ -2481,9 +2479,7 @@ class MemoryService:
             search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
                 scope, terminal_context, scan_all=scan_all
             )
-            vault_candidates = self._vault_candidates(
-                vault_bindings, require_injectable=False
-            )
+            vault_candidates = self._vault_candidates(vault_bindings, require_injectable=False)
         else:
             search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
         wanted = {self._identity(m) for m in memories}
@@ -2579,9 +2575,7 @@ class MemoryService:
             search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
                 scope, terminal_context, scan_all=scan_all
             )
-            vault_candidates = self._vault_candidates(
-                vault_bindings, require_injectable=False
-            )
+            vault_candidates = self._vault_candidates(vault_bindings, require_injectable=False)
         else:
             search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
 
@@ -2658,9 +2652,8 @@ class MemoryService:
             # The full indexed scope supplies IDF. Filters apply only to
             # returned candidates, never to the corpus population.
             if (
-                (memory_type is None or candidate.metadata.memory_type == memory_type)
-                and candidate.metadata.key not in exclude_keys
-            ):
+                memory_type is None or candidate.metadata.memory_type == memory_type
+            ) and candidate.metadata.key not in exclude_keys:
                 vault_memories[index] = memory
 
         if not candidates:
@@ -3123,9 +3116,7 @@ class MemoryService:
             binding = resolve(scope, scope_id, vault_config=get_vault_config())
             if not isinstance(binding, VaultBinding):
                 return
-            increment_counter(
-                binding.vault_id, "injection_budget_exceeded.scopes_clipped", 1
-            )
+            increment_counter(binding.vault_id, "injection_budget_exceeded.scopes_clipped", 1)
             increment_counter(
                 binding.vault_id,
                 "injection_budget_exceeded.memories_dropped",

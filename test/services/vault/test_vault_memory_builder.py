@@ -5,6 +5,7 @@ import errno
 import os
 import sys
 from datetime import datetime, timezone
+from test.fixtures.vault_factory import build_vault_fixture
 from types import SimpleNamespace
 
 import pytest
@@ -25,12 +26,12 @@ from cli_agent_orchestrator.services.vault.reader import (
     resolve_candidates,
 )
 from cli_agent_orchestrator.services.vault.reconcile import reconcile
-from test.fixtures.vault_factory import build_vault_fixture
 
 
 def test_ordinary_vault_note_builds_memory_without_native_timestamp_heading(tmp_path, monkeypatch):
     """An Obsidian body has no native ``## <ISO8601Z>`` section requirement."""
-    from cli_agent_orchestrator.services.vault import reader, reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
     Base.metadata.create_all(engine)
@@ -79,7 +80,8 @@ def test_ordinary_vault_note_builds_memory_without_native_timestamp_heading(tmp_
 
 def test_reader_rejects_non_injectable_mapping_when_required(tmp_path, monkeypatch):
     """The explicit injection policy is enforced again at the byte boundary."""
-    from cli_agent_orchestrator.services.vault import reader, reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
     Base.metadata.create_all(engine)
@@ -111,11 +113,11 @@ def test_reader_rejects_non_injectable_mapping_when_required(tmp_path, monkeypat
 
 def test_metadata_recall_uses_vault_builder_not_native_wiki_parser(tmp_path, monkeypatch):
     """Vault recall returns ordinary Markdown that native parsing would drop."""
-    from cli_agent_orchestrator.services import memory_service
-    from cli_agent_orchestrator.services import settings_service
-    from cli_agent_orchestrator.services.vault import reader, reconcile as reconcile_module
-    from cli_agent_orchestrator.services.vault.config import VaultConfig
+    from cli_agent_orchestrator.services import memory_service, settings_service
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
 
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
     Base.metadata.create_all(engine)
@@ -179,7 +181,8 @@ def test_recall_counter_uses_durable_vault_counter_table(tmp_path, monkeypatch):
 
 def test_vault_memory_body_budget_marks_content_stale_and_truncated(tmp_path, monkeypatch):
     """A post-index edit is bounded and freshness-stamped without reconciliation."""
-    from cli_agent_orchestrator.services.vault import reader, reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
     Base.metadata.create_all(engine)
@@ -208,9 +211,7 @@ def test_vault_memory_body_budget_marks_content_stale_and_truncated(tmp_path, mo
         )
         if item.metadata.key == "design"
     )
-    (fixture.root / "Projects" / "CAO Design" / "Design.md").write_text(
-        "x" * 200, encoding="utf-8"
-    )
+    (fixture.root / "Projects" / "CAO Design" / "Design.md").write_text("x" * 200, encoding="utf-8")
 
     memory = load_candidate(candidate, max_body_chars=64, require_injectable=False)
 
@@ -224,7 +225,8 @@ def test_vault_memory_body_budget_marks_content_stale_and_truncated(tmp_path, mo
 
 def _indexed_reader_candidate(tmp_path, monkeypatch, *, run_id: str):
     """Build one real indexed row so read-boundary tests exercise recall."""
-    from cli_agent_orchestrator.services.vault import reader, reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
     Base.metadata.create_all(engine)
@@ -282,9 +284,11 @@ def test_reader_refuses_and_counts_every_escaped_metadata_path(
 
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
     with Session() as db:
-        counter = db.query(VaultRecallCounterModel).filter_by(
-            vault_id="fixture", counter_name="path_escapes_root"
-        ).one()
+        counter = (
+            db.query(VaultRecallCounterModel)
+            .filter_by(vault_id="fixture", counter_name="path_escapes_root")
+            .one()
+        )
     assert counter.value == 1
     assert any("arm=lexical" in record.getMessage() for record in caplog.records)
 
@@ -318,9 +322,11 @@ def test_reader_counts_an_intermediate_symlink_swap_after_resolution(tmp_path, m
 
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
     with Session() as db:
-        counter = db.query(VaultRecallCounterModel).filter_by(
-            vault_id="fixture", counter_name="path_escapes_root"
-        ).one()
+        counter = (
+            db.query(VaultRecallCounterModel)
+            .filter_by(vault_id="fixture", counter_name="path_escapes_root")
+            .one()
+        )
     assert counter.value == 1
 
 
@@ -352,9 +358,11 @@ def test_reader_counts_a_final_symlink_swap_after_resolution(tmp_path, monkeypat
 
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
     with Session() as db:
-        counter = db.query(VaultRecallCounterModel).filter_by(
-            vault_id="fixture", counter_name="path_escapes_root"
-        ).one()
+        counter = (
+            db.query(VaultRecallCounterModel)
+            .filter_by(vault_id="fixture", counter_name="path_escapes_root")
+            .one()
+        )
     assert counter.value == 1
     assert any("arm=eloop" in record.getMessage() for record in caplog.records)
 
@@ -388,9 +396,11 @@ def test_reader_counts_a_root_symlink_swap_after_resolution(tmp_path, monkeypatc
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
     assert root_swapped is True
     with Session() as db:
-        counter = db.query(VaultRecallCounterModel).filter_by(
-            vault_id="fixture", counter_name="path_escapes_root"
-        ).one()
+        counter = (
+            db.query(VaultRecallCounterModel)
+            .filter_by(vault_id="fixture", counter_name="path_escapes_root")
+            .one()
+        )
     assert counter.value == 1
     assert any("arm=eloop" in record.getMessage() for record in caplog.records)
 
@@ -420,9 +430,11 @@ def test_reader_counts_a_root_eloop_from_the_initial_open(tmp_path, monkeypatch,
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
     assert root_opened is True
     with Session() as db:
-        counter = db.query(VaultRecallCounterModel).filter_by(
-            vault_id="fixture", counter_name="path_escapes_root"
-        ).one()
+        counter = (
+            db.query(VaultRecallCounterModel)
+            .filter_by(vault_id="fixture", counter_name="path_escapes_root")
+            .one()
+        )
     assert counter.value == 1
     assert any("arm=eloop" in record.getMessage() for record in caplog.records)
 
@@ -509,7 +521,8 @@ def test_reader_refuses_a_changed_read_window(tmp_path, monkeypatch):
 
 def test_quarantined_note_is_not_a_recall_candidate_even_with_live_metadata(tmp_path, monkeypatch):
     """Recall joins vault_note status rather than trusting metadata alone."""
-    from cli_agent_orchestrator.services.vault import reader, reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
     Base.metadata.create_all(engine)
@@ -534,13 +547,16 @@ def test_quarantined_note_is_not_a_recall_candidate_even_with_live_metadata(tmp_
         mapping=mapping,
     )
 
-    assert resolve_candidates(
-        binding,
-        keys=["design"],
-        scope="project",
-        scope_id="fixture-project",
-        require_injectable=False,
-    ) == []
+    assert (
+        resolve_candidates(
+            binding,
+            keys=["design"],
+            scope="project",
+            scope_id="fixture-project",
+            require_injectable=False,
+        )
+        == []
+    )
 
 
 def test_recall_truncation_does_not_introduce_a_third_content_digest() -> None:
@@ -596,18 +612,22 @@ def test_resolve_candidates_never_joins_a_native_metadata_row(tmp_path, monkeypa
         )
         db.commit()
 
-    assert resolve_candidates(
-        binding,
-        scope="global",
-        scope_id=None,
-        require_injectable=False,
-    ) == []
+    assert (
+        resolve_candidates(
+            binding,
+            scope="global",
+            scope_id=None,
+            require_injectable=False,
+        )
+        == []
+    )
 
 
 def test_bm25_reads_a_vault_only_scope_without_native_candidates(tmp_path, monkeypatch):
     """The vault corpus is a real corpus, not gated by native discovery."""
-    from cli_agent_orchestrator.services.vault import reader, reconcile as reconcile_module
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
     Base.metadata.create_all(engine)
@@ -648,13 +668,12 @@ def test_bm25_reads_a_vault_only_scope_without_native_candidates(tmp_path, monke
     assert [(memory.key, memory.source_kind) for memory in memories] == [("design", "vault")]
 
 
-def test_bm25_vault_corpus_uses_all_indexed_candidates_with_one_read_each(
-    tmp_path, monkeypatch
-):
+def test_bm25_vault_corpus_uses_all_indexed_candidates_with_one_read_each(tmp_path, monkeypatch):
     """Eligibility filters cannot shrink the vault BM25 document population."""
     from cli_agent_orchestrator.services import memory_service
-    from cli_agent_orchestrator.services.vault import reader, reconcile as reconcile_module
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
 
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
     Base.metadata.create_all(engine)

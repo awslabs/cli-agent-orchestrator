@@ -3,7 +3,6 @@
 import ast
 from pathlib import Path
 
-
 SOURCE_ROOT = Path(__file__).parents[3] / "src" / "cli_agent_orchestrator"
 
 
@@ -13,14 +12,8 @@ def _is_memory_metadata_file_path(node: ast.AST) -> bool:
         isinstance(node, ast.Attribute)
         and node.attr == "file_path"
         and (
-            (
-                isinstance(node.value, ast.Name)
-                and node.value.id in {"metadata", "memory_metadata"}
-            )
-            or (
-                isinstance(node.value, ast.Attribute)
-                and node.value.attr == "metadata"
-            )
+            (isinstance(node.value, ast.Name) and node.value.id in {"metadata", "memory_metadata"})
+            or (isinstance(node.value, ast.Attribute) and node.value.attr == "metadata")
         )
     )
 
@@ -121,9 +114,10 @@ def test_vault_candidate_chokepoint_requires_explicit_injection_policy():
     )
     assert require_parameter.arg == "require_injectable"
     assert len(load_definition.args.kw_defaults) == len(load_definition.args.kwonlyargs)
-    assert load_definition.args.kw_defaults[
-        load_definition.args.kwonlyargs.index(require_parameter)
-    ] is None
+    assert (
+        load_definition.args.kw_defaults[load_definition.args.kwonlyargs.index(require_parameter)]
+        is None
+    )
 
     call_sites: list[str] = []
     violations: list[str] = []
@@ -137,9 +131,7 @@ def test_vault_candidate_chokepoint_requires_explicit_injection_policy():
             ):
                 location = f"{path.name}:{node.lineno}"
                 call_sites.append(location)
-                if not any(
-                    keyword.arg == "require_injectable" for keyword in node.keywords
-                ):
+                if not any(keyword.arg == "require_injectable" for keyword in node.keywords):
                     violations.append(location)
             if (
                 isinstance(node, ast.Call)

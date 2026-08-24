@@ -43,9 +43,7 @@ def _resolve_vault_binding(
     return _vault_binding(scope, scope_id)
 
 
-def test_wiki_lint_excludes_vault_metadata_before_detectors(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_wiki_lint_excludes_vault_metadata_before_detectors(tmp_path: Path, monkeypatch) -> None:
     base = tmp_path / "memory"
     wiki_dir = base / "global" / "wiki"
     wiki_dir.mkdir(parents=True)
@@ -106,11 +104,7 @@ def test_wiki_healer_refuses_vault_bound_scope_before_delete_row(monkeypatch) ->
     ):
         asyncio.run(
             wiki_healer.heal(
-                [
-                    _make_issue(
-                        issue_type="orphan_page", key="note", description="orphan"
-                    )
-                ],
+                [_make_issue(issue_type="orphan_page", key="note", description="orphan")],
                 scope="project",
                 scope_id="project-id",
                 apply=True,
@@ -125,9 +119,7 @@ def test_wiki_healer_refuses_when_vault_config_is_unavailable(monkeypatch) -> No
     monkeypatch.setattr(
         settings_service,
         "get_vault_config",
-        lambda: (_ for _ in ()).throw(
-            ValueError("vault root 'missing' does not exist")
-        ),
+        lambda: (_ for _ in ()).throw(ValueError("vault root 'missing' does not exist")),
     )
     svc = MagicMock()
 
@@ -172,8 +164,7 @@ def test_cleanup_refuses_vault_bound_scope_before_forget(
 
     forget.assert_not_called()
     assert (
-        "vault-bound memory retention refused scope=project scope_id=project-id"
-        in caplog.messages
+        "vault-bound memory retention refused scope=project scope_id=project-id" in caplog.messages
     )
 
 
@@ -192,9 +183,7 @@ def test_cleanup_refuses_when_vault_config_is_unavailable(
     monkeypatch.setattr(
         settings_service,
         "get_vault_config",
-        lambda: (_ for _ in ()).throw(
-            ValueError("vault root 'missing' does not exist")
-        ),
+        lambda: (_ for _ in ()).throw(ValueError("vault root 'missing' does not exist")),
     )
     forget = MagicMock()
     monkeypatch.setattr(cleanup_service, "_forget_sync", forget)

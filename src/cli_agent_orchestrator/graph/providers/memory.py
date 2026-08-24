@@ -87,9 +87,7 @@ class MemoryGraphProvider(GraphProvider):
             meta=make_meta(view.meta, cached=cached, as_of=as_of),
         )
 
-    async def _build(
-        self, scope: str, scope_id: Optional[str], lint_enabled: bool
-    ) -> GraphView:
+    async def _build(self, scope: str, scope_id: Optional[str], lint_enabled: bool) -> GraphView:
         """Project the scope's wiki into a GraphView (the uncached, ~148s path)."""
         meta: dict[str, Any] = {
             "provider": "memory",
@@ -142,9 +140,7 @@ class MemoryGraphProvider(GraphProvider):
                 seen.add(entry["key"])
                 keys.append(entry["key"])
 
-        nodes: dict[str, Node] = {
-            key: Node(id=key, kind="topic", label=key) for key in keys
-        }
+        nodes: dict[str, Node] = {key: Node(id=key, kind="topic", label=key) for key in keys}
         edges: list[Edge] = []
 
         # Typed relationship edges from the STORE (issue #511, FR-4.3). The
@@ -173,9 +169,7 @@ class MemoryGraphProvider(GraphProvider):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(
-                    "memory graph provider: run_lint failed: %r", e, exc_info=True
-                )
+                logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
                 meta["lint_error"] = type(e).__name__
                 meta["lint_enrichment"] = "failed"
                 meta["disabled_enrichments"] = _LINT_ENRICHMENTS
