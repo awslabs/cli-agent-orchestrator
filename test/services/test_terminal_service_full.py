@@ -1240,6 +1240,65 @@ class TestCreateTerminalEnvVars:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_profile_env_reaches_window_as_trusted_env(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_get_session_env,
+    ):
+        """A profile-declared ``env:`` block reaches the backend as
+        ``trusted_env`` for that agent's window, separate from the
+        operator/session ``extra_env`` channel (so it bypasses the
+        forwarded-env prefix blocklist and is never persisted to the
+        session)."""
+        mock_load_profile.return_value = AgentProfile(
+            name="developer",
+            description="Developer",
+            env={"CLAUDE_CONFIG_DIR": "/home/u/.claude-b"},
+        )
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+        mock_get_session_env.return_value = {}
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            new_session=False,
+        )
+
+        kwargs = mock_tmux.create_window.call_args.kwargs
+        assert kwargs["trusted_env"] == {"CLAUDE_CONFIG_DIR": "/home/u/.claude-b"}
+        # Profile env travels on its own channel, not through extra_env.
+        assert "CLAUDE_CONFIG_DIR" not in (kwargs["extra_env"] or {})
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     async def test_no_env_vars_existing_session_uses_session_env_only(
         self,
         mock_load_profile,

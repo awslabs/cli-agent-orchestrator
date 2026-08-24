@@ -287,6 +287,7 @@ class HerdrBackend(TerminalBackend):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create a herdr workspace (= CAO session) with an initial tab."""
         import os
@@ -298,7 +299,7 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--cwd", working_directory])
         # Inject CAO identity + operator-forwarded env natively via --env
         # (replaces the former shell ``export`` send-text injection).
-        args.extend(self._build_env_args(terminal_id, session_name, extra_env))
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env, trusted_env))
 
         result = self._run_herdr(args)
 
@@ -386,6 +387,7 @@ class HerdrBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create a new tab in the workspace."""
         import os
@@ -400,7 +402,7 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--cwd", working_directory])
         # Inject CAO identity + operator-forwarded env natively via --env
         # (replaces the former shell ``export`` send-text injection).
-        args.extend(self._build_env_args(terminal_id, session_name, extra_env))
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env, trusted_env))
 
         result = self._run_herdr(args)
 
@@ -865,6 +867,7 @@ class HerdrBackend(TerminalBackend):
         terminal_id: str,
         session_name: str,
         extra_env: Optional[Dict[str, str]] = None,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """Build ``--env KEY=VALUE`` argument pairs for a create command.
 
@@ -892,6 +895,15 @@ class HerdrBackend(TerminalBackend):
                 continue
             if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
                 logger.warning("Dropping forwarded env var %s -- exceeds byte cap", key)
+                continue
+            env[key] = value
+
+        # Profile-declared env (trusted_env) merges after operator env — same
+        # policy as TmuxClient._merge_trusted_env: no prefix blocklist (it is
+        # installed configuration, not inherited leakage), byte cap kept.
+        for key, value in (trusted_env or {}).items():
+            if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
+                logger.warning("Dropping profile env var %s -- exceeds byte cap", key)
                 continue
             env[key] = value
 

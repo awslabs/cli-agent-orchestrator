@@ -340,6 +340,33 @@ class TmuxClient:
                 continue
             environment[key] = value
 
+    @classmethod
+    def _merge_trusted_env(
+        cls, environment: Dict[str, str], trusted_env: Optional[Dict[str, str]]
+    ) -> None:
+        """Merge profile-declared env vars into ``environment`` in place.
+
+        Unlike ``_merge_extra_env`` (operator-forwarded ``--env``, which
+        mirrors the inherited-env hygiene filter), these values come from an
+        installed agent profile — explicit configuration at the same trust
+        level as the profile's own ``mcpServers`` commands — so the prefix
+        blocklist does not apply. The per-value byte cap is kept because it
+        protects the backend argv limit, not a trust boundary. Merged after
+        operator env so the more specific per-agent declaration wins on
+        conflict (CAO identity vars are still forced last by the caller).
+        """
+        if not trusted_env:
+            return
+        for key, value in trusted_env.items():
+            if len(value.encode("utf-8")) >= cls._MAX_ENV_VALUE_BYTES:
+                logger.warning(
+                    "Dropping profile env var %s — value exceeds %d bytes",
+                    key,
+                    cls._MAX_ENV_VALUE_BYTES,
+                )
+                continue
+            environment[key] = value
+
     def create_session(
         self,
         session_name: str,
@@ -347,6 +374,7 @@ class TmuxClient:
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
@@ -385,6 +413,7 @@ class TmuxClient:
             # explicit ``--env AWS_REGION=us-west-2`` wins over the inherited
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
+            self._merge_trusted_env(environment, trusted_env)
             environment["CAO_TERMINAL_ID"] = terminal_id
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
@@ -463,12 +492,15 @@ class TmuxClient:
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create window in session and return window name.
 
         ``extra_env`` carries operator-forwarded vars from
         ``cao launch --env`` so workers spawned via ``assign`` / ``handoff`` /
         the web UI inherit the same context as the supervisor. See issue #248.
+        ``trusted_env`` carries the agent profile's own ``env:`` declaration
+        for this terminal only (not persisted to the session).
         """
         try:
             working_directory = self._resolve_and_validate_working_directory(working_directory)
@@ -479,6 +511,7 @@ class TmuxClient:
 
             window_env: dict[str, str] = {}
             self._merge_extra_env(window_env, extra_env)
+            self._merge_trusted_env(window_env, trusted_env)
             window_env["CAO_TERMINAL_ID"] = terminal_id
 
             kwargs: dict = {
