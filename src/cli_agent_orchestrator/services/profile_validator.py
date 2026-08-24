@@ -18,17 +18,62 @@ Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/510
 """
 
 import json
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.resources import files as _pkg_files
-from typing import Literal, Optional
+from itertools import islice
+from typing import Any, Iterator, Literal, Optional
 
 import frontmatter
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator as _Draft202012Validator
+from jsonschema import ValidationError, validators
 
 from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
 
 Severity = Literal["error", "warning"]
+
+
+_DEFAULT_ADDITIONAL_PROPERTIES = _Draft202012Validator.VALIDATORS["additionalProperties"]
+
+
+def _ordered_additional_properties(
+    validator: Any,
+    additional_properties: object,
+    instance: object,
+    schema: dict[str, Any],
+) -> Iterator[ValidationError]:
+    """Validate object-valued additional properties in document order.
+
+    jsonschema's default keyword implementation first converts matching property
+    names to a set. When the outer validator takes a bounded prefix, that makes
+    the selected findings depend on ``PYTHONHASHSEED``. Walking the already
+    ordered mapping directly keeps the prefix stable without materializing or
+    sorting the omitted tail.
+
+    Boolean-valued ``additionalProperties`` keeps the default implementation so
+    its single aggregate error and wording remain unchanged.
+    """
+    if isinstance(additional_properties, dict) and isinstance(instance, dict):
+        properties = schema.get("properties", {})
+        patterns = tuple(schema.get("patternProperties", {}))
+        for property_name, value in instance.items():
+            if property_name in properties:
+                continue
+            if isinstance(property_name, str) and any(
+                re.search(pattern, property_name) for pattern in patterns
+            ):
+                continue
+            yield from validator.descend(value, additional_properties, path=property_name)
+        return
+
+    yield from _DEFAULT_ADDITIONAL_PROPERTIES(validator, additional_properties, instance, schema)
+
+
+Draft202012Validator = validators.extend(
+    _Draft202012Validator,
+    {"additionalProperties": _ordered_additional_properties},
+)
 
 # Known deprecated frontmatter fields that should trigger warnings.
 _DEPRECATED_FIELDS = {"autoApproveTools"}
@@ -81,13 +126,22 @@ def load_profile_schema() -> dict:
 _MAX_RENDERED_BYTES = 1_000_000
 _MAX_DEPTH = 64
 
-# Ceiling on a single schema finding's text. Only jsonschema's own messages need
-# it: everything this module authors is a fixed sentence plus a path.
+# Ceiling on a single finding's text. The collector applies it to every producer,
+# even though jsonschema is the one that can interpolate a large instance.
 _MAX_FINDING_CHARS = 2_000
+
+# Aggregate response ceilings. The finding count includes the omission marker,
+# and the text budget counts UTF-8 bytes from both messages and paths. The marker
+# is reserved up front so truncation can always be reported within both limits.
+_MAX_FINDINGS = 100
+_MAX_FINDING_TEXT_BYTES = 100_000
+_MAX_FINDING_PATH_BYTES = 2_000
+_OMISSION_MESSAGE = "Additional validation findings omitted."
+_PATH_TRUNCATION_SUFFIX = "... (path truncated)"
 
 
 def _capped(message: str) -> str:
-    """Bound one schema finding's text before it reaches a response body.
+    """Bound one finding's text before it reaches a response body.
 
     A backstop, not the fix. jsonschema interpolates the offending instance into
     the message inside ``iter_errors``, so the allocation has already happened by
@@ -102,6 +156,71 @@ def _capped(message: str) -> str:
         return message
     suffix = f"... (message truncated, {len(message)} chars)"
     return f"{message[: _MAX_FINDING_CHARS - len(suffix)]}{suffix}"
+
+
+def _capped_path(path: Optional[str]) -> Optional[str]:
+    """Bound one finding path in the byte unit used by response serialization."""
+    if path is None:
+        return None
+    encoded = path.encode("utf-8")
+    if len(encoded) <= _MAX_FINDING_PATH_BYTES:
+        return path
+
+    suffix_bytes = _PATH_TRUNCATION_SUFFIX.encode("utf-8")
+    prefix_budget = _MAX_FINDING_PATH_BYTES - len(suffix_bytes)
+    prefix = encoded[:prefix_budget].decode("utf-8", errors="ignore")
+    return f"{prefix}{_PATH_TRUNCATION_SUFFIX}"
+
+
+class _FindingCollector:
+    """Apply one count and aggregate-text budget across every finding producer."""
+
+    def __init__(self) -> None:
+        self._findings: list[ValidationMessage] = []
+        self._remaining_regular_slots = _MAX_FINDINGS - 1
+        self._remaining_text_bytes = _MAX_FINDING_TEXT_BYTES - len(
+            _OMISSION_MESSAGE.encode("utf-8")
+        )
+        self._omitted_severity: Optional[Severity] = None
+
+    @property
+    def remaining_regular_slots(self) -> int:
+        """Number of findings available before the reserved marker slot."""
+        return self._remaining_regular_slots
+
+    def add(self, finding: ValidationMessage) -> bool:
+        """Add one normalized finding, or mark it omitted and reject it."""
+        normalized = ValidationMessage(
+            finding.severity,
+            _capped(finding.message),
+            _capped_path(finding.path),
+        )
+        text_bytes = len(normalized.message.encode("utf-8"))
+        if normalized.path is not None:
+            text_bytes += len(normalized.path.encode("utf-8"))
+
+        if self._remaining_regular_slots == 0 or text_bytes > self._remaining_text_bytes:
+            self.mark_omitted(normalized.severity)
+            return False
+
+        self._findings.append(normalized)
+        self._remaining_regular_slots -= 1
+        self._remaining_text_bytes -= text_bytes
+        return True
+
+    def mark_omitted(self, severity: Severity) -> None:
+        """Record omission without counting or exhausting the producer."""
+        if self._omitted_severity is None or severity == "error":
+            self._omitted_severity = severity
+
+    def finalize(self) -> list[ValidationMessage]:
+        """Return findings with exactly one trailing marker when truncated."""
+        if self._omitted_severity is None:
+            return list(self._findings)
+        return [
+            *self._findings,
+            ValidationMessage(self._omitted_severity, _OMISSION_MESSAGE),
+        ]
 
 
 def _structural_bound_finding(metadata: object) -> Optional["ValidationMessage"]:
@@ -222,8 +341,8 @@ def _structural_bound_finding(metadata: object) -> Optional["ValidationMessage"]
     return None
 
 
-def _non_string_key_findings(metadata: object) -> list["ValidationMessage"]:
-    """Report every mapping key reachable from ``metadata`` that is not a string.
+def _collect_non_string_key_findings(metadata: object, collector: _FindingCollector) -> bool:
+    """Add non-string mapping keys in document order until the budget fills.
 
     Closes a gap between the two formats in play. A profile arrives as **YAML**,
     which allows any scalar as a mapping key, but the format is described by
@@ -242,138 +361,118 @@ def _non_string_key_findings(metadata: object) -> list["ValidationMessage"]:
     unquoted dates, so ``2026-01-01:`` becomes a ``datetime.date`` key. Checking
     the key type generally covers those without enumerating them.
 
-    **Why the walk memoizes.** YAML anchors make a document's value *graph*
-    arbitrarily larger than its bytes: ``yaml.safe_load`` resolves each alias to
-    another reference to the *same* object, so N chained anchors that each
-    reference the previous one twice build a graph an unmemoized walk traverses
-    2**N times while memory stays linear. The first version of this function
-    carried only a depth cap, which bounded the wrong dimension: depth was never
-    the problem, revisiting shared objects was. A 640-byte, schema-valid document
-    with 20 anchor levels took ~1s here against ~0s in jsonschema, doubling per
-    added level, on a route that is scope-exempt and ``async``.
-
     ``seen`` skips any container already walked, keyed on ``id()``. That removes
-    the amplification at its source and needs no size ceiling of its own: the walk
-    is linear in the document's *distinct* containers, and
-    :func:`_structural_bound_finding` has already rejected anything whose expansion
-    is large before this runs. Comparing identity is sound because every value
-    stays reachable from ``metadata`` for the duration of the walk, so nothing can
-    be collected and no id recycled midway.
+    alias amplification at its source and costs no coverage: a shared subtree
+    cannot hold different keys on a second visit. Comparing identity is sound
+    because every value stays reachable from ``metadata`` for the duration, so
+    nothing can be collected and no id recycled midway.
 
-    Skipping repeats costs no coverage: a shared subtree cannot hold a different
-    set of keys on a second visit, so one finding per offending key is the correct
-    output. Worth knowing that this makes the two halves of
-    :func:`validate_frontmatter` report shared values differently. A shared value
-    that is *schema*-invalid yields one finding per referencing path, because
-    jsonschema does not memoize, while a shared *non-string key* yields exactly
-    one, at whichever path reached it first. Both are defensible; a client
+    A shared value that is *schema*-invalid still yields one finding per
+    referencing path because jsonschema does not memoize, while a shared
+    *non-string key* yields exactly one at the first path reaching it. A client
     highlighting findings against a document should not assume one convention.
 
-    Args:
-        metadata: Any parsed YAML value, already accepted by
-            :func:`_structural_bound_finding`. Only mappings and sequences are
-            descended into.
+    The collector replaces the former accumulated list. No intermediate children
+    list is built, and a rejected candidate stops traversal immediately.
 
     Returns:
-        One error finding per offending key, in document order.
+        ``True`` when the walk completed, or ``False`` when the collector rejected
+        a finding and traversal stopped immediately.
     """
-    findings: list[ValidationMessage] = []
     seen: set[int] = set()
 
-    def walk(value: object, path: str) -> None:
+    def walk(value: object, path: str) -> bool:
         if not isinstance(value, (dict, list)):
-            return  # A scalar has no keys, and nothing to descend into.
+            return True
         if id(value) in seen:
-            return
+            return True
         seen.add(id(value))
 
-        children: list[tuple[str, object]]
         if isinstance(value, dict):
-            children = []
-            for key, child in value.items():
+            # Preserve the previous direct-keys-before-descendants ordering without
+            # materializing an unbounded intermediate children list.
+            for key in value:
                 child_path = f"{path}.{key}" if path else str(key)
                 if not isinstance(key, str):
-                    findings.append(
+                    if not collector.add(
                         ValidationMessage(
                             "error",
                             f"Mapping key {key!r} is a {type(key).__name__}, not a string. "
                             f"Profile fields are string-keyed; quote it as '{key}'.",
                             child_path,
                         )
-                    )
-                children.append((child_path, child))
+                    ):
+                        return False
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                if not walk(child, child_path):
+                    return False
         else:
-            children = [
-                (f"{path}.{index}" if path else str(index), child)
-                for index, child in enumerate(value)
-            ]
+            for index, child in enumerate(value):
+                child_path = f"{path}.{index}" if path else str(index)
+                if not walk(child, child_path):
+                    return False
 
-        for child_path, child in children:
-            walk(child, child_path)
+        return True
 
-    walk(metadata, "")
-
-    return findings
+    return walk(metadata, "")
 
 
 def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
     """Validate a frontmatter dict against the schema and CAO conventions.
 
-    Returns findings in a stable order: deprecated fields, then non-string
-    mapping keys, then JSON-Schema errors sorted by path, then ``allowedTools``
-    vocabulary warnings, then the role check. An empty list means the profile is
-    valid with no advisories.
+    Returns a bounded prefix in stable producer order: deprecated fields, then
+    non-string mapping keys, then a bounded JSON-Schema prefix sorted by path,
+    then ``allowedTools`` vocabulary warnings, then the role check. At most
+    ``_MAX_FINDINGS`` are returned, including one final omission marker when the
+    shared count or aggregate-text budget fills. An empty list means the profile
+    is valid with no advisories.
 
     A document outside the structural ceilings is the one exception to that
     order: it is reported and nothing further runs, because the later steps are
     exactly what such a document is expensive in.
     """
-    messages: list[ValidationMessage] = []
+    collector = _FindingCollector()
 
     # 1. Deprecated fields first, before ``additionalProperties: false``
     #    rejects them with a less helpful message.
     for field in sorted(_DEPRECATED_FIELDS):
         if field in metadata:
-            messages.append(
+            if not collector.add(
                 ValidationMessage(
                     "warning",
                     f"'{field}' is deprecated and rejected by CAO 2.2+. "
                     f"Use 'allowedTools' instead.",
                 )
-            )
+            ):
+                return collector.finalize()
 
     # 2. Structural ceilings, before anything traverses or validates the
     #    document: rendered size, nesting depth, and cycles.
-    #
-    #    Returning here rather than continuing is the whole point of the check.
-    #    Step 3 is linear in distinct containers, but step 4 hands the document
-    #    to jsonschema, which interpolates a rendering of an offending instance
-    #    into every error message it builds -- so on an alias-amplified document,
-    #    reporting the ceiling and then running the remaining steps anyway would
-    #    pay the exact cost the ceiling exists to avoid.
     structural = _structural_bound_finding(metadata)
     if structural is not None:
-        messages.append(structural)
-        return messages
+        collector.add(structural)
+        return collector.finalize()
 
-    # 3. Non-string mapping keys, which JSON Schema cannot see. Reported before
-    #    the schema errors because a document with a non-string key is outside
-    #    the format entirely, and because the schema's own findings for such a
-    #    document tend to be confusing.
-    messages.extend(_non_string_key_findings(metadata))
+    # 3. Non-string mapping keys, which JSON Schema cannot see. Stream findings
+    #    into the shared collector and stop the walk as soon as its budget fills.
+    if not _collect_non_string_key_findings(metadata, collector):
+        return collector.finalize()
 
-    # 4. JSON-Schema structural validation.
-    #
-    # The sort key stringifies each path component. Raw components are whatever
-    # the document used as mapping keys, so a profile with mixed-type keys (for
-    # example ``mcpServers: {1: {}, x: {}}``) yields paths that cannot be ordered
-    # against each other and would raise TypeError mid-sort. Such a document is
-    # already schema-invalid; it must be *reported* as invalid rather than crash
-    # the validator.
+    # 4. JSON-Schema structural validation. Consume only the remaining capacity
+    #    plus one lookahead before sorting, so the iterator and sort allocation
+    #    are bounded without exhausting the omitted tail merely to count it.
     validator = Draft202012Validator(load_profile_schema())
-    for error in sorted(validator.iter_errors(metadata), key=lambda e: [str(p) for p in e.path]):
+    remaining = collector.remaining_regular_slots
+    sampled_errors = list(islice(validator.iter_errors(metadata), remaining + 1))
+    omitted_schema_errors = len(sampled_errors) > remaining
+    for error in sorted(sampled_errors[:remaining], key=lambda e: [str(p) for p in e.path]):
         path = ".".join(str(p) for p in error.absolute_path) or "(root)"
-        messages.append(ValidationMessage("error", _capped(error.message), path))
+        if not collector.add(ValidationMessage("error", error.message, path)):
+            return collector.finalize()
+    if omitted_schema_errors:
+        collector.mark_omitted("error")
+        return collector.finalize()
 
     # 5. allowedTools vocabulary check (advisory, not blocking).
     #
@@ -388,13 +487,14 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
             if not isinstance(tool, str):
                 continue
             if tool not in _VALID_TOOL_VOCAB:
-                messages.append(
+                if not collector.add(
                     ValidationMessage(
                         "warning",
                         f"allowedTools entry '{tool}' is not in CAO's recognized "
                         f"vocabulary. It may be silently ignored by some providers.",
                     )
-                )
+                ):
+                    return collector.finalize()
 
     # 6. Role check (advisory — custom roles are valid but worth flagging).
     #
@@ -402,7 +502,7 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
     # schema reports the type error, so this advisory check simply stands aside.
     role = metadata.get("role")
     if isinstance(role, str) and role and role not in _BUILTIN_ROLES:
-        messages.append(
+        collector.add(
             ValidationMessage(
                 "warning",
                 f"role '{role}' is not a built-in CAO role "
@@ -411,7 +511,7 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
             )
         )
 
-    return messages
+    return collector.finalize()
 
 
 def validate_profile_text(text: str) -> list[ValidationMessage]:

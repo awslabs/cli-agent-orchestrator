@@ -11,12 +11,18 @@ Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/510
 
 import pytest
 
+import cli_agent_orchestrator.services.profile_validator as profile_validator
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.profile_validator import (
     _MAX_FINDING_CHARS,
+    _MAX_FINDING_PATH_BYTES,
+    _MAX_FINDING_TEXT_BYTES,
+    _MAX_FINDINGS,
     _MAX_RENDERED_BYTES,
+    _OMISSION_MESSAGE,
     ValidationMessage,
     _capped,
+    _FindingCollector,
     load_profile_schema,
     validate_frontmatter,
     validate_profile_text,
@@ -677,3 +683,157 @@ class TestMcpServerTransports:
         )
 
         assert any(f.severity == "error" and f.path == "mcpServers.docs.url" for f in findings)
+
+
+class TestAggregateFindingBudget:
+    """Every producer shares one bounded response budget."""
+
+    @staticmethod
+    def _text_bytes(findings: list[ValidationMessage]) -> int:
+        return sum(
+            len(finding.message.encode("utf-8"))
+            + len(finding.path.encode("utf-8") if finding.path else b"")
+            for finding in findings
+        )
+
+    def test_non_string_keys_stop_at_one_error_marker(self) -> None:
+        metadata = {"name": "agent", **{index: "value" for index in range(200)}}
+
+        findings = validate_frontmatter(metadata)
+
+        assert len(findings) == _MAX_FINDINGS
+        assert sum(f.message == _OMISSION_MESSAGE for f in findings) == 1
+        assert findings[-1] == ValidationMessage("error", _OMISSION_MESSAGE)
+
+    def test_unknown_tools_keep_warning_only_result_advisory(self) -> None:
+        findings = validate_frontmatter(
+            {"name": "agent", "allowedTools": [f"unknown-{index}" for index in range(200)]}
+        )
+
+        assert len(findings) == _MAX_FINDINGS
+        assert sum(f.message == _OMISSION_MESSAGE for f in findings) == 1
+        assert findings[-1] == ValidationMessage("warning", _OMISSION_MESSAGE)
+        assert not any(f.severity == "error" for f in findings)
+
+    def test_aggregate_text_and_each_path_stay_within_byte_limits(self) -> None:
+        collector = _FindingCollector()
+        long_unicode = "界" * 2_000
+        for index in range(200):
+            if not collector.add(
+                ValidationMessage("error", long_unicode, f"field.{long_unicode}.{index}")
+            ):
+                break
+
+        findings = collector.finalize()
+
+        assert len(findings) <= _MAX_FINDINGS
+        assert self._text_bytes(findings) <= _MAX_FINDING_TEXT_BYTES
+        assert all(
+            finding.path is None or len(finding.path.encode("utf-8")) <= _MAX_FINDING_PATH_BYTES
+            for finding in findings
+        )
+
+    def test_schema_iterator_consumes_only_remaining_plus_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        consumed = 0
+
+        class FakeError:
+            def __init__(self, index: int) -> None:
+                self.path = [f"field{index}"]
+                self.absolute_path = self.path
+                self.message = f"error {index}"
+
+        class FakeValidator:
+            def __init__(self, schema: dict) -> None:
+                del schema
+
+            def iter_errors(self, metadata: dict):
+                nonlocal consumed
+                del metadata
+                for index in range(200):
+                    consumed += 1
+                    yield FakeError(index)
+
+        monkeypatch.setattr(profile_validator, "Draft202012Validator", FakeValidator)
+        metadata = {"name": "agent", **{index: "value" for index in range(10)}}
+
+        findings = validate_frontmatter(metadata)
+
+        remaining_after_key_findings = (_MAX_FINDINGS - 1) - 10
+        assert consumed == remaining_after_key_findings + 1
+        assert len(findings) == _MAX_FINDINGS
+        assert findings[-1] == ValidationMessage("error", _OMISSION_MESSAGE)
+
+    def test_ordered_additional_properties_is_lazy_with_real_validator(self) -> None:
+        """The real keyword handler must not inspect the omitted tail."""
+        from itertools import islice
+
+        class CountingDict(dict):
+            def __init__(self) -> None:
+                super().__init__((f"srv{index:04}", {}) for index in range(300))
+                self.visited = 0
+
+            def items(self):
+                for item in super().items():
+                    self.visited += 1
+                    yield item
+
+        servers = CountingDict()
+        validator = profile_validator.Draft202012Validator(load_profile_schema())
+
+        errors = list(
+            islice(
+                validator.iter_errors({"name": "agent", "mcpServers": servers}),
+                _MAX_FINDINGS,
+            )
+        )
+
+        assert len(errors) == _MAX_FINDINGS
+        assert servers.visited == _MAX_FINDINGS
+
+    def test_schema_prefix_is_stable_across_hash_seeds(self) -> None:
+        """Truncation must select the same document-order prefix in every worker."""
+        import json
+        import os
+        import subprocess
+        import sys
+
+        script = """
+import json
+from cli_agent_orchestrator.services.profile_validator import validate_frontmatter
+
+metadata = {
+    "name": "agent",
+    "mcpServers": {f"srv{index:04}": {} for index in range(299, -1, -1)},
+}
+findings = validate_frontmatter(metadata)
+print(json.dumps([
+    {"severity": finding.severity, "message": finding.message, "path": finding.path}
+    for finding in findings
+]))
+"""
+        outputs = []
+        for seed in ("0", "1", "2", "3"):
+            environment = os.environ.copy()
+            environment["PYTHONHASHSEED"] = seed
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            outputs.append(completed.stdout)
+
+        assert len(set(outputs)) == 1
+        findings = json.loads(outputs[0])
+        selected_document_prefix = [
+            f"mcpServers.srv{index:04}" for index in range(299, 299 - (_MAX_FINDINGS - 1), -1)
+        ]
+        assert [finding["path"] for finding in findings[:-1]] == sorted(selected_document_prefix)
+        assert findings[-1] == {
+            "severity": "error",
+            "message": _OMISSION_MESSAGE,
+            "path": None,
+        }

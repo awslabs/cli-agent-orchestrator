@@ -11,6 +11,10 @@ from unittest.mock import patch
 import pytest
 
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
+from cli_agent_orchestrator.services.profile_validator import (
+    _MAX_FINDINGS,
+    _OMISSION_MESSAGE,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1072,6 +1076,40 @@ class TestValidateEndpointResistsAliasAmplification:
 
         assert response.status_code == 200
         assert response.json()["valid"] is True
+
+
+class TestValidateEndpointBoundsAggregateFindings:
+    """A compact permitted-size request cannot produce an unbounded response."""
+
+    @staticmethod
+    def _content(entry: str) -> str:
+        items = ",".join([entry] * 130_000)
+        return f"---\nname: t\ndescription: d\nallowedTools: [{items}]\n---\n\nB.\n"
+
+    @pytest.mark.parametrize(
+        "entry,expected_valid,marker_severity",
+        [("0", False, "error"), ("z", True, "warning")],
+        ids=["integer schema errors", "unknown string warnings"],
+    )
+    def test_130k_entries_return_one_bounded_result_set(
+        self, client, entry: str, expected_valid: bool, marker_severity: str
+    ) -> None:
+        content = self._content(entry)
+        assert len(content) < 262_144
+
+        response = client.post("/agents/profiles/validate", json={"content": content})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["valid"] is expected_valid
+        assert len(body["messages"]) == _MAX_FINDINGS
+        assert sum(m["message"] == _OMISSION_MESSAGE for m in body["messages"]) == 1
+        assert body["messages"][-1] == {
+            "severity": marker_severity,
+            "message": _OMISSION_MESSAGE,
+            "path": None,
+        }
+        assert len(response.content) < 120_000
 
 
 class TestUrlBasedMcpServersAreWritable:
