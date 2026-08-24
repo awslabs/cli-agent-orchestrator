@@ -1896,6 +1896,12 @@ async def readopt_terminals_at_startup() -> Dict[str, int]:
                 # tmux's ``pipe-pane -o`` toggle would switch it OFF.
                 backend.stop_pipe_pane(session_name, window_name)
                 backend.pipe_pane(session_name, window_name, str(fifo_path))
+                # Nudge the agent's TUI so it repaints AFTER the fresh pipe
+                # attaches (same rationale as create_terminal's post-pipe
+                # Enter): pipe-pane only streams NEW output, so without a
+                # repaint the rolling status buffer stays empty and the
+                # re-adopted terminal reads UNKNOWN until it next speaks.
+                backend.send_special_key(session_name, window_name, "Enter")
                 counts["readopted"] += 1
                 logger.info(f"Re-adopted terminal {terminal_id} ({session_name}:{window_name})")
             except Exception as e:

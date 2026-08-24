@@ -55,6 +55,9 @@ class TestReadoptTerminalsAtStartup:
         # pipe_pane() toggle would switch the dead pipe OFF.
         mock_backend.stop_pipe_pane.assert_called_once_with("cao-s", "dev-1")
         mock_backend.pipe_pane.assert_called_once()
+        # Post-pipe repaint nudge: without it the fresh rolling buffer stays
+        # empty and the re-adopted terminal reads UNKNOWN until it speaks.
+        mock_backend.send_special_key.assert_called_once_with("cao-s", "dev-1", "Enter")
         mock_db_delete.assert_not_called()
 
     @pytest.mark.asyncio
