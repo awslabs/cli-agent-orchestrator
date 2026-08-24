@@ -187,6 +187,17 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 >   only … never prompt text or step output" when the flag was off. That was wrong in
 >   the security-relevant direction and is corrected above.
 
+#### Obsidian vault
+
+`memory.vault` is an optional, file-defined configuration for one managed
+Obsidian vault. It defines the vault root, mappings from vault-relative folders
+to memory scopes, and the CAO-owned managed folder. The environment variable
+`CAO_MEMORY_VAULT_ENABLED` can only disable that configuration; it cannot
+configure a root, folder mapping, or scope.
+
+See [Obsidian Vault](obsidian-vault.md) for the complete configuration example,
+limits, secret-gate behavior, safety model, and maintenance commands.
+
 ### Terminal backend (`terminal`)
 
 CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an experimental, opt-in alternative — a terminal-native agent runtime that exposes real-time status events instead of requiring CAO to poll and pattern-match terminal output.
