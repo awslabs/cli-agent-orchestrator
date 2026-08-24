@@ -15,6 +15,8 @@ from cli_agent_orchestrator.graph.models import Edge, EdgeType, GraphView, Node
 from cli_agent_orchestrator.graph.providers.base import GraphProvider, register_provider
 from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.vault import binding
+from cli_agent_orchestrator.services.vault.binding import ScopeBinding, VaultBinding
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,13 @@ logger = logging.getLogger(__name__)
 # (ripgrep stale_claim ~20s + LLM ~8.5s ⇒ ~30s typical, up to ~148s under
 # load, past the frontend's 120s timeout). Keyed by (provider, scope, scope_id).
 _CACHE = GraphViewCache()
+_LINT_ENRICHMENTS = [
+    "orphan_page",
+    "contradiction",
+    "stale_claim",
+    "poison_frequency",
+    "graph_density",
+]
 
 
 @register_provider("memory")
@@ -45,9 +54,11 @@ class MemoryGraphProvider(GraphProvider):
         self,
         memory_service: Optional[MemoryService] = None,
         lint_enabled: Optional[Callable[[], bool]] = None,
+        binding_resolver: Optional[Callable[[str, Optional[str]], ScopeBinding]] = None,
     ) -> None:
         self._svc = memory_service or MemoryService()
         self._lint_enabled = lint_enabled or settings_service.is_memory_lint_enabled
+        self._binding_resolver = binding_resolver or binding.resolve
 
     async def project(self, **filters: Any) -> GraphView:
         """Return this scope's GraphView, served from cache when fresh.
@@ -76,21 +87,31 @@ class MemoryGraphProvider(GraphProvider):
             meta=make_meta(view.meta, cached=cached, as_of=as_of),
         )
 
-    async def _build(self, scope: str, scope_id: Optional[str], lint_enabled: bool) -> GraphView:
+    async def _build(
+        self, scope: str, scope_id: Optional[str], lint_enabled: bool
+    ) -> GraphView:
         """Project the scope's wiki into a GraphView (the uncached, ~148s path)."""
-        meta: dict[str, Any] = {"provider": "memory", "scope": scope, "scope_id": scope_id}
+        meta: dict[str, Any] = {
+            "provider": "memory",
+            "scope": scope,
+            "scope_id": scope_id,
+        }
         if not lint_enabled:
             meta.update(
                 {
                     "lint_enabled": False,
-                    "lint_enrichment": "disabled",
-                    "disabled_enrichments": [
-                        "orphan_page",
-                        "contradiction",
-                        "stale_claim",
-                        "poison_frequency",
-                        "graph_density",
-                    ],
+                    "lint_enrichment": "disabled_by_setting",
+                    "disabled_enrichments": _LINT_ENRICHMENTS,
+                }
+            )
+        vault_bound = lint_enabled and isinstance(
+            self._binding_resolver(scope, scope_id), VaultBinding
+        )
+        if vault_bound:
+            meta.update(
+                {
+                    "lint_enrichment": "unavailable_vault",
+                    "disabled_enrichments": _LINT_ENRICHMENTS,
                 }
             )
 
@@ -121,7 +142,9 @@ class MemoryGraphProvider(GraphProvider):
                 seen.add(entry["key"])
                 keys.append(entry["key"])
 
-        nodes: dict[str, Node] = {key: Node(id=key, kind="topic", label=key) for key in keys}
+        nodes: dict[str, Node] = {
+            key: Node(id=key, kind="topic", label=key) for key in keys
+        }
         edges: list[Edge] = []
 
         # Typed relationship edges from the STORE (issue #511, FR-4.3). The
@@ -138,7 +161,7 @@ class MemoryGraphProvider(GraphProvider):
         }
 
         issues = []
-        if lint_enabled:
+        if lint_enabled and not vault_bound:
             # Lint findings may run expensive detectors. A failure degrades to
             # a lint-free graph rather than a 500.
             try:
@@ -150,8 +173,12 @@ class MemoryGraphProvider(GraphProvider):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
+                logger.warning(
+                    "memory graph provider: run_lint failed: %r", e, exc_info=True
+                )
                 meta["lint_error"] = type(e).__name__
+                meta["lint_enrichment"] = "failed"
+                meta["disabled_enrichments"] = _LINT_ENRICHMENTS
 
         # ORDERING (human review, PR #524): the relationship read MUST come after
         # run_lint. run_lint persists its contradiction findings into this same

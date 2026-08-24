@@ -488,7 +488,7 @@ class TestMemoryProviderEdgeCases:
             ("a", "b", EdgeType.RELATES_TO)
         ]
         assert view.meta["lint_enabled"] is False
-        assert view.meta["lint_enrichment"] == "disabled"
+        assert view.meta["lint_enrichment"] == "disabled_by_setting"
         assert set(view.meta["disabled_enrichments"]) == {
             "orphan_page",
             "contradiction",
