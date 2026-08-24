@@ -616,6 +616,37 @@ class WorkflowValidateRequest(BaseModel):
     path: str = Field(description="Filesystem path to the workflow spec YAML file")
 
 
+class WorkflowCreateRequest(BaseModel):
+    """Request body for ``POST /workflows`` (issue #583 Bolt 3, ``authoring-cli-verbs``).
+
+    Carries the spec's SOURCE TEXT rather than a path, because the caller may be a CLI on the same
+    machine or an MCP client elsewhere and only the server may decide where a spec lands — the whole
+    point of ADR-583-11. A path here would also be a containment problem the service layer already
+    solved for the destination.
+    """
+
+    name: str = Field(description="Bare workflow name (no path, no extension)")
+    source: str = Field(description="The Python spec's full source text")
+
+
+class WorkflowUpdateRequest(BaseModel):
+    """Request body for ``PUT /workflows/{name}`` (issue #583 Bolt 3, ``authoring-cli-verbs``).
+
+    ``expected_hash`` is REQUIRED and is never derived server-side. It is the caller's assertion about
+    what it believes it is replacing, and that assertion is the entire mechanism: a hash computed from
+    the file about to be overwritten would always match, so the check would pass unconditionally and a
+    concurrent edit between read and write is exactly what would slip through. FR-8's second criterion
+    (issue #583), closed by ``stale-update-rejection``.
+
+    The name rides the PATH rather than the body, matching ``DELETE /workflows/{name}``.
+    """
+
+    source: str = Field(description="The Python spec's full source text")
+    expected_hash: str = Field(
+        description="The content_hash the caller believes the spec currently has"
+    )
+
+
 class StepOutputRequest(BaseModel):
     """Request body for the structured-return endpoint (Bolt 2, N4, C5).
 
@@ -4216,6 +4247,102 @@ async def get_workflow_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return spec.model_dump()
+
+
+@app.post("/workflows", status_code=status.HTTP_201_CREATED)
+async def create_workflow_endpoint(
+    body: WorkflowCreateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Create a NEW Python workflow spec, refusing to overwrite one (issue #583 FR-10).
+
+    THE FIRST NETWORK-REACHABLE SPEC WRITE PATH. ``create_workflow`` shipped in Bolt 3 pass 3A and had
+    no caller — this endpoint and its ``PUT`` sibling are what make it reachable, for the CLI verbs and
+    (from the next batch) the MCP authoring tools, which reach CAO over HTTP like any other client.
+
+    ``SCOPE_WRITE`` rather than ``SCOPE_ADMIN``: writing a spec is a write, not an administrative act.
+    ``DELETE``'s admin-only tier reflects that deletion is unrecoverable, whereas ``create`` refuses to
+    clobber and ``update`` requires a matching hash. (Note ``require_any_scope`` is default-off, so the
+    tier is inert unless auth is enabled.)
+
+    EVERY GUARANTEE IS THE SERVICE LAYER'S, NOT THIS HANDLER'S. Name and tier validation, the
+    existence check, cross-tier collision, the lint gate, path containment, the atomic write and the
+    index upsert all live in ``workflow_spec_service``, whose containment guard carries four
+    CodeQL-driven constraints that a second implementation here would not reproduce. This handler maps
+    exceptions to statuses and nothing else.
+    """
+    from cli_agent_orchestrator.models.workflow import TierCollisionError
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        spec = workflow_spec_service.create_workflow(body.name, body.source)
+    except FileExistsError as e:
+        # 409 rather than 400: the request was well-formed and the caller's next action is to choose
+        # another name or switch to PUT, which a validation error would not communicate.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except TierCollisionError as e:
+        # A ValueError subclass, so it MUST precede the bare ValueError arm below.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        # This arm carries LINT FAILURES too, not only malformed names. ``_validated_script_spec``
+        # flattens a lint error into a ``ValueError`` whose message names the failing rules, rather
+        # than raising a findings-bearing error, so there is nothing structured to render and 422 is
+        # not available here without changing a committed pass-3A unit. The message does name the
+        # errors, so the refusal stays actionable. Divergence from this unit's ``business-rules.md``
+        # BR-5, recorded in ``code-summary.md``.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {
+        "name": spec.name,
+        "path": spec.path,
+        "content_hash": spec.content_hash,
+    }
+
+
+@app.put("/workflows/{name}")
+async def update_workflow_endpoint(
+    name: str,
+    body: WorkflowUpdateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Update an EXISTING Python workflow spec, refusing to create one (issue #583 FR-10, FR-8).
+
+    ``PUT`` because this replaces the whole spec at a named location, and the name keys the path exactly
+    as it does for ``DELETE``.
+
+    ``expected_hash`` is required by ``update_workflow`` itself and is passed through verbatim. This
+    handler NEVER computes or defaults it: doing so would remove FR-8's stale-update check rather than
+    weaken it, since a hash read from the file about to be overwritten always matches.
+
+    ``StaleSpecError`` maps to 409 and its arm MUST precede the bare ``ValueError`` arm, because it is a
+    ``ValueError`` subclass and Python matches ``except`` clauses in order. Ordered the other way it
+    would transport as 400 — "your request was malformed" — when the true condition is "someone else
+    changed this spec", and the caller's next action differs completely. The wrong order produces a
+    plausible answer rather than an error, which is why a test asserts the order structurally.
+    """
+    from cli_agent_orchestrator.models.workflow import StaleSpecError, TierCollisionError
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        spec = workflow_spec_service.update_workflow(name, body.source, body.expected_hash)
+    except FileNotFoundError:
+        # ``update_workflow`` raises FileNotFoundError, NOT KeyError, when the spec is absent — an
+        # OSError, so it would escape a ValueError arm entirely and surface as 500. Verified against
+        # the function rather than assumed from ``delete_workflow``'s KeyError precedent.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown workflow '{name}'"
+        )
+    except StaleSpecError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        # Carries lint failures as well as malformed names — see the note on the create endpoint.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {
+        "name": spec.name,
+        "path": spec.path,
+        "content_hash": spec.content_hash,
+    }
 
 
 @app.delete("/workflows/{name}")

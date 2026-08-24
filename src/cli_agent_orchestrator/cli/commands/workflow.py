@@ -18,6 +18,7 @@ reaches its data over the REST surface only.
 """
 
 import json as _json
+import pathlib
 import sys
 import time
 
@@ -51,9 +52,178 @@ def _extract_detail(response: requests.Response, fallback: str) -> str:
     return fallback
 
 
+#: HTTP status -> the refusal class carried in the ``--json`` error envelope for the authoring verbs
+#: (issue #583 Bolt 3, ``authoring-cli-verbs``). A CLOSED set: the classes exist so a script can branch
+#: without parsing prose, which is why exit codes stay uniform at 1 rather than growing a private
+#: taxonomy the other thirteen verbs do not have.
+_AUTHORING_ERROR_CLASSES = {
+    400: "invalid_request",
+    404: "not_found",
+    409: "conflict",
+    422: "lint_failed",
+}
+
+
+def _authoring_failure(
+    response: requests.Response, as_json: bool, fallback: str
+) -> "click.ClickException":
+    """Build the exception for a refused authoring call, honouring ``--json``.
+
+    Exit stays 1 for every class (matching every other ``cao workflow`` verb); the machine-readable
+    distinction rides the envelope instead. ``conflict`` covers both "already exists" on create and
+    "your hash is stale" on update — the two can never apply to the same call, and the message
+    distinguishes them for a human.
+    """
+    detail = _extract_detail(response, fallback)
+    if not as_json:
+        return click.ClickException(detail)
+    envelope = {
+        "ok": False,
+        "class": _AUTHORING_ERROR_CLASSES.get(response.status_code, "error"),
+        "status": response.status_code,
+        "message": detail,
+    }
+    return click.ClickException(_json.dumps(envelope, indent=2))
+
+
+def _unreachable(exc: Exception, as_json: bool) -> "click.ClickException":
+    """A transport failure is not a refusal, and must not read like one.
+
+    The operator's action differs completely — start the server versus fix the spec — so this carries
+    its own class rather than being folded into the refusal set above.
+    """
+    if not as_json:
+        return click.ClickException(f"could not reach cao-server: {exc}")
+    return click.ClickException(
+        _json.dumps(
+            {"ok": False, "class": "unreachable", "message": f"could not reach cao-server: {exc}"},
+            indent=2,
+        )
+    )
+
+
+def _echo_spec_result(record: dict, as_json: bool, verb: str) -> None:
+    """Report a successful create/update.
+
+    The ``content_hash`` is printed deliberately: ``update`` REQUIRES an ``--expected-hash``, so handing
+    the new one back is what keeps the next call a one-liner instead of forcing a ``cao workflow get``
+    in between. The SOURCE is never echoed — a spec may contain credentials the operator pasted by
+    mistake, and terminal output is the easiest place for that to leak.
+    """
+    if as_json:
+        click.echo(_json.dumps(record, indent=2))
+        return
+    click.echo(f"{verb} {record['name']}")
+    click.echo(f"  path: {record.get('path')}")
+    click.echo(f"  hash: {record.get('content_hash')}")
+
+
 @click.group()
 def workflow():
     """Author and inspect CAO workflow specs."""
+
+
+@workflow.command(name="create")
+@click.argument("name")
+@click.option(
+    "--from-file",
+    "from_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Path to the Python source for the new spec.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def create_cmd(name, from_file, as_json):
+    """Create a NEW workflow spec named NAME from a Python source file.
+
+    Refuses to overwrite an existing spec — use ``cao workflow update`` for that. Python only; a
+    YAML-tier name is refused with a message naming the restriction.
+
+    The source is sent as TEXT and the SERVER decides where it lands: validation, the lint gate, path
+    containment, the atomic write and the index update all happen there. This command opens exactly one
+    file — the one you named — and never touches the spec directory itself.
+
+    Prints the new spec's ``content_hash``, which is what ``cao workflow update`` will want next.
+
+    Exit codes:
+      0  created
+      1  refused, or the request errored (``--json`` carries a machine-readable class)
+    """
+    try:
+        source = pathlib.Path(from_file).read_text()
+    except (OSError, ValueError) as e:
+        raise click.ClickException(f"could not read {from_file}: {e}")
+
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows",
+            json={"name": name, "source": source},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        raise _unreachable(e, as_json)
+
+    if response.status_code not in (200, 201):
+        # The server's own message is surfaced verbatim rather than replaced by a generic phrase: the
+        # over-cap refusal names the actual byte limit, and the YAML refusal names the restriction.
+        # Substituting "invalid request" here would throw away the only actionable part.
+        raise _authoring_failure(response, as_json, f"status {response.status_code}")
+
+    _echo_spec_result(response.json(), as_json, "created")
+
+
+@workflow.command(name="update")
+@click.argument("name")
+@click.option(
+    "--from-file",
+    "from_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Path to the replacement Python source.",
+)
+@click.option(
+    "--expected-hash",
+    "expected_hash",
+    required=True,
+    help="The content_hash you believe the spec currently has (see `cao workflow get`).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def update_cmd(name, from_file, expected_hash, as_json):
+    """Replace an EXISTING workflow spec's source, refusing a stale update.
+
+    Refuses to create — use ``cao workflow create`` for that.
+
+    ``--expected-hash`` IS REQUIRED AND IS NEVER COMPUTED FOR YOU, deliberately. It is your assertion
+    about what you believe you are replacing, and that assertion is the whole mechanism: a hash derived
+    from the file about to be overwritten would always match, so the check would pass unconditionally
+    and a concurrent edit between read and write is exactly what would slip through. There is no
+    ``--force`` for the same reason — an unguarded path that exists is a path that gets used.
+
+    Get the current hash from ``cao workflow get NAME`` (it is on the ``Hash:`` line), or from the
+    ``hash`` field this command and ``create`` print on success.
+
+    Exit codes:
+      0  updated
+      1  refused, or the request errored (``--json`` carries a machine-readable class)
+    """
+    try:
+        source = pathlib.Path(from_file).read_text()
+    except (OSError, ValueError) as e:
+        raise click.ClickException(f"could not read {from_file}: {e}")
+
+    try:
+        response = requests.put(
+            f"{API_BASE_URL}/workflows/{name}",
+            json={"source": source, "expected_hash": expected_hash},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        raise _unreachable(e, as_json)
+
+    if response.status_code != 200:
+        raise _authoring_failure(response, as_json, f"status {response.status_code}")
+
+    _echo_spec_result(response.json(), as_json, "updated")
 
 
 @workflow.command(name="validate")
@@ -168,6 +338,15 @@ def get_cmd(name, as_json):
     click.echo(f"Mode:        {spec['mode']}")
     click.echo(f"Description: {spec.get('description', '') or '(none)'}")
     click.echo(f"Steps:       {len(spec.get('steps', []))}")
+    # issue #583 Bolt 3 (``authoring-cli-verbs``): ``cao workflow update`` requires an
+    # ``--expected-hash`` and this was the only place a human could have found it — it was in the
+    # ``--json`` output all along but absent from the table, so the required flag would have meant
+    # piping through jq for the one verb that needs it most. GUARDED rather than unconditional: a YAML
+    # spec carries no content_hash, and printing "Hash: None" on every YAML spec would be noise that
+    # reads like a defect.
+    content_hash = spec.get("content_hash")
+    if content_hash:
+        click.echo(f"Hash:        {content_hash}")
     for step in spec.get("steps", []):
         click.echo(f"  - {step['id']} ({step['provider']}/{step['agent']})")
 
