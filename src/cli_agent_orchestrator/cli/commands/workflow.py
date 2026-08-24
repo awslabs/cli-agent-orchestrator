@@ -534,15 +534,38 @@ def _render_result(result):
     _render_failure_envelope(result.get("failure_envelope"))
 
 
+#: The human phrasing of each failure classification (issue #583 Bolt 3, ``failure-classification``).
+#: PHRASED AS AN ACTION rather than echoing the enum, because the taxonomy exists to answer "what do I
+#: do next" and a human line that makes the reader translate a token has not finished that job. The
+#: machine-readable value stays the raw enum in ``--json``, which is what FR-10's criterion and the
+#: branch-on-the-field contract require.
+#:
+#: An UNKNOWN key is deliberately absent from this map, so a future fourth value degrades to silence in
+#: the human view while still appearing in ``--json`` — better than printing a token no phrasing was
+#: written for.
+_CLASSIFICATION_ACTIONS = {
+    "transient": "Retry — transient failure",
+    "artifact_defect": "Fix the spec — artifact defect",
+    "cancelled": "Cancelled by a human",
+}
+
+
 def _render_failure_envelope(envelope):
     """Human-render the U9 failure envelope beneath a failed/cancelled result (FR-7.1).
 
     A no-op when ``envelope`` is absent (a completed/non-terminal run carries none).
     The ``next_command`` hint points the operator at the diagnostic command.
+
+    The ``what to do`` line is issue #583's FR-10 classification, rendered as an action. It sits above
+    ``error kind`` deliberately: the kind is the CAUSE and the classification is the NEXT ACTION, and an
+    operator scanning a failure wants the second first.
     """
     if not envelope:
         return
     click.echo("Failure:")
+    action = _CLASSIFICATION_ACTIONS.get(envelope.get("classification"))
+    if action:
+        click.echo(f"  what to do:         {action}")
     click.echo(f"  failing step:       {envelope.get('failing_step') or '(none)'}")
     click.echo(f"  attempt:            {envelope.get('attempt')}")
     click.echo(f"  error kind:         {envelope.get('error_kind') or '(none)'}")

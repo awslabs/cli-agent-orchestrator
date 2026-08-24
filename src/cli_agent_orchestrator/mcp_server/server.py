@@ -2742,6 +2742,17 @@ async def workflow_result(
     Returns a structured envelope on EVERY path — never raises into the agent loop
     (EV-1).
 
+    **TO DECIDE WHETHER TO RETRY OR TO FIX THE WORKFLOW, READ
+    ``failure_envelope.classification``** (issue #583 FR-10): ``transient`` means the
+    same run may succeed on retry; ``artifact_defect`` means a new run needs a changed
+    spec first; ``cancelled`` means a human stopped it and no action is implied. Branch
+    on that FIELD rather than on ``error_kind``, which records the cause rather than the
+    remedy, and never on the message text.
+
+    Two related conditions never appear here, because neither is a run outcome: a replay
+    divergence and a halt awaiting a recovery decision are both returned as a ``kind`` on
+    a 409 from the step-execution route, and neither is persisted.
+
     No run-level ``output`` (PR #525 review): the journal has no column for one, so
     the key this docstring used to advertise was always null. Per-step outputs are
     unaffected — read them from ``steps[].output``.

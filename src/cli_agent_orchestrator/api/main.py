@@ -6035,18 +6035,21 @@ def _json_or_none(output_json: Optional[str]) -> Optional[Dict[str, Any]]:
 def _durable_error_kind(steps: List[Any]) -> Optional[str]:
     """Read the durable ``error_kind`` off the step projection, if present (U9, RP-1).
 
-    The column-first swap target (ADR-5): #504 persists a durable ``error_kind`` on
-    the ``workflow_run_step`` projection. Once that column lands and ``StepRow``
-    surfaces it, this returns the first non-null durable kind found on a step —
-    authoritative over any inference (RP-1). Until then, ``StepRow`` carries no
-    ``error_kind`` attribute, so ``getattr`` yields ``None`` for every row and this
-    helper is INERT (returns ``None``), leaving the inference floor in force (RP-2).
+    The column-first path (ADR-5), and it is **LIVE**: ``StepRow`` carries ``error_kind``
+    today, so this returns the first non-null durable kind found on a step and that value
+    is authoritative over any inference (RP-1). ``_resolve_error_kind``'s inference floor
+    (RP-2) now serves only pre-migration rows, whose column is null.
 
-    Reading via ``getattr(step, "error_kind", None)`` makes the rebase a clean swap
-    confined to this one helper (RP-5): when the column arrives no call site changes.
+    CORRECTED (issue #583 Bolt 3, ``failure-classification``): this docstring previously
+    said the helper was "INERT" because "``StepRow`` carries no ``error_kind`` attribute",
+    and that the swap awaited #504. The column has landed. The claim mattered enough to fix
+    here rather than leave to a later docs pass: ``failure-classification`` reads this
+    value as its PRIMARY INPUT, and a reader who believed the docstring would conclude the
+    classification runs on inference alone and would test the wrong branch.
+
+    Reading via ``getattr(step, "error_kind", None)`` is kept rather than a direct attribute
+    access, so the helper stays total against a pre-migration ``StepRow`` shape (RP-5).
     """
-    # TODO(#504-rebase): prefer durable step.error_kind once the column lands — the
-    # getattr below activates automatically the moment StepRow surfaces the field.
     for s in steps:
         durable = getattr(s, "error_kind", None)
         if durable:
@@ -6097,6 +6100,94 @@ def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
     return None
 
 
+#: Resolved ``error_kind`` values that mean "the artifact is fine, the moment was not" (issue #583
+#: Bolt 3, ``failure-classification``). A CLOSED set: anything outside it takes the
+#: ``artifact_defect`` default AND logs, because an unrecognised kind is exactly the case where a
+#: confident answer would be unearned. See ``_classify_failure``.
+_TRANSIENT_ERROR_KINDS = frozenset({"timeout", "provider_error"})
+
+#: The three classifications this surface can emit. ``diverged`` and ``decision_required`` belong to the
+#: same vocabulary but are NOT here: both are live-call kinds returned as a 409 from the ``run_step``
+#: route, and neither is persisted, so a read-time classification has no evidence to emit them from.
+CLASSIFICATION_TRANSIENT = "transient"
+CLASSIFICATION_ARTIFACT_DEFECT = "artifact_defect"
+CLASSIFICATION_CANCELLED = "cancelled"
+
+
+def _classify_failure(row: Any, error_kind: Optional[str]) -> Optional[str]:
+    """Classify a terminal run by WHAT TO DO NEXT (issue #583 FR-10's second Pass criterion).
+
+    FR-10 requires that "transient failures are distinguishable from artifact defects requiring a new
+    run", and its Fail condition is that "the two failure classes are conflated". This function is the
+    sole owner of that criterion.
+
+    ``error_kind`` IS A CAUSE TAXONOMY AND THIS IS A NEXT-ACTION TAXONOMY, which is the whole reason
+    the function exists rather than the endpoint simply surfacing ``error_kind``. ``timeout`` and
+    ``provider_error`` describe what went wrong; ``transient`` and ``artifact_defect`` describe what to
+    do about it, and the mapping between them is a judgement rather than a rename.
+
+    THE CANCELLED CHECK PRECEDES THE KIND, AND THE ORDER IS THE RULE. A run cancelled while a step was
+    in flight carries BOTH ``state == CANCELLED`` and a step-level error, so reading the kind first
+    would label a human's deliberate stop as a failure to diagnose — the conflation FR-10 forbids,
+    arriving from a direction the requirement's wording does not anticipate. Ordered wrongly this
+    returns a plausible ``transient`` rather than raising, so a test asserts the order by planting it.
+
+    A BARE ``error`` RESOLVES TO ``artifact_defect``, AND THAT IS A JUDGEMENT RATHER THAN A DEDUCTION.
+    ``error`` is both the most common value and the least informative: a provider blip and a broken
+    spec both land there. The two possible wrong answers are not symmetric — wrongly ``transient``
+    sends the operator round a retry loop that cannot succeed, spending a provider call and teaching
+    them nothing, repeatably; wrongly ``artifact_defect`` costs one inspection of a sound spec, after
+    which they know more. So the default is the more useful wrong answer.
+
+    **This default is the SOLE source of ``artifact_defect``.** The design originally also derived it
+    from a recorded replay divergence — but nothing persists a divergence
+    (``workflow_journal.raise``s ``ReplayDivergenceError``, and the ``run_step`` route's own comment
+    records "The step is NOT settled: it never ran, so there is no outcome to record"). Without this
+    default the field could only ever say ``transient`` or ``cancelled`` and FR-10 would be UNMET, so
+    this is the first rule to revisit when richer error kinds are persisted.
+
+    TOTAL BY CONTRACT: never raises, for any input shape. It runs inside the result assembly for a
+    FAILED run — the request an operator makes precisely when something has already gone wrong — so
+    trading a diagnosis for a classification would invert the point of the unit. This is the same
+    degrade-don't-500 posture the endpoint already applies to a corrupt step ``output_json``.
+
+    NEVER READS MESSAGE TEXT. ``services.md`` requires a caller to "branch on the field, never
+    regex-scrape the message", and the same discipline applies inside: a classifier that never touches
+    an error string cannot be steered by workflow-controlled content.
+
+    Computed on read and persisted nowhere, so a later change to these rules re-labels historical runs.
+    That is accepted and recorded; a persisted column was the considered alternative.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+
+    state = getattr(row, "state", None)
+    if state == RunState.CANCELLED.value:
+        return CLASSIFICATION_CANCELLED
+    if state != RunState.FAILED.value:
+        # COMPLETED, RUNNING, or a state outside the enum. No failure to classify, and no guess: the
+        # field is simply absent, exactly as ``failure_envelope`` itself is absent for a success.
+        return None
+
+    if error_kind == "cancelled":
+        return CLASSIFICATION_CANCELLED
+    if error_kind in _TRANSIENT_ERROR_KINDS:
+        return CLASSIFICATION_TRANSIENT
+    if error_kind is not None and error_kind != "error":
+        # An UNRECOGNISED kind. The value returned is the same default a bare ``error`` gets, but the
+        # reason is different and the difference must not be silent: under the CLI's action phrasing
+        # this renders as "Fix the spec", a confident instruction derived from no evidence. A silent
+        # fallback is indistinguishable from a correct classification, so an operator misled by one
+        # would leave no trace. One record per classification, identifiers only — never the error text.
+        logger.warning(
+            "workflow failure classification: unrecognised error_kind %r for run %r; "
+            "defaulting to %s",
+            error_kind,
+            getattr(row, "run_id", None),
+            CLASSIFICATION_ARTIFACT_DEFECT,
+        )
+    return CLASSIFICATION_ARTIFACT_DEFECT
+
+
 def _build_failure_envelope(
     row: Any, step_results: List[Any], run_id: str, error_kind: Optional[str]
 ) -> Optional[Dict[str, Any]]:
@@ -6112,6 +6203,10 @@ def _build_failure_envelope(
       run's ``current_step_id`` at failure (EF-1).
     - ``attempt`` — that step's ``attempts`` (EF-2).
     - ``error_kind`` — the ``_resolve_error_kind`` result (already resolved).
+    - ``classification`` — ``transient`` / ``artifact_defect`` / ``cancelled``, derived from the run
+      state and ``error_kind`` by :func:`_classify_failure` (issue #583 FR-10). A NEXT-ACTION value,
+      where ``error_kind`` above is a CAUSE value; both are kept because they answer different
+      questions.
     - ``terminal_reference`` — the ``run_id`` (the durable handle, EF-3).
     - ``next_command`` — a fixed literal hint keyed on the run id (EF-4, ST-1); the
       shape does not drift, so ``--json`` consumers can parse it across releases.
@@ -6136,6 +6231,11 @@ def _build_failure_envelope(
         "failing_step": failing_step,
         "attempt": attempt,
         "error_kind": error_kind,
+        # issue #583 Bolt 3 (``failure-classification``): FR-10's second Pass criterion. Placed INSIDE
+        # this envelope rather than at top level, so a successful run's ``--json`` stays byte-identical
+        # for free — the early return above already omits the whole key. Both inputs are already in
+        # scope, so this adds no query and no parameter.
+        "classification": _classify_failure(row, error_kind),
         "terminal_reference": run_id,
         "next_command": f"cao workflow result {run_id}",
     }

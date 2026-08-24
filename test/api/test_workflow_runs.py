@@ -2001,7 +2001,13 @@ def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
 def test_failure_envelope_json_shape_stable_across_surfaces(client, read_surface_db):
     """U9-T8 (ST-1 / NFR-3): the ``--json`` (REST body) envelope has the fixed field
     set and a next_command hint whose shape does not drift — the same shape the CLI
-    and MCP surfaces spread verbatim."""
+    and MCP surfaces spread verbatim.
+
+    ``classification`` was added by issue #583 Bolt 3 (``failure-classification``), FR-10's second Pass
+    criterion. THE EXACT-SET ASSERTION IS KEPT DELIBERATELY: relaxing it to a subset check would remove
+    this test's teeth for the sake of one intentional addition, and an exact set is what makes an
+    UNintentional field appear as a failure. Extend the set when a field is added on purpose.
+    """
     _seed_run(
         "shape",
         RunState.FAILED.value,
@@ -2014,6 +2020,7 @@ def test_failure_envelope_json_shape_stable_across_surfaces(client, read_surface
         "failing_step",
         "attempt",
         "error_kind",
+        "classification",
         "terminal_reference",
         "next_command",
     }
