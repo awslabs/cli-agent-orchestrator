@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -3087,6 +3087,222 @@ async def workflow_events(
         "gaps": gaps,
         "timed_out": timed_out,
     }
+
+
+# ---------------------------------------------------------------------------
+# Conversational authoring (issue #583 Bolt 3, ``authoring-mcp-tools``).
+#
+# The four operations FR-10 asks for, and the surface its Pass criterion is actually about: "an agent can
+# carry a workflow from description to running without the user choosing a format". Python is the only
+# format written, so no format question is ever put to anyone.
+#
+# THERE IS NO GRANT TOOL HERE, AND THERE NEVER WILL BE. Approving a plan stays a human act performed
+# through ``cao workflow approve``. Bolt 2 made ``workflow_plan_approval`` read-only for this reason: an
+# MCP grant tool lets an agent approve the plan it just wrote, which collapses the human authorisation
+# FR-8 exists to preserve. Adding four authoring tools is precisely the moment someone would "complete
+# the set", so the absence is enforced by a test over the registered tool inventory rather than by this
+# comment alone — see ``test_no_mcp_tool_grants_an_approval``.
+#
+# EVERY PARAMETER BELOW IS REQUIRED, VIA ``Annotated[str, Field(...)]`` RATHER THAN A DEFAULT. That shape
+# is load-bearing, not stylistic. A ``Field(...)`` sitting in a parameter's DEFAULT arrives as a truthy
+# ``FieldInfo`` sentinel when a Python caller omits the argument — which is how this module's own tests
+# call these tools — so a guard written as ``if value:`` would treat "nothing supplied" as "something
+# supplied". That trap is live here and mitigated inline three times elsewhere in this file. With nothing
+# optional it cannot occur at all, and ``test_authoring_tools_declare_no_field_defaults`` keeps it that
+# way rather than trusting that no one adds a convenience argument later.
+#
+# Refusals carry a machine-readable ``class`` alongside the server's own message. This departs from the
+# 11 older workflow tools, which return a bare string: FR-10's criterion is about what an AGENT can do,
+# and ``services.md`` tells callers to branch on a field and never to scrape a message, so a surface
+# built for agents that forces prose-parsing satisfies the letter and misses the point. Retrofitting the
+# other 11 is the correct end state and is deliberately NOT done here (it would mean reaching into tools
+# this unit does not own); it needs ``_extract_error_detail`` widened to return the status alongside the
+# detail.
+# ---------------------------------------------------------------------------
+
+#: Status -> refusal class, per calling tool. Knowing the TOOL is what lets ``create``'s 409
+#: (already_exists) and ``update``'s 409 (stale_hash) carry different classes — a discrimination the CLI
+#: could not make, because it maps from the status alone.
+_AUTHORING_CLASS_BY_STATUS = {
+    "create": {409: "already_exists", 400: "invalid_request", 422: "lint_failed"},
+    "update": {404: "not_found", 409: "stale_hash", 400: "invalid_request", 422: "lint_failed"},
+    "get": {404: "not_found", 400: "invalid_request", 409: "invalid_request"},
+    "validate": {400: "invalid_request", 404: "not_found", 422: "lint_failed"},
+}
+
+
+def _authoring_refusal(op: str, response: requests.Response) -> Dict[str, Any]:
+    """Build the classed refusal envelope for an authoring tool.
+
+    ``lint_failed`` is reachable on ``create``/``update`` through a 400 whose detail names lint errors:
+    the service flattens a lint failure into a ``ValueError``, so the status alone cannot distinguish it.
+    Rather than sniff the message — which is the thing this whole design refuses to do — the class stays
+    ``invalid_request`` and the server's message names the failing rules. Recorded so a reader does not
+    mistake the map's ``422`` entries for the live lint path.
+    """
+    detail = _extract_error_detail(response, f"status {response.status_code}")
+    klass = _AUTHORING_CLASS_BY_STATUS.get(op, {}).get(response.status_code, "error")
+    return {"ok": False, "class": klass, "error": detail}
+
+
+def _unreachable_refusal(exc: Exception) -> Dict[str, Any]:
+    """A transport failure is not a content refusal, and must never read like one.
+
+    The agent's next action differs completely — start the server versus fix the spec — so this carries
+    its own class rather than being folded into ``invalid_request``.
+    """
+    return {"ok": False, "class": "unreachable", "error": f"could not reach cao-server: {exc}"}
+
+
+@mcp.tool()
+async def workflow_create(
+    name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
+    source: Annotated[str, Field(description="The Python spec's full source text")],
+) -> Dict[str, Any]:
+    """Create a NEW Python workflow spec (issue #583 FR-10).
+
+    A thin HTTP client over ``POST /workflows``. Refuses to overwrite an existing spec — use
+    ``workflow_update`` for that. Python only; a YAML-tier name is refused with a message naming the
+    restriction.
+
+    Send the SOURCE TEXT, never a path: the server decides where a spec lands, and validation, the lint
+    gate, path containment, the atomic write and the index update all happen there. This tool opens no
+    files — going through CAO rather than using your own file tools is the point of the design.
+
+    On success returns ``{ok: True, name, path, content_hash}``. **Keep ``content_hash``** — it is what
+    ``workflow_update`` requires next, so the authoring loop needs no ``workflow_get`` between edits.
+
+    On refusal returns ``{ok: False, class, error}`` where ``class`` is one of ``already_exists`` (that
+    name is taken), ``invalid_request`` (bad name, wrong tier, YAML refused, over the size cap, or lint
+    errors that would make the spec unrunnable), or ``unreachable``. Branch on ``class``, not on the
+    message. Never raises into the agent loop (EV-1).
+    """
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows",
+            json={"name": name, "source": source},
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code not in (200, 201):
+        return _authoring_refusal("create", response)
+
+    return {"ok": True, **response.json()}
+
+
+@mcp.tool()
+async def workflow_update(
+    name: Annotated[str, Field(description="Bare workflow name of the EXISTING spec")],
+    source: Annotated[str, Field(description="The replacement Python source text")],
+    expected_hash: Annotated[
+        str,
+        Field(
+            description="The content_hash you believe the spec currently has (see the tool docs)"
+        ),
+    ],
+) -> Dict[str, Any]:
+    """Replace an EXISTING spec's source, refusing a stale update (issue #583 FR-10, FR-8).
+
+    A thin HTTP client over ``PUT /workflows/{name}``. Refuses to create — use ``workflow_create``.
+
+    **WHERE ``expected_hash`` COMES FROM.** Use the ``content_hash`` returned by your previous
+    ``workflow_create`` or ``workflow_update`` call. The happy path therefore needs no extra call at all:
+    both write tools hand back the new hash, so an agent iterating on a spec already holds what the next
+    edit requires. If you have lost it, ``workflow_get`` returns it.
+
+    **DO NOT FETCH IT IMMEDIATELY BEFORE WRITING.** Calling ``workflow_get`` and passing the hash you just
+    received straight into this tool DEFEATS the check entirely rather than satisfying it: a hash read
+    from the file you are about to overwrite always matches, so the comparison passes unconditionally and
+    a concurrent edit between your read and your write is exactly what slips through unnoticed. The hash
+    is meaningful only as an assertion about what you believe you are replacing — which is why there is no
+    force flag and no way to omit it.
+
+    On success returns ``{ok: True, name, path, content_hash}`` with the NEW hash for your next edit.
+
+    On refusal returns ``{ok: False, class, error}`` where ``class`` is ``not_found`` (no such spec —
+    create it), ``stale_hash`` (someone changed it since your hash; re-read and re-apply your change),
+    ``invalid_request``, or ``unreachable``. Never raises into the agent loop (EV-1).
+    """
+    try:
+        response = requests.put(
+            f"{API_BASE_URL}/workflows/{name}",
+            json={"source": source, "expected_hash": expected_hash},
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code != 200:
+        return _authoring_refusal("update", response)
+
+    return {"ok": True, **response.json()}
+
+
+@mcp.tool()
+async def workflow_get(
+    name: Annotated[str, Field(description="Bare workflow name, or a spec file path")],
+) -> Dict[str, Any]:
+    """Read back a workflow spec, including its source and ``content_hash`` (issue #583 FR-10).
+
+    A thin HTTP client over ``GET /workflows/{name}``. This is FR-10's "inspect" operation: it returns the
+    parsed, validated spec, so it is how you see what a workflow currently is rather than what you last
+    sent.
+
+    Use it to recover a ``content_hash`` you no longer have — but note ``workflow_create`` and
+    ``workflow_update`` both return the hash, so the ordinary editing loop does not need this call. Note
+    also that this route rebuilds the spec index, so calling it in a loop is the expensive way to do
+    anything.
+
+    On refusal returns ``{ok: False, class, error}`` with ``class`` of ``not_found``, ``invalid_request``
+    or ``unreachable``. Never raises into the agent loop (EV-1).
+    """
+    try:
+        response = requests.get(f"{API_BASE_URL}/workflows/{name}", timeout=_mcp_timeout())
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code != 200:
+        return _authoring_refusal("get", response)
+
+    return {"ok": True, **response.json()}
+
+
+@mcp.tool()
+async def workflow_validate(
+    source: Annotated[str, Field(description="Python spec source text to lint, as a draft")],
+) -> Dict[str, Any]:
+    """Lint Python spec source WITHOUT creating anything (issue #583 FR-10).
+
+    A thin HTTP client over ``POST /workflows/validate``. Takes TEXT, not a name and not a path, so **a
+    draft can be checked before it exists anywhere** — which is the order to work in: validate, revise,
+    then ``workflow_create``. Creating first and learning about lint errors from a refused write is the
+    slower loop.
+
+    Nothing is written to disk to perform the check, and no file needs to exist.
+
+    To validate a spec that is already stored, call ``workflow_get`` and pass its ``source`` here.
+
+    On success returns ``{ok: True, **the ScriptValidationResult}`` — read its ``status`` (``pass`` or
+    ``fail``) and its ``findings``. **A lint ERROR means CAO would refuse to RUN the spec**, so treat a
+    failing verdict as work to do before creating, not as advice.
+
+    On refusal returns ``{ok: False, class, error}``. Never raises into the agent loop (EV-1).
+    """
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/validate",
+            json={"source": source},
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code != 200:
+        return _authoring_refusal("validate", response)
+
+    return {"ok": True, **response.json()}
 
 
 # The MCP Apps surface — tools (render_dashboard / render_agent_view /

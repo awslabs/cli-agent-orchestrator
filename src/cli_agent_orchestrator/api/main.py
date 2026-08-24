@@ -611,9 +611,29 @@ class RunStepResponse(BaseModel):
 
 
 class WorkflowValidateRequest(BaseModel):
-    """Request body for ``POST /workflows/validate`` (Bolt 2, N2)."""
+    """Request body for ``POST /workflows/validate`` (Bolt 2, N2).
 
-    path: str = Field(description="Filesystem path to the workflow spec YAML file")
+    TWO FORMS, EXACTLY ONE OF THEM (issue #583 Bolt 3, ``authoring-mcp-tools``):
+
+    * ``path`` — the original form, unchanged. Extension-based dispatch, ``_safe_spec_path``
+      containment, and every existing caller (including ``cao workflow validate``) sends this.
+    * ``source`` — spec TEXT, linted in memory as Python. Added so an **agent can validate a draft
+      before creating it**, which is the validate-then-create order FR-10's sequence wants. A source-only
+      body has no extension to dispatch on and is always treated as Python, which is correct because
+      pass 3A made writes Python-only.
+
+    ``path`` became optional at the model level so ``source`` can stand alone; the handler enforces
+    exactly-one, so neither and both are 400s rather than silently preferring one. Making it optional is
+    NOT a relaxation of the old contract — a body carrying only ``path`` behaves identically.
+    """
+
+    path: Optional[str] = Field(
+        default=None, description="Filesystem path to the workflow spec file (YAML or Python)"
+    )
+    source: Optional[str] = Field(
+        default=None,
+        description="Python spec source text, validated without needing a file on disk",
+    )
 
 
 class WorkflowCreateRequest(BaseModel):
@@ -4096,10 +4116,44 @@ async def validate_workflow_endpoint(
     DIRECTLY — NOT via ``get_workflow``/``ScriptSpec`` — staying read-only,
     side-effect-free, and collision-check-free like the YAML arm (BR-23b).
     The complete ``ScriptValidationResult`` is returned with ``model_dump()``.
+
+    THE ``source`` FORM (issue #583 Bolt 3, ``authoring-mcp-tools``) lints spec TEXT with no file
+    involved, so an agent can validate a draft BEFORE creating it. It writes no temp file, deliberately:
+    ``lint_script`` accepts a placeholder path, so materialising the source would add a write and a
+    cleanup path to a read-only route for no gain. There is therefore no path to contain on this arm —
+    the containment question does not arise rather than being answered.
     """
     import os as _os
 
     from cli_agent_orchestrator.services import workflow_spec_service
+
+    if (body.path is None) == (body.source is None):
+        # Exactly one, enforced rather than defaulted: silently preferring one form would make a
+        # both-supplied request look like it validated the thing the caller meant, which is the
+        # ambiguity this check exists to refuse.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "supply exactly one of 'path' or 'source' "
+                f"(path={'set' if body.path is not None else 'unset'}, "
+                f"source={'set' if body.source is not None else 'unset'})"
+            ),
+        )
+
+    if body.source is not None:
+        from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
+        from cli_agent_orchestrator.services.script_lint import lint_script
+
+        if len(body.source.encode("utf-8")) > WORKFLOW_MAX_SPEC_BYTES:
+            # The same cap the write path enforces, checked here too so a caller cannot learn the
+            # limit only by trying to create. Message names the limit (unit 2's PERF-3 discipline).
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)",
+            )
+        # "<draft>" is a placeholder, never opened. Always Python: a source body has no extension to
+        # dispatch on, and pass 3A made writes Python-only.
+        return lint_script(body.source, "<draft>").model_dump()
 
     ext = _os.path.splitext(body.path)[1].lower()
     if ext in (".yaml", ".yml"):
