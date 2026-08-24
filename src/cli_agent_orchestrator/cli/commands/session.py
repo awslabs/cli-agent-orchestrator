@@ -191,6 +191,41 @@ def status(session_name, terminal_id, workers, as_json):
             click.echo("\nNo worker terminals")
 
 
+@session.command("set-env")
+@click.argument("session_name")
+@click.argument("pairs", nargs=-1, required=True, metavar="KEY=VALUE...")
+def set_env(session_name, pairs):
+    """Re-hydrate forwarded env vars for a live session.
+
+    The per-session env map (``cao launch --env``) lives only in cao-server
+    memory and is wiped by a server restart; workers spawned after that lose
+    the forwarded vars. This re-registers them (merge-on-top, per-key
+    overwrite) without recreating the session. Values travel in the request
+    body so secrets stay out of the server's HTTP access log.
+    """
+    from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs
+
+    env_vars = _parse_env_pairs(pairs)
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/sessions/{quote(session_name)}/env",
+            json={"env_vars": env_vars},
+        )
+        response.raise_for_status()
+        data = response.json()
+        click.echo(
+            f"Session '{data['session_name']}' env re-hydrated "
+            f"({len(env_vars)} set, now holding: {', '.join(data['env_keys'])})"
+        )
+    except requests.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            pass
+        raise click.ClickException(detail or str(e))
+
+
 @session.command()
 @click.argument("session_name")
 @click.argument("message")
