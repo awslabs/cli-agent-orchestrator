@@ -213,6 +213,19 @@ def test_frontmatter_region_preserves_original_bytes_and_body():
     )
 
 
+def test_frontmatter_boundary_recognizes_bom_and_crlf_complete_fences():
+    text = "\ufeff---\r\ntitle: Keep\r\n---\r\nbody\r\n"
+
+    boundary = parser.frontmatter_boundary(text)
+
+    assert boundary is not None
+    region, newline = boundary
+    assert newline == "\r\n"
+    assert region.raw == "title: Keep"
+    assert region.body == "body\r\n"
+    assert region.start == 1
+
+
 def test_bom_prefixed_frontmatter_is_parsed_without_a_finding():
     result = parser.parse_note(
         "\ufeff---\ncao:\n  key: stable\n---\nbody",

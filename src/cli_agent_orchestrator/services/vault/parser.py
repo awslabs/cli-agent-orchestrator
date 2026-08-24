@@ -45,25 +45,46 @@ def _quarantined(region: FrontmatterRegion, code: FindingCode, detail: str) -> P
     return ParseResult({}, {}, region, code, detail)
 
 
-def split_frontmatter(text: str, max_frontmatter_bytes: int) -> FrontmatterRegion:
-    """Split YAML frontmatter and refuse an over-cap region before YAML sees it."""
+def frontmatter_boundary(text: str) -> Optional[tuple[FrontmatterRegion, str]]:
+    """Return the raw frontmatter region and its fence newline, if present.
+
+    A leading BOM is ignored only for fence recognition and remains outside the
+    returned region.  The closing fence must occupy a complete line, matching
+    the parser's existing boundary rule rather than accepting ``---suffix``.
+    """
     offset = 1 if text.startswith("\ufeff") else 0
     source = text[offset:]
-    if not source.startswith("---\n") and source != "---":
-        return FrontmatterRegion("", source, offset, offset)
+    newline = "\r\n" if source.startswith("---\r\n") else "\n"
+    opening = f"---{newline}"
+    if not source.startswith(opening):
+        return None
+    closing_pattern = (
+        r"(?m)^---(?:\r\n|\Z)" if newline == "\r\n" else r"(?m)^---(?:\n|\Z)"
+    )
     closing_match = next(
-        (match for match in re.finditer(r"(?m)^---(?:\n|\Z)", source[4:])),
+        (match for match in re.finditer(closing_pattern, source[len(opening) :])),
         None,
     )
     if closing_match is None:
         raise ValueError("frontmatter_malformed")
-    closing = 4 + closing_match.start()
-    end = 4 + closing_match.end()
-    raw_end = closing - 1 if source[closing - 1] == "\n" else closing
-    raw = source[4:raw_end]
+    closing = len(opening) + closing_match.start()
+    end = len(opening) + closing_match.end()
+    raw_end = closing - len(newline) if source[closing - len(newline) : closing] == newline else closing
+    raw = source[len(opening) : raw_end]
+    return FrontmatterRegion(raw, source[end:], offset, offset + end), newline
+
+
+def split_frontmatter(text: str, max_frontmatter_bytes: int) -> FrontmatterRegion:
+    """Split YAML frontmatter and refuse an over-cap region before YAML sees it."""
+    boundary = frontmatter_boundary(text)
+    if boundary is None:
+        offset = 1 if text.startswith("\ufeff") else 0
+        return FrontmatterRegion("", text[offset:], offset, offset)
+    region, _newline = boundary
+    raw = region.raw
     if len(raw.encode("utf-8")) > max_frontmatter_bytes:
         raise ValueError("frontmatter_too_large")
-    return FrontmatterRegion(raw, source[end:], offset, offset + end)
+    return region
 
 
 def parse_note(text: str, *, max_frontmatter_bytes: int, secret_gate: str) -> ParseResult:
