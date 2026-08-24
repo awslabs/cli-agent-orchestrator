@@ -44,6 +44,7 @@ class VaultWriteResult:
 
     path: str
     content_sha256: str
+    ignored_frontmatter_keys: tuple[str, ...] = ()
 
 
 def write_managed_note(
@@ -55,18 +56,22 @@ def write_managed_note(
     cao: Mapping[str, Any],
     expected_content_sha256: Optional[str],
     refresh: Optional[Callable[[str], None]] = None,
+    frontmatter: Optional[Mapping[str, Any]] = None,
 ) -> VaultWriteResult:
     """Replace one CAO-owned note and refresh its projection after publication.
 
-    ``body`` is the full body that the caller has rendered. The writer owns only
-    the managed note, not the caller's append/history policy. ``refresh`` runs
-    after the durable publish so callers can perform the scoped reconciliation
-    without coupling the filesystem safety boundary to database access.
+    ``body`` is the full body that the caller has rendered. ``frontmatter`` may
+    seed only the standard ``tags`` and ``created`` keys on a new note; an
+    existing user-owned value is preserved and reported as ignored. ``refresh``
+    runs after the durable publish so callers can perform the scoped
+    reconciliation without coupling the filesystem safety boundary to database
+    access.
     """
     if vault.id != binding.vault_id:
         raise ValueError("vault binding does not belong to the requested vault")
     if not binding.writable:
         raise ValueError(f"vault mapping {binding.mapping.folder!r} is not writable")
+    seeded_frontmatter = _validated_seed_frontmatter(frontmatter)
 
     managed_base, target = _managed_target(vault, key)
     lock_path = _lock_path_for(Path(os.path.realpath(target)))
@@ -76,8 +81,13 @@ def write_managed_note(
         _check_expected_hash(target, existing, expected_content_sha256)
         boundary = _existing_frontmatter_boundary(target, existing)
         try:
-            rendered = _merge_frontmatter(
-                existing, body, key=key, cao=cao, boundary=boundary
+            rendered, ignored_frontmatter_keys = _merge_frontmatter(
+                existing,
+                body,
+                key=key,
+                cao=cao,
+                boundary=boundary,
+                seeded_frontmatter=seeded_frontmatter,
             )
         except ValueError as exc:
             raise _conflict(target) from exc
@@ -88,7 +98,11 @@ def write_managed_note(
         mode = _target_mode(target)
         _publish_managed_note(vault.root, managed_base, target, rendered, mode)
 
-    result = VaultWriteResult(path=target, content_sha256=_sha256(rendered))
+    result = VaultWriteResult(
+        path=target,
+        content_sha256=_sha256(rendered),
+        ignored_frontmatter_keys=ignored_frontmatter_keys,
+    )
     if refresh is not None:
         try:
             refresh(target)
@@ -172,7 +186,8 @@ def _merge_frontmatter(
     key: str,
     cao: Mapping[str, Any],
     boundary,
-) -> str:
+    seeded_frontmatter: Mapping[str, Any],
+) -> tuple[str, tuple[str, ...]]:
     """Preserve every non-``cao`` frontmatter byte while replacing ``cao``."""
     if boundary is None:
         prefix, raw, existing_body, newline = "", "", "", "\n"
@@ -182,12 +197,50 @@ def _merge_frontmatter(
         raw = _frontmatter_text_region(existing, region.start, region.end, newline)
         existing_body = region.body
     retained, indentation = _remove_cao_block(raw)
+    existing_keys = _top_level_frontmatter_keys(raw)
+    ignored = tuple(key for key in seeded_frontmatter if key in existing_keys)
+    seeds = {key: value for key, value in seeded_frontmatter.items() if key not in existing_keys}
+    rendered_seeds = _render_seed_frontmatter(seeds, newline)
     rendered_cao = _render_cao(key, cao, newline, indentation=indentation)
 
     if retained and not retained.endswith(("\n", "\r")):
         retained += newline
-    frontmatter = f"---{newline}{retained}{rendered_cao}---{newline}"
-    return prefix + frontmatter + (body if body else existing_body)
+    frontmatter = f"---{newline}{retained}{rendered_seeds}{rendered_cao}---{newline}"
+    return prefix + frontmatter + (body if body else existing_body), ignored
+
+
+def _validated_seed_frontmatter(
+    frontmatter: Optional[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    if frontmatter is None:
+        return {}
+    unsupported = sorted(set(frontmatter) - {"tags", "created"})
+    if unsupported:
+        raise ValueError(f"unsupported top-level frontmatter key: {unsupported[0]!r}")
+    return dict(frontmatter)
+
+
+def _top_level_frontmatter_keys(raw: str) -> set[str]:
+    document = yaml.compose(raw, Loader=yaml.SafeLoader)
+    if not isinstance(document, yaml.MappingNode):
+        return set()
+    return {
+        key.value
+        for key, _value in document.value
+        if isinstance(key, yaml.ScalarNode) and key.value in {"tags", "created"}
+    }
+
+
+def _render_seed_frontmatter(values: Mapping[str, Any], newline: str) -> str:
+    if not values:
+        return ""
+    rendered = yaml.safe_dump(
+        dict(values),
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+    )
+    return str(rendered.replace("\n", newline))
 
 
 def _frontmatter_text_region(text: str, start: int, end: int, newline: str) -> str:

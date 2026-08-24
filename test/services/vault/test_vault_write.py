@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import stat
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,52 @@ def test_write_preserves_user_frontmatter_bytes_except_cao_block(tmp_path) -> No
     assert "cao:\n  type: reference\n  key: managed-note\n  managed: true\n" in written
     assert "old-key" not in written
     assert written.endswith("new body\n")
+
+
+def test_write_seeds_standard_top_level_frontmatter_on_a_new_note(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+
+    result = _write(
+        fixture,
+        frontmatter={
+            "tags": ["migration", "native"],
+            "created": datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        },
+    )
+
+    written = (fixture.root / "CAO" / "managed-note.md").read_text(encoding="utf-8")
+    assert "tags:\n- migration\n- native\n" in written
+    assert "created: 2025-01-02 03:04:05+00:00\n" in written
+    assert result.ignored_frontmatter_keys == ()
+
+
+def test_write_preserves_existing_standard_frontmatter_and_reports_ignored_seed(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    target = fixture.root / "CAO" / "managed-note.md"
+    original = "---\ntags: user-value\n---\nold body\n"
+    target.write_text(original, encoding="utf-8")
+
+    result = _write(
+        fixture,
+        frontmatter={
+            "tags": ["migration"],
+            "created": datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        },
+        expected_content_sha256=_sha256(original),
+    )
+
+    written = target.read_text(encoding="utf-8")
+    assert "tags: user-value\n" in written
+    assert "tags:\n- migration\n" not in written
+    assert "created: 2025-01-02 03:04:05+00:00\n" in written
+    assert result.ignored_frontmatter_keys == ("tags",)
+
+
+def test_write_rejects_unsupported_top_level_frontmatter_key_by_name(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match=r"unsupported top-level frontmatter key: 'title'"):
+        _write(fixture, frontmatter={"title": "would overwrite a user key"})
 
 
 def test_write_preserves_bom_crlf_and_unusual_user_frontmatter_bytes(tmp_path) -> None:
