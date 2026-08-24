@@ -86,7 +86,7 @@ The validated bounds are:
 
 The first three belong to the vault entry. `max_recall_body_chars` belongs to
 the enclosing `memory.vault` object. Its runtime recall behavior is documented
-with the U12-B placeholder below.
+in [Recall and injection](#recall-and-injection).
 
 `allow_hardlinks` defaults to `false` for each mapping. A hardlinked note is
 otherwise refused during scanning. Set it to `true` only when that sharing is
@@ -106,6 +106,47 @@ ordinary CLI recall without a terminal, are refused. These bounds cannot
 constrain an agent that reads vault files directly or spawns another identity.
 A vault mapping scoped to `agent` therefore returns nothing to plain CLI recall
 without a resolvable terminal, where earlier releases returned its notes.
+
+## Recall and injection
+
+Vault recall uses one confined read path. Only notes currently indexed by a
+successful reconciliation are eligible; quarantined, excluded, and unsupported
+notes are not returned, even if older derived metadata remains. An indexed note
+can still yield no result when CAO cannot safely open or decode its current
+file. Run `cao memory vault reconcile --apply` after resolving a finding or
+changing vault content.
+
+Recall returns this state in its `index_freshness` field as `fresh` or `stale`.
+CAO compares the current file size and modification time with the values
+recorded at reconciliation.
+`stale` does not withhold a note: release one has no watcher or implicit
+reconciliation, so CAO serves the safely readable current content and marks it
+stale. Reconcile the vault to refresh its derived metadata and relationships.
+Reconciliation alone does not release a note quarantined by the secret gate;
+remove or change the matching content before reconciling again.
+
+`max_recall_body_chars` defaults to 4096 characters. A longer note body is
+clipped with a visible `[Content truncated for recall]` marker, and the recall
+result records that it was truncated. This is deliberately lossy; inspect the
+note in the vault when the complete body matters. It is separate from the
+tighter context budget used for automatic injection.
+
+Automatic injection always applies the injection policy; a caller on that path
+cannot waive it. Mappings with `inject: false` are omitted, as described above,
+and the deterministic builder considers only session, project, and global
+scopes, in that order. Each scope is limited independently to ten entries and
+its share of the context character budget (at most 1000 characters); unused
+space is not reassigned. Related entries are added only after their primary
+entry and are capped at five across one context build. A recallable note can
+therefore be absent from an agent prompt because its mapping is not injectable,
+its scope is agent, or it lost a per-scope or related-entry budget decision.
+Vault status reports injection budget effects without recording note content.
+
+When a same-session memory curator is available, CAO may use its returned
+context block. Any curator failure, busy state, timeout, unavailable provider,
+or unusable response falls back to the deterministic builder so injection does
+not block the worker. That fallback can produce a different selection from the
+curator; it does not bypass the injection policy.
 
 ### Secret handling
 
@@ -199,6 +240,11 @@ scopes. Vault status reports this limitation for every agent-scoped mapping.
 Adding agent scope to injection would change the existing per-scope budget
 allocation, so it is intentionally deferred.
 
+Graph projection has no requesting terminal identity. It therefore omits
+agent-scoped vault notes and reports that the graph is partial in its metadata,
+rather than publishing a topology that the same unknown requester cannot
+recall.
+
 CAO can retain identity across an unambiguous pure rename. A rename plus an
 edit in one reconciliation window without an authored `cao.key` is reported,
 not guessed. Add an authored `cao.key` when stable identity across those edits
@@ -206,9 +252,3 @@ matters.
 
 `cao memory vault adopt` is deferred to release two. CAO does not turn an
 existing unmanaged note into a managed note in this release.
-
-## Planned Documentation
-
-**U12-B placeholder:** recall behavior, injection behavior,
-`index_freshness`, body-budget semantics, and what reaches an agent prompt are
-not documented here. Those surfaces depend on U6 and U7 work that is not final.
