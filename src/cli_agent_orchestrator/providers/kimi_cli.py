@@ -465,7 +465,21 @@ class KimiCliProvider(BaseProvider):
                             env["CAO_TERMINAL_ID"] = self.terminal_id
                             mcp_config[server_name]["env"] = env
 
-                    command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
+                    if self._agent_file_uses_markdown():
+                        # Kimi Code CLI has no --mcp-config flag; it reads
+                        # project-local MCP from <cwd>/.kimi-code/mcp.json
+                        # ({"mcpServers": {...}}). The provider already cd's
+                        # into its per-instance temp dir, so the file is
+                        # scoped to this terminal only. Enabling these
+                        # project-level servers is what triggers the
+                        # workspace-trust dialog answered in
+                        # _handle_startup_dialog.
+                        kimi_code_dir = os.path.join(self._temp_dir, ".kimi-code")
+                        os.makedirs(kimi_code_dir, exist_ok=True)
+                        with open(os.path.join(kimi_code_dir, "mcp.json"), "w") as f:
+                            json.dump({"mcpServers": mcp_config}, f, indent=2)
+                    else:
+                        command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
 
             except Exception as e:
                 raise ProviderError(
