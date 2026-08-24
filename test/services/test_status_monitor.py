@@ -30,12 +30,50 @@ class TestGetStatusTmux:
 
         assert sm.get_status("t1") == TerminalStatus.PROCESSING
 
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
-    def test_unknown_when_never_seen(self, mock_get_backend):
+    def test_unknown_when_never_seen(self, mock_get_backend, mock_pm):
         mock_get_backend.return_value = _backend(event_inbox=False)
+        mock_pm.get_provider.side_effect = ValueError("terminal not in db")
         sm = StatusMonitor()
 
         assert sm.get_status("missing") == TerminalStatus.UNKNOWN
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_rehydrates_persisted_tmux_terminal_from_live_history(self, mock_get_backend, mock_pm):
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "completed turn with prompt"
+        mock_get_backend.return_value = backend
+        provider = MagicMock()
+        provider.session_name = "cao-aiva"
+        provider.window_name = "aiva-e88a"
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+
+        assert sm.get_status("restored") == TerminalStatus.COMPLETED
+        assert sm._last_status["restored"] == TerminalStatus.COMPLETED
+        backend.get_history.assert_called_once_with("cao-aiva", "aiva-e88a")
+        provider.get_status.assert_called_once_with("completed turn with prompt")
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_restored_tmux_terminal_stays_unknown_when_live_history_is_ambiguous(
+        self, mock_get_backend, mock_pm
+    ):
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "partial repaint"
+        mock_get_backend.return_value = backend
+        provider = MagicMock()
+        provider.session_name = "cao-aiva"
+        provider.window_name = "aiva-e88a"
+        provider.get_status.return_value = TerminalStatus.UNKNOWN
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+
+        assert sm.get_status("restored") == TerminalStatus.UNKNOWN
+        assert "restored" not in sm._last_status
 
 
 class TestGetStatusEventInbox:

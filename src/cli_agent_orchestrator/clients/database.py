@@ -1467,6 +1467,27 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
     return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
 
 
+def find_inbox_message_by_marker(receiver_id: str, marker: str) -> Optional[InboxMessage]:
+    """Find the newest inbox row for a receiver containing an exact managed marker."""
+    with SessionLocal() as db:
+        row = (
+            db.query(InboxModel)
+            .filter(InboxModel.receiver_id == receiver_id, InboxModel.message.contains(marker))
+            .order_by(InboxModel.created_at.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        return InboxMessage(
+            id=row.id,
+            sender_id=row.sender_id,
+            receiver_id=row.receiver_id,
+            message=row.message,
+            status=MessageStatus(row.status),
+            created_at=row.created_at,
+        )
+
+
 def get_inbox_messages(
     receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
 ) -> List[InboxMessage]:
@@ -1554,6 +1575,45 @@ def list_aliases_for_project(project_id: str) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.debug(f"list_aliases_for_project failed (non-fatal): {e}")
         return []
+
+
+def claim_inbox_message(
+    receiver_id: str, message_id: int, sender_id: Optional[str] = None
+) -> Optional[InboxMessage]:
+    """Atomically claim one pending inbox row for managed callback consumption.
+
+    A claimed callback is marked DELIVERED without being typed into the provider
+    TUI. Filtering by receiver + optional sender prevents one supervisor from
+    claiming another terminal's message. Already-delivered/failed rows are not
+    claimable and return None.
+    """
+    with SessionLocal() as db:
+        query = db.query(InboxModel).filter(
+            InboxModel.id == message_id,
+            InboxModel.receiver_id == receiver_id,
+            InboxModel.status == MessageStatus.PENDING.value,
+        )
+        if sender_id is not None:
+            query = query.filter(InboxModel.sender_id == sender_id)
+        claimed = query.update(
+            {InboxModel.status: MessageStatus.DELIVERED.value},
+            synchronize_session=False,
+        )
+        if claimed != 1:
+            db.rollback()
+            return None
+        db.commit()
+        row = db.query(InboxModel).filter(InboxModel.id == message_id).first()
+        if row is None:
+            return None
+        return InboxMessage(
+            id=row.id,
+            sender_id=row.sender_id,
+            receiver_id=row.receiver_id,
+            message=row.message,
+            status=MessageStatus(row.status),
+            created_at=row.created_at,
+        )
 
 
 def update_message_status(message_id: int, status: MessageStatus) -> bool:

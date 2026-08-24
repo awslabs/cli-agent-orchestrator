@@ -493,3 +493,23 @@ class TestResolveHandoffProvider:
         assert ctx.session_name is None
         assert ctx.caller_id is None
         assert ctx.allowed_tools is None
+
+
+def test_handoff_can_be_disabled_for_async_callback_supervisors():
+    """Persistent heads must use assign when callback completion is required."""
+    with (
+        patch(
+            "cli_agent_orchestrator.mcp_server.server.REQUIRE_ASYNC_CHILD_DELEGATION",
+            True,
+        ),
+        patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider") as resolve,
+    ):
+        result = asyncio.run(_handoff_impl("department-worker", "bounded task"))
+
+    assert result.success is False
+    assert result.terminal_id is None
+    assert result.output is None
+    assert "Synchronous handoff is disabled" in result.message
+    assert "Use assign" in result.message
+    assert "caller_id callback" in result.message
+    resolve.assert_not_called()

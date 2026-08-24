@@ -78,6 +78,21 @@ class AgentProfile(BaseModel):
     model: Optional[str] = None
     permissionMode: Optional[PermissionMode] = None
     native_agent: Optional[str] = None  # Claude Code native agent name (thin-wrapper mode)
+    claudeSessionId: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Claude Code conversation/session id to resume with --resume. "
+            "Claude Code provider only."
+        ),
+    )
+    claudeMcpConfigFiles: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Additional Claude Code MCP config files to load with --mcp-config "
+            "without --strict-mcp-config. Claude Code provider only."
+        ),
+    )
 
     # Codex-only. Names a [profiles.<name>] block in ~/.codex/config.toml.
     # Used as --profile <name> when yolo mode is not active; unrestricted
@@ -85,6 +100,10 @@ class AgentProfile(BaseModel):
     # empty string from silently degrading to --yolo, since this is a
     # permission-floor knob.
     codexProfile: Optional[str] = Field(default=None, min_length=1)
+    # Codex-only. When true, launch Codex with --yolo while preserving any
+    # configured codexProfile. This is an explicit profile-level permission
+    # choice, equivalent to unrestricted CAO tool access for the profile.
+    yolo: Optional[bool] = False
 
     # Codex-only. Inline Codex config overrides passed as `-c key=value` at
     # launch (e.g. {"model_reasoning_effort": "xhigh", "service_tier": "fast",

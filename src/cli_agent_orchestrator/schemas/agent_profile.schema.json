@@ -86,9 +86,23 @@
     "native_agent": {
       "type": "string"
     },
+    "claudeSessionId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Claude Code conversation/session id to resume with --resume. Claude Code provider only."
+    },
+    "claudeMcpConfigFiles": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Additional Claude Code MCP config files loaded additively with --mcp-config. Claude Code provider only."
+    },
     "codexProfile": {
       "type": "string",
       "minLength": 1
+    },
+    "yolo": {
+      "type": "boolean",
+      "description": "Codex-only profile-level unrestricted mode. Preserves codexProfile and launches with --yolo."
     },
     "codexConfig": {
       "type": "object"

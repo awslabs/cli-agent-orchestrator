@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import requests
@@ -54,6 +55,63 @@ ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lo
 # Defaults to enabled (issue #284): callback routing must not depend on the
 # supervisor LLM remembering to hand-write its terminal ID into the message.
 ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
+
+# Persistent-agent routing is deliberately opt-in. A CAO MCP server is mounted
+# in many supervisors/workers; enabling semantic cross-session discovery for all
+# of them would widen their routing surface. The production AIVA profile enables
+# this explicitly, while department heads/workers leave it disabled.
+ENABLE_PERSISTENT_AGENT_ROUTING = (
+    os.getenv("CAO_ENABLE_PERSISTENT_AGENT_ROUTING", "false").lower() == "true"
+)
+# Trusted top-level orchestrators can also forbid raw terminal-address sends.
+# Semantic routing itself bypasses this guard only after resolving an exact
+# persistent_agent_id internally.
+REQUIRE_SEMANTIC_PERSISTENT_ROUTING = (
+    os.getenv("CAO_REQUIRE_SEMANTIC_PERSISTENT_ROUTING", "false").lower() == "true"
+)
+# Canonical AIVA can require synchronous semantic requests for persistent
+# department work. When enabled, fire-and-forget semantic sends are rejected so
+# the orchestrator cannot report completion before the persistent head's reviewed
+# turn has actually finished.
+REQUIRE_PERSISTENT_AGENT_REQUEST = (
+    os.getenv("CAO_REQUIRE_PERSISTENT_AGENT_REQUEST", "false").lower() == "true"
+)
+# Top-level orchestrators can require managed async semantic dispatch. This keeps
+# department work non-blocking while preserving a durable request ID and a
+# callback route that never exposes terminal addresses to either model.
+REQUIRE_MANAGED_PERSISTENT_DISPATCH = (
+    os.getenv("CAO_REQUIRE_MANAGED_PERSISTENT_DISPATCH", "false").lower() == "true"
+)
+# Persistent department/specialist supervisors use durable async workers. A
+# synchronous handoff auto-tears the child down when the step returns, which can
+# race startup/callback delivery and make a boot screen look like task output.
+# Enable this on supervisors whose child work must complete through assign +
+# durable caller_id callback instead.
+REQUIRE_ASYNC_CHILD_DELEGATION = (
+    os.getenv("CAO_REQUIRE_ASYNC_CHILD_DELEGATION", "false").lower() == "true"
+)
+# Persistent supervisors can require managed child delegation. Bare assign is
+# blocked, but the supervisor may choose either async managed dispatch (the
+# default) or an explicit synchronous wait when the current turn truly depends
+# on the worker result. Both routes pin callbacks to the recorded caller.
+REQUIRE_MANAGED_CHILD_CALLBACK = (
+    os.getenv("CAO_REQUIRE_MANAGED_CHILD_CALLBACK", "false").lower() == "true"
+)
+
+
+def _enforce_child_profile_policy(agent_profile: str) -> None:
+    """Reject child profiles outside the optional per-supervisor allowlist."""
+    raw = os.getenv("CAO_ALLOWED_CHILD_PROFILES", "").strip()
+    if not raw:
+        return
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    if agent_profile not in allowed:
+        allowed_text = ", ".join(sorted(allowed))
+        raise ValueError(
+            f"Child agent profile '{agent_profile}' is not allowed by this supervisor. "
+            f"Allowed profiles: {allowed_text}"
+        )
+
 
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
@@ -148,6 +206,10 @@ def _resolve_child_allowed_tools(
 
     try:
         child_profile = load_agent_profile(child_profile_name)
+        if getattr(child_profile, "yolo", False) is True:
+            # Explicit profile-level yolo is a permission-floor choice. None is
+            # CAO's canonical representation of unrestricted child tools.
+            return None
         mcp_server_names = (
             list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
         )
@@ -186,6 +248,7 @@ def _create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -222,6 +285,7 @@ def _create_terminal(
     Raises:
         Exception: If terminal creation fails
     """
+    _enforce_child_profile_policy(agent_profile)
     provider = DEFAULT_PROVIDER
     parent_allowed_tools = None
 
@@ -278,10 +342,12 @@ def _create_terminal(
             params["model"] = model
         if use_worktree:
             params["use_worktree"] = "true"
+        if isinstance(metadata, dict) and metadata.get("managed_callback") is True:
+            params["managed_callback"] = "true"
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
-        json_body = None
+        json_body: Optional[Dict[str, Any]] = None
         if defer_init:
             params["defer_init"] = "true"
             json_body = {}
@@ -293,6 +359,8 @@ def _create_terminal(
                     if isinstance(initial_message_orchestration_type, OrchestrationType)
                     else str(initial_message_orchestration_type)
                 )
+            if metadata is not None:
+                json_body["metadata"] = metadata
 
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
@@ -652,7 +720,9 @@ def _parse_run_step_error(
     return None, fallback, None
 
 
-def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
+def _send_to_inbox(
+    receiver_id: str, message: str, *, defer_delivery: bool = False
+) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Args:
@@ -675,6 +745,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         params={
             "sender_id": sender_id,
             "message": message,
+            "defer_delivery": "true" if defer_delivery else "false",
         },
         timeout=_mcp_timeout(),
     )
@@ -746,7 +817,20 @@ async def _handoff_impl(
     start_time = time.time()
     terminal_id: Optional[str] = None
 
+    if REQUIRE_ASYNC_CHILD_DELEGATION:
+        return HandoffResult(
+            success=False,
+            message=(
+                "Synchronous handoff is disabled for this supervisor. Use assign so the "
+                "child remains alive for durable caller_id callback, then wait for the "
+                "callback before reviewing or reporting completion."
+            ),
+            output=None,
+            terminal_id=None,
+        )
+
     try:
+        _enforce_child_profile_policy(agent_profile)
         # Resolve the supervisor context WITHOUT creating a terminal, so the
         # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
         # prompt-shaping can both run caller-side before the single combined
@@ -892,7 +976,7 @@ if ENABLE_WORKING_DIRECTORY:
             default=600,
             description="Maximum time to wait for the agent to complete the task (in seconds)",
             ge=1,
-            le=3600,
+            le=540,
         ),
         working_directory: Optional[str] = Field(
             default=None,
@@ -1082,6 +1166,10 @@ def _assign_impl(
     engine: Optional[str] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    *,
+    managed_wait: bool = False,
+    managed_async: bool = False,
+    assignment_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1095,6 +1183,20 @@ def _assign_impl(
     """
     terminal_id: Optional[str] = None
     try:
+        managed_mode = "wait" if managed_wait else ("async" if managed_async else None)
+        if REQUIRE_MANAGED_CHILD_CALLBACK and managed_mode is None:
+            return {
+                "success": False,
+                "terminal_id": None,
+                "message": (
+                    "Bare assign is disabled for this supervisor. Use assign_async for the "
+                    "normal non-blocking path, or assign_and_wait only when this turn truly "
+                    "cannot continue without the worker result."
+                ),
+            }
+        if managed_mode is not None and not assignment_id:
+            assignment_id = uuid.uuid4().hex
+
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
         # path only forwards the initial message on the existing-session branch
@@ -1120,7 +1222,14 @@ def _assign_impl(
         # suffix depends on ``CAO_TERMINAL_ID``, which lives in this MCP
         # subprocess's env (the supervisor-owned instance), not on the
         # cao-server side.
-        if ENABLE_SENDER_ID_INJECTION:
+        if managed_mode is not None:
+            worker_message = (
+                message
+                + f"\n\n[Managed CAO assignment {assignment_id}: when done, call send_message "
+                "with receiver_id omitted. CAO will route the durable callback to your "
+                "recorded caller. Do not transcribe or invent a terminal ID.]"
+            )
+        elif ENABLE_SENDER_ID_INJECTION:
             worker_message = (
                 message
                 + f"\n\n[Assigned by terminal {current_terminal_id}. "
@@ -1143,11 +1252,22 @@ def _assign_impl(
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
             use_worktree=use_worktree,
+            metadata=(
+                {
+                    "managed_callback": True,
+                    "managed_callback_mode": managed_mode,
+                    "managed_assignment_id": assignment_id,
+                }
+                if managed_mode is not None
+                else None
+            ),
         )
 
         return {
             "success": True,
             "terminal_id": terminal_id,
+            "assignment_id": assignment_id,
+            "managed_mode": managed_mode,
             "message": (
                 f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
                 f"Worker is initializing in the background; your task will be "
@@ -1317,11 +1437,693 @@ else:
         )
 
 
+def _assign_async_impl(
+    agent_profile: str,
+    message: str,
+    working_directory: Optional[str] = None,
+    engine: Optional[str] = None,
+    model: Optional[str] = None,
+    use_worktree: bool = False,
+) -> Dict[str, Any]:
+    """Create a managed worker and return immediately with a stable assignment ID."""
+    assignment_id = uuid.uuid4().hex
+    assigned = _assign_impl(
+        agent_profile,
+        message,
+        working_directory,
+        engine=engine,
+        model=model,
+        use_worktree=use_worktree,
+        managed_async=True,
+        assignment_id=assignment_id,
+    )
+    if not assigned.get("success"):
+        return assigned
+    # Terminal IDs are intentionally private implementation details. The durable
+    # assignment ID is the only address the supervisor should retain.
+    return {
+        "success": True,
+        "assignment_id": assignment_id,
+        "agent_profile": agent_profile,
+        "status": "dispatched",
+        "message": (
+            "Worker dispatched asynchronously. Continue other work; its durable callback "
+            f"will arrive automatically with assignment_id={assignment_id}."
+        ),
+    }
+
+
+@mcp.tool()
+async def assign_async(
+    agent_profile: str = Field(description="Allowed worker agent profile"),
+    message: str = Field(description="Bounded task for the worker"),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
+    use_worktree: bool = Field(
+        default=False,
+        description="Run the worker in an isolated git worktree",
+    ),
+) -> Dict[str, Any]:
+    """Dispatch a callback-safe worker without blocking the supervisor.
+
+    This is the normal managed child path for persistent supervisors. CAO records
+    the caller relationship and a stable assignment ID, returns immediately, and
+    later delivers the worker callback through the supervisor inbox.
+    """
+    return _assign_async_impl(
+        agent_profile,
+        message,
+        model=model,
+        use_worktree=use_worktree,
+    )
+
+
+def _claim_managed_callback(supervisor_id: str, worker_id: str, timeout: int) -> Dict[str, Any]:
+    """Wait for and claim one durable callback row from a specific worker."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{supervisor_id}/inbox/messages",
+            params={"limit": 100},
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        rows = response.json()
+        matches = [
+            row for row in rows if isinstance(row, dict) and row.get("sender_id") == worker_id
+        ]
+        if matches:
+            row = matches[-1]
+            status_value = row.get("status")
+            if status_value == "failed":
+                return {
+                    "success": False,
+                    "message": "Worker callback delivery failed",
+                    "terminal_id": worker_id,
+                    "message_id": row.get("id"),
+                }
+            if status_value == "pending":
+                claim = requests.post(
+                    f"{API_BASE_URL}/terminals/{supervisor_id}/inbox/messages/{row['id']}/claim",
+                    params={"sender_id": worker_id},
+                    timeout=_mcp_timeout(),
+                )
+                if claim.status_code == 409:
+                    time.sleep(0.1)
+                    continue
+                claim.raise_for_status()
+                claimed = claim.json()
+                return {
+                    "success": True,
+                    "terminal_id": worker_id,
+                    "message_id": claimed.get("message_id"),
+                    "callback": claimed.get("message", ""),
+                    "callback_status": claimed.get("status"),
+                }
+            if status_value == "delivered":
+                # Recovery path only. Managed callbacks skip eager delivery, so
+                # this means the normal reconciler won a >grace-period race.
+                return {
+                    "success": True,
+                    "terminal_id": worker_id,
+                    "message_id": row.get("id"),
+                    "callback": row.get("message", ""),
+                    "callback_status": "delivered",
+                    "delivery_race": True,
+                }
+
+        # Fail early if the worker vanished instead of burning the full timeout.
+        worker = requests.get(f"{API_BASE_URL}/terminals/{worker_id}", timeout=_mcp_timeout())
+        if worker.status_code == 404:
+            return {
+                "success": False,
+                "terminal_id": worker_id,
+                "message": "Worker disappeared before sending its durable callback",
+            }
+        worker.raise_for_status()
+        time.sleep(0.25)
+
+    return {
+        "success": False,
+        "terminal_id": worker_id,
+        "message": f"Timed out after {timeout}s waiting for durable worker callback",
+    }
+
+
+def _assign_and_wait_impl(
+    agent_profile: str,
+    message: str,
+    timeout: int = 540,
+    working_directory: Optional[str] = None,
+    engine: Optional[str] = None,
+    model: Optional[str] = None,
+    use_worktree: bool = False,
+) -> Dict[str, Any]:
+    """Create one worker and return only after its durable callback is claimed."""
+    if timeout < 1 or timeout > 540:
+        return {"success": False, "message": "timeout must be between 1 and 540 seconds"}
+    supervisor_id = _current_terminal_id()
+    if not supervisor_id:
+        return {
+            "success": False,
+            "message": "assign_and_wait requires CAO_TERMINAL_ID inside a CAO terminal",
+        }
+
+    assigned = _assign_impl(
+        agent_profile,
+        message,
+        working_directory,
+        engine=engine,
+        model=model,
+        use_worktree=use_worktree,
+        managed_wait=True,
+        assignment_id=uuid.uuid4().hex,
+    )
+    if not assigned.get("success"):
+        return assigned
+    worker_id = assigned.get("terminal_id")
+    if not isinstance(worker_id, str):
+        return {"success": False, "message": "assign returned no worker terminal id"}
+
+    callback = _claim_managed_callback(supervisor_id, worker_id, timeout)
+    if callback.get("success"):
+        callback["agent_profile"] = agent_profile
+    return callback
+
+
+@mcp.tool()
+async def assign_and_wait(
+    agent_profile: str = Field(description="Allowed worker agent profile"),
+    message: str = Field(description="Bounded task for the worker"),
+    timeout: int = Field(
+        default=540,
+        ge=1,
+        le=540,
+        description="Maximum seconds to wait for the durable callback",
+    ),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
+    use_worktree: bool = Field(
+        default=False,
+        description="Run the worker in an isolated git worktree",
+    ),
+) -> Dict[str, Any]:
+    """Assign a worker and block until its durable caller callback is claimed.
+
+    The worker is stamped for managed callback delivery. Its send_message reply
+    is persisted but not injected as a second supervisor user turn; this tool
+    claims the exact callback row and returns it for immediate review.
+    """
+    return _assign_and_wait_impl(
+        agent_profile,
+        message,
+        timeout=timeout,
+        model=model,
+        use_worktree=use_worktree,
+    )
+
+
+def _discover_persistent_agent_routes_impl() -> Dict[str, Any]:
+    """Discover live terminals stamped with a canonical persistent agent ID.
+
+    This deliberately fans out across every session and then reads each exact
+    terminal record because the per-session summary omits metadata. A partial
+    discovery is unsafe for semantic routing: if any session/detail read fails,
+    fail the whole operation rather than silently hiding a possible duplicate.
+    """
+    if not ENABLE_PERSISTENT_AGENT_ROUTING:
+        return {
+            "success": False,
+            "error": (
+                "Persistent-agent routing is disabled for this MCP process. "
+                "Set CAO_ENABLE_PERSISTENT_AGENT_ROUTING=true only on an "
+                "authorized orchestrator profile."
+            ),
+            "agents": [],
+        }
+
+    try:
+        sessions_response = requests.get(f"{API_BASE_URL}/sessions", timeout=_mcp_timeout())
+        sessions_response.raise_for_status()
+        sessions = sessions_response.json()
+        if not isinstance(sessions, list):
+            return {
+                "success": False,
+                "error": "CAO /sessions returned a non-list response",
+                "agents": [],
+            }
+
+        agents: List[Dict[str, Any]] = []
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            session_name = session.get("id") or session.get("name")
+            if not session_name:
+                continue
+            listing = requests.get(
+                f"{API_BASE_URL}/sessions/{session_name}/terminals", timeout=_mcp_timeout()
+            )
+            listing.raise_for_status()
+            terminals = listing.json()
+            if not isinstance(terminals, list):
+                return {
+                    "success": False,
+                    "error": f"CAO session {session_name} returned a non-list terminal response",
+                    "agents": [],
+                }
+            for summary in terminals:
+                if not isinstance(summary, dict) or not summary.get("id"):
+                    continue
+                terminal_id = str(summary["id"])
+                detail_response = requests.get(
+                    f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+                )
+                detail_response.raise_for_status()
+                detail = detail_response.json()
+                metadata = detail.get("metadata") if isinstance(detail, dict) else None
+                if not isinstance(metadata, dict):
+                    continue
+                persistent_agent_id = metadata.get("persistent_agent_id")
+                if not isinstance(persistent_agent_id, str) or not persistent_agent_id.strip():
+                    continue
+                agents.append(
+                    {
+                        "agent_id": persistent_agent_id,
+                        "terminal_id": terminal_id,
+                        "display_name": metadata.get("display_name"),
+                        "organization_id": metadata.get("organization_id"),
+                        "kind": metadata.get("kind"),
+                        "parent_agent_id": metadata.get("parent_agent_id"),
+                        "agent_profile": detail.get("agent_profile"),
+                        "provider": detail.get("provider"),
+                        "session_name": detail.get("session_name") or session_name,
+                        "status": detail.get("status"),
+                    }
+                )
+        agents.sort(key=lambda item: (str(item.get("organization_id") or ""), item["agent_id"]))
+        return {"success": True, "agents": agents, "count": len(agents)}
+    except requests.HTTPError as exc:
+        detail = str(exc)
+        if exc.response is not None:
+            detail = _extract_error_detail(exc.response, detail)
+        return {
+            "success": False,
+            "error": f"Persistent-agent discovery failed closed: {detail}",
+            "agents": [],
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Persistent-agent discovery failed closed: {exc}",
+            "agents": [],
+        }
+
+
+def _list_persistent_agents_impl() -> Dict[str, Any]:
+    """Return semantic persistent-agent identities without terminal addresses."""
+    discovered = _discover_persistent_agent_routes_impl()
+    if not discovered.get("success"):
+        return discovered
+    public_fields = (
+        "agent_id",
+        "display_name",
+        "organization_id",
+        "kind",
+        "parent_agent_id",
+        "status",
+    )
+    public_agents = []
+    for agent in discovered.get("agents", []):
+        public_agents.append({key: agent.get(key) for key in public_fields})
+    return {"success": True, "agents": public_agents, "count": len(public_agents)}
+
+
+def _send_message_to_persistent_agent_impl(agent_id: str, message: str) -> Dict[str, Any]:
+    """Resolve a canonical persistent agent ID to its current terminal and send."""
+    if REQUIRE_PERSISTENT_AGENT_REQUEST or REQUIRE_MANAGED_PERSISTENT_DISPATCH:
+        return {
+            "success": False,
+            "error": (
+                "Unmanaged persistent-agent sends are disabled for this orchestrator. "
+                "Use dispatch_persistent_agent for normal non-blocking department work, "
+                "or request_persistent_agent only when the current turn truly must wait."
+            ),
+        }
+    agent_id = agent_id.strip()
+    if not agent_id:
+        return {"success": False, "error": "agent_id must not be empty"}
+
+    discovered = _discover_persistent_agent_routes_impl()
+    if not discovered.get("success"):
+        return discovered
+    matches = [a for a in discovered.get("agents", []) if a.get("agent_id") == agent_id]
+    if not matches:
+        return {
+            "success": False,
+            "error": f"No live persistent agent matches agent_id '{agent_id}'",
+        }
+    if len(matches) != 1:
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent_id '{agent_id}' is ambiguous across {len(matches)} live "
+                "terminals. Repair duplicate persistent-agent metadata before routing."
+            ),
+        }
+
+    target = matches[0]
+    result = _send_message_impl(
+        str(target["terminal_id"]),
+        message,
+        semantic_resolved=True,
+        suppress_runtime_address=True,
+    )
+    if result.get("success"):
+        public_result = {
+            key: value for key, value in result.items() if key not in {"sender_id", "receiver_id"}
+        }
+        return {
+            **public_result,
+            "persistent_agent_id": agent_id,
+        }
+    detail = str(result.get("error") or "Semantic persistent delivery failed")
+    detail = detail.replace(str(target["terminal_id"]), "[runtime address]")
+    return {"success": False, "error": detail}
+
+
+def _resolve_persistent_target_for_dispatch(agent_id: str) -> Dict[str, Any]:
+    agent_id = agent_id.strip()
+    if not agent_id:
+        return {"success": False, "error": "agent_id must not be empty"}
+    discovered = _discover_persistent_agent_routes_impl()
+    if not discovered.get("success"):
+        return discovered
+    matches = [a for a in discovered.get("agents", []) if a.get("agent_id") == agent_id]
+    if not matches:
+        return {
+            "success": False,
+            "error": f"No live persistent agent matches agent_id '{agent_id}'",
+        }
+    if len(matches) != 1:
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent_id '{agent_id}' is ambiguous across {len(matches)} live "
+                "terminals. Repair duplicate persistent-agent metadata before routing."
+            ),
+        }
+    return {"success": True, "target": matches[0]}
+
+
+def _dispatch_persistent_agent_impl(agent_id: str, message: str) -> Dict[str, Any]:
+    """Queue durable department work and return immediately with a request ID."""
+    resolved = _resolve_persistent_target_for_dispatch(agent_id)
+    if not resolved.get("success"):
+        return resolved
+    target = resolved["target"]
+    request_id = uuid.uuid4().hex
+    wrapped = (
+        f"[Managed persistent request request_id={request_id}] This request is asynchronous. "
+        "Do not hold this turn open waiting on child work. Use assign_async for normal child "
+        "delegation and continue other work while children run. When the final reviewed result "
+        f"is ready, call reply_to_persistent_request with request_id={request_id}. Never use a "
+        "terminal ID for the return path.\n\n" + message
+    )
+    result = _send_message_impl(
+        str(target["terminal_id"]),
+        wrapped,
+        semantic_resolved=True,
+        suppress_runtime_address=True,
+    )
+    if not result.get("success"):
+        detail = str(result.get("error") or "Managed persistent dispatch failed")
+        detail = detail.replace(str(target["terminal_id"]), "[runtime address]")
+        return {"success": False, "error": detail}
+    return {
+        "success": True,
+        "persistent_agent_id": agent_id,
+        "request_id": request_id,
+        "status": "dispatched",
+        "message": (
+            "Department work dispatched asynchronously. Continue other work; the reviewed "
+            f"result will return automatically with request_id={request_id}."
+        ),
+    }
+
+
+def _reply_to_persistent_request_impl(request_id: str, message: str) -> Dict[str, Any]:
+    """Reply to the original managed requester without exposing its terminal ID."""
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        return {"success": False, "error": "Invalid managed request id"}
+    own_terminal_id = _current_terminal_id()
+    if not own_terminal_id:
+        return {"success": False, "error": "CAO_TERMINAL_ID is required"}
+    response = requests.get(
+        f"{API_BASE_URL}/terminals/{own_terminal_id}/inbox/managed-request/{request_id}",
+        timeout=_mcp_timeout(),
+    )
+    if response.status_code == 404:
+        return {"success": False, "error": "Managed request not found for this terminal"}
+    response.raise_for_status()
+    sender_id = response.json().get("sender_id")
+    if not isinstance(sender_id, str) or not sender_id:
+        return {"success": False, "error": "Managed request has no durable sender"}
+    callback = f"[Persistent department result request_id={request_id}]\n{message}"
+    result = _send_message_impl(
+        sender_id,
+        callback,
+        semantic_resolved=True,
+        suppress_runtime_address=True,
+    )
+    if not result.get("success"):
+        detail = str(result.get("error") or "Managed persistent reply failed")
+        detail = detail.replace(str(sender_id), "[runtime address]")
+        return {"success": False, "error": detail}
+    return {
+        "success": True,
+        "request_id": request_id,
+        "status": "returned",
+    }
+
+
+@mcp.tool()
+async def dispatch_persistent_agent(
+    agent_id: str = Field(description="Canonical persistent_agent_id, e.g. shaffer-estimating"),
+    message: str = Field(
+        description="Task packet for the persistent department or specialist head"
+    ),
+) -> Dict[str, Any]:
+    """Dispatch persistent department work asynchronously by semantic ID."""
+    return _dispatch_persistent_agent_impl(agent_id, message)
+
+
+@mcp.tool()
+async def reply_to_persistent_request(
+    request_id: str = Field(description="Managed persistent request ID from the task packet"),
+    message: str = Field(description="Final reviewed result to return to the original requester"),
+) -> Dict[str, Any]:
+    """Return a reviewed async department result to its durable original requester."""
+    return _reply_to_persistent_request_impl(request_id, message)
+
+
+def _request_persistent_agent_impl(
+    agent_id: str, message: str, timeout: int = 560
+) -> Dict[str, Any]:
+    """Run one synchronous turn on an existing persistent agent terminal."""
+    agent_id = agent_id.strip()
+    if not agent_id:
+        return {"success": False, "error": "agent_id must not be empty"}
+    if timeout < 1 or timeout > 560:
+        return {"success": False, "error": "timeout must be between 1 and 560 seconds"}
+
+    discovered = _discover_persistent_agent_routes_impl()
+    if not discovered.get("success"):
+        return discovered
+    matches = [a for a in discovered.get("agents", []) if a.get("agent_id") == agent_id]
+    if not matches:
+        return {
+            "success": False,
+            "error": f"No live persistent agent matches agent_id '{agent_id}'",
+        }
+    if len(matches) != 1:
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent_id '{agent_id}' is ambiguous across {len(matches)} live "
+                "terminals. Repair duplicate persistent-agent metadata before routing."
+            ),
+        }
+
+    target = matches[0]
+    status_value = str(target.get("status") or "").lower()
+    if status_value not in {"idle", "completed"}:
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent '{agent_id}' is busy (status={status_value or 'unknown'}). "
+                "Retry after its current turn completes; concurrent driving is not allowed."
+            ),
+        }
+    terminal_id = target.get("terminal_id")
+    provider = target.get("provider")
+    agent_profile = target.get("agent_profile")
+    if not all(
+        isinstance(value, str) and value for value in (terminal_id, provider, agent_profile)
+    ):
+        return {
+            "success": False,
+            "error": f"Persistent agent '{agent_id}' is missing runtime metadata; routing failed closed",
+        }
+
+    prompt = (
+        f"[CAO Persistent Request: {agent_id}] This is a synchronous semantic request from "
+        "the top-level orchestrator. Complete the task under your canonical doctrine. If "
+        "fresh child work is needed in this explicitly synchronous request, use assign_and_wait "
+        "and review its returned callback before responding. Return the final reviewed result directly in "
+        "this assistant turn. Do not use send_message for this request result; CAO captures "
+        "this turn's output synchronously.\n\n" + message
+    )
+    payload: Dict[str, Any] = {
+        "provider": provider,
+        "agent": agent_profile,
+        "prompt": prompt,
+        "reuse_terminal_id": terminal_id,
+        "teardown": False,
+        "timeout": float(timeout),
+    }
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/run-step",
+            json=payload,
+            timeout=float(timeout) + 20.0,
+        )
+    except requests.Timeout:
+        return {
+            "success": False,
+            "error": f"Persistent agent '{agent_id}' timed out after {timeout} seconds",
+        }
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "error": f"Persistent agent request failed: {exc}",
+        }
+
+    if response.status_code != 200:
+        kind, detail, _runtime_terminal_id = _parse_run_step_error(response)
+        if kind == "timeout" or response.status_code == 504:
+            return {
+                "success": False,
+                "error": f"Persistent agent '{agent_id}' timed out after {timeout} seconds",
+            }
+        if kind == "error" or response.status_code == 502:
+            return {
+                "success": False,
+                "error": f"Persistent agent '{agent_id}' errored: {detail}",
+            }
+        return {
+            "success": False,
+            "error": f"Persistent agent '{agent_id}' request failed: {detail}",
+        }
+
+    data = response.json()
+    if data.get("terminal_id") != terminal_id:
+        return {
+            "success": False,
+            "error": (
+                f"Persistent agent '{agent_id}' response came from an unexpected runtime "
+                "terminal; routing failed closed"
+            ),
+        }
+    if "last_message" not in data:
+        return {
+            "success": False,
+            "error": f"Persistent agent '{agent_id}' returned no reviewed output",
+        }
+    return {
+        "success": True,
+        "persistent_agent_id": agent_id,
+        "output": data.get("last_message"),
+        "status": data.get("status"),
+    }
+
+
+@mcp.tool()
+async def request_persistent_agent(
+    agent_id: str = Field(description="Canonical persistent_agent_id, e.g. shaffer-estimating"),
+    message: str = Field(
+        description="Task packet for the persistent department or specialist head"
+    ),
+    timeout: int = Field(
+        default=560,
+        ge=1,
+        le=560,
+        description="Maximum seconds to wait for the persistent head's reviewed turn",
+    ),
+) -> Dict[str, Any]:
+    """Run and await one reviewed turn on a persistent agent by semantic ID.
+
+    The target terminal is resolved internally at call time, driven synchronously
+    through CAO's existing-terminal run-step substrate, and never exposed to the
+    calling model. The persistent head remains alive after the turn.
+    """
+    return _request_persistent_agent_impl(agent_id, message, timeout)
+
+
+@mcp.tool()
+async def list_persistent_agents() -> Dict[str, Any]:
+    """List live persistent agents by canonical semantic ID.
+
+    This cross-session discovery surface is disabled unless the MCP process was
+    launched with CAO_ENABLE_PERSISTENT_AGENT_ROUTING=true. It is intended for
+    trusted top-level orchestrators, not ordinary workers or department heads.
+    """
+    return _list_persistent_agents_impl()
+
+
+@mcp.tool()
+async def send_message_to_persistent_agent(
+    agent_id: str = Field(description="Canonical persistent_agent_id, e.g. shaffer-estimating"),
+    message: str = Field(description="Message content to send"),
+) -> Dict[str, Any]:
+    """Send to a persistent agent without exposing ephemeral terminal IDs.
+
+    The current terminal is resolved from exact `persistent_agent_id` metadata at
+    call time. Missing and duplicate matches fail closed; no fuzzy name/profile
+    fallback is performed.
+    """
+    return _send_message_to_persistent_agent_impl(agent_id, message)
+
+
 # Implementation function for send_message
-def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
+def _send_message_impl(
+    receiver_id: Optional[str],
+    message: str,
+    *,
+    semantic_resolved: bool = False,
+    suppress_runtime_address: bool = False,
+) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
         own_terminal_id = _current_terminal_id()
+
+        if REQUIRE_SEMANTIC_PERSISTENT_ROUTING and receiver_id and not semantic_resolved:
+            return {
+                "success": False,
+                "error": (
+                    "Raw terminal receiver IDs are disabled for this orchestrator. "
+                    "Use send_message_to_persistent_agent with a canonical agent_id."
+                ),
+            }
+
+        managed_callback = os.getenv("CAO_MANAGED_CALLBACK", "false").lower() == "true"
+        managed_callback_mode = os.getenv("CAO_MANAGED_CALLBACK_MODE", "wait").lower()
+        managed_assignment_id = os.getenv("CAO_MANAGED_ASSIGNMENT_ID", "").strip()
+        if managed_callback and receiver_id:
+            return {
+                "success": False,
+                "error": (
+                    "This worker uses a managed callback. Omit receiver_id; CAO routes "
+                    "to the durable recorded caller automatically."
+                ),
+            }
 
         # Default the receiver to the recorded caller (issue #284): handoff/
         # assign persist the creating terminal's ID on the worker's row, so a
@@ -1381,13 +2183,24 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
         # address (issue #284); _send_to_inbox raises a clear error for that
         # case anyway.
-        if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
+        if managed_callback and managed_assignment_id:
+            message = f"[Managed worker callback assignment_id={managed_assignment_id}]\n" + message
+        if (
+            ENABLE_SENDER_ID_INJECTION
+            and own_terminal_id
+            and not managed_callback
+            and not suppress_runtime_address
+        ):
             message += (
                 f"\n\n[Message from terminal {own_terminal_id}. "
                 "Use send_message MCP tool for any follow-up work.]"
             )
 
-        return _send_to_inbox(receiver_id, message)
+        return _send_to_inbox(
+            receiver_id,
+            message,
+            defer_delivery=managed_callback and managed_callback_mode == "wait",
+        )
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
@@ -1395,6 +2208,13 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         detail = str(exc)
         if exc.response is not None:
             detail = _extract_error_detail(exc.response, detail)
+        if suppress_runtime_address:
+            if receiver_id:
+                detail = detail.replace(str(receiver_id), "[runtime address]")
+            return {
+                "success": False,
+                "error": f"Managed semantic delivery failed: {detail}",
+            }
         return {
             "success": False,
             "error": f"Failed to deliver to terminal {receiver_id}: {detail}",

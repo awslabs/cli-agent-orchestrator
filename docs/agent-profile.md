@@ -65,6 +65,7 @@ portable and make profile listings useful.
   launch must agree with this value. See [Kiro CLI](kiro-cli.md).
 - `permissionMode` (string): Claude Code permission mode.
 - `native_agent` (string): Claude Code native-agent name.
+- `claudeSessionId` (string): Claude Code conversation/session ID to resume on every launch.
 - `codexProfile` (string): named Codex configuration profile.
 - `codexConfig` (object): inline Codex configuration overrides.
 - `claudeConfig` (object): inline Claude Code launch flags; `{"effort":
