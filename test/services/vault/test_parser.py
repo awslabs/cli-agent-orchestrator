@@ -96,7 +96,9 @@ def test_unsafe_and_malformed_frontmatter_are_quarantined_with_specific_code(
 
 def test_unterminated_frontmatter_is_malformed():
     result = parser.parse_note(
-        "---\ncao:\n  key: valid\nbody", max_frontmatter_bytes=8192, secret_gate="reject"
+        "---\ncao:\n  key: valid\nbody",
+        max_frontmatter_bytes=8192,
+        secret_gate="reject",
     )
 
     assert result.finding_code == FindingCode.FRONTMATTER_MALFORMED
@@ -107,9 +109,21 @@ def test_unterminated_frontmatter_is_malformed():
     ("frontmatter", "code", "detail"),
     [
         ("cao: invalid", FindingCode.INVALID_CAO_BLOCK, "cao must be an object"),
-        ("cao:\n  key: Bad Key", FindingCode.KEY_INVALID, "cao.key must match ^[a-z0-9-]{1,60}$"),
-        ("cao:\n  type: unsupported", FindingCode.INVALID_CAO_BLOCK, "cao.type is invalid"),
-        ("cao:\n  managed: 'yes'", FindingCode.INVALID_CAO_BLOCK, "cao.managed must be a boolean"),
+        (
+            "cao:\n  key: Bad Key",
+            FindingCode.KEY_INVALID,
+            "cao.key must match ^[a-z0-9-]{1,60}$",
+        ),
+        (
+            "cao:\n  type: unsupported",
+            FindingCode.INVALID_CAO_BLOCK,
+            "cao.type is invalid",
+        ),
+        (
+            "cao:\n  managed: 'yes'",
+            FindingCode.INVALID_CAO_BLOCK,
+            "cao.managed must be a boolean",
+        ),
         (
             "cao:\n  links: not-a-list",
             FindingCode.INVALID_CAO_BLOCK,
@@ -118,7 +132,8 @@ def test_unterminated_frontmatter_is_malformed():
         (
             "cao:\n  links:\n"
             + "\n".join(
-                "    - {to: invalid, type: wrong}" for _ in range(parser.MAX_CAO_LINKS + 1)
+                "    - {to: invalid, type: wrong}"
+                for _ in range(parser.MAX_CAO_LINKS + 1)
             ),
             FindingCode.INVALID_CAO_BLOCK,
             "cao.links must be a list of at most 64 objects",
@@ -180,7 +195,9 @@ def test_unterminated_frontmatter_is_malformed():
         ),
     ],
 )
-def test_invalid_cao_values_are_quarantined_without_defaulting(frontmatter, code, detail):
+def test_invalid_cao_values_are_quarantined_without_defaulting(
+    frontmatter, code, detail
+):
     result = _parse(frontmatter)
 
     assert result.finding_code == code
@@ -247,6 +264,34 @@ def test_closing_fence_must_be_a_complete_line():
 
     assert result.finding_code == FindingCode.FRONTMATTER_MALFORMED
     assert result.finding_detail == "unterminated frontmatter"
+
+
+@pytest.mark.parametrize(
+    ("raw", "spans", "indentation"),
+    [
+        ("cao:\n  key: stale\ntitle: keep\n", ((0, 18),), ""),
+        ("? cao\n: \n  key: stale\ntitle: keep\n", ((0, 22),), ""),
+        ("!!str cao:\n  key: stale\ntitle: keep\n", ((0, 24),), ""),
+        ("  cao:\n    key: stale\n  title: keep\n", ((2, 24),), "  "),
+        (
+            "cao:\n  key: first\ncao:\n  key: second\ntitle: keep\n",
+            ((0, 18), (18, 37)),
+            "",
+        ),
+        ('desc: "one\\ncao: fake\\nend"\ntitle: keep\n', (), ""),
+        ("items: [\ncao: not-really,\nother]\ntitle: keep\n", (), ""),
+    ],
+)
+def test_locate_top_level_cao_blocks_uses_yaml_nodes(raw, spans, indentation):
+    locations = parser.locate_top_level_cao_blocks(raw)
+
+    assert locations.spans == spans
+    assert locations.indentation == indentation
+
+
+def test_locate_top_level_cao_blocks_refuses_anchors_before_composing():
+    with pytest.raises(ValueError, match="^frontmatter_unsafe$"):
+        parser.locate_top_level_cao_blocks("cao: &anchor {key: stale}\n")
 
 
 def test_secret_classification_threads_mapping_gate():

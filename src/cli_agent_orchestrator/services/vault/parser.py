@@ -33,6 +33,14 @@ class FrontmatterRegion:
 
 
 @dataclass(frozen=True)
+class CaoBlockLocations:
+    """Exact top-level ``cao`` entry spans in a frontmatter mapping."""
+
+    spans: tuple[tuple[int, int], ...]
+    indentation: str
+
+
+@dataclass(frozen=True)
 class ParseResult:
     frontmatter: dict[str, Any]
     cao: dict[str, Any]
@@ -41,7 +49,9 @@ class ParseResult:
     finding_detail: Optional[str] = None
 
 
-def _quarantined(region: FrontmatterRegion, code: FindingCode, detail: str) -> ParseResult:
+def _quarantined(
+    region: FrontmatterRegion, code: FindingCode, detail: str
+) -> ParseResult:
     return ParseResult({}, {}, region, code, detail)
 
 
@@ -69,7 +79,11 @@ def frontmatter_boundary(text: str) -> Optional[tuple[FrontmatterRegion, str]]:
         raise ValueError("frontmatter_malformed")
     closing = len(opening) + closing_match.start()
     end = len(opening) + closing_match.end()
-    raw_end = closing - len(newline) if source[closing - len(newline) : closing] == newline else closing
+    raw_end = (
+        closing - len(newline)
+        if source[closing - len(newline) : closing] == newline
+        else closing
+    )
     raw = source[len(opening) : raw_end]
     return FrontmatterRegion(raw, source[end:], offset, offset + end), newline
 
@@ -87,33 +101,99 @@ def split_frontmatter(text: str, max_frontmatter_bytes: int) -> FrontmatterRegio
     return region
 
 
-def parse_note(text: str, *, max_frontmatter_bytes: int, secret_gate: str) -> ParseResult:
+def locate_top_level_cao_blocks(raw: str) -> CaoBlockLocations:
+    """Locate semantic top-level ``cao`` entries without interpreting text lines.
+
+    The token check mirrors ``parse_note`` before this second YAML load path can
+    compose an anchored document.  The returned indentation lets writers append
+    a replacement entry to uniformly indented mappings without changing shape.
+    """
+    try:
+        if _has_yaml_anchor_or_alias(raw):
+            raise ValueError("frontmatter_unsafe")
+        document = yaml.compose(raw, Loader=yaml.SafeLoader)
+    except (yaml.YAMLError, RecursionError) as exc:
+        raise ValueError("frontmatter_malformed") from exc
+    if not isinstance(document, yaml.MappingNode):
+        return CaoBlockLocations((), "")
+
+    indentation = _line_indentation(raw, document.start_mark.index)
+    spans = tuple(
+        _mapping_entry_span(raw, key, value)
+        for key, value in document.value
+        if isinstance(key, yaml.ScalarNode) and key.value == "cao"
+    )
+    return CaoBlockLocations(spans, indentation)
+
+
+def _has_yaml_anchor_or_alias(raw: str) -> bool:
+    return any(
+        isinstance(token, (yaml.tokens.AnchorToken, yaml.tokens.AliasToken))
+        for token in yaml.scan(raw, Loader=yaml.SafeLoader)
+    )
+
+
+def _line_indentation(raw: str, index: int) -> str:
+    line_start = raw.rfind("\n", 0, index) + 1
+    return raw[line_start:index]
+
+
+def _mapping_entry_span(raw: str, key: yaml.Node, value: yaml.Node) -> tuple[int, int]:
+    """Return the full source span for one mapping entry, including ``?`` syntax."""
+    start = key.start_mark.index
+    line_start = raw.rfind("\n", 0, start) + 1
+    prefix = raw[line_start:start]
+    if prefix.lstrip(" \t").startswith("?"):
+        start = line_start
+    end = value.end_mark.index
+    # PyYAML includes trailing document blank lines in a final mapping value's
+    # end mark. Retain those separators; only the entry's final newline belongs
+    # to the span being excised.
+    if raw[:end].endswith("\r\n\r\n"):
+        end -= len("\r\n")
+    elif raw[:end].endswith("\n\n"):
+        end -= len("\n")
+    return start, end
+
+
+def parse_note(
+    text: str, *, max_frontmatter_bytes: int, secret_gate: str
+) -> ParseResult:
     """Parse text only; invalid frontmatter is represented as a quarantine finding."""
     try:
         region = split_frontmatter(text, max_frontmatter_bytes)
     except ValueError as exc:
         region = FrontmatterRegion("", text, 0, 0)
         if str(exc) == "frontmatter_too_large":
-            return _quarantined(region, FindingCode.FRONTMATTER_TOO_LARGE, "frontmatter byte cap")
-        return _quarantined(region, FindingCode.FRONTMATTER_MALFORMED, "unterminated frontmatter")
+            return _quarantined(
+                region, FindingCode.FRONTMATTER_TOO_LARGE, "frontmatter byte cap"
+            )
+        return _quarantined(
+            region, FindingCode.FRONTMATTER_MALFORMED, "unterminated frontmatter"
+        )
     if not region.raw:
         return ParseResult({}, {}, region)
     try:
-        for token in yaml.scan(region.raw, Loader=yaml.SafeLoader):
-            if isinstance(token, (yaml.tokens.AnchorToken, yaml.tokens.AliasToken)):
-                return _quarantined(region, FindingCode.FRONTMATTER_UNSAFE, "YAML anchor or alias")
+        if _has_yaml_anchor_or_alias(region.raw):
+            return _quarantined(
+                region, FindingCode.FRONTMATTER_UNSAFE, "YAML anchor or alias"
+            )
         loaded = yaml.safe_load(region.raw)
     except (yaml.YAMLError, RecursionError):
         return _quarantined(region, FindingCode.FRONTMATTER_MALFORMED, "invalid YAML")
     if loaded is None:
         loaded = {}
     if not isinstance(loaded, dict):
-        return _quarantined(region, FindingCode.INVALID_CAO_BLOCK, "frontmatter must be an object")
+        return _quarantined(
+            region, FindingCode.INVALID_CAO_BLOCK, "frontmatter must be an object"
+        )
     cao = loaded.get("cao", {})
     if cao is None:
         cao = {}
     if not isinstance(cao, dict):
-        return _quarantined(region, FindingCode.INVALID_CAO_BLOCK, "cao must be an object")
+        return _quarantined(
+            region, FindingCode.INVALID_CAO_BLOCK, "cao must be an object"
+        )
     try:
         _validate_cao(cao)
     except ValueError as exc:
@@ -137,7 +217,9 @@ def _validate_cao(cao: dict[str, Any]) -> None:
     if "managed" in cao and not isinstance(cao["managed"], bool):
         raise ValueError("cao.managed must be a boolean")
     links = cao.get("links")
-    if links is not None and (not isinstance(links, list) or len(links) > MAX_CAO_LINKS):
+    if links is not None and (
+        not isinstance(links, list) or len(links) > MAX_CAO_LINKS
+    ):
         raise ValueError("cao.links must be a list of at most 64 objects")
     for link in links or ():
         _validate_cao_link(link)
@@ -154,7 +236,9 @@ def _validate_cao_link(link: Any) -> None:
     if len(link["to"]) > MAX_CAO_LINK_TARGET_CHARS or any(
         ord(character) < 32 or ord(character) == 127 for character in link["to"]
     ):
-        raise ValueError("cao.links[].to contains unsupported characters or exceeds 256 characters")
+        raise ValueError(
+            "cao.links[].to contains unsupported characters or exceeds 256 characters"
+        )
     for key, values in (
         ("type", VALID_TYPES),
         ("status", VALID_STATUSES),
@@ -170,7 +254,9 @@ def _validate_cao_link(link: Any) -> None:
         raise ValueError("cao.links[].confidence must be between 0 and 1")
 
 
-def classify_secret(body: str, *, secret_gate: str) -> Optional[tuple[FindingCode, str, str]]:
+def classify_secret(
+    body: str, *, secret_gate: str
+) -> Optional[tuple[FindingCode, str, str]]:
     """Return the content-free secret finding with explicit mapping gate severity."""
     pattern = scan_for_secrets(body)
     if pattern is None:

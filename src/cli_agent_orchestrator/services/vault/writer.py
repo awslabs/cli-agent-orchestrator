@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import re
 import stat
 import tempfile
 from collections.abc import Callable, Mapping
@@ -18,7 +17,10 @@ import yaml
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.config import VaultSpec
-from cli_agent_orchestrator.services.vault.parser import frontmatter_boundary
+from cli_agent_orchestrator.services.vault.parser import (
+    frontmatter_boundary,
+    locate_top_level_cao_blocks,
+)
 from cli_agent_orchestrator.utils.atomic_file import _file_lock, _lock_path_for
 from cli_agent_orchestrator.utils.path_validation import (
     safe_join_under_base,
@@ -26,7 +28,6 @@ from cli_agent_orchestrator.utils.path_validation import (
 )
 
 logger = logging.getLogger(__name__)
-_TOP_LEVEL_CAO_KEY = re.compile(r"""^(?:"cao"|'cao'|cao)\s*:""")
 
 
 class VaultWriteConflictError(RuntimeError):
@@ -74,9 +75,12 @@ def write_managed_note(
         existing = _read_contained_text(managed_base, target)
         _check_expected_hash(target, existing, expected_content_sha256)
         boundary = _existing_frontmatter_boundary(target, existing)
-        rendered = _merge_frontmatter(
-            existing, body, key=key, cao=cao, boundary=boundary
-        )
+        try:
+            rendered = _merge_frontmatter(
+                existing, body, key=key, cao=cao, boundary=boundary
+            )
+        except ValueError as exc:
+            raise _conflict(target) from exc
         rendered_cao = _render_cao(
             key, cao, boundary[1] if boundary is not None else "\n"
         )
@@ -177,8 +181,8 @@ def _merge_frontmatter(
         prefix = existing[: region.start]
         raw = _frontmatter_text_region(existing, region.start, region.end, newline)
         existing_body = region.body
-    retained = _remove_cao_block(raw)
-    rendered_cao = _render_cao(key, cao, newline)
+    retained, indentation = _remove_cao_block(raw)
+    rendered_cao = _render_cao(key, cao, newline, indentation=indentation)
 
     if retained and not retained.endswith(("\n", "\r")):
         retained += newline
@@ -199,26 +203,18 @@ def _frontmatter_text_region(text: str, start: int, end: int, newline: str) -> s
     return fenced[len(opening) : -len(closing)]
 
 
-def _remove_cao_block(raw: str) -> str:
-    """Remove every top-level ``cao`` region without YAML-round-tripping others."""
-    lines = raw.splitlines(keepends=True)
-    retained: list[str] = []
-    index = 0
-    while index < len(lines):
-        if not _TOP_LEVEL_CAO_KEY.match(lines[index]):
-            retained.append(lines[index])
-            index += 1
-            continue
-        index += 1
-        while index < len(lines):
-            line = lines[index]
-            if not line.strip() or not line[0].isspace():
-                break
-            index += 1
-    return "".join(retained)
+def _remove_cao_block(raw: str) -> tuple[str, str]:
+    """Remove semantic top-level ``cao`` entries while preserving all other bytes."""
+    locations = locate_top_level_cao_blocks(raw)
+    retained = raw
+    for start, end in reversed(locations.spans):
+        retained = retained[:start] + retained[end:]
+    return retained, locations.indentation
 
 
-def _render_cao(key: str, cao: Mapping[str, Any], newline: str) -> str:
+def _render_cao(
+    key: str, cao: Mapping[str, Any], newline: str, *, indentation: str = ""
+) -> str:
     value = dict(cao)
     value["key"] = key
     value["managed"] = True
@@ -228,7 +224,10 @@ def _render_cao(key: str, cao: Mapping[str, Any], newline: str) -> str:
         default_flow_style=False,
         sort_keys=False,
     )
-    return str(rendered.replace("\n", newline))
+    return "".join(
+        f"{indentation}{line}" if line else line
+        for line in str(rendered.replace("\n", newline)).splitlines(keepends=True)
+    )
 
 
 def _check_secret_gate(body: str, rendered_cao: str, binding: VaultBinding) -> None:

@@ -17,7 +17,7 @@ import yaml
 from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
 from cli_agent_orchestrator.services.vault import writer
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
-from cli_agent_orchestrator.services.vault.parser import split_frontmatter
+from cli_agent_orchestrator.services.vault.parser import parse_note, split_frontmatter
 from test.fixtures.vault_factory import build_vault_fixture
 
 
@@ -121,15 +121,6 @@ def test_write_preserves_bom_crlf_and_unusual_user_frontmatter_bytes(tmp_path) -
         "valid_yaml",
     ),
     [
-        (
-            "",
-            "\n",
-            "title: keep\n---abc\n----\n",
-            "cao:\n  key: old-key\n",
-            "title: keep\n---abc\n----\n",
-            "new body\n",
-            False,
-        ),
         (
             "",
             "\n",
@@ -239,6 +230,44 @@ def test_writer_output_round_trips_through_shared_frontmatter_boundary(
     assert target.read_bytes() == written.encode("utf-8")
 
 
+@pytest.mark.parametrize(
+    "user_frontmatter",
+    [
+        'desc: "one\\ncao: fake\\nend"\ntitle: keep\n',
+        "items: [\ncao: not-really,\nother]\ntitle: keep\n",
+        "m: {\ncao: inner,\nz: 1,\n}\ntitle: keep\n",
+        "  cao:\n    key: stale\n  title: keep\n",
+        'desc: "one\x85cao: fake\x85end"\ntitle: keep\n',
+        'desc: "one\u2028cao: fake\u2028end"\ntitle: keep\n',
+        'desc: "one\u2029cao: fake\u2029end"\ntitle: keep\n',
+        "? cao\n: \n  key: stale\ntitle: keep\n",
+        "!!str cao:\n  key: stale\ntitle: keep\n",
+    ],
+)
+def test_write_preserves_every_non_cao_frontmatter_value(
+    tmp_path, user_frontmatter
+) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    target = fixture.root / "CAO" / "managed-note.md"
+    original = f"---\n{user_frontmatter}---\nold body\n"
+    parsed_before = parse_note(
+        original, max_frontmatter_bytes=8192, secret_gate="reject"
+    )
+    assert parsed_before.finding_code is None
+    user_values_before = dict(parsed_before.frontmatter)
+    user_values_before.pop("cao", None)
+    target.write_text(original, encoding="utf-8")
+
+    _write(fixture, expected_content_sha256=writer._sha256(original))
+
+    written = target.read_text(encoding="utf-8")
+    parsed_after = parse_note(written, max_frontmatter_bytes=8192, secret_gate="reject")
+    assert parsed_after.finding_code is None
+    user_values_after = dict(parsed_after.frontmatter)
+    user_values_after.pop("cao", None)
+    assert user_values_after == user_values_before
+
+
 def test_writer_never_second_guesses_shared_frontmatter_newline() -> None:
     source = Path(writer.__file__).read_text(encoding="utf-8")
 
@@ -296,9 +325,14 @@ def test_write_uses_complete_line_frontmatter_fence(tmp_path) -> None:
     original = "---\n" + user_frontmatter + "cao:\n  key: old-key\n---\nbody\n"
     target.write_text(original, encoding="utf-8")
 
-    _write(fixture, expected_content_sha256=writer._sha256(original))
+    with pytest.raises(writer.VaultWriteConflictError) as caught:
+        _write(fixture, expected_content_sha256=writer._sha256(original))
 
-    assert user_frontmatter in target.read_text(encoding="utf-8")
+    assert str(caught.value) == (
+        f"vault note changed at {str(target)!r}; "
+        "run `cao memory vault reconcile --apply` before writing"
+    )
+    assert target.read_text(encoding="utf-8") == original
 
 
 def test_write_rejects_secret_rendered_in_cao_frontmatter(tmp_path) -> None:
