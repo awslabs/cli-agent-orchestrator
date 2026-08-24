@@ -448,6 +448,14 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::MemoryLint => None,
         CommandId::MemoryPromote => None,
         CommandId::MemoryRepair => None,
+        // HIDE: U11-A vault maintenance commands intentionally have no TUI route or MCP
+        // equivalent. A rescan may read a curator's files, so only an operator-selected CLI
+        // invocation can trigger it. U11-B may add a read-only status endpoint separately.
+        CommandId::MemoryVaultMigrate => None,
+        CommandId::MemoryVaultRebuild => None,
+        CommandId::MemoryVaultReconcile => None,
+        CommandId::MemoryVaultScan => None,
+        CommandId::MemoryVaultStatus => None,
 
         // ── `cao profile *` ──────────────────────────────────────────────────────────────
         CommandId::ProfileList => plain(Method::Get, "/agents/profiles"),
@@ -2659,7 +2667,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 27 HIDE = 69; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 32 HIDE = 74; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

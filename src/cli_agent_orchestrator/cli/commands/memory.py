@@ -1,6 +1,8 @@
 """Memory commands for CLI Agent Orchestrator CLI."""
 
 import asyncio
+import dataclasses
+import json
 import os
 import re
 from pathlib import Path
@@ -94,6 +96,216 @@ def repair_cmd(do_apply):
     render_report(report)
     if report.has_unresolved:
         raise click.exceptions.Exit(1)
+
+
+def _vault_config():
+    """Load the configured release-one vault or fail with a CLI-visible error."""
+    from cli_agent_orchestrator.services.settings_service import get_vault_config
+
+    try:
+        config = get_vault_config()
+    except Exception as exc:
+        raise click.ClickException(f"vault configuration unavailable: {exc}") from exc
+    if not config.enabled:
+        raise click.ClickException("memory vault is disabled by configuration")
+    if not config.vaults:
+        raise click.ClickException("memory vault has no configured vault")
+    return config
+
+
+def _configured_vault():
+    """Return the sole release-one vault after checking configuration."""
+    config = _vault_config()
+    return config, config.vaults[0]
+
+
+def _vault_scope_binding(scope: str, scope_id: str | None):
+    """Resolve a configured writable vault mapping for migration."""
+    from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+    config, vault = _configured_vault()
+    binding = resolve(scope, scope_id, vault_config=config)
+    if not isinstance(binding, VaultBinding):
+        raise click.ClickException(
+            f"scope '{scope}' is not mapped to a configured vault; migration requires a vault binding"
+        )
+    if binding.vault_id != vault.id:
+        raise click.ClickException(f"scope '{scope}' resolved to an unexpected vault binding")
+    if not binding.writable:
+        raise click.ClickException(f"scope '{scope}' vault mapping is not writable")
+    return vault, binding
+
+
+def _render_vault_payload(value, out_format: str) -> None:
+    """Render content-free vault operation results consistently."""
+    payload = dataclasses.asdict(value)
+    if out_format == "json":
+        click.echo(json.dumps(payload, indent=2, default=str, sort_keys=True))
+        return
+    for key, item in payload.items():
+        if isinstance(item, list):
+            item = ", ".join(f"{name}={count}" for name, count in item) if item else "-"
+        click.echo(f"{key}: {item}")
+
+
+@memory.group(name="vault")
+def vault():
+    """Inspect and maintain the configured Obsidian vault."""
+
+
+@vault.command(name="status")
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+)
+def vault_status(out_format):
+    """Show durable vault projection status and configuration warnings."""
+    from cli_agent_orchestrator.services.vault.status import get_vault_status
+
+    config = _vault_config()
+    for item in get_vault_status(config):
+        payload = dataclasses.asdict(item)
+        # A CLI invocation is a fresh process. Do not present this observation
+        # as durable status retained from earlier processes.
+        payload["process_local_unmapped_project_writes"] = "process-local; unavailable in a fresh CLI process"
+        if out_format == "json":
+            click.echo(json.dumps(payload, indent=2, sort_keys=True))
+            continue
+        click.echo(f"vault_id: {payload['vault_id']}")
+        for name in ("status_counts", "finding_counts", "recall_counters"):
+            counts = payload[name]
+            click.echo(f"{name}: " + (", ".join(f"{key}={value}" for key, value in counts) or "-"))
+        for warning in payload["warnings"]:
+            click.echo(f"warning: {warning}")
+        click.echo(
+            "process_local_unmapped_project_writes: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+
+
+@vault.command(name="scan")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Accepted for explicit review workflows; scan is always read-only.",
+)
+def vault_scan(dry_run):
+    """Scan configured vault notes without changing files or derived rows."""
+    from cli_agent_orchestrator.services.vault.scan import scan_vault
+
+    _config, configured_vault = _configured_vault()
+    report = scan_vault(configured_vault)
+    click.echo(
+        f"Scanned {len(report.notes)} note(s); {report.total_bytes_scanned} bytes "
+        f"(limit {report.max_total_bytes})."
+    )
+    for note in report.notes:
+        click.echo(f"{note.status}: {note.vault_relpath}")
+
+
+@vault.command(name="reconcile")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Apply the derived-state projection. The default is a dry-run.",
+)
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+)
+def vault_reconcile(do_apply, out_format):
+    """Reconcile scanned vault notes into derived state."""
+    from cli_agent_orchestrator.services.vault.reconcile import reconcile
+
+    _config, configured_vault = _configured_vault()
+    _render_vault_payload(reconcile(configured_vault, apply=do_apply), out_format)
+
+
+@vault.command(name="rebuild")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Required: delete and re-derive vault state, resetting vault access counts.",
+)
+def vault_rebuild(do_apply):
+    """Delete and re-derive vault state; vault access counts reset by design."""
+    from cli_agent_orchestrator.services.vault.reconcile import rebuild
+
+    if not do_apply:
+        raise click.ClickException(
+            "--apply is required because vault rebuild deletes and re-derives derived state"
+        )
+    _config, configured_vault = _configured_vault()
+    _render_vault_payload(rebuild(configured_vault), "table")
+
+
+@vault.command(name="migrate")
+@click.option(
+    "--scope",
+    type=click.Choice(["global", "project", "agent"], case_sensitive=False),
+    required=True,
+    help="Native memory scope to migrate.",
+)
+@click.option("--scope-id", default=None, help="Explicit scope identifier for project or agent.")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Write managed notes. The default is a dry-run report.",
+)
+@click.option(
+    "--delete-source",
+    is_flag=True,
+    default=False,
+    help="Delete native source after a successful migration; requires both confirmation flags.",
+)
+@click.option(
+    "--confirm-delete-source",
+    is_flag=True,
+    default=False,
+    help="Second confirmation required with --delete-source.",
+)
+def vault_migrate(scope, scope_id, do_apply, delete_source, confirm_delete_source):
+    """Migrate native memories into a managed vault folder, dry-run by default."""
+    from cli_agent_orchestrator.services.vault.migrate import migrate_scope
+
+    if delete_source and not do_apply:
+        raise click.ClickException("--delete-source requires --apply")
+    if delete_source and not confirm_delete_source:
+        raise click.ClickException("--delete-source requires --confirm-delete-source")
+
+    service = _get_memory_service()
+    if scope != MemoryScope.GLOBAL.value and scope_id is None:
+        scope_id = service.resolve_scope_id(scope, _cwd_context())
+        if scope_id is None:
+            raise click.ClickException(f"could not resolve scope_id for scope '{scope}'")
+    if scope == MemoryScope.GLOBAL.value and scope_id is not None:
+        raise click.ClickException("--scope-id is not allowed with --scope global")
+
+    configured_vault, binding = _vault_scope_binding(scope, scope_id)
+    report = migrate_scope(
+        service,
+        configured_vault,
+        binding,
+        scope=scope,
+        scope_id=scope_id,
+        apply=do_apply,
+        delete_source=delete_source,
+        confirm_delete_source=confirm_delete_source,
+    )
+    _render_vault_payload(report, "table")
 
 
 @memory.command(name="list")
