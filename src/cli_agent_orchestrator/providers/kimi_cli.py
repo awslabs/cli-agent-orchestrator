@@ -11,7 +11,10 @@ Key characteristics:
 - Thinking output: Gray italic ``•`` bullets (ANSI color 38;5;244 + italic)
 - User input: Displayed in a bordered box using box-drawing characters (╭│╰)
 - Auto-approve: ``--yolo`` flag bypasses all tool action confirmations
-- Agent profiles: ``--agent-file FILE`` (YAML format, extends built-in 'default' agent)
+- Agent profiles: ``--agent-file FILE``. Legacy kimi-cli expects a YAML file
+  (extends built-in 'default' agent via ``system_prompt_path``); Kimi Code CLI
+  (MoonshotAI/kimi-code) expects a Markdown file with YAML frontmatter. The
+  installed variant is auto-detected from ``kimi --help``.
 - MCP config: ``--mcp-config TEXT`` (JSON configuration, repeatable flag)
 - Exit commands: ``/exit``, ``exit``, ``quit``, or Ctrl-D
 - Status bar: ``HH:MM [yolo] agent (model, thinking) ctrl-x: toggle mode context: X.X%``
@@ -33,6 +36,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -200,6 +204,10 @@ class KimiCliProvider(BaseProvider):
     # the config file causes race conditions and file corruption.
     _mcp_timeout_configured = False
 
+    # Class-level cache for the --agent-file format probe (one subprocess call
+    # per process, shared by concurrent provider instances).
+    _markdown_agent_file_cache: Optional[bool] = None
+
     # Class-level prompt regex shared between status detection
     # and ``extract_session_context``. Bounded quantifiers
     # (no unbounded ``*`` / ``+`` — defeats ReDoS on pathological pane bytes).
@@ -284,6 +292,31 @@ class KimiCliProvider(BaseProvider):
         except Exception:
             return None
 
+    @classmethod
+    def _agent_file_uses_markdown(cls) -> bool:
+        """Return True when the installed ``kimi`` binary is Kimi Code CLI.
+
+        Kimi Code CLI (MoonshotAI/kimi-code, successor of the wound-down
+        kimi-cli) expects ``--agent-file`` to be a Markdown agent definition
+        (YAML frontmatter + body as system prompt) and rejects the legacy YAML
+        format with "Missing frontmatter". Legacy kimi-cli expects the YAML
+        ``system_prompt_path`` format. Probed once per process from
+        ``kimi --help``: kimi-code's help describes ``--agent-file`` as loading
+        "from a Markdown file". Falls back to the legacy YAML format when the
+        probe fails, preserving pre-existing behavior.
+        """
+        if cls._markdown_agent_file_cache is None:
+            try:
+                result = subprocess.run(
+                    ["kimi", "--help"], capture_output=True, text=True, timeout=10
+                )
+                cls._markdown_agent_file_cache = "Markdown file" in (
+                    result.stdout + result.stderr
+                )
+            except (OSError, subprocess.SubprocessError):
+                cls._markdown_agent_file_cache = False
+        return cls._markdown_agent_file_cache
+
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
 
@@ -345,23 +378,48 @@ class KimiCliProvider(BaseProvider):
                     system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
                 if system_prompt:
-                    # Write the system prompt as a markdown file
-                    prompt_file = os.path.join(self._temp_dir, "system.md")
-                    with open(prompt_file, "w") as f:
-                        f.write(system_prompt)
+                    if self._agent_file_uses_markdown():
+                        # Kimi Code CLI: --agent-file is a Markdown agent
+                        # definition — YAML frontmatter (name/description)
+                        # with the body as the system prompt. json.dumps
+                        # yields valid YAML scalars, so no PyYAML dependency
+                        # is needed for quoting.
+                        # kimi-code validates the frontmatter name as
+                        # kebab-case (e.g. "code-reviewer"); CAO profile
+                        # names are snake_case, so normalize.
+                        raw_name = getattr(profile, "name", None) or "cao-agent"
+                        name = re.sub(r"[^a-z0-9]+", "-", str(raw_name).lower()).strip("-")
+                        name = name or "cao-agent"
+                        description = (
+                            getattr(profile, "description", None) or "CAO-managed agent"
+                        )
+                        header = (
+                            "---\n"
+                            f"name: {json.dumps(name)}\n"
+                            f"description: {json.dumps(description)}\n"
+                            "---\n\n"
+                        )
+                        agent_file = os.path.join(self._temp_dir, "agent.md")
+                        with open(agent_file, "w") as f:
+                            f.write(header + system_prompt)
+                    else:
+                        # Legacy kimi-cli: YAML agent file that extends the
+                        # default agent and points to a separate markdown
+                        # system prompt. Plain strings avoid a PyYAML
+                        # dependency.
+                        prompt_file = os.path.join(self._temp_dir, "system.md")
+                        with open(prompt_file, "w") as f:
+                            f.write(system_prompt)
 
-                    # Create the agent YAML that extends the default agent
-                    # and points to our custom system prompt file.
-                    # Written as plain string to avoid adding PyYAML dependency.
-                    agent_yaml = (
-                        "version: 1\n"
-                        "agent:\n"
-                        "  extend: default\n"
-                        "  system_prompt_path: ./system.md\n"
-                    )
-                    agent_file = os.path.join(self._temp_dir, "agent.yaml")
-                    with open(agent_file, "w") as f:
-                        f.write(agent_yaml)
+                        agent_yaml = (
+                            "version: 1\n"
+                            "agent:\n"
+                            "  extend: default\n"
+                            "  system_prompt_path: ./system.md\n"
+                        )
+                        agent_file = os.path.join(self._temp_dir, "agent.yaml")
+                        with open(agent_file, "w") as f:
+                            f.write(agent_yaml)
 
                     command_parts.extend(["--agent-file", agent_file])
 
