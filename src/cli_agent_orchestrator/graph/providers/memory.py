@@ -21,6 +21,10 @@ from cli_agent_orchestrator.services.vault.binding import (
     VaultBinding,
     VaultConfigUnavailableError,
 )
+from cli_agent_orchestrator.services.vault.reader import (
+    NO_REQUESTER_IDENTITY,
+    resolve_candidates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,10 +110,10 @@ class MemoryGraphProvider(GraphProvider):
                     "disabled_enrichments": _LINT_ENRICHMENTS,
                 }
             )
+        resolved_binding: ScopeBinding | None = None
         try:
-            vault_bound = lint_enabled and isinstance(
-                self._binding_resolver(scope, scope_id), VaultBinding
-            )
+            resolved_binding = self._binding_resolver(scope, scope_id)
+            vault_bound = isinstance(resolved_binding, VaultBinding)
         except VaultConfigUnavailableError:
             # Graph projection is derived observability, not a vault enforcement
             # path. An unavailable optional vault config must not hide native
@@ -126,34 +130,57 @@ class MemoryGraphProvider(GraphProvider):
                 }
             )
 
-        # Resolve + parse the scope's index. A scope with no wiki on disk
-        # (or an unresolvable scope/scope_id) is an empty graph, not an error.
-        try:
-            index_path = self._svc.get_index_path(scope, scope_id)
-        except ValueError:
-            return GraphView(nodes=[], edges=[], meta=meta)
-        if not index_path.exists():
-            return GraphView(nodes=[], edges=[], meta=meta)
-        try:
-            entries = self._svc._parse_index(index_path)
-        except OSError:
-            return GraphView(nodes=[], edges=[], meta=meta)
-
-        # session/agent indexes are shared per container with scope_id
-        # encoded in each entry's path; project/global indexes are already
-        # per-container, so their entries carry no scope_id.
         keys: list[str] = []
-        seen: set[str] = set()
-        for entry in entries:
-            if entry["scope"] != scope:
-                continue
-            if scope in ("session", "agent") and entry["scope_id"] != scope_id:
-                continue
-            if entry["key"] not in seen:
-                seen.add(entry["key"])
-                keys.append(entry["key"])
+        nodes: dict[str, Node] = {}
+        if vault_bound:
+            # This is metadata-only: resolve_candidates enforces indexed status
+            # and policy eligibility without reading note bytes. Graph projection
+            # must never call load_candidate, the vault content read sink.
+            assert isinstance(resolved_binding, VaultBinding)
+            candidates = resolve_candidates(
+                resolved_binding,
+                scope=scope,
+                scope_id=scope_id,
+                require_injectable=False,
+                terminal_id=NO_REQUESTER_IDENTITY,
+                consumer="explicit_recall",
+            )
+            if any(
+                resolution.exit_arm == "curator_agent_scope_refused"
+                for resolution in candidates.resolutions
+            ):
+                meta["agent_scope_omitted"] = True
+            for candidate in candidates:
+                key = candidate.metadata.key
+                keys.append(key)
+                nodes[key] = Node(id=key, kind="topic", label=key, attrs={"is_vault": True})
+        else:
+            # Resolve + parse the native scope's index. A scope with no wiki on
+            # disk (or an unresolvable scope/scope_id) is an empty graph.
+            try:
+                index_path = self._svc.get_index_path(scope, scope_id)
+            except ValueError:
+                return GraphView(nodes=[], edges=[], meta=meta)
+            if not index_path.exists():
+                return GraphView(nodes=[], edges=[], meta=meta)
+            try:
+                entries = self._svc._parse_index(index_path)
+            except OSError:
+                return GraphView(nodes=[], edges=[], meta=meta)
 
-        nodes: dict[str, Node] = {key: Node(id=key, kind="topic", label=key) for key in keys}
+            # session/agent indexes are shared per container with scope_id
+            # encoded in each entry's path; project/global indexes are already
+            # per-container, so their entries carry no scope_id.
+            seen: set[str] = set()
+            for entry in entries:
+                if entry["scope"] != scope:
+                    continue
+                if scope in ("session", "agent") and entry["scope_id"] != scope_id:
+                    continue
+                if entry["key"] not in seen:
+                    seen.add(entry["key"])
+                    keys.append(entry["key"])
+            nodes = {key: Node(id=key, kind="topic", label=key) for key in keys}
         edges: list[Edge] = []
 
         # Typed relationship edges from the STORE (issue #511, FR-4.3). The

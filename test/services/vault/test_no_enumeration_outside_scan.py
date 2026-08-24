@@ -236,10 +236,16 @@ def test_vault_candidate_consumers_stay_behind_memory_service_boundary():
                     parent, (ast.FunctionDef, ast.AsyncFunctionDef)
                 ):
                     parent = parents[parent]
-                if (
-                    path.name != "memory_service.py"
-                    or getattr(parent, "name", None) not in allowed_resolver_functions
-                ):
+                allowed_memory_service_call = (
+                    path.name == "memory_service.py"
+                    and getattr(parent, "name", None) in allowed_resolver_functions
+                )
+                allowed_graph_projection = (
+                    path.name == "memory.py"
+                    and path.parent.name == "providers"
+                    and getattr(parent, "name", None) == "_build"
+                )
+                if not (allowed_memory_service_call or allowed_graph_projection):
                     violations.append(f"{path.name}:{node.lineno}")
             if name == "load_candidate" and path.name not in {"reader.py", "memory_service.py"}:
                 violations.append(f"{path.name}:{node.lineno}")
@@ -252,6 +258,22 @@ def test_vault_candidate_consumers_stay_behind_memory_service_boundary():
 
     assert violations == []
     assert consumer_violations == []
+
+
+def test_graph_provider_never_reads_vault_candidate_content():
+    """U9 projects candidate metadata only; reader.py remains the sole content sink."""
+    path = SOURCE_ROOT / "graph" / "providers" / "memory.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    calls = [
+        f"memory.py:{node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "load_candidate")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "load_candidate")
+        )
+    ]
+    assert calls == []
 
 
 def test_production_vault_policy_instances_are_resolver_owned():

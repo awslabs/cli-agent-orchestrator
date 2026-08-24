@@ -201,6 +201,31 @@ class TestMemoryProviderHappyPath:
     async def test_resolvable_from_registry(self):
         assert isinstance(get_provider("memory"), MemoryGraphProvider)
 
+    @pytest.mark.asyncio
+    async def test_graph_attributes_do_not_expose_paths(self, populated_scope, monkeypatch):
+        """Node and edge attrs are flags/provenance, never vault path data."""
+        _disable_llm(monkeypatch)
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        view = await provider.project(scope="global")
+
+        def values(value):
+            if isinstance(value, dict):
+                for child in value.values():
+                    yield from values(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    yield from values(child)
+            else:
+                yield value
+
+        for item in [*view.nodes, *view.edges]:
+            for value in values(item.attrs):
+                if isinstance(value, str):
+                    assert "/" not in value
+                    assert "\\" not in value
+                    assert not value.endswith(".md")
+
 
 class TestMemoryProviderEdgeCases:
     @pytest.mark.asyncio

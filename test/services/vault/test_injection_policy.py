@@ -25,6 +25,7 @@ from cli_agent_orchestrator.services.vault.binding import (
     resolve,
 )
 from cli_agent_orchestrator.services.vault.reader import (
+    NO_REQUESTER_IDENTITY,
     VaultCandidate,
     VaultInjectionPolicy,
     load_candidate,
@@ -535,6 +536,29 @@ def test_agent_scoped_mapping_is_not_recallable_without_a_confirmed_non_curator(
     assert warning.detail == (
         "agent-scoped mapping 'Injectable' is recall-only and is not injected in this release"
     )
+
+
+def test_identityless_server_projection_suppresses_ambient_terminal_identity(tmp_path, monkeypatch):
+    """The graph sentinel must not inherit a contradictory process terminal."""
+    from test.services.vault.test_vault_injection_renderer import _injectable_renderer
+
+    _service, _session_factory, _vault_root, config = _injectable_renderer(tmp_path, monkeypatch)
+    binding = resolve("agent", "fixture-agent", vault_config=config)
+    assert isinstance(binding, VaultBinding)
+    monkeypatch.setenv("CAO_TERMINAL_ID", "missing-terminal")
+
+    result = resolve_candidates(
+        binding,
+        scope="agent",
+        scope_id="fixture-agent",
+        require_injectable=False,
+        terminal_id=NO_REQUESTER_IDENTITY,
+        consumer="explicit_recall",
+    )
+
+    assert result == []
+    assert result.policy_arm == "no_terminal"
+    assert result.exit_arm == "curator_agent_scope_refused"
 
 
 def test_curator_refuses_indexed_agent_mapping_before_it_reaches_worker_context(

@@ -30,6 +30,15 @@ MEMORY_MANAGER_POLICY_ARM = "memory_manager"
 logger = logging.getLogger(__name__)
 
 
+class _NoRequesterIdentity:
+    """Marker for server projections that have no requester terminal."""
+
+
+# A server projection must not inherit the process's ambient terminal identity.
+NO_REQUESTER_IDENTITY = _NoRequesterIdentity()
+RequesterIdentity = Optional[str] | _NoRequesterIdentity
+
+
 @dataclass(frozen=True)
 class VaultCandidate:
     """An indexed vault row. Paths remain internal to this read boundary."""
@@ -112,7 +121,7 @@ def resolve_candidates(
     scope: str,
     scope_id: Optional[str],
     require_injectable: bool,
-    terminal_id: Optional[str],
+    terminal_id: RequesterIdentity,
     consumer: Literal["injected_context", "explicit_recall"],
     policy: Optional[VaultInjectionPolicy] = None,
 ) -> VaultCandidateResolution:
@@ -197,12 +206,13 @@ def _resolve_injection_policy(
     require_injectable: bool,
     *,
     consumer: Literal["injected_context", "explicit_recall"],
-    terminal_id: Optional[str],
+    terminal_id: RequesterIdentity,
 ) -> VaultInjectionPolicy:
     """Combine a caller's request with the requesting terminal's policy."""
     effective_require_injectable = consumer != "explicit_recall" or require_injectable
-    ambient_terminal_id = os.environ.get("CAO_TERMINAL_ID")
-    requester_terminal_id = terminal_id or ambient_terminal_id
+    identityless_projection = terminal_id is NO_REQUESTER_IDENTITY
+    ambient_terminal_id = None if identityless_projection else os.environ.get("CAO_TERMINAL_ID")
+    requester_terminal_id = None if identityless_projection else terminal_id or ambient_terminal_id
     if not requester_terminal_id:
         policy = VaultInjectionPolicy(effective_require_injectable, "no_terminal", None)
     else:
@@ -221,7 +231,12 @@ def _resolve_injection_policy(
                 policy = VaultInjectionPolicy(True, MEMORY_MANAGER_POLICY_ARM, True)
             else:
                 policy = VaultInjectionPolicy(effective_require_injectable, "caller", False)
-    _log_identity_anomaly(policy, terminal_id, ambient_terminal_id, requester_terminal_id)
+    _log_identity_anomaly(
+        policy,
+        terminal_id if isinstance(terminal_id, str) else None,
+        ambient_terminal_id,
+        requester_terminal_id,
+    )
     return policy
 
 
