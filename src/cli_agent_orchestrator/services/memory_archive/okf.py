@@ -130,6 +130,10 @@ class OkfArchiveBackend(MemoryArchiveBackend):
         MemoryScope(scope)  # narrow ValueError on unknown scope
         if scope == MemoryScope.PROJECT.value and not scope_id:
             raise ValueError("project-scope export requires a scope_id (resolved project id)")
+        from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+        if isinstance(resolve(scope, scope_id), VaultBinding):
+            raise ValueError("vault-bound scopes cannot be exported as native OKF bundles")
 
         dest_real = Path(
             resolve_and_validate_path(

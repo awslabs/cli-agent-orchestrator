@@ -380,13 +380,52 @@ def test_binding_aware_query_helpers_default_to_native_without_call_site_changes
             while not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 current = parents[current]
             kwonly_names = {argument.arg for argument in current.args.kwonlyargs}
-            # A source-aware wrapper may only forward its own keyword-only
-            # value. Literal or unrelated overrides would weaken the native
-            # default at an existing call site.
+            # A source-aware wrapper may forward its own keyword-only value.
+            # A backend-matched consumer may instead derive the value from the
+            # Memory row it is grouping. Literal or unrelated overrides would
+            # weaken the native default at an existing call site.
             assert len(source_kind_keywords) == 1
             assert isinstance(source_kind_keywords[0].value, ast.Name)
-            assert source_kind_keywords[0].value.id == "source_kind"
-            assert "source_kind" in kwonly_names
+            source_kind_name = source_kind_keywords[0].value.id
+            forwards_kwonly = (
+                source_kind_name == "source_kind" and "source_kind" in kwonly_names
+            )
+            derives_from_memory = any(
+                isinstance(assignment, (ast.Assign, ast.AnnAssign))
+                and source_kind_name
+                in {
+                    target.id
+                    for target in (
+                        assignment.targets
+                        if isinstance(assignment, ast.Assign)
+                        else [assignment.target]
+                    )
+                    if isinstance(target, ast.Name)
+                }
+                and (
+                    (
+                        isinstance(assignment.value, ast.Attribute)
+                        and assignment.value.attr == "source_kind"
+                    )
+                    or (
+                        isinstance(assignment.value, ast.Call)
+                        and isinstance(assignment.value.func, ast.Name)
+                        and assignment.value.func.id == "getattr"
+                        and len(assignment.value.args) >= 2
+                        and isinstance(assignment.value.args[1], ast.Constant)
+                        and assignment.value.args[1].value == "source_kind"
+                        and (
+                            len(assignment.value.args) < 3
+                            or (
+                                isinstance(assignment.value.args[2], ast.Constant)
+                                and assignment.value.args[2].value == "native"
+                            )
+                        )
+                    )
+                )
+                for assignment in ast.walk(current)
+            )
+            assert forwards_kwonly or derives_from_memory
 
     relationship_tree = ast.parse(
         Path("src/cli_agent_orchestrator/services/memory_relationship_service.py").read_text(

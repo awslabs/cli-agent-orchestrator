@@ -1029,6 +1029,11 @@ class MemorySummary(BaseModel):
     tags: str
     created_at: datetime
     updated_at: datetime
+    source_kind: str = "native"
+    source_path: Optional[str] = None
+    indexed_at: Optional[datetime] = None
+    index_freshness: Optional[str] = None
+    content_truncated: bool = False
 
 
 class MemoryDetail(MemorySummary):
@@ -6490,6 +6495,11 @@ def _to_memory_summary(mem, base_dir: Path) -> MemorySummary:
         tags=mem.tags,
         created_at=mem.created_at,
         updated_at=mem.updated_at,
+        source_kind=getattr(mem, "source_kind", "native"),
+        source_path=getattr(mem, "source_path", None),
+        indexed_at=getattr(mem, "indexed_at", None),
+        index_freshness=getattr(mem, "index_freshness", None),
+        content_truncated=bool(getattr(mem, "content_truncated", False)),
     )
 
 

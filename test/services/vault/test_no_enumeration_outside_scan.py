@@ -105,6 +105,55 @@ def test_reviewed_vault_files_own_every_nonempty_read_sink_set():
     assert violations == []
 
 
+def test_vault_candidate_chokepoint_requires_explicit_injection_policy():
+    """Every candidate load carries an explicit gate decision from the resolver."""
+    reader_path = SOURCE_ROOT / "services" / "vault" / "reader.py"
+    reader_tree = ast.parse(reader_path.read_text(encoding="utf-8"), filename=str(reader_path))
+    load_definition = next(
+        node
+        for node in ast.walk(reader_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "load_candidate"
+    )
+    require_parameter = next(
+        argument
+        for argument in load_definition.args.kwonlyargs
+        if argument.arg == "require_injectable"
+    )
+    assert require_parameter.arg == "require_injectable"
+    assert len(load_definition.args.kw_defaults) == len(load_definition.args.kwonlyargs)
+    assert load_definition.args.kw_defaults[
+        load_definition.args.kwonlyargs.index(require_parameter)
+    ] is None
+
+    call_sites: list[str] = []
+    violations: list[str] = []
+    candidate_constructors: list[str] = []
+    for path in SOURCE_ROOT.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Name) and node.func.id == "load_candidate")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "load_candidate")
+            ):
+                location = f"{path.name}:{node.lineno}"
+                call_sites.append(location)
+                if not any(
+                    keyword.arg == "require_injectable" for keyword in node.keywords
+                ):
+                    violations.append(location)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "VaultCandidate"
+                and path.name != "reader.py"
+            ):
+                candidate_constructors.append(f"{path.name}:{node.lineno}")
+
+    assert call_sites, "load_candidate call-site matcher must find consumers"
+    assert violations == []
+    assert candidate_constructors == []
+
+
 def _is_read_sink(node: ast.Call) -> bool:
     """Match all supported open/read forms, then subtract explicit write modes."""
     if isinstance(node.func, ast.Name):

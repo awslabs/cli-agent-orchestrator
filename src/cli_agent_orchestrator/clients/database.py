@@ -191,6 +191,16 @@ class VaultNoteAliasModel(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
+class VaultRecallCounterModel(Base):
+    """Durable, content-free operational counters for vault recall outcomes."""
+
+    __tablename__ = "vault_recall_counter"
+
+    vault_id = Column(String, primary_key=True)
+    counter_name = Column(String, primary_key=True)
+    value = Column(Integer, nullable=False, default=0, server_default="0")
+
+
 # Relationship-store sentinel: ``memory_relationships.scope_id`` is NOT NULL and
 # stores this value for global/federated scope. SQLite treats ``NULL != NULL``
 # in a UNIQUE index, so a nullable scope_id would make the dedup index (and thus

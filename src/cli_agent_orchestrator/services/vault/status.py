@@ -6,7 +6,12 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
 
-from cli_agent_orchestrator.clients.database import SessionLocal, VaultFindingModel, VaultNoteModel
+from cli_agent_orchestrator.clients.database import (
+    SessionLocal,
+    VaultFindingModel,
+    VaultNoteModel,
+    VaultRecallCounterModel,
+)
 from cli_agent_orchestrator.services.vault.binding import (
     collect_binding_warnings,
     unmapped_project_write_count,
@@ -26,6 +31,7 @@ class VaultStatus:
     finding_counts: tuple[tuple[str, int], ...]
     warnings: tuple[str, ...]
     process_local_unmapped_project_writes: int
+    recall_counters: tuple[tuple[str, int], ...] = ()
 
 
 def get_vault_status(
@@ -41,6 +47,11 @@ def get_vault_status(
             findings = (
                 db.query(VaultFindingModel).filter(VaultFindingModel.vault_id == vault.id).all()
             )
+            counters = (
+                db.query(VaultRecallCounterModel)
+                .filter(VaultRecallCounterModel.vault_id == vault.id)
+                .all()
+            )
             warnings = list(config.warnings)
             warnings.extend(warning.detail for warning in collect_binding_warnings(config))
             statuses.append(
@@ -50,6 +61,7 @@ def get_vault_status(
                     tuple(sorted(Counter(finding.code for finding in findings).items())),
                     tuple(dict.fromkeys(warnings)),
                     unmapped_project_write_count(),
+                    tuple(sorted((counter.counter_name, counter.value) for counter in counters)),
                 )
             )
     return tuple(statuses)

@@ -25,6 +25,13 @@ from cli_agent_orchestrator.services.memory_format import (
     normalize_memory_tags,
     parse_index_entry,
 )
+from cli_agent_orchestrator.services.vault.binding import VaultBinding
+from cli_agent_orchestrator.services.vault.reader import (
+    VaultCandidate,
+    increment_counter,
+    load_candidate,
+    resolve_candidates,
+)
 from cli_agent_orchestrator.utils.path_validation import (
     safe_join_under_base,
     validate_path_component,
@@ -1683,9 +1690,10 @@ class MemoryService:
         store_lookups: dict = {}
         for (g_scope, g_scope_id), members in groups.items():
             member_keys = [m.key for m in members]
+            source_kind = getattr(members[0], "source_kind", "native")
             try:
                 legacy_lookups[(g_scope, g_scope_id)] = self._related_keys_lookup(
-                    member_keys, g_scope, g_scope_id
+                    member_keys, g_scope, g_scope_id, source_kind=source_kind
                 )
             except Exception as e:  # noqa: BLE001 — non-blocking
                 logger.debug(f"related_keys lookup failed for {g_scope}: {e}")
@@ -1718,12 +1726,49 @@ class MemoryService:
                 if rk in visited:
                     continue
                 visited.add(rk)
-                related_mem = self._load_related_memory(rk, primary.scope, primary_scope_id)
+                if getattr(primary, "source_kind", "native") == "vault":
+                    related_mem = self._load_related_vault_memory(
+                        rk, primary.scope, primary_scope_id
+                    )
+                else:
+                    related_mem = self._load_related_memory(rk, primary.scope, primary_scope_id)
                 if related_mem is None:
                     continue
                 related_mem.is_related = True
                 extras.append(related_mem)
         return primaries + extras
+
+    def _load_related_vault_memory(
+        self, key: str, scope: str, scope_id: Optional[str]
+    ) -> Optional[Memory]:
+        """Load one vault relationship target through the candidate chokepoint."""
+        try:
+            from cli_agent_orchestrator.services.settings_service import get_vault_config
+            from cli_agent_orchestrator.services.vault.binding import resolve
+
+            config = get_vault_config()
+            binding = resolve(scope, scope_id, vault_config=config)
+            if not isinstance(binding, VaultBinding):
+                return None
+            candidates = resolve_candidates(
+                binding,
+                keys=[key],
+                scope=scope,
+                scope_id=scope_id,
+                require_injectable=False,
+            )
+            return (
+                load_candidate(
+                    candidates[0],
+                    max_body_chars=config.max_recall_body_chars,
+                    require_injectable=False,
+                )
+                if candidates
+                else None
+            )
+        except Exception as exc:  # noqa: BLE001 -- missing related targets are silent
+            logger.debug("vault related-memory load skipped key=%s: %s", key, exc)
+            return None
 
     # -------------------------------------------------------------------------
     # Index maintenance
@@ -1982,6 +2027,9 @@ class MemoryService:
         query: Optional[str] = None,
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
+        *,
+        vault_candidates: Optional[list[VaultCandidate]] = None,
+        max_body_chars: int = 4096,
     ) -> list:
         """Apply sort mode, slice, then best-effort access bump.
 
@@ -2017,7 +2065,15 @@ class MemoryService:
                 # rows in different scopes never collide. No query / no
                 # rank_bm25 → empty map → degrades to recency+usage.
                 norm_bm25 = normalise_bm25_scores(
-                    self._bm25_relevance(query, results, terminal_context, scope, scan_all)
+                    self._bm25_relevance(
+                        query,
+                        results,
+                        terminal_context,
+                        scope,
+                        scan_all,
+                        vault_candidates=vault_candidates,
+                        max_body_chars=max_body_chars,
+                    )
                 )
                 composite = {
                     self._identity(m): score_memory(
@@ -2192,8 +2248,11 @@ class MemoryService:
         """Substring-match recall via index.md walk (Phase 1 path)."""
         results: list[Memory] = []
 
-        # Determine which project dirs to search
-        search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        # Determine native dirs and vault projections without enumerating vault
+        # directories on this read path.
+        search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+            scope, terminal_context, scan_all=scan_all
+        )
 
         # For session/agent scopes, all entries share the global
         # index. If the caller passes a terminal_context that resolves
@@ -2264,6 +2323,20 @@ class MemoryService:
                 if memory:
                     results.append(memory)
 
+        for candidate in self._vault_candidates(vault_bindings, require_injectable=False):
+            if memory_type and candidate.metadata.memory_type != memory_type:
+                continue
+            memory = load_candidate(
+                candidate, max_body_chars=max_body_chars, require_injectable=False
+            )
+            if memory is None:
+                continue
+            if query:
+                terms = query.lower().split()
+                if not all(term in memory.content.lower() for term in terms):
+                    continue
+            results.append(memory)
+
         # Sort by updated_at descending
         results.sort(key=lambda m: m.updated_at, reverse=True)
 
@@ -2279,6 +2352,76 @@ class MemoryService:
             results.sort(key=lambda m: (precedence.get(m.scope, 99), -m.updated_at.timestamp()))
 
         return results[:limit]
+
+    def _resolve_sources(
+        self,
+        scope: Optional[str],
+        terminal_context: Optional[dict],
+        *,
+        scan_all: bool,
+    ) -> tuple[list[Path], list[VaultBinding], int]:
+        """Resolve native search directories plus indexed vault bindings.
+
+        ``_get_search_dirs`` remains the native discovery implementation.  A
+        vault source is selected from configuration and then queried through
+        ``services.vault.reader``; it is never filesystem-enumerated here.
+        """
+        native_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        try:
+            from cli_agent_orchestrator.services.settings_service import get_vault_config
+            from cli_agent_orchestrator.services.vault.binding import resolve
+
+            config = get_vault_config()
+            if not config.enabled:
+                return native_dirs, [], config.max_recall_body_chars
+            if scope is not None:
+                scope_id = (
+                    self.resolve_scope_id(scope, terminal_context)
+                    if scope != MemoryScope.GLOBAL.value and terminal_context
+                    else None
+                )
+                binding = resolve(scope, scope_id, vault_config=config)
+                return (
+                    [] if isinstance(binding, VaultBinding) else native_dirs,
+                    [binding] if isinstance(binding, VaultBinding) else [],
+                    config.max_recall_body_chars,
+                )
+            bindings: list[VaultBinding] = []
+            for vault in config.vaults:
+                for mapping in vault.mappings:
+                    if not scan_all and mapping.scope not in {
+                        MemoryScope.GLOBAL.value,
+                        MemoryScope.PROJECT.value,
+                        MemoryScope.SESSION.value,
+                    }:
+                        continue
+                    binding = resolve(
+                        mapping.scope, mapping.scope_id, vault_config=config
+                    )
+                    if isinstance(binding, VaultBinding) and binding not in bindings:
+                        bindings.append(binding)
+            return native_dirs, bindings, config.max_recall_body_chars
+        except Exception as exc:  # configuration unavailability preserves native recall
+            logger.debug("vault recall sources unavailable: %s", exc)
+            return native_dirs, [], 4096
+
+    def _vault_candidates(
+        self,
+        bindings: list[VaultBinding],
+        *,
+        require_injectable: bool,
+    ) -> list[VaultCandidate]:
+        candidates: list[VaultCandidate] = []
+        for binding in bindings:
+            candidates.extend(
+                resolve_candidates(
+                    binding,
+                    scope=binding.scope,
+                    scope_id=binding.scope_id,
+                    require_injectable=require_injectable,
+                )
+            )
+        return candidates
 
     # -------------------------------------------------------------------------
     # BM25 fallback search
@@ -2296,6 +2439,9 @@ class MemoryService:
         terminal_context: Optional[dict],
         scope: Optional[str],
         scan_all: bool,
+        *,
+        vault_candidates: Optional[list[VaultCandidate]] = None,
+        max_body_chars: int = 4096,
     ) -> dict:
         """Raw BM25 score per memory identity for the score-mode lexical factor.
 
@@ -2331,7 +2477,15 @@ class MemoryService:
         # computed against the real document population, not just the matches.
         # A candidate-only corpus collapses when every candidate contains the
         # query term (df == N → negative IDF → all-zero).
-        search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        if vault_candidates is None:
+            search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+                scope, terminal_context, scan_all=scan_all
+            )
+            vault_candidates = self._vault_candidates(
+                vault_bindings, require_injectable=False
+            )
+        else:
+            search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
         wanted = {self._identity(m) for m in memories}
         identities: list[Optional[tuple]] = []  # parallel to corpus_tokens
         corpus_tokens: list[list[str]] = []
@@ -2366,6 +2520,15 @@ class MemoryService:
                 # (for IDF) but map to None so they're skipped on readback.
                 identity = (wiki_file.stem, file_scope, file_scope_id, "native")
                 identities.append(identity if identity in wanted else None)
+        for candidate in vault_candidates:
+            memory = load_candidate(
+                candidate, max_body_chars=max_body_chars, require_injectable=False
+            )
+            if memory is None:
+                continue
+            corpus_tokens.append(self._bm25_tokenize(memory.content))
+            identity = self._identity(memory)
+            identities.append(identity if identity in wanted else None)
 
         if not corpus_tokens:
             return {}
@@ -2393,6 +2556,9 @@ class MemoryService:
         exclude_keys: set,
         terminal_context: Optional[dict],
         scan_all: bool,
+        *,
+        vault_candidates: Optional[list[VaultCandidate]] = None,
+        max_body_chars: int = 4096,
     ) -> list[Memory]:
         """Rank wiki bodies by BM25 against ``query``.
 
@@ -2409,9 +2575,17 @@ class MemoryService:
         if not query_tokens:
             return []
 
-        search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        if vault_candidates is None:
+            search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+                scope, terminal_context, scan_all=scan_all
+            )
+            vault_candidates = self._vault_candidates(
+                vault_bindings, require_injectable=False
+            )
+        else:
+            search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
 
-        candidates: list[tuple[Path, dict]] = []
+        candidates: list[tuple[Optional[Path], dict]] = []
         seen: set[Path] = set()
         for project_dir in search_dirs:
             wiki_root = project_dir / "wiki"
@@ -2462,15 +2636,35 @@ class MemoryService:
                 }
                 candidates.append((wiki_file, entry))
 
-        if not candidates:
-            return []
-
         corpus_tokens: list[list[str]] = []
         contents: list[str] = []
         for wiki_file, _entry in candidates:
             text = wiki_file.read_text(encoding="utf-8")
             contents.append(text)
             corpus_tokens.append(self._bm25_tokenize(text))
+        vault_memories: dict[int, Memory] = {}
+        vault_indexes: set[int] = set()
+        for candidate in vault_candidates:
+            memory = load_candidate(
+                candidate, max_body_chars=max_body_chars, require_injectable=False
+            )
+            if memory is None:
+                continue
+            index = len(candidates)
+            vault_indexes.add(index)
+            candidates.append((None, {}))
+            contents.append(memory.content)
+            corpus_tokens.append(self._bm25_tokenize(memory.content))
+            # The full indexed scope supplies IDF. Filters apply only to
+            # returned candidates, never to the corpus population.
+            if (
+                (memory_type is None or candidate.metadata.memory_type == memory_type)
+                and candidate.metadata.key not in exclude_keys
+            ):
+                vault_memories[index] = memory
+
+        if not candidates:
+            return []
 
         bm25 = BM25Okapi(corpus_tokens)
         scores = bm25.get_scores(query_tokens)
@@ -2485,6 +2679,7 @@ class MemoryService:
                 (scores[i], i)
                 for i in range(len(candidates))
                 if query_token_set & set(corpus_tokens[i])
+                and (i not in vault_indexes or i in vault_memories)
             ),
             key=lambda x: x[0],
             reverse=True,
@@ -2492,7 +2687,11 @@ class MemoryService:
 
         results: list[Memory] = []
         for _score, idx in ranked:
+            if idx in vault_memories:
+                results.append(vault_memories[idx])
+                continue
             wiki_file, entry = candidates[idx]
+            assert wiki_file is not None
             memory = self._parse_wiki_file(wiki_file, contents[idx], entry)
             if memory:
                 results.append(memory)
@@ -2811,21 +3010,22 @@ class MemoryService:
             wiki_dir = project_dir / "wiki"
             wiki_resolved = os.path.realpath(str(wiki_dir))
             index_path = wiki_dir / "index.md"
-            if not index_path.exists():
-                continue
 
             scope_entries = []
-            for e in self._parse_index(index_path):
-                if e["scope"] != scope_val:
-                    continue
-                # Session/agent entries embed scope_id in the wiki path and
-                # share index.md with global, so the scope_id must match the
-                # caller's. Project entries already live in a per-project
-                # directory and global has no scope_id by design.
-                if scope_val in (MemoryScope.SESSION.value, MemoryScope.AGENT.value):
-                    if e.get("scope_id") != scope_id:
+            if index_path.exists():
+                for e in self._parse_index(index_path):
+                    if e["scope"] != scope_val:
                         continue
-                scope_entries.append(e)
+                    # Session/agent entries embed scope_id in the wiki path and
+                    # share index.md with global, so the scope_id must match the
+                    # caller's. Project entries already live in a per-project
+                    # directory and global has no scope_id by design.
+                    if scope_val in (MemoryScope.SESSION.value, MemoryScope.AGENT.value):
+                        if e.get("scope_id") != scope_id:
+                            continue
+                    scope_entries.append(e)
+            # U7 adds injectable vault candidates here. A missing native index
+            # must not skip this scope, because a vault-only mapping has none.
             scope_entries.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
 
             scope_memories: list[Memory] = []
@@ -2885,7 +3085,7 @@ class MemoryService:
                     related_added_total += 1
 
             scope_used_chars = 0
-            for mem in scope_memories:
+            for position, mem in enumerate(scope_memories):
                 tag = " [related]" if getattr(mem, "is_related", False) else ""
                 line = f"- [{mem.scope}] {mem.key}{tag}: {mem.content}"
                 line_len = len(line) + 1
@@ -2894,6 +3094,9 @@ class MemoryService:
                         # Never truncate mid-list for a related extra; skip
                         # it and try the next (possibly shorter) one.
                         continue
+                    self._record_vault_injection_clip(
+                        scope_val, scope_id, scope_memories[position:]
+                    )
                     break
                 lines.append(line)
                 scope_used_chars += line_len
@@ -2903,6 +3106,33 @@ class MemoryService:
 
         context = "## Context from CAO Memory\n" + "\n".join(lines)
         return f"<cao-memory>\n{context}\n</cao-memory>"
+
+    def _record_vault_injection_clip(
+        self, scope: str, scope_id: Optional[str], dropped: list[Memory]
+    ) -> None:
+        """Persist clip magnitude only when a vault-backed scope is affected."""
+        vault_dropped = [
+            memory for memory in dropped if getattr(memory, "source_kind", "native") == "vault"
+        ]
+        if not vault_dropped:
+            return
+        try:
+            from cli_agent_orchestrator.services.settings_service import get_vault_config
+            from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+            binding = resolve(scope, scope_id, vault_config=get_vault_config())
+            if not isinstance(binding, VaultBinding):
+                return
+            increment_counter(
+                binding.vault_id, "injection_budget_exceeded.scopes_clipped", 1
+            )
+            increment_counter(
+                binding.vault_id,
+                "injection_budget_exceeded.memories_dropped",
+                len(vault_dropped),
+            )
+        except Exception as exc:  # noqa: BLE001 -- counters never block injection
+            logger.debug("vault injection clip counter skipped: %s", exc)
 
     # -------------------------------------------------------------------------
     # U9 — Curated injection via context-manager agent
