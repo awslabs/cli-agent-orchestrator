@@ -5,9 +5,10 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 import uuid
-from typing import Callable, Dict, List, Optional, TypeVar
+from typing import Callable, Dict, FrozenSet, List, Optional, Tuple, TypeVar
 
 import libtmux
 from libtmux.pane import Pane
@@ -49,13 +50,316 @@ class TmuxLookupError(RuntimeError):
     deliberately NOT a subclass of ``ValueError``: an ``except ValueError``
     written for the not-found case must not swallow it.
 
+    ``session_exists_strict`` raises it for a SECOND, unrelated cause: a
+    ``list-sessions`` that tmux itself could not answer (an unreachable socket
+    whose server may still be alive, a permission error, an unrecognised
+    failure). Both causes mean the same thing to a caller — the answer is
+    UNKNOWN — which is why they share one type. Session teardown turns it into a
+    failed, re-runnable teardown with the registry left intact (#498), the
+    fail-CLOSED direction.
+
     Treat it as transient and retryable — ``TmuxClient`` already retries the
     read once before raising.
     """
 
 
+# ---------------------------------------------------------------------------
+# stderr classification for ``session_exists_strict``.
+#
+# WARNING: THE WORDING BELOW IS TMUX-VERSION-DEPENDENT. The same injected
+# failure does NOT produce the same message on every tmux: a socket path that is
+# a regular file yields "Socket operation on non-socket" (ENOTSOCK) on tmux 3.7b
+# but "no server running on <path>" (ECONNREFUSED) on tmux 3.2a. So do not grow
+# these tables from one version's observed output, and do not write tests around
+# a vector whose message tmux words ITSELF. The "error connecting to <path>
+# (<strerror>)" messages are worded by the kernel's errno and are the portable
+# ones. Wording we do not recognise raises, which is the safe direction.
+# ---------------------------------------------------------------------------
+
+# tmux got a definitive answer from the kernel ABOUT THE SOCKET PATH: the path
+# resolved and nothing is listening on it (ECONNREFUSED). No server on the socket
+# means no sessions on it, so this is a CONFIRMED absence. Treating it as an
+# error instead would strand registry rows left by a long-dead server forever —
+# ``delete_session`` would raise on every retry and never reconcile them.
+_NO_SERVER_STDERR_MARKERS = ("no server running",)
+
+# The socket path does not exist (ENOENT). On its own this is NOT an absence: a
+# tmux server keeps serving its socket after the PATH has been unlinked — the
+# classic cause is a tmp-cleaner / systemd-tmpfiles sweeping /tmp on a long-lived
+# host, and the recovery is ``kill -USR1 <server-pid>``, which makes the server
+# recreate the path. A never-created socket and an unlinked socket under a LIVE
+# server produce byte-identical stderr, so no string matching can separate them;
+# this marker is a confirmed absence only once ``_tmux_server_liveness`` says no
+# tmux server is bound to the path.
+_SOCKET_MISSING_STDERR_MARKERS = ("no such file or directory",)
+
+# "error connecting to /tmp/tmux-1000/default (No such file or directory)".
+# Greedy, anchored on the trailing "(<strerror>)", so socket paths that
+# themselves contain " (" still parse.
+_CONNECT_ERROR_PATH_PATTERN = re.compile(r"error connecting to (?P<path>.+) \([^()]*\)\s*$")
+
+# Verdicts of ``_tmux_server_liveness``. UNKNOWN must be treated exactly like
+# ALIVE by anything deciding whether a session can be declared gone.
+_SERVER_ALIVE = "alive"
+_SERVER_ABSENT = "absent"
+_SERVER_UNKNOWN = "unknown"
+
+# Which socket-table detector to prefer is a PLATFORM question, so it is read
+# from a named module constant rather than from ``sys.platform`` at the call site:
+# a test can then exercise another platform's ladder without mutating the real
+# ``sys`` for everything else running in the process.
+_HOST_PLATFORM = sys.platform
+
+# The kernel's AF_UNIX socket table. Linux-only; absence of it is "cannot tell".
+_PROC_NET_UNIX = "/proc/net/unix"
+
+# macOS/BSD equivalent. ``-U`` selects AF_UNIX sockets only; ``-F n`` prints one
+# field per line ("n<name>") so socket paths containing spaces survive, which
+# column splitting would not guarantee. Deliberately NO other flags: ``-b``
+# (avoid blocking kernel calls) suppresses the socket rows entirely on Linux lsof
+# 4.94, and ``-n``/``-P`` only affect internet sockets, which ``-U`` excludes.
+_LSOF_COMMAND = "lsof"
+_LSOF_ARGUMENTS = ("-U", "-F", "n")
+# lsof walks every process's descriptors, so on a busy host it is slow, and it
+# can block on a hung mount. Teardown must not hang behind it: this bound is the
+# whole reason the call is safe to make in that path. A timeout is "cannot tell"
+# from THIS detector, so the ladder simply moves on.
+_LSOF_TIMEOUT_SECONDS = 3.0
+_PROCESS_LIST_TIMEOUT_SECONDS = 5.0
+# Linux lsof decorates a unix socket's name with " type=STREAM" / " type=DGRAM";
+# macOS lsof does not. Stripped so both platforms yield the bare bound path.
+_LSOF_NAME_SUFFIX_PATTERN = re.compile(r"\s+type=\S+\s*$")
+
+
+def _connect_error_socket_path(stderr_lines: List[str]) -> Optional[str]:
+    """The socket path out of tmux's own "error connecting to ..." message.
+
+    Taken from tmux rather than re-derived from libtmux/``TMUX_TMPDIR``, so the
+    path we probe is exactly the one tmux failed to reach. ``None`` when no line
+    has that shape — the caller must then fail CLOSED, since a "no such file or
+    directory" from somewhere other than the connect (a missing config file, say)
+    says nothing about the server.
+    """
+    for line in stderr_lines:
+        match = _CONNECT_ERROR_PATH_PATTERN.search(line.strip())
+        if match:
+            return match.group("path")
+    return None
+
+
+def _bound_unix_socket_paths_via_proc() -> Optional[FrozenSet[str]]:
+    """Bound AF_UNIX socket paths from the kernel's own table (Linux).
+
+    Returns ``None`` when the table cannot be read — which is the NORMAL case off
+    Linux, where ``/proc/net/unix`` simply does not exist. ``None`` means "this
+    detector cannot tell", never "nothing is bound"; see
+    ``_bound_unix_socket_paths`` for how the ladder handles that.
+    """
+    try:
+        with open(_PROC_NET_UNIX, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+
+    paths = set()
+    # Columns: Num RefCount Protocol Flags Type St Inode Path. The path is the
+    # last column and is optional (unnamed sockets have none); maxsplit keeps
+    # paths containing spaces intact. Line 0 is the header.
+    for line in lines[1:]:
+        columns = line.rstrip("\n").split(None, 7)
+        if len(columns) == 8 and columns[7]:
+            paths.add(columns[7])
+    return frozenset(paths)
+
+
+def _bound_unix_socket_paths_via_lsof() -> Optional[FrozenSet[str]]:
+    """Bound AF_UNIX socket paths from ``lsof -U`` (macOS/BSD, and Linux backup).
+
+    ``None`` when lsof is missing, times out, or produces nothing parsable — all
+    "cannot tell", never "nothing is bound". In particular an EMPTY parse is
+    reported as ``None`` rather than as an empty set: a host with no named unix
+    socket anywhere is implausible, so an empty listing much more likely means
+    lsof failed, and reading it as "nothing is bound" would fail OPEN.
+
+    Like ``/proc/net/unix``, lsof keeps reporting the path after it has been
+    unlinked, because the report comes from the process's open descriptor rather
+    than from the filesystem. Verified on macOS by the reviewer of fixup 5 (lsof
+    still named an unlinked private tmux socket) and re-verified here on Linux
+    lsof 4.94.
+
+    Nonzero exit is NOT treated as failure on its own: lsof routinely exits 1
+    after warning about processes it could not fully inspect while still printing
+    a complete-enough listing. The parse result is what decides.
+    """
+    try:
+        result = subprocess.run(
+            [_LSOF_COMMAND, *_LSOF_ARGUMENTS],
+            capture_output=True,
+            text=True,
+            timeout=_LSOF_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # FileNotFoundError (no lsof) and TimeoutExpired both land here.
+        return None
+
+    paths = set()
+    for line in result.stdout.splitlines():
+        # "-F n" emits one field per line, tagged by its first character: "p"
+        # for the pid set, "n" for a name. Anything else is not a name.
+        if not line.startswith("n"):
+            continue
+        name = line[1:]
+        # Both forms, because the " type=STREAM" decoration is indistinguishable
+        # from a socket path that genuinely ends that way. Keeping the undecorated
+        # name as well means such a path still matches; the extra string can only
+        # ever produce a spurious ALIVE, which is the fail-CLOSED direction.
+        for candidate in (name, _LSOF_NAME_SUFFIX_PATTERN.sub("", name)):
+            # Unnamed sockets render as "type=STREAM" alone, and lsof uses
+            # "->0x..." / "socket" placeholders; only absolute paths are usable.
+            if candidate.startswith("/"):
+                paths.add(candidate)
+    return frozenset(paths) or None
+
+
+# The socket-table detectors, in the order they should be tried, per platform.
+# Split out as a named seam so the non-Linux ladder is exercisable from a Linux
+# test (and vice versa) instead of only on the platform that selects it.
+def _socket_table_detectors(
+    platform_name: Optional[str] = None,
+) -> Tuple[Callable[[], Optional[FrozenSet[str]]], ...]:
+    """Which socket-table detectors to try, most authoritative first.
+
+    Linux prefers ``/proc/net/unix``: exact, pid-free and free of a subprocess.
+    Everywhere else that file does not exist, so lsof leads — the alternative
+    (fixup 5's behaviour) was that the whole tier reported "cannot tell" on every
+    non-Linux host, which combined with fail-closed made ``session_exists_strict``
+    raise unconditionally there and blocked teardown permanently.
+
+    lsof is kept as a Linux backup too, for the case where ``/proc`` is not
+    mounted in the namespace CAO runs in.
+    """
+    if platform_name is None:
+        platform_name = _HOST_PLATFORM
+    if platform_name.startswith("linux"):
+        return (_bound_unix_socket_paths_via_proc, _bound_unix_socket_paths_via_lsof)
+    return (_bound_unix_socket_paths_via_lsof,)
+
+
+def _bound_unix_socket_paths() -> Optional[FrozenSet[str]]:
+    """Every filesystem path an AF_UNIX socket is currently bound to.
+
+    Returns ``None`` only when NO detector on this platform could answer.
+    Callers MUST treat ``None`` as "cannot tell", never as "nothing is bound".
+
+    This is the one piece of evidence that survives the failure
+    ``session_exists_strict`` has to detect: the bound path stays visible after
+    that path has been UNLINKED, and disappears when the owning process dies.
+    tmux itself cannot tell us — its only channel to the server is the path that
+    is gone.
+    """
+    for detector in _socket_table_detectors():
+        paths = detector()
+        if paths is not None:
+            return paths
+    return None
+
+
+def _tmux_process_command_lines() -> Optional[List[str]]:
+    """Command lines of running processes that mention tmux, via ``ps``.
+
+    Last resort, for hosts where no socket table can be read at all (no
+    ``/proc/net/unix`` AND no usable ``lsof``). Returns ``None`` if the
+    process table cannot be listed at all. Deliberately coarse: it can prove
+    "there is no tmux process anywhere" and it can prove "a tmux process names
+    this socket path", but on a server started without an explicit ``-S``/``-L``
+    the socket path does not appear in the argv at all, so a match failure is
+    ambiguous rather than negative — see ``_tmux_server_liveness``.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=_PROCESS_LIST_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return [line for line in result.stdout.splitlines() if "tmux" in line]
+
+
+def _socket_path_aliases(socket_path: str) -> FrozenSet[str]:
+    """``socket_path`` plus its fully resolved form.
+
+    tmux reports the path it tried to connect to; a socket table may report the
+    same socket under a resolved path instead (on macOS ``/tmp`` is a symlink to
+    ``/private/tmp``). Comparing both forms can only ever turn a missed match into
+    a match, i.e. ABSENT into ALIVE, which is the fail-CLOSED direction.
+    """
+    aliases = {socket_path}
+    try:
+        aliases.add(os.path.realpath(socket_path))
+    except OSError:
+        pass
+    return frozenset(aliases)
+
+
+def _tmux_server_liveness(socket_path: str) -> str:
+    """Is a tmux server serving ``socket_path``, even if the path is unlinked?
+
+    Returns ``_SERVER_ALIVE``, ``_SERVER_ABSENT`` (demonstrably none) or
+    ``_SERVER_UNKNOWN``. Only ``_SERVER_ABSENT`` licenses concluding that a
+    session is gone; the other two must fail CLOSED.
+
+    The ladder, in order:
+
+    1. **The socket table**, via ``_bound_unix_socket_paths`` — per platform,
+       ``/proc/net/unix`` on Linux and ``lsof -U`` on macOS/BSD (see
+       ``_socket_table_detectors``). Authoritative in BOTH directions: a live tmux
+       server necessarily holds a bound AF_UNIX socket at its path, so
+       path-not-listed is real evidence of absence, and the entry survives the
+       path being unlinked. Verified on Linux 6.1 / tmux 3.2a for both detectors:
+       listed while alive, still listed after the socket file is unlinked,
+       unlisted the moment the server dies (also after a normal ``kill-server``,
+       which leaves the socket FILE behind).
+    2. **The process table** (``ps``), only if no socket-table detector could
+       answer at all. Coarse by nature, so it answers ABSENT only when there is no
+       tmux process anywhere, ALIVE when some tmux process names this exact path,
+       and UNKNOWN for a tmux process it cannot attribute to the path — a server
+       started without an explicit ``-S``/``-L`` (i.e. every real CAO server) does
+       not carry its socket path in argv, so a match failure here is ambiguous,
+       never negative.
+
+    UNKNOWN when nothing in the ladder can be consulted. That case fails closed
+    and must stay RARE: fixup 5 made it universal off Linux, which blocked
+    teardown permanently there.
+    """
+    candidates = _socket_path_aliases(socket_path)
+
+    bound_paths = _bound_unix_socket_paths()
+    if bound_paths is not None:
+        return _SERVER_ALIVE if candidates & bound_paths else _SERVER_ABSENT
+
+    command_lines = _tmux_process_command_lines()
+    if command_lines is None:
+        return _SERVER_UNKNOWN
+    if not command_lines:
+        return _SERVER_ABSENT
+    if any(candidate in command_line for command_line in command_lines for candidate in candidates):
+        return _SERVER_ALIVE
+    return _SERVER_UNKNOWN
+
+
 class TmuxClient:
     """Simplified tmux client for basic operations."""
+
+    # How long ``kill_session`` waits for tmux to actually reap the session
+    # before giving up and reporting the kill unconfirmed. tmux's own reaping is
+    # asynchronous with respect to ``kill-session`` returning, so a bound is
+    # needed; 2s covers the observed lag with margin without stalling a teardown.
+    _KILL_SESSION_VERIFY_TIMEOUT_SECONDS = 2.0
+    _KILL_SESSION_VERIFY_INTERVAL_SECONDS = 0.2
 
     def __init__(self) -> None:
         self.server = libtmux.Server()
@@ -909,33 +1213,79 @@ class TmuxClient:
             return []
 
     def kill_session(self, session_name: str) -> bool:
-        """Kill tmux session.
+        """Kill tmux session, returning True only once it is CONFIRMED gone.
 
-        Returns:
-            True if a session was killed, False if there was nothing to kill
-            (or the kill itself failed).
+        Dispatching the kill is not the same as the session being gone: tmux
+        reaps asynchronously, so ``session.kill()`` can return while the session
+        is still listed. Session teardown treats True as proof the session is
+        gone and only then drops the matching registry rows, so an optimistic
+        True is exactly what lets tmux and the registry diverge (#498). Hence the
+        bounded verification poll below.
+
+        Returns False for BOTH "no such session" and "kill dispatched but not
+        confirmed gone within the verify bound"; callers that need to tell those
+        apart re-check existence themselves (see ``services/session_service.py``).
 
         A listing parse failure does NOT return False here: "we could not look"
         is not "nothing to kill", and swallowing it is exactly how a failed
         launch leaves a live session that blocks the retry. The kill is retried
-        through the parse-free tmux CLI instead.
+        through the parse-free tmux CLI instead — and then verified like any
+        other, so the fallback cannot report an unconfirmed kill as success.
         """
         try:
             session = self._find_session(session_name)
             if session is None:
                 return False
             self._read_listing(f"kill-session '{session_name}'", session.kill)
-            logger.info(f"Killed tmux session: {session_name}")
-            return True
         except TmuxLookupError as e:
             logger.warning(
                 f"tmux listing failed while killing session {session_name}: {e} — "
                 "falling back to the tmux CLI"
             )
-            return self._kill_via_cli(session_name)
+            if not self._kill_via_cli(session_name):
+                return False
         except Exception as e:
             logger.error(f"Failed to kill session {session_name}: {e}")
             return False
+
+        return self._confirm_session_gone(session_name)
+
+    def _confirm_session_gone(self, session_name: str) -> bool:
+        """Poll, bounded, until tmux confirms ``session_name`` is gone.
+
+        Confirmation uses ``session_exists_strict``, not ``session_exists``: a
+        transient tmux/socket error during the poll must NOT be misread as
+        "session gone". The strict check raises ``TmuxLookupError`` on an
+        unanswerable lookup, which returns False here — so a kill is never
+        reported as confirmed while the session may still be alive.
+
+        Returns True only on a CONFIRMED absence.
+        """
+        start = time.monotonic()
+        deadline = start + self._KILL_SESSION_VERIFY_TIMEOUT_SECONDS
+        while True:
+            try:
+                still_here = self.session_exists_strict(session_name)
+            except TmuxLookupError as e:
+                logger.error(
+                    f"Could not confirm tmux session {session_name} is gone after "
+                    f"kill_session: {e}"
+                )
+                return False
+            if not still_here:
+                logger.info(f"Killed tmux session: {session_name}")
+                return True
+            if time.monotonic() >= deadline:
+                # Elapsed time helps diagnose a false negative: on a heavily
+                # loaded host tmux can take longer than the bound to reap a
+                # session that kill() did dispatch, so a caller re-run will
+                # typically then see it gone.
+                elapsed = time.monotonic() - start
+                logger.error(
+                    f"Tmux session {session_name} still exists {elapsed:.2f}s after kill_session"
+                )
+                return False
+            time.sleep(self._KILL_SESSION_VERIFY_INTERVAL_SECONDS)
 
     def kill_window(self, session_name: str, window_name: str) -> bool:
         """Kill a specific tmux window within a session.
@@ -971,6 +1321,12 @@ class TmuxClient:
         a wrong False is the worst possible answer. On a parse failure we ask
         tmux directly (``has-session``), which needs no listing parse.
 
+        Still LENIENT about everything else: any other lookup error collapses to
+        False ("assume absent"). Fine for best-effort callers (status/UI, the
+        duplicate-name guard), but NOT for teardown confirmation, where a
+        transient socket error must not read as "gone" — use
+        ``session_exists_strict`` there (#498).
+
         Raises:
             TmuxLookupError: The listing could not be parsed AND the direct
                 probe could not answer either — genuinely unknown.
@@ -988,6 +1344,138 @@ class TmuxClient:
             return exists
         except Exception:
             return False
+
+    def session_exists_strict(self, session_name: str) -> bool:
+        """Check if a session exists, RAISING when the lookup cannot be answered.
+
+        Unlike ``session_exists``, this never collapses a query error into
+        "absent": a live session returns True, a confirmed absence returns False,
+        and an inability to tell raises ``TmuxLookupError`` — the only exception
+        type this method lets out. Teardown depends on that third case existing —
+        it deletes registry rows only once tmux is provably gone, so "couldn't
+        tell" reaching it as False is precisely how rows get dropped from under a
+        live session (#498).
+
+        Why this does NOT go through ``self.server.sessions``: libtmux's
+        ``Server.sessions`` property wraps its ``list-sessions`` fetch in a bare
+        ``try/except Exception: pass`` and returns whatever it collected. A
+        transient socket or tmux failure therefore yields an EMPTY QueryList,
+        indistinguishable from a server with no sessions, and the lookup on it
+        reports a clean absence. Any strict check built on that property fails
+        OPEN by construction, no matter how its own exceptions are handled. So we
+        issue the query ourselves through ``Server.cmd`` (which runs the tmux
+        subprocess and exposes ``returncode``/``stderr`` without swallowing
+        anything) and classify the outcome.
+
+        **False is only ever returned on positive evidence of absence:**
+
+        * exit 0 and the name is not in the list — the list is authoritative;
+          membership is an exact string match against ``#{session_name}``, with no
+          tmux target-syntax parsing involved, so no prefix or ``=``/``:`` quoting
+          subtleties. Matches the old ``sessions.get(session_name=...)``.
+        * the kernel refused the connection to the socket path (ECONNREFUSED,
+          ``_NO_SERVER_STDERR_MARKERS``) — the path resolved and nothing is
+          listening, so there is no server and therefore no session.
+        * the socket path does NOT exist (ENOENT, ``_SOCKET_MISSING_STDERR_MARKERS``)
+          **and** ``_tmux_server_liveness`` finds no tmux server bound to it. The
+          extra check is load-bearing: a server keeps serving its socket after the
+          path is unlinked (tmp-cleaners do this; ``kill -USR1 <pid>`` recovers),
+          and that produces stderr byte-identical to a socket that never existed.
+          Concluding absence from the message alone declared live sessions dead —
+          the fail-open this check exists to prevent.
+
+        Everything else raises: permission denied, a path that cannot be resolved
+        at all (ENOTDIR, ENAMETOOLONG), an unrecognised message, a nonzero exit
+        with no message, a missing socket whose server liveness cannot be
+        established, or any unexpected exception from the tmux call itself.
+
+        **What this does NOT guarantee.** The check reaches the server only
+        through its socket PATH, so it cannot see a server the path no longer
+        leads to:
+
+        * If the path is unlinked and then re-created — by a second tmux server,
+          or by an unrelated file or directory — ``list-sessions`` answers about
+          the NEW object and reports the original server's sessions absent. (On
+          tmux 3.2a a plain file at the path even yields ECONNREFUSED, i.e. the
+          confirmed-absence branch above.) No check built on the socket path can
+          detect that; it needs a server identity CAO does not record.
+        * ``/proc/net/unix`` is per network namespace, so a server holding the
+          unlinked socket from another netns reads as absent (it is also
+          unreachable from here). The lsof detector has the analogous blind spot:
+          unprivileged lsof cannot inspect other users' processes, so a socket
+          bound by ANOTHER user's tmux server can read as absent. CAO's own
+          server always runs as the same user.
+        * Where no socket table can be read at all the liveness probe falls back
+          to the process table and answers UNKNOWN for any tmux process it cannot
+          attribute to the path. That fails CLOSED, but it means an unrelated
+          tmux server can block reconciliation of a dead server's rows on such a
+          host. This is now the rare case (no ``/proc/net/unix`` AND no usable
+          ``lsof``); in fixup 5 it was every non-Linux host, which blocked
+          teardown there permanently.
+        * The stderr tables are tmux-version-dependent (see the comment on them).
+          Wording from a build we do not recognise lands in the raise branch: a
+          loud, non-destructive, re-runnable teardown FAILURE rather than a silent
+          false success.
+
+        Behaviour above measured on private sockets against tmux 3.2a / libtmux
+        0.51.0 on Linux 6.1 (this repo's dev environment) with BOTH socket-table
+        detectors, and, for the stderr wording, tmux 3.7b in fixup 4. The macOS
+        lsof behaviour is the reviewer's measurement on macOS; no other BSD has
+        been exercised.
+        """
+        try:
+            return self._classify_session_lookup(session_name)
+        except TmuxLookupError:
+            raise
+        except Exception as exc:
+            # The tmux call itself can fail in ways that are not about the
+            # session (no tmux binary, OSError spawning it). Callers handle
+            # exactly one type, so translate rather than leak: both call sites
+            # already turn TmuxLookupError into the fail-CLOSED outcome.
+            raise TmuxLookupError(
+                f"could not determine whether tmux session '{session_name}' exists: "
+                f"the lookup itself failed with {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def _classify_session_lookup(self, session_name: str) -> bool:
+        """``session_exists_strict`` without the exception normalisation."""
+        result = self.server.cmd("list-sessions", "-F", "#{session_name}")
+
+        if result.returncode == 0:
+            return session_name in result.stdout
+
+        stderr_lines = [str(line) for line in result.stderr]
+        stderr = " ".join(stderr_lines)
+        lowered = stderr.lower()
+
+        if any(marker in lowered for marker in _NO_SERVER_STDERR_MARKERS):
+            return False
+
+        if any(marker in lowered for marker in _SOCKET_MISSING_STDERR_MARKERS):
+            socket_path = _connect_error_socket_path(stderr_lines)
+            if socket_path is not None:
+                liveness = _tmux_server_liveness(socket_path)
+                if liveness == _SERVER_ABSENT:
+                    return False
+                verdict = (
+                    "a tmux server is still bound to it"
+                    if liveness == _SERVER_ALIVE
+                    else "whether a tmux server is still bound to it cannot be "
+                    "determined on this host"
+                )
+                raise TmuxLookupError(
+                    f"could not determine whether tmux session '{session_name}' "
+                    f"exists: the tmux socket {socket_path} is gone from the "
+                    f"filesystem and {verdict}, so the session may be alive. A "
+                    "tmp-cleaner unlinking the socket does this; "
+                    "`kill -USR1 <server-pid>` makes the server recreate it."
+                )
+
+        raise TmuxLookupError(
+            f"could not determine whether tmux session '{session_name}' exists: "
+            f"list-sessions exited {result.returncode} "
+            f"({stderr or 'no error output'})"
+        )
 
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         """Get the current working directory of a pane.
