@@ -22,6 +22,7 @@ from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
@@ -76,7 +77,19 @@ class InboxService:
         if not messages:
             return
 
-        status = status_monitor.get_status(terminal_id)
+        cached_status = status_monitor.get_status(terminal_id)
+        status = cached_status
+        provider = None
+        rendered_status = None
+        if status == TerminalStatus.PROCESSING:
+            provider = provider_manager.get_provider(terminal_id)
+            if isinstance(provider, CodexProvider):
+                rendered_status = terminal_service._get_direct_rendered_status(
+                    terminal_id, provider
+                )
+                if rendered_status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                    status = rendered_status
+
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -86,12 +99,22 @@ class InboxService:
                 TerminalStatus.PROCESSING,
                 TerminalStatus.WAITING_USER_ANSWER,
             ):
-                provider = provider_manager.get_provider(terminal_id)
+                if provider is None:
+                    provider = provider_manager.get_provider(terminal_id)
                 eager_eligible = provider is not None and getattr(
                     provider, "accepts_input_while_processing", False
                 )
             if not eager_eligible:
                 return
+
+        if provider is None:
+            try:
+                provider = provider_manager.get_provider(terminal_id)
+            except Exception:
+                provider = None
+
+        if isinstance(provider, CodexProvider) and rendered_status is None:
+            rendered_status = terminal_service._get_direct_rendered_status(terminal_id, provider)
 
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
         # pane; that output flows back through the FIFO/StatusMonitor pipeline and
@@ -121,6 +144,28 @@ class InboxService:
                         sender_id=sender_id,
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
+                if isinstance(provider, CodexProvider) and not (
+                    terminal_service._confirm_input_accepted_or_resubmit(
+                        terminal_id,
+                        combined,
+                        registry,
+                        sender_id,
+                        OrchestrationType.SEND_MESSAGE,
+                        provider=provider,
+                        initial_cached_status=cached_status,
+                        initial_rendered_status=rendered_status,
+                        delivery_name="Inbox delivery",
+                    )
+                ):
+                    for message in batch:
+                        update_message_status(message.id, MessageStatus.PENDING)
+                    logger.warning(
+                        "Inbox delivery to terminal %s was not accepted after "
+                        "bounded retries; leaving %d message(s) pending",
+                        terminal_id,
+                        len(batch),
+                    )
+                    continue
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
             except TerminalNotFoundError as e:
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
