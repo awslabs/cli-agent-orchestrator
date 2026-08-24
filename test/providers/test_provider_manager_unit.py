@@ -461,3 +461,35 @@ def test_create_provider_omp_stores_mapping():
 
     assert isinstance(provider, OmpProvider)
     assert manager.get_provider("t1") is provider
+
+
+def test_create_provider_resume_session_id_reaches_claude_code():
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        terminal_id="t-resume",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+    )
+
+    assert isinstance(provider, ClaudeCodeProvider)
+    assert provider._resume_session_id == "11d55034-bb41-46ca-8686-59a9dbff16b5"
+
+
+def test_create_provider_resume_session_id_rejected_for_other_providers():
+    """resume_session_id is claude_code-only; other providers must fail closed
+    instead of silently starting a fresh conversation."""
+    manager = ProviderManager()
+    with pytest.raises(Exception, match="resume_session_id is only supported"):
+        manager.create_provider(
+            ProviderType.CODEX.value,
+            terminal_id="t-bad",
+            tmux_session="s1",
+            tmux_window="w1",
+            agent_profile=None,
+            resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+        )

@@ -54,6 +54,7 @@ async def create_session(
     initial_message: str | None = None,
     initial_message_orchestration_type: OrchestrationType | None = None,
     model: str | None = None,
+    resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
@@ -99,6 +100,7 @@ async def create_session(
         initial_message=initial_message,
         initial_message_orchestration_type=initial_message_orchestration_type,
         model=model,
+        resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
     )

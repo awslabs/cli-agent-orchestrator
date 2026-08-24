@@ -153,6 +153,14 @@ def _parse_env_pairs(pairs):
     "the URL. Blocked prefixes (CLAUDE/CODEX_/__MISE_) and >=2048-byte values "
     "are rejected. See issue #248.",
 )
+@click.option(
+    "--resume-session-id",
+    "resume_session_id",
+    default=None,
+    metavar="SESSION_ID",
+    help="Resume a prior Claude Code conversation in the launched supervisor "
+    "(claude --resume <id>). claude_code provider only.",
+)
 def launch(
     message,
     agents,
@@ -167,6 +175,7 @@ def launch(
     working_directory,
     memory,
     env_pairs,
+    resume_session_id,
 ):
     """Launch cao session with specified agent profile."""
     try:
@@ -296,6 +305,8 @@ def launch(
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
         if memory:
             params["memory_manager"] = "true"
+        if resume_session_id:
+            params["resume_session_id"] = resume_session_id
 
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.
