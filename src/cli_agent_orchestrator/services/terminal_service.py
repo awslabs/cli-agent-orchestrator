@@ -814,6 +814,67 @@ def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
 
 
+def redeliver_dropped_message(
+    terminal_id: str,
+    message: str,
+    attempt: int,
+    provider=None,
+    *,
+    registry: "PluginRegistry | None" = None,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> bool:
+    """Re-deliver a message the TUI never accepted (blocking; to_thread it).
+
+    One attempt of the confirm-and-redeliver loop shared by the deferred-init
+    path (#479) and the synchronous step path (#562). First, when the provider
+    opts in via ``supports_direct_status_probe``, a live capture-pane check
+    catches a worker that IS already running but whose cached status lags
+    behind (#496) — returns True (started) without sending anything. A caller
+    that already holds the provider instance passes it; otherwise it is
+    resolved from the registry, best-effort (a resolution failure means no
+    probe, never a failed redelivery). Then the box check picks the
+    redelivery: if the delivered text still sits in the input box only the
+    Enter was swallowed (send a bare Enter); if it is absent the paste itself
+    was dropped (re-deliver in full). See ``_message_visible_in_box`` for why
+    guessing wrong must be avoided.
+
+    Returns True when the worker was found already started and nothing was
+    sent; False when a redelivery was attempted.
+    """
+    if provider is None:
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+    if provider is not None and getattr(provider, "supports_direct_status_probe", False):
+        if _worker_is_started_direct(terminal_id, provider):
+            return True
+    if _message_visible_in_box(terminal_id, message):
+        logger.warning(
+            "Delivery to %s unsubmitted (Enter swallowed); "
+            "re-submitting via Enter (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        send_special_key(terminal_id, "Enter")
+        return False
+    logger.warning(
+        "Delivery to %s not accepted (paste dropped); "
+        "re-delivering message (attempt %d)",
+        terminal_id,
+        attempt,
+    )
+    send_input(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+    )
+    return False
+
+
 async def _confirm_worker_started_or_resubmit(
     terminal_id: str,
     message: str,
@@ -837,40 +898,21 @@ async def _confirm_worker_started_or_resubmit(
         return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
-        # The cached status_monitor status is event-driven (pyte screener at
-        # rising-edge/quiescence only) and can lag behind reality. Before
-        # re-delivering, do a direct capture-pane / visible-screen check via
-        # the provider to catch cases where the worker IS processing but the
-        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
-        # footer appearing between pyte detection edges). Only providers that
-        # opt in via ``supports_direct_status_probe = True`` take this path.
-        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
-            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
-                return True
-
-        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
-            logger.warning(
-                "Deferred assign to %s unsubmitted (Enter swallowed); "
-                "re-submitting via Enter (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
-        else:
-            logger.warning(
-                "Deferred assign to %s not accepted (paste dropped); "
-                "re-delivering message (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(
-                send_input,
-                terminal_id,
-                message,
-                registry=registry,
-                sender_id=sender_id,
-                orchestration_type=orchestration_type,
-            )
+        # The redelivery decision (box check + #496's direct-probe guard for
+        # providers that opt in) lives in ``redeliver_dropped_message`` —
+        # shared with the synchronous step path (#562).
+        already_started = await asyncio.to_thread(
+            redeliver_dropped_message,
+            terminal_id,
+            message,
+            attempt,
+            provider,
+            registry=registry,
+            sender_id=sender_id,
+            orchestration_type=orchestration_type,
+        )
+        if already_started:
+            return True
         if await wait_until_status(
             terminal_id,
             _DEFERRED_STARTED_STATUSES,

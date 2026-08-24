@@ -38,6 +38,45 @@ class TestMessageVisibleInBox:
             assert ts._message_visible_in_box("t1", "Analyze the logs") is True
 
 
+class TestRedeliverDroppedMessageHelper:
+    """The shared one-attempt helper: a caller without a provider instance
+    (the synchronous step path, #562) gets it resolved from the registry,
+    best-effort — a resolution failure means no probe, never a lost
+    redelivery."""
+
+    def test_resolves_provider_from_registry_for_direct_probe(self):
+        # Provider without explicit pass + direct probe True → started, no send.
+        provider = MagicMock(supports_direct_status_probe=True)
+        with (
+            patch.object(ts, "provider_manager") as mgr,
+            patch.object(ts, "_worker_is_started_direct", return_value=True) as probe,
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            mgr.get_provider.return_value = provider
+            started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1)
+        assert started is True
+        mgr.get_provider.assert_called_once_with("t1")
+        probe.assert_called_once_with("t1", provider)
+        key.assert_not_called()
+        send.assert_not_called()
+
+    def test_provider_resolution_failure_falls_through_to_box_check(self):
+        # Registry blowup must not lose the redelivery — box check still runs.
+        with (
+            patch.object(ts, "provider_manager") as mgr,
+            patch.object(ts, "_message_visible_in_box", return_value=True) as box,
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            mgr.get_provider.side_effect = ValueError("Terminal t1 not found")
+            started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1)
+        assert started is False
+        box.assert_called_once_with("t1", "Analyze the logs")
+        key.assert_called_once_with("t1", "Enter")
+        send.assert_not_called()
+
+
 @pytest.mark.asyncio
 class TestConfirmWorkerStartedOrResubmit:
     async def test_started_on_first_confirm_no_resubmit(self):
