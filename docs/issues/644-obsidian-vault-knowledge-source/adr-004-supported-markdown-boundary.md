@@ -76,7 +76,7 @@ status view and the documentation cannot drift.
 | Sync-conflict filenames (`*.sync-conflict-*`, `*conflicted copy*`, `*.icloud`, `.~lock.*`) | Refused | Never a candidate; this includes Dropbox names such as `A (conflicted copy 2024).md` | `sync_artifact_skipped` (info) |
 | Two paths differing only by case, on a case-insensitive filesystem | Refused, both | Both quarantined | `path_case_collision` (error) |
 | A candidate whose `st_nlink > 1` (hardlink) | Refused unless the mapping sets `allow_hardlinks` | Not indexed | `hardlink_refused` (warn) |
-| A `memory_metadata.file_path` that does not resolve under the vault root | Refused at the sink | Row skipped, recall continues | `path_escapes_root` (warn) |
+| A `memory_metadata.file_path` that does not resolve under the vault root | Refused at the sink | Row skipped, recall continues. Scan and reconcile record a finding row; U6 records a recall-side counter | `path_escapes_root` (warn) |
 | Note whose bytes are not valid UTF-8 | Refused | Quarantined, never lossily decoded | `note_not_utf8` (error) |
 | Note frontmatter or body matching a `secret_gate` pattern, at reconcile | Refused under `secret_gate: "reject"` (the **default**); reported-only under `"warn"` | `reject` quarantines; `warn` indexes and records the finding. **The finding is reported in BOTH modes** — the mode changes whether the note is indexed, never whether the operator is told. The finding carries the matched **pattern name** only, never the matched bytes | `secret_detected` (error under `reject`, warn under `warn`) |
 | Two distinct paths producing the same derived key | Refused, both | Both quarantined; `detail` flags `derived` to distinguish it from an authored duplicate | `key_collision` (error) |
@@ -135,6 +135,14 @@ status view and the documentation cannot drift.
    stale `memory_metadata` row — and it is rowed anyway, because the alternative is a
    guard whose firing is invisible. Its teeth test is named in
    [test-strategy.md](test-strategy.md).
+
+   The finding vocabulary has three axes with three matching surfaces. Markdown constructs
+   and reconcile-operational outcomes are `vault_finding` rows, keyed to a note and a run.
+   Recall-operational outcomes are vault-keyed counters: a recall has no run id and may have
+   no single path to attach to a row. U6 owns the read-side `path_escapes_root` outcome and
+   records it on that recall-operational counter surface, while `scan.py` continues to record
+   scan and reconcile occurrences as findings. This keeps an invisible read-side guard from
+   being mistaken for a reason to use `vault_finding` by default.
 9. **`secret_detected` is the one refusal driven by a heuristic rather than a parse
    result, and that changes what the row has to promise.** Every other refusal in this table
    is decidable: a symlink either is one or is not, YAML either parses or does not.

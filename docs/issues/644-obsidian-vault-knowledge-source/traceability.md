@@ -270,8 +270,8 @@ criterion anticipates it by requiring lossy fields to be **reported**. They are,
 | --- | --- | --- |
 | `key`, `scope`, `scope_id` | Yes | `cao.key` plus the mapping's scope |
 | `memory_type` | Yes | `cao.type` |
-| `tags` | Yes | frontmatter `tags` |
-| `created_at` | Yes | `cao.created` |
+| `tags` | Yes | Top-level frontmatter `tags`; the writer seeds it only when absent and never overwrites a user value |
+| `created_at` | Yes | Top-level frontmatter `created`; the writer seeds it only when absent and never overwrites a user value |
 | `updated_at` | Yes | the note's mtime |
 | Content body | Yes | the note body |
 | Typed `memory_relationships` rows | Yes | `cao.links`, with type, status, confidence and origin |
@@ -282,6 +282,7 @@ criterion anticipates it by requiring lossy fields to be **reported**. They are,
 | `source_terminal_id` | **No** | Reported lossy, and ephemeral |
 | `related_keys` (legacy text column) | **No** | Reported lossy — the compiler's computation-state marker, superseded by typed relationships, which **do** migrate |
 | Append-only `## <ISO8601Z>` history beyond what fits | **Partial** | Written into the managed note when it fits `max_note_bytes`; entries beyond it reported lossy with a count, never silently truncated |
+| Typed relationships beyond `MAX_CAO_LINKS = 64` | **Partial** | First 64 migrate into `cao.links`; the omitted count is reported as lossy `cao.links`, never silently truncated. This is a pipeline-limit loss rather than one of the seven enumerated native field types |
 
 **Why ruling R2 exists.** Without the widened `uq_memory_key_scope`, `migrate` without
 `--delete-source` keeps the key by design, so every migrated memory would collide with its
