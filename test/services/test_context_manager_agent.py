@@ -11,8 +11,6 @@ Covers:
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 # ---------------------------------------------------------------------------
 # U9.1 — memory_manager.md agent profile
 # ---------------------------------------------------------------------------
@@ -42,6 +40,7 @@ class TestMemoryManagerProfile:
         profile = load_agent_profile("memory_manager")
         assert profile.mcpServers is not None
         assert "cao-mcp-server" in profile.mcpServers
+        assert profile.tools == ["memory_recall"]
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +73,7 @@ class TestMemoryFlag:
             mock_response.raise_for_status = MagicMock()
             mock_requests.post.return_value = mock_response
 
-            result = runner.invoke(
+            runner.invoke(
                 launch,
                 ["--agents", "code_supervisor", "--headless", "--auto-approve", "--memory"],
                 catch_exceptions=False,
@@ -180,16 +179,221 @@ class TestGetCuratedMemoryContext:
         ]
         mock_pm.get_provider.return_value = MagicMock()
 
-        mock_get_output.return_value = (
-            "<cao-memory>\n## Curated\n- [global] pref: use pytest\n</cao-memory>"
-        )
+        mock_get_output.side_effect = [
+            "prior terminal output\n",
+            "prior terminal output\n"
+            "<cao-memory>\n## Curated\n- [global] pref: use pytest\n</cao-memory>",
+        ]
 
         svc = MemoryService()
+        svc._curator_policy_allows_reuse = lambda *_args: True  # type: ignore[method-assign]
         result = svc.get_curated_memory_context("t1", "Write tests")
 
         assert "<cao-memory>" in result
         assert "Curated" in result
         mock_send_input.assert_called_once()
+
+    @patch.object(
+        __import__(
+            "cli_agent_orchestrator.services.memory_service", fromlist=["MemoryService"]
+        ).MemoryService,
+        "get_memory_context_for_terminal",
+        return_value="<cao-memory>\nfallback\n</cao-memory>",
+    )
+    @patch.object(
+        __import__(
+            "cli_agent_orchestrator.services.memory_service", fromlist=["MemoryService"]
+        ).MemoryService,
+        "_find_context_manager_terminal",
+        return_value={"id": "cm-1", "agent_profile": "memory_manager"},
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_output")
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    def test_falls_back_when_current_curator_dispatch_emits_no_block(
+        self, mock_status_monitor, mock_pm, mock_get_output, mock_send_input, mock_find, mock_phase1
+    ):
+        """A prior dispatch's block cannot be reused for the current worker."""
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+
+        stale = "<cao-memory>\n## Stale\n- [global] secret: prior worker\n</cao-memory>"
+        mock_status_monitor.get_status.side_effect = [
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+        ]
+        mock_pm.get_provider.return_value = MagicMock()
+        mock_get_output.side_effect = [stale, stale + "\nNo memory block this turn."]
+
+        svc = MemoryService()
+        svc._curator_policy_allows_reuse = lambda *_args: True  # type: ignore[method-assign]
+        result = svc.get_curated_memory_context("t1", "Current task")
+
+        assert result == "<cao-memory>\nfallback\n</cao-memory>"
+        assert "prior worker" not in result
+        mock_send_input.assert_called_once()
+        mock_phase1.assert_called_once_with("t1")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_output")
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    def test_reuses_curator_when_policy_fingerprint_is_unchanged(
+        self, mock_status_monitor, mock_pm, mock_get_output, mock_send_input, monkeypatch, caplog
+    ):
+        """A stamped matching policy permits consecutive dispatches to one curator."""
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.memory_service import (
+            _CURATOR_POLICY_METADATA_KEY,
+            MemoryService,
+        )
+
+        caplog.set_level("INFO", logger="cli_agent_orchestrator.services.memory_service")
+        stored_metadata: dict = {}
+        fingerprint = (("fixture", "project", "fixture-project", True),)
+        monkeypatch.setattr(
+            database,
+            "get_terminal_metadata",
+            lambda _terminal_id: {"metadata": dict(stored_metadata)},
+        )
+
+        def update_metadata(_terminal_id, metadata):
+            stored_metadata.clear()
+            stored_metadata.update(metadata)
+            return True
+
+        monkeypatch.setattr(terminal_service, "update_metadata", update_metadata)
+        mock_status_monitor.get_status.side_effect = [
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+        ]
+        mock_pm.get_provider.return_value = MagicMock()
+        first = "<cao-memory>\nfirst\n</cao-memory>"
+        second = "<cao-memory>\nsecond\n</cao-memory>"
+        mock_get_output.side_effect = ["", first, first, first + second]
+
+        svc = MemoryService()
+        svc._get_terminal_context = lambda _terminal_id: {"session_name": "same-session"}  # type: ignore[method-assign]
+        svc._find_context_manager_terminal = lambda _session: {"id": "cm-1"}  # type: ignore[method-assign]
+        svc._curator_policy_fingerprint = lambda _ctx: fingerprint  # type: ignore[method-assign]
+
+        assert svc.get_curated_memory_context("worker-1", "first task") == first
+        assert svc.get_curated_memory_context("worker-2", "second task") == second
+        assert stored_metadata[_CURATOR_POLICY_METADATA_KEY] == [list(fingerprint[0])]
+        assert mock_send_input.call_count == 2
+        assert any("curator policy arm=stamped" in record.getMessage() for record in caplog.records)
+        assert any("curator policy arm=match" in record.getMessage() for record in caplog.records)
+
+    def test_policy_fingerprint_is_stable_for_permuted_bindings(self):
+        """A policy-stable curator must not fall back because binding order changed."""
+        from types import SimpleNamespace
+
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+
+        injectable = SimpleNamespace(
+            vault_id="fixture",
+            scope="project",
+            scope_id="fixture-project",
+            inject=True,
+        )
+        non_injectable = SimpleNamespace(
+            vault_id="fixture",
+            scope="project",
+            scope_id="fixture-project",
+            inject=False,
+        )
+        orders = iter(
+            (
+                [injectable, non_injectable],
+                [injectable, non_injectable],
+                [injectable, non_injectable],
+                [non_injectable, injectable],
+                [non_injectable, injectable],
+                [non_injectable, injectable],
+            )
+        )
+        service = MemoryService()
+
+        def resolve_sources(*_args, **_kwargs):
+            return [], list(next(orders)), 4096
+
+        service._resolve_sources = resolve_sources  # type: ignore[method-assign]
+
+        first = service._curator_policy_fingerprint({"terminal_id": "worker"})
+        second = service._curator_policy_fingerprint({"terminal_id": "worker"})
+
+        assert (
+            first
+            == second
+            == (
+                ("fixture", "project", "fixture-project", False),
+                ("fixture", "project", "fixture-project", True),
+            )
+        )
+
+    @patch.object(
+        __import__(
+            "cli_agent_orchestrator.services.memory_service", fromlist=["MemoryService"]
+        ).MemoryService,
+        "get_memory_context_for_terminal",
+        return_value="<cao-memory>\nfallback\n</cao-memory>",
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.get_output")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    def test_policy_fingerprint_change_falls_back_without_reusing_curator(
+        self,
+        mock_status_monitor,
+        mock_pm,
+        mock_send_input,
+        mock_get_output,
+        mock_phase1,
+        monkeypatch,
+        caplog,
+    ):
+        """A changed policy stamps no new curator state and dispatches nothing."""
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.memory_service import (
+            _CURATOR_POLICY_METADATA_KEY,
+            MemoryService,
+        )
+
+        caplog.set_level("WARNING", logger="cli_agent_orchestrator.services.memory_service")
+        old_policy = [["fixture", "project", "fixture-project", True]]
+        monkeypatch.setattr(
+            database,
+            "get_terminal_metadata",
+            lambda _terminal_id: {"metadata": {_CURATOR_POLICY_METADATA_KEY: old_policy}},
+        )
+        monkeypatch.setattr(terminal_service, "update_metadata", lambda *_args: True)
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = MagicMock()
+        mock_get_output.side_effect = ["", "<cao-memory>\ncurated\n</cao-memory>"]
+
+        svc = MemoryService()
+        svc._get_terminal_context = lambda _terminal_id: {"session_name": "same-session"}  # type: ignore[method-assign]
+        svc._find_context_manager_terminal = lambda _session: {"id": "cm-1"}  # type: ignore[method-assign]
+        svc._curator_policy_fingerprint = lambda _ctx: (  # type: ignore[method-assign]
+            ("fixture", "project", "fixture-project", False),
+        )
+
+        result = svc.get_curated_memory_context("worker", "task after flag flip")
+
+        assert result == "<cao-memory>\nfallback\n</cao-memory>"
+        mock_send_input.assert_not_called()
+        mock_phase1.assert_called_once_with("worker")
+        assert any(
+            "curator fallback reason=policy_changed" in record.getMessage()
+            for record in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +465,7 @@ class TestHeartbeatCheck:
         mock_pm.get_provider.return_value = None
 
         svc = MemoryService()
-        result = svc.get_curated_memory_context("t1")
+        svc.get_curated_memory_context("t1")
 
         mock_phase1.assert_called_once_with("t1")
 
@@ -289,7 +493,7 @@ class TestHeartbeatCheck:
         mock_pm.get_provider.return_value = mock_provider
 
         svc = MemoryService()
-        result = svc.get_curated_memory_context("t1")
+        svc.get_curated_memory_context("t1")
 
         mock_phase1.assert_called_once_with("t1")
 

@@ -99,9 +99,32 @@ def test_reviewed_vault_files_own_every_nonempty_read_sink_set():
 
 
 def test_vault_candidate_chokepoint_requires_explicit_injection_policy():
-    """Every candidate load carries an explicit gate decision from the resolver."""
+    """Candidate construction and loading require explicit policy and consumer identity."""
     reader_path = SOURCE_ROOT / "services" / "vault" / "reader.py"
     reader_tree = ast.parse(reader_path.read_text(encoding="utf-8"), filename=str(reader_path))
+    resolve_definition = next(
+        node
+        for node in ast.walk(reader_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "resolve_candidates"
+    )
+    terminal_parameter = next(
+        argument for argument in resolve_definition.args.kwonlyargs if argument.arg == "terminal_id"
+    )
+    assert (
+        resolve_definition.args.kw_defaults[
+            resolve_definition.args.kwonlyargs.index(terminal_parameter)
+        ]
+        is None
+    )
+    consumer_parameter = next(
+        argument for argument in resolve_definition.args.kwonlyargs if argument.arg == "consumer"
+    )
+    assert (
+        resolve_definition.args.kw_defaults[
+            resolve_definition.args.kwonlyargs.index(consumer_parameter)
+        ]
+        is None
+    )
     load_definition = next(
         node
         for node in ast.walk(reader_tree)
@@ -121,6 +144,8 @@ def test_vault_candidate_chokepoint_requires_explicit_injection_policy():
 
     call_sites: list[str] = []
     violations: list[str] = []
+    resolver_call_sites: list[str] = []
+    resolver_violations: list[str] = []
     candidate_constructors: list[str] = []
     for path in SOURCE_ROOT.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -133,6 +158,14 @@ def test_vault_candidate_chokepoint_requires_explicit_injection_policy():
                 call_sites.append(location)
                 if not any(keyword.arg == "require_injectable" for keyword in node.keywords):
                     violations.append(location)
+            if isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Name) and node.func.id == "resolve_candidates")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "resolve_candidates")
+            ):
+                location = f"{path.name}:{node.lineno}"
+                resolver_call_sites.append(location)
+                if not {keyword.arg for keyword in node.keywords} >= {"terminal_id", "consumer"}:
+                    resolver_violations.append(location)
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
@@ -143,7 +176,145 @@ def test_vault_candidate_chokepoint_requires_explicit_injection_policy():
 
     assert call_sites, "load_candidate call-site matcher must find consumers"
     assert violations == []
+    assert resolver_call_sites, "resolver call-site matcher must find consumers"
+    assert resolver_violations == []
     assert candidate_constructors == []
+
+
+def test_injected_context_call_sites_explicitly_name_their_consumer():
+    """Every injection entry point must opt into the non-waivable consumer gate."""
+    path = SOURCE_ROOT / "services" / "memory_service.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    renderer = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "get_memory_context_for_terminal"
+    )
+    injected_calls: list[str] = []
+    violations: list[str] = []
+    for node in ast.walk(renderer):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in {"_vault_candidates", "_load_related_vault_memory"}:
+            continue
+        location = f"memory_service.py:{node.lineno}"
+        injected_calls.append(node.func.attr)
+        consumer = next((item.value for item in node.keywords if item.arg == "consumer"), None)
+        if not isinstance(consumer, ast.Constant) or consumer.value != "injected_context":
+            violations.append(location)
+
+    assert len(injected_calls) >= 2
+    assert violations == []
+
+
+def test_vault_candidate_consumers_stay_behind_memory_service_boundary():
+    """Direct candidate resolution remains in the two reviewed service helpers.
+
+    BM25 may build an ungated corpus through ``_vault_candidates`` for IDF,
+    but result selection still goes through the caller policy in that helper.
+    """
+    allowed_resolver_functions = {"_vault_candidates", "_load_related_vault_memory"}
+    violations: list[str] = []
+    consumer_violations: list[str] = []
+
+    for path in SOURCE_ROOT.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr if isinstance(node.func, ast.Attribute) else None
+            )
+            if name == "resolve_candidates" and path.name != "reader.py":
+                parent = node
+                while parent in parents and not isinstance(
+                    parent, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    parent = parents[parent]
+                if (
+                    path.name != "memory_service.py"
+                    or getattr(parent, "name", None) not in allowed_resolver_functions
+                ):
+                    violations.append(f"{path.name}:{node.lineno}")
+            if name == "load_candidate" and path.name not in {"reader.py", "memory_service.py"}:
+                violations.append(f"{path.name}:{node.lineno}")
+            if name in {"_vault_candidates", "_load_related_vault_memory"}:
+                consumer = next(
+                    (item.value for item in node.keywords if item.arg == "consumer"), None
+                )
+                if not isinstance(consumer, ast.Constant) or not isinstance(consumer.value, str):
+                    consumer_violations.append(f"{path.name}:{node.lineno}")
+
+    assert violations == []
+    assert consumer_violations == []
+
+
+def test_production_vault_policy_instances_are_resolver_owned():
+    """Only the resolver and named identity-free BM25 corpus policy construct policies."""
+    violations: list[str] = []
+    for path in SOURCE_ROOT.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id == "VaultInjectionPolicy":
+                    parent = node
+                    while parent in parents and not isinstance(
+                        parent, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        parent = parents[parent]
+                    outside_resolver = (
+                        path.name != "reader.py"
+                        or getattr(parent, "name", None) != "_resolve_injection_policy"
+                    )
+                    is_bm25_corpus_policy = (
+                        path.name == "memory_service.py"
+                        and isinstance(parents.get(node), ast.Assign)
+                        and any(
+                            isinstance(target, ast.Name) and target.id == "_BM25_CORPUS_POLICY"
+                            for target in parents[node].targets
+                        )
+                    )
+                    if outside_resolver and not is_bm25_corpus_policy:
+                        violations.append(f"{path.name}:{node.lineno}")
+
+    assert violations == [], (
+        "VaultInjectionPolicy construction is resolver-owned; the only exception is "
+        "_BM25_CORPUS_POLICY, the named identity-free BM25 corpus policy."
+    )
+
+
+def test_bm25_corpus_policy_is_confined_to_corpus_population():
+    """The identity-free policy must never reach a returning vault read path."""
+    path = SOURCE_ROOT / "services" / "memory_service.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    uses: list[tuple[str, str]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        policy = next((item.value for item in node.keywords if item.arg == "policy"), None)
+        if not isinstance(policy, ast.Name) or policy.id != "_BM25_CORPUS_POLICY":
+            continue
+        parent = node
+        while parent in parents and not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            parent = parents[parent]
+        call_name = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        uses.append((getattr(parent, "name", ""), call_name))
+
+    assert set(uses) == {
+        ("_bm25_relevance", "_vault_candidates"),
+        ("_bm25_search", "_vault_candidates"),
+    }
+    assert len(uses) == 2
 
 
 def _is_read_sink(node: ast.Call) -> bool:

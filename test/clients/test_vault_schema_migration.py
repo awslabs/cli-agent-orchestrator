@@ -383,10 +383,21 @@ def test_binding_aware_query_helpers_default_to_native_without_call_site_changes
             # A source-aware wrapper may forward its own keyword-only value.
             # A backend-matched consumer may instead derive the value from the
             # Memory row it is grouping. Literal or unrelated overrides would
-            # weaken the native default at an existing call site.
+            # weaken the native default at an existing call site. The
+            # deterministic renderer is the one exception: it deliberately
+            # queries native and vault relationship edges separately before
+            # expanding either source.
             assert len(source_kind_keywords) == 1
-            assert isinstance(source_kind_keywords[0].value, ast.Name)
-            source_kind_name = source_kind_keywords[0].value.id
+            source_kind_value = source_kind_keywords[0].value
+            explicit_renderer_source = (
+                current.name == "get_memory_context_for_terminal"
+                and isinstance(source_kind_value, ast.Constant)
+                and source_kind_value.value in {"native", "vault"}
+            )
+            if explicit_renderer_source:
+                continue
+            assert isinstance(source_kind_value, ast.Name)
+            source_kind_name = source_kind_value.id
             forwards_kwonly = source_kind_name == "source_kind" and "source_kind" in kwonly_names
             derives_from_memory = any(
                 isinstance(assignment, (ast.Assign, ast.AnnAssign))

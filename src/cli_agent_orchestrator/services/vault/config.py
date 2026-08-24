@@ -124,7 +124,10 @@ class FolderMapping(BaseModel):
     scope: Literal["global", "project", "agent"]
     scope_id: Optional[str] = None
     index: StrictBool = True
-    inject: StrictBool = False
+    inject: StrictBool = Field(
+        default=False,
+        description="Controls automatic context injection only; it is not a confidentiality control.",
+    )
     writable: StrictBool = False
     secret_gate: Literal["reject", "warn"] = "reject"
     allow_hardlinks: StrictBool = False

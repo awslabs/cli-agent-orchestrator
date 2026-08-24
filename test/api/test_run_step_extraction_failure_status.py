@@ -13,6 +13,7 @@ failure -> 500"), it is a 500.
 """
 
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -87,7 +88,7 @@ class TestExtractionFailureSettlement:
         from cli_agent_orchestrator.services import workflow_journal, workflow_service
         from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
 
-        run_id = "run-bookkeeping"
+        run_id = f"run-bookkeeping-{uuid4().hex}"
         env_vars = {
             "CAO_WORKFLOW_RUN_ID": run_id,
             "CAO_WORKFLOW_GENERATION": "1",

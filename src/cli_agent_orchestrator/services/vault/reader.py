@@ -8,13 +8,14 @@ import os
 import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Literal, Optional, Sequence
 
 from sqlalchemy import and_, func
 
 from cli_agent_orchestrator.clients.database import (
     MemoryMetadataModel,
     SessionLocal,
+    TerminalModel,
     VaultNoteModel,
     VaultRecallCounterModel,
 )
@@ -24,6 +25,8 @@ from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.parser import split_frontmatter
 
 _TRUNCATION_MARKER = "\n\n[Content truncated for recall]"
+MEMORY_MANAGER_PROFILE = "memory_manager"
+MEMORY_MANAGER_POLICY_ARM = "memory_manager"
 logger = logging.getLogger(__name__)
 
 
@@ -34,6 +37,72 @@ class VaultCandidate:
     binding: VaultBinding
     metadata: MemoryMetadataModel
     note: VaultNoteModel
+    require_injectable: bool
+    policy_arm: str
+
+
+@dataclass(frozen=True)
+class VaultInjectionPolicy:
+    """One immutable gate decision shared by every binding in a recall."""
+
+    effective_require_injectable: bool
+    arm: str
+    is_curator: Optional[bool]
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True, eq=False)
+class VaultCandidateResolution(Sequence[VaultCandidate]):
+    """Candidates and the observable policy/exit arm for one vault binding."""
+
+    candidates: tuple[VaultCandidate, ...]
+    policy_arm: str
+    exit_arm: str
+
+    def __iter__(self) -> Iterator[VaultCandidate]:
+        return iter(self.candidates)
+
+    def __len__(self) -> int:
+        return len(self.candidates)
+
+    def __getitem__(self, index):
+        return self.candidates[index]
+
+    def __bool__(self) -> bool:
+        return bool(self.candidates)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, VaultCandidateResolution):
+            return (
+                self.candidates,
+                self.policy_arm,
+                self.exit_arm,
+            ) == (
+                other.candidates,
+                other.policy_arm,
+                other.exit_arm,
+            )
+        return list(self.candidates) == other
+
+
+@dataclass(frozen=True, eq=False)
+class VaultCandidateBatch(Sequence[VaultCandidate]):
+    """Aggregated candidates retain each binding's resolution arm."""
+
+    candidates: tuple[VaultCandidate, ...]
+    resolutions: tuple[VaultCandidateResolution, ...]
+
+    def __iter__(self) -> Iterator[VaultCandidate]:
+        return iter(self.candidates)
+
+    def __len__(self) -> int:
+        return len(self.candidates)
+
+    def __getitem__(self, index):
+        return self.candidates[index]
+
+    def __bool__(self) -> bool:
+        return bool(self.candidates)
 
 
 def resolve_candidates(
@@ -43,12 +112,27 @@ def resolve_candidates(
     scope: str,
     scope_id: Optional[str],
     require_injectable: bool,
-) -> list[VaultCandidate]:
+    terminal_id: Optional[str],
+    consumer: Literal["injected_context", "explicit_recall"],
+    policy: Optional[VaultInjectionPolicy] = None,
+) -> VaultCandidateResolution:
     """Return indexed candidates for one already-resolved vault binding."""
-    if require_injectable and not binding.inject:
-        return []
+    policy = policy or _resolve_injection_policy(
+        require_injectable,
+        consumer=consumer,
+        terminal_id=terminal_id,
+    )
+    # Curator recall is inserted verbatim into another terminal's context.
+    # Agent-scoped mappings are explicit-recall-only, matching the builder.
+    if policy.is_curator is not False and binding.scope == "agent":
+        return _resolution(policy, (), "curator_agent_scope_refused")
+    # Callers may tighten the policy but can never waive the curator's gate.
+    if policy.effective_require_injectable and not binding.inject:
+        return _resolution(policy, (), "not_injectable")
+    # Direct-call contract guard. Production callers derive these values from
+    # the binding, but a future direct caller must not cross scopes silently.
     if binding.scope != scope or binding.scope_id != scope_id:
-        return []
+        return _resolution(policy, (), "scope_mismatch")
 
     with SessionLocal() as db:
         query = (
@@ -76,12 +160,94 @@ def resolve_candidates(
         if keys is not None:
             key_list = list(keys)
             if not key_list:
-                return []
+                return _resolution(policy, (), "empty_keys")
             query = query.filter(MemoryMetadataModel.key.in_(key_list))
         rows = query.order_by(MemoryMetadataModel.updated_at.desc(), MemoryMetadataModel.key).all()
-        return [
-            VaultCandidate(binding=binding, metadata=metadata, note=note) for metadata, note in rows
-        ]
+        if not rows:
+            return _resolution(policy, (), "no_rows")
+        candidates = tuple(
+            VaultCandidate(
+                binding=binding,
+                metadata=metadata,
+                note=note,
+                require_injectable=policy.effective_require_injectable,
+                policy_arm=policy.arm,
+            )
+            for metadata, note in rows
+        )
+        return _resolution(policy, candidates, "candidates")
+
+
+def _resolution(
+    policy: VaultInjectionPolicy,
+    candidates: tuple[VaultCandidate, ...],
+    exit_arm: str,
+) -> VaultCandidateResolution:
+    logger.warning(
+        "vault candidate resolution policy_arm=%s exit_arm=%s candidates=%d reason=%s",
+        policy.arm,
+        exit_arm,
+        len(candidates),
+        policy.reason or "none",
+    )
+    return VaultCandidateResolution(candidates, policy.arm, exit_arm)
+
+
+def _resolve_injection_policy(
+    require_injectable: bool,
+    *,
+    consumer: Literal["injected_context", "explicit_recall"],
+    terminal_id: Optional[str],
+) -> VaultInjectionPolicy:
+    """Combine a caller's request with the requesting terminal's policy."""
+    effective_require_injectable = consumer != "explicit_recall" or require_injectable
+    ambient_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    requester_terminal_id = terminal_id or ambient_terminal_id
+    if not requester_terminal_id:
+        policy = VaultInjectionPolicy(effective_require_injectable, "no_terminal", None)
+    else:
+        try:
+            with SessionLocal() as db:
+                terminal = db.get(TerminalModel, requester_terminal_id)
+        except Exception as exc:  # noqa: BLE001 -- unresolved identity must fail closed
+            policy = VaultInjectionPolicy(True, "unresolved", None, f"lookup_failed:{exc}")
+        else:
+            if terminal is None or not terminal.agent_profile:
+                policy = VaultInjectionPolicy(True, "unresolved", None, "terminal_not_found")
+            elif terminal.agent_profile == MEMORY_MANAGER_PROFILE:
+                # Curators use the explicit-recall MCP surface, so ``consumer`` alone
+                # cannot identify their injected destination. Identity is the second,
+                # non-waivable tightening layer.
+                policy = VaultInjectionPolicy(True, MEMORY_MANAGER_POLICY_ARM, True)
+            else:
+                policy = VaultInjectionPolicy(effective_require_injectable, "caller", False)
+    _log_identity_anomaly(policy, terminal_id, ambient_terminal_id, requester_terminal_id)
+    return policy
+
+
+def _log_identity_anomaly(
+    policy: VaultInjectionPolicy,
+    terminal_id: Optional[str],
+    ambient_terminal_id: Optional[str],
+    requester_terminal_id: Optional[str],
+) -> None:
+    """Expose use of ambient identity without changing explicit-ID precedence."""
+    if terminal_id is None and ambient_terminal_id:
+        logger.warning(
+            "vault injection policy identity_source=ambient resolved_terminal_id=%s "
+            "policy_arm=%s",
+            requester_terminal_id,
+            policy.arm,
+        )
+    elif terminal_id and ambient_terminal_id and terminal_id != ambient_terminal_id:
+        logger.warning(
+            "vault injection policy identity_mismatch explicit_terminal_id=%s "
+            "ambient_terminal_id=%s resolved_terminal_id=%s policy_arm=%s",
+            terminal_id,
+            ambient_terminal_id,
+            requester_terminal_id,
+            policy.arm,
+        )
 
 
 def load_candidate(

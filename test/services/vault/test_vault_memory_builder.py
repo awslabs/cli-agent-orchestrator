@@ -28,6 +28,20 @@ from cli_agent_orchestrator.services.vault.reader import (
 from cli_agent_orchestrator.services.vault.reconcile import reconcile
 
 
+@pytest.fixture(autouse=True)
+def _legacy_reader_calls_are_ordinary_requesters(monkeypatch):
+    """Keep U6 boundary tests focused on their declared containment contract."""
+    from cli_agent_orchestrator.services.vault import reader
+
+    monkeypatch.setattr(
+        reader,
+        "_resolve_injection_policy",
+        lambda require_injectable, **_kwargs: reader.VaultInjectionPolicy(
+            require_injectable, "test", False
+        ),
+    )
+
+
 def test_ordinary_vault_note_builds_memory_without_native_timestamp_heading(tmp_path, monkeypatch):
     """An Obsidian body has no native ``## <ISO8601Z>`` section requirement."""
     from cli_agent_orchestrator.services.vault import reader
@@ -62,6 +76,8 @@ def test_ordinary_vault_note_builds_memory_without_native_timestamp_heading(tmp_
         scope="project",
         scope_id="fixture-project",
         require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
     )
     memory = next(
         load_candidate(candidate, max_body_chars=4096, require_injectable=False)
@@ -106,6 +122,8 @@ def test_reader_rejects_non_injectable_mapping_when_required(tmp_path, monkeypat
         scope="project",
         scope_id="fixture-project",
         require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
     )[0]
 
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=True) is None
@@ -208,6 +226,8 @@ def test_vault_memory_body_budget_marks_content_stale_and_truncated(tmp_path, mo
             scope="project",
             scope_id="fixture-project",
             require_injectable=False,
+            terminal_id=None,
+            consumer="explicit_recall",
         )
         if item.metadata.key == "design"
     )
@@ -251,6 +271,8 @@ def _indexed_reader_candidate(tmp_path, monkeypatch, *, run_id: str):
         scope="project",
         scope_id="fixture-project",
         require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
     )[0]
     return reader, Session, fixture, candidate
 
@@ -554,6 +576,8 @@ def test_quarantined_note_is_not_a_recall_candidate_even_with_live_metadata(tmp_
             scope="project",
             scope_id="fixture-project",
             require_injectable=False,
+            terminal_id=None,
+            consumer="explicit_recall",
         )
         == []
     )
@@ -567,7 +591,7 @@ def test_recall_truncation_does_not_introduce_a_third_content_digest() -> None:
     assert scan._sha256(scan._normalize_line_endings(raw)) == writer._sha256(raw)
 
 
-def test_resolve_candidates_never_joins_a_native_metadata_row(tmp_path, monkeypatch):
+def test_resolve_candidates_never_joins_a_native_metadata_row(tmp_path, monkeypatch, caplog):
     """The vault source discriminator prevents same-key native disclosure."""
     from cli_agent_orchestrator.services.vault import reader
 
@@ -577,7 +601,7 @@ def test_resolve_candidates_never_joins_a_native_metadata_row(tmp_path, monkeypa
     monkeypatch.setattr(reader, "SessionLocal", Session)
     root = tmp_path / "vault"
     root.mkdir()
-    mapping = FolderMapping(folder="Mapped", scope="global")
+    mapping = FolderMapping(folder="Mapped", scope="global", inject=True)
     binding = VaultBinding(
         scope="global",
         scope_id=None,
@@ -588,12 +612,12 @@ def test_resolve_candidates_never_joins_a_native_metadata_row(tmp_path, monkeypa
     with Session() as db:
         db.add(
             MemoryMetadataModel(
-                id="native-id",
+                id="metadata-id",
                 key="shared",
                 memory_type="reference",
                 scope="global",
                 scope_id=None,
-                source_kind="native",
+                source_kind="vault",
                 file_path="native.md",
                 tags="",
             )
@@ -612,15 +636,31 @@ def test_resolve_candidates_never_joins_a_native_metadata_row(tmp_path, monkeypa
         )
         db.commit()
 
+    positive_control = resolve_candidates(
+        binding,
+        scope="global",
+        scope_id=None,
+        require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
+    )
+    with Session() as db:
+        db.get(MemoryMetadataModel, "metadata-id").source_kind = "native"
+        db.commit()
+
     assert (
         resolve_candidates(
             binding,
             scope="global",
             scope_id=None,
             require_injectable=False,
+            terminal_id=None,
+            consumer="explicit_recall",
         )
         == []
     )
+    assert [candidate.metadata.key for candidate in positive_control] == ["shared"]
+    assert any("arm=no_rows" in record.getMessage() for record in caplog.records)
 
 
 def test_bm25_reads_a_vault_only_scope_without_native_candidates(tmp_path, monkeypatch):
@@ -651,6 +691,8 @@ def test_bm25_reads_a_vault_only_scope_without_native_candidates(tmp_path, monke
         scope="project",
         scope_id="fixture-project",
         require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
     )
 
     memories = MemoryService(base_dir=tmp_path / "native")._bm25_search(
@@ -697,6 +739,8 @@ def test_bm25_vault_corpus_uses_all_indexed_candidates_with_one_read_each(tmp_pa
         scope="project",
         scope_id="fixture-project",
         require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
     )
     reads: list[str] = []
     original_load = memory_service.load_candidate

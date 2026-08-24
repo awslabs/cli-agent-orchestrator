@@ -92,6 +92,21 @@ with the U12-B placeholder below.
 otherwise refused during scanning. Set it to `true` only when that sharing is
 intentional.
 
+### Automatic injection
+
+`inject: false` governs automatic injection into agent context only. It is not
+a confidentiality control: indexed content remains available through explicit
+recall and to anything that can read the vault or call the local API. An agent
+can pull content that CAO will not push into its context.
+
+Curator injection bounds apply to CAO-mediated vault reads for the
+`memory_manager` identity. Agent-scoped mappings are returned only to a
+requester positively identified as a non-curator; unknown identities, including
+ordinary CLI recall without a terminal, are refused. These bounds cannot
+constrain an agent that reads vault files directly or spawns another identity.
+A vault mapping scoped to `agent` therefore returns nothing to plain CLI recall
+without a resolvable terminal, where earlier releases returned its notes.
+
 ### Secret handling
 
 Each mapping has a `secret_gate`:
@@ -176,6 +191,13 @@ simultaneous manual edit while a managed write is in progress, then reconcile
 again if a conflict is reported.
 
 ## Known limitations
+
+**Agent-scoped mappings are recall-only in this release.** They remain
+available to explicit memory recall for the matching agent profile, but CAO's
+deterministic injection builder considers only session, project, and global
+scopes. Vault status reports this limitation for every agent-scoped mapping.
+Adding agent scope to injection would change the existing per-scope budget
+allocation, so it is intentionally deferred.
 
 CAO can retain identity across an unambiguous pure rename. A rename plus an
 edit in one reconciliation window without an authored `cao.key` is reported,

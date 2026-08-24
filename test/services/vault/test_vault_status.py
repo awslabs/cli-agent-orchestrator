@@ -41,7 +41,10 @@ def test_status_keeps_combined_warn_inject_warning_from_live_config(tmp_path, mo
 
     result = get_vault_status(config)[0]
 
-    assert result.warnings == ("mapping 'Mapped' has secret_gate='warn' with inject=true",)
+    assert result.warnings == (
+        "mapping 'Mapped' has secret_gate='warn' with inject=true",
+        "agent-scoped mapping 'Mapped' is recall-only and is not injected in this release",
+    )
 
 
 def test_status_surfaces_binding_warning_details(tmp_path, monkeypatch):

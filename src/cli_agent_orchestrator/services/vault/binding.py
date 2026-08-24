@@ -147,6 +147,17 @@ def collect_binding_warnings(vault_config: VaultConfig) -> tuple[BindingWarning,
     warnings: list[BindingWarning] = []
     for vault in vault_config.vaults:
         for mapping in vault.mappings:
+            if mapping.scope == "agent":
+                warnings.append(
+                    BindingWarning(
+                        kind="agent_scope_recall_only",
+                        mapping=mapping.folder,
+                        detail=(
+                            f"agent-scoped mapping {mapping.folder!r} is recall-only and "
+                            "is not injected in this release"
+                        ),
+                    )
+                )
             if mapping.scope != "project" or mapping.scope_id is None:
                 continue
 

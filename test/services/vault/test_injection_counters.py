@@ -95,6 +95,34 @@ def test_native_clip_performs_no_vault_counter_write(monkeypatch) -> None:
     assert calls == []
 
 
+def test_related_vault_budget_skip_records_a_distinct_counter(monkeypatch) -> None:
+    """A related skip is visible without inflating the primary-drop magnitude."""
+    from cli_agent_orchestrator.services import memory_service, settings_service
+    from cli_agent_orchestrator.services.vault import binding
+
+    vault_binding = VaultBinding(
+        scope="global",
+        scope_id=None,
+        vault_id="fixture",
+        root="/vault",
+        mapping=FolderMapping(folder="CAO", scope="global"),
+    )
+    calls: list[tuple[str, str, int]] = []
+    monkeypatch.setattr(settings_service, "get_vault_config", lambda: object())
+    monkeypatch.setattr(binding, "resolve", lambda *_args, **_kwargs: vault_binding)
+    monkeypatch.setattr(
+        memory_service,
+        "increment_counter",
+        lambda vault_id, counter_name, amount: calls.append((vault_id, counter_name, amount)),
+    )
+
+    MemoryService()._record_vault_related_injection_skip(_vault_memory("related"))
+
+    assert calls == [
+        ("fixture", "injection_budget_exceeded.related_memories_dropped", 1),
+    ]
+
+
 def test_empty_dropped_list_performs_no_counter_write(monkeypatch) -> None:
     """The helper reaches neither config nor a committing counter session."""
     from cli_agent_orchestrator.services import memory_service, settings_service

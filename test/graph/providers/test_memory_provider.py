@@ -21,6 +21,7 @@ from cli_agent_orchestrator.graph.providers import get_provider
 from cli_agent_orchestrator.graph.providers.memory import MemoryGraphProvider
 from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.vault.binding import VaultConfigUnavailableError
 from cli_agent_orchestrator.services.wiki_lint import LintIssue
 
 BODY = "A reasonably long article body so contradiction pairing engages." + " filler" * 10
@@ -499,3 +500,25 @@ class TestMemoryProviderEdgeCases:
         by_id = {n.id: n for n in view.nodes}
         assert "is_hub" not in by_id["a"].attrs
         assert all(e.type != EdgeType.CONTRADICTION for e in view.edges)
+
+    @pytest.mark.asyncio
+    async def test_unavailable_vault_binding_degrades_to_native_projection(
+        self, populated_scope, monkeypatch
+    ):
+        """Optional vault configuration cannot make graph projection unavailable."""
+        run_lint = AsyncMock(return_value=[])
+        monkeypatch.setattr(wiki_lint, "run_lint", run_lint)
+
+        def unavailable_binding(*_args):
+            raise VaultConfigUnavailableError("invalid vault configuration")
+
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: True,
+            binding_resolver=unavailable_binding,
+        )
+
+        view = await provider.project(scope="global")
+
+        run_lint.assert_awaited_once()
+        assert {node.id for node in view.nodes} >= {"a", "b", "c"}

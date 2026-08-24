@@ -16,7 +16,11 @@ from cli_agent_orchestrator.graph.providers.base import GraphProvider, register_
 from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.vault import binding
-from cli_agent_orchestrator.services.vault.binding import ScopeBinding, VaultBinding
+from cli_agent_orchestrator.services.vault.binding import (
+    ScopeBinding,
+    VaultBinding,
+    VaultConfigUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +106,18 @@ class MemoryGraphProvider(GraphProvider):
                     "disabled_enrichments": _LINT_ENRICHMENTS,
                 }
             )
-        vault_bound = lint_enabled and isinstance(
-            self._binding_resolver(scope, scope_id), VaultBinding
-        )
+        try:
+            vault_bound = lint_enabled and isinstance(
+                self._binding_resolver(scope, scope_id), VaultBinding
+            )
+        except VaultConfigUnavailableError:
+            # Graph projection is derived observability, not a vault enforcement
+            # path. An unavailable optional vault config must not hide native
+            # topology or prevent lint enrichment.
+            logger.warning(
+                "memory graph provider: vault binding unavailable; using native projection"
+            )
+            vault_bound = False
         if vault_bound:
             meta.update(
                 {

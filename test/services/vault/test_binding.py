@@ -141,6 +141,7 @@ def test_collect_binding_warnings_are_complete_deterministic_and_content_free(
                         scope="project",
                         scope_id="deadbeefcafe",
                     ),
+                    FolderMapping(folder="Agent", scope="agent", scope_id="fixture-agent"),
                     FolderMapping(folder="CAO", scope="global", writable=True),
                 ],
             )
@@ -172,14 +173,17 @@ def test_collect_binding_warnings_are_complete_deterministic_and_content_free(
     warnings = binding.collect_binding_warnings(config)
 
     assert [warning.kind for warning in warnings] == [
+        "agent_scope_recall_only",
         "cwd_hash_scope_id",
         "orphaned_mapping",
         "unmapped_project_write",
     ]
-    assert warnings[0].mapping == "Cwd Hash"
-    assert warnings[1].mapping == "Orphaned"
-    assert warnings[2].mapping == ""
+    assert warnings[0].mapping == "Agent"
+    assert warnings[1].mapping == "Cwd Hash"
+    assert warnings[2].mapping == "Orphaned"
+    assert warnings[3].mapping == ""
     assert [warning.detail for warning in warnings] == [
+        "agent-scoped mapping 'Agent' is recall-only and is not injected in this release",
         "project scope_id 'deadbeefcafe' is a cwd-hash alias and may change after a folder rename",
         "project scope_id 'missing-project' is not a known project id or alias",
         "1 native project write(s) missed configured vault mappings",

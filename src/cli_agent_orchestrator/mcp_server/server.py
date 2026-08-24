@@ -2022,6 +2022,14 @@ async def memory_recall(
             sort_by=sort_by,
             include_related=bool(include_related) if isinstance(include_related, bool) else False,
         )
+        # Curated recall is inserted verbatim into another terminal's context.
+        # Keep its vault/native scope set aligned with the deterministic builder:
+        # agent-scoped memories are explicit-recall-only in this release.
+        from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
+
+        if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
+            injectable_scopes = {"session", "project", "global"}
+            memories = [memory for memory in memories if memory.scope in injectable_scopes]
         return {
             "success": True,
             "memories": [

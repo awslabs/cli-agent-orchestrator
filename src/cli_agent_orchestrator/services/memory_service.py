@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Set
+from typing import Any, Literal, Optional, Sequence, Set
 
 from cli_agent_orchestrator.constants import (
     MEMORY_BASE_DIR,
@@ -27,7 +27,11 @@ from cli_agent_orchestrator.services.memory_format import (
 )
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.reader import (
+    MEMORY_MANAGER_PROFILE,
     VaultCandidate,
+    VaultCandidateBatch,
+    VaultInjectionPolicy,
+    _resolve_injection_policy,
     increment_counter,
     load_candidate,
     resolve_candidates,
@@ -99,6 +103,16 @@ def _is_memory_enabled() -> bool:
 # curator lock falls back to Phase 1 rather than queueing — context injection
 # is best-effort and must never block the worker.
 _curator_locks: dict[str, threading.Lock] = {}
+_CURATOR_POLICY_METADATA_KEY = "vault_injection_policy"
+# Corpus population must be identical for every requester: a
+# requester-dependent corpus leaks withheld rows through IDF. ``is_curator``
+# means no identity gate applies to this corpus operation, not that any
+# requester is a confirmed non-curator.
+_BM25_CORPUS_POLICY = VaultInjectionPolicy(
+    effective_require_injectable=False,
+    arm="bm25_corpus",
+    is_curator=False,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -1645,7 +1659,13 @@ class MemoryService:
         """
         return (m.scope, self._effective_scope_id(m), m.key) in superseded
 
-    def _expand_related(self, primaries: list) -> list:
+    def _expand_related(
+        self,
+        primaries: list,
+        *,
+        terminal_id: Optional[str] = None,
+        policy: Optional[VaultInjectionPolicy] = None,
+    ) -> list:
         """One-level cross-reference traversal for ``recall(include_related=True)``.
 
         Appended AFTER the limit slice — the caller asked for related, we
@@ -1728,7 +1748,13 @@ class MemoryService:
                 visited.add(rk)
                 if getattr(primary, "source_kind", "native") == "vault":
                     related_mem = self._load_related_vault_memory(
-                        rk, primary.scope, primary_scope_id
+                        rk,
+                        primary.scope,
+                        primary_scope_id,
+                        require_injectable=False,
+                        terminal_id=terminal_id,
+                        consumer="explicit_recall",
+                        policy=policy,
                     )
                 else:
                     related_mem = self._load_related_memory(rk, primary.scope, primary_scope_id)
@@ -1739,9 +1765,23 @@ class MemoryService:
         return primaries + extras
 
     def _load_related_vault_memory(
-        self, key: str, scope: str, scope_id: Optional[str]
+        self,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        *,
+        require_injectable: bool,
+        terminal_id: Optional[str] = None,
+        consumer: Literal["injected_context", "explicit_recall"],
+        policy: Optional[VaultInjectionPolicy] = None,
     ) -> Optional[Memory]:
-        """Load one vault relationship target through the candidate chokepoint."""
+        """Load one vault relationship target through the candidate chokepoint.
+
+        Related expansion currently resolves the target with the primary's
+        scope and scope_id, so both share a mapping and its ``inject`` value.
+        Thread the policy anyway: a future cross-scope or per-note mapping
+        model must not turn that current invariant into an injection bypass.
+        """
         try:
             from cli_agent_orchestrator.services.settings_service import get_vault_config
             from cli_agent_orchestrator.services.vault.binding import resolve
@@ -1755,13 +1795,16 @@ class MemoryService:
                 keys=[key],
                 scope=scope,
                 scope_id=scope_id,
-                require_injectable=False,
+                require_injectable=require_injectable,
+                terminal_id=terminal_id,
+                consumer=consumer,
+                policy=policy,
             )
             return (
                 load_candidate(
                     candidates[0],
                     max_body_chars=config.max_recall_body_chars,
-                    require_injectable=False,
+                    require_injectable=candidates[0].require_injectable,
                 )
                 if candidates
                 else None
@@ -1925,6 +1968,12 @@ class MemoryService:
         from cli_agent_orchestrator.services.memory_scoring import validate_sort_by
 
         validate_sort_by(sort_by)
+        terminal_id = (terminal_context or {}).get("terminal_id")
+        recall_policy = _resolve_injection_policy(
+            False,
+            consumer="explicit_recall",
+            terminal_id=terminal_id,
+        )
 
         if search_mode == "bm25":
             if not query:
@@ -1943,6 +1992,7 @@ class MemoryService:
                 exclude_keys=set(),
                 terminal_context=terminal_context,
                 scan_all=scan_all,
+                policy=recall_policy,
             )
             return self._apply_sort_and_increment(
                 bm25_only,
@@ -1953,6 +2003,7 @@ class MemoryService:
                 query=query,
                 terminal_context=terminal_context,
                 scan_all=scan_all,
+                policy=recall_policy,
             )
 
         metadata_results = await self._metadata_recall(
@@ -1962,6 +2013,7 @@ class MemoryService:
             limit=limit,
             terminal_context=terminal_context,
             scan_all=scan_all,
+            policy=recall_policy,
         )
 
         if search_mode == "metadata" or not query:
@@ -1974,6 +2026,7 @@ class MemoryService:
                 query=query,
                 terminal_context=terminal_context,
                 scan_all=scan_all,
+                policy=recall_policy,
             )
 
         # hybrid: top up with BM25 hits not already in metadata results
@@ -1989,6 +2042,7 @@ class MemoryService:
                 query=query,
                 terminal_context=terminal_context,
                 scan_all=scan_all,
+                policy=recall_policy,
             )
 
         scope_id = (
@@ -2005,6 +2059,7 @@ class MemoryService:
             exclude_keys=exclude_keys,
             terminal_context=terminal_context,
             scan_all=scan_all,
+            policy=recall_policy,
         )
         return self._apply_sort_and_increment(
             metadata_results + bm25_results,
@@ -2015,6 +2070,7 @@ class MemoryService:
             query=query,
             terminal_context=terminal_context,
             scan_all=scan_all,
+            policy=recall_policy,
         )
 
     def _apply_sort_and_increment(
@@ -2028,8 +2084,9 @@ class MemoryService:
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
         *,
-        vault_candidates: Optional[list[VaultCandidate]] = None,
+        vault_candidates: Optional[Sequence[VaultCandidate]] = None,
         max_body_chars: int = 4096,
+        policy: Optional[VaultInjectionPolicy] = None,
     ) -> list:
         """Apply sort mode, slice, then best-effort access bump.
 
@@ -2073,6 +2130,7 @@ class MemoryService:
                         scan_all,
                         vault_candidates=vault_candidates,
                         max_body_chars=max_body_chars,
+                        policy=policy,
                     )
                 )
                 composite = {
@@ -2130,7 +2188,11 @@ class MemoryService:
         # limit slice (the caller asked for related; we deliver in addition).
         if include_related and sliced:
             try:
-                sliced = self._expand_related(sliced)
+                sliced = self._expand_related(
+                    sliced,
+                    terminal_id=(terminal_context or {}).get("terminal_id"),
+                    policy=policy,
+                )
             except Exception as e:  # noqa: BLE001 — non-blocking promise
                 logger.warning(f"related expansion failed, returning primaries: {e}")
 
@@ -2244,6 +2306,7 @@ class MemoryService:
         limit: int = 10,
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
+        policy: Optional[VaultInjectionPolicy] = None,
     ) -> list[Memory]:
         """Substring-match recall via index.md walk (Phase 1 path)."""
         results: list[Memory] = []
@@ -2323,11 +2386,19 @@ class MemoryService:
                 if memory:
                     results.append(memory)
 
-        for candidate in self._vault_candidates(vault_bindings, require_injectable=False):
+        for candidate in self._vault_candidates(
+            vault_bindings,
+            require_injectable=False,
+            terminal_id=(terminal_context or {}).get("terminal_id"),
+            consumer="explicit_recall",
+            policy=policy,
+        ):
             if memory_type and candidate.metadata.memory_type != memory_type:
                 continue
             memory = load_candidate(
-                candidate, max_body_chars=max_body_chars, require_injectable=False
+                candidate,
+                max_body_chars=max_body_chars,
+                require_injectable=candidate.require_injectable,
             )
             if memory is None:
                 continue
@@ -2408,18 +2479,30 @@ class MemoryService:
         bindings: list[VaultBinding],
         *,
         require_injectable: bool,
-    ) -> list[VaultCandidate]:
-        candidates: list[VaultCandidate] = []
+        terminal_id: Optional[str] = None,
+        consumer: Literal["injected_context", "explicit_recall"],
+        policy: Optional[VaultInjectionPolicy] = None,
+    ) -> VaultCandidateBatch:
+        policy = policy or _resolve_injection_policy(
+            require_injectable, consumer=consumer, terminal_id=terminal_id
+        )
+        resolutions = []
         for binding in bindings:
-            candidates.extend(
+            resolutions.append(
                 resolve_candidates(
                     binding,
                     scope=binding.scope,
                     scope_id=binding.scope_id,
                     require_injectable=require_injectable,
+                    terminal_id=terminal_id,
+                    consumer=consumer,
+                    policy=policy,
                 )
             )
-        return candidates
+        return VaultCandidateBatch(
+            tuple(candidate for resolution in resolutions for candidate in resolution),
+            tuple(resolutions),
+        )
 
     # -------------------------------------------------------------------------
     # BM25 fallback search
@@ -2438,8 +2521,9 @@ class MemoryService:
         scope: Optional[str],
         scan_all: bool,
         *,
-        vault_candidates: Optional[list[VaultCandidate]] = None,
+        vault_candidates: Optional[Sequence[VaultCandidate]] = None,
         max_body_chars: int = 4096,
+        policy: Optional[VaultInjectionPolicy] = None,
     ) -> dict:
         """Raw BM25 score per memory identity for the score-mode lexical factor.
 
@@ -2479,7 +2563,15 @@ class MemoryService:
             search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
                 scope, terminal_context, scan_all=scan_all
             )
-            vault_candidates = self._vault_candidates(vault_bindings, require_injectable=False)
+            # BM25 corpus population is deliberately ungated: withholding
+            # non-injectable rows here changes IDF for rows we do return.
+            vault_candidates = self._vault_candidates(
+                vault_bindings,
+                require_injectable=False,
+                terminal_id=None,
+                consumer="explicit_recall",
+                policy=_BM25_CORPUS_POLICY,
+            )
         else:
             search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
         wanted = {self._identity(m) for m in memories}
@@ -2518,7 +2610,9 @@ class MemoryService:
                 identities.append(identity if identity in wanted else None)
         for candidate in vault_candidates:
             memory = load_candidate(
-                candidate, max_body_chars=max_body_chars, require_injectable=False
+                candidate,
+                max_body_chars=max_body_chars,
+                require_injectable=candidate.require_injectable,
             )
             if memory is None:
                 continue
@@ -2553,8 +2647,9 @@ class MemoryService:
         terminal_context: Optional[dict],
         scan_all: bool,
         *,
-        vault_candidates: Optional[list[VaultCandidate]] = None,
+        vault_candidates: Optional[Sequence[VaultCandidate]] = None,
         max_body_chars: int = 4096,
+        policy: Optional[VaultInjectionPolicy] = None,
     ) -> list[Memory]:
         """Rank wiki bodies by BM25 against ``query``.
 
@@ -2575,9 +2670,22 @@ class MemoryService:
             search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
                 scope, terminal_context, scan_all=scan_all
             )
-            vault_candidates = self._vault_candidates(vault_bindings, require_injectable=False)
+            # The corpus is intentionally ungated so hidden rows cannot alter
+            # IDF. Result eligibility below still uses the caller's policy.
+            vault_candidates = self._vault_candidates(
+                vault_bindings,
+                require_injectable=False,
+                terminal_id=None,
+                consumer="explicit_recall",
+                policy=_BM25_CORPUS_POLICY,
+            )
         else:
             search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        selection_policy = policy or _resolve_injection_policy(
+            False,
+            consumer="explicit_recall",
+            terminal_id=(terminal_context or {}).get("terminal_id"),
+        )
 
         candidates: list[tuple[Optional[Path], dict]] = []
         seen: set[Path] = set()
@@ -2640,7 +2748,9 @@ class MemoryService:
         vault_indexes: set[int] = set()
         for candidate in vault_candidates:
             memory = load_candidate(
-                candidate, max_body_chars=max_body_chars, require_injectable=False
+                candidate,
+                max_body_chars=max_body_chars,
+                require_injectable=candidate.require_injectable,
             )
             if memory is None:
                 continue
@@ -2652,8 +2762,10 @@ class MemoryService:
             # The full indexed scope supplies IDF. Filters apply only to
             # returned candidates, never to the corpus population.
             if (
-                memory_type is None or candidate.metadata.memory_type == memory_type
-            ) and candidate.metadata.key not in exclude_keys:
+                (not selection_policy.effective_require_injectable or candidate.binding.inject)
+                and (memory_type is None or candidate.metadata.memory_type == memory_type)
+                and candidate.metadata.key not in exclude_keys
+            ):
                 vault_memories[index] = memory
 
         if not candidates:
@@ -2996,6 +3108,11 @@ class MemoryService:
 
         lines: list[str] = []
         related_added_total = 0  # global per-build fanout cap
+        injection_policy = _resolve_injection_policy(
+            True,
+            consumer="injected_context",
+            terminal_id=terminal_id,
+        )
 
         for scope_val in scopes_in_order:
             scope_id = self.resolve_scope_id(scope_val, terminal_context)
@@ -3043,6 +3160,26 @@ class MemoryService:
                 if memory:
                     scope_memories.append(memory)
 
+            _native_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+                scope_val, terminal_context, scan_all=False
+            )
+            for candidate in self._vault_candidates(
+                vault_bindings,
+                require_injectable=True,
+                terminal_id=terminal_id,
+                consumer="injected_context",
+                policy=injection_policy,
+            ):
+                if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
+                    break
+                memory = load_candidate(
+                    candidate,
+                    max_body_chars=max_body_chars,
+                    require_injectable=candidate.require_injectable,
+                )
+                if memory:
+                    scope_memories.append(memory)
+
             # One-level cross-reference expansion. Looks up ``related_keys``
             # for primary entries via SQLite (source of truth, not the
             # rendered ``## See Also`` markdown), expands within the same
@@ -3050,12 +3187,18 @@ class MemoryService:
             # the total related articles added across this entire context
             # build at ``RELATED_FANOUT_CAP``. Any lookup failure is silent.
             try:
-                related_lookup = self._related_keys_lookup(
-                    [m.key for m in scope_memories], scope_val, scope_id
-                )
+                primary_keys = [m.key for m in scope_memories]
+                related_lookups = {
+                    "native": self._related_keys_lookup(
+                        primary_keys, scope_val, scope_id, source_kind="native"
+                    ),
+                    "vault": self._related_keys_lookup(
+                        primary_keys, scope_val, scope_id, source_kind="vault"
+                    ),
+                }
             except Exception as e:  # noqa: BLE001 — non-blocking
                 logger.debug(f"related_keys lookup failed: {e}")
-                related_lookup = {}
+                related_lookups = {}
 
             visited: set = {m.key for m in scope_memories}
             primary_snapshot = list(scope_memories)
@@ -3063,14 +3206,26 @@ class MemoryService:
                 if related_added_total >= self.RELATED_FANOUT_CAP:
                     logger.info("related_fanout_cap_reached added=%d", related_added_total)
                     break
-                raw = related_lookup.get(primary.key)
+                source_kind = getattr(primary, "source_kind", "native")
+                raw = related_lookups.get(source_kind, {}).get(primary.key)
                 for rk in self._parse_related_keys(raw, scope=scope_val):
                     if related_added_total >= self.RELATED_FANOUT_CAP:
                         break
                     if rk in visited:
                         continue
                     visited.add(rk)
-                    related_mem = self._load_related_memory(rk, scope_val, scope_id)
+                    if getattr(primary, "source_kind", "native") == "vault":
+                        related_mem = self._load_related_vault_memory(
+                            rk,
+                            scope_val,
+                            scope_id,
+                            require_injectable=True,
+                            terminal_id=terminal_id,
+                            consumer="injected_context",
+                            policy=injection_policy,
+                        )
+                    else:
+                        related_mem = self._load_related_memory(rk, scope_val, scope_id)
                     if related_mem is None:
                         continue
                     related_mem.is_related = True  # transient render label
@@ -3086,9 +3241,16 @@ class MemoryService:
                     if getattr(mem, "is_related", False):
                         # Never truncate mid-list for a related extra; skip
                         # it and try the next (possibly shorter) one.
+                        self._record_vault_related_injection_skip(mem)
                         continue
                     self._record_vault_injection_clip(
-                        scope_val, scope_id, scope_memories[position:]
+                        scope_val,
+                        scope_id,
+                        [
+                            dropped
+                            for dropped in scope_memories[position:]
+                            if not getattr(dropped, "is_related", False)
+                        ],
                     )
                     break
                 lines.append(line)
@@ -3125,6 +3287,25 @@ class MemoryService:
         except Exception as exc:  # noqa: BLE001 -- counters never block injection
             logger.debug("vault injection clip counter skipped: %s", exc)
 
+    def _record_vault_related_injection_skip(self, memory: Memory) -> None:
+        """Record a related vault entry skipped by the injection budget."""
+        if getattr(memory, "source_kind", "native") != "vault":
+            return
+        try:
+            from cli_agent_orchestrator.services.settings_service import get_vault_config
+            from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+            binding = resolve(memory.scope, memory.scope_id, vault_config=get_vault_config())
+            if not isinstance(binding, VaultBinding):
+                return
+            increment_counter(
+                binding.vault_id,
+                "injection_budget_exceeded.related_memories_dropped",
+                1,
+            )
+        except Exception as exc:  # noqa: BLE001 -- counters never block injection
+            logger.debug("vault related injection skip counter skipped: %s", exc)
+
     # -------------------------------------------------------------------------
     # U9 — Curated injection via context-manager agent
     # -------------------------------------------------------------------------
@@ -3142,13 +3323,69 @@ class MemoryService:
 
             for t in list_all_terminals():
                 if (
-                    t.get("agent_profile") == "memory_manager"
+                    t.get("agent_profile") == MEMORY_MANAGER_PROFILE
                     and t.get("session_name") == session_name
                 ):
                     return t
         except Exception as e:
             logger.debug(f"_find_context_manager_terminal failed: {e}")
         return None
+
+    def _curator_policy_fingerprint(
+        self, terminal_context: dict
+    ) -> tuple[tuple[str, str, Optional[str], bool], ...]:
+        """Return the injection policy that this worker's renderer will apply."""
+        bindings: set[tuple[str, str, Optional[str], bool]] = set()
+        for scope in (
+            MemoryScope.SESSION.value,
+            MemoryScope.PROJECT.value,
+            MemoryScope.GLOBAL.value,
+        ):
+            _native_dirs, vault_bindings, _max_body_chars = self._resolve_sources(
+                scope, terminal_context, scan_all=False
+            )
+            bindings.update(
+                (binding.vault_id, binding.scope, binding.scope_id, binding.inject)
+                for binding in vault_bindings
+            )
+        return tuple(
+            sorted(
+                bindings,
+                key=lambda binding: (binding[0], binding[1], binding[2] or "", binding[3]),
+            )
+        )
+
+    def _curator_policy_allows_reuse(self, curator_id: str, terminal_context: dict) -> bool:
+        """Stamp the live curator policy and reject reuse after it changes."""
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+        from cli_agent_orchestrator.services.terminal_service import update_metadata
+
+        fingerprint = self._curator_policy_fingerprint(terminal_context)
+        stored_fingerprint = [list(binding) for binding in fingerprint]
+        terminal = get_terminal_metadata(curator_id)
+        if terminal is None or not isinstance(terminal.get("metadata"), (dict, type(None))):
+            logger.warning("curator policy arm=metadata_unavailable")
+            return False
+
+        metadata = dict(terminal.get("metadata") or {})
+        previous = metadata.get(_CURATOR_POLICY_METADATA_KEY)
+        if previous is not None and previous != stored_fingerprint:
+            logger.warning(
+                "curator fallback reason=policy_changed previous=%s current=%s",
+                previous,
+                stored_fingerprint,
+            )
+            return False
+        if previous == stored_fingerprint:
+            logger.info("curator policy arm=match")
+            return True
+
+        metadata[_CURATOR_POLICY_METADATA_KEY] = stored_fingerprint
+        if not update_metadata(curator_id, metadata):
+            logger.warning("curator policy arm=stamp_failed")
+            return False
+        logger.info("curator policy arm=stamped")
+        return True
 
     def get_curated_memory_context(
         self, terminal_id: str, task_description: Optional[str] = None
@@ -3160,6 +3397,12 @@ class MemoryService:
         failure (no manager, busy, timeout, missing provider, parse failure),
         fall back to the deterministic Phase 1 path so injection never blocks
         the worker agent.
+
+        A curator terminal persists for its session. It may restate content
+        that was injectable when an earlier dispatch recalled it after that
+        mapping becomes non-injectable; this window closes at the session
+        boundary. Requester policy still prevents a later dispatch from
+        recalling newly non-injectable vault content.
         """
         if not _is_memory_enabled():
             return ""
@@ -3187,12 +3430,24 @@ class MemoryService:
             try:
                 if status_monitor.get_status(cm["id"]) != TerminalStatus.IDLE:
                     return self.get_memory_context_for_terminal(terminal_id)
+                if not self._curator_policy_allows_reuse(cm["id"], ctx):
+                    return self.get_memory_context_for_terminal(terminal_id)
 
                 from cli_agent_orchestrator.services.terminal_service import (
                     get_output,
                     send_input,
                 )
 
+                # The terminal buffer is persistent across curator dispatches.
+                # Keep a watermark so a response that omits a block cannot
+                # reuse a previous worker's block. A real session_context tool
+                # would be a second memory input to this curator and must be
+                # gated with the same care as its MCP recall calls.
+                output_before = get_output(cm["id"])
+                if isinstance(output_before, dict):
+                    output_before = output_before.get("output", "")
+                if not isinstance(output_before, str):
+                    output_before = ""
                 send_input(cm["id"], task_description or "")
 
                 # Poll up to ~15s for the curator to finish responding. Without
@@ -3212,11 +3467,19 @@ class MemoryService:
 
             if isinstance(output, dict):
                 output = output.get("output", "")
-            if output and "<cao-memory>" in output:
-                start = output.rfind("<cao-memory>")
-                end = output.rfind("</cao-memory>")
+            # A truncated/replaced buffer cannot establish a safe watermark.
+            # Falling back is preferable to serving a block from an earlier
+            # dispatch when the current response cannot be isolated.
+            dispatch_output = (
+                output[len(output_before) :]
+                if isinstance(output, str) and output.startswith(output_before)
+                else ""
+            )
+            if dispatch_output and "<cao-memory>" in dispatch_output:
+                start = dispatch_output.rfind("<cao-memory>")
+                end = dispatch_output.rfind("</cao-memory>")
                 if 0 <= start < end:
-                    return output[start : end + len("</cao-memory>")]
+                    return dispatch_output[start : end + len("</cao-memory>")]
         except Exception as e:
             logger.debug(f"get_curated_memory_context failed, falling back: {e}")
 
