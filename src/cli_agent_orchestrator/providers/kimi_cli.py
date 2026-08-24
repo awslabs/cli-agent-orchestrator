@@ -109,6 +109,18 @@ WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code CLI!"
 # (persisted, so it does not recur until the next release).
 UPGRADE_PROMPT_PATTERN = r"Skip reminders for version|Upgrade now"
 
+# Kimi Code (MoonshotAI/kimi-code) workspace-trust dialog. When --mcp-config is
+# passed in a folder not previously trusted, kimi-code blocks BEFORE the REPL
+# asking whether to trust the workspace ("Project-level MCP servers are
+# disabled until you explicitly choose Trust"). CAO launches every instance in
+# a fresh per-instance temp dir, so with MCP servers configured the dialog
+# fires on EVERY launch and init times out unless answered. Answering "Trust
+# this folder" here is sound: the folder is CAO's own temp dir containing only
+# CAO-written files (agent.md / system.md), and the MCP config being enabled
+# is the one the operator's own profile declared. Approved by the operator
+# (Carlos, 2026-08-24) for the WaP fork.
+TRUST_PROMPT_PATTERN = r"Trust this folder"
+
 # User input box boundaries (pre-v1.20.0). Kimi displayed user messages in a bordered box:
 #   ╭──────────────────────────────╮
 #   │ user message text             │
@@ -585,6 +597,7 @@ class KimiCliProvider(BaseProvider):
         last_prompt_time = time.monotonic()
         any_prompt_handled = False
         upgrade_dismissed = False
+        trust_answered = False
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -597,6 +610,36 @@ class KimiCliProvider(BaseProvider):
             )
             if output:
                 clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+                # Answer the kimi-code workspace-trust dialog once (same
+                # linger-in-buffer consideration as the upgrade dialog below).
+                # See TRUST_PROMPT_PATTERN for why answering it is sound here.
+                if not trust_answered and re.search(TRUST_PROMPT_PATTERN, clean_output):
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    logger.info(
+                        "Kimi Code workspace-trust dialog detected, trusting CAO temp dir"
+                    )
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    # Menu cursor defaults to "Don't trust"; Up selects
+                    # "Trust this folder", Enter confirms (validated manually
+                    # against kimi-code 0.38 in tmux).
+                    await asyncio.to_thread(
+                        get_backend().send_special_key,
+                        self.session_name,
+                        self.window_name,
+                        "Up",
+                    )
+                    await asyncio.to_thread(
+                        get_backend().send_special_key,
+                        self.session_name,
+                        self.window_name,
+                        "Enter",
+                    )
+                    trust_answered = True
+                    any_prompt_handled = True
+                    last_prompt_time = time.monotonic()  # reset idle timer
+                    await asyncio.sleep(1.0)
+                    continue
                 # Answer the upgrade dialog once; its text lingers in the buffer
                 # after dismissal, so the flag stops a re-answer on later polls.
                 if not upgrade_dismissed and re.search(UPGRADE_PROMPT_PATTERN, clean_output):
