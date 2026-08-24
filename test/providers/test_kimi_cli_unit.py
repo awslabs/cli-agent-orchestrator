@@ -224,6 +224,38 @@ class TestKimiCliProviderInitialization:
 
         provider.cleanup()
 
+    def test_get_status_new_tui_black_circle_bullet_completes(self):
+        """Kimi Code 0.38+ renders response bullets as ● (U+25CF), not •.
+
+        Without accepting ●, _has_received_input never latches on the new
+        TUI, the terminal reads IDLE forever after answering, and handoff
+        completion/extraction never fires (observed live: worker replied
+        '● SMOKE-OK' and stayed idle).
+        """
+        provider = KimiCliProvider("t-tui", "sess", "win")
+        screen = (
+            " ● SMOKE-OK\n"
+            " ╭──────────╮\n"
+            " │ >        │\n"
+            " ╰──────────╯\n"
+            " yolo  agent (kimi-k2.5 ●)  /tmp/x\n"
+            "                        context: 12% (29.5k/256k)\n"
+        )
+        assert provider.get_status(screen) == TerminalStatus.COMPLETED
+
+    def test_get_status_new_tui_status_bar_circle_alone_is_idle(self):
+        """The status bar's own ● ('agent (<model> ●)') is mid-line and must
+        NOT latch input — a freshly booted terminal stays IDLE."""
+        provider = KimiCliProvider("t-tui2", "sess", "win")
+        screen = (
+            " ╭──────────╮\n"
+            " │ >        │\n"
+            " ╰──────────╯\n"
+            " yolo  agent (kimi-k2.5 ●)  /tmp/x\n"
+            "                        context: 0% (0/256k)\n"
+        )
+        assert provider.get_status(screen) == TerminalStatus.IDLE
+
     def test_agent_file_probe_detects_kimi_code_help(self):
         """The probe keys off kimi-code's '--agent-file ... Markdown file' help text."""
         KimiCliProvider._markdown_agent_file_cache = None

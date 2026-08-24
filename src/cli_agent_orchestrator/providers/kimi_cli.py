@@ -7,7 +7,8 @@ Key characteristics:
 - Command: ``kimi`` (installed via ``brew install kimi-cli`` or ``uv tool install kimi-cli``)
 - Idle prompt: ``💫`` (thinking mode, default) or ``✨`` (optionally prefixed with ``username@dirname``)
 - Processing: No idle prompt visible at bottom while the response is streaming
-- Response format: Bullet points prefixed with ``•`` (U+2022)
+- Response format: Bullet points prefixed with ``•`` (U+2022); Kimi Code
+  0.38+ renders response bullets as ``●`` (U+25CF) instead
 - Thinking output: Gray italic ``•`` bullets (ANSI color 38;5;244 + italic)
 - User input: Displayed in a bordered box using box-drawing characters (╭│╰)
 - Auto-approve: ``--yolo`` flag bypasses all tool action confirmations
@@ -140,7 +141,7 @@ PROMPT_WITH_INPUT_PATTERN = r"(?:\w+@[\w.-]+)?[✨💫][^\S\n]+\S"
 # To distinguish them in extraction, check ANSI styling in raw output:
 # - Thinking: gray italic (\x1b[38;5;244m• ... \x1b[3m\x1b[38;5;244m)
 # - Response: plain ``•`` without ANSI color prefix
-RESPONSE_BULLET_PATTERN = r"^•\s"
+RESPONSE_BULLET_PATTERN = r"^[•●]\s"
 
 # Thinking bullet detection in raw (ANSI-preserved) output.
 # Thinking lines use gray color (38;5;244) before the bullet character.
@@ -189,11 +190,13 @@ def _is_live_turn_spinner_line(line: str) -> bool:
     )
 
 
-# A response/thinking bullet ("• …") at line start. Its presence means a turn
+# A response/thinking bullet ("• …", or "● …" on Kimi Code 0.38+ — the
+# status bar's "agent (<model> ●)" is mid-line, so the line-start anchor
+# cannot false-match it) at line start. Its presence means a turn
 # has produced output — used to latch "input received" on the new TUI (the
 # welcome banner / update nag contain no "•", so this won't false-trigger at
 # init).
-ANY_BULLET_PATTERN = r"(?m)^\s*•"
+ANY_BULLET_PATTERN = r"(?m)^\s*[•●]"
 
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
@@ -230,7 +233,7 @@ class KimiCliProvider(BaseProvider):
     _KIMI_PROMPT_RE = re.compile(r"(?:\w{1,32}@[\w.\-]{1,64})?[✨💫][^\S\n]{1,4}\S")
     # Response/thinking markers used to bound a user message line. Matches
     # the same ``• `` bullet the IDLE/PROCESSING path uses.
-    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^•\s")
+    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^[•●]\s")
 
     def __init__(
         self,
@@ -837,7 +840,7 @@ class KimiCliProvider(BaseProvider):
                 default=-1,
             )
             last_bullet = max(
-                (i for i, line in enumerate(lines) if re.match(r"\s*•", line)),
+                (i for i, line in enumerate(lines) if re.match(r"\s*[•●]", line)),
                 default=-1,
             )
             spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
@@ -981,7 +984,7 @@ class KimiCliProvider(BaseProvider):
         if any(
             re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
             for ln in rows
-            if not re.match(r"\s*•", ln)
+            if not re.match(r"\s*[•●]", ln)
         ):
             return TerminalStatus.PROCESSING
 
