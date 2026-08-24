@@ -1236,6 +1236,24 @@ async def lifespan(app: FastAPI):
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
+    # Re-adopt persisted terminals whose tmux windows survived a server
+    # restart (and finalize the ones that did not). Runs AFTER the event bus
+    # consumers above: the re-armed FIFO readers publish into that pipeline.
+    # Best-effort — a re-adoption failure must not block server startup.
+    async def _readopt_at_startup() -> None:
+        try:
+            counts = await terminal_service.readopt_terminals_at_startup()
+            if counts["readopted"] or counts["finalized"]:
+                logger.info(
+                    "Terminal re-adoption: %d re-adopted, %d finalized",
+                    counts["readopted"],
+                    counts["finalized"],
+                )
+        except Exception as e:
+            logger.warning(f"Terminal re-adoption failed: {e}")
+
+    asyncio.create_task(_readopt_at_startup())
+
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
     from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled
