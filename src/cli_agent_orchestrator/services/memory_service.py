@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional, Sequence, Set
@@ -82,6 +83,25 @@ class MemoryPartialWriteError(RuntimeError):
             "Memory content and index were saved, but SQLite metadata could not be updated. "
             f"Run `{self.repair_command}`."
         )
+
+
+@dataclass(frozen=True)
+class ForgetResult:
+    """Content-free outcome of removing native or vault-backed memory state.
+
+    Truthiness means CAO completed the forgetting operation, not that every
+    file was removed. Callers needing file semantics must inspect ``action``
+    and ``path``/``paths``.
+    """
+
+    action: Literal["deleted", "deindexed", "deleted_and_deindexed", "absent"]
+    source_kind: Literal["native", "vault", "both"] | None
+    path: str | None
+    paths: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        """Preserve the historical bool contract for existing consumers."""
+        return self.action != "absent"
 
 
 def _is_memory_enabled() -> bool:
@@ -782,7 +802,39 @@ class MemoryService:
             key = self._sanitize_key(key)
 
         tags = normalize_memory_tags(tags)
+        from cli_agent_orchestrator.services.settings_service import get_vault_config
+        from cli_agent_orchestrator.services.vault.binding import (
+            NativeBinding,
+            record_unmapped_project_write,
+            resolve,
+        )
 
+        vault_config = get_vault_config()
+        if vault_config.enabled:
+            scope_binding = resolve(scope, scope_id, vault_config=vault_config)
+            if isinstance(scope_binding, VaultBinding):
+                return self._store_vault_memory(
+                    content=content,
+                    key=key,
+                    memory_type=memory_type,
+                    tags=tags,
+                    terminal_context=terminal_context,
+                    binding=scope_binding,
+                    vault_config=vault_config,
+                )
+            assert isinstance(scope_binding, NativeBinding)
+            scope_id = scope_binding.scope_id
+            if scope == MemoryScope.PROJECT.value:
+                # Observational only: a native project can be legitimate, but this
+                # makes a configured-map miss visible before native publication.
+                record_unmapped_project_write(scope_id, vault_config=vault_config)
+
+        self._assert_no_cross_tier_collision(
+            key,
+            scope,
+            scope_id,
+            target_source_kind="native",
+        )
         now = datetime.now(timezone.utc)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1004,6 +1056,148 @@ class MemoryService:
             action=action,
             timestamp_clamped=timestamp_clamped,
         )
+
+    def _store_vault_memory(
+        self,
+        *,
+        content: str,
+        key: str,
+        memory_type: str,
+        tags: str,
+        terminal_context: Optional[dict],
+        binding: VaultBinding,
+        vault_config,
+    ) -> Memory:
+        """Publish a mapped memory through the managed vault writer only."""
+        from cli_agent_orchestrator.clients.database import (
+            VAULT_NOTE_SCOPE_ID_SENTINEL,
+            VaultNoteModel,
+        )
+        from cli_agent_orchestrator.services.vault.reconcile import reconcile
+        from cli_agent_orchestrator.services.vault.writer import (
+            VaultWriteConflictError,
+            write_managed_note,
+        )
+
+        if not binding.writable:
+            from cli_agent_orchestrator.services.vault.binding import (
+                record_non_writable_write_refusal,
+            )
+
+            record_non_writable_write_refusal(binding.vault_id)
+            raise ValueError(f"vault mapping {binding.mapping.folder!r} is not writable")
+        if not binding.index:
+            raise ValueError(f"vault mapping {binding.mapping.folder!r} is not indexed")
+        vault = next((item for item in vault_config.vaults if item.id == binding.vault_id), None)
+        if vault is None:
+            raise ValueError(f"vault binding references unknown vault {binding.vault_id!r}")
+        if binding.scope == MemoryScope.AGENT.value:
+            from cli_agent_orchestrator.services.vault.reader import _resolve_injection_policy
+
+            policy = _resolve_injection_policy(
+                False,
+                consumer="explicit_recall",
+                terminal_id=(terminal_context or {}).get("terminal_id"),
+            )
+            if policy.is_curator is not False:
+                raise PermissionError(
+                    "agent-scoped vault writes require a positively identified non-curator requester"
+                )
+
+        self._assert_no_cross_tier_collision(
+            key,
+            binding.scope,
+            binding.scope_id,
+            target_source_kind="vault",
+        )
+        stored_scope_id = (
+            binding.scope_id if binding.scope_id is not None else VAULT_NOTE_SCOPE_ID_SENTINEL
+        )
+        with self._get_db_session() as db:
+            note = (
+                db.query(VaultNoteModel)
+                .filter(
+                    VaultNoteModel.vault_id == binding.vault_id,
+                    VaultNoteModel.scope == binding.scope,
+                    VaultNoteModel.scope_id == stored_scope_id,
+                    VaultNoteModel.cao_key == key,
+                )
+                .one_or_none()
+            )
+            managed_relpath = f"{vault.managed_folder}/{key}.md"
+            if note is not None and note.vault_relpath != managed_relpath:
+                raise VaultWriteConflictError(
+                    f"key {key!r} is already minted by {note.vault_relpath!r} in this mapping; "
+                    "choose another key or rename that note"
+                )
+            expected_content_sha256 = note.content_sha256 if note is not None else None
+
+        write = write_managed_note(
+            vault=vault,
+            binding=binding,
+            key=key,
+            body=content,
+            cao={"type": memory_type},
+            frontmatter={"tags": tags} if tags else None,
+            expected_content_sha256=expected_content_sha256,
+            refresh=lambda _path: reconcile(vault, apply=True),
+        )
+        now = datetime.now(timezone.utc)
+        return Memory(
+            id=str(uuid.uuid4()),
+            key=key,
+            memory_type=memory_type,
+            scope=binding.scope,
+            scope_id=binding.scope_id,
+            file_path=write.path,
+            tags=tags,
+            source_provider=(terminal_context or {}).get("provider"),
+            source_terminal_id=(terminal_context or {}).get("terminal_id"),
+            created_at=now,
+            updated_at=now,
+            content=content,
+            source_kind="vault",
+            source_path=os.path.relpath(write.path, binding.root).replace(os.sep, "/"),
+            action="updated" if expected_content_sha256 is not None else "created",
+        )
+
+    def _assert_no_cross_tier_collision(
+        self,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        *,
+        target_source_kind: Literal["native", "vault"],
+    ) -> None:
+        """Refuse a write that would create same-key native and vault memories."""
+        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+        other_source_kind = "vault" if target_source_kind == "native" else "native"
+        with self._get_db_session() as db:
+            existing = (
+                db.query(MemoryMetadataModel)
+                .filter(
+                    MemoryMetadataModel.key == key,
+                    MemoryMetadataModel.scope == scope,
+                    MemoryMetadataModel.source_kind == other_source_kind,
+                    (
+                        MemoryMetadataModel.scope_id == scope_id
+                        if scope_id is not None
+                        else MemoryMetadataModel.scope_id.is_(None)
+                    ),
+                )
+                .first()
+            )
+        if existing is not None:
+            raise ValueError(
+                f"memory key {key!r} already exists in the {other_source_kind} store "
+                f"for {scope!r}; resolve the cross-tier collision before writing"
+            )
+        if target_source_kind == "vault" and self.get_wiki_path(scope, scope_id, key).exists():
+            raise ValueError(
+                f"memory key {key!r} already exists in the native store "
+                f"for {scope!r}; resolve the cross-tier collision before writing"
+            )
 
     # -------------------------------------------------------------------------
     # Deferred LLM compaction
@@ -2992,8 +3186,9 @@ class MemoryService:
         scope: str = "project",
         terminal_context: Optional[dict] = None,
         scope_id: Optional[str] = None,
-    ) -> bool:
-        """Remove a memory. Deletes wiki file and updates index.md.
+        target: Literal["binding", "native"] = "binding",
+    ) -> ForgetResult:
+        """Remove a memory from its binding or an explicitly native target.
 
         If scope_id is provided directly it is used as-is (for cleanup).
         Otherwise it is resolved from terminal_context.
@@ -3007,8 +3202,22 @@ class MemoryService:
         key = self._sanitize_key(key)
         if scope_id is None:
             scope_id = self.resolve_scope_id(scope, terminal_context)
-        wiki_path = self.get_wiki_path(scope, scope_id, key)
+        if target not in {"binding", "native"}:
+            raise ValueError(f"unsupported forget target: {target!r}")
 
+        if target == "binding":
+            from cli_agent_orchestrator.services.settings_service import get_vault_config
+            from cli_agent_orchestrator.services.vault.binding import resolve
+
+            binding = resolve(scope, scope_id, vault_config=get_vault_config())
+            if isinstance(binding, VaultBinding):
+                return self._deindex_vault_memory(key, binding)
+
+        return self._forget_native_memory(key, scope, scope_id)
+
+    def _forget_native_memory(self, key: str, scope: str, scope_id: Optional[str]) -> ForgetResult:
+        """Remove only CAO-owned native state, without binding resolution."""
+        wiki_path = self.get_wiki_path(scope, scope_id, key)
         if not wiki_path.exists():
             # Drop any stale SQLite row so metadata stays consistent
             # with the wiki even when the file vanished out-of-band.
@@ -3019,7 +3228,7 @@ class MemoryService:
             # Purge only native-produced relationships. Vault-origin rows are
             # deliberately retained with their vault metadata projection.
             self._purge_relationships(key, scope, scope_id)
-            return False
+            return ForgetResult("absent", "native", str(wiki_path))
 
         # Delete the wiki file
         wiki_path.unlink()
@@ -3042,7 +3251,59 @@ class MemoryService:
         # edge touching this key is dangling.
         self._purge_relationships(key, scope, scope_id)
 
-        return True
+        return ForgetResult("deleted", "native", str(wiki_path), (str(wiki_path),))
+
+    def _deindex_vault_memory(self, key: str, binding: VaultBinding) -> ForgetResult:
+        """Remove derived state for a vault note without modifying its file."""
+        from cli_agent_orchestrator.clients.database import (
+            VAULT_NOTE_SCOPE_ID_SENTINEL,
+            VaultNoteModel,
+        )
+
+        scope_id = binding.scope_id
+        stored_scope_id = scope_id if scope_id is not None else VAULT_NOTE_SCOPE_ID_SENTINEL
+        with self._get_db_session() as db:
+            note = (
+                db.query(VaultNoteModel)
+                .filter(
+                    VaultNoteModel.vault_id == binding.vault_id,
+                    VaultNoteModel.scope == binding.scope,
+                    VaultNoteModel.scope_id == stored_scope_id,
+                    VaultNoteModel.cao_key == key,
+                )
+                .one_or_none()
+            )
+            if note is None:
+                return ForgetResult("absent", "vault", None)
+            note.status = "excluded"
+            path = note.vault_relpath
+            db.commit()
+
+        self._delete_metadata(key, binding.scope, scope_id, source_kind="vault")
+        self._purge_vault_relationships(key, binding.scope, scope_id)
+        # Vault notes may be user-authored, so deindexing never unlinks them.
+        # Native peers are CAO-owned and must be removed to avoid leaving an
+        # invisible same-key copy after a vault-bound forget.
+        native = self._forget_native_memory(key, binding.scope, scope_id)
+        if native.action == "deleted":
+            return ForgetResult(
+                "deleted_and_deindexed",
+                "both",
+                path,
+                (path, *native.paths),
+            )
+        return ForgetResult("deindexed", "vault", path, (path,))
+
+    def _purge_vault_relationships(self, key: str, scope: str, scope_id: Optional[str]) -> None:
+        """Remove only derived vault edges after a vault note is deindexed."""
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            MemoryRelationshipService().purge_for_key(scope, scope_id, key, origins=("vault",))
+        except Exception as e:  # noqa: BLE001 -- deindexing remains best-effort for edges
+            logger.warning(f"Vault relationship purge failed (key={key}): {e}")
 
     def _purge_relationships(self, key: str, scope: str, scope_id: Optional[str]) -> None:
         """Hard-delete relationship rows for a FORGOTTEN memory. Best-effort.

@@ -20,6 +20,7 @@ from cli_agent_orchestrator.services.vault.config import VaultSpec
 from cli_agent_orchestrator.services.vault.parser import (
     frontmatter_boundary,
     locate_top_level_cao_blocks,
+    split_frontmatter,
 )
 from cli_agent_orchestrator.utils.atomic_file import _file_lock, _lock_path_for
 from cli_agent_orchestrator.utils.path_validation import (
@@ -92,6 +93,7 @@ def write_managed_note(
         except ValueError as exc:
             raise _conflict(target) from exc
         rendered_cao = _render_cao(key, cao, boundary[1] if boundary is not None else "\n")
+        _check_indexable(rendered, vault)
         _check_secret_gate(body, rendered_cao, binding)
         mode = _target_mode(target)
         _publish_managed_note(vault.root, managed_base, target, rendered, mode)
@@ -278,21 +280,33 @@ def _render_cao(key: str, cao: Mapping[str, Any], newline: str, *, indentation: 
 
 
 def _check_secret_gate(body: str, rendered_cao: str, binding: VaultBinding) -> None:
-    for region, content in (("body", body), ("cao", rendered_cao)):
-        secret_pattern = scan_for_secrets(content)
-        if secret_pattern is None:
-            continue
-        if binding.mapping.secret_gate == "reject":
-            logger.warning(
-                "vault_write_secret_rejected pattern=%s region=%s",
-                secret_pattern,
-                region,
-            )
-            raise VaultSecretWriteError(
-                f"vault write rejected: {region} matched credential pattern {secret_pattern!r}"
-            )
-        logger.warning("vault_write_secret_warn pattern=%s region=%s", secret_pattern, region)
-        continue
+    """Check authored body and generated metadata, preserving user frontmatter."""
+    secret_pattern = scan_for_secrets(f"{body}\n{rendered_cao}")
+    if secret_pattern is None:
+        return
+    if binding.mapping.secret_gate == "reject":
+        from cli_agent_orchestrator.services.vault.binding import record_secret_gate_write_refusal
+
+        record_secret_gate_write_refusal(binding.vault_id)
+        logger.warning("vault_write_secret_rejected pattern=%s", secret_pattern)
+        raise VaultSecretWriteError(
+            f"vault write rejected: note matched credential pattern {secret_pattern!r}"
+        )
+    logger.warning("vault_write_secret_warn pattern=%s", secret_pattern)
+
+
+def _check_indexable(rendered: str, vault: VaultSpec) -> None:
+    """Reject bytes that reconciliation would quarantine or skip."""
+    if "\x00" in rendered:
+        raise ValueError("vault write contains NUL byte")
+    if len(rendered.encode("utf-8")) > vault.max_note_bytes:
+        raise ValueError("vault write exceeds max_note_bytes")
+    try:
+        split_frontmatter(rendered, vault.max_frontmatter_bytes)
+    except ValueError as exc:
+        if str(exc) == "frontmatter_too_large":
+            raise ValueError("vault write exceeds max_frontmatter_bytes") from exc
+        raise
 
 
 def _umask_default_mode() -> int:

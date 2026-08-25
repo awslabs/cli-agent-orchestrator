@@ -384,9 +384,11 @@ def test_binding_aware_query_helpers_default_to_native_without_call_site_changes
             # A backend-matched consumer may instead derive the value from the
             # Memory row it is grouping. Literal or unrelated overrides would
             # weaken the native default at an existing call site. The
-            # deterministic renderer is the one exception: it deliberately
-            # queries native and vault relationship edges separately before
-            # expanding either source.
+            # The deterministic renderer deliberately queries native and vault
+            # relationship edges separately before expanding either source.
+            # The vault deindex helper has already resolved a VaultBinding, so
+            # its literal identifies the store it is removing from rather
+            # than weakening a native-default query.
             assert len(source_kind_keywords) == 1
             source_kind_value = source_kind_keywords[0].value
             explicit_renderer_source = (
@@ -394,9 +396,17 @@ def test_binding_aware_query_helpers_default_to_native_without_call_site_changes
                 and isinstance(source_kind_value, ast.Constant)
                 and source_kind_value.value in {"native", "vault"}
             )
-            if explicit_renderer_source:
+            explicit_vault_deindex_source = (
+                current.name == "_deindex_vault_memory"
+                and isinstance(source_kind_value, ast.Constant)
+                and source_kind_value.value in {"native", "vault"}
+            )
+            if explicit_renderer_source or explicit_vault_deindex_source:
                 continue
-            assert isinstance(source_kind_value, ast.Name)
+            assert isinstance(source_kind_value, ast.Name), (
+                "source_kind literals are allowed only for the deterministic "
+                "renderer's dual-source query and VaultBinding-resolved deindexing"
+            )
             source_kind_name = source_kind_value.id
             forwards_kwonly = source_kind_name == "source_kind" and "source_kind" in kwonly_names
             derives_from_memory = any(

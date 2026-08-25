@@ -65,6 +65,8 @@ class VaultConfigUnavailableError(RuntimeError):
 
 
 _unmapped_project_writes: Counter[str] = Counter()
+_non_writable_write_refusals: Counter[str] = Counter()
+_secret_gate_write_refusals: Counter[str] = Counter()
 _unmapped_project_writes_lock = Lock()
 
 
@@ -140,6 +142,42 @@ def unmapped_project_write_count(scope_id: Optional[str] = None) -> int:
         if scope_id is None:
             return sum(_unmapped_project_writes.values())
         return _unmapped_project_writes[scope_id]
+
+
+def unmapped_project_identity_count() -> int:
+    """Return the process-local number of affected project identities."""
+    with _unmapped_project_writes_lock:
+        return len(_unmapped_project_writes)
+
+
+def record_non_writable_write_refusal(vault_id: str) -> None:
+    """Count a process-local refusal caused by a non-writable vault mapping."""
+    with _unmapped_project_writes_lock:
+        _non_writable_write_refusals[vault_id] += 1
+
+
+def non_writable_write_refusal_count(vault_id: Optional[str] = None) -> int:
+    with _unmapped_project_writes_lock:
+        return (
+            sum(_non_writable_write_refusals.values())
+            if vault_id is None
+            else _non_writable_write_refusals[vault_id]
+        )
+
+
+def record_secret_gate_write_refusal(vault_id: str) -> None:
+    """Count a process-local reject-mode secret-gate write refusal."""
+    with _unmapped_project_writes_lock:
+        _secret_gate_write_refusals[vault_id] += 1
+
+
+def secret_gate_write_refusal_count(vault_id: Optional[str] = None) -> int:
+    with _unmapped_project_writes_lock:
+        return (
+            sum(_secret_gate_write_refusals.values())
+            if vault_id is None
+            else _secret_gate_write_refusals[vault_id]
+        )
 
 
 def collect_binding_warnings(vault_config: VaultConfig) -> tuple[BindingWarning, ...]:
@@ -219,6 +257,8 @@ def _reset_unmapped_project_write_count() -> None:
     """Reset process-local warning counters for isolated tests."""
     with _unmapped_project_writes_lock:
         _unmapped_project_writes.clear()
+        _non_writable_write_refusals.clear()
+        _secret_gate_write_refusals.clear()
 
 
 def _canonical_scope_id(scope: str, scope_id: Optional[str]) -> Optional[str]:

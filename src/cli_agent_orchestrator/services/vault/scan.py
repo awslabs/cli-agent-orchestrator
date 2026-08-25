@@ -173,10 +173,11 @@ def scan_vault(
                     finding_severity(FindingCode.PLUGIN_FORMAT_EXCLUDED, secret_gate="reject"),
                 ),
             )
-        # Frontmatter is retained and consumed downstream, so the gate covers
-        # the whole note rather than only the rendered body.
+        # User frontmatter is preserved verbatim by managed writes. Scan only
+        # authored body content; the writer separately rejects secret-shaped
+        # generated ``cao`` metadata before publishing it.
         secret = classify_secret(
-            parsed.region.raw + "\n" + parsed.region.body,
+            parsed.region.body,
             secret_gate=candidate.mapping.secret_gate,
         )
         if secret is not None:

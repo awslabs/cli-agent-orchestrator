@@ -95,11 +95,14 @@ def test_unmapped_project_write_warns_and_increments_counter(tmp_path, caplog) -
     config = _config(tmp_path)
 
     binding.record_unmapped_project_write("unmapped-project", vault_config=config)
+    binding.record_unmapped_project_write("unmapped-project", vault_config=config)
+    binding.record_unmapped_project_write("another-project", vault_config=config)
 
-    assert binding.unmapped_project_write_count() == 1
-    assert binding.unmapped_project_write_count("unmapped-project") == 1
+    assert binding.unmapped_project_write_count() == 3
+    assert binding.unmapped_project_write_count("unmapped-project") == 2
+    assert binding.unmapped_project_identity_count() == 2
     assert (
-        "unmapped_project_write scope_id='unmapped-project' count=1; "
+        "unmapped_project_write scope_id='unmapped-project' count=2; "
         "writing native wiki while project vault mappings exist"
     ) in caplog.messages
 

@@ -227,6 +227,14 @@ def test_rule_10_rejects_a_second_writable_mapping(tmp_path):
         _load(document)
 
 
+def test_writable_mapping_requires_indexing(tmp_path):
+    document = _document(str(tmp_path))
+    document["vaults"][0]["mappings"][0]["index"] = False
+
+    with pytest.raises(ValidationError, match="writable=true requires index=true"):
+        _load(document)
+
+
 @pytest.mark.parametrize("scope", ["federated", "session"])
 def test_rule_11_refuses_unmappable_scopes(tmp_path, scope):
     document = _document(str(tmp_path))

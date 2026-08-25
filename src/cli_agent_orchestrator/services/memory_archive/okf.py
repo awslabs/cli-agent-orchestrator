@@ -344,6 +344,12 @@ class OkfArchiveBackend(MemoryArchiveBackend):
                 self._reject(report, rel, f"matched credential pattern {hit!r}")
                 return
 
+        from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+        if isinstance(resolve(target_scope, scope_id), VaultBinding):
+            self._reject(report, rel, "vault-bound scopes cannot be imported as native OKF bundles")
+            return
+
         wiki_path = self._svc.get_wiki_path(target_scope, scope_id, key)
         exists = wiki_path.exists()
 
@@ -372,6 +378,7 @@ class OkfArchiveBackend(MemoryArchiveBackend):
                         scope=target_scope,
                         scope_id=scope_id,
                         terminal_context=terminal_context,
+                        target="native",
                     )
                 )
             memory = asyncio.run(

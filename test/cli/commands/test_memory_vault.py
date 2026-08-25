@@ -45,6 +45,9 @@ def test_vault_status_labels_unmapped_writes_as_process_local(monkeypatch) -> No
                 (),
                 (),
                 7,
+                1,
+                0,
+                0,
             ),
         ),
     )
@@ -54,6 +57,10 @@ def test_vault_status_labels_unmapped_writes_as_process_local(monkeypatch) -> No
     assert result.exit_code == 0
     assert (
         "process_local_unmapped_project_writes: unavailable in a fresh CLI process" in result.output
+    )
+    assert (
+        "process_local_unmapped_project_identities: unavailable in a fresh CLI process"
+        in result.output
     )
     assert "7" not in result.output
 

@@ -161,6 +161,11 @@ handling can legitimately match a credential-shaped pattern; `warn` is the
 operator escape hatch for that case. CAO does not silently remove or redact
 the note.
 
+For managed writes, the gate checks the authored body and CAO-generated
+`cao` metadata before publishing. Preserved user frontmatter is not scanned or
+rewritten by this gate; review and change that frontmatter directly when it
+contains credential-shaped text.
+
 `CAO_MEMORY_VAULT_ENABLED` can only disable a file-defined vault
 configuration. Set it to a false value to turn the configured vault off for a
 process. It cannot enable an absent or file-disabled vault, and no environment
@@ -225,6 +230,10 @@ CAO stages its replacement inside the managed folder and publishes it
 atomically on that filesystem. A non-empty managed note whose frontmatter
 cannot be recognized is a conflict, not permission to rewrite it. Resolve the
 note and run `cao memory vault reconcile --apply` before retrying.
+
+Retention may remove CAO's native copy in a vault-backed scope, but it never
+deletes the vault file. A vault-backed memory can therefore outlive the native
+scope retention period until its vault note is changed or removed by its owner.
 
 The release-one writer coordinates CAO writers, not Obsidian or a sync client.
 "Obsidian open and writing" is not a guarantee in this release. Avoid a

@@ -8,9 +8,9 @@ from test.fixtures.vault_factory import build_vault_fixture
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
-from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
+from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel, VaultNoteModel
 from cli_agent_orchestrator.services.memory_relationship_service import RelationshipDTO
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.vault import migrate
@@ -126,6 +126,45 @@ def test_confirmed_delete_source_removes_native_only_after_a_successful_write(
     assert report.deleted_source == 1
     assert not svc.get_wiki_path("global", None, "delete-me").exists()
     assert (fixture.root / "CAO" / "delete-me.md").exists()
+
+
+def test_delete_source_targets_native_memory_not_the_new_vault_note(
+    tmp_path, monkeypatch, svc
+) -> None:
+    """Migration must not deindex the vault destination it just published."""
+    from cli_agent_orchestrator.services import settings_service
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    fixture = build_vault_fixture(tmp_path)
+    engine = svc._db_engine
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(reconcile_module, "SessionLocal", Session)
+    monkeypatch.setattr(reader, "SessionLocal", Session)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes: None)
+    monkeypatch.setattr(reconcile_module, "_clear_stale_vault_edges", lambda *_args: None)
+    monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
+    monkeypatch.setattr(settings_service, "get_vault_config", lambda: VaultConfig(enabled=False))
+    _store(svc, "native-source")
+    native_path = svc.get_wiki_path("global", None, "native-source")
+
+    config = VaultConfig(enabled=True, vaults=[fixture.vault])
+    monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+    report = _migrate(
+        svc,
+        fixture,
+        apply=True,
+        delete_source=True,
+        confirm_delete_source=True,
+        refresh=lambda _path: reconcile_module.reconcile(fixture.vault, apply=True),
+    )
+
+    assert report.deleted_source == 1
+    assert not native_path.exists()
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(cao_key="native-source").one()
+        assert note.status == "indexed"
 
 
 def test_migration_reports_each_named_lossy_field(tmp_path, svc) -> None:
@@ -248,7 +287,7 @@ def test_secret_bearing_item_is_reported_while_later_items_migrate(tmp_path, svc
     assert report.migrated == 1
     assert report.failed == 1
     assert "credential" in report.errors
-    assert "body matched credential pattern" in report.errors["credential"]
+    assert "note matched credential pattern" in report.errors["credential"]
     assert (fixture.root / "CAO" / "ordinary.md").exists()
     assert not (fixture.root / "CAO" / "credential.md").exists()
 

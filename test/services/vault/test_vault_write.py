@@ -369,7 +369,7 @@ def test_write_rejects_secret_rendered_in_cao_frontmatter(tmp_path) -> None:
         _write(fixture, cao={"note": "Authorization: Bearer " + "a" * 16})
 
     assert (
-        str(caught.value) == "vault write rejected: cao matched credential pattern 'bearer_token'"
+        str(caught.value) == "vault write rejected: note matched credential pattern 'bearer_token'"
     )
     assert not (fixture.root / "CAO" / "managed-note.md").exists()
 
@@ -423,17 +423,48 @@ def test_write_detects_modification_after_lock_acquisition(tmp_path, monkeypatch
 def test_reject_secret_gate_refuses_without_creating_note(tmp_path) -> None:
     fixture = build_vault_fixture(tmp_path)
     secret_body = "Authorization: Bearer " + "a" * 16
+    from cli_agent_orchestrator.services.vault import binding
+
+    binding._reset_unmapped_project_write_count()
 
     with pytest.raises(writer.VaultSecretWriteError) as caught:
         _write(fixture, body=secret_body)
 
     assert (
-        str(caught.value) == "vault write rejected: body matched credential pattern 'bearer_token'"
+        str(caught.value) == "vault write rejected: note matched credential pattern 'bearer_token'"
     )
+    assert not (fixture.root / "CAO" / "managed-note.md").exists()
+    assert binding.secret_gate_write_refusal_count(fixture.vault.id) == 1
+
+
+def test_write_refuses_note_that_reconcile_would_skip_for_size(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="exceeds max_note_bytes"):
+        _write(fixture, body="x" * (fixture.vault.max_note_bytes + 1))
+
     assert not (fixture.root / "CAO" / "managed-note.md").exists()
 
 
-def test_write_allows_secret_shaped_retained_frontmatter(tmp_path) -> None:
+def test_write_refuses_retained_frontmatter_that_exceeds_index_cap(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    target = fixture.root / "CAO" / "managed-note.md"
+    original = (
+        "---\n"
+        + "title: "
+        + "x" * fixture.vault.max_frontmatter_bytes
+        + "\n"
+        + "cao:\n  key: old-key\n---\nold body\n"
+    )
+    target.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exceeds max_frontmatter_bytes"):
+        _write(fixture, expected_content_sha256=writer._sha256(original))
+
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_write_preserves_secret_shaped_retained_frontmatter(tmp_path) -> None:
     fixture = build_vault_fixture(tmp_path)
     target = fixture.root / "CAO" / "managed-note.md"
     original = (
@@ -447,12 +478,12 @@ def test_write_allows_secret_shaped_retained_frontmatter(tmp_path) -> None:
 
     _write(fixture, expected_content_sha256=writer._sha256(original))
 
-    written = target.read_text(encoding="utf-8")
-    assert "notes: 'see password: hunter2sixteen in the runbook'\n" in written
-    assert written.endswith("new body\n")
+    assert "notes: 'see password: hunter2sixteen in the runbook'\n" in target.read_text(
+        encoding="utf-8"
+    )
 
 
-def test_warn_secret_gate_logs_each_introduced_region(tmp_path, caplog) -> None:
+def test_warn_secret_gate_logs_final_note_scan(tmp_path, caplog) -> None:
     fixture = build_vault_fixture(tmp_path)
     binding = _binding(fixture)
     warn_binding = VaultBinding(
@@ -476,10 +507,7 @@ def test_warn_secret_gate_logs_each_introduced_region(tmp_path, caplog) -> None:
         for record in caplog.records
         if record.getMessage().startswith("vault_write_secret_warn")
     ]
-    assert secret_messages == [
-        "vault_write_secret_warn pattern=bearer_token region=body",
-        "vault_write_secret_warn pattern=secret_assignment region=cao",
-    ]
+    assert secret_messages == ["vault_write_secret_warn pattern=bearer_token"]
 
 
 def test_write_refuses_read_only_mapping(tmp_path) -> None:

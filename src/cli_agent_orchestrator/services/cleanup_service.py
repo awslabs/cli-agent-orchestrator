@@ -187,12 +187,14 @@ async def cleanup_expired_memories() -> None:
                     if isinstance(resolved_binding, VaultBinding):
                         if binding_key not in refused_bindings:
                             logger.warning(
-                                "vault-bound memory retention refused scope=%s scope_id=%s",
+                                "vault-bound memory retention preserves vault note scope=%s scope_id=%s",
                                 entry["scope"],
                                 effective_scope_id,
                             )
                             refused_bindings.add(binding_key)
-                        continue
+                        target = "native"
+                    else:
+                        target = "binding"
                     # ``forget()`` is declared async but its body is
                     # sync FS work (unlink + flock + index rewrite).
                     # Offload to a thread so the event loop stays
@@ -203,6 +205,7 @@ async def cleanup_expired_memories() -> None:
                         entry["key"],
                         entry["scope"],
                         effective_scope_id,
+                        target,
                     )
                     expired_count += 1
                     logger.info(
@@ -221,7 +224,9 @@ async def cleanup_expired_memories() -> None:
         logger.error(f"Error during memory cleanup: {e}")
 
 
-def _forget_sync(memory_service, key: str, scope: str, scope_id: str | None) -> None:
+def _forget_sync(
+    memory_service, key: str, scope: str, scope_id: str | None, target: str = "binding"
+) -> None:
     """Run MemoryService.forget() synchronously in a worker thread.
 
     forget() is declared async but its body is sync; we invoke it
@@ -230,7 +235,7 @@ def _forget_sync(memory_service, key: str, scope: str, scope_id: str | None) -> 
     """
     import asyncio as _asyncio
 
-    _asyncio.run(memory_service.forget(key=key, scope=scope, scope_id=scope_id))
+    _asyncio.run(memory_service.forget(key=key, scope=scope, scope_id=scope_id, target=target))
 
 
 def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:

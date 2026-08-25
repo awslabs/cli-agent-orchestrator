@@ -140,7 +140,7 @@ def test_wiki_healer_refuses_when_vault_config_is_unavailable(monkeypatch) -> No
     svc._get_db_session.assert_not_called()
 
 
-def test_cleanup_refuses_vault_bound_scope_before_forget(
+def test_cleanup_expires_native_copy_and_preserves_vault_note(
     tmp_path: Path, monkeypatch, caplog
 ) -> None:
     index = tmp_path / "project-id" / "wiki" / "index.md"
@@ -162,9 +162,11 @@ def test_cleanup_refuses_vault_bound_scope_before_forget(
 
     asyncio.run(cleanup_service.cleanup_expired_memories())
 
-    forget.assert_not_called()
+    forget.assert_called_once()
+    assert forget.call_args.args[1:] == ("old-note", "project", "project-id", "native")
     assert (
-        "vault-bound memory retention refused scope=project scope_id=project-id" in caplog.messages
+        "vault-bound memory retention preserves vault note scope=project scope_id=project-id"
+        in caplog.messages
     )
 
 

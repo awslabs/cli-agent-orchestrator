@@ -14,6 +14,9 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.services.vault.binding import (
     collect_binding_warnings,
+    non_writable_write_refusal_count,
+    secret_gate_write_refusal_count,
+    unmapped_project_identity_count,
     unmapped_project_write_count,
 )
 from cli_agent_orchestrator.services.vault.config import VaultConfig
@@ -31,6 +34,9 @@ class VaultStatus:
     finding_counts: tuple[tuple[str, int], ...]
     warnings: tuple[str, ...]
     process_local_unmapped_project_writes: int
+    process_local_unmapped_project_identities: int
+    process_local_non_writable_write_refusals: int
+    process_local_secret_gate_write_refusals: int
     recall_counters: tuple[tuple[str, int], ...] = ()
 
 
@@ -61,6 +67,9 @@ def get_vault_status(
                     tuple(sorted(Counter(finding.code for finding in findings).items())),
                     tuple(dict.fromkeys(warnings)),
                     unmapped_project_write_count(),
+                    unmapped_project_identity_count(),
+                    non_writable_write_refusal_count(vault.id),
+                    secret_gate_write_refusal_count(vault.id),
                     tuple(sorted((counter.counter_name, counter.value) for counter in counters)),
                 )
             )

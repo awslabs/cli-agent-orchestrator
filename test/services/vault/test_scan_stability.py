@@ -118,7 +118,7 @@ def test_utf8_normalization_parser_and_secret_gate_are_scanned(tmp_path):
     assert by_path["Mapped/Credential.md"].findings[0].code == FindingCode.SECRET_DETECTED
 
 
-def test_secret_gate_scans_frontmatter_as_well_as_body(tmp_path):
+def test_secret_gate_leaves_user_frontmatter_outside_body_scan(tmp_path):
     root = tmp_path / "vault"
     root.mkdir()
     (root / "CAO").mkdir()
@@ -130,8 +130,10 @@ def test_secret_gate_scans_frontmatter_as_well_as_body(tmp_path):
 
     report = scan_vault(_vault(root))
 
-    assert report.notes[0].status == "quarantined"
-    assert report.notes[0].findings[0].code == FindingCode.SECRET_DETECTED
+    assert report.notes[0].status == "indexed"
+    assert not any(
+        finding.code == FindingCode.SECRET_DETECTED for finding in report.notes[0].findings
+    )
 
 
 def test_case_collisions_are_refused_before_projection(tmp_path):

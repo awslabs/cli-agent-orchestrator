@@ -1098,7 +1098,7 @@ def test_forget_purges_relationships_and_slug_reuse_inherits_nothing(
     assert len(rel.list_relationships("global", None, "doomed")) == 1
     assert len(rel.list_relationships("global", None, "survivor")) == 1
 
-    assert asyncio.run(svc.forget("doomed", scope="global", scope_id=None)) is True
+    assert asyncio.run(svc.forget("doomed", scope="global", scope_id=None))
 
     # Both directions are gone...
     assert rel.list_relationships("global", None, "doomed") == []
@@ -1145,7 +1145,7 @@ def test_forget_purges_relationships_when_the_file_already_vanished(
     # Remove the file out-of-band so forget() takes the not-exists branch.
     svc.get_wiki_path("global", None, "ghost").unlink()
 
-    assert asyncio.run(svc.forget("ghost", scope="global", scope_id=None)) is False
+    assert not asyncio.run(svc.forget("ghost", scope="global", scope_id=None))
     assert (
         rel.list_relationships("global", None, "ghost") == []
     ), "the vanished-file path must purge relationships too"
@@ -1185,7 +1185,7 @@ def test_forget_spares_vault_edges_and_metadata_while_purging_native_edges(
         source_kind="vault",
     )
 
-    assert asyncio.run(svc.forget("shared", scope=scope, scope_id=scope_id)) is False
+    assert not asyncio.run(svc.forget("shared", scope=scope, scope_id=scope_id))
 
     with Session() as db:
         assert (db.query(MemoryRelationshipModel).filter_by(origin="compiler").count()) == 0

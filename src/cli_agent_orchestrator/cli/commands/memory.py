@@ -173,6 +173,15 @@ def vault_status(out_format):
         payload["process_local_unmapped_project_writes"] = (
             "process-local; unavailable in a fresh CLI process"
         )
+        payload["process_local_unmapped_project_identities"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
+        payload["process_local_non_writable_write_refusals"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
+        payload["process_local_secret_gate_write_refusals"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
         if out_format == "json":
             click.echo(json.dumps(payload, indent=2, sort_keys=True))
             continue
@@ -184,6 +193,18 @@ def vault_status(out_format):
             click.echo(f"warning: {warning}")
         click.echo(
             "process_local_unmapped_project_writes: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+        click.echo(
+            "process_local_unmapped_project_identities: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+        click.echo(
+            "process_local_non_writable_write_refusals: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+        click.echo(
+            "process_local_secret_gate_write_refusals: "
             "unavailable in a fresh CLI process (not durable status)"
         )
 
@@ -430,8 +451,14 @@ def delete(key, scope, yes):
     except Exception as e:
         raise click.ClickException(str(e))
 
-    if deleted:
+    if deleted.action == "deleted":
         click.echo(f"Deleted memory '{key}' (scope: {scope}).")
+    elif deleted.action == "deindexed":
+        click.echo(f"De-indexed '{key}'; the file is retained in your vault at {deleted.path}.")
+    elif deleted.action == "deleted_and_deindexed":
+        click.echo(
+            f"Deleted native memory '{key}' and de-indexed the retained vault file at {deleted.path}."
+        )
     else:
         raise click.ClickException(f"Memory '{key}' not found in scope '{scope}'.")
 
@@ -474,7 +501,7 @@ def clear(scope, yes):
                     scope_id=mem.scope_id,
                 )
             )
-            if result:
+            if result.action in {"deleted", "deleted_and_deindexed"}:
                 deleted_count += 1
         except Exception:
             click.echo(f"Warning: Failed to delete '{mem.key}'.", err=True)

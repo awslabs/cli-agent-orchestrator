@@ -154,6 +154,8 @@ class FolderMapping(BaseModel):
             raise ValueError(f"scope_id is required for {self.scope} scope")
         if self.inject and not self.index:
             raise ValueError("inject=true requires index=true")
+        if self.writable and not self.index:
+            raise ValueError("writable=true requires index=true")
         return self
 
 

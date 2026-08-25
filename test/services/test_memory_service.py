@@ -322,7 +322,7 @@ class TestForgetRemovesFileAndIndex:
         assert file_path.exists()
 
         deleted = _run(svc.forget(key="temp-note", scope="global", terminal_context=ctx))
-        assert deleted is True
+        assert deleted.action == "deleted"
         assert not file_path.exists()
 
         # Check index
@@ -341,7 +341,7 @@ class TestForgetNonexistentKey:
         ctx = _make_terminal_context()
 
         result = _run(svc.forget(key="nonexistent", scope="global", terminal_context=ctx))
-        assert result is False
+        assert result.action == "absent"
 
 
 class TestGetContextRespectsBudget:
@@ -832,7 +832,7 @@ class TestForgetWithExplicitScopeId:
             )
         )
 
-        assert deleted is True
+        assert bool(deleted)
         assert not Path(mem.file_path).exists()
 
     def test_forget_global_with_explicit_scope_id_none(self, tmp_path: Path):
@@ -853,7 +853,7 @@ class TestForgetWithExplicitScopeId:
         assert Path(mem.file_path).exists()
 
         deleted = _run(svc.forget(key="global-ref", scope="global", scope_id=None))
-        assert deleted is True
+        assert deleted.action == "deleted"
         assert not Path(mem.file_path).exists()
 
 
@@ -1138,7 +1138,7 @@ class TestSessionScopeIdRoundTrip:
                 terminal_context=None,
                 scope_id=mem.scope_id,
             )
-            assert ok is True
+            assert ok.action == "deleted"
 
         # Both files gone.
         remaining = await svc.recall(scope="session", terminal_context=None)
@@ -1298,7 +1298,7 @@ class TestFederatedScope:
         assert "[fed-forget]" in index_path.read_text(encoding="utf-8")
 
         ok = _run(svc.forget(key="fed-forget", scope="federated", terminal_context=ctx))
-        assert ok is True
+        assert ok.action == "deleted"
         assert not wiki.exists()
         assert _fed_row(engine, "fed-forget") is None
         assert "[fed-forget]" not in index_path.read_text(encoding="utf-8")

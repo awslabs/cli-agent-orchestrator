@@ -96,6 +96,9 @@ def test_status_names_unmapped_writes_as_process_local(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     monkeypatch.setattr(status, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(status, "unmapped_project_write_count", lambda: 3)
+    monkeypatch.setattr(status, "unmapped_project_identity_count", lambda: 2)
+    monkeypatch.setattr(status, "non_writable_write_refusal_count", lambda _vault_id: 4)
+    monkeypatch.setattr(status, "secret_gate_write_refusal_count", lambda _vault_id: 5)
     root = tmp_path / "vault"
     root.mkdir()
     (root / "CAO").mkdir()
@@ -114,3 +117,6 @@ def test_status_names_unmapped_writes_as_process_local(tmp_path, monkeypatch):
     result = get_vault_status(config)[0]
 
     assert result.process_local_unmapped_project_writes == 3
+    assert result.process_local_unmapped_project_identities == 2
+    assert result.process_local_non_writable_write_refusals == 4
+    assert result.process_local_secret_gate_write_refusals == 5

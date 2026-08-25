@@ -119,7 +119,17 @@ def migrate_scope(
         report.migrated += 1
         if delete_source:
             try:
-                if asyncio.run(memory_service.forget(row.key, scope=scope, scope_id=scope_id)):
+                forgotten = asyncio.run(
+                    memory_service.forget(
+                        row.key,
+                        scope=scope,
+                        scope_id=scope_id,
+                        target="native",
+                    )
+                )
+                if forgotten.source_kind != "native":
+                    raise RuntimeError("migration delete-source did not target native memory")
+                if forgotten:
                     report.deleted_source += 1
             except Exception as exc:  # Durable vault note remains observable as an item failure.
                 report.failed += 1

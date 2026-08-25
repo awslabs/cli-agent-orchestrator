@@ -6866,12 +6866,17 @@ async def delete_memory_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete memory: {str(e)}",
         )
-    if not deleted:
+    if deleted.action == "absent":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Memory '{key}' not found in scope '{scope.value}'",
         )
-    return {"success": True}
+    return {
+        "success": True,
+        "action": deleted.action,
+        "path": deleted.path,
+        "source_kind": deleted.source_kind,
+    }
 
 
 @app.delete("/memory")
@@ -6911,7 +6916,12 @@ async def clear_memories_endpoint(
         try:
             # session/agent results carry scope_id natively; project results
             # need the query param (their recalled scope_id is None).
-            if await svc.forget(key=mem.key, scope=scope.value, scope_id=mem.scope_id or scope_id):
+            result = await svc.forget(
+                key=mem.key,
+                scope=scope.value,
+                scope_id=mem.scope_id or scope_id,
+            )
+            if result.action in {"deleted", "deleted_and_deindexed"}:
                 deleted_count += 1
         except MemoryDisabledError:
             raise HTTPException(

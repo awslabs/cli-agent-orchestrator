@@ -2077,7 +2077,8 @@ async def memory_forget(
 ) -> Dict[str, Any]:
     """Remove a memory by key and scope.
 
-    Deletes the wiki topic file and removes the entry from index.md.
+    Deletes native memory files or deindexes vault-backed memory without
+    deleting the underlying vault note.
     """
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
@@ -2091,7 +2092,9 @@ async def memory_forget(
         )
         return {
             "success": True,
-            "deleted": deleted,
+            "deleted": bool(deleted),
+            "action": deleted.action,
+            "path": deleted.path,
             "key": key,
             "scope": scope,
         }

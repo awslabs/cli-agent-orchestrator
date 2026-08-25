@@ -764,8 +764,9 @@ class MemoryRelationshipService:
         key: str,
         *,
         spare_origins: tuple[str, ...] = ("vault",),
+        origins: tuple[str, ...] | None = None,
     ) -> int:
-        """HARD-delete non-spared rows touching ``key`` in either direction.
+        """HARD-delete selected rows touching ``key`` in either direction.
 
         Called when the underlying memory is FORGOTTEN (human review, PR #524).
         Native ``forget()`` removes the wiki file, the index entry and its
@@ -778,6 +779,10 @@ class MemoryRelationshipService:
         ``MemoryService._delete_metadata``'s source-kind predicate: native
         forget must not half-delete a vault-backed memory by removing its
         relationship projection while preserving its metadata.
+
+        ``origins`` selects only those origins for a derived-state removal.
+        It lets vault forget deindex vault edges without touching a native
+        memory that shares the same key and scope.
 
         This is a HARD delete, not the ``soft_delete`` status transition: a
         soft-deleted row is a curation record ABOUT a live memory, whereas here
@@ -795,19 +800,19 @@ class MemoryRelationshipService:
         k = self._sanitize_key(key)
         sentinel = self._to_sentinel(scope_id)
         with SessionLocal() as db:
-            rows = (
-                db.query(MemoryRelationshipModel)
-                .filter(
-                    MemoryRelationshipModel.scope == scope,
-                    MemoryRelationshipModel.scope_id == sentinel,
-                    or_(
-                        MemoryRelationshipModel.source_key == k,
-                        MemoryRelationshipModel.target_key == k,
-                    ),
-                    MemoryRelationshipModel.origin.notin_(spare_origins),
-                )
-                .all()
-            )
+            filters = [
+                MemoryRelationshipModel.scope == scope,
+                MemoryRelationshipModel.scope_id == sentinel,
+                or_(
+                    MemoryRelationshipModel.source_key == k,
+                    MemoryRelationshipModel.target_key == k,
+                ),
+            ]
+            if origins is None:
+                filters.append(MemoryRelationshipModel.origin.notin_(spare_origins))
+            else:
+                filters.append(MemoryRelationshipModel.origin.in_(origins))
+            rows = db.query(MemoryRelationshipModel).filter(*filters).all()
             if not rows:
                 return 0
             for r in rows:
