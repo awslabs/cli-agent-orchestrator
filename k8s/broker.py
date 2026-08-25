@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hmac
+import json
+import logging
 import os
 import secrets
 import time
@@ -26,9 +28,16 @@ WORKSPACE_ROOT = os.environ.get(
 )
 PROJECT_ID = os.environ.get("CAO_ELASTIC_PROJECT_ID", "cao-cluster")
 WORKER_TIMEOUT = int(os.environ.get("CAO_ELASTIC_WORKER_TIMEOUT", "3600"))
+# ConfigMap the fleet panel mounts. The broker keeps the worker entries in it
+# current; see the "fleet view" section below.
+FLEET_CONFIG_MAP = os.environ.get("CAO_ELASTIC_FLEET_CONFIG_MAP", "cao-fleet-config")
+FLEET_CONFIG_KEY = os.environ.get("CAO_ELASTIC_FLEET_CONFIG_KEY", "fleet.json")
+FLEET_CONFIG_RETRIES = 3
 READY_TIMEOUT = int(os.environ.get("CAO_ELASTIC_READY_TIMEOUT", "300"))
 
 config.load_incluster_config()
+logger = logging.getLogger("cao.broker")
+
 batch_api = client.BatchV1Api()
 core_api = client.CoreV1Api()
 
@@ -190,6 +199,88 @@ def _worker_service(worker_id: str) -> client.V1Service:
     )
 
 
+# --- fleet view -------------------------------------------------------------
+#
+# The panel renders whatever `fleet.json` lists, and it has no way to discover an
+# elastic worker: the pods are Jobs with generated names that come and go. So the
+# broker, which already owns that lifecycle, publishes each ready worker into the
+# ConfigMap the panel mounts and withdraws it on release.
+#
+# The panel re-reads the file on every /api/fleet request, so no restart is
+# needed. A mounted ConfigMap is refreshed by the kubelet on its sync period,
+# which means the panel can lag a change by up to about a minute.
+
+
+def _worker_machine(worker_id: str) -> dict[str, str]:
+    """The panel's fleet entry for one worker."""
+    return {
+        "name": f"worker-{worker_id}",
+        "host": f"{_job_name(worker_id)}.{NAMESPACE}.svc.cluster.local",
+        "label": f"Worker {worker_id}",
+        "role": "worker",
+    }
+
+
+def _fleet_with(doc: dict, worker_id: str) -> dict:
+    """Return `doc` with this worker present exactly once.
+
+    Pure so the merge rules are reviewable on their own: entries the broker does
+    not own -- the supervisor, anything an operator added by hand -- are carried
+    through untouched, and re-publishing an existing worker replaces its entry
+    rather than duplicating it.
+    """
+    machines = [m for m in doc.get("machines", []) if m.get("name") != f"worker-{worker_id}"]
+    machines.append(_worker_machine(worker_id))
+    return {**doc, "machines": machines}
+
+
+def _fleet_without(doc: dict, worker_id: str) -> dict:
+    """Return `doc` with this worker absent. Idempotent."""
+    machines = [m for m in doc.get("machines", []) if m.get("name") != f"worker-{worker_id}"]
+    return {**doc, "machines": machines}
+
+
+def _update_fleet_config(worker_id: str, publish: bool) -> None:
+    """Add or remove this worker in the panel's ConfigMap.
+
+    Never raises. The fleet view is an operator convenience; a worker that runs
+    but is missing from the panel is a cosmetic fault, while a lease that fails
+    because a ConfigMap write did is a real one. Every failure here is therefore
+    swallowed after logging.
+
+    Retries on 409. Two concurrent leases read-modify-write the same object, so
+    the loser must re-read rather than clobber the winner's entry.
+    """
+    for attempt in range(FLEET_CONFIG_RETRIES):
+        try:
+            cm = core_api.read_namespaced_config_map(FLEET_CONFIG_MAP, NAMESPACE)
+            raw = (cm.data or {}).get(FLEET_CONFIG_KEY)
+            if raw is None:
+                # Nothing to merge into. Publishing a fleet from scratch would
+                # invent a supervisor entry this code cannot know, so leave the
+                # ConfigMap to whoever owns it.
+                logger.warning(
+                    "fleet config %s/%s has no %s key; skipping fleet view update",
+                    NAMESPACE,
+                    FLEET_CONFIG_MAP,
+                    FLEET_CONFIG_KEY,
+                )
+                return
+            doc = json.loads(raw)
+            updated = _fleet_with(doc, worker_id) if publish else _fleet_without(doc, worker_id)
+            cm.data[FLEET_CONFIG_KEY] = json.dumps(updated, indent=2) + "\n"
+            core_api.replace_namespaced_config_map(FLEET_CONFIG_MAP, NAMESPACE, cm)
+            return
+        except ApiException as exc:
+            if exc.status == 409 and attempt < FLEET_CONFIG_RETRIES - 1:
+                continue
+            logger.warning("could not update fleet view for worker %s: %s", worker_id, exc)
+            return
+        except Exception as exc:  # malformed JSON, missing ConfigMap, anything
+            logger.warning("could not update fleet view for worker %s: %s", worker_id, exc)
+            return
+
+
 def _wait_ready(worker_id: str) -> None:
     deadline = time.monotonic() + READY_TIMEOUT
     selector = f"cao.aws/worker-id={worker_id}"
@@ -207,6 +298,10 @@ def _wait_ready(worker_id: str) -> None:
 
 def _release(worker_id: str) -> None:
     name = _job_name(worker_id)
+    # First, so the panel stops probing a host that is about to disappear. This
+    # is the one funnel for every removal path -- delete, complete, and the
+    # rollback when creation fails -- so withdrawing here covers all of them.
+    _update_fleet_config(worker_id, publish=False)
     try:
         batch_api.delete_namespaced_job(
             name,
@@ -259,6 +354,10 @@ def create_worker(
     except Exception:
         _release(worker_id)
         raise
+    # After readiness on purpose: the panel probes every entry it is given and
+    # reports a node that does not answer as unreachable, so listing a worker
+    # still booting would show it as a fault for the ~20s it takes to come up.
+    _update_fleet_config(worker_id, publish=True)
     return WorkerLease(
         worker_id=worker_id,
         target_host=f"{name}.{NAMESPACE}.svc.cluster.local",
