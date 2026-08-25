@@ -77,7 +77,7 @@ Parameters:
       eviction.
 
       Graviton (m7g) rather than Intel (m6i) so the node architecture matches
-      the Workshop Studio code editor, which is m8g.large — arm64. The image is
+      the Workshop Studio code editor, which is m8g.large - arm64. The image is
       built on the code editor and pushed to this account's ECR, so an x86 node
       group would mean either a cross-build under emulation or an image that
       simply will not start. Keep this and AmiType below in agreement.
@@ -149,7 +149,7 @@ Parameters:
       Optional IAM principal to grant cluster-admin via an EKS access entry.
       REQUIRED in Workshop Studio: the stack is deployed by the WS provisioning
       role, so BootstrapClusterCreatorAdminPermissions grants admin to THAT
-      principal and the participant role gets no cluster access at all — every
+      principal and the participant role gets no cluster access at all - every
       kubectl command in the workshop then fails Unauthorized. Set this to the
       participant role ARN. Leave empty when deploying by hand, where the
       deploying principal is already the creator.
@@ -1177,7 +1177,7 @@ Outputs:
     Description: >-
       Rendered into the broker's egress NetworkPolicy by ../deploy.sh. The broker
       needs to reach the Kubernetes API server, whose control plane ENIs sit in
-      this range — and the agent pods' egress policy blocks it, so the broker gets
+      this range - and the agent pods' egress policy blocks it, so the broker gets
       an explicit allow instead of a copy of their rules.
     Value: !Ref VpcCidr
 
