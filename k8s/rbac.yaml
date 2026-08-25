@@ -28,6 +28,13 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "get", "list", "watch", "delete"]
+  # The broker publishes each ready worker into the panel's fleet ConfigMap and
+  # withdraws it on release, because nothing else can enumerate Job-backed
+  # workers. Read plus update only: it merges into a ConfigMap the kustomization
+  # owns, and never creates or deletes one.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

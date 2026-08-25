@@ -1,0 +1,38 @@
+# Fleet registry for the panel (mounted at /config/fleet.json).
+#
+# JOINTLY OWNED, which is unusual enough to state plainly:
+#
+#   * This file supplies the entries that are always there -- the supervisor.
+#   * The broker adds and removes the `role: worker` entries at runtime, because
+#     elastic workers are Jobs with generated names that nothing can enumerate
+#     ahead of time. See `_update_fleet_config` in broker.py.
+#
+# So the live object normally differs from this file, and that is expected rather
+# than drift. Re-running `kubectl apply -k k8s` resets it to just the supervisor;
+# the broker republishes each worker on its next lease, but workers already
+# running at that moment disappear from the panel until they are released. Avoid
+# re-applying while a fleet is busy.
+#
+# The panel re-reads this file on every /api/fleet request, so edits need no
+# restart. A mounted ConfigMap refreshes on the kubelet's sync period, so a
+# change can take up to about a minute to become visible.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cao-fleet-config
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-elastic-fleet
+data:
+  fleet.json: |
+    {
+      "port": 9889,
+      "machines": [
+        {
+          "name": "supervisor",
+          "host": "cao-supervisor.cao-cluster.svc.cluster.local",
+          "label": "Supervisor",
+          "role": "supervisor"
+        }
+      ]
+    }

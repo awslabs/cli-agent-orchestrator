@@ -7,8 +7,12 @@ resources:
   - storage.yaml
   - rbac.yaml
   - external-secret.yaml
+  # Base fleet registry for the panel. The broker maintains the worker entries in
+  # it at runtime, so the live object intentionally diverges from this file.
+  - configmap-fleet.yaml
   - broker.yaml
   - supervisor.yaml
+  - panel.yaml
   - networkpolicy.yaml
 images:
   - name: cao-server
@@ -16,4 +20,7 @@ images:
     newTag: <immutable-tag>
   - name: cao-worker-broker
     newName: <account-id>.dkr.ecr.<aws-region>.amazonaws.com/cao-worker-broker
+    newTag: <immutable-tag>
+  - name: cao-fleet-panel
+    newName: <account-id>.dkr.ecr.<aws-region>.amazonaws.com/cao-fleet-panel
     newTag: <immutable-tag>
