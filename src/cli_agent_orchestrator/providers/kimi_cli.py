@@ -981,15 +981,31 @@ class KimiCliProvider(BaseProvider):
         # the real message and box-first priority would slice the response
         # from the boot screen. The response always follows the LAST user
         # input, whichever marker style rendered it.
+        anchored_on_prompt = False
         if box_end_idx is not None and prompt_input_idx is not None:
             response_start = max(box_end_idx, prompt_input_idx) + 1
+            anchored_on_prompt = prompt_input_idx >= box_end_idx
         elif box_end_idx is not None:
             response_start = box_end_idx + 1
         elif prompt_input_idx is not None:
             response_start = prompt_input_idx + 1
+            anchored_on_prompt = True
         else:
             # Neither marker found — long response scrolled everything out
             return self._extract_without_input_box(raw_lines, clean_lines)
+
+        # ✨-anchored (newest TUI): long user messages WRAP, and the wrapped
+        # continuation lines sit between the anchor and the first response
+        # bullet with no distinguishing style. Every assistant block starts
+        # with a bullet, so advance to the first bullet line — dropping the
+        # echoed tail of the user message. Box-anchored (legacy) extraction is
+        # left untouched; if no bullet exists in the window, keep the start
+        # (fallback safety).
+        if anchored_on_prompt:
+            for i in range(response_start, len(clean_lines)):
+                if re.match(r"^\s*[•●]", clean_lines[i]):
+                    response_start = i
+                    break
 
         # Find where the response ends: the next bare idle prompt
         # (legacy/v1.20 TUIs), or the newest-TUI footer chrome — the

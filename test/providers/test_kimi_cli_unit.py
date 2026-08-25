@@ -569,6 +569,28 @@ class TestKimiCliProviderMessageExtraction:
         assert "Pensando" not in result
         assert "more lines" not in result
 
+    def test_extract_new_tui_skips_wrapped_message_echo(self):
+        """✨-anchored: wrapped user-message continuation lines are skipped.
+
+        Long user messages wrap below the ✨ anchor with no distinguishing
+        style; extraction must start at the first response bullet, not echo
+        the task tail back to the caller.
+        """
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "\u2728 Primera parte de una tarea larga que\n"
+            "continua envuelta en la linea siguiente y\n"
+            "termina aqui con instrucciones finales.\n"
+            "\u25cf Respuesta real del worker.\n"
+            "Segunda linea de la respuesta.\n"
+            "context: 2% (5k/256k)\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Respuesta real del worker" in result
+        assert "Segunda linea de la respuesta" in result
+        assert "continua envuelta" not in result
+        assert "instrucciones finales" not in result
+
     def test_extract_message_filters_thinking(self):
         """Test that thinking bullets (gray ANSI) are filtered from output."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
