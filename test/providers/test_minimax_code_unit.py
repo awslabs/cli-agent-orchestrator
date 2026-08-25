@@ -13,7 +13,12 @@ import yaml
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider, ProviderError
+from cli_agent_orchestrator.providers.minimax_code import (
+    _COMPLETION_PATTERN,
+    MiniMaxCodeProvider,
+    ProviderError,
+    _last_match_start,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -30,6 +35,12 @@ def make_provider(**kwargs) -> MiniMaxCodeProvider:
         agent_profile=kwargs.pop("agent_profile", "developer"),
         **kwargs,
     )
+
+
+def test_completion_marker_matches_after_blank_terminal_rows():
+    output = "assistant output\n\n  └ Completed in 12s"
+
+    assert _last_match_start(_COMPLETION_PATTERN, output) == output.index("  └")
 
 
 def test_prepare_runtime_isolates_auth_and_generates_private_mcp_plugin(

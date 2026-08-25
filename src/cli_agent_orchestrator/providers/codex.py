@@ -71,7 +71,11 @@ ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)
 # v0.136+: "model · path" (the "N% left" segment was removed)
 # The "·\s+[~/]" alternative anchors on the path component of the footer,
 # which is shared across v0.111 and v0.136 status bars.
-TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])"
+TUI_FOOTER_PATTERNS = (
+    re.compile(r"\?\s+for shortcuts"),
+    re.compile(r"context left"),
+    re.compile(r"·\s+[~/]"),
+)
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
 # "• Working (1m 00s ...)", "• Working (1h 00m 00s ...)", or dynamic
 # prefixes such as "• Starting script creation (10s • esc to interrupt)".
@@ -310,7 +314,7 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
 
     # Find the status bar line (last TUI_FOOTER_PATTERN match in the bottom area)
     for i in range(n - 1, max(n - IDLE_PROMPT_TAIL_LINES - 1, -1), -1):
-        if re.search(TUI_FOOTER_PATTERN, all_lines[i]):
+        if _has_tui_footer(all_lines[i]):
             footer_start_idx = i
             break
 
@@ -424,6 +428,26 @@ def _has_update_dialog_in_bottom(clean_output: str) -> bool:
     )
 
 
+def _has_tui_footer(line: str) -> bool:
+    return any(pattern.search(line) for pattern in TUI_FOOTER_PATTERNS) or _has_percent_left(line)
+
+
+def _has_percent_left(line: str) -> bool:
+    percent = line.find("%")
+    while percent != -1:
+        digits = percent
+        while digits > 0 and line[digits - 1].isdecimal():
+            digits -= 1
+        if digits < percent:
+            cursor = percent + 1
+            while cursor < len(line) and line[cursor].isspace():
+                cursor += 1
+            if line.startswith("left", cursor):
+                return True
+        percent = line.find("%", percent + 1)
+    return False
+
+
 def _modal_line_content(line: str) -> Optional[str]:
     """Reduce one line to its modal text, or None if the line reads as prose.
 
@@ -482,7 +506,7 @@ def _is_chrome_only(line: str) -> bool:
         return True
     if re.fullmatch(rf"\s*{IDLE_PROMPT_PATTERN}\s*", line):
         return True
-    return re.search(TUI_FOOTER_PATTERN, line) is not None
+    return _has_tui_footer(line)
 
 
 def _is_transcript_marker(line: str) -> bool:
@@ -694,7 +718,7 @@ def _has_startup_idle_composer(clean_output: str) -> bool:
     # footer below it so typed drafts and ordinary output are not treated as ready.
     for index in range(len(tail_lines) - 1, -1, -1):
         if re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, tail_lines[index]):
-            return any(re.search(TUI_FOOTER_PATTERN, line) for line in tail_lines[index + 1 :])
+            return any(_has_tui_footer(line) for line in tail_lines[index + 1 :])
     return False
 
 
@@ -1237,7 +1261,7 @@ class CodexProvider(BaseProvider):
         # to avoid over-excluding in short outputs or test fixtures.
         all_lines = clean_output.splitlines()
         tui_footer_detected = any(
-            re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
+            _has_tui_footer(line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
         )
         if tui_footer_detected:
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
@@ -1433,7 +1457,7 @@ class CodexProvider(BaseProvider):
         # Exclude the Codex TUI footer from user-message matching when detected.
         all_lines = clean_output.splitlines()
         tui_footer_detected = any(
-            re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
+            _has_tui_footer(line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
         )
         if tui_footer_detected:
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
