@@ -147,6 +147,18 @@ else
     --from-literal="token=$(openssl rand -hex 24)"
 fi
 
+# The panel token, on the same terms. Not optional: panel.yaml reads it through a
+# secretKeyRef with no `optional: true`, so a missing secret stops the pod at
+# CreateContainerConfigError rather than starting it unauthenticated. Kept across
+# runs too, so a browser that has been given the token keeps working.
+if kubectl -n cao-cluster get secret cao-panel-secret >/dev/null 2>&1; then
+  echo "panel token already present, keeping it"
+else
+  echo "minting panel token"
+  kubectl -n cao-cluster create secret generic cao-panel-secret \
+    --from-literal="token=$(openssl rand -hex 24)"
+fi
+
 echo "applying"
 kubectl apply -k "$RENDER"
 
@@ -155,3 +167,4 @@ kubectl apply -k "$RENDER"
 # created by this apply at all.
 kubectl -n cao-cluster rollout status statefulset/cao-supervisor --timeout=900s
 kubectl -n cao-cluster rollout status deployment/cao-worker-broker --timeout=300s
+kubectl -n cao-cluster rollout status deployment/cao-fleet-panel --timeout=300s
