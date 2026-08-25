@@ -1115,16 +1115,14 @@ def redeliver_dropped_message(
             return True
     if _message_visible_in_box(terminal_id, message):
         logger.warning(
-            "Delivery to %s unsubmitted (Enter swallowed); "
-            "re-submitting via Enter (attempt %d)",
+            "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
             terminal_id,
             attempt,
         )
         send_special_key(terminal_id, "Enter")
         return False
     logger.warning(
-        "Delivery to %s not accepted (paste dropped); "
-        "re-delivering message (attempt %d)",
+        "Delivery to %s not accepted (paste dropped); " "re-delivering message (attempt %d)",
         terminal_id,
         attempt,
     )

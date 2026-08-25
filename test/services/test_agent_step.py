@@ -610,11 +610,7 @@ class TestPromptDeliveryVerification:
             delivered = {"again": False}
 
             def _get_status(_terminal_id):
-                return (
-                    TerminalStatus.COMPLETED
-                    if delivered["again"]
-                    else TerminalStatus.IDLE
-                )
+                return TerminalStatus.COMPLETED if delivered["again"] else TerminalStatus.IDLE
 
             def _redeliver(_terminal_id, _message, _attempt):
                 delivered["again"] = True
