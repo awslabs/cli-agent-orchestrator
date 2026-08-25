@@ -457,6 +457,84 @@ class TestKimiCliProviderMessageExtraction:
         with pytest.raises(ValueError, match="Empty Kimi CLI response"):
             provider.extract_last_message_from_script(output)
 
+    def test_extract_new_tui_skips_empty_input_box_anchor(self):
+        """Newest Kimi Code TUI: the trailing EMPTY input box must not win anchor.
+
+        Regression: the empty input box (``│ > │``) at the bottom of the screen
+        is always the LAST ╰─ marker, so "latest marker wins" anchored there and
+        extraction returned the footer chrome ("yolo  kimi-k2.5 thinking  …")
+        instead of the response (observed live 2026-08-24, cao-wap-lockall
+        handoff to worker_kimi).
+        """
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "╭──────────────────────────╮\n"
+            "│  Welcome to Kimi Code!    │\n"
+            "╰──────────────────────────╯\n"
+            "✨ TAREA: documenta la ronda de cache y reporta\n"
+            "● Leo la configuracion del servidor.\n"
+            "  Ronda documentada: cache CSS estabilizada.\n"
+            "  CRITERIO DE HECHO: SATISFECHO\n"
+            "╭──────────────────────────╮\n"
+            "│ >                         │\n"
+            "╰──────────────────────────╯\n"
+            "yolo  kimi-k2.5 thinking  …/T/cao_kimi_xyz          shift+enter: newline\n"
+            "context: 26% (64.5k/256k)\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "CRITERIO DE HECHO: SATISFECHO" in result
+        assert "cache CSS estabilizada" in result
+        assert "yolo" not in result
+        assert "shift+enter" not in result
+        assert "context:" not in result
+        assert ">" not in result  # empty input box interior
+
+    def test_extract_new_tui_footer_boundary_stops_response(self):
+        """Response scan must stop at the newest-TUI footer, not run past it."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "✨ di hola\n"
+            "● Hola!\n"
+            "yolo  kimi-k2.5 thinking  …/T/cao_kimi_abc\n"
+            "context: 3% (7k/256k)\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Hola" in result
+        assert "yolo" not in result
+        assert "context:" not in result
+
+    def test_extract_fallback_filters_new_tui_chrome(self):
+        """Long-response fallback (no markers) must filter newest-TUI chrome."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "  resultado parcial 1\n"
+            "  resultado parcial 2\n"
+            "╭──────────────────────────╮\n"
+            "│ >                         │\n"
+            "╰──────────────────────────╯\n"
+            "yolo  kimi-k2.5 thinking  …/T/cao_kimi_abc          shift+enter: newline\n"
+            "context: 12% (30k/256k)\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "resultado parcial 1" in result
+        assert "resultado parcial 2" in result
+        assert "yolo" not in result
+        assert "context:" not in result
+        assert "╭" not in result and "╰" not in result
+
+    def test_extract_legacy_message_box_still_anchors(self):
+        """Legacy TUI message boxes (with content) must keep working as anchor."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "╭──────────────────╮\n"
+            "│ resume el informe │\n"
+            "╰──────────────────╯\n"
+            "• Aqui esta el resumen del informe.\n"
+            "user@my-app💫\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "resumen del informe" in result
+
     def test_extract_message_filters_thinking(self):
         """Test that thinking bullets (gray ANSI) are filtered from output."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
