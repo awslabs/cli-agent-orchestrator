@@ -6503,6 +6503,42 @@ def _to_memory_summary(mem, base_dir: Path) -> MemorySummary:
     )
 
 
+@app.get("/memory/vault/status")
+async def vault_status_endpoint(
+    vault_id: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the existing read-only, content-free vault status projection."""
+    from cli_agent_orchestrator.services.settings_service import get_vault_config
+    from cli_agent_orchestrator.services.vault.binding import VaultConfigUnavailableError
+    from cli_agent_orchestrator.services.vault.status import get_vault_status
+
+    try:
+        config = get_vault_config()
+    except (VaultConfigUnavailableError, ValueError):
+        return {"configured": False, "vaults": []}
+    if not config.enabled:
+        return {"configured": False, "vaults": []}
+
+    return {
+        "configured": True,
+        "vaults": [
+            {
+                "vault_id": item.vault_id,
+                "status_counts": dict(item.status_counts),
+                "finding_counts": dict(item.finding_counts),
+                "warnings": list(item.warnings),
+                "recall_counters": dict(item.recall_counters),
+                "process_local_unmapped_project_writes": item.process_local_unmapped_project_writes,
+                "process_local_unmapped_project_identities": item.process_local_unmapped_project_identities,
+                "process_local_non_writable_write_refusals": item.process_local_non_writable_write_refusals,
+                "process_local_secret_gate_write_refusals": item.process_local_secret_gate_write_refusals,
+            }
+            for item in get_vault_status(config, vault_id=vault_id)
+        ],
+    }
+
+
 @app.get("/memory", response_model=List[MemorySummary])
 async def list_memories_endpoint(
     scope: Optional[MemoryScope] = None,

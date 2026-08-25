@@ -13,11 +13,23 @@ import pytest
 
 from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services.memory_service import ForgetResult
+from cli_agent_orchestrator.services.vault.status import VaultStatus
 
 MEMORY_BASE = Path("/home/user/.aws/cli-agent-orchestrator/memory")
 
 FACTORY_TARGET = "cli_agent_orchestrator.api.main._get_memory_service"
 ENABLED_TARGET = "cli_agent_orchestrator.services.settings_service.is_memory_enabled"
+
+
+def _walk_values(value):
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _walk_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_values(child)
+    else:
+        yield value
 
 
 def _make_memory(
@@ -82,6 +94,56 @@ class TestMemorySettingsEndpoint:
         assert body["enabled"] is False
         # learning is a child of memory: disabled memory forces it off
         assert body["learning_enabled"] is False
+
+
+class TestVaultStatusEndpoint:
+    def test_returns_content_free_counters_and_honors_vault_filter(self, client):
+        statuses = (
+            VaultStatus(
+                "alpha",
+                (("indexed", 2),),
+                (("secret_detected", 1),),
+                ("agent-scoped mapping is recall-only",),
+                3,
+                2,
+                1,
+                4,
+                (("vault_recall", 5),),
+            ),
+            VaultStatus("beta", (), (), (), 0, 0, 0, 0),
+        )
+        config = MagicMock(enabled=True)
+        with (
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_vault_config",
+                return_value=config,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.vault.status.get_vault_status",
+                return_value=(statuses[0],),
+            ) as get_status,
+        ):
+            response = client.get("/memory/vault/status?vault_id=alpha")
+
+        assert response.status_code == 200
+        assert response.json()["vaults"][0]["process_local_secret_gate_write_refusals"] == 4
+        assert response.json()["vaults"][0]["finding_counts"] == {"secret_detected": 1}
+        get_status.assert_called_once_with(config, vault_id="alpha")
+        assert [item["vault_id"] for item in response.json()["vaults"]] == ["alpha"]
+        assert not any(
+            "/" in str(value) or str(value).endswith(".md")
+            for value in _walk_values(response.json())
+        )
+
+    def test_unavailable_config_degrades_to_not_configured(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.get_vault_config",
+            side_effect=ValueError("unavailable"),
+        ):
+            response = client.get("/memory/vault/status")
+
+        assert response.status_code == 200
+        assert response.json() == {"configured": False, "vaults": []}
 
 
 class TestListMemories:
