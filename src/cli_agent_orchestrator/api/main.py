@@ -342,7 +342,7 @@ class CreateSessionBody(CreateTerminalBody):
         return _check_metadata_size(v)
 
 
-RESUME_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}$")
+RESUME_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}\Z")
 
 
 def _validate_resume_session_id(value: str) -> None:
