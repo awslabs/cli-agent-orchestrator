@@ -46,9 +46,10 @@ first, speak once at the end".
 
 ## Prerequisites
 
-- AWS CLI, `kubectl`, Docker with `buildx`. Images are built `linux/amd64` to
-  match the node group. Build on an x86_64 host: an arm64 build host cross-builds
-  under emulation, which is slow and not universally reliable
+- AWS CLI, `kubectl`, Docker with `buildx`. Images are built `linux/arm64` to
+  match the node group, which is Graviton. The Workshop Studio code editor is
+  arm64, so that build is native there; on an x86_64 host it cross-builds under
+  emulation, which is slow and not universally reliable
 - Credentials allowed to create VPC, EKS, IAM, KMS, ECR and EFS resources
 - On the default path: no Helm, no External Secrets Operator, and no provider
   API key. Claude Code signs Bedrock requests with SigV4 using credentials from
@@ -88,9 +89,10 @@ different principal from the one running `kubectl`:
 `BootstrapClusterCreatorAdminPermissions` grants admin to the *deploying*
 principal only, so without this every `kubectl` command fails `Unauthorized`.
 
-Nodes are x86_64 (`m6a.xlarge`, `AL2023_x86_64_STANDARD`). Build for the same
-architecture: a mismatched image is not caught at deploy time, it surfaces as a
-crash loop with `exec format error` rather than as a pull failure.
+Nodes are Graviton (`m7g.xlarge`, `AL2023_ARM_64_STANDARD`), matching the arm64
+code editor the images are built on. Build for the same architecture: a mismatch
+is not caught at deploy time, it surfaces as a crash loop with `exec format
+error` rather than as a pull failure.
 
 ## Build
 
@@ -104,13 +106,13 @@ REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$
 aws ecr get-login-password --region "${AWS_REGION}" |
   docker login --username AWS --password-stdin "${REGISTRY}"
 
-docker buildx build --platform linux/amd64 \
+docker buildx build --platform linux/arm64 \
   -f docker/Dockerfile \
   -t "${REGISTRY}/cao-server:${TAG}" --push .
-docker buildx build --platform linux/amd64 \
+docker buildx build --platform linux/arm64 \
   -f docker/Dockerfile.broker \
   -t "${REGISTRY}/cao-worker-broker:${TAG}" --push .
-docker buildx build --platform linux/amd64 \
+docker buildx build --platform linux/arm64 \
   -f docker/Dockerfile.panel \
   -t "${REGISTRY}/cao-fleet-panel:${TAG}" --push .
 ```
@@ -167,16 +169,16 @@ The seam has three parts.
 image needed:
 
 ```bash
-docker buildx build --platform linux/amd64 -f docker/Dockerfile \
+docker buildx build --platform linux/arm64 -f docker/Dockerfile \
   --build-arg INSTALL_KIRO_CLI=1 --build-arg INSTALL_CLAUDE_CODE=0 \
   -t "${REGISTRY}/cao-server:${TAG}" --push .
 ```
 
 It fetches the pinned `musl` archive and runs the vendor installer with
 `Q_INSTALL_GLOBAL=1 Q_SKIP_SETUP=1`, which is the unattended combination. Expect
-the image to roughly double: the archive is ~693MB for `x86_64` and installs to
+the image to roughly double: the archive is ~689MB for `aarch64` and installs to
 1.1GB, of which `kiro-cli-chat` is 943MB. The URL is built from `$(uname -m)`, so
-it follows the build platform. The `musl` build is not a preference: the *gnu*
+it follows the build platform and needs no change if that ever moves. The `musl` build is not a preference: the *gnu*
 archive requires glibc 2.39 and bookworm ships 2.36, so its own installer refuses
 it and points at musl, which skips the glibc check. `ARG BASE_PROVIDER_IMAGE` remains for any other provider: point it at
 an image that already carries that CLI and pass `INSTALL_CLAUDE_CODE=0`.
