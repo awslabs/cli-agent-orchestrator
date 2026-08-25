@@ -812,6 +812,12 @@ Resources:
     # Keep credentials when the infrastructure stack is deleted accidentally.
     # A retained named secret must be imported, renamed, or deleted manually
     # before recreating a stack with the same ProviderSecretName.
+    #
+    # Deliberately NOT the same as WorkspaceFileSystem below, which is Delete.
+    # The asymmetry is the point and should not be "tidied up": this holds a key a
+    # human pasted in by hand and cannot regenerate, while the workspace holds
+    # checkouts an agent clones again on the next run. Retain costs a manual
+    # delete before a same-named redeploy; that is cheaper than losing the key.
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
