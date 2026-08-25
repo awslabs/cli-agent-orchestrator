@@ -507,12 +507,6 @@ def _origin_scheme_and_authority(origin: str) -> "tuple[str, str] | None":
     return parts.scheme, parts.netloc.rsplit("@", 1)[-1]
 
 
-def _origin_authority(origin: str) -> "str | None":
-    """Return the ``host[:port]`` authority of an http/https ``Origin``."""
-    parsed = _origin_scheme_and_authority(origin)
-    return None if parsed is None else parsed[1]
-
-
 def _is_same_origin(origin: str, host: str, scheme: "str | None") -> bool:
     """Whether ``origin`` is same-origin with the request ``host``/``scheme``.
 
@@ -529,6 +523,14 @@ def _is_same_origin(origin: str, host: str, scheme: "str | None") -> bool:
     genuinely made over TLS. Rejecting that direction would break working
     reverse-proxy and Codespaces deployments without closing a real hole, since
     forging it means already controlling the victim's own origin over TLS.
+
+    That leniency has a corollary worth stating: the comparison only does
+    anything where ``scheme`` is trustworthy, meaning uvicorn terminates TLS
+    itself or the proxy is listed in ``TRUSTED_FORWARDER_IPS``. Behind an
+    untrusted proxy ``scheme`` is ``"http"`` on a request the browser made over
+    TLS, and the check is then inert in both directions: the ``http`` Origin is
+    accepted as well. Operators who want it enforced should set
+    ``CAO_FORWARDED_ALLOW_IPS`` to the proxy address.
 
     ``scheme=None`` skips the comparison entirely, preserving the behaviour
     callers had before the scheme was threaded through.
