@@ -69,25 +69,27 @@ Parameters:
 
   NodeInstanceType:
     Type: String
-    Default: m6a.xlarge
+    Default: m7g.xlarge
     Description: >-
       Node instance type. .xlarge (16 GiB) rather than .large because each CAO
       pod requests 1Gi and may use up to 3Gi: a running agent settles near
       660Mi. Two .large nodes would leave the fleet one burst away from
       eviction.
 
-      x86_64 (m6a), and the images in ../README.md are built for linux/amd64 to
-      match. The node architecture and the build host's architecture have to
-      agree: an image built for the wrong one does not fail at deploy, it fails
-      at pod start with an exec format error. If the build host is arm64, either
-      change it or accept an emulated cross-build. Keep this and AmiType below in
-      agreement.
+      Graviton (m7g) rather than Intel or AMD, so the node architecture matches
+      the Workshop Studio code editor, which is m8g.large - arm64. The images are
+      built on the code editor and pushed to this account's ECR, so an x86 node
+      group would mean either a cross-build under emulation or an image that
+      simply will not start. Keep this and AmiType below in agreement.
 
-      m6a rather than m6i: same 4 vCPU and 16 GiB on AMD EPYC for roughly 10
-      percent less, and cheapest of the non-burstable x86 options at this size in
-      both us-east-1 and us-west-2. The t3/t3a equivalents are cheaper still but
-      burstable, and an agent that pegs a core through a long task is exactly the
-      workload CPU credits punish.
+      Graviton is also the cheaper end of this size class: in both us-east-1 and
+      us-west-2, m7g.xlarge is 0.1632 USD/hour against 0.1728 for m6a.xlarge and
+      0.1920 for m6i.xlarge. There is no cost argument for leaving arm64, only a
+      convenience one for a build host that is not arm64 - and here it is.
+
+      An architecture mismatch is not caught at deploy time: the pull succeeds and
+      the pod dies with an exec format error, so it reads as a crash loop rather
+      than as a configuration fault.
 
   NodeDesiredSize:
     Type: Number
@@ -536,7 +538,7 @@ Resources:
         - !Ref PrivateSubnetA
         - !Ref PrivateSubnetB
       # Must match the architecture of NodeInstanceType.
-      AmiType: AL2023_x86_64_STANDARD
+      AmiType: AL2023_ARM_64_STANDARD
       InstanceTypes:
         - !Ref NodeInstanceType
       DiskSize: !Ref NodeDiskSize
@@ -950,7 +952,7 @@ Resources:
 
   # The broker image, from docker/Dockerfile.broker. A separate repository rather
   # than a second tag in the one above, because the two images share nothing: the
-  # server image is a ~310 MiB build carrying a provider CLI, the broker is
+  # server image is a ~310 MiB arm64 build carrying a provider CLI, the broker is
   # python:3.12-slim plus one file. Same tag in both, always, since one CodeBuild
   # run builds both from one commit.
   WorkerBrokerRepository:
