@@ -2139,6 +2139,42 @@ class TestCodexProviderTrustPrompt:
 
         assert _has_startup_idle_composer(output) is True
 
+    def test_v0149_idle_composer_placeholder(self):
+        """Codex 0.149's new glyph/copy is a ready composer, not a timeout."""
+        output = (
+            "OpenAI Codex (v0.149.0)\n"
+            "» Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol ultra · /private/tmp/cao-smoke\n"
+        )
+
+        assert _has_startup_idle_composer(output) is True
+
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.providers.codex.time.time",
+        side_effect=[0.0, 0.0, 20.0],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_returns_on_v0149_idle_composer(
+        self, mock_backend, mock_error, mock_sleep, _mock_time
+    ):
+        mock_backend.return_value.get_history.return_value = (
+            "OpenAI Codex (v0.149.0)\n"
+            "» Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol ultra · /private/tmp/cao-smoke\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        mock_backend.return_value.get_history.assert_called_once()
+        mock_sleep.assert_not_awaited()
+        mock_error.assert_not_called()
+        mock_backend.return_value.send_keys.assert_not_called()
+        mock_backend.return_value.send_special_key.assert_not_called()
+
     @pytest.mark.asyncio
     @patch(
         "cli_agent_orchestrator.providers.codex.time.time",

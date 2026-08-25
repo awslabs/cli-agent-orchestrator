@@ -40,6 +40,7 @@ TERMINAL_ID = "abcdef12"
 _GATED_ROUTES = [
     ("GET", "/agents/profiles"),
     ("GET", "/agents/profiles/{name}"),
+    ("GET", "/agents/profiles/{name}/source"),
     ("GET", "/sessions"),
     ("GET", "/sessions/{session_name}"),
     ("GET", "/terminals/{terminal_id}"),
@@ -62,6 +63,7 @@ def _sample_requests():
     return [
         ("GET", "/agents/profiles", {}),
         ("GET", "/agents/profiles/sample", {}),
+        ("GET", "/agents/profiles/sample/source", {}),
         ("GET", "/sessions", {}),
         ("GET", "/sessions/sample-session", {}),
         ("GET", f"/terminals/{TERMINAL_ID}", {}),
