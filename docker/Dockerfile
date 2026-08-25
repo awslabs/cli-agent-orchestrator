@@ -109,7 +109,9 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
 # The MUSL build is deliberate, not a preference. The aarch64 *gnu* archive
 # requires glibc 2.39 and bookworm ships 2.36, so its own installer refuses with
 # "try installing the musl version"; for a musl target the installer skips the
-# glibc check entirely.
+# glibc check entirely. The archive URL uses $(uname -m), so this builds on either
+# architecture -- x86_64 and aarch64 musl archives both exist at this version
+# (693MB and 689MB) -- and musl is kept for both rather than special-casing one.
 #
 # The two variables are what make this unattended: Q_INSTALL_GLOBAL installs to
 # /usr/local/bin instead of ~/.local/bin, and Q_SKIP_SETUP skips
