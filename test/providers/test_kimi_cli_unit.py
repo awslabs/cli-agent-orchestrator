@@ -535,6 +535,40 @@ class TestKimiCliProviderMessageExtraction:
         result = provider.extract_last_message_from_script(output)
         assert "resumen del informe" in result
 
+    def test_extract_new_tui_filters_thinking_real_capture(self):
+        """Real ``capture-pane -e`` of the newest TUI: thinking must be dropped.
+
+        The newest TUI renders reasoning as a gray truecolor (38;2;136;136;136)
+        italic bullet collapsed to one line plus a dim "... (N more lines,
+        ctrl+o to expand)" hint; the legacy 38;5;244 detector never matches it.
+        Fixture is an unedited tmux capture with the message, the thinking
+        line, the collapse hint, the response, the empty input box and the
+        footer chrome.
+        """
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = _read_fixture("kimi_code_tui_thinking_response_raw.txt")
+        result = provider.extract_last_message_from_script(output)
+        assert "RESPUESTA-A: nueve" in result
+        assert "RESPUESTA-B: fin" in result
+        assert "El usuario me pide" not in result  # thinking
+        assert "more lines" not in result  # collapse hint
+        assert "yolo" not in result and "context:" not in result
+
+    def test_extract_new_tui_thinking_inline(self):
+        """Unit shape: gray-italic bullet filtered, 224-gray response kept."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "\u2728 di algo\n"
+            "\x1b[38;2;136;136;136m\x1b[3m \u25cf Pensando en la respuesta.\x1b[0m\n"
+            "   ... (3 more lines, ctrl+o to expand)\n"
+            "\x1b[38;2;224;224;224m \u25cf Hola mundo\x1b[39m\n"
+            "context: 1% (2k/256k)\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Hola mundo" in result
+        assert "Pensando" not in result
+        assert "more lines" not in result
+
     def test_extract_message_filters_thinking(self):
         """Test that thinking bullets (gray ANSI) are filtered from output."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")

@@ -159,6 +159,13 @@ NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)]*●"
 # ("shift+enter: newline") and the context meter. None of that is response
 # content; extraction must never anchor on the empty box nor return the footer.
 NEW_TUI_FOOTER_PATTERN = r"^\s*yolo\s{2,}|shift\+enter:\s*newline"
+
+# Newest-TUI thinking: rendered as a gray (truecolor 136;136;136) italic bullet
+# line, collapsed by default to one line plus a dim "... (N more lines,
+# ctrl+o to expand)" hint. The legacy detector keys on the 256-color gray
+# (38;5;244) and never matches these. Both belong to reasoning, not response.
+NEW_TUI_THINKING_RAW_PATTERN = r"\x1b\[38;2;136;136;136m(?:\x1b\[[0-9;]*m)*\s*[•●]"
+NEW_TUI_THINKING_COLLAPSE_PATTERN = r"^\s*\.\.\.\s*\(\d+ more lines?, ctrl\+o to expand\)"
 EMPTY_INPUT_BOX_LINE_PATTERN = r"^\s*│\s*>?\s*│?\s*$"
 
 NEW_TUI_SPINNER_PATTERN = r"[⠁-⣿]|[🌑🌒🌓🌔🌕🌖🌗🌘]"
@@ -1036,6 +1043,13 @@ class KimiCliProvider(BaseProvider):
             if re.search(THINKING_BULLET_RAW_PATTERN, raw_line):
                 continue
 
+            # Skip newest-TUI thinking (gray truecolor italic bullet) and its
+            # collapsed-lines hint
+            if re.search(NEW_TUI_THINKING_RAW_PATTERN, raw_line) or re.match(
+                NEW_TUI_THINKING_COLLAPSE_PATTERN, clean_line
+            ):
+                continue
+
             # Skip status bar lines
             if re.search(STATUS_BAR_PATTERN, clean_line):
                 continue
@@ -1117,6 +1131,12 @@ class KimiCliProvider(BaseProvider):
 
             # Skip thinking bullets
             if re.search(THINKING_BULLET_RAW_PATTERN, raw_line):
+                continue
+
+            # Skip newest-TUI thinking and its collapsed-lines hint
+            if re.search(NEW_TUI_THINKING_RAW_PATTERN, raw_line) or re.match(
+                NEW_TUI_THINKING_COLLAPSE_PATTERN, clean_line
+            ):
                 continue
 
             # Skip status bar
