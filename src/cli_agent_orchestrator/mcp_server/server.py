@@ -145,6 +145,57 @@ def _resolve_target_base_url(target_host: str) -> str:
     return f"http://{host}:{DEFAULT_TARGET_PORT}"
 
 
+def _wait_remote_ready(base_url: str, timeout: float) -> None:
+    """Poll a remote node's ``/health`` until it answers, or raise.
+
+    Exists because "the pod is Ready" and "the Service in front of the pod is
+    routable" are different claims, and only the second one is what a caller
+    needs. A broker that leases a worker the moment its Job and Service objects
+    exist is handing back an address that becomes usable shortly afterwards -
+    endpoint published, kube-proxy rules programmed on this node - and the
+    difference is a second or two that no readiness probe on the pod can observe.
+    Waiting here, on the address actually about to be used, is the only check
+    that covers both.
+
+    Polls rather than retrying the real request, and polls a GET, because that is
+    what makes this safe: ``POST /sessions`` is not idempotent, so retrying it
+    through a connection error risks two terminals on a node that allows one.
+    ``GET /health`` can be retried as often as we like.
+
+    A short per-attempt connect timeout on purpose: the expected failure while a
+    Service converges is a fast refusal or a DNS miss, and spending 10s on each
+    would turn a 2s wait into one attempt.
+
+    Raises:
+        ValueError: the node did not answer within ``timeout``.
+    """
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    last_error = "no attempt made"
+    while True:
+        attempt += 1
+        try:
+            response = requests.get(f"{base_url}/health", timeout=(2.0, 5.0))
+            if response.status_code < 400:
+                if attempt > 1:
+                    logger.info(
+                        "Remote node %s answered /health on attempt %d", base_url, attempt
+                    )
+                return
+            last_error = f"HTTP {response.status_code}"
+        except requests.RequestException as exc:
+            last_error = str(exc)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError(
+                f"remote CAO node at {base_url} did not become reachable within "
+                f"{timeout:.0f}s ({attempt} attempts, last error: {last_error}); "
+                f"check the pod's status, CoreDNS, and any NetworkPolicy on "
+                f"worker ingress"
+            )
+        time.sleep(min(0.5, remaining))
+
+
 def _resolve_remote_provider(base_url: str, agent_profile: str) -> str:
     """Resolve a worker's provider from the REMOTE node's own profile store.
 
@@ -1337,6 +1388,7 @@ def _assign_remote(
     engine: Optional[str],
     model: Optional[str],
     use_worktree: bool,
+    ready_wait_seconds: float = 0.0,
 ) -> Dict[str, Any]:
     """Create an assign worker on a REMOTE CAO node (one-agent-per-pod topology).
 
@@ -1354,6 +1406,13 @@ def _assign_remote(
     that URL. Without an advertised URL the results could never route back,
     so that misconfiguration fails fast here instead of creating a stranded
     worker.
+
+    ``ready_wait_seconds`` > 0 waits for the target's ``/health`` before posting
+    (see ``_wait_remote_ready``). It defaults to 0, which keeps every existing
+    caller byte-identical: a ``target_host`` naming a long-running pod is either
+    up or genuinely broken, and a node that is down should still fail in seconds
+    rather than after a wait. Only a caller that just CREATED the target - the
+    elastic path - has reason to expect it to arrive shortly.
     """
     advertised_url = os.environ.get(ADVERTISED_URL_ENV)
     if not advertised_url:
@@ -1380,6 +1439,8 @@ def _assign_remote(
         }
 
     base_url = _resolve_target_base_url(target_host)
+    if ready_wait_seconds > 0:
+        _wait_remote_ready(base_url, ready_wait_seconds)
     params: Dict[str, Any] = {"agent_profile": agent_profile}
     if working_directory:
         # Interpreted on the REMOTE node's filesystem; the supervisor's own
@@ -1459,6 +1520,7 @@ def _assign_impl(
     model: Optional[str] = None,
     use_worktree: bool = False,
     target_host: Optional[str] = None,
+    ready_wait_seconds: float = 0.0,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1526,6 +1588,7 @@ def _assign_impl(
                 engine=engine,
                 model=model,
                 use_worktree=use_worktree,
+                ready_wait_seconds=ready_wait_seconds,
             )
 
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
@@ -1735,6 +1798,24 @@ def _elastic_broker_config() -> Tuple[str, str]:
     return url, token
 
 
+# How long the elastic path waits for a freshly leased worker to answer through
+# its Service. The broker returns a lease as soon as the Job and Service objects
+# exist, so this covers the worker's whole boot plus endpoint propagation - and it
+# is the ONE place that wait now happens, instead of once in the broker (on pod
+# readiness) and then implicitly again here (on a connect timeout, unretried).
+#
+# Generous rather than tight: the failure this replaces was a 10s connect timeout
+# on a worker that was 3 seconds from being usable, and the cost of waiting too
+# long is a slow delegation, while the cost of waiting too little is a destroyed
+# worker and a failed task. The broker's own READY_TIMEOUT (300s) remains the
+# outer bound - it settles the lease `failed` whether or not anyone is waiting.
+def _elastic_ready_wait() -> float:
+    try:
+        return max(0.0, float(os.environ.get("CAO_ELASTIC_WORKER_READY_WAIT", "120")))
+    except ValueError:
+        return 120.0
+
+
 def _release_elastic_worker(broker_url: str, broker_token: str, worker_id: str) -> bool:
     try:
         response = requests.delete(
@@ -1754,7 +1835,14 @@ async def assign_elastic(
         description='Agent profile for the disposable worker (for example "developer")'
     ),
     message: str = Field(description="Task for the disposable worker"),
-    provider: str = Field(default="kiro_cli", description="Provider installed in the worker"),
+    provider: Optional[str] = Field(
+        default=None,
+        description=(
+            "Provider to install in the worker. Omit to use the broker's "
+            "configured default, which is what the deployment's image actually "
+            "contains."
+        ),
+    ),
     engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
 ) -> Dict[str, Any]:
@@ -1763,38 +1851,86 @@ async def assign_elastic(
     The worker must call ``complete_assignment`` exactly once after producing
     its final result. That tool durably delivers the callback before releasing
     this worker's Job.
+
+    A successful return means the task was PLACED, not that it finished - the
+    result arrives later through the supervisor's inbox. So a worker that dies
+    before calling ``complete_assignment`` is indistinguishable from a slow one
+    here, and nothing on this side can tell them apart. The broker resolves it:
+    it holds the lease, reaps a worker whose pod ended or whose completion never
+    arrived, and records which happened. Query ``GET /workers`` on the broker
+    when a delegation reports success and produces no artifact.
     """
     try:
         if not _current_terminal_id():
             raise ValueError("assign_elastic must run from inside a CAO terminal")
         broker_url, broker_token = _elastic_broker_config()
-        response = requests.post(
-            f"{broker_url}/workers",
-            headers={"X-CAO-Broker-Token": broker_token},
-            json={"agent_profile": agent_profile, "provider": provider},
-            timeout=(REMOTE_CONNECT_TIMEOUT, 360),
+        # `provider` is omitted rather than defaulted here on purpose. A default
+        # baked into this signature silently overrides the broker's, so a fleet
+        # whose image ships one provider would still be asked for another - and
+        # the failure names a CLI the caller never mentioned. The provider a
+        # worker can actually run is a property of the deployment, so the
+        # deployment decides it.
+        #
+        # The isinstance check is not defensive noise. Called through FastMCP,
+        # `provider` arrives resolved to a string or None; called directly - as
+        # the tests do - the unfilled default is the `FieldInfo` object itself,
+        # which a plain truthiness test would happily place into the request body.
+        payload: Dict[str, Any] = {"agent_profile": agent_profile}
+        if isinstance(provider, str) and provider.strip():
+            payload["provider"] = provider.strip()
+        # `requests` is blocking, and this coroutine runs on the MCP server's
+        # event loop. Called once that costs nothing; called five times in one
+        # LLM turn - the fan-out this tool exists for - the awaits could not
+        # interleave, so five placements ran strictly one after another. Measured
+        # from the broker's access log: the five POSTs never overlapped, 16-17s
+        # apart, 76s from first to last, and a failed worker's DELETE landed
+        # before the next POST was even sent.
+        #
+        # to_thread moves the block off the loop so the gather actually gathers.
+        # It changes nothing for a single delegation - that call was never the
+        # latency, the worker's boot was - and the broker was always ready for it:
+        # `create_worker` is a sync `def`, so Starlette already runs it in its own
+        # threadpool worker.
+        response = await asyncio.to_thread(
+            lambda: requests.post(
+                f"{broker_url}/workers",
+                headers={"X-CAO-Broker-Token": broker_token},
+                json=payload,
+                timeout=(REMOTE_CONNECT_TIMEOUT, 360),
+            )
         )
         response.raise_for_status()
         lease = response.json()
         worker_id = str(lease["worker_id"])
         worker_message = (
-            message + "\n\n[Elastic worker lifecycle: when the task is fully complete, "
+            message + "\n\n[Elastic worker lifecycle: make every tool call you "
+            "need BEFORE you write any prose. Text that settles before your first "
+            "tool call is read as the end of your turn, and this terminal is then "
+            "killed with the task unfinished. When the task is fully complete, "
             "call complete_assignment with your final result. Do not use "
             "send_message for the final result; complete_assignment acknowledges "
             "delivery before terminating this disposable worker.]"
         )
-        result = _assign_impl(
+        # Also off the loop: _assign_impl waits for the new worker to answer and
+        # then posts the task to it, both blocking. This is the longer of the two
+        # blocks, so threading only the broker call above would have left the
+        # serialisation almost entirely in place.
+        result = await asyncio.to_thread(
+            _assign_impl,
             agent_profile,
             worker_message,
             str(lease["working_directory"]),
             engine=engine,
             model=model,
             target_host=str(lease["target_host"]),
+            ready_wait_seconds=_elastic_ready_wait(),
         )
         result["worker_id"] = worker_id
         result["elastic"] = True
         if not result.get("success"):
-            result["worker_released"] = _release_elastic_worker(broker_url, broker_token, worker_id)
+            result["worker_released"] = await asyncio.to_thread(
+                _release_elastic_worker, broker_url, broker_token, worker_id
+            )
         return result
     except Exception as exc:
         return {
