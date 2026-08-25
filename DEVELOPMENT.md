@@ -86,10 +86,10 @@ Unit tests are fast and use mocked dependencies:
 
 ```bash
 # Run all unit tests (excludes E2E and integration tests)
-uv run pytest test/ --ignore=test/e2e -m "not integration" -v
+uv run pytest test/ --ignore=test/e2e -m "not e2e and not integration" -v
 
 # Run with coverage report
-uv run pytest test/ --ignore=test/e2e -m "not integration" --cov=src --cov-report=term-missing -v
+uv run pytest test/ --ignore=test/e2e -m "not e2e and not integration" --cov=src --cov-report=term-missing -v
 
 # Run specific test file
 uv run pytest test/providers/test_claude_code_unit.py -v
@@ -107,8 +107,13 @@ Integration tests require the provider CLI to be installed and authenticated:
 uv run pytest test/providers/test_kiro_cli_integration.py -v
 
 # Skip integration tests
-uv run pytest test/providers/ -m "not integration" -v
+uv run pytest test/providers/ -m "not e2e and not integration" -v
 ```
+
+A marker expression passed on the command line **replaces** the `-m 'not e2e'` in
+`addopts` (pyproject.toml) rather than adding to it, so every `-m` above spells out
+`not e2e` explicitly. Drop it and the 15 e2e-marked tests that live outside
+`test/e2e/` are selected — they need a running CAO server and a provider CLI.
 
 ### E2E Tests
 
@@ -125,14 +130,29 @@ uv run pytest -m e2e test/e2e/ -v -k codex
 ### Run All Tests
 
 ```bash
-# Run all tests
+# Run everything except E2E (the `addopts` in pyproject.toml deselects e2e by default)
 uv run pytest -v
 
-# Run tests with coverage for all modules
+# Same, with coverage for all modules
 uv run pytest --cov=src --cov-report=term-missing -v
 
 # Run tests in parallel (faster)
 uv run pytest -n auto
+```
+
+### What CI runs on your pull request
+
+Run this before opening a PR — it is the exact command in `.github/workflows/ci.yml`,
+and it is a strictly larger set than the unit-test command above:
+
+```bash
+uv run pytest test/ \
+  --ignore=test/providers/test_kiro_cli_integration.py \
+  --ignore=test/e2e \
+  -m "not e2e" \
+  --cov=src/cli_agent_orchestrator --cov-report=term-missing -v
+
+uv run python scripts/validate_markdown_links.py
 ```
 
 ### Test Markers
