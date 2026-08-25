@@ -28,7 +28,7 @@ spec:
     spec:
       containers:
         - name: fleet-panel
-          image: cao-fleet-panel:latest
+          image: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-fleet-panel:latest
           ports:
             - name: http
               containerPort: 9888
