@@ -427,8 +427,26 @@ The two refusals are deliberately different, because the operator's next action 
 
 | Status | Meaning | What to do |
 |---|---|---|
-| `403` | The plan's `plan_id` has no approval. The message carries the identifier. | `cao workflow approve <plan_id>`, then run again. |
+| `403` | The plan's `plan_id` has no approval. | `cao workflow approve <plan_id>`, then run again. |
 | `503` | No plan identifier could be read from the run's frozen manifest — CAO's own freeze failed. Nothing about your request was wrong. | Retry. No approval will help. |
+
+The refusal body carries the identifier as a **field**, not only in the message
+(issue #583 Bolt 3), so a script or agent branches on it rather than parsing prose:
+
+```json
+{
+  "detail": {
+    "kind": "approval_required",
+    "plan_id": "plan-v1:9f3c…",
+    "message": "Plan 'plan-v1:9f3c…' has not been approved. …"
+  }
+}
+```
+
+`kind` is authoritative and the status mirrors it: `approval_required` → 403, and
+`plan_identity_unavailable` → 503 with `plan_id: null`, because in that case there is no identifier to
+approve. `cao workflow run` and the `workflow_run` tool both read that field and print — or return — the
+exact `approve` command.
 
 Note that a `plan_id` is computed at run start, so the **first run of a new or changed plan is
 refused by design** — that is the mechanism by which a changed plan needs its own approval.
@@ -494,16 +512,21 @@ One consequence is worth stating plainly, because it differs from a non-workflow
 The recorded hash covers the full resolved content, taken **before** redaction, so it identifies what was resolved
 rather than what survived the redaction rules of the day.
 
-### Two things not yet implemented
+### One thing not yet recorded
 
-Stated here because their absence is easy to assume away:
+Stated here because its absence is easy to assume away:
 
-1. **Stale source-hash rejection.** A `plan_id` changes when the source changes, but an update
-   presenting a stale expected source hash is **not** rejected. Do not rely on such a check running.
-2. **Six manifest fields are omitted rather than recorded** — provider, model, profile, permissions,
+1. **Six manifest fields are omitted rather than recorded** — provider, model, profile, permissions,
    limits and retry policy. Script-tier steps are discovered by executing the Python, so those values
    have no run-level existence at freeze time; they are covered transitively by the source hash,
    because changing any of them means editing the script.
+
+> **Stale source-hash rejection now runs** (issue #583 Bolt 3). This section previously listed it as a
+> second gap. `cao workflow update` and the `workflow_update` tool both require the `content_hash` you
+> last read, and the write is refused if the spec has moved on since — so an edit made from a stale read
+> is stopped rather than silently overwriting someone else's. Do not work around it by re-reading the
+> hash immediately before writing: a hash read from the file you are about to overwrite always matches,
+> which removes the check instead of satisfying it.
 
 ## See also
 

@@ -677,7 +677,12 @@ def list_workflows(scan_dir: Optional[str] = None) -> List[WorkflowIndexRow]:
 
 
 def _resolve_source_path(name: str, scan_dir: Optional[str] = None) -> str:
-    """Return the canonical YAML path for an indexed workflow ``name``.
+    """Return the canonical source path for an indexed workflow ``name``.
+
+    TIER-NEUTRAL, and the wording matters: this said "canonical YAML path" until issue #583 Bolt 3
+    (``authoring-docs-truth``). The index carries ``.py`` specs as well as ``.yaml`` ones, so naming one
+    tier described a restriction this function does not apply — and it is the helper ``delete_workflow``
+    calls, which carried the identical false claim.
 
     Rebuilds the index first so the lookup reflects disk. Raises ``KeyError`` if
     no workflow with that name exists (B2-BR-9) -> HTTPException 404.
@@ -1155,9 +1160,14 @@ def _load_by_extension(real_path: str, scan_dir: Optional[str]) -> Union[Workflo
 
 
 def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
-    """Delete a workflow's canonical YAML file and its index row (FR-2.4, B2-BR-4).
+    """Delete a workflow's canonical source file and its index row (FR-2.4, B2-BR-4).
 
-    Files are canonical, so removing the YAML is the authoritative act; the index
+    EITHER TIER. This said "canonical YAML file" until issue #583 Bolt 3 (``authoring-docs-truth``), and
+    it was false rather than merely imprecise: a ``.py`` spec created through ``create_workflow`` is
+    deleted by this function too, verified by running it. The same false claim was in
+    ``_resolve_source_path``, the helper this calls, and both were corrected together.
+
+    Files are canonical, so removing the source file is the authoritative act; the index
     row removal is bookkeeping (rebuild would also drop it). An unknown name
     raises ``KeyError`` -> 404; a repeat delete of an already-removed name is a
     404, not a silent success (the unknown name is surfaced, not masked).

@@ -2752,11 +2752,16 @@ async def workflow_plan_approval(
     Approving is ``cao workflow approve <plan_id>`` at a human's terminal, behind the ``cao:admin``
     scope. Use this tool to tell the operator which ``plan_id`` to approve.
 
-    WHAT IS NOT IMPLEMENTED, stated because you may otherwise assume it: a plan identifier covers the
-    workflow's execution-affecting fields, so changing any of them yields a different ``plan_id`` that
-    needs its own approval. But **rejection of an update presenting a stale source hash is NOT yet
-    implemented** — do not rely on a stale-hash check having run. Six manifest fields (provider,
-    model, profile, permissions, limits, retry policy) are also **omitted rather than recorded**,
+    A plan identifier covers the workflow's execution-affecting fields, so changing any of them yields a
+    different ``plan_id`` that needs its own approval. **Rejection of an update presenting a stale source
+    hash IS implemented** (issue #583 Bolt 3): ``workflow_update`` requires an ``expected_hash`` and the
+    server refuses the write when the spec has moved on, so a caller that edits from a stale read is
+    stopped rather than silently overwriting. You therefore do NOT need to re-verify the hash yourself —
+    and you must not fetch it immediately before writing, because a hash read from the file you are about
+    to overwrite always matches, which removes the check rather than satisfying it.
+
+    WHAT IS STILL NOT RECORDED, stated because you may otherwise assume it: six manifest fields
+    (provider, model, profile, permissions, limits, retry policy) are **omitted rather than recorded**,
     because script-tier steps are discovered by executing the Python and so have no run-level value at
     freeze time; they are covered transitively by the source hash.
 

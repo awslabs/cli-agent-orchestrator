@@ -197,22 +197,42 @@ def test_no_mcp_tool_can_grant_an_approval():
         )
 
 
-def test_the_mcp_report_description_names_the_stale_hash_gap():
+def test_the_mcp_report_description_says_the_stale_hash_check_runs():
     """The description is MACHINE-READ metadata an agent uses to decide what to call.
 
-    A description implying stale-hash rejection would cause an agent to rely on a check that never
-    runs. Two of Bolt 1C's five false surfaces were prioritised for exactly this reason.
+    RENAMED AND REWRITTEN at issue #583 Bolt 3 (``authoring-docs-truth``), and both halves were
+    necessary. This test was ``…names_the_stale_hash_gap`` and asserted
+    ``"stale" in doc and "not" in doc`` -- pinning a denial that pass 3A's ``stale-update-rejection``
+    had made false. Unit ``approval-enforcement-default`` left a NOTE here saying so and assigning the
+    fix to this unit, because a description and the assertion pinning it must move together.
+
+    THE OLD ASSERTION WOULD NOT HAVE CAUGHT THE CORRECTION, which is why it is replaced rather than
+    trusted. Measured: ``"not"`` occurs FIVE times in this docstring and THREE of them are outside the
+    denial sentence ("what is still not recorded", "could not be read", "distinctly from 'not
+    approved'"). A corrected description keeps the word "stale" and keeps three ``"not"``s, so both
+    substrings still match -- the test would have stayed GREEN while its own name asserted the
+    opposite of the code. A loose assertion pinning prose is worse than no assertion: it survives the
+    correction it exists to force.
+
+    A description that denies this check is not merely stale, it is HARMFUL: an agent that believes it
+    will compensate by fetching the hash immediately before writing, which is the one sequence
+    ``workflow_update``'s own description forbids because such a hash always matches.
     """
     from cli_agent_orchestrator.mcp_server.server import workflow_plan_approval
 
-    doc = workflow_plan_approval.__doc__ or ""
-    # NOTE (issue #583): this assertion pins a statement that pass 3A's ``stale-update-rejection``
-    # (commit for Bolt 3 unit 4) made FALSE -- stale-hash rejection IS now implemented, while this
-    # description still says it is not. The falsehood predates this unit and fixing it means editing
-    # both the description and this assertion together, which is ``authoring-docs-truth``'s assigned
-    # work. Recorded here so the next reader knows it is a known stale claim rather than a live one.
-    assert "stale" in doc.lower() and "not" in doc.lower()
-    assert "NO TOOL THAT GRANTS" in doc.upper() or "no tool that grants" in doc.lower()
+    doc = (getattr(workflow_plan_approval, "fn", workflow_plan_approval).__doc__ or "").lower()
+    normalised = " ".join(doc.split())  # the prose is hard-wrapped; a phrase can span a line break
+
+    assert "stale source hash is implemented" in normalised, (
+        "the description must state that the check RUNS -- pass 3A built it and "
+        "authoring-sequence-proof drives it end to end"
+    )
+    assert "not yet implemented" not in normalised, "the denial must be gone, not softened"
+    assert "must not fetch it immediately before writing" in normalised, (
+        "the remaining hazard is the fetch-then-write shortcut, so saying the check runs without "
+        "saying that would trade one wrong instruction for another"
+    )
+    assert "no tool that grants" in doc
     assert "on by default" in doc.lower(), (
         "enforcement's default must not be left to be guessed. Updated at Bolt 3: the default "
         "flipped from off to on, and a description carrying the stale default would tell an agent "
