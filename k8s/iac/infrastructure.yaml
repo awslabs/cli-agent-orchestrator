@@ -668,6 +668,42 @@ Resources:
   # Only the cluster's own nodes may mount the workspace. Being in the same stack
   # as the cluster, this can reference the security group EKS created rather than
   # taking it as a parameter.
+  # Image for the fleet panel, built by ../../docker/Dockerfile.panel. Separate
+  # from the server repository because the panel is an operator console with its
+  # own release cadence, and IMMUTABLE like the others so a deployed tag always
+  # names one image.
+  PanelRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-fleet-panel"
+      ImageTagMutability: IMMUTABLE
+      # Same reason as ServerRepository above; a missing flag here fails the whole
+      # delete, not just this resource.
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # Only the cluster's own nodes may mount the workspace. Being in the same stack
+  # as the cluster, this can reference the security group EKS created rather than
+  # taking it as a parameter.
+
   WorkspaceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -784,6 +820,10 @@ Outputs:
   WorkerBrokerRepositoryUri:
     Description: Push the elastic worker broker image here.
     Value: !GetAtt WorkerBrokerRepository.RepositoryUri
+
+  PanelRepositoryUri:
+    Description: Push the fleet panel image here.
+    Value: !GetAtt PanelRepository.RepositoryUri
 
   VpcId:
     Description: VPC holding the cluster.
