@@ -1413,6 +1413,27 @@ def delete_terminals_by_session(tmux_session: str) -> int:
         return deleted
 
 
+def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
+    """Delete specific terminal rows by id. Returns the number deleted.
+
+    Unlike ``delete_terminals_by_session`` (which deletes EVERY row for a
+    session name), this deletes only the given ids. Session teardown uses it to
+    scope its reconciliation sweep to the incarnation it started tearing down,
+    so a concurrent same-name recreate — whose rows carry freshly generated ids
+    — is never swept (#498).
+    """
+    if not terminal_ids:
+        return 0
+    with SessionLocal() as db:
+        deleted = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id.in_(terminal_ids))
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return deleted
+
+
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
