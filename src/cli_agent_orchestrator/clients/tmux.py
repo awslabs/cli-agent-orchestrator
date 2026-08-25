@@ -729,6 +729,17 @@ class TmuxClient:
                     "been removed; the launch can be retried with the same name."
                 ) from e
 
+            # Keep mouse-wheel input inside tmux. With mouse mode disabled,
+            # tmux forwards wheel events to the foreground application as
+            # Up/Down keys, which makes shells and agent TUIs navigate their
+            # command history instead of entering copy mode to scroll output
+            # (#546). This is a session option, so it does not change the
+            # user's other tmux sessions or their global configuration. The
+            # flip side -- a wheel-scrolled pane now routinely sits in copy
+            # mode, where it consumes orchestrated keys (#654) -- is handled
+            # by the mode-cancel guard in each send path below.
+            session.set_option("mouse", "on")
+
             logger.info(
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
             )
@@ -937,6 +948,20 @@ class TmuxClient:
             # available here at DEBUG for local delivery troubleshooting.
             logger.info(f"send_keys: {target} - keys length: {len(keys)}")
             logger.debug(f"send_keys: {target} - keys: {keys}")
+            # A pane the user has wheel-scrolled sits in copy mode (routine
+            # now that sessions enable mouse), and a pane in a mode consumes
+            # send-keys through the mode's key table instead of delivering
+            # them to the application: the submitting Enter below would be
+            # eaten by copy mode while the pasted message sits unsubmitted
+            # (#654, verified on tmux 3.4). Cancel any active mode first.
+            # Unconditional on purpose -- when the pane is not in a mode the
+            # command fails with "not in a mode" and delivers nothing, so no
+            # pane-state pre-check is needed (and none would be race-free).
+            subprocess.run(
+                ["tmux", "send-keys", "-t", target, "-X", "cancel"],
+                check=False,
+                capture_output=True,
+            )
             if force_bracketed_paste and self._pane_is_bracketed_paste_incompatible(
                 validated_session, validated_window
             ):
@@ -1044,6 +1069,12 @@ class TmuxClient:
             if pane:
                 buf_name = "cao_paste"
 
+                # Punch through any active copy mode first -- keys sent to a
+                # pane in a mode go to the mode's key table, not the
+                # application, so the submitting C-m below would be eaten
+                # (#654). Harmless "not in a mode" failure when there is none.
+                pane.cmd("send-keys", "-X", "cancel")
+
                 # Load text into tmux buffer
                 self.server.cmd("set-buffer", "-b", buf_name, text)
 
@@ -1092,6 +1123,10 @@ class TmuxClient:
 
             pane = self._find_active_pane(window, session_name, window_name)
             if pane:
+                # Same copy-mode guard as the paste paths (#654): a control
+                # key like C-c sent into an active mode is consumed by the
+                # mode's key table and never reaches the application.
+                pane.cmd("send-keys", "-X", "cancel")
                 pane.send_keys(key, enter=False)
                 logger.debug(f"Sent special key to {session_name}:{window_name}")
         except Exception as e:

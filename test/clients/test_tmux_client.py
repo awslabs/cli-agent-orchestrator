@@ -78,6 +78,21 @@ class TestCreateSession:
         with pytest.raises(Exception, match="tmux error"):
             tmux.create_session("ses", "w", "tid1", str(tmp_path))
 
+    def test_create_session_enables_mouse(self, tmux, tmp_path):
+        """Mouse mode keeps wheel scroll inside tmux (#546): without it tmux
+        forwards wheel events to the foreground application as Up/Down keys,
+        so agent TUIs walk their input history instead of scrolling output.
+        Session-level option: the user's other sessions are untouched."""
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        mock_session.set_option.assert_called_once_with("mouse", "on")
+
     def test_create_session_uses_explicit_dimensions(self, tmux, tmp_path):
         """Guard against regressing the kiro-cli 2.1.x SIGWINCH-repaint bug (#216).
 
@@ -278,8 +293,9 @@ class TestSendKeys:
         mock_subprocess.run.return_value = MagicMock(returncode=0)
         tmux.send_keys("ses", "win", "hello", enter_count=1)
 
-        # load-buffer, paste-buffer, send-keys Enter, delete-buffer
-        assert mock_subprocess.run.call_count == 4
+        # copy-mode cancel, load-buffer, paste-buffer, send-keys Enter,
+        # delete-buffer
+        assert mock_subprocess.run.call_count == 5
 
     @patch("cli_agent_orchestrator.clients.tmux.time")
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
@@ -287,8 +303,24 @@ class TestSendKeys:
         mock_subprocess.run.return_value = MagicMock(returncode=0)
         tmux.send_keys("ses", "win", "hello", enter_count=3)
 
-        # load-buffer + paste-buffer + 3 send-keys Enter + delete-buffer = 6
-        assert mock_subprocess.run.call_count == 6
+        # copy-mode cancel + load-buffer + paste-buffer + 3 send-keys Enter
+        # + delete-buffer = 7
+        assert mock_subprocess.run.call_count == 7
+
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_cancels_copy_mode_before_paste(self, mock_subprocess, mock_time, tmux):
+        """A pane in copy mode consumes send-keys through the mode's key
+        table instead of delivering them to the application, so the
+        submitting Enter after paste-buffer is silently eaten (#654). The
+        cancel must come first, and must not check the exit code: on a pane
+        not in a mode the command fails with "not in a mode" by design."""
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        tmux.send_keys("ses", "win", "hello")
+
+        first = mock_subprocess.run.call_args_list[0]
+        assert first.args[0] == ["tmux", "send-keys", "-t", "ses:win", "-X", "cancel"]
+        assert first.kwargs.get("check") is False
 
     @patch("cli_agent_orchestrator.clients.tmux.time")
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
@@ -315,7 +347,9 @@ class TestSendKeysViaPaste:
         tmux.send_keys_via_paste("ses", "win", "hello")
 
         tmux.server.cmd.assert_any_call("set-buffer", "-b", "cao_paste", "hello")
-        mock_pane.cmd.assert_called_once_with("paste-buffer", "-p", "-b", "cao_paste")
+        # Copy-mode cancel (#654) must precede the paste.
+        assert mock_pane.cmd.call_args_list[0] == call("send-keys", "-X", "cancel")
+        assert mock_pane.cmd.call_args_list[1] == call("paste-buffer", "-p", "-b", "cao_paste")
         mock_pane.send_keys.assert_called_once_with("C-m", enter=False)
 
     @patch("cli_agent_orchestrator.clients.tmux.time")
@@ -349,6 +383,9 @@ class TestSendSpecialKey:
 
         tmux.send_special_key("ses", "win", "C-d")
 
+        # Copy-mode cancel (#654) must precede the key: a C-c/C-d sent into
+        # an active mode is consumed by the mode's key table.
+        mock_pane.cmd.assert_called_once_with("send-keys", "-X", "cancel")
         mock_pane.send_keys.assert_called_once_with("C-d", enter=False)
 
     def test_send_special_key_session_not_found(self, tmux):
