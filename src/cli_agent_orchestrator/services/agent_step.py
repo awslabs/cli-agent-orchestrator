@@ -276,9 +276,12 @@ async def _wait_for_completion(
         # ``full_resend_requires_probe``: without a probe there is NO reliable
         # "already working" check for the full re-send branch — the box check
         # matches the whole rendered pane (see ``_message_visible_in_box``),
-        # so a working worker whose prompt scrolled off would get its task
-        # pasted twice. Probe-capable providers keep the full re-send; the
-        # rest keep the bare-Enter recovery, which cannot duplicate a task.
+        # and under the pyte screen path a whole turn can process inside one
+        # rising-edge/quiescence burst, leaving the cached status IDLE
+        # throughout while the prompt scrolls off — so a full re-send could
+        # duplicate a task the worker already ran. Probe-capable providers
+        # keep the full re-send; the rest keep the bare-Enter recovery,
+        # which cannot duplicate a task.
         if (
             prompt is not None
             and not delivery_verified

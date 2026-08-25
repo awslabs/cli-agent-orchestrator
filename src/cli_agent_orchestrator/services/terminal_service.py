@@ -1112,17 +1112,19 @@ def redeliver_dropped_message(
 
     ``full_resend_requires_probe`` gates the full re-send on the provider
     being probe-capable. Reason: ``_message_visible_in_box`` scans the whole
-    rendered pane, so for a provider without a direct status probe there is
-    no way to distinguish "paste dropped" from "worker already running and
-    the prompt scrolled off" — and re-pasting the full message into a
-    working worker silently runs the task twice. When the gate is on and the
-    provider is not probe-capable, the bare-Enter branch (which cannot
-    duplicate a task) is still taken whenever the text is visible; otherwise
-    nothing is sent and False is returned, leaving the caller's own
-    timeout to classify the outcome. The deferred-init path keeps the
-    default (off) because it loops on ``wait_until_status`` for the
-    PROCESSING edge before ever reaching here, and that pre-existing
-    behavior is unchanged by this helper's extraction.
+    rendered pane, and under the pyte screen path status detection runs only
+    at rising-edge/quiescence — a whole turn can process inside one burst,
+    leaving the cached status IDLE throughout while the prompt scrolls off —
+    so for a provider without a direct status probe there is no way to
+    distinguish "paste dropped" from "worker already ran" — and re-pasting
+    the full message into a working worker silently runs the task twice.
+    When the gate is on and the provider is not probe-capable, the
+    bare-Enter branch (which cannot duplicate a task) is still taken
+    whenever the text is visible; otherwise nothing is sent and False is
+    returned, leaving the caller's own timeout to classify the outcome. The
+    deferred-init path keeps the default (off) because it loops on
+    ``wait_until_status`` for the PROCESSING edge before ever reaching here,
+    and that pre-existing behavior is unchanged by this helper's extraction.
 
     Returns True when the worker was found already started and nothing was
     sent; False when a redelivery was attempted (or deliberately skipped).
