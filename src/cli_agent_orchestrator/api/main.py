@@ -4155,10 +4155,19 @@ async def validate_workflow_endpoint(
         # dispatch on, and pass 3A made writes Python-only.
         return lint_script(body.source, "<draft>").model_dump()
 
-    ext = _os.path.splitext(body.path)[1].lower()
+    # Bind the narrowed value ONCE rather than re-reading ``body.path`` below. The exactly-one guard
+    # above already proved it is not None, but that guard tests ``body.source`` -- so a type checker
+    # cannot follow the implication and reported four errors here (``str | None`` reaching
+    # ``splitext``, ``validate_info``, ``_safe_spec_path``). Introduced by ``authoring-mcp-tools``
+    # when ``path`` became optional at the model level; fixed here because ``mypy`` runs
+    # ``continue-on-error`` in CI and would never have failed a PR over it.
+    spec_path = body.path
+    assert spec_path is not None  # guaranteed by the exactly-one check above
+
+    ext = _os.path.splitext(spec_path)[1].lower()
     if ext in (".yaml", ".yml"):
         try:
-            result = workflow_spec_service.validate_only(body.path)
+            result = workflow_spec_service.validate_only(spec_path)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         return result.model_dump()
@@ -4172,7 +4181,7 @@ async def validate_workflow_endpoint(
             # filesystem op below MUST use THIS value (not ``body.path``) so the
             # resolve-then-contain check dominates the sink (CodeQL sanitizer
             # requirement — it does not track taint through a re-derived path).
-            real_path = workflow_spec_service._safe_spec_path(body.path)
+            real_path = workflow_spec_service._safe_spec_path(spec_path)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
@@ -4777,6 +4786,83 @@ async def get_workflow_run_plan_endpoint(
     }
 
 
+# --- The approval-refusal detail (issue #583 Bolt 3, ``authoring-sequence``) -----------------
+#
+# FR-10 states the authoring sequence as "describe -> author -> validate -> PRESENT PLAN -> APPROVE
+# -> run -> observe", and that centre link was not executable before this. Three facts composed into
+# a dead end:
+#
+#   1. A refused start writes NO run row -- ``ensure_plan_approved`` runs at ``script_runner``:1183
+#      and ``insert_run`` at :1215, deliberately, because "every first run of every new plan is
+#      refused by design, so recording them would durably record runs that never happened".
+#   2. So ``workflow_plan_approval(run_id)`` -- the only surface that reports a ``plan_id`` as a
+#      FIELD -- has nothing to read on the first run of a new plan. It works from the SECOND run
+#      onward, i.e. never when the sequence needs it.
+#   3. These handlers transported ``detail=str(e)``, discarding the ``plan_id`` the exception carries
+#      expressly so it can travel ("the operator's ONLY handle on what to approve").
+#
+# What was left was scraping ``Plan 'plan-v1:<hex>' has not been approved`` out of prose, which
+# ``services.md`` forbids in terms: a caller that can read the body branches on the field.
+#
+# ONE BUILDER FOR ALL SIX RAISE SITES, and the reasoning is ``ensure_plan_approved``'s own for being
+# one function rather than three inline checks: three copies of an authorisation-related decision is
+# three chances for one to drift, and both start arms must agree or a run's approvability would
+# depend on which route started it.
+#
+# It lives HERE rather than in ``approval_gate``: ``kind`` names a wire contract and the status
+# mapping belongs to the route, so putting it in the service would give a transport concern to a
+# module that has no other transport knowledge.
+#
+# NOT A PYDANTIC MODEL. ``HTTPException(detail=...)`` accepts any JSON-serialisable value and does not
+# validate it, so a model would be constructed and immediately dumped -- no enforcement where it
+# matters. It would also put a response shape in ``models/workflow.py``, whose ``LintFinding`` has
+# already shown the cost of that placement (a closed ``Literal`` there raises ``ValidationError``
+# from call sites that never imported it). The shape is enforced by an exact-key-set test instead,
+# which is the layer where it can actually fail. The local precedent is the 422 on this same route:
+# ``detail={"findings": ...}`` is already a plain dict.
+_REFUSAL_KIND_APPROVAL_REQUIRED = "approval_required"
+_REFUSAL_KIND_PLAN_IDENTITY_UNAVAILABLE = "plan_identity_unavailable"
+
+
+def _approval_refusal_detail(error: approval_gate.PlanApprovalRequiredError) -> Dict[str, Any]:
+    """Build the structured ``detail`` for an approval refusal (403) or a failed freeze (503).
+
+    ``kind`` IS AUTHORITATIVE and the HTTP status mirrors it -- the contract the run-step route
+    already documents, reused rather than reinvented. A caller that can read the body must branch on
+    the field.
+
+    EXACTLY THREE KEYS. Not the manifest, not the source hash, not the resolved inputs, not the spec
+    path. A refusal must not become an oracle for anything but the plan's identity: inputs are
+    journaled in plaintext and may name paths, and the spec path would disclose filesystem layout to
+    a caller that only asked to run something. An agent presenting a plan for review would LIKE those
+    fields -- that is a plan-preview surface's job, where the disclosure is the caller's explicit
+    request rather than a side effect of being refused.
+
+    ``plan_id`` is PRESENT-AND-NULL on the 503, never absent, so one reader handles both statuses
+    without an isinstance or status check first. It is ``None`` there by definition of the condition:
+    the identifier that is the operator's only handle is exactly what could not be read.
+
+    NO NORMALISATION, ever. ``cao workflow approve`` records the constraint in the inbound direction
+    -- "a normalisation is how two distinct plans could share one approval" -- and outbound the
+    caller's next act is to pass this value to ``approve``, so a transformation here produces either a
+    rejected approval or one that matches the wrong plan.
+
+    Reads ONLY the exception. It must not re-derive the identifier from the manifest: a second
+    extraction could disagree with the gate's, which is exactly what ``plan_id_from_manifest``'s
+    docstring exists to prevent, and it would add a read to a refusal path.
+
+    ``message`` is ``str(error)`` verbatim -- no rewording, and nothing from the request interpolated
+    into it. This body is rendered into a terminal and into an agent's context, so a caller-controlled
+    substring here would be an injection surface into whatever reads it.
+    """
+    kind = (
+        _REFUSAL_KIND_PLAN_IDENTITY_UNAVAILABLE
+        if isinstance(error, approval_gate.PlanIdentityUnavailableError)
+        else _REFUSAL_KIND_APPROVAL_REQUIRED
+    )
+    return {"kind": kind, "plan_id": error.plan_id, "message": str(error)}
+
+
 @app.post("/workflows/runs")
 async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
@@ -4851,9 +4937,14 @@ async def start_workflow_run_endpoint(
             # MUST precede the PlanApprovalRequiredError arm below: it is a subclass, and Python
             # matches except clauses in order, so the broad-first ordering would silently return 403
             # for a failed freeze -- a wrong answer that reads as a correct one.
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=_approval_refusal_detail(e),
+            )
         except approval_gate.PlanApprovalRequiredError as e:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=_approval_refusal_detail(e)
+            )
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except ValueError as e:
@@ -5025,11 +5116,16 @@ async def submit_workflow_run_endpoint(
             # 503, not 403: the freeze above returned None, so CAO could not complete its own work and
             # nothing about the caller was wrong. MUST precede the arm below, which is its base class
             # -- a broad-first ordering returns 403 and reads as correct.
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=_approval_refusal_detail(e),
+            )
         except approval_gate.PlanApprovalRequiredError as e:
             # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
             # caller can tell "needs approval" from "the run broke".
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=_approval_refusal_detail(e)
+            )
         # Step 5 — the script row is a single INSERT (no seed steps), already
         # atomic on its own connection. This is the one deliberate deviation from
         # the engines' best-effort write: awaited, and its failure aborts with 500.
@@ -6519,14 +6615,19 @@ async def resume_workflow_run_endpoint(
             # on the row carries no readable identifier -- a CAO-side failure, not a permission
             # problem. MUST precede the base-class arm below for the same ordering reason as the two
             # start arms.
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=_approval_refusal_detail(e),
+            )
         except approval_gate.PlanApprovalRequiredError as e:
             # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
             # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
             # precisely so the trailing 400 arm cannot claim it, and not a ``ResumeNotAllowedError``
             # because 409 means "this run cannot be resumed" — a fact about the run — whereas this is
             # a fact about the plan, and the operator's next action is completely different.
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=_approval_refusal_detail(e)
+            )
         except workflow_service.ResumeNotAllowedError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except workflow_service.ResumeCorruptError as e:

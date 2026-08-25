@@ -682,14 +682,108 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     return response.json()
 
 
+def _render_lint_findings(findings: Any) -> str:
+    """Render a 422 ``findings`` body into one readable line per finding.
+
+    All FOUR ``LintFinding`` fields -- ``line`` is a REQUIRED 1-based anchor (FR-2.3), so dropping it
+    would discard the field the finding exists to provide. Source is never echoed: a finding names a
+    line so the author can look.
+
+    DUPLICATED, deliberately, with ``cli/commands/workflow.py::_render_lint_findings``.
+    ``render_findings`` returns ``List[dict]`` rather than strings and no shared renderer exists, so
+    unifying would mean a new module for two call sites of four lines. The trigger for consolidating is
+    a THIRD caller, not a second.
+    """
+    if not isinstance(findings, list):
+        return ""
+    lines = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        lines.append(
+            f"{finding.get('severity', '?')} {finding.get('rule_id', '?')} "
+            f"at line {finding.get('line', '?')}: {finding.get('message', '')}"
+        )
+    return "; ".join(lines)
+
+
+def _refusal_envelope_fields(response: requests.Response) -> Dict[str, Any]:
+    """Extra ``ok=False`` envelope fields for an approval refusal, or ``{}`` if this is not one.
+
+    Issue #583 Bolt 3 (``authoring-sequence``) -- the APPROVE step of FR-10's sequence, made
+    branchable. An agent must be able to tell these apart WITHOUT parsing prose:
+
+    * ``class: "approval_required"`` with a ``plan_id`` -> present that identifier to the human, tell
+      them to run ``cao workflow approve <plan_id>``, and STOP. Do not retry: a loop around a human
+      authorisation gate is a bypass by repetition. There is deliberately no tool that grants an
+      approval.
+    * ``class: "plan_identity_unavailable"`` with ``plan_id: None`` -> CAO could not complete its own
+      freeze. Retry. Presenting an approval prompt here would send someone hunting for a plan to grant
+      when nothing about the caller was wrong.
+
+    Returns ``{}`` for every other body, INCLUDING a string ``detail`` from an older server -- so the
+    envelope simply keeps its previous shape rather than growing a null ``class``.
+
+    Follows the classed-refusal convention the four authoring tools established. The other eleven
+    workflow tools still return a bare ``error`` string; widening them is the retrofit named at
+    ``authoring-mcp-tools``' BR-9.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    detail = payload.get("detail")
+    if not isinstance(detail, dict):
+        return {}
+    kind = detail.get("kind")
+    if kind not in ("approval_required", "plan_identity_unavailable"):
+        return {}
+    return {"class": kind, "plan_id": detail.get("plan_id")}
+
+
 def _extract_error_detail(response: requests.Response, fallback: str) -> str:
-    """Extract a human-readable error detail from an API response."""
+    """Extract a human-readable error detail from an API response.
+
+    THE OBJECT ARM IS THE POINT OF THIS FUNCTION'S CHANGE at issue #583 Bolt 3
+    (``authoring-sequence``), and it repairs a defect that was ALREADY LIVE rather than only serving the
+    new refusal shape. Two object shapes exist and the set is CLOSED -- check ``api/main.py`` before
+    adding a third:
+
+    * ``{kind, plan_id, message}`` -- an approval refusal (403) or a failed freeze (503). New here.
+    * ``{findings: [...]}`` -- a 422 lint failure, which has shipped since Bolt 2 and which THIS
+      FUNCTION HAS BEEN SWALLOWING: an agent that called ``workflow_run`` on a spec with a lint error
+      received ``"status 422"`` and nothing else, because the pre-Bolt-3 body of this function returned
+      the fallback for any non-string ``detail``.
+
+    THIS READER DEGRADED SILENTLY AND THE CLI'S DID NOT, which is why the object arm is asserted
+    directly rather than inferred from the CLI's behaviour. ``isinstance(detail, str)`` returning a
+    fallback produces a plausible-looking ``"status 403"`` with no error and no log; the CLI's
+    ``str(detail)`` produced a visible dict repr a human would report. A silent degradation is not the
+    one you notice.
+
+    THE STRING ARM IS PERMANENT. Most of this API returns a string ``detail``, and the MCP server can
+    be installed from a DIFFERENT REVISION than the running API server -- so a newer reader must keep
+    working against an older server. Removing it would not be a cleanup.
+
+    A ``list`` falls through: FastAPI's own request-validation errors produce
+    ``{"detail": [{"loc": ..., "msg": ...}]}``, and subscripting that with a string key raises.
+    """
     try:
         payload = response.json()
     except ValueError:
         return fallback
+    if not isinstance(payload, dict):
+        return fallback
 
     detail = payload.get("detail")
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return message
+        rendered = _render_lint_findings(detail.get("findings"))
+        return rendered or fallback
     if isinstance(detail, str) and detail:
         return detail
     return fallback
@@ -2451,7 +2545,9 @@ async def workflow_run(
 
     if response.status_code != 200:
         detail = _extract_error_detail(response, f"status {response.status_code}")
-        return {"ok": False, "error": detail}
+        # FR-10 APPROVE step: carry the refusal class and plan_id as FIELDS so an
+        # agent branches rather than scraping the message. {} for any other body.
+        return {"ok": False, "error": detail, **_refusal_envelope_fields(response)}
 
     data = response.json()
     return {
@@ -2536,7 +2632,9 @@ async def workflow_resume(
 
     if response.status_code != 200:
         detail = _extract_error_detail(response, f"status {response.status_code}")
-        return {"ok": False, "error": detail}
+        # FR-10 APPROVE step: carry the refusal class and plan_id as FIELDS so an
+        # agent branches rather than scraping the message. {} for any other body.
+        return {"ok": False, "error": detail, **_refusal_envelope_fields(response)}
 
     data = response.json()
     return {
@@ -2628,7 +2726,9 @@ async def workflow_start(
 
     if response.status_code != 202:
         detail = _extract_error_detail(response, f"status {response.status_code}")
-        return {"ok": False, "error": detail}
+        # FR-10 APPROVE step: carry the refusal class and plan_id as FIELDS so an
+        # agent branches rather than scraping the message. {} for any other body.
+        return {"ok": False, "error": detail, **_refusal_envelope_fields(response)}
 
     data = response.json()
     links = data.get("links") or {}

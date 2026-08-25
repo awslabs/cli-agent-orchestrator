@@ -318,7 +318,23 @@ def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
     )
 
     assert response.status_code == 403
-    assert "plan-v1:blocked" in response.json()["detail"]
+    detail = response.json()["detail"]
+
+    # REWRITTEN at issue #583 Bolt 3 (``authoring-sequence``). This asserted
+    # ``"plan-v1:blocked" in response.json()["detail"]``, which read the identifier out of a PROSE
+    # sentence. FR-10's sequence needs it as a FIELD: a refused start writes no run row, so
+    # ``workflow_plan_approval(run_id)`` -- the only structured carrier -- has nothing to read on the
+    # first run of a new plan, which by design is every newly authored workflow.
+    assert detail["kind"] == "approval_required"
+    # BYTE-IDENTICAL round trip, not a substring match. The caller's next act is to pass this to
+    # ``cao workflow approve``, and that command records why a normalisation is dangerous: "a
+    # normalisation is how two distinct plans could share one approval."
+    assert detail["plan_id"] == "plan-v1:blocked"
+    assert "plan-v1:blocked" in detail["message"], "the prose is kept verbatim alongside the field"
+    # An EXACT set (not a subset check): extend it when a field is added deliberately, because an
+    # exact set is what makes an UNINTENTIONAL field -- the manifest, the inputs, the spec path --
+    # show up as a failure. Relaxing this is the tempting move precisely because it never fails again.
+    assert set(detail) == {"kind", "plan_id", "message"}
 
 
 def test_script_start_returns_503_when_the_plan_identity_is_unavailable(client, monkeypatch):
@@ -358,10 +374,31 @@ def test_script_start_returns_503_when_the_plan_identity_is_unavailable(client, 
         f"expected 503, got {response.status_code}: 403 would assert the caller lacked permission "
         "for a freeze that CAO itself failed to complete"
     )
-    assert isinstance(response.json()["detail"], str), (
-        "detail stays a string — this unit deliberately does not change the response shape, so the "
-        "CLI's _extract_detail and any external client keep working unmodified"
+    # REWRITTEN at issue #583 Bolt 3 (``authoring-sequence``), and the history matters because the
+    # original was deliberate. It asserted ``isinstance(response.json()["detail"], str)`` with the
+    # reason: "this unit deliberately does not change the response shape, so the CLI's
+    # _extract_detail and any external client keep working unmodified."
+    #
+    # That PURPOSE is honoured and is what the replacement pins; only the WORDING changed. Both
+    # ``detail`` readers were updated in the same change (``_extract_detail`` and
+    # ``_extract_error_detail``), so neither degrades -- the CLI still prints one clean sentence and
+    # the MCP surface still returns a real message rather than "status 503". An external client that
+    # reads ``detail`` as a string on these three routes DOES break; that is a documented,
+    # human-approved break, and it is not novel -- this same route already returns
+    # ``detail={"findings": [...]}`` on a 422 lint failure.
+    #
+    # A shape check would have been the weak replacement: ``isinstance(detail, dict)`` passes for
+    # ``{}``. This asserts CONTENT.
+    detail = response.json()["detail"]
+    assert detail["kind"] == "plan_identity_unavailable", (
+        "the freeze failed, so the caller did nothing wrong -- an agent branching on this field must "
+        "retry rather than hunt for an approval to grant"
     )
+    assert (
+        "plan_id" in detail
+    ), "present-and-null, never absent, so one reader handles both statuses"
+    assert detail["plan_id"] is None, "there is no identifier to approve; that IS the condition"
+    assert detail["message"], "the prose survives verbatim as the human-readable half"
 
 
 @pytest.mark.asyncio

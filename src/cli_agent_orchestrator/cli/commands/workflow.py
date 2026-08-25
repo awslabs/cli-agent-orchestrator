@@ -41,14 +41,122 @@ from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_fra
 _TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
 
 
-def _extract_detail(response: requests.Response, fallback: str) -> str:
-    """Pull the FastAPI ``detail`` string out of an error response."""
+def _render_lint_findings(findings: object) -> str:
+    """Render a 422 ``findings`` body into one human-readable line per finding.
+
+    All FOUR ``LintFinding`` fields, because ``line`` is a REQUIRED 1-based anchor (FR-2.3) and
+    dropping it would discard the field the finding exists to provide.
+
+    NEVER echoes source. ``_echo_spec_result`` records the reason and it applies verbatim here: "a spec
+    may contain credentials the operator pasted by mistake, and terminal output is the easiest place for
+    that to leak." A finding names a line so the AUTHOR can look -- the finding locates, the author
+    reads.
+
+    DUPLICATED, deliberately, with ``mcp_server/server.py::_render_lint_findings``. ``render_findings``
+    returns ``List[dict]`` rather than strings and there is no shared renderer to reuse, so unifying
+    would mean the MCP server importing from the CLI package or a new module, for two call sites. The
+    trigger for consolidating is a THIRD caller, not a second -- the same call Bolt 2 made for its
+    never-raises git wrapper.
+    """
+    if not isinstance(findings, list):
+        return ""
+    lines = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        lines.append(
+            f"{finding.get('severity', '?')} {finding.get('rule_id', '?')} "
+            f"at line {finding.get('line', '?')}: {finding.get('message', '')}"
+        )
+    return "; ".join(lines)
+
+
+def _approval_refusal_message(response: requests.Response) -> str:
+    """Turn an approval refusal into a message that names the next action, or "" if not one.
+
+    Issue #583 Bolt 3 (``authoring-sequence``) -- the APPROVE step of FR-10's sequence. A 403 here is
+    not a permission problem to escalate: a ``plan_id`` is computed at RUN START, so the first run of a
+    new or changed plan is refused BY DESIGN, and the remedy is one command a human runs.
+
+    THE TWO KINDS GET DIFFERENT REMEDIES AND MUST NOT BE CONFLATED:
+
+    * ``approval_required`` -> print the identifier and the exact ``cao workflow approve`` line, and
+      STOP. There is deliberately no retry: a loop around a human authorisation gate is a bypass by
+      repetition.
+    * ``plan_identity_unavailable`` -> CAO could not complete its own freeze. There is NO identifier to
+      approve, so presenting an approval prompt would send someone looking for a plan to grant when the
+      correct action is to retry.
+
+    Returns "" when the body is not a refusal, so the caller falls back to its ordinary error path --
+    including against an OLDER server that still sends a string ``detail``.
+    """
     try:
         body = response.json()
-        if isinstance(body, dict) and "detail" in body:
-            return str(body["detail"])
     except ValueError:
-        pass
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    detail = body.get("detail")
+    if not isinstance(detail, dict):
+        return ""
+
+    kind = detail.get("kind")
+    message = detail.get("message") or ""
+    if kind == "plan_identity_unavailable":
+        return (
+            f"{message}\n"
+            "This is a CAO-side failure, not a permission problem: no plan identifier could be read, "
+            "so there is nothing to approve. Retry the run."
+        )
+    if kind == "approval_required":
+        plan_id = detail.get("plan_id")
+        if not plan_id:
+            return ""
+        return (
+            f"{message}\n"
+            f"Approve it with:  cao workflow approve {plan_id}\n"
+            "Approval is a human decision and there is no way to grant it from here."
+        )
+    return ""
+
+
+def _extract_detail(response: requests.Response, fallback: str) -> str:
+    """Pull a human-readable message out of a FastAPI error response.
+
+    ``detail`` IS NOT ALWAYS A STRING on this API, and the object arm is why this function changed at
+    issue #583 Bolt 3 (``authoring-sequence``). Two object shapes exist, and the set is CLOSED --
+    check ``api/main.py`` before adding a third, because a third shape is a third body contract:
+
+    * ``{kind, plan_id, message}`` -- an approval refusal (403) or a failed freeze (503).
+    * ``{findings: [...]}`` -- a 422 lint failure on the run path.
+
+    THE PREVIOUS VERSION RETURNED ``str(body["detail"])``, which for an object printed a Python dict
+    repr at a human. That is the LOUD failure of the two readers; the MCP server's equivalent fell
+    through to its fallback and lost the identifier silently.
+
+    THE STRING ARM IS PERMANENT, NOT LEGACY -- removing it would not be a cleanup. Most of this API
+    still returns a string ``detail``; only three routes carry an object, for one condition each.
+
+    A ``list`` FALLS THROUGH, and that shape is live rather than hypothetical: FastAPI's own
+    request-validation errors produce ``{"detail": [{"loc": ..., "msg": ...}]}``. Subscripting one with
+    a string key raises, so the ``isinstance`` ladder is what keeps an unfamiliar shape a fallback
+    instead of a traceback.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return fallback
+    if not isinstance(body, dict):
+        return fallback
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return message
+        rendered = _render_lint_findings(detail.get("findings"))
+        return rendered or fallback
+    if isinstance(detail, str) and detail:
+        return detail
     return fallback
 
 
@@ -715,6 +823,10 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
             raise click.ClickException(
                 _extract_detail(response, f"unknown workflow '{name_or_path}'")
             )
+        # The APPROVE step of FR-10's sequence: name the identifier and the command, never just 403.
+        refusal = _approval_refusal_message(response)
+        if refusal:
+            raise click.ClickException(refusal)
         if response.status_code != 200:
             raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
         result = response.json()
@@ -737,6 +849,10 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
 
     if response.status_code == 404:
         raise click.ClickException(_extract_detail(response, f"unknown workflow '{name_or_path}'"))
+    # The APPROVE step of FR-10's sequence: name the identifier and the command, never just 403.
+    refusal = _approval_refusal_message(response)
+    if refusal:
+        raise click.ClickException(refusal)
     if response.status_code != 202:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 
@@ -990,6 +1106,11 @@ def resume_cmd(run_id, decide, as_json):
 
     if response.status_code == 404:
         raise click.ClickException(f"unknown run '{run_id}'")
+    # A resume is gated too (the fifth check in resume_script_run's admission ladder), so the same
+    # actionable refusal applies -- a resume of a run whose plan was never approved is refused.
+    refusal = _approval_refusal_message(response)
+    if refusal:
+        raise click.ClickException(refusal)
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 

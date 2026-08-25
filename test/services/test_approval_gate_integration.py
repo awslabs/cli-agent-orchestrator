@@ -171,6 +171,14 @@ def test_the_resume_endpoint_answers_403_and_not_400_or_409():
     )
     assert PLAN_ID in json.dumps(response.json()), "the refusal must carry the plan_id"
 
+    # STRENGTHENED at issue #583 Bolt 3 (``authoring-sequence``). The line above survived the shape
+    # change by accident -- ``json.dumps`` flattens a dict as readily as a string, so it would pass
+    # even if the identifier were reachable only as prose. FR-10's APPROVE step needs it as a FIELD,
+    # because a refused START writes no run row and the structured reader has nothing to query there.
+    detail = response.json()["detail"]
+    assert detail["kind"] == "approval_required"
+    assert detail["plan_id"] == PLAN_ID, "byte-identical: the next act is `cao workflow approve`"
+
 
 def test_the_resume_endpoint_answers_503_when_the_manifest_carries_no_identity():
     """Issue #583 Bolt 3: a CAO-side freeze failure is not the caller's fault.
@@ -204,6 +212,12 @@ def test_the_resume_endpoint_answers_503_when_the_manifest_carries_no_identity()
         "operator to approve a plan whose identifier was never readable, when the correct action "
         "is to retry"
     )
+
+    # issue #583 Bolt 3: the same distinction, readable from the BODY rather than only the status, so
+    # a caller that branches on a field applies the retry remedy instead of hunting for an approval.
+    detail = response.json()["detail"]
+    assert detail["kind"] == "plan_identity_unavailable"
+    assert detail["plan_id"] is None, "present-and-null: there is no identifier to approve"
 
 
 def test_the_two_causes_do_not_share_a_status_on_the_resume_arm():

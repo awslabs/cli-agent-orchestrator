@@ -90,23 +90,49 @@ which is why `validate` reports the `run_step` form as `unenforced-recovery-poli
 
 ## Lifecycle
 
-Follow every step in order. **No step may be skipped** — validate is mandatory, and you must
+The whole sequence, in order: **describe → author → validate → present plan → approve → run →
+observe**. **No step may be skipped** — validate is mandatory, approval is a human act, and you must
 ask before running.
+
+**Python is the format.** You are never asked to choose between YAML and Python, and you must never
+ask the user to: workflows you author are Python, full stop. (YAML workflows still *run* — they
+predate this — but nothing new is generated in YAML.)
 
 ### a. AUTHOR
 
-Write a `.py` file to `~/.aws/cli-agent-orchestrator/workflows/<name>.py`. The workflow is
-**run by its stem** (`<name>`), so:
+**Create the spec through CAO, not by writing the file yourself.**
 
-- The name must be a bare stem — **no path separators**, no directory prefix.
-- Do **not** create a same-stem `.yaml` sibling — a `<name>.yaml` next to `<name>.py` collides
-  on the run surface.
+```
+cao workflow create <name> --from-file ./draft.py     # human at a terminal
+workflow_create(name="<name>", source="<the Python>")  # agent, via MCP
+```
+
+Both return the `path` and a `content_hash` — **keep the hash**, because `cao workflow update` /
+`workflow_update` require it to prove you edited the version you last read.
+
+The workflow is **run by its stem** (`<name>`), so the name must be a bare stem — **no path
+separators**, no directory prefix.
+
+Going through `create` rather than writing into
+`~/.aws/cli-agent-orchestrator/workflows/` yourself is what gets you three checks that only exist on
+that path: the write is contained and size-capped, validate-then-index is atomic with it, and a
+**same-stem cross-tier collision is refused before anything is written**. That last one matters more
+than it sounds: a raw write of `<name>.py` beside an existing `<name>.yaml` *succeeds*, and then
+every attempt to run or inspect `<name>` fails with a tier collision — a file that is unreachable
+the moment it lands.
 
 ### b. VALIDATE (mandatory gate)
 
+You can lint a **draft that does not exist on disk yet**, which is the cheapest order — validate,
+revise, then create:
+
 ```
-cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/<name>.py
+workflow_validate(source="<the Python>")               # agent: no file needed
+cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/<name>.py   # a spec on disk
 ```
+
+`create` and `update` lint server-side too and **refuse to write** a spec with a blocking error, so
+validating first saves a round trip rather than replacing a check.
 
 Fix **every** finding before proceeding — the lint findings are **load-bearing**, not style
 nits:
@@ -129,9 +155,44 @@ nits:
 ### c. ASK the user — NEVER auto-run
 
 The script tier executes generated Python. **Never run a workflow without the user's explicit
-approval.** Present the validated file and ask before doing anything in step d.
+approval.** Present the validated file and ask before doing anything in steps d–e.
 
-### d. RUN with an explicit, pre-announced run-id
+Ask **before** step d, not after it: step d learns the plan identifier by *attempting* the run, and if
+that plan already happens to be approved the attempt does not stop — it executes.
+
+### d. PRESENT THE PLAN and get it APPROVED
+
+**The first run of a new or changed workflow is refused, by design.** A *plan identifier* is computed
+at run start from everything that affects execution, so it does not exist until you try to run — the
+refusal is how you learn it.
+
+Attempt the run. If it is refused, the response tells you which of two things happened, as a
+**field** — read the field, never the sentence:
+
+| `class` / `kind` | What happened | What to do |
+| --- | --- | --- |
+| `approval_required` | this plan has no approval yet | present the `plan_id` to the user and **stop** |
+| `plan_identity_unavailable` | **CAO** could not complete its own freeze | retry; there is nothing to approve |
+
+On `approval_required`, show the user the identifier and the one command that grants it:
+
+```
+cao workflow approve <plan_id>
+```
+
+Then **stop and wait.** Do not retry the run, do not poll for the approval to appear, and do not look
+for a tool that grants one — **there deliberately isn't one.** An agent that could approve the plan it
+just wrote would make the check decorative in exactly the case it exists for. Approving is a human act
+at a human's terminal.
+
+Once approved, run again and it proceeds. Approval binds *that* plan: change anything that affects
+execution and the next run needs its own approval.
+
+> **This pause is not a defect, and it does not fail FR-10.** The requirement's failure condition is
+> *asking the user to choose a format* — which never happens, since Python is the format. A human
+> approving what is about to execute on their machine is the requirement working.
+
+### e. RUN with an explicit, pre-announced run-id
 
 Announce the run-id before you start so the user can cancel it:
 "Starting run `kb-1` — cancel with `cao workflow cancel kb-1`."
@@ -155,7 +216,7 @@ So:
   Backgrounding keeps the run alive server-side without a short MCP host timeout silently
   dropping the return.
 
-### e. RESUME
+### f. RESUME
 
 ```
 cao workflow resume <run-id>
@@ -198,6 +259,24 @@ forward — never present one `rerun` to a user as standing authorisation for la
 **Do not let a blanket `except ShimError` swallow a halt** (see R4): `ShimHTTPError` is a
 `ShimError`, so a catch-all around a step absorbs the 409 and the run finishes with a sentinel
 where a human decision was required. Re-raise when `.status == 409`.
+
+### g. OBSERVE — and decide resume vs repair from a field, not a message
+
+```
+cao workflow result <run-id> --json
+workflow_result(run_id="<run-id>")
+```
+
+A failed run's `failure_envelope` carries a **`classification`**. Read it; do not infer the failure
+class from the message, the state, or the status:
+
+| `classification` | What it means | What to do |
+| --- | --- | --- |
+| `transient` | the failure was environmental — a timeout, a provider error | **resume** the same run |
+| `durable` | the artifact itself is wrong and a resume will fail the same way | **repair** the script, then author a new run |
+
+This is the second half of what the sequence promises: a transient failure and a defect that needs a
+new run are told apart by a field, so you never advise a user to retry something that cannot succeed.
 
 ## Parameterized workflows
 
@@ -301,7 +380,7 @@ file, per-unit fault tolerance, and results written to disk:
 import os
 from concurrent.futures import ThreadPoolExecutor
 
-from cao_workflow import run_step, emit_output, get_inputs, ShimError
+from cao_workflow import step, emit_output, get_inputs, ShimError
 
 # Parameterized: author once, invoke with different inputs.
 INPUTS = {
@@ -325,11 +404,17 @@ def summarize(filename: str):
     try:
         # Explicit, STABLE step_id per concurrent call (R1). Read-only role
         # RETURNS its summary inline (R3) — it does not write files.
-        handle = run_step(
+        handle = step(
             provider="claude_code",          # headless (R5)
             agent="reviewer",
             prompt=f"Summarize the file at {path} in 3 bullet points. Return the summary only.",
             step_id=f"summarize:{filename}",
+            # DECLARED, not defaulted. This step reads a file and returns text — it writes
+            # nothing and charges nothing — so "re-running it has the same effect as running
+            # it once" is an honest claim about THIS step. If it sent mail or filed a ticket,
+            # the honest declaration would be "manual", and CAO would halt and ask instead of
+            # repeating it. `recovery=` is your claim; nothing verifies it for you.
+            recovery="idempotent",
         )
         return filename, handle.output
     except ShimError as exc:
@@ -349,10 +434,29 @@ with open(out_path, "w") as fh:
 emit_output({"summarized": len(results), "output_file": out_path})
 ```
 
-Validate it, ask the user, then run with a pre-announced run-id:
+The whole sequence for it, end to end — note that the **first run is refused** and that the identifier
+comes out of that refusal:
 
 ```
-cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/summarize_dir.py
-# fix findings, then — after the user approves:
-cao workflow run summarize_dir --run-id sum-1 --json &
+# b. validate the draft before it exists anywhere
+workflow_validate(source="<the script above>")
+
+# a. create it (returns path + content_hash — keep the hash for a later update)
+cao workflow create summarize_dir --from-file ./summarize_dir.py
+
+# c. ask the user. Then:
+
+# d. attempt the run — refused, because this plan is new
+cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports
+#   -> Plan 'plan-v1:9f3c…' has not been approved. …
+#      Approve it with:  cao workflow approve plan-v1:9f3c…
+
+# the USER approves (you cannot, and no tool can):
+cao workflow approve plan-v1:9f3c…
+
+# e. run for real, with the run-id announced first
+cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports --json &
+
+# g. observe; on failure read failure_envelope.classification for resume-vs-repair
+cao workflow result sum-1 --json
 ```
