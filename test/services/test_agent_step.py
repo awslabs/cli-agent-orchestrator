@@ -612,7 +612,7 @@ class TestPromptDeliveryVerification:
             def _get_status(_terminal_id):
                 return TerminalStatus.COMPLETED if delivered["again"] else TerminalStatus.IDLE
 
-            def _redeliver(_terminal_id, _message, _attempt):
+            def _redeliver(_terminal_id, _message, _attempt, **_kwargs):
                 delivered["again"] = True
                 return False  # a redelivery was attempted, not a started probe
 
@@ -639,10 +639,49 @@ class TestPromptDeliveryVerification:
 
         assert result.status == TerminalStatus.COMPLETED
         assert result.last_message == "the answer"
-        m_redeliver.assert_called_once_with("abc12345", "x", 1)
+        m_redeliver.assert_called_once_with("abc12345", "x", 1, full_resend_requires_probe=True)
         # The original send still happened exactly once; only the dropped
         # copy is re-delivered.
         m_send.assert_called_once_with("abc12345", "x")
+
+    def test_redelivery_failure_does_not_break_the_raises_contract(self):
+        """The redelivery performs tmux I/O and can raise (blocked input,
+        vanished pane). A failed RECOVERY attempt is not a step failure:
+        the exception must be swallowed so the wait keeps its documented
+        contract — the step classifies via its own deadline, ending in
+        StepExecutionError(kind="timeout"), never the raw exception."""
+
+        def _raise_blocked(_terminal_id, _message, _attempt, **_kwargs):
+            from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError
+
+            raise TerminalInputBlockedError("worker is blocked on a prompt")
+
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.IDLE,  # idle forever: no pickup, no work
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
+            patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 0.0),
+            patch(
+                f"{_MODULE}.terminal_service.redeliver_dropped_message",
+                side_effect=_raise_blocked,
+            ) as m_redeliver,
+        ):
+            with pytest.raises(StepExecutionError, match="did not complete") as exc_info:
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=0.5))
+
+        assert exc_info.value.kind == "timeout"
+        # The failure did not stop recovery attempts: capped retries continue.
+        from cli_agent_orchestrator.services.agent_step import _PROMPT_REDELIVER_MAX
+
+        assert m_redeliver.call_count == _PROMPT_REDELIVER_MAX
 
     def test_redelivery_is_capped_when_worker_never_picks_up(self):
         """A worker that never accepts the task is redelivered at most

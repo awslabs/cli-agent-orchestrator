@@ -63,6 +63,11 @@ _IDLE_STABLE_POLLS = 3
 # dropped right after the send and the worker never sees its task. Wait this
 # long for pickup evidence (any working-state read) before re-delivering, and
 # cap the attempts. The step's own ``timeout`` still bounds everything.
+# 8s mirrors ``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` in terminal_service: the
+# same decision helper serves that deferred-init confirm loop, so both paths
+# give the PROCESSING edge the same window before calling a send dropped. It
+# is a consistency number with the sibling path, not a measured provider
+# startup latency — tune them together.
 _PROMPT_PICKUP_GRACE = 8.0
 _PROMPT_REDELIVER_MAX = 3
 
@@ -181,13 +186,16 @@ async def _wait_for_completion(
     the worker would sit unprompted for the whole budget. When ``prompt`` is
     given, a worker that shows NO pickup evidence (any working-state read) within
     ``_PROMPT_PICKUP_GRACE`` gets the message re-delivered — bare Enter when the
-    text still sits in the input box, full paste when it vanished — up to
-    ``_PROMPT_REDELIVER_MAX`` times, reusing the deferred-init confirm loop's
-    decision helper (#479/#496). Redelivery only ever fires while the terminal
-    reads IDLE and was never observed working; once work is seen — or the
-    helper's direct probe confirms the worker is running — the step is an
-    ordinary completion wait: a probe "started" verdict proves delivery, never
-    completion, so the cached-IDLE exit still requires prior work.
+    text is still visible in the rendered pane, full paste when it vanished and
+    the provider is probe-capable — up to ``_PROMPT_REDELIVER_MAX`` times,
+    reusing the deferred-init confirm loop's decision helper (#479/#496).
+    Redelivery only ever fires while the terminal reads IDLE and was never
+    observed working; once work is seen — or the helper's direct probe confirms
+    the worker is running — the step is an ordinary completion wait: a probe
+    "started" verdict proves delivery, never completion, so the cached-IDLE exit
+    still requires prior work. A redelivery that itself raises is logged and
+    swallowed (a failed recovery attempt is not a step failure) so this wait
+    never escapes with anything but its documented exceptions.
 
     Interruptibility (issue #409b): if ``cancel_event`` fires mid-wait, raises
     ``StepCancelledError`` PROMPTLY (it does not wait out the poll interval) so an
@@ -204,6 +212,10 @@ async def _wait_for_completion(
     consecutive_idle = 0
     redeliveries = 0
     delivery_verified = False
+    # Seeded at entry — i.e. AFTER ``send_input`` returned — so the first
+    # grace window runs from the start of this wait, not from the send. That
+    # reads long, which is the conservative direction: a false "dropped"
+    # verdict only costs a wait, a false "delivered" one burns the budget.
     last_send = time.monotonic()
 
     while True:
@@ -261,6 +273,12 @@ async def _wait_for_completion(
         # dropped (see module constants). Re-deliver off the loop via the
         # shared decision helper — #496's direct-probe guard inside it also
         # catches a worker already running under a lagging cached status.
+        # ``full_resend_requires_probe``: without a probe there is NO reliable
+        # "already working" check for the full re-send branch — the box check
+        # matches the whole rendered pane (see ``_message_visible_in_box``),
+        # so a working worker whose prompt scrolled off would get its task
+        # pasted twice. Probe-capable providers keep the full re-send; the
+        # rest keep the bare-Enter recovery, which cannot duplicate a task.
         if (
             prompt is not None
             and not delivery_verified
@@ -278,12 +296,28 @@ async def _wait_for_completion(
                 _PROMPT_PICKUP_GRACE,
                 redeliveries,
             )
-            already_started = await asyncio.to_thread(
-                terminal_service.redeliver_dropped_message,
-                terminal_id,
-                prompt,
-                redeliveries,
-            )
+            # A failed redelivery is a failed RECOVERY attempt, not a step
+            # failure: ``redeliver_dropped_message`` performs tmux I/O and can
+            # raise (blocked input, vanished pane). Swallow it and let the
+            # step's own deadline classify the outcome, so this wait keeps
+            # its documented Raises contract (StepExecutionError /
+            # StepCancelledError, never a raw terminal exception).
+            try:
+                already_started = await asyncio.to_thread(
+                    terminal_service.redeliver_dropped_message,
+                    terminal_id,
+                    prompt,
+                    redeliveries,
+                    full_resend_requires_probe=True,
+                )
+            except Exception:
+                logger.warning(
+                    "prompt redelivery to %s failed (attempt %d) — continuing to wait",
+                    terminal_id,
+                    redeliveries,
+                    exc_info=True,
+                )
+                already_started = False
             if already_started:
                 # Probe saw the worker running: delivery is confirmed, stop
                 # re-sending. That verdict proves delivery only, NOT
