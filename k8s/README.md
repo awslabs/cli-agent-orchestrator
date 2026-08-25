@@ -82,7 +82,7 @@ kubectl -n external-secrets rollout restart deployment/external-secrets
 
 ## Build
 
-Choose a new immutable tag for every build, then update both tags in
+Choose a new immutable tag for every build, then update all three tags in
 `kustomization.yaml` and the worker image value in `broker.yaml`.
 
 ```bash
@@ -99,19 +99,28 @@ docker build \
 docker build \
   -f docker/Dockerfile.broker \
   -t "${REGISTRY}/cao-worker-broker:${TAG}" .
+docker build \
+  -f docker/Dockerfile.panel \
+  -t "${REGISTRY}/cao-fleet-panel:${TAG}" .
 ```
 
 The provider base image must already contain the CAO runtime, its container
 entrypoint, the selected provider CLI, and the unprivileged `cao` user. This
 branch image replaces the installed CAO wheel while retaining that runtime.
 
-Authenticate to ECR and push both images:
+The panel build is driven by `docker/Dockerfile.panel.dockerignore` rather than
+the repository-root `.dockerignore`, which excludes `examples/` and would leave
+the panel's own source out of its image. Build it from the repository root so
+both `app/` and `static/` are in context.
+
+Authenticate to ECR and push all three images:
 
 ```bash
 aws ecr get-login-password --region "${AWS_REGION}" |
   docker login --username AWS --password-stdin "${REGISTRY}"
 docker push "${REGISTRY}/cao-server:${TAG}"
 docker push "${REGISTRY}/cao-worker-broker:${TAG}"
+docker push "${REGISTRY}/cao-fleet-panel:${TAG}"
 ```
 
 ## Deploy
@@ -129,11 +138,15 @@ Use `ServerRepositoryUri`, `WorkerBrokerRepositoryUri`, and
 `WorkspaceVolumeHandle` from the CloudFormation outputs. Split
 `WorkspaceVolumeHandle` at `::` for the two placeholders in `storage.yaml`.
 
-Create the broker credential outside Git:
+Create the two credentials outside Git. The panel token is not optional: the
+panel reads it from `cao-panel-secret`, and without that secret the pod stops at
+`CreateContainerConfigError`.
 
 ```bash
 kubectl create namespace cao-cluster --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n cao-cluster create secret generic cao-elastic-broker-token \
+  --from-literal=token="$(openssl rand -hex 32)"
+kubectl -n cao-cluster create secret generic cao-panel-secret \
   --from-literal=token="$(openssl rand -hex 32)"
 kubectl apply -k k8s
 ```
@@ -148,7 +161,31 @@ only that worker's Job and Service.
 kubectl -n cao-cluster get externalsecret,pvc,pod,job,service
 kubectl -n cao-cluster rollout status deployment/cao-worker-broker
 kubectl -n cao-cluster rollout status statefulset/cao-supervisor
+kubectl -n cao-cluster rollout status deployment/cao-fleet-panel
 ```
+
+Reach the panel over a port-forward; it is not exposed through an Ingress. Send
+the token you generated above — it guards the whole origin, so a browser prompts
+once and reuses it:
+
+```bash
+kubectl -n cao-cluster port-forward svc/cao-fleet-panel 9888:9888
+TOKEN=$(kubectl -n cao-cluster get secret cao-panel-secret \
+  -o jsonpath='{.data.token}' | base64 -d)
+curl -fsS -H "Authorization: Bearer ${TOKEN}" http://127.0.0.1:9888/api/fleet
+```
+
+The fleet view lists the supervisor from `configmap-fleet.yaml` plus whichever
+elastic workers hold a lease: the broker publishes each worker into that
+ConfigMap once it is ready and withdraws it on release, since Job-backed workers
+cannot be enumerated ahead of time. The panel re-reads the file per request, so
+no restart is needed, but a mounted ConfigMap refreshes on the kubelet's sync
+period and the view can lag a lease by up to about a minute.
+
+Re-running `kubectl apply -k k8s` resets that ConfigMap to the supervisor alone.
+The broker republishes on the next lease, but workers running at that moment drop
+off the panel until they are released, so avoid re-applying while a fleet is
+busy.
 
 Default `project` memory is shared through the supervisor because all elastic
 nodes use `CAO_PROJECT_ID=cao-cluster`. Local CAO installations are unchanged
@@ -289,11 +326,40 @@ kubectl -n "${NAMESPACE}" exec cao-supervisor-0 -- \
 
 ## Cleanup
 
+Remove the Kubernetes objects:
+
 ```bash
 kubectl delete -k k8s
 kubectl delete namespace cao-cluster
 ```
 
-The EFS PV and CloudFormation file system use `Retain`; cleanup does not delete
-workspace data. The retained EFS filesystem and provider secret must be removed
-explicitly when they are no longer required.
+That leaves the AWS resources running — the EKS control plane, the node group and
+the NAT gateway keep billing until the stack goes too:
+
+```bash
+aws cloudformation delete-stack --stack-name <stack-name>
+aws cloudformation wait stack-delete-complete --stack-name <stack-name>
+```
+
+Both ECR repositories set `EmptyOnDelete`, so the images pushed during Build do
+not block the delete. Without it the stack ends in `DELETE_FAILED` and takes the
+VPC with it, because the subnets fail alongside the repositories.
+
+Two resources deliberately survive the stack, because losing them to an
+accidental delete is worse than keeping them: `WorkspaceFileSystem` (the shared
+workspace) and `ProviderSecret` (the API key). Both use `DeletionPolicy: Retain`.
+
+Deleting the file system is a cost decision — it keeps charging until removed.
+Deleting the secret is a **prerequisite for redeploying**: the name survives, so
+a new stack using the same `ProviderSecretName` fails with a name conflict.
+Recreating a stack under the same name therefore needs this first:
+
+```bash
+aws secretsmanager delete-secret --secret-id <provider-secret-name> \
+  --force-delete-without-recovery
+aws efs delete-file-system --file-system-id <fs-id>
+```
+
+`--force-delete-without-recovery` matters: a normal delete schedules the secret
+for removal but keeps the name reserved through the recovery window, so the
+redeploy still collides.

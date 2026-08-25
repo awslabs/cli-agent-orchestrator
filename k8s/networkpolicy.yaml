@@ -14,6 +14,11 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: cao-supervisor
+        # Same reason as the supervisor rule. Grants nothing until the panel's
+        # fleet config names the elastic workers, which is still open.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-fleet-panel
       ports:
         - port: 9889
 ---
@@ -35,6 +40,11 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: cao-supervisor
+        # The panel polls every node's cao-server API to build the fleet view.
+        # Without this it renders the supervisor as permanently unreachable.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-fleet-panel
       ports:
         - port: 9889
 ---
