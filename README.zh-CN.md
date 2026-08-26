@@ -1,6 +1,9 @@
 <!-- An absolute raw URL so the banner renders wherever this file is mirrored.
-     The banner carries its own dark background, so a single <img> is correct on
-     both GitHub themes. Keep in sync with README.md. -->
+     The banner supplies its own background, so the mark's navy never has to
+     survive a backdrop it cannot see. It is light, so it matches GitHub's light
+     theme and shows as a bright panel on the dark one; it cannot be swapped per
+     theme, because README.md shares this markup and doubles as the PyPI long
+     description, where <picture> is disallowed. Keep in sync with README.md. -->
 <p align="center">
   <img src="https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/docusaurus/static/img/cao-social-card.png"
        alt="" width="640">

@@ -114,10 +114,17 @@ white, because the outlined mark turns to mush at 16px and a favicon gets no
 say in what background it lands on.
 
 The card is committed as a PNG because neither GitHub's social preview nor
-`og:image` consumers accept SVG, and because the root READMEs use it as their
-banner: it carries its own dark background, so one `<img>` is correct on both
-GitHub themes and on PyPI, where `<picture>` is not allowed. Regenerate it after
-editing the source:
+`og:image` consumers accept SVG. The root READMEs use it as their banner, where
+it earns its keep by supplying its own background: the bare mark would need a
+per-theme swap, and it cannot have one, because README.md doubles as the PyPI
+long description and PyPI disallows `<picture>`.
+
+That same constraint applies to the card. It is light, which matches PyPI, the
+official artwork, and GitHub's light theme, and it shows as a bright panel on
+GitHub's dark theme. Its text colors deviate from the palette on purpose: brand
+teal on white measures 3.1:1 and only scrapes past WCAG as large text, so the
+URL uses the brand blue at 4.6:1 instead. Regenerate it after editing the
+source:
 
 ```bash
 cd static/img

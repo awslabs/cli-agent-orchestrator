@@ -2,12 +2,17 @@
      long description (see `readme` in pyproject.toml) and PyPI cannot resolve
      relative paths.
 
-     The banner is used rather than the bare mark because it carries its own
-     dark background, so one <img> is correct on both GitHub themes and on
-     PyPI. The bare mark would need a <picture>/prefers-color-scheme swap, since
-     its navy contrasts at only 1.77:1 on GitHub's dark theme -- and PyPI
-     allows <img> but not <picture>, so that markup would either be dropped or
-     escaped into visible tag soup depending on how it sanitizes. -->
+     The banner is used rather than the bare mark because it supplies its own
+     background, so the mark's navy never has to survive a backdrop it cannot
+     see. The bare mark would need a <picture>/prefers-color-scheme swap, since
+     that navy contrasts at only 1.77:1 on GitHub's dark theme, and PyPI allows
+     <img> but not <picture>, so that markup would either be dropped or escaped
+     into visible tag soup depending on how it sanitizes.
+
+     The same constraint means the banner cannot be swapped per theme either.
+     It is light, matching PyPI and GitHub's light theme, and it shows as a
+     bright panel on GitHub's dark theme. That is a deliberate trade, not an
+     oversight. Keep in sync with README.zh-CN.md. -->
 <p align="center">
   <img src="https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/docusaurus/static/img/cao-social-card.png"
        alt="" width="640">
