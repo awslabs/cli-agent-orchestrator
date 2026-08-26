@@ -65,6 +65,56 @@ def _capture_full_scrollback(
     return result.stdout
 
 
+def _grok_rules_from_live_process(session_name: str, window_name: str) -> str:
+    """Read Grok's live ``--rules`` argument from the pane process tree.
+
+    Grok receives the full rule catalog as a single CLI argument.  A narrow
+    pane can truncate that argument in tmux scrollback, so inspect the live
+    process argv instead: this verifies what the running Grok process actually
+    received, rather than an in-memory provider command or LLM response.
+    """
+    target = f"{session_name}:{window_name}"
+    pane_pid = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    ).stdout.strip()
+    assert pane_pid.isdigit(), f"Could not resolve pane PID for {target}: {pane_pid!r}"
+
+    process_table = subprocess.run(
+        ["ps", "-eo", "pid=,ppid="],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    ).stdout
+    children: dict[int, list[int]] = {}
+    for line in process_table.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdigit() for field in fields):
+            pid, parent_pid = map(int, fields)
+            children.setdefault(parent_pid, []).append(pid)
+
+    pending = [int(pane_pid)]
+    while pending:
+        pid = pending.pop()
+        pending.extend(children.get(pid, []))
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except FileNotFoundError:
+            continue
+        args = [arg.decode("utf-8", errors="replace") for arg in argv if arg]
+        if Path(args[0]).name != "grok" or "--rules" not in args:
+            continue
+        rules_index = args.index("--rules")
+        assert rules_index + 1 < len(args), "Grok process has --rules without a payload"
+        return args[rules_index + 1]
+
+    raise AssertionError(f"Live Grok process with --rules was not found below pane {target}")
+
+
 def _run_skill_injection_test(provider: str, agent_profile: str):
     """Assert the global skill catalog was injected into the provider CLI command.
 
@@ -123,6 +173,30 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
             )
             payload = Path(m.group(1), "system.md").read_text(encoding="utf-8")
             source = f"kimi system.md ({m.group(1)})"
+        elif provider == "omp":
+            # OMP receives CAO context from a private --append-system-prompt
+            # file. The launch command exposes the path, while its contents do
+            # not appear in TUI scrollback after startup.
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            assert resp.status_code == 200
+            window_name = resp.json()["name"]
+            scrollback = _capture_full_scrollback(actual_session, window_name, join_wrapped=True)
+            match = re.search(r"--append-system-prompt\s+(\S+)", scrollback)
+            assert match, (
+                "OMP --append-system-prompt file not found in tmux scrollback. "
+                f"First 500 chars: {scrollback[:500]}"
+            )
+            payload = Path(match.group(1)).read_text(encoding="utf-8")
+            source = f"OMP context file ({match.group(1)})"
+        elif provider == "grok_cli":
+            # Grok's rules payload is larger than the configured tmux
+            # scrollback in a 220-column e2e pane.  Read the running process
+            # argv, which is the exact provider-to-CLI handoff.
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            assert resp.status_code == 200
+            window_name = resp.json()["name"]
+            payload = _grok_rules_from_live_process(actual_session, window_name)
+            source = "live Grok --rules argument"
         else:
             # Capture the full tmux scrollback (capture-pane -S - reads from the
             # very start of the buffer so the initial CLI command with the
@@ -187,6 +261,20 @@ class TestAntigravityCliSkills:
     def test_skill_catalog_injected(self, require_antigravity):
         """Antigravity CLI terminal command contains the injected skill catalog."""
         _run_skill_injection_test(provider="antigravity_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestOmpSkills:
+    def test_skill_catalog_is_appended(self, require_omp):
+        _run_skill_injection_test(provider="omp", agent_profile="developer")
+
+
+class TestGrokCliSkills:
+    """E2E runtime skill-catalog injection test for Grok Build CLI."""
+
+    def test_skill_catalog_injected(self, require_grok):
+        """Grok's additive rules contain the CAO worker protocol catalog."""
+        _run_skill_injection_test(provider="grok_cli", agent_profile="developer")
 
 
 # ---------------------------------------------------------------------------

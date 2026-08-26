@@ -22,6 +22,10 @@ _EXCLUDED_PREFIXES = (
     Path("src/cli_agent_orchestrator/skills"),
     Path("test/fixtures"),
     Path("test/providers/fixtures"),
+    # Blog posts link to documentation pages by rendered site route
+    # (/docs/patterns/handoff), which has no repository path. Docusaurus
+    # validates those links at build time with onBrokenLinks: 'throw'.
+    Path("docusaurus/blog"),
 )
 _EXCLUDED_FILES = (
     # This profile contains a literal, generic README template with deliberately

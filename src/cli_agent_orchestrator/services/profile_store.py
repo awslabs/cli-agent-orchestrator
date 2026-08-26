@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_delete, locked_atomic_write
 
 # A profile name becomes a single filesystem segment under
 # LOCAL_AGENT_STORE_DIR. Restricting to [A-Za-z0-9_-] with a 64-char cap
@@ -38,6 +38,7 @@ __all__ = [
     "ProfileExistsError",
     "ProfileNotFoundError",
     "delete_profile",
+    "replace_profile",
     "store_path",
     "write_profile",
 ]
@@ -140,8 +141,65 @@ def write_profile(name: str, content: str, *, overwrite: bool = False) -> Path:
     return target
 
 
+def replace_profile(name: str, content: str) -> Path:
+    """Replace an existing local-store profile. Never creates one.
+
+    The update-only counterpart to :func:`write_profile`. ``write_profile`` with
+    ``overwrite=True`` is an upsert, which is wrong for an HTTP ``PUT``: a request
+    naming a built-in or provider-managed profile would not fail, it would create a
+    *new* local file that shadows the original, silently changing which profile
+    wins on load. That is exactly the shadowing the ``duplicated_in`` field exists
+    to surface, so an upsert would manufacture the condition we warn about.
+
+    Because this module resolves only inside ``LOCAL_AGENT_STORE_DIR``, a built-in's
+    name is simply not present here, so requiring the target to exist rejects
+    writes against built-ins at the service boundary rather than by a check in the
+    caller.
+
+    The existence requirement is enforced *inside* the write lock. A caller testing
+    for the file first would leave a window where a concurrent delete turns the
+    intended update back into a create.
+
+    Args:
+        name: Profile name, used as the filename stem.
+        content: Full profile text (frontmatter + body).
+
+    Returns:
+        The path written.
+
+    Raises:
+        InvalidProfileNameError: If ``name`` is not a safe single segment.
+        ProfileNotFoundError: If the profile is not in the local store.
+    """
+    # Inline guard: see _PROFILE_NAME_RE.
+    if not _PROFILE_NAME_RE.fullmatch(name):
+        raise InvalidProfileNameError(f"Profile name '{name}' must match [A-Za-z0-9_-]{{1,64}}.")
+    root = LOCAL_AGENT_STORE_DIR.resolve()
+    target = (LOCAL_AGENT_STORE_DIR / f"{name}.md").resolve()
+    if not target.is_relative_to(root):
+        raise InvalidProfileNameError(f"Profile name '{name}' escapes the local store.")
+
+    try:
+        locked_atomic_write(target, content, overwrite=True, must_exist=True)
+    except FileNotFoundError as exc:
+        raise ProfileNotFoundError(
+            f"Profile '{name}' is not in the local store, so there is nothing to "
+            f"replace. Built-in and provider-managed profiles are not writable; "
+            f"copy one into the local store first."
+        ) from exc
+    return target
+
+
 def delete_profile(name: str) -> None:
     """Delete the profile ``name`` from the local store.
+
+    The existence check and the unlink both happen inside the target's write
+    lock, via :func:`locked_atomic_delete`. That lock is shared with
+    :func:`replace_profile`, and it has to be: an unlocked delete can slip
+    between an update's ``must_exist`` check and its publish, so the update
+    recreates the file and both operations report success. Deletion being the
+    unlocked side of that pair would silently void the update-only guarantee
+    ``replace_profile`` advertises.
 
     Args:
         name: Profile name, used as the filename stem.
@@ -158,6 +216,7 @@ def delete_profile(name: str) -> None:
     if not target.is_relative_to(root):
         raise InvalidProfileNameError(f"Profile name '{name}' escapes the local store.")
 
-    if not target.exists():
-        raise ProfileNotFoundError(f"Profile '{name}' not found in the local store.")
-    target.unlink()
+    try:
+        locked_atomic_delete(target)
+    except FileNotFoundError as exc:
+        raise ProfileNotFoundError(f"Profile '{name}' not found in the local store.") from exc

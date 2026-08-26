@@ -410,7 +410,16 @@ export const api = {
   getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${name}`),
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
-  deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' }),
+  deleteSession: async (name: string) => {
+    const result = await fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' })
+    if (!result?.success || (result.errors && result.errors.length > 0)) {
+      const err: ApiError = new Error(result?.errors?.[0]?.error || 'Session cleanup is pending; retry delete')
+      err.status = 409
+      err.detail = err.message
+      throw err
+    }
+    return result
+  },
 
   // Terminals
   getTerminalStatus: (id: string) =>
@@ -421,7 +430,16 @@ export const api = {
     fetchJSON<{ success: boolean }>(`/terminals/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
   exitTerminal: (id: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/exit`, { method: 'POST' }),
-  deleteTerminal: (id: string) => fetchJSON<{ success: boolean }>(`/terminals/${id}`, { method: 'DELETE' }),
+  deleteTerminal: async (id: string) => {
+    const result = await fetchJSON<{ success: boolean }>(`/terminals/${id}`, { method: 'DELETE' })
+    if (!result?.success) {
+      const err: ApiError = new Error('Terminal cleanup is pending; retry delete')
+      err.status = 409
+      err.detail = err.message
+      throw err
+    }
+    return result
+  },
   getWorkingDirectory: (id: string) =>
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
   addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>

@@ -6,7 +6,13 @@ fallback is UNSAFE across runs under concurrent scheduling (BR-13); an
 explicit label per shard is REQUIRED, not optional, whenever ``run_step`` is
 called from more than one thread.
 
-Run standalone via ``cao workflow run --script docs/examples/fanout_example.py``.
+Run standalone by copying it into the workflows directory and running it by its
+stem — ``cao workflow run`` resolves a bare name, and rejects a path outside
+that directory::
+
+    cp docs/examples/fanout_example.py ~/.aws/cli-agent-orchestrator/workflows/
+    cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/fanout_example.py
+    cao workflow run fanout_example
 """
 
 from __future__ import annotations

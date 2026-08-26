@@ -24,8 +24,9 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.models.workflow_runtime import ReturnAck
+from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
@@ -271,9 +272,9 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
-        if engine is not None:
+        if provider == ProviderType.KIRO_CLI.value and engine is not None:
             params["engine"] = engine
-        if model is not None:
+        if model and model.strip():
             params["model"] = model
         if use_worktree:
             params["use_worktree"] = "true"
@@ -321,9 +322,9 @@ def _create_terminal(
         }
         if working_directory:
             params["working_directory"] = working_directory
-        if engine is not None:
+        if provider == ProviderType.KIRO_CLI.value and engine is not None:
             params["engine"] = engine
-        if model is not None:
+        if model and model.strip():
             params["model"] = model
 
         json_body = None
@@ -795,9 +796,9 @@ async def _handoff_impl(
             payload["allowed_tools"] = ctx.allowed_tools
         if working_directory:
             payload["working_directory"] = working_directory
-        if engine is not None:
+        if provider == ProviderType.KIRO_CLI.value and engine is not None:
             payload["engine"] = engine
-        if model:
+        if model and model.strip():
             payload["model"] = model
 
         # Allow the full step time plus the server-side ready-wait (up to 120s)
@@ -1530,11 +1531,36 @@ def delete_terminal(
         response = requests.delete(
             f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
         )
+        if response.status_code == 409:
+            return {
+                "success": False,
+                "message": (
+                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
+                    "after the Grok process exits."
+                ),
+            }
         response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success", False):
+            return {
+                "success": False,
+                "message": (
+                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
+                    "after the Grok process exits."
+                ),
+            }
         return {"success": True, "message": f"Terminal {terminal_id} deleted successfully"}
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id} not found"}
+        if e.response is not None and e.response.status_code == 409:
+            return {
+                "success": False,
+                "message": (
+                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
+                    "after the Grok process exits."
+                ),
+            }
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
     except Exception as e:
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
@@ -2439,21 +2465,70 @@ async def workflow_run(
 @mcp.tool()
 async def workflow_resume(
     run_id: str = Field(description="The run id to resume (a crashed/failed prior run)"),
+    decisions: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Optional per-step recovery decisions for a halted script run: "
+            "{step_id: 'rerun'|'skip'}. 'rerun' authorises re-executing the step; "
+            "'skip' authorises using its stored result. Applied before the script is "
+            "spawned; an unknown step id or value applies nothing at all. Each "
+            "decision authorises exactly ONE attempt: if that attempt crashes before "
+            "it settles, the next resume asks again rather than re-executing on old "
+            "consent, so a decision is never standing authorisation for a later "
+            "resume and must not be presented to a user as one."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Resume a crashed or failed workflow run from its durable journal (issue #312, N6).
 
     A thin HTTP client over ``POST /workflows/runs/{run_id}/resume`` (single seam):
-    the server re-drives the snapshotted spec in-process, skipping already-completed
-    steps and re-running the rest, and this tool blocks until the run finishes (like
-    ``workflow_run``). Returns a structured envelope on EVERY path — it never raises
-    into the agent loop. ``ok=False`` carries the server error detail (unknown run, a
-    terminal/live run that cannot be resumed, a corrupt snapshot, etc.).
+    the server re-drives the snapshotted spec in-process and this tool blocks until
+    the run finishes (like ``workflow_run``). Returns a structured envelope on EVERY
+    path — it never raises into the agent loop. ``ok=False`` carries the server error
+    detail (unknown run, a terminal/live run that cannot be resumed, a corrupt
+    snapshot, etc.).
+
+    A script-tier resume RE-EXECUTES THE SCRIPT TOP-TO-BOTTOM; completed steps are
+    NOT skipped. Each step call is decided as it arrives and lands on one of three
+    outcomes: REPLAYED (the stored result is returned and nothing runs — the
+    handle's ``replayed`` is True and its ``terminal_id`` names a terminal that no
+    longer exists), EXECUTED (it runs again), or HALTED (CAO will not decide alone,
+    so the run stops there for a human — see ``decisions``). A fourth outcome ends
+    the run rather than one step: a step whose script changed at the same key
+    DIVERGES and the run fails.
+
+    ``decisions`` (issue #583, ``recovery-decision-intake``, FR-7) resolves a halted
+    step. The closed set is validated HERE against the same ``RecoveryDecision``
+    vocabulary the CLI and the route use (BR-10/TD-7) — one enum, one
+    ``parse_decision``, so no surface accepts a value another rejects — and a
+    rejection is returned as this tool's ordinary ``ok=False`` envelope rather than
+    raised, exactly like every other failure path. The server re-validates and is the
+    authority; this check only saves a round trip and gives the agent the accepted
+    values. The tool's contract is otherwise unchanged: a 400 from the route is still
+    just another ``ok=False`` detail.
     """
+    # ``decisions`` arrives as a real dict from an MCP client (fastmcp resolves the
+    # declared default through the generated model) and as the ``FieldInfo`` SENTINEL
+    # when a Python caller omits the argument entirely — this module's tools are
+    # called directly as plain functions by the test suite, and ``@mcp.tool()`` leaves
+    # the function itself in place. Only a non-empty dict is a decision map; anything
+    # else means none was supplied, so an ordinary resume cannot trip over the
+    # sentinel's truthiness.
+    supplied = decisions if isinstance(decisions, dict) else None
+    if supplied:
+        for step_id, value in supplied.items():
+            try:
+                parse_decision(value)
+            except ValueError as e:
+                return {"ok": False, "error": f"step '{step_id}': {e}"}
     try:
         # Resume re-drives the WHOLE run inline, so block for the full run duration
         # using the worst-case run timeout, NOT the short per-call _mcp_timeout().
+        # ``json=None`` sends NO body, so a decision-free resume is byte-identical to
+        # the pre-#583 request.
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
+            json={"decisions": dict(supplied)} if supplied else None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
     except requests.RequestException as e:

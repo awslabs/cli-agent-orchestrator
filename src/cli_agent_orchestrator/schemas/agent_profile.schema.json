@@ -50,14 +50,19 @@
       "description": "MCP server configurations for additional tools.",
       "additionalProperties": {
         "type": "object",
+        "description": "One MCP server. A command-launched server sets 'command'; a remote server sets 'url', with 'type' naming its transport (for example 'http' or 'sse'). At least one of the two is required.",
         "properties": {
           "type": {"type": "string"},
           "command": {"type": "string"},
           "args": {"type": "array", "items": {"type": "string"}},
           "env": {"type": "object", "additionalProperties": {"type": "string"}},
-          "timeout": {"type": "integer"}
+          "timeout": {"type": "integer"},
+          "url": {"type": "string"}
         },
-        "required": ["command"]
+        "anyOf": [
+          {"required": ["command"]},
+          {"required": ["url"]}
+        ]
       }
     },
     "tools": {
@@ -88,9 +93,17 @@
     "codexConfig": {
       "type": "object"
     },
+    "claudeConfig": {
+      "type": "object"
+    },
     "hermesProfile": {
       "type": "string",
       "minLength": 1
+    },
+    "grokNativeWorkflows": {
+      "type": "boolean",
+      "default": false,
+      "description": "Grok Build only. Explicitly permits Grok-native subagents, workflows, and /goal in this CAO terminal."
     },
     "skills": {
       "type": "array",

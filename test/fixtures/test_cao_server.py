@@ -21,6 +21,7 @@ from test.fixtures.cao_server import (
     CaoServer,
     _JWKSServer,
     _pick_free_port,
+    _seed_omp_e2e_state,
     _session_rsa_keys,
     _start_cao_server,
 )
@@ -56,6 +57,25 @@ def test_home_isolated(cao_server: CaoServer) -> None:
     assert cao_root.exists(), f"subprocess never wrote anything under {cao_root}"
     # The logs subdir is created during lifespan setup_logging().
     assert (cao_root / "logs").exists()
+
+
+def test_omp_e2e_state_is_non_secret_and_complete(cao_server: CaoServer) -> None:
+    home = cao_server.home_dir
+    assert (home / ".omp" / "agent" / "config.yml").read_text(
+        encoding="utf-8"
+    ) == "setupVersion: 1\n"
+    store = home / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    for name in ("data_analyst", "report_generator", "analysis_supervisor"):
+        assert (store / f"{name}.md").exists()
+
+
+def test_omp_e2e_seed_is_idempotent(tmp_path: Path) -> None:
+    _seed_omp_e2e_state(tmp_path)
+    _seed_omp_e2e_state(tmp_path)
+
+    assert (tmp_path / ".omp" / "agent" / "config.yml").read_text(
+        encoding="utf-8"
+    ) == "setupVersion: 1\n"
 
 
 def test_log_file_populated(cao_server: CaoServer) -> None:

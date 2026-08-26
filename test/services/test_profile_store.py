@@ -244,3 +244,173 @@ def test_delete_profile_does_not_follow_a_name_out_of_the_store(
     with pytest.raises((InvalidProfileNameError, ProfileNotFoundError)):
         delete_profile("../outsider")
     assert outsider.exists()
+
+
+# --------------------------------------------------------------------------
+# replace_profile
+# --------------------------------------------------------------------------
+
+
+def test_replace_profile_updates_an_existing_profile(store: Path) -> None:
+    profile_store.write_profile("agent", "original\n")
+
+    written = profile_store.replace_profile("agent", "updated\n")
+
+    assert written.read_text(encoding="utf-8") == "updated\n"
+
+
+def test_replace_profile_refuses_to_create_a_missing_profile(store: Path) -> None:
+    """The whole point of the function: update-only, never insert.
+
+    ``write_profile(..., overwrite=True)`` is an upsert, which is wrong for an
+    HTTP PUT. Requiring the target to exist is what stops a PUT from creating a
+    file at all.
+    """
+    with pytest.raises(profile_store.ProfileNotFoundError):
+        profile_store.replace_profile("never-installed", "content\n")
+
+    assert not (store / "never-installed.md").exists()
+
+
+def test_replace_profile_will_not_shadow_a_built_in(store: Path) -> None:
+    """A built-in's name is not in the local store, so PUT must reject it.
+
+    ``code_supervisor`` ships in ``cli_agent_orchestrator/agent_store``. An upsert
+    would create a *local* file of the same name that wins on load, silently
+    shadowing the built-in. That is precisely the condition ``duplicated_in``
+    exists to report, so it must not be manufacturable through the write path.
+    """
+    with pytest.raises(profile_store.ProfileNotFoundError):
+        profile_store.replace_profile("code_supervisor", "hijacked\n")
+
+    assert not (store / "code_supervisor.md").exists()
+
+
+def test_replace_profile_rejects_an_unsafe_name_before_touching_disk(store: Path) -> None:
+    with pytest.raises(profile_store.InvalidProfileNameError):
+        profile_store.replace_profile("../escape", "content\n")
+
+    assert not store.exists()
+
+
+def test_replace_profile_can_replace_a_corrupt_store_file(store: Path) -> None:
+    """Undecodable bytes must not make an existing profile unrepairable.
+
+    Same property ``write_profile`` has, for the same reason: the write path must
+    not read the old content first.
+    """
+    store.mkdir(parents=True, exist_ok=True)
+    target = store / "agent.md"
+    target.write_bytes(b"\xff\xfe not utf-8 at all")
+
+    profile_store.replace_profile("agent", "clean\n")
+
+    assert target.read_text(encoding="utf-8") == "clean\n"
+
+
+def test_replace_profile_refuses_every_concurrent_writer_when_the_target_is_absent(
+    store: Path,
+) -> None:
+    """The existence requirement holds under contention, not just serially.
+
+    Two threads race to replace the same profile after it is deleted. Neither may
+    succeed by creating the file, because the check lives inside the lock.
+
+    Note what this does NOT cover: the file is removed *before* the barrier, so
+    both racers are writers and no delete overlaps a write. The interleaving that
+    actually threatened the update-only guarantee is covered by
+    ``test_delete_profile_cannot_unlink_while_a_replace_holds_the_lock`` below.
+    """
+    import threading
+
+    profile_store.write_profile("agent", "original\n")
+    profile_store.delete_profile("agent")
+
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def attempt(label: str) -> None:
+        barrier.wait()
+        try:
+            profile_store.replace_profile("agent", f"{label}\n")
+            with lock:
+                outcomes.append(f"created:{label}")
+        except profile_store.ProfileNotFoundError:
+            with lock:
+                outcomes.append(f"rejected:{label}")
+
+    threads = [threading.Thread(target=attempt, args=(name,)) for name in ("FIRST", "SECOND")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["rejected:FIRST", "rejected:SECOND"]
+    assert not (store / "agent.md").exists()
+
+
+def test_delete_profile_cannot_unlink_while_a_replace_holds_the_lock(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent delete cannot resurrect a profile through an in-flight update.
+
+    Reported on PR #585. ``delete_profile`` used to do an unlocked ``exists()``
+    then ``unlink()``, so this interleaving was reachable:
+
+      1. ``replace_profile`` takes the lock and passes its ``must_exist`` check
+      2. ``delete_profile`` unlinks the file and reports success
+      3. ``replace_profile`` publishes, recreating what was just deleted
+
+    Both callers were told they succeeded and the "deleted" profile was back on
+    disk holding the replacement text. Pausing inside the publish makes the
+    window deterministic rather than hoping the scheduler lands in it: the
+    deleter must still be blocked on the lock while the replace holds it.
+    """
+    from cli_agent_orchestrator.utils import atomic_file
+
+    profile_store.write_profile("agent", "original\n")
+    target = store / "agent.md"
+
+    publish_entered = threading.Event()
+    release = threading.Event()
+    real_publish = atomic_file._atomic_publish
+
+    def paused_publish(t: Path, content: str, encoding: str) -> None:
+        publish_entered.set()
+        release.wait(timeout=10)
+        return real_publish(t, content, encoding)
+
+    monkeypatch.setattr(atomic_file, "_atomic_publish", paused_publish)
+
+    delete_outcome: list[str] = []
+
+    def deleter() -> None:
+        try:
+            profile_store.delete_profile("agent")
+            delete_outcome.append("deleted")
+        except Exception as exc:  # noqa: BLE001 - recording the class is the point
+            delete_outcome.append(type(exc).__name__)
+
+    replacer = threading.Thread(target=lambda: profile_store.replace_profile("agent", "REPLACED\n"))
+    replacer.start()
+    assert publish_entered.wait(timeout=10), "replace never reached the publish step"
+
+    deleter_thread = threading.Thread(target=deleter)
+    deleter_thread.start()
+    deleter_thread.join(timeout=0.5)
+
+    # The assertion that fails on the unlocked implementation: the delete would
+    # have completed here, having unlinked a file the replace is about to
+    # republish.
+    assert deleter_thread.is_alive(), "delete_profile did not wait for the write lock"
+    assert target.exists()
+
+    release.set()
+    replacer.join(timeout=10)
+    deleter_thread.join(timeout=15)
+
+    # Serialised, so the delete lands after the update rather than inside it and
+    # the file is genuinely gone.
+    assert delete_outcome == ["deleted"]
+    assert not target.exists()

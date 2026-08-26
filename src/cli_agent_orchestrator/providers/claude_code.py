@@ -253,11 +253,17 @@ class ClaudeCodeProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        resume_session_id: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # When set, the launched claude process resumes this Claude Code
+        # session id (--resume <sid>) instead of starting a fresh
+        # conversation. Used to re-open a supervisor conversation inside a
+        # new CAO session (durable-orchestra recovery).
+        self._resume_session_id = resume_session_id
         # Explicit per-call override for profile.model (see launch()'s own
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
         # specific model for one worker without needing a dedicated profile.
@@ -368,6 +374,12 @@ class ClaudeCodeProvider(BaseProvider):
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
 
+        # Resume a prior Claude Code conversation. Applied for every profile
+        # branch below -- resume is orthogonal to profile decomposition; the
+        # session id was validated at the API boundary.
+        if self._resume_session_id:
+            command_parts.extend(["--resume", self._resume_session_id])
+
         # Route based on profile state
         native = getattr(profile, "native_agent", None) if profile else None
         if profile is not None and isinstance(native, str) and native:
@@ -401,6 +413,21 @@ class ClaudeCodeProvider(BaseProvider):
             resolved_model = self._model or profile.model
             if resolved_model:
                 command_parts.extend(["--model", resolved_model])
+
+            # Apply Claude Code-only per-agent knobs from claudeConfig:
+            #   effort         -> --effort <level>
+            #   fallback_model -> --fallback-model <model>
+            # Claude analog of codexConfig: per-agent reasoning effort without
+            # depending on the machine-global effortLevel in
+            # ~/.claude/settings.json.
+            claude_config = getattr(profile, "claudeConfig", None)
+            if isinstance(claude_config, dict):
+                effort = claude_config.get("effort")
+                if effort:
+                    command_parts.extend(["--effort", str(effort)])
+                fallback_model = claude_config.get("fallback_model")
+                if fallback_model:
+                    command_parts.extend(["--fallback-model", str(fallback_model)])
 
             # Add system prompt - escape newlines to prevent tmux chunking issues
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""

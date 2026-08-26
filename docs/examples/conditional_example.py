@@ -12,7 +12,13 @@ be deterministic from its own source, not from ambient environment state
 (the authoring guide's determinism obligation). Edit ``IS_URGENT`` below to
 exercise the other branch.
 
-Run standalone via ``cao workflow run --script docs/examples/conditional_example.py``.
+Run standalone by copying it into the workflows directory and running it by its
+stem — ``cao workflow run`` resolves a bare name, and rejects a path outside
+that directory::
+
+    cp docs/examples/conditional_example.py ~/.aws/cli-agent-orchestrator/workflows/
+    cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/conditional_example.py
+    cao workflow run conditional_example
 """
 
 from __future__ import annotations

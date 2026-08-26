@@ -37,6 +37,21 @@ def parse_failure(*, times: int, then=None):
     return [ValueError(ZIP_ERROR)] * times + ([then] if then is not None else [])
 
 
+def list_sessions_result(*names, returncode=0):
+    """Stand-in for libtmux's ``tmux_cmd`` result for a ``list-sessions`` call.
+
+    ``kill_session``'s verification poll asks ``session_exists_strict``, which
+    runs its own ``list-sessions`` through ``server.cmd`` rather than reading
+    ``server.sessions`` — so the parse failures these tests inject never reach
+    it and it needs an answer of its own (#498).
+    """
+    result = MagicMock()
+    result.returncode = returncode
+    result.stdout = list(names)
+    result.stderr = []
+    return result
+
+
 def make_window(pane=None):
     window = MagicMock()
     if pane is not None:
@@ -305,6 +320,10 @@ class TestCreateSessionHalfState:
 class TestKillParseFailure:
     def test_kill_session_falls_back_to_the_cli(self, tmux):
         tmux.server.sessions.get.side_effect = parse_failure(times=2)
+        # The CLI kill exiting 0 is not on its own a True: the verification poll
+        # still has to see the session gone. Exit 0 with "ses" absent from the
+        # name list is that authoritative "gone" (#498).
+        tmux.server.cmd.return_value = list_sessions_result()
 
         with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock(returncode=0, stderr="")
@@ -316,6 +335,24 @@ class TestKillParseFailure:
             "-t",
             "=ses",
         ]
+
+    def test_cli_fallback_still_has_to_confirm_the_session_is_gone(self, tmux, monkeypatch):
+        """A dispatched CLI kill is not a confirmed kill.
+
+        The fallback is exempt from the parse-prone listing, not from the
+        confirmation contract: with the session still listed after the CLI kill
+        exits 0, kill_session must report False so teardown leaves the registry
+        intact instead of dropping rows for a live session (#498).
+        """
+        tmux.server.sessions.get.side_effect = parse_failure(times=2)
+        tmux.server.cmd.return_value = list_sessions_result("ses")
+        monkeypatch.setattr(tmux, "_KILL_SESSION_VERIFY_TIMEOUT_SECONDS", 0)
+
+        with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(returncode=0, stderr="")
+            assert tmux.kill_session("ses") is False
+
+        mock_subprocess.run.assert_called_once()
 
     def test_kill_session_reports_absence_without_calling_the_cli(self, tmux):
         tmux.server.sessions.get.return_value = None

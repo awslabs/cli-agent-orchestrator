@@ -21,6 +21,9 @@ from cli_agent_orchestrator.services.terminal_service import create_terminal
 _MODULE = "cli_agent_orchestrator.services.terminal_service"
 
 
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
+
 @pytest.mark.asyncio
 async def test_capability_probe_does_not_block_event_loop():
     """A synchronous capability probe runs in a worker while async work advances."""
@@ -161,6 +164,7 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
         ),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
+        patch(f"{_MODULE}.delete_terminals_by_session"),
         patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,
         patch(f"{_MODULE}.generate_terminal_id", return_value="test1234"),
@@ -209,6 +213,7 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
         ),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal"),
+        patch(f"{_MODULE}.delete_terminals_by_session"),
         patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,
         patch(f"{_MODULE}.generate_terminal_id", return_value="test1234"),

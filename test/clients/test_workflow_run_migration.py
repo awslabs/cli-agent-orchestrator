@@ -107,10 +107,19 @@ def test_workflow_run_step_columns(patched_db):
         "terminal_id",
         "reprompted",
         "error_kind",
+        "result_json",
     }
     # Composite PRIMARY KEY (run_id, step_id): both carry pk>0.
     assert cols["run_id"][5] > 0
     assert cols["step_id"][5] > 0
+    # MERGE NOTE (2026-08-17, #583 x #504). #583 asserted here that ``reprompted`` and
+    # ``terminal_id`` were deliberately NOT journaled (F3) and that the COLUMNS did not
+    # exist. #504 then ADDED both columns plus ``error_kind``, so those two assertions
+    # became FALSE and are removed rather than reconciled — this is the one place in the
+    # merge where the two changes genuinely disagreed instead of both appending. The
+    # #583 point that survives: ``terminal_id`` is ALSO carried inside the ``result_json``
+    # envelope, so the value now exists in two places and a reader must not assume the
+    # column and the envelope field are the same write.
     # U3 additive column (E2): defaults to NULL (INV-2). PRAGMA table_info reports
     # the literal default expression as the string "NULL", not Python None.
     assert cols["call_fingerprint"][4] == "NULL"
@@ -122,6 +131,10 @@ def test_workflow_run_step_columns(patched_db):
     assert cols["terminal_id"][4] == "NULL"
     assert cols["reprompted"][4] == "NULL"
     assert cols["error_kind"][4] == "NULL"
+    # result-envelope additive column (issue #583, BR-7/BR-10): one TEXT column defaulting
+    # to NULL, so every pre-#583 row reads as "envelope absent".
+    assert cols["result_json"][4] == "NULL"
+    assert cols["result_json"][2] == "TEXT"
 
 
 def test_workflow_run_event_columns(patched_db):

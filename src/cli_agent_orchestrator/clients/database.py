@@ -39,6 +39,7 @@ class TerminalModel(Base):
     tmux_window = Column(String, nullable=False)  # "window-name"
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
@@ -789,6 +790,30 @@ def _migrate_workflow_run_step() -> None:
     ``error_kind`` (structured error kind). All default to ``NULL`` so a
     pre-U1 row reads back observably identical to its pre-extension form
     (additive-only, C-1/C-4). ``workflow_run`` itself is untouched.
+
+    ``result-envelope`` (issue #583, BR-7) then additively appends ONE column,
+    ``result_json``, through the same gate — the serialised ``StepResultEnvelope``
+    that replay returns (FR-1). ``DEFAULT NULL`` means every pre-#583 row reads as
+    "envelope absent" (BR-10), which is safe rather than a gap: such a row's
+    fingerprint is legacy-scheme or NULL, so FR-6 already keeps it off the replay
+    path and the two guards agree instead of disagreeing.
+
+    Because the failure is silent, the column's existence is VERIFIED rather than
+    assumed (BR-8): see ``test/services/test_step_result.py`` for the
+    ``PRAGMA table_info`` assertion on a fresh database. A silent failure would
+    otherwise surface far away as every settle losing its envelope, which the
+    replay gate would read as crash-window rows and halt on.
+
+    MERGE NOTE (2026-08-17, #583 x #504). #583's original rationale for adding ONE
+    column rather than three read: "three statements would triple the chance of a
+    partial, silent migration", because this body is wrapped in
+    ``except Exception`` -> ``logger.debug``. **That argument is overtaken by the
+    merge** — #504 independently added three columns to the same silently-failing
+    block, so the combined body now issues FOUR guarded ``ALTER`` statements, not
+    one. The risk #583 minimised is materially larger than either change assumed
+    alone. #583's mitigation (assert the column exists on a fresh database) is
+    therefore MORE load-bearing after this merge, and #504's three columns have no
+    equivalent assertion. Flagged rather than silently reconciled.
     """
     import sqlite3
 
@@ -829,6 +854,11 @@ def _migrate_workflow_run_step() -> None:
                     "ALTER TABLE workflow_run_step ADD COLUMN error_kind TEXT DEFAULT NULL"
                 )
                 logger.info("Migration: added error_kind column to workflow_run_step")
+            if "result_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN result_json TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added result_json column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
 
@@ -1015,6 +1045,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute('ALTER TABLE terminals ADD COLUMN "metadata" TEXT')
             conn.commit()
             logger.info("Migration: added metadata column to terminals table")
+        if "working_directory" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
+            conn.commit()
+            logger.info("Migration: added working_directory column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1032,6 +1066,7 @@ def create_terminal(
     engine: Optional[str] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    working_directory: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -1043,6 +1078,7 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            working_directory=working_directory,
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
@@ -1058,6 +1094,7 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
@@ -1094,6 +1131,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
@@ -1262,6 +1300,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "last_active": t.last_active,
             }
@@ -1302,6 +1341,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "last_active": t.last_active,
             }
@@ -1368,6 +1408,27 @@ def delete_terminals_by_session(tmux_session: str) -> int:
     with SessionLocal() as db:
         deleted = (
             db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
+        )
+        db.commit()
+        return deleted
+
+
+def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
+    """Delete specific terminal rows by id. Returns the number deleted.
+
+    Unlike ``delete_terminals_by_session`` (which deletes EVERY row for a
+    session name), this deletes only the given ids. Session teardown uses it to
+    scope its reconciliation sweep to the incarnation it started tearing down,
+    so a concurrent same-name recreate — whose rows carry freshly generated ids
+    — is never swept (#498).
+    """
+    if not terminal_ids:
+        return 0
+    with SessionLocal() as db:
+        deleted = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id.in_(terminal_ids))
+            .delete(synchronize_session=False)
         )
         db.commit()
         return deleted

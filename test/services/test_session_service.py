@@ -1,16 +1,33 @@
 """Tests for the session service."""
 
+import asyncio
+import contextlib
+import os
+import shlex
+import uuid
+from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
+import pytest_asyncio
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.backends import registry as backend_registry
+from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+from cli_agent_orchestrator.clients import database as db_mod
+from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.services import fifo_reader as fifo_reader_mod
+from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.session_service import (
     create_session,
     delete_session,
     get_session,
     list_sessions,
 )
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 
 class TestCreateSession:
@@ -117,19 +134,39 @@ class TestCreateSession:
 class TestListSessions:
     """Tests for list_sessions function."""
 
+    class _FakeTmuxClient:
+        def __init__(self, sessions, working_directories):
+            self._sessions = sessions
+            self._working_directories = working_directories
+            self.cwd_calls = []
+
+        def list_sessions(self):
+            return self._sessions
+
+        def get_pane_working_directory(self, session_name, window_name):
+            self.cwd_calls.append((session_name, window_name))
+            value = self._working_directories[(session_name, window_name)]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_list_sessions_success(self, mock_get_backend):
+    def test_list_sessions_success(self, mock_get_backend, mock_list_terminals):
         """Test listing sessions successfully."""
         mock_get_backend.return_value.list_sessions.return_value = [
             {"id": "cao-session1", "name": "Session 1"},
             {"id": "cao-session2", "name": "Session 2"},
             {"id": "other-session", "name": "Other"},
         ]
+        mock_list_terminals.return_value = []
 
         result = list_sessions()
 
         assert len(result) == 2
         assert all(s["id"].startswith("cao-") for s in result)
+        assert all("working_directory" in s for s in result)
+        assert all("agent_profile" in s for s in result)
 
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_empty(self, mock_get_backend):
@@ -140,8 +177,9 @@ class TestListSessions:
 
         assert result == []
 
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_list_sessions_no_cao_sessions(self, mock_get_backend):
+    def test_list_sessions_no_cao_sessions(self, mock_get_backend, mock_list_terminals):
         """Test listing sessions when no CAO sessions exist."""
         mock_get_backend.return_value.list_sessions.return_value = [
             {"id": "other-session1", "name": "Other 1"},
@@ -151,6 +189,7 @@ class TestListSessions:
         result = list_sessions()
 
         assert result == []
+        mock_list_terminals.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_error(self, mock_get_backend):
@@ -160,6 +199,376 @@ class TestListSessions:
         result = list_sessions()
 
         assert result == []
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_prefers_persisted_working_directory(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """Launch-time cwd from terminal metadata is the preferred ownership signal."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-owned", "name": "cao-owned", "status": "detached"}],
+            {("cao-owned", "developer-abcd"): AssertionError("pane cwd should not be used")},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.return_value = [
+            {
+                "id": "term1",
+                "tmux_session": "cao-owned",
+                "tmux_window": "developer-abcd",
+                "agent_profile": "developer",
+                "working_directory": "/launch/project",
+            }
+        ]
+
+        result = list_sessions()
+
+        assert result == [
+            {
+                "id": "cao-owned",
+                "name": "cao-owned",
+                "status": "detached",
+                "agent_profile": "developer",
+                "working_directory": "/launch/project",
+            }
+        ]
+        assert fake_client.cwd_calls == []
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_falls_back_to_pane_working_directory(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """When no launch cwd is stored, list_sessions resolves the pane cwd."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-owned", "name": "cao-owned", "status": "detached"}],
+            {("cao-owned", "developer-abcd"): "/pane/project"},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.return_value = [
+            {
+                "id": "term1",
+                "tmux_session": "cao-owned",
+                "tmux_window": "developer-abcd",
+                "agent_profile": "developer",
+                "working_directory": None,
+            }
+        ]
+
+        result = list_sessions()
+
+        assert result[0]["working_directory"] == "/pane/project"
+        assert result[0]["agent_profile"] == "developer"
+        assert fake_client.cwd_calls == [("cao-owned", "developer-abcd")]
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_keeps_session_when_working_directory_unresolvable(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """A cwd resolution failure affects only that field, not the session list."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-owned", "name": "cao-owned", "status": "detached"}],
+            {("cao-owned", "developer-abcd"): RuntimeError("pane unavailable")},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.return_value = [
+            {
+                "id": "term1",
+                "tmux_session": "cao-owned",
+                "tmux_window": "developer-abcd",
+                "agent_profile": "developer",
+                "working_directory": None,
+            }
+        ]
+
+        result = list_sessions()
+
+        assert len(result) == 1
+        assert result[0]["id"] == "cao-owned"
+        assert result[0]["working_directory"] is None
+        assert result[0]["agent_profile"] == "developer"
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_handles_orphaned_tmux_session(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """A tmux session with no DB terminals still lists (null metadata)."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-orphaned", "name": "Orphaned", "status": "active"}],
+            {},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.return_value = []
+
+        result = list_sessions()
+
+        assert len(result) == 1
+        assert result[0]["id"] == "cao-orphaned"
+        assert result[0]["working_directory"] is None
+        assert result[0]["agent_profile"] is None
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_handles_enrichment_exception_gracefully(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """One session's enrichment failure doesn't blank the entire list."""
+        fake_client = self._FakeTmuxClient(
+            [
+                {"id": "cao-good", "name": "Good", "status": "active"},
+                {"id": "cao-bad", "name": "Bad", "status": "active"},
+            ],
+            {("cao-good", "win-good"): "/home/user/project"},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.side_effect = [
+            [
+                {
+                    "id": "term-good",
+                    "tmux_session": "cao-good",
+                    "tmux_window": "win-good",
+                    "agent_profile": "developer",
+                    "working_directory": None,
+                }
+            ],
+            Exception("DB connection failed"),
+        ]
+
+        result = list_sessions()
+
+        assert len(result) == 2
+        assert result[0]["id"] == "cao-good"
+        assert result[0]["working_directory"] == "/home/user/project"
+        assert result[0]["agent_profile"] == "developer"
+        assert result[1]["id"] == "cao-bad"
+        assert result[1]["working_directory"] is None
+        assert result[1]["agent_profile"] is None
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_ignores_none_id_without_blanking_result(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """A backend row with id=None should be skipped without blanking valid rows."""
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": None, "name": "Bad"},
+            {"id": "cao-good", "name": "Good"},
+        ]
+        mock_list_terminals.return_value = []
+
+        result = list_sessions()
+
+        assert result == [
+            {
+                "id": "cao-good",
+                "name": "Good",
+                "working_directory": None,
+                "agent_profile": None,
+            }
+        ]
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_uses_one_terminal_for_profile_and_directory(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """Ownership metadata should not mix profile and cwd from different terminals."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-owned", "name": "cao-owned", "status": "detached"}],
+            {("cao-owned", "developer-abcd"): "/pane/developer"},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.return_value = [
+            {
+                "id": "term1",
+                "tmux_session": "cao-owned",
+                "tmux_window": "developer-abcd",
+                "agent_profile": "developer",
+                "working_directory": None,
+            },
+            {
+                "id": "term2",
+                "tmux_session": "cao-owned",
+                "tmux_window": "reviewer-efgh",
+                "agent_profile": None,
+                "working_directory": "/launch/reviewer",
+            },
+        ]
+
+        result = list_sessions()
+
+        assert result[0]["agent_profile"] == "developer"
+        assert result[0]["working_directory"] == "/pane/developer"
+        assert fake_client.cwd_calls == [("cao-owned", "developer-abcd")]
+
+
+@pytest.fixture
+def real_session_db(tmp_path, monkeypatch):
+    """Route terminal metadata to a per-test real SQLite database."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'session-ownership.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    db_mod.Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(
+        db_mod,
+        "SessionLocal",
+        sessionmaker(autocommit=False, autoflush=False, bind=engine),
+    )
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def real_tmux_backend(tmp_path, monkeypatch):
+    """Use a real tmux backend while keeping FIFO files in pytest's temp area."""
+    fifo_dir = Path(os.path.realpath(tmp_path / "fifos"))
+    fifo_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(terminal_service, "FIFO_DIR", fifo_dir)
+    monkeypatch.setattr(fifo_reader_mod, "FIFO_DIR", fifo_dir)
+
+    backend = TmuxBackend()
+    monkeypatch.setattr(backend_registry, "_backend", backend)
+    return backend
+
+
+@pytest_asyncio.fixture
+async def running_status_monitor():
+    """Run the in-process status monitor used by mock_cli initialization."""
+    loop = asyncio.get_running_loop()
+    bus.set_loop(loop)
+    task = asyncio.create_task(status_monitor.run())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        bus.set_loop(None)
+
+
+def _session_suffix() -> str:
+    return f"ownership-{uuid.uuid4().hex[:8]}"
+
+
+async def _wait_for_pane_directory(backend, session_name: str, window_name: str, expected: str):
+    deadline = asyncio.get_running_loop().time() + 8
+    while asyncio.get_running_loop().time() < deadline:
+        if backend.get_pane_working_directory(session_name, window_name) == expected:
+            return
+        await asyncio.sleep(0.2)
+    assert backend.get_pane_working_directory(session_name, window_name) == expected
+
+
+@pytest.mark.integration
+class TestSessionOwnershipIntegration:
+    """Regression tests for list_sessions ownership metadata persistence."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "working_directory",
+        [None, "."],
+        ids=["omitted-working-directory", "relative-dot-working-directory"],
+    )
+    async def test_create_terminal_persists_effective_cwd_and_list_sessions_does_not_drift(
+        self,
+        working_directory,
+        tmp_path,
+        monkeypatch,
+        real_session_db,
+        real_tmux_backend,
+        running_status_monitor,
+    ):
+        project = tmp_path / "project"
+        drift = tmp_path / "drift"
+        project.mkdir()
+        drift.mkdir()
+        monkeypatch.chdir(project)
+        expected = os.path.realpath(project)
+        session_name = _session_suffix()
+        terminal = None
+
+        try:
+            terminal = await terminal_service.create_terminal(
+                provider="mock_cli",
+                agent_profile="developer",
+                session_name=session_name,
+                new_session=True,
+                working_directory=working_directory,
+            )
+
+            metadata = get_terminal_metadata(terminal.id)
+            assert metadata is not None
+            assert metadata["working_directory"] == expected
+
+            real_tmux_backend.send_keys(terminal.session_name, terminal.name, "/exit")
+            await asyncio.sleep(0.5)
+            real_tmux_backend.send_keys(
+                terminal.session_name,
+                terminal.name,
+                f"cd {shlex.quote(str(drift))}",
+            )
+            await _wait_for_pane_directory(
+                real_tmux_backend,
+                terminal.session_name,
+                terminal.name,
+                os.path.realpath(drift),
+            )
+
+            sessions = {s["id"]: s for s in list_sessions()}
+            assert sessions[terminal.session_name]["working_directory"] == expected
+            assert sessions[terminal.session_name]["agent_profile"] == "developer"
+        finally:
+            if terminal is not None:
+                with contextlib.suppress(Exception):
+                    delete_session(terminal.session_name)
+
+    @pytest.mark.asyncio
+    async def test_same_name_relaunch_purges_stale_terminal_metadata(
+        self,
+        tmp_path,
+        real_session_db,
+        real_tmux_backend,
+        running_status_monitor,
+    ):
+        old_project = tmp_path / "old-project"
+        new_project = tmp_path / "new-project"
+        old_project.mkdir()
+        new_project.mkdir()
+        session_name = _session_suffix()
+        live_session_name = f"cao-{session_name}"
+
+        first = await create_session(
+            provider="mock_cli",
+            agent_profile="developer",
+            session_name=session_name,
+            working_directory=str(old_project),
+        )
+        real_tmux_backend.kill_session(first.session_name)
+        terminal_service.fifo_manager.stop_reader(first.id)
+        terminal_service.status_monitor.clear_terminal(first.id)
+        terminal_service.provider_manager.cleanup_provider(first.id)
+
+        second = None
+        try:
+            second = await create_session(
+                provider="mock_cli",
+                agent_profile="reviewer",
+                session_name=session_name,
+                working_directory=str(new_project),
+            )
+
+            sessions = {s["id"]: s for s in list_sessions()}
+            assert sessions[live_session_name]["working_directory"] == os.path.realpath(new_project)
+            assert sessions[live_session_name]["agent_profile"] == "reviewer"
+        finally:
+            if second is not None:
+                with contextlib.suppress(Exception):
+                    delete_session(second.session_name)
 
 
 class TestGetSession:
@@ -234,24 +643,42 @@ class TestGetSession:
 
 
 class TestDeleteSession:
-    """Tests for delete_session function."""
+    """Tests for delete_session function.
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    delete_session (#498) runs its whole critical section under the
+    per-session-name lifecycle lock, captures each terminal's scrollback
+    (read-only) first, checks session liveness with a STRICT existence check
+    (a lookup error is not "gone"), disambiguates a False kill via a strict
+    follow-up (a session gone-before-kill is success, not failure), and only
+    THEN dismantles the per-terminal runtime and deletes registry rows — scoped
+    BY ID to the incarnation it started tearing down. Faithful-fake, real-DB
+    reconciliation and concurrency tests live in test_session_teardown_atomic.py.
+    """
+
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_success(
         self,
         mock_get_backend,
         mock_list_terminals,
-        mock_delete_terminal,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
     ):
         """Test deleting session successfully.
 
-        delete_session delegates per-terminal teardown (FIFO reader, status
-        buffer, provider, DB) to terminal_service.delete_terminal, then kills
-        the backend session and returns the Dict result shape.
+        delete_session captures each terminal's snapshot, kills the backend
+        session through the verified backend primitive, and only after that
+        confirmation dismantles the runtime (FIFO reader, status buffer,
+        provider) and deletes the rows + sweeps by id.
         """
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
@@ -261,71 +688,121 @@ class TestDeleteSession:
 
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
-        # Each terminal is torn down via the event-driven delete_terminal path.
-        assert mock_delete_terminal.call_count == 2
-        mock_delete_terminal.assert_any_call("terminal1", registry=ANY)
-        mock_delete_terminal.assert_any_call("terminal2", registry=ANY)
+        # Registry rows are reconciled after kill_session confirms the session
+        # is gone — scoped to the incarnation's ids, not the whole session name.
+        mock_delete_terminals_by_ids.assert_called_once_with(["terminal1", "terminal2"])
+        # Snapshots are captured while the panes still exist ...
+        assert mock_capture.call_count == 2
+        mock_capture.assert_any_call("terminal1")
+        mock_capture.assert_any_call("terminal2")
+        # ... and the runtime + row are only touched after the kill was confirmed.
+        assert mock_dismantle.call_count == 2
+        mock_dismantle.assert_any_call("terminal1", ANY, kill_window=False)
+        mock_dismantle.assert_any_call("terminal2", ANY, kill_window=False)
+        assert mock_delete_row.call_count == 2
+        mock_delete_row.assert_any_call("terminal1", ANY, registry=ANY)
+        mock_delete_row.assert_any_call("terminal2", ANY, registry=ANY)
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_when_backend_session_already_gone(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
     ):
         """Backend session already gone — delete_session should not raise and not
-        call kill_session, but still tear down each terminal via delete_terminal."""
-        mock_get_backend.return_value.session_exists.return_value = False
+        call kill_session, but still tear down each terminal and reconcile the
+        registry."""
+        mock_get_backend.return_value.session_exists_strict.return_value = False
         mock_list_terminals.return_value = [{"id": "terminal1"}]
 
         result = delete_session("cao-test")
 
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_not_called()
-        mock_delete_terminal.assert_called_once_with("terminal1", registry=ANY)
+        mock_capture.assert_called_once_with("terminal1")
+        mock_dismantle.assert_called_once_with("terminal1", ANY, kill_window=False)
+        mock_delete_row.assert_called_once_with("terminal1", ANY, registry=ANY)
+        mock_delete_terminals_by_ids.assert_called_once_with(["terminal1"])
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_no_terminals(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
     ):
         """Test deleting session with no terminals."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
         mock_list_terminals.return_value = []
 
         result = delete_session("cao-test")
 
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
-        mock_delete_terminal.assert_not_called()
+        mock_capture.assert_not_called()
+        mock_dismantle.assert_not_called()
+        mock_delete_row.assert_not_called()
+        mock_delete_terminals_by_ids.assert_called_once_with([])
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_error(self, mock_get_backend, mock_list_terminals):
         """Test deleting session with error."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
         mock_list_terminals.side_effect = Exception("Database error")
 
         with pytest.raises(Exception, match="Database error"):
             delete_session("cao-test")
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_continues_when_terminal_cleanup_fails(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
     ):
-        """Test that delete_session continues even when terminal teardown fails for some terminals."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        """delete_session continues when one terminal's snapshot capture fails.
+
+        A failed capture yields no metadata but must not abort the teardown, drop
+        the terminal from the incarnation, or skip the session kill.
+        """
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
             {"id": "terminal3"},
         ]
 
-        # First terminal teardown fails, others succeed
-        mock_delete_terminal.side_effect = [
-            Exception("Terminal teardown error for terminal1"),
+        # First terminal's snapshot capture fails, others succeed
+        mock_capture.side_effect = [
+            Exception("Snapshot error for terminal1"),
             None,  # terminal2 succeeds
             None,  # terminal3 succeeds
         ]
@@ -335,17 +812,77 @@ class TestDeleteSession:
         # Session should still be deleted despite per-terminal teardown failure
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
-        # All three terminal teardowns were attempted
-        assert mock_delete_terminal.call_count == 3
+        # All three captures were attempted ...
+        assert mock_capture.call_count == 3
+        # ... and every terminal is still dismantled and row-deleted: a failed
+        # capture only costs its metadata (passed as None), never its teardown.
+        assert mock_dismantle.call_count == 3
+        assert mock_delete_row.call_count == 3
+        mock_dismantle.assert_any_call("terminal1", None, kill_window=False)
+        mock_delete_row.assert_any_call("terminal1", None, registry=ANY)
+        # The by-id sweep still backstops any row a failed delete left behind.
+        mock_delete_terminals_by_ids.assert_called_once_with(
+            ["terminal1", "terminal2", "terminal3"]
+        )
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_reports_deferred_terminal_cleanup(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
+    ):
+        """An explicit retryable teardown result must not be reported deleted.
+
+        A deferred runtime teardown (Grok has not released its private home yet,
+        #596) keeps the terminal's registry row: the row is the only retry handle,
+        so neither the per-terminal delete nor the by-id sweep may drop it, and
+        the session is reported in ``errors`` rather than ``deleted``. The tmux
+        session itself is still killed — the deferral is about on-disk provider
+        state, not the session.
+        """
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [{"id": "grok-terminal"}]
+        mock_dismantle.return_value = False
+
+        result = delete_session("cao-grok")
+
+        assert result["deleted"] == []
+        assert result["errors"] == [
+            {"terminal_id": "grok-terminal", "error": "cleanup deferred; retry delete_session"}
+        ]
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-grok")
+        # The retry handle survives both row-deletion paths.
+        mock_delete_row.assert_not_called()
+        mock_delete_terminals_by_ids.assert_called_once_with([])
+
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_cleans_up_each_terminal(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
     ):
-        """Test that delete_session tears down every terminal in the session via delete_terminal."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        """Test that delete_session tears down every terminal in the session."""
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
         mock_list_terminals.return_value = [
             {"id": "term-aaa"},
             {"id": "term-bbb"},
@@ -356,9 +893,11 @@ class TestDeleteSession:
         result = delete_session("cao-multi-terminal")
 
         assert result == {"deleted": ["cao-multi-terminal"], "errors": []}
-        # Verify delete_terminal was called for each terminal with the correct ID
-        assert mock_delete_terminal.call_count == 4
-        mock_delete_terminal.assert_any_call("term-aaa", registry=ANY)
-        mock_delete_terminal.assert_any_call("term-bbb", registry=ANY)
-        mock_delete_terminal.assert_any_call("term-ccc", registry=ANY)
-        mock_delete_terminal.assert_any_call("term-ddd", registry=ANY)
+        # Verify all three teardown phases ran for each terminal id
+        assert mock_capture.call_count == 4
+        assert mock_dismantle.call_count == 4
+        assert mock_delete_row.call_count == 4
+        for tid in ("term-aaa", "term-bbb", "term-ccc", "term-ddd"):
+            mock_capture.assert_any_call(tid)
+            mock_dismantle.assert_any_call(tid, ANY, kill_window=False)
+            mock_delete_row.assert_any_call(tid, ANY, registry=ANY)

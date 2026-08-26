@@ -60,6 +60,76 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   client can render create and edit forms from the server's definition instead
   of duplicating the field list.
 - `POST /agents/profiles/install` installs a profile.
+- `POST /agents/profiles` creates a profile in the local store from a supplied
+  document. Named distinctly from `install`, which takes a bare profile name or
+  an https:// URL rather than the document itself. The request carries `name`
+  and `content`; the two identities of a profile, its storage key and its
+  frontmatter `name`, must agree, so a mismatch is a 400 rather than a silent
+  rename. A conflicting name returns 409. Requires `cao:write` or `cao:admin`.
+- `PUT /agents/profiles/{name}` replaces an existing local-store profile and
+  never creates one. A request naming a built-in or provider-managed profile
+  returns 404 rather than writing a local file that would shadow the original.
+  Requires `cao:write` or `cao:admin`.
+- `DELETE /agents/profiles/{name}` removes a profile from the local store.
+  Requires `cao:write` or `cao:admin`, the same guard as create and replace, so
+  one credential covers the whole create/edit/delete cycle. Scopes are a flat
+  set rather than a hierarchy, so requiring admin here would 403 a caller
+  holding exactly `cao:write`. Built-ins are not deletable, for the same reason
+  they are not replaceable.
+- Both write routes run the profile validator on the exact submitted document
+  before persisting anything, so an invalid profile never reaches disk. Errors
+  reject the request with 400 and the findings attached; warnings do not block
+  the write and are returned in the response so a client can surface them after
+  a successful save.
+- The validator rejects non-string mapping keys. A profile is written as YAML,
+  which allows any scalar as a key, but the format is described by JSON Schema,
+  where object keys are strings. Without this rule `mcpServers: {1: {...}}`
+  validates clean and persists, then fails to load, since the model requires
+  string keys. Note YAML also auto-types an unquoted date, so `2026-01-01:` is a
+  date key rather than a string; quote such keys.
+- A document is rejected up front if it cannot safely be handed to the steps that
+  follow, on any of three grounds: how large it renders, how deeply it nests, or
+  whether it contains a cycle. The reason is that YAML anchors decouple a
+  document's rendered size from its byte count, and the schema step interpolates a
+  rendering of an offending value into every error message it builds. Chained
+  anchors multiply structure, and aliasing one large scalar multiplies content, so
+  a request under the 256 KB `content` cap can render to gigabytes either way. The
+  ceilings are therefore in *rendered bytes*, the unit that cost is paid in: at
+  most 1 MB, about 3.8x the largest request that can arrive and ~2060x the largest
+  bundled profile's 485 bytes, and at most 64 levels of nesting (~21x). Exceeding
+  either is itself an error and nothing further runs, since the later steps are
+  what such a document is expensive in. A cycle is rejected rather than measured:
+  it has no finite rendering, and the providers that consume a profile cannot
+  serialize one, so accepting it would persist a document the runtime cannot
+  install. Individual schema findings are also length-capped before they reach a
+  response, which bounds the case where several fields each render a subtree.
+- Within those bounds, containers already visited are skipped, so each offending
+  mapping key is reported once, at the first path that reaches it. Note that
+  differs from the schema step, which does not memoize and so reports a shared
+  invalid value once per referencing path.
+- An `mcpServers` entry must define either `command`, for a server CAO launches,
+  or `url`, for a remote one whose `type` names its transport. The schema
+  previously required `command` unconditionally, which made the write routes
+  reject url-based servers that the runtime accepts and passes through to the
+  provider unchanged. An entry defining neither is still rejected. `url` is the
+  spelling `resolve_mcp_server_config` documents; an entry naming its endpoint
+  under any other key satisfies neither branch and is rejected.
+- Every 400 from the profile write and source routes uses one `detail` shape,
+  `{"message", "errors"}`, so a client never has to switch on the type of
+  `detail`. `errors` is empty for a failure that is not attributable to a field,
+  but the key is always present. This covers rejected names as well as schema
+  findings. 404 and 409 keep FastAPI's conventional bare-string `detail`, since
+  the status code already discriminates and there are no findings to attach.
+- `GET /agents/profiles/{name}/source` returns a profile's document exactly as
+  stored. Use this, not `GET /agents/profiles/{name}`, when the document is
+  going to be edited and written back: that route returns the *resolved*
+  profile, having applied `${VAR}` substitution from the managed environment
+  file to the raw text before parsing. Round-tripping a resolved document
+  through a write would persist substituted values into a plaintext profile.
+  Requires `cao:read`, `cao:write`, or `cao:admin`, the same guard the profile
+  reads beside it now carry. Gating matters at least as much here as on the parsed
+  route, because this one returns the stored bytes verbatim from every configured
+  store, including documents that fail to parse.
 - Template validation and preview require the selected template to include a
   `schema.json` file.
 - `/agents/providers` reports provider availability.

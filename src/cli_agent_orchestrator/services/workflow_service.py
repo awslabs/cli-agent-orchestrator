@@ -66,6 +66,29 @@ from cli_agent_orchestrator.services.step_output_store import (
     step_output_store,
 )
 
+# RE-EXPORT, not a use (issue #583, unit ``workflow-errors``, BR-2/INV-5). ADR-583-9 MOVED
+# these two exceptions to the ``workflow_errors`` leaf so ``workflow_journal`` can import them
+# at module level instead of inside ``lookup_replay`` — the function-local import there was a
+# workaround for a cycle with THIS module. A move carries a compatibility obligation a
+# creation does not, and this one is verified rather than defensive:
+# ``test_script_journal_extension.py`` imports ``ReplayDivergenceError`` from here, so
+# dropping the rebind would fail that module AT COLLECTION, taking its whole file down.
+#
+# The redundant ``as`` aliases are the explicit re-export form (PEP 484): they say "this name
+# is deliberately part of this module's surface" to a reader and to a type checker, rather
+# than leaving the intent to be inferred from an import nothing in this file uses. There is no
+# Ruff in this repository, so nothing would have flagged it either way — which is the point;
+# relying on the absence of a checker is not the same as saying what you mean.
+#
+# ``StaleGenerationError`` deliberately did NOT move (BR-7): it is raised inside this module,
+# so no cycle involves it, and breaking a cycle is the leaf's only warrant.
+from cli_agent_orchestrator.services.workflow_errors import (
+    RecoveryDecisionRequired as RecoveryDecisionRequired,
+)
+from cli_agent_orchestrator.services.workflow_errors import (
+    ReplayDivergenceError as ReplayDivergenceError,
+)
+
 logger = logging.getLogger(__name__)
 
 # Event record format version stamped on every emitted ``workflow_run_event`` row
@@ -117,15 +140,6 @@ class StaleGenerationError(ValueError):
     """
 
 
-class ReplayDivergenceError(Exception):
-    """The reserved replay lookup found a fingerprint mismatch (A2, DR-4).
-
-    U3 addition (issue #312, script-tier journal extension, C3). The current
-    run-step route does not call ``lookup_replay``, so this exception is not
-    mapped at an HTTP boundary or surfaced by script resume today.
-    """
-
-
 # ---------------------------------------------------------------------------
 # In-memory run aggregate (engine-internal; never crosses the HTTP seam)
 # ---------------------------------------------------------------------------
@@ -144,6 +158,19 @@ class StepRunState:
     output: Optional[StepOutputRecord] = None
     terminal_id: Optional[str] = None
     error: Optional[str] = None
+    # In-memory carrier for the step's ``v2`` call fingerprint (issue #583, unit
+    # ``settlement-rewire``, BR-2/TD-3). ``run_agent_step`` COMPUTES the value in the one
+    # window BR-5 permits — after working-directory resolution, before terminal creation —
+    # and cannot publish it itself: this module imports ``run_agent_step``, so the reverse
+    # import would be circular. It therefore travels as the terminal-ready hook's second
+    # argument and is published here by ``script_runner``'s hook closure, beside the
+    # ``terminal_id`` that closure already writes.
+    #
+    # IN-MEMORY ONLY — no schema change, no migration. The DURABLE
+    # ``workflow_run_step.call_fingerprint`` column already exists and is
+    # ``workflow_journal.begin_step``'s to write (unit 6 BR-7/BR-9); this field only carries
+    # the value between two callbacks inside one process.
+    call_fingerprint: Optional[str] = None
     which_guard_fired: Optional[str] = None  # RESERVED (N8) — always None in MVP
     iterations_run: Optional[int] = None  # RESERVED (N8) — always None in MVP
 

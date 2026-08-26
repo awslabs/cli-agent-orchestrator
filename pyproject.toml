@@ -81,6 +81,7 @@ dependencies = [
     # command unconditionally, so tomli must be a RUNTIME dependency on 3.10 —
     # not just a dev dependency — or every `cao` command would fail to import.
     "tomli>=2.0.0; python_version < '3.11'",
+    "psutil>=7.0.0",
 ]
 
 [project.optional-dependencies]
@@ -307,6 +308,7 @@ dev = [
     # JWT/JWKS test fixtures (test/fixtures/jwt_factory.py) mint RS256 tokens
     # with authlib; runtime verification needs only pyjwt[crypto].
     "authlib>=1.7.1",
+    "types-psutil>=7.0.0",
 ]
 
 [tool.black]

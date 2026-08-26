@@ -6,7 +6,13 @@ to ``/terminals/run-step`` with stdlib ``urllib`` directly, with no
 ``cao_workflow`` import at all. Compare against ``loop_example.py`` — same
 shape, same env contract, no shim.
 
-Run standalone via ``cao workflow run --script docs/examples/loop_raw_http_example.py``.
+Run standalone by copying it into the workflows directory and running it by its
+stem — ``cao workflow run`` resolves a bare name, and rejects a path outside
+that directory::
+
+    cp docs/examples/loop_raw_http_example.py ~/.aws/cli-agent-orchestrator/workflows/
+    cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/loop_raw_http_example.py
+    cao workflow run loop_raw_http_example
 """
 
 from __future__ import annotations

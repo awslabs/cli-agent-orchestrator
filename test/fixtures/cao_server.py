@@ -367,6 +367,30 @@ def _seed_packaged_skills(home_dir: Path) -> None:
             shutil.copy2(entry, target)
 
 
+def _seed_omp_e2e_state(home_dir: Path) -> None:
+    """Seed non-secret OMP setup state and assign profiles for real OMP E2E tests.
+
+    OMP stores a first-run completion marker under HOME. The managed server
+    deliberately redirects HOME, so without this marker OMP opens its setup
+    wizard and cannot reach a CAO-ready terminal. Authentication remains in
+    normal environment-based providers; this writes no credential material.
+    """
+    import shutil
+
+    omp_config = home_dir / ".omp" / "agent" / "config.yml"
+    omp_config.parent.mkdir(parents=True, exist_ok=True)
+    if not omp_config.exists():
+        omp_config.write_text("setupVersion: 1\n", encoding="utf-8")
+
+    examples_dir = Path(__file__).resolve().parents[2] / "examples" / "assign"
+    store_dir = home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("data_analyst", "report_generator", "analysis_supervisor"):
+        target = store_dir / f"{name}.md"
+        if not target.exists():
+            shutil.copy2(examples_dir / f"{name}.md", target)
+
+
 def _start_cao_server(
     home_dir: Path,
     port: int,
@@ -382,6 +406,7 @@ def _start_cao_server(
     """
     home_dir.mkdir(parents=True, exist_ok=True)
     _seed_packaged_skills(home_dir)
+    _seed_omp_e2e_state(home_dir)
     log_path = home_dir / "server.log"
     log_handle = open(log_path, "ab")  # noqa: SIM115 — handle lifetime is in stop()
 
