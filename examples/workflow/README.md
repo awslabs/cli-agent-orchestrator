@@ -145,8 +145,9 @@ a replay-lookup primitive exists in the journal layer, but it is not yet wired i
 the run-step route, so every `run_step` call — including the plan step and every
 check that already finished — runs again. This example's steps are read-only
 (`reviewer`, no file writes), so a resume is safe to try, but do not expect
-replay-safe, exactly-once behavior yet. See "Resume re-executes the frozen script" in
-[docs/workflow-scripts-authoring-guide.md](../../docs/workflow-scripts-authoring-guide.md#resume-re-executes-the-frozen-script)
+replay-safe, exactly-once behavior yet. See
+"Resume re-executes the script, and the server decides each step" in
+[docs/workflow-scripts-authoring-guide.md](../../docs/workflow-scripts-authoring-guide.md#resume-re-executes-the-script-and-the-server-decides-each-step)
 for the full explanation.
 
 ## Tests
