@@ -71,7 +71,7 @@ from typing import Optional
 import pytest
 import requests
 
-from cli_agent_orchestrator.constants import WORKFLOW_SPEC_DIR
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, WORKFLOW_SPEC_DIR
 
 pytestmark = pytest.mark.integration
 
@@ -113,7 +113,8 @@ def _spec_dir(server: CaoServer) -> Path:
     """
     if os.environ.get("CAO_HOME_DIR", "").strip():
         return WORKFLOW_SPEC_DIR
-    return server.home_dir / WORKFLOW_SPEC_DIR.relative_to(Path.home())
+    # Fallback only when CAO_HOME_DIR is unset; constant is home-derived at import.
+    return server.home_dir / WORKFLOW_SPEC_DIR.relative_to(CAO_HOME_DIR.parent.parent)
 
 
 def _write_script_spec(server: CaoServer, source: str, name: str) -> str:
