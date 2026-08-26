@@ -48,11 +48,25 @@ const config: Config = {
   ],
 
   themeConfig: {
+    // Default preview image for link unfurls (og:image / twitter:image).
+    // Individual pages can override it with `image:` in their front matter.
+    image: 'img/cao-social-card.png',
     colorMode: {
       respectPrefersColorScheme: true,
     },
     navbar: {
       title: 'CLI Agent Orchestrator',
+      // srcDark is not optional here: dark mode paints the navbar pure black
+      // (see the navbar background override in src/css/custom.css), and the
+      // mark's navy contrasts against that at only ~2:1. The dark file lifts
+      // navy to a light tint; everything else about the two is identical.
+      logo: {
+        alt: '',
+        src: 'img/cao-mark.svg',
+        srcDark: 'img/cao-mark-dark.svg',
+        width: 32,
+        height: 32,
+      },
       items: [
         {
           type: 'docSidebar',
