@@ -2,9 +2,17 @@
 # Render the placeholders in these manifests from CloudFormation stack outputs,
 # then apply them.
 #
-# The manifests are checked in with placeholders (<account-id>, <region>,
-# <filesystem-id>, <access-point-id>, <vpc-cidr>) rather than real values, because
-# the real values differ per account and a checked-in account number is a trap.
+# The manifests are checked in with placeholders (<server-image>, <broker-image>,
+# <panel-image>, <account-id>, <region>, <filesystem-id>, <access-point-id>,
+# <vpc-cidr>) rather than real values, because the real values differ per account
+# and a checked-in account number is a trap.
+#
+# The three image placeholders are whole repository URIs read from the stack
+# outputs, not just an account and a region. The repositories are named
+# ${NamePrefix}-server and friends, so a manifest spelling out `cao-server` was
+# correct only while NamePrefix kept its default. Under any other prefix every pod
+# went ImagePullBackOff, and this script printed the right URIs while applying the
+# wrong ones: it read the outputs and used them for nothing but the account number.
 # Editing four files by hand before every deploy is the alternative this replaces.
 #
 # It also generates the broker token. That secret is NOT checked in and NOT read
@@ -45,6 +53,7 @@ REGION="$(aws configure get region || true)"
 echo "reading outputs from stack '$STACK' in $REGION"
 REPO="$(out ServerRepositoryUri)"
 BROKER_REPO="$(out WorkerBrokerRepositoryUri)"
+PANEL_REPO="$(out PanelRepositoryUri)"
 HANDLE="$(out WorkspaceVolumeHandle)"
 CLUSTER="$(out ClusterName)"
 VPC_CIDR="$(out VpcCidrBlock)"
@@ -54,6 +63,7 @@ VPC_CIDR="$(out VpcCidrBlock)"
 # with a literal "<account-id>" in the image name, which surfaces much later as
 # an ImagePullBackOff.
 for pair in "ServerRepositoryUri=$REPO" "WorkerBrokerRepositoryUri=$BROKER_REPO" \
+            "PanelRepositoryUri=$PANEL_REPO" \
             "WorkspaceVolumeHandle=$HANDLE" "ClusterName=$CLUSTER" \
             "VpcCidrBlock=$VPC_CIDR"; do
   [ -n "${pair#*=}" ] || { echo "error: stack output ${pair%%=*} is empty" >&2; exit 1; }
@@ -71,6 +81,7 @@ cat <<EOF
   vpc cidr    $VPC_CIDR
   images      $REPO:$TAG
               $BROKER_REPO:$TAG
+              $PANEL_REPO:$TAG
   workspace   $FS_ID / $AP_ID
 EOF
 
@@ -81,6 +92,9 @@ cp -R "$K8S_DIR"/. "$RENDER/"
 # LC_ALL=C and the -i.bak form keep this working on both GNU and BSD sed.
 find "$RENDER" -name '*.yaml' -print0 | while IFS= read -r -d '' f; do
   LC_ALL=C sed -i.bak \
+    -e "s|<server-image>|$REPO|g" \
+    -e "s|<broker-image>|$BROKER_REPO|g" \
+    -e "s|<panel-image>|$PANEL_REPO|g" \
     -e "s|<account-id>|$ACCOUNT|g" \
     -e "s|<region>|$REGION|g" \
     -e "s|<aws-region>|$REGION|g" \

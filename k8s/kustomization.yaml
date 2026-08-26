@@ -42,18 +42,26 @@ images:
   # it, with nothing to indicate the mismatch. Bump this deliberately when you
   # push a new image.
   #
+  # The repository part is a placeholder, not a literal. It is rendered by
+  # deploy.sh from the stack's own ServerRepositoryUri / WorkerBrokerRepositoryUri
+  # / PanelRepositoryUri outputs, because the repositories are named
+  # ${NamePrefix}-server and friends: hardcoding `cao-server` here worked only
+  # while NamePrefix kept its default, and any other value produced three
+  # ImagePullBackOffs while deploy.sh reported the correct URIs it had read and
+  # then not used.
+  #
   # deploy.sh rewrites EVERY `newTag:` line to the tag it is given, so all three
   # images below always move together. They are built from the same commit by
   # the same CodeBuild run, so a split tag would only ever mean a mistake.
-  - name: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-server
+  - name: <server-image>
     # Built from docker/Dockerfile, which installs Claude Code from public npm
     # and carries the entrypoint that runs `cao init`, installs the profiles
     # named in CAO_INSTALL_PROFILES, and execs cao-server.
     newTag: 2.4.1-el1
-  - name: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-worker-broker
+  - name: <broker-image>
     # Built from docker/Dockerfile.broker.
     newTag: 2.4.1-el1
-  - name: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-fleet-panel
+  - name: <panel-image>
     # Built from docker/Dockerfile.panel, which copies the panel's source tree
     # rather than installing its wheel: the frontend is resolved as a sibling of
     # the app package, which an installed wheel does not preserve.
