@@ -1,3 +1,11 @@
+<!-- An absolute raw URL so the banner renders wherever this file is mirrored.
+     The banner carries its own dark background, so a single <img> is correct on
+     both GitHub themes. Keep in sync with README.md. -->
+<p align="center">
+  <img src="https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/docusaurus/static/img/cao-social-card.png"
+       alt="" width="640">
+</p>
+
 # CLI Agent Orchestrator (CAO)
 
 [English](README.md) | [简体中文](README.zh-CN.md)

@@ -1,3 +1,18 @@
+<!-- An absolute raw URL, not a repo-relative path: this file is also the PyPI
+     long description (see `readme` in pyproject.toml) and PyPI cannot resolve
+     relative paths.
+
+     The banner is used rather than the bare mark because it carries its own
+     dark background, so one <img> is correct on both GitHub themes and on
+     PyPI. The bare mark would need a <picture>/prefers-color-scheme swap, since
+     its navy contrasts at only 1.77:1 on GitHub's dark theme -- and PyPI
+     allows <img> but not <picture>, so that markup would either be dropped or
+     escaped into visible tag soup depending on how it sanitizes. -->
+<p align="center">
+  <img src="https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/docusaurus/static/img/cao-social-card.png"
+       alt="" width="640">
+</p>
+
 # CLI Agent Orchestrator (CAO)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
