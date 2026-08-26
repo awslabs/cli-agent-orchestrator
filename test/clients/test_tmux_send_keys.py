@@ -36,14 +36,16 @@ def reset_version_cache():
 
 
 def payload_calls(mock_subprocess):
-    """The paste pipeline minus send_keys' leading copy-mode cancel.
+    """The paste pipeline minus the copy-mode cancels.
 
-    Every send_keys call opens with ``send-keys -X cancel`` so a
-    wheel-scrolled pane sitting in copy mode cannot eat the delivery (#654);
-    that call is pinned by its own test in test_tmux_client.py. The tests
-    here assert the payload pipeline that follows it.
+    Every send_keys call cancels any active pane mode before the paste and
+    again immediately before each submitting Enter, so a wheel-scrolled pane
+    sitting in copy mode cannot eat the delivery or the submission (#654);
+    those guards are pinned by their own tests in test_tmux_client.py. The
+    tests here assert the payload pipeline threaded between them, at the
+    same indices as before the guards existed.
     """
-    return mock_subprocess.run.call_args_list[1:]
+    return [c for c in mock_subprocess.run.call_args_list if c[0][0][-2:] != ["-X", "cancel"]]
 
 
 @pytest.fixture
@@ -64,11 +66,11 @@ class TestSendKeys:
     """Tests for the paste-buffer based send_keys implementation."""
 
     def test_basic_message(self, client, mock_subprocess, mock_uuid):
-        """Sends copy-mode cancel, then load-buffer, paste-buffer -p,
-        send-keys Enter, delete-buffer."""
+        """Sends copy-mode cancel, load-buffer, paste-buffer -p, another
+        cancel, send-keys Enter, delete-buffer."""
         client.send_keys("sess", "win", "hello")
 
-        assert mock_subprocess.run.call_count == 5
+        assert mock_subprocess.run.call_count == 6
         calls = payload_calls(mock_subprocess)
 
         # load-buffer with unique name and message as stdin
@@ -117,7 +119,7 @@ class TestSendKeys:
         """Empty string still goes through the full pipeline."""
         client.send_keys("sess", "win", "")
 
-        assert mock_subprocess.run.call_count == 5
+        assert mock_subprocess.run.call_count == 6
         load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == b""
 
@@ -150,19 +152,19 @@ class TestSendKeys:
             client.send_keys("sess", "win", "msg2")
 
         calls = mock_subprocess.run.call_args_list
-        # First send's load-buffer (index 1, after its copy-mode cancel)
-        # uses cao_aaaa1111
+        # First send's load-buffer (index 1, after its leading copy-mode
+        # cancel) uses cao_aaaa1111
         assert calls[1][0][0][3] == "cao_aaaa1111"
-        # Second send's load-buffer (index 6, after 5 calls from the first
-        # send_keys and the second's cancel) uses cao_cccc2222
-        assert calls[6][0][0][3] == "cao_cccc2222"
+        # Second send's load-buffer (index 7, after 6 calls from the first
+        # send_keys and the second's leading cancel) uses cao_cccc2222
+        assert calls[7][0][0][3] == "cao_cccc2222"
 
     def test_double_enter(self, client, mock_subprocess, mock_uuid):
         """When enter_count=2, two Enter keys are sent after pasting."""
         client.send_keys("sess", "win", "hello", enter_count=2)
 
-        # cancel + load + paste + 2 Enter + delete
-        assert mock_subprocess.run.call_count == 6
+        # cancel + load + paste + 2 x (cancel + Enter) + delete
+        assert mock_subprocess.run.call_count == 8
         calls = payload_calls(mock_subprocess)
         # Both Enters
         assert calls[2] == call(
@@ -179,8 +181,8 @@ class TestSendKeys:
         msg = "X" * 50000
         client.send_keys("sess", "win", msg)
 
-        # Still exactly 5 subprocess calls — no chunking
-        assert mock_subprocess.run.call_count == 5
+        # Still exactly 6 subprocess calls — no chunking
+        assert mock_subprocess.run.call_count == 6
         load_call = payload_calls(mock_subprocess)[0]
         assert len(load_call[1]["input"]) == 50000
 

@@ -734,11 +734,24 @@ class TmuxClient:
             # Up/Down keys, which makes shells and agent TUIs navigate their
             # command history instead of entering copy mode to scroll output
             # (#546). This is a session option, so it does not change the
-            # user's other tmux sessions or their global configuration. The
-            # flip side -- a wheel-scrolled pane now routinely sits in copy
-            # mode, where it consumes orchestrated keys (#654) -- is handled
-            # by the mode-cancel guard in each send path below.
-            session.set_option("mouse", "on")
+            # user's other tmux sessions or their global configuration.
+            # Standard tmux trade-off: click-drag now makes a tmux selection
+            # rather than the terminal's (Shift-drag reaches the native one).
+            # The flip side -- a wheel-scrolled pane now routinely sits in
+            # copy mode, where it consumes orchestrated keys (#654) -- is
+            # handled by the mode-cancel guards in each send path below.
+            # Best-effort on purpose: mouse-on is a scroll convenience, not a
+            # precondition for a usable session, and this line sits after
+            # new_session but outside the rollback guard below -- raising
+            # here would orphan a perfectly good session and block relaunch
+            # under the same name.
+            try:
+                session.set_option("mouse", "on")
+            except Exception as mouse_error:
+                logger.warning(
+                    f"Could not enable mouse mode on session {session_name}: "
+                    f"{mouse_error} — continuing without wheel scrolling."
+                )
 
             logger.info(
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
@@ -1024,6 +1037,17 @@ class TmuxClient:
                     # process the previous Enter (e.g., Ink adding a newline)
                     # before the next Enter triggers form submission.
                     time.sleep(0.5)
+                # Re-cancel right before each submitting Enter: submit_delay
+                # is up to 2s (claude_code's paste_submit_delay), and a wheel
+                # scroll inside that window would put the pane back in copy
+                # mode and eat the Enter -- the exact #654 stall the leading
+                # cancel exists to prevent (text in the composer, submission
+                # never fires, nothing raises).
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, "-X", "cancel"],
+                    check=False,
+                    capture_output=True,
+                )
                 subprocess.run(
                     ["tmux", "send-keys", "-t", target, "Enter"],
                     check=True,
@@ -1084,6 +1108,11 @@ class TmuxClient:
                 pane.cmd("paste-buffer", "-p", "-b", buf_name)
 
                 time.sleep(0.3)
+
+                # Re-cancel before the submitting C-m for the same reason as
+                # send_keys: a wheel scroll during the 0.3s sleep would put
+                # the pane back in copy mode and eat the submission (#654).
+                pane.cmd("send-keys", "-X", "cancel")
 
                 # Send Enter to submit the pasted text
                 pane.send_keys("C-m", enter=False)

@@ -93,6 +93,22 @@ class TestCreateSession:
 
         mock_session.set_option.assert_called_once_with("mouse", "on")
 
+    def test_create_session_survives_mouse_option_failure(self, tmux, tmp_path):
+        """set_option runs after new_session but outside the rollback guard,
+        and libtmux raises on ANY set-option stderr -- if that propagated,
+        a scroll convenience would orphan a live session and block relaunch
+        under the same name. It must degrade to a warning instead."""
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        mock_session.set_option.side_effect = RuntimeError("unknown option: mouse")
+        tmux.server.new_session.return_value = mock_session
+
+        result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        assert result == "my-window"
+
     def test_create_session_uses_explicit_dimensions(self, tmux, tmp_path):
         """Guard against regressing the kiro-cli 2.1.x SIGWINCH-repaint bug (#216).
 
@@ -293,9 +309,9 @@ class TestSendKeys:
         mock_subprocess.run.return_value = MagicMock(returncode=0)
         tmux.send_keys("ses", "win", "hello", enter_count=1)
 
-        # copy-mode cancel, load-buffer, paste-buffer, send-keys Enter,
-        # delete-buffer
-        assert mock_subprocess.run.call_count == 5
+        # copy-mode cancel, load-buffer, paste-buffer, pre-Enter cancel,
+        # send-keys Enter, delete-buffer
+        assert mock_subprocess.run.call_count == 6
 
     @patch("cli_agent_orchestrator.clients.tmux.time")
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
@@ -303,9 +319,9 @@ class TestSendKeys:
         mock_subprocess.run.return_value = MagicMock(returncode=0)
         tmux.send_keys("ses", "win", "hello", enter_count=3)
 
-        # copy-mode cancel + load-buffer + paste-buffer + 3 send-keys Enter
-        # + delete-buffer = 7
-        assert mock_subprocess.run.call_count == 7
+        # copy-mode cancel + load-buffer + paste-buffer
+        # + 3 x (pre-Enter cancel + send-keys Enter) + delete-buffer = 10
+        assert mock_subprocess.run.call_count == 10
 
     @patch("cli_agent_orchestrator.clients.tmux.time")
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
@@ -321,6 +337,26 @@ class TestSendKeys:
         first = mock_subprocess.run.call_args_list[0]
         assert first.args[0] == ["tmux", "send-keys", "-t", "ses:win", "-X", "cancel"]
         assert first.kwargs.get("check") is False
+
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_cancels_copy_mode_before_each_enter(self, mock_subprocess, mock_time, tmux):
+        """The leading cancel alone is not enough: submit_delay is up to 2s
+        (claude_code's paste_submit_delay), and a wheel scroll inside that
+        window re-enters copy mode and eats the submitting Enter -- the
+        message sits typed but unsubmitted (#654). Every Enter must be
+        immediately preceded by its own cancel."""
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        tmux.send_keys("ses", "win", "hello", enter_count=2)
+
+        calls = mock_subprocess.run.call_args_list
+        cancel_argv = ["tmux", "send-keys", "-t", "ses:win", "-X", "cancel"]
+        enter_argv = ["tmux", "send-keys", "-t", "ses:win", "Enter"]
+        enter_indices = [i for i, c in enumerate(calls) if c.args[0] == enter_argv]
+        assert len(enter_indices) == 2
+        for i in enter_indices:
+            assert calls[i - 1].args[0] == cancel_argv
+            assert calls[i - 1].kwargs.get("check") is False
 
     @patch("cli_agent_orchestrator.clients.tmux.time")
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
@@ -347,9 +383,12 @@ class TestSendKeysViaPaste:
         tmux.send_keys_via_paste("ses", "win", "hello")
 
         tmux.server.cmd.assert_any_call("set-buffer", "-b", "cao_paste", "hello")
-        # Copy-mode cancel (#654) must precede the paste.
+        # Copy-mode cancel (#654) must precede the paste, and again right
+        # before the submitting C-m -- a wheel scroll during the 0.3s
+        # post-paste sleep would re-enter copy mode and eat the submission.
         assert mock_pane.cmd.call_args_list[0] == call("send-keys", "-X", "cancel")
         assert mock_pane.cmd.call_args_list[1] == call("paste-buffer", "-p", "-b", "cao_paste")
+        assert mock_pane.cmd.call_args_list[2] == call("send-keys", "-X", "cancel")
         mock_pane.send_keys.assert_called_once_with("C-m", enter=False)
 
     @patch("cli_agent_orchestrator.clients.tmux.time")
