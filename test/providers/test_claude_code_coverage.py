@@ -96,7 +96,15 @@ class TestHandleStartupPromptsBranches:
             "❯ 1. Yes, I trust this folder\n"
             "  2. No, exit\n"
         )
-        mock_backend.get_history.side_effect = [echoed_launch_cmd, trust_frame]
+        # A third frame is required because accepting trust no longer ends the
+        # handler: the model-upgrade nudge can render after it, so the loop keeps
+        # polling until the banner (or the idle gap). Without the banner frame
+        # here the mock's side_effect list runs dry mid-loop.
+        mock_backend.get_history.side_effect = [
+            echoed_launch_cmd,
+            trust_frame,
+            "Welcome to Claude Code v2.1.235",
+        ]
 
         await provider._handle_startup_prompts(idle_gap=5.0)
 
