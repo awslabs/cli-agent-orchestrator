@@ -39,7 +39,32 @@ const config: Config = {
           editUrl:
             'https://github.com/awslabs/cli-agent-orchestrator/tree/main/docusaurus/',
         },
-        blog: false,
+        blog: {
+          blogTitle: 'CAO Blog',
+          blogDescription:
+            'Tutorials, deep dives, and community stories about orchestrating multi-agent CLI workflows.',
+          blogSidebarTitle: 'Recent posts',
+          blogSidebarCount: 'ALL',
+          postsPerPage: 10,
+          showReadingTime: true,
+          editUrl:
+            'https://github.com/awslabs/cli-agent-orchestrator/tree/main/docusaurus/',
+          feedOptions: {
+            type: ['rss', 'atom'],
+            title: 'CAO Blog',
+            description:
+              'Tutorials, deep dives, and community stories about CLI Agent Orchestrator.',
+            copyright: `Copyright © ${new Date().getFullYear()} Amazon.com, Inc. or its affiliates.`,
+            xslt: true,
+          },
+          // Contributors must register in blog/authors.yml and pick a tag from
+          // blog/tags.yml, so both go through PR review instead of accumulating
+          // one-off values. A missing truncate marker dumps a whole post onto
+          // the list page, so that fails the build too. See CONTRIBUTING.md.
+          onInlineAuthors: 'throw',
+          onInlineTags: 'throw',
+          onUntruncatedBlogPosts: 'throw',
+        },
         theme: {
           customCss: './src/css/custom.css',
         },
@@ -80,6 +105,11 @@ const config: Config = {
           position: 'left',
         },
         {
+          to: '/blog',
+          label: 'Blog',
+          position: 'left',
+        },
+        {
           href: 'https://github.com/awslabs/cli-agent-orchestrator',
           label: 'GitHub',
           position: 'right',
@@ -105,6 +135,10 @@ const config: Config = {
         {
           title: 'Community',
           items: [
+            {
+              label: 'Blog',
+              to: '/blog',
+            },
             {
               label: 'GitHub Discussions',
               href: 'https://github.com/awslabs/cli-agent-orchestrator/discussions',

@@ -29,6 +29,18 @@ This generates static content into the `build` directory.
 3. Run `npm run build` to verify there are no broken links
 4. Submit a PR — the site auto-deploys when changes merge to `main`
 
+## Adding a blog post
+
+Posts live in `blog/`, one directory per post
+(`blog/YYYY-MM-DD-short-slug/index.md`). Authors and tags are registries rather
+than free-form front matter: the build fails on an author missing from
+`blog/authors.yml`, a tag missing from `blog/tags.yml`, or a post with no
+`{/* truncate */}` marker.
+
+See [Writing a blog post](../CONTRIBUTING.md#writing-a-blog-post) for the full
+process and style rules.
+
+
 ## Deploying on a fork
 
 The `Docs site` workflow (`.github/workflows/gh-pages.yml`) always builds the
@@ -64,6 +76,9 @@ docusaurus/
 │   ├── features/
 │   ├── guides/
 │   └── reference/
+├── blog/                  # Blog posts, one directory per post
+│   ├── authors.yml        # Registry of blog authors (enforced at build time)
+│   └── tags.yml           # Registry of blog tags (enforced at build time)
 ├── course-src/            # Interactive course sources (assembled into static/)
 │   ├── build.sh           # Concatenates each course into a single page
 │   ├── shared/            # styles.css + main.js shared by both courses
