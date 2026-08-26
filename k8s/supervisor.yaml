@@ -34,7 +34,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: cao-node
-          image: <account-id>.dkr.ecr.<region>.amazonaws.com/cao-server:latest
+          image: <server-image>:latest
           ports:
             - name: http
               containerPort: 9889
