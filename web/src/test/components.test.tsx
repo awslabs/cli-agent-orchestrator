@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, fireEvent } from '@testing-library/react'
 import { StatusBadge } from '../components/StatusBadge'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
@@ -67,6 +67,28 @@ describe('ErrorBoundary', () => {
 })
 
 describe('ConfirmModal', () => {
+  it('resets the typed confirmation on reopen so a previous confirmation never carries over', () => {
+    const props = {
+      title: 'Delete profile',
+      message: 'Sure?',
+      details: [],
+      confirmLabel: 'Delete',
+      variant: 'danger' as const,
+      loading: false,
+      confirmationText: 'prof-x',
+      onConfirm: () => {},
+      onCancel: () => {},
+    }
+    const { rerender } = render(<ConfirmModal open={true} {...props} />)
+    fireEvent.change(screen.getByRole('textbox', { name: /confirmation text/i }), { target: { value: 'prof-x' } })
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeEnabled()
+
+    rerender(<ConfirmModal open={false} {...props} />)
+    rerender(<ConfirmModal open={true} {...props} />)
+    expect(screen.getByRole('textbox', { name: /confirmation text/i })).toHaveValue('')
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeDisabled()
+  })
+
   it('renders when open', () => {
     render(
       <ConfirmModal

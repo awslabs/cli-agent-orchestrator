@@ -528,9 +528,16 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
           return
         }
       } catch (ve: any) {
-        // 400 = the document is unparseable (not even frontmatter). Block.
-        setSaveError((ve as ApiError)?.detail || ve?.message || 'Validation failed')
-        return
+        const status = (ve as ApiError)?.status
+        if (typeof status === 'number' && status < 500) {
+          // 400 = the document is unparseable (not even frontmatter). Block.
+          setSaveError((ve as ApiError)?.detail || ve?.message || 'Validation failed')
+          return
+        }
+        // Transport failure or server error on the pre-save check: this gate
+        // is UX only -- the write route re-validates authoritatively -- so
+        // fall through to the save instead of hard-blocking behind a
+        // phantom 'Validation failed'.
       }
       const res = await api.createProfile(name, content)
       onCreated(res.name, res.warnings ?? [])

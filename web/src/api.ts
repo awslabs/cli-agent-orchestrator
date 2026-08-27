@@ -171,11 +171,6 @@ export interface ProfileWriteResponse {
   warnings: ProfileValidationMessage[]
 }
 
-export interface TemplateConfigValidation {
-  valid: boolean
-  errors: string[]
-}
-
 export interface TemplatePreview {
   template: string
   content: string
@@ -474,22 +469,14 @@ export const api = {
   searchProfiles: (q: string, limit?: number) =>
     fetchJSON<ProfileSearchResult[]>(`/agents/profiles/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ''}`),
   getProfile: (name: string) => fetchJSON<AgentProfileDetail>(`/agents/profiles/${encodeURIComponent(name)}`),
-  // Profile authoring (issue #510). The template identifier is `category/name`
-  // and travels as two path segments — the backend route is declared as
-  // `/templates/{category}/{name}/schema` — so the slash must NOT be encoded.
+  // Profile authoring (issue #510).
   getProfileSchema: () => fetchJSON<Record<string, any>>('/agents/profiles/schema'),
   listProfileTemplates: () => fetchJSON<TemplateSummary[]>('/agents/profiles/templates'),
+  // The template identifier is `category/name` and travels as two path
+  // segments — the backend route is declared as
+  // `/templates/{category}/{name}/schema` — so the slash must NOT be encoded.
   getTemplateSchema: (template: string) =>
     fetchJSON<Record<string, any>>(`/agents/profiles/templates/${template.split('/').map(encodeURIComponent).join('/')}/schema`),
-  validateTemplateConfig: (template: string, config: Record<string, unknown>) =>
-    fetchJSON<TemplateConfigValidation>('/agents/profiles/templates/validate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ template, config }),
-      // Authoring calls run the full validator server-side; the 10s
-      // default turns a slow round-trip into a phantom 'Validation failed'.
-      timeoutMs: 30000
-    }),
   previewTemplate: (template: string, config: Record<string, unknown>) =>
     fetchJSON<TemplatePreview>('/agents/profiles/templates/preview', {
       method: 'POST',

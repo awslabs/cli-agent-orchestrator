@@ -122,6 +122,24 @@ describe('Stage 4 — edit flow', () => {
     await act(async () => {})
     expect(screen.getByRole('alert')).toHaveTextContent(/not found in the local store/)
   })
+
+  it('a transport failure on the pre-save validate falls through to the authoritative save', async () => {
+    // The pre-save validate is a UX gate; the write route re-validates.
+    // A network failure/timeout on the gate must not hard-block the save
+    // behind a phantom 'Validation failed' -- real 4xx findings still block.
+    const mock = routedFetch({
+      '/agents/profiles/validate': () => Promise.reject(new TypeError('network down')),
+    })
+    vi.stubGlobal('fetch', mock)
+    const detail = await openDetail('local-agent')
+    fireEvent.click(within(detail).getByRole('button', { name: /edit/i }))
+    await screen.findByRole('textbox', { name: /profile source/i })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await act(async () => {})
+    // The PUT was issued despite the failed pre-check
+    expect(mock.mock.calls.some(([, o]) => o?.method === 'PUT')).toBe(true)
+    expect(screen.queryByText(/validation failed/i)).not.toBeInTheDocument()
+  })
 })
 
 describe('Stage 4 — clone flow', () => {
@@ -269,6 +287,28 @@ describe('Stage 4 — delete flow', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(mock.mock.calls.filter(([, o]) => o?.method === 'DELETE')).toHaveLength(0)
     expect(screen.queryByText('Delete profile')).not.toBeInTheDocument()
+  })
+
+  it('a DELETE failure shows an error snackbar and keeps the row listed', async () => {
+    vi.stubGlobal('fetch', routedFetch({
+      '/agents/profiles/local-agent': (url, opts) => {
+        if (opts?.method === 'DELETE') return errJson(500, 'store locked')
+        return okJson(DETAIL)
+      },
+    }))
+    useStore.setState({ snackbar: null })
+    const detail = await openDetail('local-agent')
+    fireEvent.click(within(detail).getByRole('button', { name: /delete/i }))
+    const modal = screen.getByText('Delete profile').closest('.fixed') as HTMLElement
+    fireEvent.change(within(modal).getByRole('textbox', { name: /confirmation text/i }), { target: { value: 'local-agent' } })
+    fireEvent.click(within(modal).getByRole('button', { name: 'Delete' }))
+    await act(async () => {})
+
+    expect(useStore.getState().snackbar?.type).toBe('error')
+    expect(useStore.getState().snackbar?.message).toContain('store locked')
+    // The failed delete must not remove the row (optimistic removal happens
+    // only on DELETE success).
+    expect(screen.getByRole('option', { name: /local-agent/ })).toBeInTheDocument()
   })
 })
 

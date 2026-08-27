@@ -74,8 +74,15 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
           return
         }
       } catch (ve: any) {
-        setSaveError((ve as ApiError)?.detail || ve?.message || 'Validation failed')
-        return
+        const status = (ve as ApiError)?.status
+        if (typeof status === 'number' && status < 500) {
+          setSaveError((ve as ApiError)?.detail || ve?.message || 'Validation failed')
+          return
+        }
+        // Transport failure or server error on the pre-save check: this gate
+        // is UX only -- the write route re-validates authoritatively -- so
+        // fall through to the save instead of hard-blocking behind a
+        // phantom 'Validation failed'.
       }
       const res = mode === 'edit'
         ? await api.replaceProfile(name, document)

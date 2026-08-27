@@ -360,7 +360,7 @@ export function ProfilesPanel() {
         </div>
       ) : (
         <div className="grid grid-cols-[minmax(260px,1fr)_2fr] gap-4 items-start">
-          {/* Master list */}
+          {/* List pane */}
           <div className="bg-gray-900/60 border border-gray-800 rounded-xl overflow-hidden" role="listbox" aria-label="Profile list">
             {rows.length === 0 ? (
               <div className="p-6 text-sm text-gray-500 text-center">

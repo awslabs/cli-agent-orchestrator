@@ -98,6 +98,17 @@ describe('Profiles tab navigation (stage 1)', () => {
     fireEvent.click(await screen.findByRole('button', { name: /open profiles tab/i }))
     expect(await screen.findByRole('searchbox', { name: /search profiles/i })).toBeInTheDocument()
   })
+
+  it('Alt+2 selects Profiles and Alt+3 selects Agents (the renumbered shortcuts)', async () => {
+    // Inserting the Profiles tab shifted Alt+N for every later tab; this
+    // pins the new mapping beyond DOM order.
+    render(<App />)
+    fireEvent.keyDown(window, { key: '2', altKey: true })
+    expect(screen.getByRole('tab', { name: /profiles/i })).toHaveAttribute('aria-selected', 'true')
+    fireEvent.keyDown(window, { key: '3', altKey: true })
+    expect(screen.getByRole('tab', { name: /agents/i })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tab', { name: /profiles/i })).toHaveAttribute('aria-selected', 'false')
+  })
 })
 
 describe('ProfilesPanel — list and detail (stage 2)', () => {
@@ -128,6 +139,19 @@ describe('ProfilesPanel — list and detail (stage 2)', () => {
     expect(within(detail).getByText('reports')).toBeInTheDocument()
     expect(within(detail).getByText('analyze sqs metrics')).toBeInTheDocument()
     expect(within(detail).getByText(/also defined in: custom/i)).toBeInTheDocument()
+  })
+
+  it('surfaces a detail load failure without breaking the list', async () => {
+    vi.stubGlobal('fetch', routedFetch({
+      '/agents/profiles/analyst': () => errJson(500, 'detail exploded'),
+    }))
+    render(<ProfilesPanel />)
+    fireEvent.click(await screen.findByRole('option', { name: /analyst/i }))
+    const detail = await screen.findByTestId('profile-detail')
+    await waitFor(() => expect(within(detail).getByRole('alert')).toHaveTextContent('detail exploded'))
+    // The list stays intact and another selection still works
+    fireEvent.click(screen.getByRole('option', { name: /developer/i }))
+    await waitFor(() => expect(within(screen.getByTestId('profile-detail')).getByText('kiro_cli')).toBeInTheDocument())
   })
 
   it('shows a loading state while the catalog is in flight', async () => {
