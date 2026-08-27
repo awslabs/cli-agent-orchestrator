@@ -5,9 +5,9 @@ every failure mode — not a repository, ``git`` absent, unreadable directory, h
 recorded absence rather than raise or block. Four of the six tests here exist for that alone.
 """
 
-import builtins
 import os
 import subprocess
+import threading
 
 from cli_agent_orchestrator.utils import git_baseline
 
@@ -78,7 +78,7 @@ def test_untracked_file_is_hashed_in_bounded_chunks(monkeypatch, tmp_path):
     untracked_path = tmp_path / "untracked.bin"
     untracked_path.write_bytes(contents)
     read_sizes = []
-    actual_open = builtins.open
+    actual_fdopen = os.fdopen
 
     class _TrackingFile:
         def __init__(self, file):
@@ -98,20 +98,63 @@ def test_untracked_file_is_hashed_in_bounded_chunks(monkeypatch, tmp_path):
         def __exit__(self, *args):
             return self._file.__exit__(*args)
 
-    def _track_untracked_open(path, *args, **kwargs):
-        opened = actual_open(path, *args, **kwargs)
-        if os.fsencode(path) == os.fsencode(untracked_path):
-            return _TrackingFile(opened)
-        return opened
+    def _track_untracked_fdopen(descriptor, *args, **kwargs):
+        return _TrackingFile(actual_fdopen(descriptor, *args, **kwargs))
 
-    monkeypatch.setattr(builtins, "open", _track_untracked_open)
+    monkeypatch.setattr(os, "fdopen", _track_untracked_fdopen)
 
     baseline = git_baseline.derive_baseline(str(tmp_path))
 
     assert baseline["worktree_state"]["status"] == "dirty"
     assert read_sizes
     assert -1 not in read_sizes
-    assert all(read_size == hash_chunk_bytes for read_size in read_sizes)
+    assert all(0 < read_size <= hash_chunk_bytes for read_size in read_sizes)
+
+
+def test_untracked_file_replaced_by_fifo_before_open_returns_unavailable_without_blocking(
+    monkeypatch, tmp_path
+):
+    _initialise_repository(tmp_path)
+    untracked_path = tmp_path / "untracked"
+    untracked_path.write_bytes(b"contents")
+    actual_lstat = os.lstat
+    target_lstat_calls = 0
+
+    def _replace_after_entry_validation(path, *args, **kwargs):
+        nonlocal target_lstat_calls
+        result = actual_lstat(path, *args, **kwargs)
+        if os.fsencode(path) == os.fsencode(untracked_path):
+            target_lstat_calls += 1
+            if target_lstat_calls == 2:
+                untracked_path.unlink()
+                os.mkfifo(untracked_path)
+        return result
+
+    monkeypatch.setattr(os, "lstat", _replace_after_entry_validation)
+    result = []
+    completed = threading.Event()
+
+    def _derive():
+        result.append(git_baseline.derive_baseline(str(tmp_path)))
+        completed.set()
+
+    worker = threading.Thread(target=_derive, daemon=True)
+    worker.start()
+    try:
+        assert completed.wait(1), "opening the replacement FIFO must not block baseline derivation"
+    finally:
+        if worker.is_alive():
+            writer = os.open(untracked_path, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer)
+        worker.join(timeout=1)
+
+    assert result == [
+        {
+            "available": False,
+            "commit": result[0]["commit"],
+            "worktree_state": {"status": "unavailable"},
+        }
+    ]
 
 
 def test_untracked_file_symlink_hashes_link_payload_without_dereferencing(tmp_path):
@@ -176,17 +219,35 @@ def test_worktree_state_ignores_local_diff_presentation_settings(tmp_path):
 
 def test_records_an_unavailable_worktree_state_explicitly(monkeypatch, tmp_path):
     _initialise_repository(tmp_path)
-    actual_run_git = git_baseline._run_git
+    actual_run = subprocess.run
 
-    def _unavailable_after_head(args, cwd, **kwargs):
+    def _timeout_worktree_snapshot(args, *args_rest, **kwargs):
         if "diff" in args:
-            return None
-        return actual_run_git(args, cwd, **kwargs)
+            raise subprocess.TimeoutExpired(cmd=args, timeout=1)
+        return actual_run(args, *args_rest, **kwargs)
 
-    monkeypatch.setattr(git_baseline, "_run_git", _unavailable_after_head)
+    monkeypatch.setattr(subprocess, "run", _timeout_worktree_snapshot)
 
     baseline = git_baseline.derive_baseline(str(tmp_path))
 
+    assert baseline == {
+        "available": False,
+        "commit": baseline["commit"],
+        "worktree_state": {"status": "unavailable"},
+    }
+
+
+def test_untracked_hash_budget_exhaustion_records_an_unavailable_baseline(tmp_path):
+    _initialise_repository(tmp_path)
+    untracked_path = tmp_path / "untracked.bin"
+    untracked_path.touch()
+    # Without this fallback, pre-fix code fails with AttributeError instead of exercising behaviour.
+    budget = getattr(git_baseline, "_UNTRACKED_HASH_BUDGET_BYTES", 64 * 1024 * 1024)
+    os.truncate(untracked_path, budget + 1)
+
+    baseline = git_baseline.derive_baseline(str(tmp_path))
+
+    assert baseline["available"] is False
     assert baseline["worktree_state"] == {"status": "unavailable"}
 
 

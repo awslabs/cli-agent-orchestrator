@@ -88,6 +88,11 @@ def build_manifest_json(
     """
     try:
         baseline: Dict[str, Any] = derive_baseline(cwd or os.getcwd())
+        if not baseline.get("available"):
+            logger.warning(
+                "manifest freeze unavailable repository baseline (run continues, manifest absent)"
+            )
+            return None
 
         # Six of FR-8's nine fields are None here because they have no run-level source in this tier
         # (see the module docstring). ``plan_identifier`` renders a None scalar as a distinct

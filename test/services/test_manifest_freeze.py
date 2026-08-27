@@ -16,7 +16,12 @@ import json
 
 import pytest
 
-from cli_agent_orchestrator.services import execution_manifest, manifest_freeze
+from cli_agent_orchestrator.services import (
+    approval_gate,
+    approval_store,
+    execution_manifest,
+    manifest_freeze,
+)
 
 SECRET = "AKIAIOSFODNN7EXAMPLE"  # matches secret_gate's ``aws_access_key`` pattern
 
@@ -135,20 +140,91 @@ def test_the_plan_id_does_not_depend_on_the_working_directory(monkeypatch, tmp_p
 
 
 def test_a_missing_baseline_still_freezes():
-    """Outside a git repository the manifest is still written; absence is representable."""
-    document = _frozen(cwd="/nonexistent/path/for/test")
-    assert document["repo_baseline"] == {"available": False}
-    assert document["plan_id"].startswith("plan-v1:")
-
-
-def test_the_baseline_is_part_of_the_identity():
-    """Two runs of an identical script against different commits are different plans."""
-    a = _frozen(cwd="/nonexistent/path/a")["plan_id"]
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(
-            manifest_freeze,
-            "derive_baseline",
-            lambda _cwd: {"available": True, "commit": "deadbeef", "dirty": False},
+    """An unavailable baseline has no identifier that could be approved or replayed."""
+    assert (
+        manifest_freeze.build_manifest_json(
+            source_hash="abc123", inputs={"k": "v"}, cwd="/nonexistent/path/for/test"
         )
-        b = _frozen()["plan_id"]
+        is None
+    )
+
+
+def test_an_unavailable_worktree_snapshot_has_no_approvable_plan_id(monkeypatch):
+    monkeypatch.setattr(
+        manifest_freeze,
+        "derive_baseline",
+        lambda _cwd: {
+            "available": False,
+            "commit": "deadbeef",
+            "worktree_state": {"status": "unavailable"},
+        },
+    )
+
+    assert manifest_freeze.build_manifest_json(source_hash="abc123", inputs={"k": "v"}) is None
+
+
+def test_an_unavailable_snapshot_reaches_the_gate_without_a_plan_id(monkeypatch):
+    available = {
+        "available": True,
+        "commit": "deadbeef",
+        "worktree_state": {"status": "dirty", "digest": "sha256:first"},
+    }
+    unavailable = {
+        "available": False,
+        "commit": "deadbeef",
+        "worktree_state": {"status": "unavailable"},
+    }
+    baselines = iter((available, unavailable))
+    monkeypatch.setattr(manifest_freeze, "derive_baseline", lambda _cwd: next(baselines))
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+
+    approved_manifest = manifest_freeze.build_manifest_json(source_hash="abc123", inputs={"k": "v"})
+    assert approved_manifest is not None
+    approved_plan_id = json.loads(approved_manifest)["plan_id"]
+    monkeypatch.setattr(approval_store, "is_approved", lambda plan_id: plan_id == approved_plan_id)
+    approval_gate.ensure_plan_approved(tier="script", manifest_json=approved_manifest)
+
+    unavailable_manifest = manifest_freeze.build_manifest_json(
+        source_hash="abc123", inputs={"k": "v"}
+    )
+    with pytest.raises(approval_gate.PlanApprovalRequiredError) as excinfo:
+        approval_gate.ensure_plan_approved(tier="script", manifest_json=unavailable_manifest)
+
+    assert excinfo.value.plan_id is None
+
+
+def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines_are_not(
+    monkeypatch,
+):
+    """Two available commits are distinct plans; an unavailable snapshot has no plan."""
+    monkeypatch.setattr(
+        manifest_freeze,
+        "derive_baseline",
+        lambda _cwd: {
+            "available": True,
+            "commit": "first",
+            "worktree_state": {"status": "clean"},
+        },
+    )
+    a = _frozen()["plan_id"]
+    monkeypatch.setattr(
+        manifest_freeze,
+        "derive_baseline",
+        lambda _cwd: {
+            "available": True,
+            "commit": "second",
+            "worktree_state": {"status": "clean"},
+        },
+    )
+    b = _frozen()["plan_id"]
     assert a != b
+    monkeypatch.setattr(
+        manifest_freeze,
+        "derive_baseline",
+        lambda _cwd: {
+            "available": False,
+            "commit": "second",
+            "worktree_state": {"status": "unavailable"},
+        },
+    )
+    assert manifest_freeze.build_manifest_json(source_hash="abc123", inputs={"k": "v"}) is None

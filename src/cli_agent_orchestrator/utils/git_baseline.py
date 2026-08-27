@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 # invocations that read refs — because the point is to fail eventually, not quickly.
 _GIT_TIMEOUT_SECONDS = 10
 _HASH_CHUNK_BYTES = 64 * 1024
+_UNTRACKED_HASH_BUDGET_BYTES = 64 * 1024 * 1024  # 64 MiB
 
 _TRACKED_DIFF_ARGS = [
     "-c",
@@ -114,7 +115,12 @@ def _run_git(
 
 
 def _worktree_state(cwd: str) -> Dict[str, str]:
-    """Capture tracked and untracked changes without recording an absolute worktree path."""
+    """Capture tracked and untracked changes without recording an absolute worktree path.
+
+    Hash at most ``_UNTRACKED_HASH_BUDGET_BYTES`` of untracked regular-file content. Exhausting
+    that aggregate limit, or observing a path race, records the state as unavailable rather than
+    producing an identity from a partial snapshot.
+    """
     tracked = _run_git(_TRACKED_DIFF_ARGS, cwd, text=False)
     untracked = _run_git(["ls-files", "--others", "--exclude-standard", "-z"], cwd, text=False)
     if tracked is None or untracked is None:
@@ -128,6 +134,7 @@ def _worktree_state(cwd: str) -> Dict[str, str]:
     digest = hashlib.sha256()
     digest.update(len(tracked_bytes).to_bytes(8, "big"))
     digest.update(tracked_bytes)
+    hashed_untracked_bytes = 0
     try:
         for relative_path in sorted(untracked_paths):
             # ``git ls-files`` yields repository-relative paths. Refuse an unexpected path rather than
@@ -155,7 +162,8 @@ def _worktree_state(cwd: str) -> Dict[str, str]:
 
             digest.update(len(relative_path).to_bytes(8, "big"))
             digest.update(relative_path)
-            entry_mode = os.lstat(contents_path).st_mode
+            entry_stat = os.lstat(contents_path)
+            entry_mode = entry_stat.st_mode
             if stat.S_ISLNK(entry_mode):
                 link_payload = os.readlink(contents_path)
                 digest.update(b"S")
@@ -170,13 +178,55 @@ def _worktree_state(cwd: str) -> Dict[str, str]:
                 return {"status": "unavailable"}
 
             digest.update(b"F")
-            content_length = 0
-            with open(contents_path, "rb") as untracked_file:
-                content_length = os.fstat(untracked_file.fileno()).st_size
-                digest.update(content_length.to_bytes(8, "big"))
-                while chunk := untracked_file.read(_HASH_CHUNK_BYTES):
-                    digest.update(chunk)
-                    content_length -= len(chunk)
+            nonblocking_flag = getattr(os, "O_NONBLOCK", None)
+            nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+            if nonblocking_flag is None or nofollow_flag is None:
+                logger.debug(
+                    "git_baseline: required descriptor flags are unavailable "
+                    "(baseline recorded absent): %r",
+                    relative_path,
+                )
+                return {"status": "unavailable"}
+
+            descriptor = -1
+            try:
+                descriptor = os.open(contents_path, os.O_RDONLY | nonblocking_flag | nofollow_flag)
+                opened_stat = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or opened_stat.st_dev != entry_stat.st_dev
+                    or opened_stat.st_ino != entry_stat.st_ino
+                ):
+                    logger.debug(
+                        "git_baseline: untracked entry changed before descriptor open "
+                        "(baseline recorded absent): %r",
+                        relative_path,
+                    )
+                    return {"status": "unavailable"}
+
+                content_length = opened_stat.st_size
+                if content_length + hashed_untracked_bytes > _UNTRACKED_HASH_BUDGET_BYTES:
+                    logger.debug(
+                        "git_baseline: untracked hash budget exhausted (baseline recorded absent): %r",
+                        relative_path,
+                    )
+                    return {"status": "unavailable"}
+                hashed_untracked_bytes += content_length
+
+                with os.fdopen(descriptor, "rb") as untracked_file:
+                    descriptor = -1
+                    digest.update(content_length.to_bytes(8, "big"))
+                    while content_length:
+                        chunk = untracked_file.read(min(_HASH_CHUNK_BYTES, content_length))
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        content_length -= len(chunk)
+                    if os.fstat(untracked_file.fileno()).st_size != opened_stat.st_size:
+                        content_length = -1
+            finally:
+                if descriptor != -1:
+                    os.close(descriptor)
             if content_length != 0:
                 logger.debug(
                     "git_baseline: untracked file changed while reading "
@@ -194,8 +244,11 @@ def _worktree_state(cwd: str) -> Dict[str, str]:
 def derive_baseline(cwd: str) -> Dict[str, Any]:
     """The repository baseline for a run starting in ``cwd``. Never raises.
 
-    Returns ``{"available": False}`` when no baseline could be read, and
+    Returns ``{"available": False}`` when no verifiable baseline could be read, and
     ``{"available": True, "commit": <sha>, "worktree_state": <state>}`` when one could.
+
+    A successfully read commit may accompany ``available: False`` when the worktree snapshot itself
+    was unavailable. The commit alone is not a complete baseline and cannot identify an approvable plan.
 
     ``available`` IS AN EXPLICIT FIELD rather than an absent key or a ``None`` commit, because the manifest
     is a durable record read later by an agent diagnosing a failed run: "we could not determine the
@@ -210,4 +263,7 @@ def derive_baseline(cwd: str) -> Dict[str, Any]:
     if not commit:
         return {"available": False}
 
-    return {"available": True, "commit": commit, "worktree_state": _worktree_state(cwd)}
+    worktree_state = _worktree_state(cwd)
+    if worktree_state["status"] == "unavailable":
+        return {"available": False, "commit": commit, "worktree_state": worktree_state}
+    return {"available": True, "commit": commit, "worktree_state": worktree_state}
