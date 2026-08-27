@@ -18,11 +18,12 @@
   one surface it cannot match: the READMEs cannot swap it per theme, because
   README.md doubles as the PyPI long description and PyPI disallows <picture>.
 
-  Text colors are not taken from the palette unchanged. The tagline is the
-  site's own body slate rather than a tint of navy, and the URL is the brand
-  blue rather than the brand teal, because teal on white lands at 3.1:1 and
-  only scrapes past WCAG as large text. Blue reaches 4.6:1 and is the more
-  natural color for a URL anyway.
+  The card carries the name and tagline only. It deliberately does not print
+  the repo URL: as a README banner the URL sits on the very page it points at,
+  and in an unfurl the link is already the thing being unfurled.
+
+  The tagline is the site's own body slate rather than a tint of navy, so it
+  reads as supporting copy instead of a second brand color.
 
   The mark geometry below is a copy of cao-mark.svg (canonical), including its
   colors. See the note in web/src/components/CaoMark.tsx.
@@ -68,11 +69,13 @@
     <circle cx="67" cy="42" r="10.5" fill="#243F63"/>
   </g>
 
+  <!-- Baselines are measured, not eyeballed: at 312 and 368 the two lines' ink
+       box spans y 266..373, centering on 319.5, which is exactly the center of
+       the mark's own ink box (y 214..425). Re-measure if either the type sizes
+       or the mark's transform change. -->
   <g font-family="Inter, Helvetica Neue, Arial, sans-serif">
-    <text x="392" y="286" fill="#243F63" font-size="62" font-weight="700"
+    <text x="392" y="312" fill="#243F63" font-size="62" font-weight="700"
           letter-spacing="-1">CLI Agent Orchestrator</text>
-    <text x="392" y="342" fill="#475569" font-size="28" font-weight="400">Lightweight orchestration for multi-agent AI workflows</text>
-    <text x="392" y="412" fill="#0F73E0" font-size="24" font-weight="600"
-          letter-spacing="0.5">github.com/awslabs/cli-agent-orchestrator</text>
+    <text x="392" y="368" fill="#475569" font-size="28" font-weight="400">Lightweight orchestration for multi-agent AI workflows</text>
   </g>
 </svg>
