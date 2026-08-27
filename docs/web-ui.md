@@ -85,7 +85,7 @@ Then open the same URLs (localhost:5173 or localhost:9889) in your local browser
 
 ## Features
 
-Manage sessions, spawn agents, create scheduled flows, configure agent directories, and interact with live terminals — all from the browser. Includes live status badges, an inbox for agent-to-agent messaging, output viewer, and provider auto-detection.
+Manage sessions, spawn agents, browse and author agent profiles (create from templates or from scratch, edit, clone, delete — with server-side validation before every write), create scheduled flows, configure agent directories, and interact with live terminals — all from the browser. Includes live status badges, an inbox for agent-to-agent messaging, output viewer, and provider auto-detection.
 
 ## Related
 

@@ -65,9 +65,11 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
     }
     // A fixed-position menu does not follow its trigger when an ancestor
     // scrolls; close instead of drifting. Scrolls inside the menu itself
-    // (its own overflow list) are fine.
+    // (its own overflow list) are fine. The instanceof guard matters for the
+    // shared resize path: a resize event's target is `window`, which is not
+    // a Node -- contains(window) throws a TypeError and the menu never closed.
     const onScroll = (e: Event) => {
-      if (menuRef.current?.contains(e.target as Node)) return
+      if (e.target instanceof Node && menuRef.current?.contains(e.target)) return
       setOpen(false)
     }
     document.addEventListener('keydown', onKey)

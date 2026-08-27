@@ -68,7 +68,13 @@ export function rewriteFrontmatterName(content: string, name: string): string {
 
 /** Extract the frontmatter `name:` value from a rendered document, if any. */
 export function extractFrontmatterName(content: string): string | null {
-  const m = content.match(/^---\r?\n[\s\S]*?^name:\s*["']?([^"'\r\n]+)["']?\s*$/m)
+  // Match the frontmatter block first and search name: within it -- an
+  // unbounded [\s\S]*? scan continues into the markdown body when the
+  // frontmatter has no name:, matching a body line like 'name: decoy'
+  // (same bounding rewriteFrontmatterName already uses).
+  const block = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  if (!block) return null
+  const m = block[1].match(/^name:\s*["']?([^"'\r\n]+)["']?\s*$/m)
   return m ? m[1].trim() : null
 }
 
@@ -214,7 +220,13 @@ function SchemaField({
           aria-label={name}
           rows={4}
           spellCheck={false}
-          defaultValue={value ? JSON.stringify(value, null, 2) : ''}
+          // Controlled from the draft string: an uncontrolled defaultValue
+          // remounts empty when Advanced collapses and reopens, while the
+          // draft (which is what actually saves) silently persists -- the
+          // user sees an empty field but the typed JSON still lands. A
+          // non-string value (template default seeded as an object) is
+          // pretty-printed once; edits then flow through as strings.
+          value={typeof value === 'string' ? value : value ? JSON.stringify(value, null, 2) : ''}
           onChange={e => onChange(name, e.target.value)}
           className={`${inputClass} font-mono text-xs ${err || hasError ? 'border-2 !border-red-500 ring-2 ring-red-500/30' : ''}`}
           placeholder="{ }"
@@ -704,7 +716,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
                             name={k}
                             schema={scratchProps[k]}
                             required={scratchRequired.has(k)}
-                            value={scratchProps[k].type === 'object' ? undefined : scratchValues[k]}
+                            value={scratchProps[k].type === 'object' ? (jsonDrafts[k] ?? '') : scratchValues[k]}
                             jsonErrors={jsonErrors}
                             hasError={errorFields.has(k)}
                             {...fieldOverrides(k)}

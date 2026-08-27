@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Profiles tab in the Web UI: browse, search, create (from template with live
+  preview, or from scratch via a schema-driven form), edit, clone, and delete
+  agent profiles over the profile management APIs, with validate-before-save
+  surfacing bounded findings and the truncation-marker contract (#510)
 - MiniMax Code (`mcode`) provider with per-terminal authentication and profile
   isolation, model and MCP configuration, multi-turn TUI orchestration,
   supervisor/worker E2E coverage, and provider documentation (#624)

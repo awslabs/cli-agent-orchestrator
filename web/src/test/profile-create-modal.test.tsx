@@ -137,6 +137,15 @@ describe('frontmatter helpers — adversarial probe regressions', () => {
   it('extractFrontmatterName reads CRLF frontmatter without trailing \\r', () => {
     expect(extractFrontmatterName("---\r\nname: crlf-agent\r\n---\r\nbody")).toBe('crlf-agent')
   })
+
+  it('extractFrontmatterName never matches a name: line in the markdown body', () => {
+    // The unbounded scan continued past the closing --- when the frontmatter
+    // had no name:, pre-filling the name box from body prose.
+    expect(extractFrontmatterName('---\ndescription: d\n---\nbody\nname: decoy\n')).toBeNull()
+    expect(extractFrontmatterName('no frontmatter here\nname: decoy\n')).toBeNull()
+    // Bounding must not break the normal case
+    expect(extractFrontmatterName('---\ndescription: d\nname: real\n---\nbody\nname: decoy\n')).toBe('real')
+  })
 })
 
 describe('ProfileCreateModal — template flow (stage 3)', () => {
@@ -360,6 +369,19 @@ describe('ProfileCreateModal — from-scratch flow (stage 3)', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'mcpServers' }), { target: { value: '{"srv": {"command": "uvx"}}' } })
     expect(screen.queryByText(/invalid json/i)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /create profile/i })).toBeEnabled()
+  })
+
+  it('a JSON draft survives collapsing and reopening Advanced (display matches what saves)', async () => {
+    // The textarea was uncontrolled (defaultValue): a collapse/reopen
+    // remounted it EMPTY while the draft silently persisted into the POST --
+    // the user saw a blank field but the typed JSON still saved.
+    vi.stubGlobal('fetch', routedFetch())
+    await openScratch()
+    fireEvent.click(screen.getByRole('button', { name: /advanced properties/i }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'mcpServers' }), { target: { value: '{"srv": {"command": "uvx"}}' } })
+    fireEvent.click(screen.getByRole('button', { name: /advanced properties/i })) // collapse
+    fireEvent.click(screen.getByRole('button', { name: /advanced properties/i })) // reopen
+    expect(screen.getByRole('textbox', { name: 'mcpServers' })).toHaveValue('{"srv": {"command": "uvx"}}')
   })
 
   it('provider renders as a styled select (Flows look) fed by the live registry', async () => {
