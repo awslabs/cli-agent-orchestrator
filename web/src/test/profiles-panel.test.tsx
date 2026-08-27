@@ -226,3 +226,41 @@ describe('ProfilesPanel — search debounce and ordering (stage 2)', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('search backend down')
   })
 })
+
+describe('ProfilesPanel — stale in-flight responses are discarded (#692 review)', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('a search response landing after the box was cleared does not restore filtered rows', async () => {
+    // Gate the search response so it can be released AFTER the clear -- the
+    // discard branch (`seq !== searchSeq.current`) is only reachable with a
+    // genuinely reordered resolution.
+    let releaseSearch!: () => void
+    const gate = new Promise<ReturnType<typeof okJson>>(res => {
+      releaseSearch = () => res(okJson(SEARCH_RESULTS))
+    })
+    const mock = routedFetch({ '/agents/profiles/search': () => gate })
+    vi.stubGlobal('fetch', mock)
+    render(<ProfilesPanel />)
+    const box = screen.getByRole('searchbox', { name: /search profiles/i })
+    await act(async () => {}) // catalog fetch settles
+    const list = screen.getByRole('listbox', { name: /profile list/i })
+
+    // Type, let the debounce fire -> request in flight, response gated
+    fireEvent.change(box, { target: { value: 'mid' } })
+    await act(() => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS + 10))
+    expect(mock.mock.calls.filter(([u]) => String(u).includes('/search'))).toHaveLength(1)
+
+    // Clear the box while the request is still in flight
+    fireEvent.change(box, { target: { value: '' } })
+    await act(async () => {})
+    expect(within(list).getAllByRole('option')).toHaveLength(CATALOG.length)
+
+    // The stale response lands: it must be dropped, not re-filter the list
+    await act(async () => { releaseSearch() })
+    expect(within(list).getAllByRole('option')).toHaveLength(CATALOG.length)
+    expect(box).toHaveValue('')
+    // No spinner or error left behind by the discarded response
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})

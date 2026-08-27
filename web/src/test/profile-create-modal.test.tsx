@@ -509,3 +509,98 @@ describe('ProfileCreateModal — from-scratch flow (stage 3)', () => {
     expect(screen.getByRole('textbox', { name: 'provider' }).className).toContain('!border-red-500')
   })
 })
+
+describe('ProfileCreateModal — stale preview invalidation (#692 review)', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  const A_BODY = '---\nname: template-a-agent\ndescription: A\n---\n\nTEMPLATE-A-BODY\n'
+
+  it("drops template A's in-flight preview after switching to B: no stale content, Create stays disabled", async () => {
+    // Reproduces the maintainer's P1 probe: A's render is released only after
+    // the user has switched to B, whose schema is still loading -- the exact
+    // window where the stale response used to silently re-arm Create.
+    let releaseA!: () => void
+    const aGate = new Promise<any>(res => {
+      releaseA = () => res(okJson({ template: 'aws/sqs-monitor', content: A_BODY }))
+    })
+    const mock = routedFetch({
+      'aws/stepfunction/schema': () => new Promise(() => {}), // B schema never resolves
+      '/agents/profiles/templates/preview': (_u: string, opts: any) =>
+        JSON.parse(opts.body).template === 'aws/sqs-monitor'
+          ? aGate
+          : okJson({ template: 'aws/stepfunction', content: RENDERED }),
+    })
+    vi.stubGlobal('fetch', mock)
+    render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    await pickOption('Template', 'aws/sqs-monitor')
+    await act(async () => {})
+    // Debounce fires: A's preview request is now in flight, response gated
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_DEBOUNCE_MS + 10))
+
+    // Switch to B while A's render is still in flight
+    await pickOption('Template', 'aws/stepfunction')
+    await act(async () => {})
+
+    // A's stale response lands
+    await act(async () => { releaseA() })
+
+    // Nothing of A may surface: no preview pane, no pre-filled name, and
+    // Create must stay disabled even with a name typed in.
+    expect(screen.queryByTestId('template-preview')).not.toBeInTheDocument()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'victim' } })
+    expect(screen.getByRole('button', { name: /create profile/i })).toBeDisabled()
+    const posts = mock.mock.calls.filter(([u, o]) => String(u).endsWith('/agents/profiles') && o?.method === 'POST')
+    expect(posts).toHaveLength(0)
+  })
+
+  it('a preview in flight at close does not re-land after reopen', async () => {
+    // The modal stays mounted across close (`open` prop), so a response that
+    // outlives a close/reopen cycle used to satisfy the old seq check and
+    // restore a preview for a template that is no longer even selected.
+    let releaseA!: () => void
+    const aGate = new Promise<any>(res => {
+      releaseA = () => res(okJson({ template: 'aws/sqs-monitor', content: A_BODY }))
+    })
+    const mock = routedFetch({ '/agents/profiles/templates/preview': () => aGate })
+    vi.stubGlobal('fetch', mock)
+    const { rerender } = render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    await pickOption('Template', 'aws/sqs-monitor')
+    await act(async () => {})
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_DEBOUNCE_MS + 10)) // A's render in flight
+
+    rerender(<ProfileCreateModal open={false} onClose={() => {}} onCreated={() => {}} />)
+    rerender(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+
+    // The pre-close response lands after reopen: must be dropped entirely
+    await act(async () => { releaseA() })
+    expect(screen.queryByTestId('template-preview')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Profile name' })).toHaveValue('')
+    expect(screen.getByRole('button', { name: /create profile/i })).toBeDisabled()
+  })
+
+  it("template schemas resolving out of order never leave A's form under B's selection", async () => {
+    // getTemplateSchema previously had no staleness guard: a fast A->B switch
+    // with reordered resolution rendered A's fields under B's selection.
+    const A_SCHEMA = { type: 'object', properties: { a_only_field: { type: 'string' } } }
+    let releaseASchema!: () => void
+    const aGate = new Promise<any>(res => { releaseASchema = () => res(okJson(A_SCHEMA)) })
+    const mock = routedFetch({ 'aws/sqs-monitor/schema': () => aGate })
+    vi.stubGlobal('fetch', mock)
+    render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    await pickOption('Template', 'aws/sqs-monitor') // A schema in flight (gated)
+    await act(async () => {})
+    await pickOption('Template', 'aws/stepfunction') // B schema resolves immediately
+    await act(async () => {})
+    expect(screen.getByRole('textbox', { name: 'queue_url' })).toBeInTheDocument()
+
+    // A's schema lands late: must be discarded, B's form untouched
+    await act(async () => { releaseASchema() })
+    expect(screen.queryByRole('textbox', { name: 'a_only_field' })).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'queue_url' })).toBeInTheDocument()
+  })
+})

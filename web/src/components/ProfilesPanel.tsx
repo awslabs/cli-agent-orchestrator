@@ -270,6 +270,10 @@ export function ProfilesPanel() {
     if (debounceRef.current) clearTimeout(debounceRef.current)
     const q = query.trim()
     if (q === '') {
+      // Invalidate any in-flight search: without the bump, its late response
+      // still satisfied the seq check and restored filtered rows under an
+      // empty search box (#692 review).
+      searchSeq.current++
       setResults(null)
       setSearching(false)
       setSearchError(null)

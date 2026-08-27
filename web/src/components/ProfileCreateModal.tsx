@@ -272,8 +272,26 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   const [previewLoading, setPreviewLoading] = useState(false)
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const previewSeq = useRef(0)
+  // Staleness token for the template-schema fetch: a fast A->B switch with
+  // out-of-order resolution must never leave A's schema under B's selection.
+  const templateSeq = useRef(0)
   // Tracks whether the user typed a name; if not, follow the template default.
   const nameTouched = useRef(false)
+
+  // Invalidate any scheduled or in-flight preview render: bumping the token
+  // makes a late response fail its `seq === previewSeq.current` check and be
+  // dropped. This must run at every site that clears the preview -- a token
+  // bumped only when a *new* request is issued left the "reason for the
+  // request disappeared" paths (template switch, deselect, modal close and
+  // reopen) able to silently re-land stale content (#692 review).
+  const invalidatePreview = () => {
+    previewSeq.current++
+    if (previewTimer.current) {
+      clearTimeout(previewTimer.current)
+      previewTimer.current = null
+    }
+    setPreviewLoading(false)
+  }
 
   // --- scratch mode state ---
   const [profileSchema, setProfileSchema] = useState<Record<string, any> | null>(null)
@@ -286,6 +304,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   // Reset per open so a cancelled create never leaks into the next one.
   useEffect(() => {
     if (!open) return
+    invalidatePreview()
     setMode('template')
     setProfileName('')
     setSaving(false)
@@ -308,14 +327,18 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
 
   // Template selection loads that template's schema and resets its config.
   useEffect(() => {
+    const seq = ++templateSeq.current
     if (!template) {
+      invalidatePreview()
       setTemplateSchema(null)
       setPreview(null)
+      setPreviewError(null)
       return
     }
     setTemplateSchema(null)
     api.getTemplateSchema(template)
       .then(s => {
+        if (seq !== templateSeq.current) return
         setTemplateSchema(s)
         // Seed defaults so the preview renders something meaningful.
         const seeded: Record<string, unknown> = {}
@@ -324,13 +347,24 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
         }
         setConfig(seeded)
       })
-      .catch(e => setPreviewError(e?.detail || e?.message || 'Failed to load template schema'))
+      .catch(e => {
+        if (seq !== templateSeq.current) return
+        setPreviewError(e?.detail || e?.message || 'Failed to load template schema')
+      })
   }, [template])
 
   // Debounced live preview: one render request per quiet burst of config edits.
   useEffect(() => {
     if (previewTimer.current) clearTimeout(previewTimer.current)
-    if (!template || !templateSchema) return
+    if (!template || !templateSchema) {
+      // No render can be issued from this state, so any in-flight one is
+      // stale by definition (template switched or deselected mid-request).
+      // Without the bump, its late response still satisfied the seq check
+      // and silently re-armed Create with the previous template's body.
+      previewSeq.current++
+      setPreviewLoading(false)
+      return
+    }
     setPreviewLoading(true)
     previewTimer.current = setTimeout(() => {
       const seq = ++previewSeq.current
