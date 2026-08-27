@@ -12,10 +12,11 @@ There are two authoring tiers:
   and parameterized inputs. The [`cao-workflow` skill](../skills/cao-workflow/SKILL.md)
   teaches it. (The old declarative `workflow-author` YAML skill is **retired**.)
 - **YAML tier** (simpler, more limited) — a declarative spec for a fixed sequence. It is
-  easier to author and lint, but its `parallel` / `pipeline` / `loop` modes are
-  **reserved and not yet executable** in the current build (they validate as
-  `pass_reserved`, they do not run). Reach for it only for a plain sequential spec; for
-  anything with real control flow, write a script.
+  easier to author and lint. `parallel` and `pipeline` modes are executable: declare
+  `needs:` on a step and the engine schedules it only after those steps settle, running
+  ready steps concurrently (one agent terminal each). `loop` mode remains reserved. The
+  script tier still offers the most control (branching, per-iteration Python over agent
+  output); reach for the YAML tier for a straightforward fixed or parallel DAG.
 
 When in doubt, write a script.
 
@@ -237,6 +238,47 @@ Why these rules:
 
 See [`docs/examples/fanout_example.py`](examples/fanout_example.py) for the pattern
 end-to-end.
+
+## YAML parallel DAGs (`mode: parallel` / `mode: pipeline`)
+
+The YAML tier can also fan out: set `mode: parallel` and declare `needs:` edges. The
+engine runs every step whose `needs` have all settled **concurrently** (each step gets
+its own agent terminal), then the next wave, and so on:
+
+```yaml
+name: review_parallel
+mode: parallel
+steps:
+  - id: plan
+    provider: claude_code
+    agent: developer
+    prompt: Write a one-line implementation plan.
+  - id: implement
+    provider: claude_code
+    agent: developer
+    prompt: "Implement this plan: {{steps.plan.output.answer}}"
+    needs: [plan]
+  - id: audit
+    provider: claude_code
+    agent: reviewer
+    prompt: "Review this code: {{steps.implement.output.answer}}"
+    needs: [implement]
+```
+
+- `needs: [a, b]` means *start only after `a` and `b` have settled* — use it to express
+  fan-in (a step that consumes several upstream results). A step with no `needs` starts
+  in the first wave.
+- `mode: pipeline` is a linear chain — declare each step with `needs: [previous]` and
+  the engine runs one wave per step (outputs still pipe through
+  `{{steps.<id>.output.<field>}}`).
+- Unknown / self / cyclic `needs` references fail `cao workflow validate` (they are
+  grammar errors, never a silent sequential run).
+- Failure semantics match sequential mode: `on_failure: halt` (default) stops
+  scheduling new waves and marks the remaining steps skipped; `on_failure: continue`
+  keeps the run going. Each step keeps its own `retries:` budget.
+
+The script tier remains the more powerful path (branching, per-iteration Python);
+use YAML parallel mode for a fixed, declarative DAG.
 
 ## Operational tips
 

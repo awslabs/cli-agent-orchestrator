@@ -791,7 +791,10 @@ WORKFLOW_JOURNAL_RESULT_MAX_BYTES = 32768
 # non-sequential mode and every loop/conditional construct tags as reserved.
 # Each future Bolt's PR flips its own unit flag here. Reserved-ness is computed
 # solely from TIER_REGISTRY + this set — no env-dependent branching (REL-2/NFR-3).
-WORKFLOW_SHIPPED_UNITS: frozenset[str] = frozenset()
+# N5 shipped the sequential engine (issue #312) — its mode is not in
+# TIER_REGISTRY so it never tagged reserved; N7 ships parallel/pipeline DAG
+# execution (needs-edges + wave scheduling).
+WORKFLOW_SHIPPED_UNITS: frozenset[str] = frozenset({"N7"})
 
 # Allowed typed-input kinds for a workflow input declaration (FR-1.5).
 WORKFLOW_INPUT_TYPES = ("string", "int", "bool", "path")

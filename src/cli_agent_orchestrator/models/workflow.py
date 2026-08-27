@@ -190,6 +190,11 @@ class WorkflowStep(BaseModel):
     prompt: str
     engine: Optional[KiroEngine] = None
     output_schema: Optional[Dict[str, Any]] = None
+    # DAG edges (N7): step ids that must settle COMPLETED/COMPLETED_UNVALIDATED
+    # before this step starts. Empty = no ordering constraint. Sequential mode
+    # still runs declaration order; parallel/pipeline mode schedules by these.
+    # Validated in ``validate_grammar`` (unknown/self/cycle refs are errors).
+    needs: List[str] = Field(default_factory=list)
     # RESERVED — conditional execution (no MVP unit). Validates, never runs.
     when: Optional[str] = None
     # RESERVED loop fields (N8). Validate-but-inert; BR-4 requires all-three if any.
@@ -274,6 +279,23 @@ class WorkflowSpec(BaseModel):
                 schema_error = _check_output_schema(step.output_schema)
                 if schema_error is not None:
                     errors.append(f"step '{step.id}': {schema_error}")
+
+        # 4a. DAG edges (N7): every ``needs`` ref must name a declared step, a
+        # step must not need itself, and the dependency graph must be acyclic.
+        # The engine's ``_topological_order`` re-validates at drive time; this
+        # is the authoring-time floor so a bad spec fails validate, not at run.
+        decl_ids = {step.id for step in self.steps}
+        for step in self.steps:
+            for dep in step.needs:
+                if dep == step.id:
+                    errors.append(f"step '{step.id}': needs cannot reference itself")
+                elif dep not in decl_ids:
+                    errors.append(
+                        f"step '{step.id}': needs unknown step '{dep}' "
+                        "(must be a declared step id)"
+                    )
+        for cycle in _find_dependency_cycles(self.steps):
+            errors.append(f"workflow has a dependency cycle: {' -> '.join(cycle)}")
 
         # 4b. Per-step retry budget (B3-BR-3): if present, must be an integer in
         # [0, WORKFLOW_MAX_RETRIES]. Omitted -> engine default (regression-safe:
@@ -477,6 +499,35 @@ def _default_matches_type(default: Union[str, int, bool], declared: str) -> bool
         return isinstance(default, int) and not isinstance(default, bool)
     # "string" and "path" both carry their value as a string at authoring time.
     return isinstance(default, str)
+
+
+def _find_dependency_cycles(steps: List[WorkflowStep]) -> List[List[str]]:
+    """Return every dependency cycle among ``steps`` as id paths (N7).
+
+    Depth-first search over the ``needs`` edges. Each reported path is one
+    concrete cycle (``["a", "b", "a"]``) so the aggregated grammar error names
+    the steps involved rather than a bare "cycle detected". Deterministic:
+    steps are visited in declaration order and ``needs`` are visited in
+    declaration order, so the same spec yields the same cycle list (RD-3.1).
+    """
+    edges = {step.id: list(step.needs) for step in steps}
+    cycles: List[List[str]] = []
+    seen_paths: set[tuple] = set()
+
+    def _visit(step_id: str, path: List[str]) -> None:
+        if step_id in path:
+            cycle = path[path.index(step_id) :] + [step_id]
+            key = tuple(cycle)
+            if key not in seen_paths:
+                seen_paths.add(key)
+                cycles.append(cycle)
+            return
+        for dep in edges.get(step_id, []):
+            _visit(dep, path + [step_id])
+
+    for step in steps:
+        _visit(step.id, [])
+    return cycles
 
 
 def _schema_depth(node: Any, _depth: int = 1, _cap: Optional[int] = None) -> int:

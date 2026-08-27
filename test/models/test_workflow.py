@@ -267,13 +267,11 @@ steps:
     agent: a
     prompt: x
 """)
-        assert result.status == "pass_reserved"
-        assert result.reserved_notes
-        note = result.reserved_notes[0]
-        # Honesty invariant (BR-3): "reserved (not built yet)", never "will run".
-        assert "reserved" in note
-        assert "not built yet" in note
-        assert "will run" not in note
+        # N7 shipped parallel execution, so a parallel spec is executable (pass),
+        # not pass_reserved. The honesty invariant now applies to the still-
+        # reserved constructs (loop guards, when).
+        assert result.status == "pass"
+        assert result.reserved_notes == []
 
     def test_loop_construct_pass_reserved(self):
         result = validate_only("""\
@@ -300,8 +298,10 @@ steps:
         assert result.reserved_notes == []
 
     def test_is_reserved_for_known_and_unknown_constructs(self):
-        # In Bolt 1, WORKFLOW_SHIPPED_UNITS is empty -> all mapped constructs reserved.
-        assert is_reserved("parallel") is True
+        # N7 shipped parallel/pipeline, so they no longer tag reserved; N8 loop
+        # constructs remain reserved until their unit ships.
+        assert is_reserved("parallel") is False
+        assert is_reserved("pipeline") is False
         assert is_reserved("loop") is True
         assert is_reserved("when") is True
         # An unknown construct is not reserved (not in registry).
