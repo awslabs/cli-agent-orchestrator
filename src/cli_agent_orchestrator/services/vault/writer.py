@@ -281,18 +281,18 @@ def _render_cao(key: str, cao: Mapping[str, Any], newline: str, *, indentation: 
 
 def _check_secret_gate(body: str, rendered_cao: str, binding: VaultBinding) -> None:
     """Check authored body and generated metadata, preserving user frontmatter."""
-    secret_pattern = scan_for_secrets(f"{body}\n{rendered_cao}")
-    if secret_pattern is None:
+    matched_pattern_name = scan_for_secrets(f"{body}\n{rendered_cao}")
+    if matched_pattern_name is None:
         return
     if binding.mapping.secret_gate == "reject":
         from cli_agent_orchestrator.services.vault.binding import record_secret_gate_write_refusal
 
         record_secret_gate_write_refusal(binding.vault_id)
-        logger.warning("vault_write_secret_rejected pattern=%s", secret_pattern)
+        logger.warning("vault_write_secret_rejected pattern=%s", matched_pattern_name)
         raise VaultSecretWriteError(
-            f"vault write rejected: note matched credential pattern {secret_pattern!r}"
+            f"vault write rejected: note matched credential pattern {matched_pattern_name!r}"
         )
-    logger.warning("vault_write_secret_warn pattern=%s", secret_pattern)
+    logger.warning("vault_write_secret_warn pattern=%s", matched_pattern_name)
 
 
 def _check_indexable(rendered: str, vault: VaultSpec) -> None:
