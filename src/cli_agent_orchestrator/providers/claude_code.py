@@ -28,7 +28,7 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
-# Serializes concurrent _ensure_skip_bypass_prompt_setting() read-modify-writes to
+# Serializes concurrent _ensure_startup_settings() read-modify-writes to
 # ~/.claude/settings.json -- after the async conversion, N concurrent inits can run this
 # in N threads (via asyncio.to_thread), and an unlocked read-modify-write can race: one
 # thread reads while another is mid-write, decodes a truncated file, falls back to {}, and
@@ -513,21 +513,33 @@ class ClaudeCodeProvider(BaseProvider):
         return f"{unset_cmd}; {claude_cmd}"
 
     @staticmethod
-    def _ensure_skip_bypass_prompt_setting() -> None:
-        """Ensure ``skipDangerousModePermissionPrompt`` is set in settings.
+    def _ensure_startup_settings() -> None:
+        """Seed ``~/.claude/settings.json`` with the settings that prevent CLI startup
+        prompts CAO never wants to see, so PREVENTION is what suppresses them rather than
+        runtime detect-and-dismiss.
 
-        Claude Code (v2.1.41+) shows a bypass permissions confirmation dialog
-        on every launch with ``--dangerously-skip-permissions`` unless
-        ``skipDangerousModePermissionPrompt: true`` is persisted in
-        ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
-        so the confirmation is redundant and blocks initialization.
+        Two keys are seeded in a single atomic read-modify-write:
 
-        After the async conversion, N concurrent inits may run this
-        read-modify-write in N threads. ``_SETTINGS_WRITE_LOCK`` serializes
-        our own threads (in-process only: a second cao-server process, or
-        Claude Code itself, writing between our read and ``os.replace`` is
-        still a last-writer-wins lost update); ``os.replace`` only guarantees
-        no torn reads for anything outside CAO.
+        - ``skipDangerousModePermissionPrompt: true``: Claude Code (v2.1.41+) shows a bypass
+          permissions confirmation dialog on every launch with ``--dangerously-skip-permissions``
+          unless this is persisted. CAO already uses the flag intentionally, so the confirmation
+          is redundant and blocks initialization.
+        - ``tui: "default"`` (workain/harness-control#225): Claude Code shows a first-run
+          "Try the new fullscreen renderer?" onboarding upsell on a HOME dir whose stored
+          onboarding-version state lags the installed CLI, unless the CLI's own ``/tui`` setting
+          is already explicitly set. ``"default"`` keeps the classic renderer that this file's
+          own screen-scraping status detection (``get_status``/``wait_until_status`` parse raw
+          pane content) already expects -- the real fullscreen mode uses the terminal's alternate
+          screen, untested against that scraping, so it is not something to switch on as a side
+          effect of dialog suppression. Prevention beats reacting to a prompt shape that only
+          exists at all because this setting was left unset (this replaces an earlier runtime
+          detect-and-dismiss approach).
+
+        After the async conversion, N concurrent inits may run this read-modify-write in N
+        threads (via ``asyncio.to_thread``). ``_SETTINGS_WRITE_LOCK`` serializes our own threads
+        (in-process only: a second cao-server process, or Claude Code itself, writing between our
+        read and ``os.replace`` is still a last-writer-wins lost update); ``os.replace`` only
+        guarantees no torn reads for anything outside CAO.
         """
         settings_path = Path.home() / ".claude" / "settings.json"
         with _SETTINGS_WRITE_LOCK:
@@ -541,10 +553,19 @@ class ClaudeCodeProvider(BaseProvider):
                 except (json.JSONDecodeError, OSError):
                     pass
 
-            if settings.get("skipDangerousModePermissionPrompt") is True:
+            # Seed both keys in one write. Only overwrite ``tui`` when it is ABSENT --
+            # an operator who deliberately chose ``"fullscreen"`` should not be reset on
+            # every launch (unlike skipDangerousModePermissionPrompt, which CAO always owns).
+            changed = False
+            if settings.get("skipDangerousModePermissionPrompt") is not True:
+                settings["skipDangerousModePermissionPrompt"] = True
+                changed = True
+            if "tui" not in settings:
+                settings["tui"] = "default"
+                changed = True
+            if not changed:
                 return
 
-            settings["skipDangerousModePermissionPrompt"] = True
             settings_path.parent.mkdir(parents=True, exist_ok=True)
             # PID-suffixed so a stale tmp file from a prior crashed process
             # can never collide with -- or be clobbered by -- this write.
@@ -555,7 +576,7 @@ class ClaudeCodeProvider(BaseProvider):
                 # `apiKeyHelper` secrets) -- the tmp file would otherwise pick
                 # up the process umask (typically 0644) and os.replace would
                 # make the target adopt that on every launch that toggles
-                # this flag.
+                # these settings.
                 with open(tmp_path, "w") as f:
                     json.dump(settings, f, indent=2)
                 os.chmod(tmp_path, existing_mode if existing_mode is not None else 0o600)
@@ -566,7 +587,7 @@ class ClaudeCodeProvider(BaseProvider):
                 # the tmp file indefinitely.
                 tmp_path.unlink(missing_ok=True)
                 raise
-        logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
+        logger.info("Seeded startup-prompt-suppressing settings in ~/.claude/settings.json")
 
     async def _handle_startup_prompts(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
@@ -577,7 +598,7 @@ class ClaudeCodeProvider(BaseProvider):
 
         1. **Bypass permissions confirmation** (``--dangerously-skip-permissions``)
            – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
-           The settings-based fix (``_ensure_skip_bypass_prompt_setting``) prevents
+           The settings-based fix (``_ensure_startup_settings``) prevents
            this in most cases; this handler is a defensive fallback.
         2. **Workspace trust dialog** – shows "Yes, I trust this folder";
            requires ``Enter``.
@@ -717,7 +738,7 @@ class ClaudeCodeProvider(BaseProvider):
         # Not exhaustive: wait_for_shell's own backend polling, _load_profile(),
         # and _build_claude_command's temp-file I/O above/below are still
         # loop-side -- tens of ms each, not the multi-second pileup #451 fixes.
-        await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
+        await asyncio.to_thread(self._ensure_startup_settings)
 
         # Build properly escaped command string
         command = self._build_claude_command(profile)

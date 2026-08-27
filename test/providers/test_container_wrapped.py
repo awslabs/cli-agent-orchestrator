@@ -222,7 +222,7 @@ async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
 
 
 @pytest.mark.asyncio
-@patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+@patch.object(ClaudeCodeProvider, "_ensure_startup_settings")
 @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
 @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
 @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")

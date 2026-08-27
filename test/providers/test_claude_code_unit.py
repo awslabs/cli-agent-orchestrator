@@ -37,9 +37,9 @@ def cleanup_tmp_files():
             f.unlink(missing_ok=True)
 
 
-# All initialization tests need to patch _ensure_skip_bypass_prompt_setting
+# All initialization tests need to patch _ensure_startup_settings
 # to avoid writing to the real ~/.claude/settings.json.
-_PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+_PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_startup_settings")
 
 
 def _extract_mcp_config(command: str) -> dict:
@@ -2108,8 +2108,8 @@ class TestClaudeCodeProviderSettings:
     """Tests for Claude Code settings management."""
 
     @patch("cli_agent_orchestrator.providers.claude_code.Path")
-    def test_ensure_skip_bypass_prompt_already_set(self, mock_path_cls):
-        """Test no-op when setting is already present."""
+    def test_ensure_startup_settings_noop_when_both_keys_present(self, mock_path_cls):
+        """Test no-op when BOTH seeded keys are already present."""
         mock_settings_path = MagicMock()
         mock_settings_path.exists.return_value = True
         mock_path_cls.home.return_value.__truediv__ = MagicMock(
@@ -2122,12 +2122,62 @@ class TestClaudeCodeProviderSettings:
         mock_home.__truediv__ = MagicMock(return_value=mock_claude_dir)
         mock_claude_dir.__truediv__ = MagicMock(return_value=mock_settings_path)
 
-        existing = json.dumps({"skipDangerousModePermissionPrompt": True})
+        # Both keys already set (and tui at some explicit value) -> genuine no-op.
+        existing = json.dumps(
+            {"skipDangerousModePermissionPrompt": True, "tui": "default"}
+        )
         with patch("builtins.open", mock_open(read_data=existing)):
-            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+            ClaudeCodeProvider._ensure_startup_settings()
 
-        # Should not write (file handle's write not called)
+        # Should not write (no mkdir, no tmp-file replace)
         mock_settings_path.parent.mkdir.assert_not_called()
+
+    def test_ensure_startup_settings_seeds_tui_default_with_bypass(self, tmp_path):
+        """harness-control#225: both keys are seeded together in ONE atomic write --
+        tui:"default" (upsell prevention) alongside skipDangerousModePermissionPrompt."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+
+        with (
+            patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls,
+            patch(
+                "cli_agent_orchestrator.providers.claude_code.os.replace", wraps=os.replace
+            ) as mock_replace,
+        ):
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_startup_settings()
+
+        result = json.loads(settings_file.read_text())
+        assert result["skipDangerousModePermissionPrompt"] is True
+        assert result["tui"] == "default"
+        # Both keys landed in a SINGLE atomic os.replace (not two separate writes).
+        mock_replace.assert_called_once()
+        # A freshly-created settings.json may carry secrets -> 0600.
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+
+    def test_ensure_startup_settings_preserves_explicit_tui(self, tmp_path):
+        """An operator who deliberately chose tui:"fullscreen" must NOT be reset on
+        every launch -- tui is only seeded when ABSENT (unlike the bypass flag CAO owns)."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(json.dumps({"tui": "fullscreen"}))
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_startup_settings()
+
+        result = json.loads(settings_file.read_text())
+        assert result["tui"] == "fullscreen"  # preserved, not clobbered
+        assert result["skipDangerousModePermissionPrompt"] is True  # still seeded
 
     def test_ensure_skip_bypass_prompt_writes_setting(self, tmp_path):
         """Test that setting is written when missing."""
@@ -2142,7 +2192,7 @@ class TestClaudeCodeProviderSettings:
                 return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
             )
 
-            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+            ClaudeCodeProvider._ensure_startup_settings()
 
         result = json.loads(settings_file.read_text())
         assert result["skipDangerousModePermissionPrompt"] is True
@@ -2160,7 +2210,7 @@ class TestClaudeCodeProviderSettings:
                 return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
             )
 
-            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+            ClaudeCodeProvider._ensure_startup_settings()
 
         result = json.loads(settings_file.read_text())
         assert result["skipDangerousModePermissionPrompt"] is True
@@ -2181,7 +2231,7 @@ class TestClaudeCodeProviderSettings:
                 return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
             )
 
-            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+            ClaudeCodeProvider._ensure_startup_settings()
 
         assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
 
@@ -2198,7 +2248,7 @@ class TestClaudeCodeProviderSettings:
                 return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
             )
 
-            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+            ClaudeCodeProvider._ensure_startup_settings()
 
         assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
 
@@ -2220,7 +2270,7 @@ class TestClaudeCodeProviderSettings:
             )
 
             threads = [
-                threading.Thread(target=ClaudeCodeProvider._ensure_skip_bypass_prompt_setting)
+                threading.Thread(target=ClaudeCodeProvider._ensure_startup_settings)
                 for _ in range(32)
             ]
             for t in threads:
@@ -2253,7 +2303,7 @@ class TestClaudeCodeProviderSettings:
                 return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
             )
 
-            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+            ClaudeCodeProvider._ensure_startup_settings()
 
         mock_replace.assert_called_once()
         tmp_arg = mock_replace.call_args[0][0]
