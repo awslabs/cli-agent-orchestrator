@@ -6,16 +6,22 @@ import { DashboardHome } from './components/DashboardHome'
 import { AgentPanel } from './components/AgentPanel'
 import { FlowsPanel } from './components/FlowsPanel'
 import { MemoryPanel } from './components/MemoryPanel'
+import { ProfilesPanel } from './components/ProfilesPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowsPanel } from './components/WorkflowsPanel'
 import { CaoMark } from './components/CaoMark'
-import { Bot, Home, Clock, Settings, Brain, Workflow, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
+import { Bot, Home, Clock, Settings, Brain, Workflow, CheckCircle, XCircle, Info, Wifi, WifiOff, Package } from 'lucide-react'
 
-type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows'
+type TabKey = 'home' | 'profiles' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows'
 
-// Workflows + Memory appended last so Alt+N numbering of existing tabs never shifts
+// Profiles sits between Home and Agents (#510): browsing/authoring profiles
+// precedes launching agents, and AgentPanel stays the launch picker. This was
+// a one-time Alt+N renumbering of the tabs after it; Workflows + Memory remain
+// appended last (Memory is conditional, so keeping it last stops the numbering
+// of the always-visible tabs shifting with the memory backend's status).
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'home', label: 'Home', icon: <Home size={16} /> },
+  { key: 'profiles', label: 'Profiles', icon: <Package size={16} /> },
   { key: 'agents', label: 'Agents', icon: <Bot size={16} /> },
   { key: 'flows', label: 'Flows', icon: <Clock size={16} /> },
   { key: 'settings', label: 'Settings', icon: <Settings size={16} /> },
@@ -143,6 +149,7 @@ export default function App() {
         <ErrorBoundary>
           <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
             {tab === 'home' && <DashboardHome onNavigate={(t) => setTab(t as TabKey)} />}
+            {tab === 'profiles' && <ProfilesPanel />}
             {tab === 'agents' && <AgentPanel />}
             {tab === 'flows' && <FlowsPanel />}
             {tab === 'settings' && <SettingsPanel />}
