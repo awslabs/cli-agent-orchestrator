@@ -104,7 +104,7 @@ Integration tests require the provider CLI to be installed and authenticated:
 
 ```bash
 # Run integration tests for a specific provider (example: Kiro CLI)
-uv run pytest test/providers/test_kiro_cli_integration.py -v
+uv run pytest test/providers/test_kiro_cli_integration.py -m integration -v
 
 # Skip integration tests
 uv run pytest test/providers/ -v
@@ -114,6 +114,8 @@ The default pytest configuration is the contributor unit-suite entry point and o
 the marker selection. A regression test keeps integration tests and the 15 e2e-marked
 tests outside `test/e2e/` out of that suite. A command-line `-m` replaces the configured
 marker rather than composing with it, so use plain `uv run pytest` for this suite.
+For the same reason, running an integration suite requires opting back into its
+excluded marker explicitly with `-m integration`.
 
 ### E2E Tests
 
@@ -317,7 +319,7 @@ which kiro
 kiro --help
 
 # Run that provider's integration tests
-uv run pytest test/providers/test_kiro_cli_integration.py -v
+uv run pytest test/providers/test_kiro_cli_integration.py -m integration -v
 ```
 
 The same pattern applies to every provider that ships an `<provider>_integration.py` file — substitute the binary and the test filename.

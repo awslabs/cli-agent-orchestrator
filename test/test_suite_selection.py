@@ -49,6 +49,7 @@ def test_contributor_and_ci_suites_keep_their_intentional_difference(tmp_path: P
 
     contributor = _collect(regression)
     ci = _collect(regression, "-m", "not e2e")
+    integration = _collect(regression, "-m", "integration")
 
     assert "test_unit" in contributor
     assert "test_integration" not in contributor
@@ -56,3 +57,6 @@ def test_contributor_and_ci_suites_keep_their_intentional_difference(tmp_path: P
     assert "test_unit" in ci
     assert "test_integration" in ci
     assert "test_e2e_outside_e2e_directory" not in ci
+    assert "test_unit" not in integration
+    assert "test_integration" in integration
+    assert "test_e2e_outside_e2e_directory" not in integration

@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 
 echo "[pre-push] Python unit tests"
 if command -v uv >/dev/null 2>&1; then
-  uv run --project .. pytest -q --disable-warnings || exit 1
+  (cd .. && uv run pytest -q --disable-warnings) || exit 1
 elif command -v python >/dev/null 2>&1 && python -c "import pytest" >/dev/null 2>&1; then
   (cd .. && python -m pytest -q --disable-warnings) || exit 1
 elif command -v python3 >/dev/null 2>&1 && python3 -c "import pytest" >/dev/null 2>&1; then
