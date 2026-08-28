@@ -17,6 +17,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolated per-terminal MCP configuration, native hard tool restrictions,
   multi-turn TUI support, orchestration e2e coverage, and provider docs.
 
+### Security
+
+- **Path traversal in `cao install` (GHSA-6m35-gcf5-xm75, CWE-22/CWE-73, high).**
+  `cao install` derived the shared context-copy filename — and the per-provider
+  agent-file names — from a profile's *resolved* frontmatter `name:`. That value
+  is not covered by the install source-handle validation and is
+  attacker-controlled for URL installs, so a profile whose `name:` contained a
+  `../` traversal or an absolute path could overwrite an arbitrary `.md` file the
+  invoking user can write. Because `.md` is the trusted-instruction format across
+  this ecosystem, reachable targets included the user's own agent profiles and
+  global agent-instruction files, after which an agent run would follow
+  attacker-authored instructions with that agent's tool permissions. Reachable
+  from the CLI and from `POST /agents/profiles/install`. Affects 2.2.0–2.4.1.
+
+  The resolved name is now validated as a single path segment through the shared
+  `utils/path_validation.validate_path_component`, the write is confined to
+  `AGENT_CONTEXT_DIR` and opened with `O_NOFOLLOW` (POSIX) so it cannot be
+  redirected through a symlink, and the context copy is created mode `0o600`. The
+  provider agent-file sinks now flatten both `/` and `\` via a shared
+  `flatten_path_separators` helper, closing the class on Windows as well.
+
+  **Behavior change:** a profile whose frontmatter `name:` contains a path
+  separator is no longer installable. Such names only ever worked when the
+  intermediate context directory happened to already exist, and permitting them
+  is what allowed the traversal. Rename the profile to a plain identifier
+  (`[A-Za-z0-9._-]`) to install it.
+
 ### Fixed
 
 - tmux listing parse failures are retried once and reported as a distinct condition instead of surfacing as a bare `ValueError` that reads like "session not found" one layer up. libtmux 0.53.1+ zips `parse_output`'s fields with `strict=True`, so any short row (a pane or session vanishing mid-listing, or trailing fields tmux omits) raised `ValueError: zip() argument 2 is shorter than argument 1` — which propagated through `server.sessions`/`window.panes`, blocked launches outright, and left the pipe-liveness watchdog unable to tell a genuinely-gone session from a transient parse failure. Adds `TmuxLookupError` and routes the listing reads in `clients/tmux.py` through a single retry-and-classify wrapper; a failed `create_session` no longer leaves an orphaned tmux session that blocks relaunching the same name. Also caps `libtmux<0.53.1`, the last release that zips non-strict (caom-anv)
