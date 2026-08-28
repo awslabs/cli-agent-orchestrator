@@ -736,7 +736,14 @@ async def create_terminal(
             - ``memory_manager``. Never reaches this function: the endpoint
               uses it to spawn a SEPARATE sidecar terminal with
               ``agent_profile="memory_manager"`` in a background task, so it
-              cannot alter the identity of the terminal this key maps to.
+              cannot alter the identity of the terminal this key maps to. Read
+              that as excluded-from-the-fingerprint, NOT as inert on a retry:
+              the sidecar spawn is gated only on the flag's truthiness, and
+              this function returns the same ``Terminal`` shape whether it
+              created one or matched a key, so the endpoint cannot tell a
+              reuse from a fresh create and a keyed retry with
+              ``memory_manager=true`` reuses the primary terminal while still
+              spawning another sidecar.
             - ``new_session``. Not a caller parameter on either endpoint --
               each route passes its own fixed value -- so no caller can vary
               it under a shared key.
