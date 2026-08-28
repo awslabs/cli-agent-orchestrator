@@ -16,6 +16,7 @@ from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
     TerminalInputBlockedError,
+    TerminalRecordCorruptError,
     create_terminal,
     delete_terminal,
     get_output,
@@ -1097,6 +1098,65 @@ class TestCreateTerminalIdempotencyKey:
         # landed, so a future retry with this key finds test1234, not a
         # second-generation orphan.
         assert get_terminal_id_by_idempotency_key("stale-key") == "test1234"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_id_by_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_unvalidatable_row_raises_instead_of_duplicating_the_job(
+        self,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_create,
+        mock_lookup,
+        mock_get_terminal,
+        mock_delete_key,
+    ):
+        """A row that EXISTS but will not validate must raise, not fall through.
+
+        Review on PR #634: pydantic's ValidationError subclasses ValueError, so
+        guarding `Terminal(**get_terminal(...))` as one expression made a
+        malformed row indistinguishable from an absent one -- the fallthrough
+        then deleted a LIVE terminal's mapping and created a SECOND worker for
+        the same key, logging "no longer exists" while doing it. That is the
+        precise duplication the idempotency key exists to prevent, so the
+        lookup alone is guarded and construction is allowed to fail loudly.
+
+        The row below is shaped like the `terminals` TABLE (tmux_session /
+        tmux_window / working_directory) rather than the `Terminal` MODEL
+        (session_name / name, and no working_directory at all) -- the drift
+        that actually happens on a column rename.
+        """
+        mock_lookup.return_value = "live-terminal"
+        mock_get_terminal.return_value = {
+            "id": "live-terminal",
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "working_directory": "/repo",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "status": "idle",
+            "last_active": datetime.now(),
+        }
+
+        # TerminalRecordCorruptError, not the bare ValidationError: a corrupt
+        # STORED row is a server fault, and ValidationError subclasses
+        # ValueError, which the endpoints already map to 400/404 -- blaming the
+        # caller for the server's own bad data.
+        with pytest.raises(TerminalRecordCorruptError):
+            await create_terminal(
+                "kiro_cli", "developer", new_session=True, idempotency_key="live-key"
+            )
+
+        # The live terminal's mapping must survive, and no second worker may
+        # exist: no stale-row delete, no tmux window, no provider, no new row.
+        mock_delete_key.assert_not_called()
+        mock_tmux.create_session.assert_not_called()
+        mock_provider_manager.create_provider.assert_not_called()
+        mock_db_create.assert_not_called()
 
 
 class TestCreateTerminalWorktree:

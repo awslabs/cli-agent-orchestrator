@@ -27,6 +27,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from pydantic import ValidationError
+
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
@@ -99,6 +101,21 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TerminalRecordCorruptError(Exception):
+    """A stored terminal row exists but does not satisfy the ``Terminal`` model.
+
+    Review on PR #634. Raised in place of the bare pydantic
+    ``ValidationError`` so the failure cannot be mistaken for a client error:
+    ``ValidationError`` subclasses ``ValueError``, so letting it escape would
+    surface as 400 from ``create_session`` and 404 from
+    ``create_terminal_in_session`` -- both of which blame the caller for a
+    corrupt server-side row. As a plain ``Exception`` it reaches each
+    endpoint's catch-all and is reported as a 500, which is what a
+    server-data fault is, and needs no new ``except`` arm to do it.
+    """
+
 
 # Upper bound (bytes) on a single offset-ranged read of a terminal log
 # (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
@@ -446,13 +463,26 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        TerminalRecordCorruptError: If the terminal a key maps to has a stored
+            row that does not satisfy the ``Terminal`` model (HTTP 500)
         TimeoutError: If provider initialization times out
     """
     if idempotency_key:
         existing_terminal_id = get_terminal_id_by_idempotency_key(idempotency_key)
         if existing_terminal_id is not None:
+            # Only the LOOKUP is guarded. `Terminal(**row)` is deliberately
+            # OUTSIDE this try (review on PR #634): pydantic's ValidationError
+            # subclasses ValueError, so a single try around both would catch a
+            # row that EXISTS but does not validate and treat it as an absent
+            # one -- deleting a LIVE terminal's mapping below and creating a
+            # second worker for the same key, which is the exact duplication
+            # this feature exists to prevent, reported as "no longer exists".
+            # The `terminals` row and the `Terminal` model genuinely differ
+            # (no `working_directory` on the model, `metadata` vs
+            # `metadata_json`), so a future column rename reaches this arm; it
+            # must fail loudly rather than silently duplicate the job.
             try:
-                return Terminal(**get_terminal(existing_terminal_id))
+                row = get_terminal(existing_terminal_id)
             except ValueError:
                 # The key's mapping outlived the terminal it pointed to (e.g.
                 # a completed-and-torn-down handoff, retried long after the
@@ -477,6 +507,18 @@ async def create_terminal(
                     idempotency_key,
                     existing_terminal_id,
                 )
+            else:
+                try:
+                    return Terminal(**row)
+                except ValidationError as exc:
+                    # Re-raised as a non-ValueError so a corrupt STORED row is
+                    # reported as a 500 rather than being blamed on the caller
+                    # as a 400/404. See TerminalRecordCorruptError.
+                    raise TerminalRecordCorruptError(
+                        f"terminal {existing_terminal_id!r} is mapped by "
+                        f"idempotency_key {idempotency_key!r} but its stored row does "
+                        f"not satisfy the Terminal model: {exc}"
+                    ) from exc
 
     terminal_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session

@@ -706,6 +706,35 @@ class TestHandoffEarlyTerminalId:
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_waiting_path_omits_engine_for_a_non_kiro_provider(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """The sibling above pins the KIRO case; this pins the other side of it.
+
+        `engine` is a Kiro-only concept, so #625 tightened every forwarding
+        site to `provider == kiro_cli`. The reuse path is forwarded for the
+        same reason it is forwarded at all -- run_agent_step validates it
+        against what got PERSISTED -- and the create path only ever persists
+        engine for kiro_cli, so sending it for another provider could only
+        ever mismatch. Without this test the non-Kiro half of that guard is
+        unpinned: dropping the provider check leaves the Kiro test above
+        passing.
+        """
+        mock_provider.return_value = _ctx("mcode")
+        mock_create.return_value = ("dev-t1", "mcode")
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = Exception
+            asyncio.run(
+                _handoff_impl("developer", "Do task", engine="v2", on_terminal_id=lambda _: None)
+            )
+
+        assert "engine" not in mock_requests.post.call_args[1]["json"]
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_waiting_path_forwards_idempotency_key_to_create_terminal(
         self, mock_create, mock_provider, _nudge
     ):
