@@ -1185,6 +1185,8 @@ def _record(terminal_id="prior-terminal", **overrides):
         "use_worktree": False,
         "engine": None,
         "allowed_tools": None,
+        "env_vars": None,
+        "resume_session_id": None,
     }
     fields.update(overrides)
     return IdempotencyRecord(
@@ -1263,6 +1265,14 @@ class TestIdempotencyKeyRequestFingerprint:
             # leaving either unhashed was a live escalation / validation hole.
             ("engine", "v2"),
             ("allowed_tools", ["send_message", "execute_bash"]),
+            # Both reachable together with idempotency_key on POST /sessions.
+            # env_vars has the sharpest precedent: RunStepRequest refuses it
+            # alongside reuse_terminal_id because a silently dropped
+            # RUN_ID/GENERATION fence token is the quiet identity failure
+            # NFR-SEC-4 exists to prevent -- unhashed, a caller asking for one
+            # workflow run was handed a terminal carrying another run's tokens.
+            ("env_vars", {"CAO_WORKFLOW_RUN_ID": "run-BBB"}),
+            ("resume_session_id", "01234567-89ab-cdef-0123-456789abcdef"),
         ],
     )
     @pytest.mark.asyncio
@@ -1311,6 +1321,23 @@ class TestIdempotencyKeyRequestFingerprint:
         mock_tmux.create_session.assert_not_called()
         mock_provider_manager.create_provider.assert_not_called()
         mock_db_create.assert_not_called()
+
+    def test_env_vars_none_and_empty_dict_are_the_same_request(self):
+        """`None` and `{}` deliberately share an encoding (review on PR #634).
+
+        The opposite answer to `allowed_tools`, and it is verified rather than
+        assumed: every use of `env_vars` in `create_terminal` already collapses
+        them (`env_vars or {}` when merging session env, `if env_vars:` before
+        persisting), so neither can produce a materially different terminal.
+        Pinned because the surrounding code distinguishes `None` from `[]` for
+        tools, and a reader generalising that pattern here would introduce a
+        false conflict on a legitimate retry.
+        """
+        assert _request_fingerprint(
+            "kiro_cli", "developer", None, None, None, None, False, None, None, None, None
+        ) == _request_fingerprint(
+            "kiro_cli", "developer", None, None, None, None, False, None, None, {}, None
+        )
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
@@ -1403,7 +1430,7 @@ class TestIdempotencyKeyRequestFingerprint:
         # session. A retry re-sends the same None and matches; fingerprinting
         # the generated name would never match anything.
         assert mock_db_create.call_args.kwargs["request_fingerprint"] == _request_fingerprint(
-            "kiro_cli", "reviewer", None, None, None, None, False, None, None
+            "kiro_cli", "reviewer", None, None, None, None, False, None, None, None, None
         )
 
 
