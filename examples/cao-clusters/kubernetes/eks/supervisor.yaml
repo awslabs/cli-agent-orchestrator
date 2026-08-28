@@ -27,7 +27,8 @@ spec:
       # REQUIRED for Bedrock. Pod Identity binds to a (namespace,
       # serviceAccount) pair, so a pod running as `default` schedules fine and
       # then dies at its first model call - which reads as a model problem, not
-      # an auth one. The association is created in iac/infrastructure.yaml.
+      # an auth one. The association is created in
+      # iac/cfn-infrastructure.yaml.
       serviceAccountName: cao-supervisor
       securityContext:
         fsGroup: 1000
@@ -124,6 +125,19 @@ spec:
               mountPath: /home/cao/.cao
             - name: workspace
               mountPath: /home/cao/workspace
+          # The entrypoint warms both pinned Bedrock models before starting the
+          # server, and each warm-up has a 180s timeout. A startup probe suppresses
+          # liveness/readiness until that bounded initialization finishes; without
+          # it the 20s liveness delay restarts a healthy first boot mid-warm-up.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 10
+            failureThreshold: 40
           readinessProbe:
             httpGet:
               path: /health

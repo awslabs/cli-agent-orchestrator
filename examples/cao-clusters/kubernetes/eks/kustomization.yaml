@@ -54,15 +54,15 @@ images:
   # images below always move together. They are built from the same commit by
   # the same CodeBuild run, so a split tag would only ever mean a mistake.
   - name: <server-image>
-    # Built from docker/Dockerfile, which installs Claude Code from public npm
+    # Built from Dockerfile, which installs Claude Code from public npm
     # and carries the entrypoint that runs `cao init`, installs the profiles
     # named in CAO_INSTALL_PROFILES, and execs cao-server.
     newTag: 2.4.1-el1
   - name: <broker-image>
-    # Built from docker/Dockerfile.broker.
+    # Built from Dockerfile.broker.
     newTag: 2.4.1-el1
   - name: <panel-image>
-    # Built from docker/Dockerfile.panel, which copies the panel's source tree
+    # Built from Dockerfile.panel, which copies the panel's source tree
     # rather than installing its wheel: the frontend is resolved as a sibling of
     # the app package, which an installed wheel does not preserve.
     newTag: 2.4.1-el1

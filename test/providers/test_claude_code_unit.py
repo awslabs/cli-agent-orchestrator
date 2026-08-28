@@ -1889,7 +1889,7 @@ class TestClaudeCodeProviderStartupPrompts:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
-        """Test that trust prompt is detected and auto-accepted."""
+        """An older trust prompt with Yes preselected needs only Enter."""
         mock_tmux.get_history.return_value = (
             "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n"
         )
@@ -1897,7 +1897,28 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=2.0)
 
+        mock_tmux.send_keys.assert_not_called()
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_startup_prompts_moves_from_no_to_trust(self, mock_tmux):
+        """Claude Code 2.1.250 preselects No, so CAO must move to Yes."""
+        mock_tmux.get_history.side_effect = [
+            "Accessing workspace: /home/cao/workspace\n"
+            "❯ No, exit\n"
+            "  Yes, I trust this folder\n"
+            "Enter to confirm · Esc to cancel\n",
+            "Welcome to Claude Code v2.1.250",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -1976,9 +1997,11 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Verify Down arrow sent via send_keys and Enter via send_special_key
-        mock_tmux.send_keys.assert_called_once()
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        # Verify the menu receives real tmux key names, not pasted escape bytes.
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -1996,10 +2019,12 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Bypass: send_keys (Down) + send_special_key (Enter)
-        # Trust: send_special_key (Enter) — called twice total
-        assert mock_tmux.send_keys.call_count == 1  # Down arrow for bypass
-        assert mock_tmux.send_special_key.call_count == 2  # Enter for bypass + Enter for trust
+        # Bypass: Down + Enter. Trust (older layout): Enter.
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+            "Enter",
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")

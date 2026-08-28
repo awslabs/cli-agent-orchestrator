@@ -222,9 +222,9 @@ async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
     provider = ClaudeCodeProvider("t1", "sess", "win")
     await provider._handle_startup_prompts(idle_gap=20.0, outer_timeout=180.0)
 
-    # Bypass: Down arrow (send_keys) + Enter (send_special_key). Trust: Enter.
-    assert mock_backend.send_keys.call_count == 1
-    assert mock_backend.send_special_key.call_count == 2
+    # Bypass: special-key Down + Enter. Trust: special-key Enter.
+    assert mock_backend.send_keys.call_count == 0
+    assert mock_backend.send_special_key.call_count == 3
 
 
 @pytest.mark.asyncio

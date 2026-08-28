@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir \
     "uvicorn[standard]>=0.24.0"
 
 WORKDIR /app
-COPY k8s/broker.py /app/broker.py
+COPY examples/cao-clusters/kubernetes/eks/broker.py /app/broker.py
 
 USER 65532:65532
 EXPOSE 9890

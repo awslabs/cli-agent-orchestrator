@@ -63,11 +63,10 @@ class TestHandleStartupPromptsBranches:
 
         await provider._handle_startup_prompts(idle_gap=1.0)
 
-        # Down arrow sent via send_keys, Enter via send_special_key
-        mock_backend.send_keys.assert_called_once()
-        mock_backend.send_special_key.assert_called_once_with(
-            provider.session_name, provider.window_name, "Enter"
-        )
+        assert [call.args[2] for call in mock_backend.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")

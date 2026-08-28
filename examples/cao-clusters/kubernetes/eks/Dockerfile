@@ -1,7 +1,7 @@
 # CAO node image — one container = one CAO node (cao-server + tmux + agents).
 #
 # Both the supervisor pod and worker pods run this same image; they differ only
-# in env/config. In the k8s one-agent-per-pod topology (see k8s/):
+# in env/config. In the EKS one-agent-per-pod topology (see this directory):
 #   - the single SUPERVISOR pod runs the code_supervisor agent and delegates
 #     work to worker pods via the assign/handoff `target_host` parameter;
 #   - each WORKER pod hosts exactly one agent (CAO_MAX_TERMINALS=1) and
@@ -10,7 +10,8 @@
 # a building block of.
 #
 # Build (from repo root):
-#   docker build -t cao-node:dev -f docker/Dockerfile .
+#   docker build -t cao-node:dev \
+#     -f examples/cao-clusters/kubernetes/eks/Dockerfile .
 #
 # Run a worker node:
 #   docker run -d --name cao-worker-0 -p 9889:9889 \
@@ -24,7 +25,7 @@
 # base image that already carries a different provider CLI, together with
 # INSTALL_CLAUDE_CODE=0 below, to build that provider's node instead:
 #
-#   docker build -f docker/Dockerfile \
+#   docker build -f examples/cao-clusters/kubernetes/eks/Dockerfile \
 #     --build-arg BASE_PROVIDER_IMAGE=<image-with-kiro-cli> \
 #     --build-arg INSTALL_CLAUDE_CODE=0 .
 ARG BASE_PROVIDER_IMAGE=python:3.12-slim
@@ -83,13 +84,18 @@ RUN apt-get update \
 # topology, however the credential reaches the pod.
 #
 # Node 22+ is required. bookworm's nodejs is too old, so install from NodeSource.
+# Pin Claude Code because this image is rebuilt for every CAO release and a
+# mutable provider version can break an otherwise unchanged cluster. Version
+# 2.1.250 fails before its first Bedrock request with `O is not defined`;
+# 2.1.235 was validated against this example's Bedrock configuration.
 ARG INSTALL_CLAUDE_CODE=1
+ARG CLAUDE_CODE_VERSION=2.1.235
 RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
       echo "skipping Claude Code install; provider comes from BASE_PROVIDER_IMAGE"; \
     else \
     curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
     # Fail the build here rather than at pod startup if the CLI is unusable.
@@ -98,7 +104,7 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
 
 # --- Provider CLI: kiro-cli (opt in) ------------------------------------------
 #
-#   docker build -f docker/Dockerfile \
+#   docker build -f examples/cao-clusters/kubernetes/eks/Dockerfile \
 #     --build-arg INSTALL_KIRO_CLI=1 --build-arg INSTALL_CLAUDE_CODE=0 .
 #
 # Off by default because of what it costs: 722MB compressed, 1.1GB installed
@@ -125,7 +131,7 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
 #
 # NOTE: this gets the CLI into the image; it does NOT make it usable in a
 # disposable pod. kiro-cli's API key authenticates `chat --no-interactive` only,
-# and CAO drives the interactive TUI. See "Provider credentials" in k8s/README.md.
+# and CAO drives the interactive TUI. See "Provider credentials" in README.md.
 ARG INSTALL_KIRO_CLI=0
 ARG KIRO_CLI_VERSION=2.19.1
 RUN if [ "${INSTALL_KIRO_CLI}" = "1" ]; then \
@@ -160,7 +166,7 @@ RUN --mount=from=builder,source=/build/dist,target=/tmp/dist \
 # Real deployments install an authenticated provider CLI on top of this image.
 COPY --chmod=755 test/providers/fixtures/bin/mock_cli /usr/local/bin/mock_cli
 
-COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/cao-entrypoint
+COPY --chmod=755 examples/cao-clusters/kubernetes/eks/entrypoint.sh /usr/local/bin/cao-entrypoint
 
 USER cao
 WORKDIR /home/cao/workspace

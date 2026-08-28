@@ -76,7 +76,7 @@ STACK_NAME=cao-workshop
 
 aws cloudformation deploy \
   --region "${AWS_REGION}" \
-  --template-file k8s/iac/infrastructure.yaml \
+  --template-file examples/cao-clusters/kubernetes/eks/iac/cfn-infrastructure.yaml \
   --stack-name "${STACK_NAME}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides ClusterAdminPrincipalArn="$(aws sts get-caller-identity --query Arn --output text)"
@@ -107,18 +107,18 @@ aws ecr get-login-password --region "${AWS_REGION}" |
   docker login --username AWS --password-stdin "${REGISTRY}"
 
 docker buildx build --platform linux/arm64 \
-  -f docker/Dockerfile \
+  -f examples/cao-clusters/kubernetes/eks/Dockerfile \
   -t "${REGISTRY}/cao-server:${TAG}" --push .
 docker buildx build --platform linux/arm64 \
-  -f docker/Dockerfile.broker \
+  -f examples/cao-clusters/kubernetes/eks/Dockerfile.broker \
   -t "${REGISTRY}/cao-worker-broker:${TAG}" --push .
 docker buildx build --platform linux/arm64 \
-  -f docker/Dockerfile.panel \
+  -f examples/cao-clusters/kubernetes/eks/Dockerfile.panel \
   -t "${REGISTRY}/cao-fleet-panel:${TAG}" --push .
 ```
 
-`docker/Dockerfile` builds the server image self-contained: it installs CAO and
-Claude Code from public registries and carries `docker/entrypoint.sh`, which runs
+`Dockerfile` builds the server image self-contained: it installs CAO and Claude
+Code from public registries and carries `entrypoint.sh`, which runs
 `cao init`, installs the profiles named in `CAO_INSTALL_PROFILES`, and execs
 `cao-server`. Nothing out-of-tree is required to reproduce it.
 
@@ -126,7 +126,7 @@ ECR tags are `IMMUTABLE` in both repositories, deliberately: a mutable `latest`
 once left a cluster running a build that predated a fix while the manifests
 advertised it, with nothing to indicate the mismatch.
 
-The panel build uses `docker/Dockerfile.panel.dockerignore` rather than the
+The panel build uses `Dockerfile.panel.dockerignore` rather than the
 repository-root `.dockerignore`. The root file excludes `examples/`, which is
 where the panel's source lives, so without the narrower context its own image is
 built without it. BuildKit prefers a `<dockerfile>.dockerignore` when one exists,
@@ -165,11 +165,12 @@ and tested seam, not a working kiro deployment.
 
 The seam has three parts.
 
-*The image.* `docker/Dockerfile` can install kiro-cli itself — no out-of-tree
+*The image.* `Dockerfile` can install kiro-cli itself — no out-of-tree
 image needed:
 
 ```bash
-docker buildx build --platform linux/arm64 -f docker/Dockerfile \
+docker buildx build --platform linux/arm64 \
+  -f examples/cao-clusters/kubernetes/eks/Dockerfile \
   --build-arg INSTALL_KIRO_CLI=1 --build-arg INSTALL_CLAUDE_CODE=0 \
   -t "${REGISTRY}/cao-server:${TAG}" --push .
 ```
@@ -206,12 +207,12 @@ browser when one starts.
 ## Deploy
 
 ```bash
-k8s/deploy.sh cao-workshop "${TAG}"
+examples/cao-clusters/kubernetes/eks/deploy.sh cao-workshop "${TAG}"
 ```
 
 That is the whole deploy. Do not hand-edit the manifests — `deploy.sh` renders
 `<account-id>`, `<region>`, `<filesystem-id>`, `<access-point-id>` and
-`<vpc-cidr>` from stack outputs into a temporary copy, so the tree under `k8s/`
+`<vpc-cidr>` from stack outputs into a temporary copy, so this source directory
 is never modified and a failed run leaves nothing to clean up. It also:
 
 - mints `cao-elastic-broker-token` on first run and **keeps** it afterwards.
@@ -465,7 +466,7 @@ aws ec2 delete-volume --region "${AWS_REGION}" --volume-id vol-...
 
 The EFS file system is `DeletionPolicy: Delete` and goes with the stack, so
 workspace data is **not** preserved. Switch it to `Retain` in
-`iac/infrastructure.yaml` if the checkout holds anything you cannot recreate.
+`iac/cfn-infrastructure.yaml` if the checkout holds anything you cannot recreate.
 
 One thing does outlive the stack by design: `SecretsKey`, the KMS key that
 envelope-encrypts Kubernetes Secrets. KMS never deletes a key outright, only
@@ -485,7 +486,7 @@ than at the first lease on a live cluster.
 uv venv /tmp/brokertest --python 3.12
 VIRTUAL_ENV=/tmp/brokertest uv pip install \
   "fastapi>=0.104.0" "kubernetes>=30.0.0,<35.0.0" httpx
-/tmp/brokertest/bin/python k8s/test_broker.py
+/tmp/brokertest/bin/python examples/cao-clusters/kubernetes/eks/test_broker.py
 ```
 
 It covers the lease lifecycle over HTTP, both token checks, both reaper paths,

@@ -1,4 +1,4 @@
-"""Offline exercise of k8s/broker.py: object construction + lease lifecycle.
+"""Offline exercise of broker.py: object construction + lease lifecycle.
 
 Stubs the API server so the whole request path can run on a laptop. The point is
 to catch what only shows up at the first lease on a live cluster - a misspelled
@@ -13,7 +13,7 @@ a throwaway environment:
     uv venv /tmp/brokertest --python 3.12
     VIRTUAL_ENV=/tmp/brokertest uv pip install \\
         "fastapi>=0.104.0" "kubernetes>=30.0.0,<35.0.0" httpx
-    /tmp/brokertest/bin/python k8s/test_broker.py
+    /tmp/brokertest/bin/python examples/cao-clusters/kubernetes/eks/test_broker.py
 
 Exits non-zero on the first failing expectation, and prints a PASS/FAIL line per
 check.

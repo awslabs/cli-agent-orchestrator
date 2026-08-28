@@ -118,7 +118,7 @@ _absent = [name for name in WORKER_ENV_PASSTHROUGH if name not in os.environ]
 if _absent:
     raise RuntimeError(
         "CAO_ELASTIC_WORKER_ENV_PASSTHROUGH names variables that are not set on "
-        f"the broker: {', '.join(_absent)}. Set them in k8s/broker.yaml, or "
+        f"the broker: {', '.join(_absent)}. Set them in broker.yaml, or "
         "shorten the passthrough list."
     )
 
@@ -137,7 +137,7 @@ _leases_lock = threading.Lock()
 # provider from the TARGET's profile store, so a mismatch fails with
 # "<cli> was not found", naming a CLI the caller never asked for.
 #
-# Defaults to claude_code because that is what docker/Dockerfile builds by
+# Defaults to claude_code because that is what Dockerfile builds by
 # default. Set CAO_ELASTIC_WORKER_PROVIDER=kiro_cli on the broker Deployment when
 # the worker image carries kiro-cli instead.
 DEFAULT_WORKER_PROVIDER = os.environ.get("CAO_ELASTIC_WORKER_PROVIDER", "claude_code")
