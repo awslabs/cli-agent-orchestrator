@@ -45,8 +45,14 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-# The 4-platform set this repo's wheel matrix builds (interview Q2), as patterns matched
-# against the wheel filename's platform tag.
+# The platform set this repo's wheel matrix builds, as patterns matched against the wheel
+# filename's platform tag.
+#
+# WINDOWS IS DELIBERATELY ABSENT. Interview Q2 named four platforms, but
+# `cli_agent_orchestrator` cannot be imported on Windows — four modules import `fcntl` at
+# module scope and the backend is tmux — so `win_amd64` is not built and must not be
+# required here. Requiring a platform the matrix does not build would fail every publish;
+# accepting one that cannot run would be worse. See `build-wheels` in publish-to-pypi.yml.
 #
 # Patterns rather than literals because the tags carry version numbers that legitimately
 # move with the runner image — `macosx_26_0_arm64` tracks the macOS SDK, and a Linux tag may
@@ -73,7 +79,6 @@ REQUIRED_PLATFORM_PATTERNS: Dict[str, List[str]] = {
     "macOS arm64": ["macosx_*_arm64"],
     "macOS x86_64": ["macosx_*_x86_64"],
     "Linux x86_64": ["manylinux_*_x86_64", "linux_x86_64"],
-    "Windows AMD64": ["win_amd64"],
 }
 
 
@@ -197,7 +202,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         nargs="*",
         default=None,
         metavar="PATTERN",
-        help="override the expected platform patterns (default: the 4-platform matrix)",
+        help="override the expected platform patterns (default: the platforms the wheel "
+        "matrix builds)",
     )
     args = parser.parse_args(argv)
 

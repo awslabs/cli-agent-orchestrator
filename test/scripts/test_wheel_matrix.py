@@ -9,9 +9,11 @@ Every test here either (a) exercises the tag-selection logic that produces the p
 or (b) asserts a guard actually FAILS on the bad input it exists to catch. The second kind
 matters more: a guard that cannot fail is worse than no guard, because it reports success.
 
-What these tests deliberately do NOT claim: that Linux or Windows wheels work. Those cannot
-be built or executed on the development machine (macOS arm64), and no test here pretends
-otherwise — see `test_wheel_matrix_documents_unverified_platforms`.
+What these tests deliberately do NOT claim: that the Linux or macOS x86_64 wheels work.
+Neither can be built or executed on the development machine (macOS arm64), and no test here
+pretends otherwise — see `test_wheel_matrix_documents_unverified_platforms`. Windows is not
+built at all; the `win_amd64` cases below exercise the tag-selection logic and the assertion
+gate on that input, not a shippable artifact.
 """
 
 from __future__ import annotations
@@ -28,6 +30,33 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
+PUBLISH_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "publish-to-pypi.yml"
+
+
+def _publish_workflow() -> Dict[str, Any]:
+    """The publish workflow, PARSED rather than grepped.
+
+    Substring assertions over the raw YAML are what let two of the v2.5.0 release defects
+    through: a missing ``setup-python`` step and an unset ``MACOSX_DEPLOYMENT_TARGET`` are both
+    ABSENCES, and ``assert "x" in text`` cannot see an absence nobody thought to name. Parsing
+    lets a test assert structure instead — which step precedes which, and what value one
+    specific matrix leg carries.
+
+    Module-level so every class that needs the workflow shares one reader; there were two
+    copies of this before.
+    """
+    import yaml
+
+    return yaml.safe_load(PUBLISH_WORKFLOW.read_text(encoding="utf-8"))
+
+
+def _wheel_matrix_legs() -> list:
+    """The `build-wheels` matrix legs, as dicts."""
+    return _publish_workflow()["jobs"]["build-wheels"]["strategy"]["matrix"]["include"]
+
+
+def _build_wheels_steps() -> list:
+    return _publish_workflow()["jobs"]["build-wheels"]["steps"]
 
 
 def _load_script(name: str) -> Any:
@@ -603,12 +632,17 @@ class TestAutobuildStagesTheBinary:
 
 
 class TestAssertWheelMatrix:
-    def test_full_four_platform_set_passes(self, tmp_path):
+    def test_full_platform_set_passes_without_a_windows_wheel(self, tmp_path):
+        """The three platforms the matrix builds are the whole requirement.
+
+        Doubles as the regression test for the v2.5.0 publish gate: while `Windows AMD64` was
+        still in ``REQUIRED_PLATFORM_PATTERNS``, this exact directory — every wheel the matrix
+        can actually produce — would have been rejected as incomplete.
+        """
         for tag in (
             "py3-none-macosx_26_0_arm64",
             "py3-none-macosx_26_0_x86_64",
             "py3-none-linux_x86_64",
-            "py3-none-win_amd64",
         ):
             _wheel_with_tag(tmp_path, tag)
         assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 0
@@ -618,7 +652,6 @@ class TestAssertWheelMatrix:
         for tag in (
             "py3-none-macosx_26_0_arm64",
             "py3-none-linux_x86_64",
-            "py3-none-win_amd64",
         ):
             _wheel_with_tag(tmp_path, tag)
         assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 1
@@ -629,7 +662,6 @@ class TestAssertWheelMatrix:
             "py3-none-macosx_26_0_arm64",
             "py3-none-macosx_26_0_x86_64",
             "py3-none-linux_x86_64",
-            "py3-none-win_amd64",
             "py3-none-any",
         ):
             _wheel_with_tag(tmp_path, tag)
@@ -659,7 +691,6 @@ class TestAssertWheelMatrix:
             "py3-none-macosx_26_0_arm64",
             "py3-none-macosx_26_0_x86_64",
             "py3-none-manylinux_2_28_x86_64",
-            "py3-none-win_amd64",
         ):
             _wheel_with_tag(tmp_path, tag)
         assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 0
@@ -676,7 +707,6 @@ class TestAssertWheelMatrix:
             "py3-none-macosx_26_0_arm64",
             "py3-none-macosx_26_0_x86_64",
             "py3-none-musllinux_1_2_x86_64",
-            "py3-none-win_amd64",
         ):
             _wheel_with_tag(tmp_path, tag)
         assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 1
@@ -687,7 +717,6 @@ class TestAssertWheelMatrix:
             "py3-none-macosx_26_0_arm64",
             "py3-none-macosx_26_0_x86_64",
             "py3-none-manylinux_2_28_aarch64",
-            "py3-none-win_amd64",
         ):
             _wheel_with_tag(tmp_path, tag)
         assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 1
@@ -812,25 +841,15 @@ class TestReleaseToolchainInstallsEveryCrossTarget:
     later without one, which is the same silence the original defect had.
     """
 
-    WORKFLOW = REPO_ROOT / ".github" / "workflows" / "publish-to-pypi.yml"
+    WORKFLOW = PUBLISH_WORKFLOW
 
     @staticmethod
     def _wheel_matrix() -> list:
-        import yaml
-
-        workflow = yaml.safe_load(
-            TestReleaseToolchainInstallsEveryCrossTarget.WORKFLOW.read_text(encoding="utf-8")
-        )
-        return workflow["jobs"]["build-wheels"]["strategy"]["matrix"]["include"]
+        return _wheel_matrix_legs()
 
     @staticmethod
     def _toolchain_step() -> dict:
-        import yaml
-
-        workflow = yaml.safe_load(
-            TestReleaseToolchainInstallsEveryCrossTarget.WORKFLOW.read_text(encoding="utf-8")
-        )
-        steps = workflow["jobs"]["build-wheels"]["steps"]
+        steps = _build_wheels_steps()
         matches = [s for s in steps if "dtolnay/rust-toolchain" in str(s.get("uses", ""))]
         assert len(matches) == 1, (
             f"expected exactly one rust-toolchain step in build-wheels, found {len(matches)}; "
@@ -1013,19 +1032,138 @@ class TestConfigurationInvariants:
         )
         assert text.count("timeout-minutes:") >= 5
 
-    def test_matrix_covers_the_four_named_platforms(self):
-        """Interview Q2. This repo had ZERO non-Linux runners before this unit."""
-        text = (REPO_ROOT / ".github" / "workflows" / "publish-to-pypi.yml").read_text(
-            encoding="utf-8"
+    def test_matrix_covers_the_three_supported_platforms(self):
+        """Interview Q2 named four; Windows is not one of them. See the next test."""
+        legs = _wheel_matrix_legs()
+        assert {leg["label"] for leg in legs} == {
+            "macOS arm64",
+            "macOS x86_64",
+            "Linux x86_64",
+        }
+        assert {leg["os"] for leg in legs} == {"macos-latest", "ubuntu-latest"}
+        assert {leg["archs"] for leg in legs} == {"arm64", "x86_64"}
+
+    def test_no_windows_leg_is_built_or_smoke_tested(self):
+        """Windows cannot import this package, so a wheel for it must not be produced.
+
+        v2.5.0 shipped a matrix that built one. `cao-tui.exe` was fine; the Python package
+        died on `ModuleNotFoundError: No module named 'fcntl'` in the smoke test. Pinned in
+        FOUR places because a leg restored in any one of them alone would either publish a
+        broken wheel or deadlock the publish gate on an artifact nobody builds.
+
+        Asserted over the PARSED runner values, not a grep for "windows-latest": the first
+        draft of this test grepped, and failed on its own explanatory comment. A substring
+        check over YAML cannot tell configuration from prose ABOUT configuration.
+        """
+        workflow = _publish_workflow()
+        for job in ("build-wheels", "smoke-test"):
+            runners = {
+                str(leg["os"]) for leg in workflow["jobs"][job]["strategy"]["matrix"]["include"]
+            }
+            assert not any("windows" in r for r in runners), (
+                f"a Windows runner is back in the {job} matrix ({sorted(runners)}); the "
+                "package still cannot be imported on Windows (fcntl at module scope, "
+                "tmux-only backend)"
+            )
+        assert (
+            "Windows AMD64" not in assert_wheel_matrix.REQUIRED_PLATFORM_PATTERNS
+        ), "the publish gate would block on a wheel the matrix no longer builds"
+        assert "*-win*" in self._pyproject()["tool"]["cibuildwheel"]["skip"]
+
+    def test_wheel_job_provides_a_host_python_for_the_assert_step(self):
+        """The v2.5.0 macOS arm64 failure: `python: command not found`, exit 127.
+
+        cibuildwheel supplies interpreters for the BUILD, so this job originally had no
+        setup-python — but the `Assert TUI binary is inside each wheel` step shells out to
+        `python` on the HOST, and the macOS images provide only `python3`. That step runs
+        AFTER cibuildwheel has already produced and smoke-tested a good wheel, so the whole
+        leg failed on a working artifact.
+        """
+        steps = _build_wheels_steps()
+        setup_python = [s for s in steps if "actions/setup-python@" in s.get("uses", "")]
+        assert setup_python, (
+            "build-wheels invokes `python` on the host but sets up no interpreter; the macOS "
+            "runner images have only `python3`"
         )
-        for runner in ("macos-latest", "ubuntu-latest", "windows-latest"):
-            assert f"os: {runner}" in text, f"{runner} missing from the wheel matrix"
-        for arch in ("arm64", "x86_64", "AMD64"):
-            assert f"archs: {arch}" in text
+
+        # Ordering is the whole point: an interpreter configured after the step that needs it
+        # is no interpreter at all.
+        def index_of(predicate) -> int:
+            return next(i for i, s in enumerate(steps) if predicate(s))
+
+        assert index_of(lambda s: "actions/setup-python@" in s.get("uses", "")) < index_of(
+            lambda s: "python scripts/build_tui.py check" in s.get("run", "")
+        )
+
+    def test_macos_deployment_target_clears_the_rust_binary_floor_per_leg(self):
+        """The v2.5.0 macOS x86_64 failure, in delocate:
+
+            DelocationError: Library dependencies do not satisfy target MacOS version 10.9:
+              .../cao-tui has a minimum target of 10.12
+
+        cibuildwheel defaults x86_64 to 10.9, but rustc's `x86_64-apple-darwin` output
+        declares 10.12, and delocate refuses the wheel. Asserted PER LEG rather than as one
+        macOS-wide value: a blanket 10.12 would drop arm64 below its own binary's 11.0 floor
+        and break the leg that already worked, so a single shared value is itself the bug.
+        """
+        targets = {leg["label"]: leg["macos-target"] for leg in _wheel_matrix_legs()}
+        assert targets["macOS x86_64"] == "10.12", (
+            "the x86_64 leg's deployment target must clear rustc's 10.12 floor or "
+            "delocate-wheel rejects the wheel during repair"
+        )
+        assert (
+            targets["macOS arm64"] == "11.0"
+        ), "arm64's binary floor is 11.0; lowering this leg to match x86_64 would break it"
+        assert targets["Linux x86_64"] == "", "the variable is meaningless on Linux"
+
+        # And the value has to actually reach cibuildwheel.
+        steps = _build_wheels_steps()
+        cibw = next(s for s in steps if "pypa/cibuildwheel@" in s.get("uses", ""))
+        assert cibw["env"]["MACOSX_DEPLOYMENT_TARGET"] == "${{ matrix.macos-target }}"
 
     def test_wheelhouse_is_gitignored(self):
         """cibuildwheel's output dir holds multi-MB binaries; it must not enter history."""
         assert "wheelhouse/" in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+
+
+class TestWindowsIsRefusedAtImport:
+    """Not publishing a Windows wheel is NOT the same as refusing to install on Windows.
+
+    No installer enforces an ``Operating System`` classifier, and metadata cannot express an
+    OS constraint. Without a wheel, pip falls back to the sdist, which builds and installs
+    fine — the Rust hook is inert without cargo. So the guard in
+    ``cli_agent_orchestrator/__init__.py`` is the only thing standing between a Windows
+    operator and ``ModuleNotFoundError: No module named 'fcntl'`` from whichever submodule
+    happened to be imported first.
+
+    The module source is exec'd under a patched ``sys.platform`` because the real package is
+    already imported by the time these tests run, so a plain ``import`` cannot re-trigger it.
+    """
+
+    SOURCE = REPO_ROOT / "src" / "cli_agent_orchestrator" / "__init__.py"
+
+    def _exec(self) -> None:
+        exec(  # noqa: S102 - executing our own source under a patched platform is the test
+            compile(self.SOURCE.read_text(encoding="utf-8"), str(self.SOURCE), "exec"),
+            {"__name__": "cli_agent_orchestrator"},
+        )
+
+    def test_import_on_win32_raises_and_says_why(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(ImportError) as excinfo:
+            self._exec()
+        message = str(excinfo.value)
+        # The diagnosis, the cause, and the way forward — a bare "unsupported" would leave the
+        # operator no better off than the ModuleNotFoundError it replaces.
+        assert "does not support Windows" in message
+        assert "fcntl" in message and "tmux" in message
+        assert "WSL2" in message
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_the_guard_is_inert_on_supported_platforms(self, monkeypatch, platform):
+        """The negative control. A guard that fires everywhere would break every install."""
+        monkeypatch.setattr(sys, "platform", platform)
+        self._exec()
 
 
 def test_wheel_matrix_documents_unverified_platforms():

@@ -125,6 +125,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - validate and contain filesystem paths derived from profile names (GHSA-6m35-gcf5-xm75) (#695)
 
+- install a host Python in build-wheels so the post-build wheel assertion can run at all
+  (the macOS runners ship only `python3`, so `python scripts/build_tui.py check` exited 127)
+
+- set MACOSX_DEPLOYMENT_TARGET per matrix leg (11.0 arm64, 10.12 x86_64) so delocate's
+  minimum-OS check matches the Rust binary's actual floor instead of cibuildwheel's 10.9 default
+
+- stop building and requiring a Windows wheel, and refuse Windows at import with an
+  explanation: four modules import `fcntl` at module scope and the backend is tmux, so the
+  sdist fallback installed but could not import
+
 
 ### Other
 
