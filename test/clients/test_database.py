@@ -505,7 +505,7 @@ class TestIdempotencyKey:
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_idempotency_key_matching_terminal_id(self, mock_session_class):
-        """Review S-001, PR #634: this is what lets create_terminal's
+        """Review on PR #634: this is what lets create_terminal's
         stale-mapping fallthrough clear a dangling row before recreating,
         instead of colliding with it on the next insert."""
         mock_session = MagicMock()

@@ -1065,7 +1065,7 @@ class TestCreateTerminalIdempotencyKey:
         mock_fifo_manager,
         mock_status_monitor,
     ):
-        """Real-DB regression test for S-001 (review on PR #634).
+        """Real-DB regression test (review on PR #634).
 
         ``test_stale_mapping_falls_through_to_a_fresh_create`` (above) mocks
         ``db_create_terminal``, so it never runs the real INSERT that used

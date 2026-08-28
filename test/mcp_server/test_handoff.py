@@ -606,7 +606,7 @@ class TestHandoffEarlyTerminalId:
     def test_waiting_path_tears_down_the_terminal_on_success(
         self, mock_delete, mock_create, mock_provider, _nudge
     ):
-        """Regression (socrates review on commit 3952889): run_agent_step
+        """Regression (review on commit 3952889): run_agent_step
         silently never tears down a reused terminal, no matter what the
         payload's `teardown` field says (created_here is always False for a
         reuse call). Without this explicit call, every successful wait=True

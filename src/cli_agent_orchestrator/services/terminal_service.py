@@ -868,7 +868,7 @@ async def create_terminal(
                 # and create fresh rather than raising on an operator who
                 # simply reused a key from a job that already finished.
                 #
-                # The stale row must be deleted FIRST (review S-001, PR #634):
+                # The stale row must be deleted FIRST (review on PR #634):
                 # deleting a terminal does not cascade to idempotency_keys, so
                 # leaving this row in place would make the replacement
                 # terminal's own idempotency insert below collide on the same

@@ -1312,7 +1312,7 @@ def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
     """Delete an idempotency-key mapping, but only if it still points to
     ``expected_terminal_id``.
 
-    Review on PR #634, issue #616 (S-001): ``create_terminal``'s fallthrough
+    Review on PR #634, issue #616: ``create_terminal``'s fallthrough
     for a mapping whose terminal no longer exists must clear this row FIRST.
     ``delete_terminal`` does not cascade to ``idempotency_keys``, so leaving
     a stale row in place would make the replacement terminal's own

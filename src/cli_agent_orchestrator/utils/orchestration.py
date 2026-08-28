@@ -868,7 +868,7 @@ async def _handoff_impl(
             # reuse_terminal_id call -- the server literally cannot act on
             # this field once we're reusing, regardless of what we send.
             # Tearing down is therefore this function's own job on success,
-            # below (review: socrates on commit 3952889 -- the prior version
+            # below (review on commit 3952889 -- the prior version
             # sent True here and never tore anything down, leaking a
             # terminal on every successful wait=True handoff).
             "teardown": False,
