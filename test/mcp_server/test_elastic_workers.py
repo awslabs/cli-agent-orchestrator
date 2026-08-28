@@ -76,9 +76,7 @@ def test_assign_elastic_forwards_an_explicit_provider(monkeypatch):
         patch.object(server.requests, "post", return_value=_lease_response()) as post,
         patch.object(server, "_assign_impl", return_value={"success": True}),
     ):
-        asyncio.run(
-            server.assign_elastic("developer", "Implement it", provider="claude_code")
-        )
+        asyncio.run(server.assign_elastic("developer", "Implement it", provider="claude_code"))
 
     assert post.call_args.kwargs["json"] == {
         "agent_profile": "developer",
@@ -98,9 +96,7 @@ def test_assign_elastic_warns_the_worker_not_to_speak_first(monkeypatch):
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", return_value=_lease_response()),
-        patch.object(
-            server, "_assign_impl", return_value={"success": True}
-        ) as assign,
+        patch.object(server, "_assign_impl", return_value={"success": True}) as assign,
     ):
         asyncio.run(server.assign_elastic("developer", "Implement it"))
 
