@@ -122,7 +122,11 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
+    approval_gate,
+    approval_provenance,
+    approval_store,
     flow_service,
+    manifest_freeze,
     secret_gate,
     session_service,
     terminal_service,
@@ -4433,6 +4437,144 @@ async def _run_in_background(
         _failed_backstop("drive raised")
 
 
+class PlanApprovalRequest(BaseModel):
+    """Body of the approve-a-plan request (issue #583 Bolt 2, unit ``approval-operation``).
+
+    ``plan_id`` IS A BODY FIELD AND NEVER A PATH SEGMENT, on purpose. It contains a ``:``
+    (``plan-v1:…``) and ``approval_store`` requires it be stored and compared VERBATIM, never parsed
+    and never normalised — a normalisation is how two distinct plans could come to share one
+    approval. A path segment invites percent-encoding, decoding and normalisation from every layer
+    between the client and this handler; a body field makes verbatimness a property of the transport
+    instead of a hope.
+
+    THERE IS NO ``approved_by`` FIELD, also on purpose. Accepting one would create free text that
+    nothing can verify and that any caller could set to any value — the appearance of accountability
+    with none of the substance. It is resolved server-side instead, which at least makes it a true
+    statement about which local account performed the call.
+    """
+
+    plan_id: str
+
+
+@app.post("/workflows/plans/approve")
+async def approve_workflow_plan_endpoint(
+    body: PlanApprovalRequest,
+    # SCOPE_ADMIN ONLY, AND DELIBERATELY NARROWER THAN EVERY SIBLING WORKFLOW ENDPOINT, which accept
+    # ``SCOPE_WRITE, SCOPE_ADMIN``. DO NOT "align" this with them — widening it silently defeats the
+    # control. Approving a plan is an AUTHORISATION act rather than ordinary data mutation, and the
+    # MCP surface deliberately ships no grant tool so an agent cannot approve the plan it just wrote
+    # (issue #583 Bolt 2 ``approval-operation`` Q1). But the MCP boundary reaches the backplane over
+    # HTTP — that is exactly what ``test_http_only_boundary.py`` enforces — so if this endpoint
+    # accepted ``cao:write`` and an agent's token were write-scoped, the agent could grant by calling
+    # here directly and the missing tool would be a speed bump rather than a control.
+    #
+    # Honest caveat, recorded rather than implied away: ``require_any_scope`` is default-off, so in a
+    # default install this changes nothing. ``SCOPE_WRITE, SCOPE_ADMIN`` is equally inert there; the
+    # two differ ONLY when auth is enabled, which is the one case the distinction was asked for.
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict:
+    """Approve a plan identifier so its runs may start (issue #583 FR-8).
+
+    Idempotent: approving an already-approved plan changes nothing and SAYS SO, reporting the
+    ORIGINAL ``approved_at``/``approved_by``. ``approval_store.grant`` is ``INSERT OR IGNORE``
+    because an update path could transfer an existing approval to a changed plan, so a plain
+    "success" here would leave an operator unable to tell "I have just approved this" from "this was
+    approved last week by someone else and my grant did nothing".
+
+    Success is derived from a READ-BACK rather than from the absence of an exception, because
+    ``INSERT OR IGNORE`` succeeds silently whether or not it inserted. A missing row afterwards is
+    an error, never a cheerful success — this unit's worst failure mode is a command that appears to
+    work, leaving the operator to meet the same refusal on the next run with no explanation.
+    """
+    plan_id = body.plan_id
+    if not plan_id or not plan_id.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="plan_id is required")
+
+    existing = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    if existing is not None:
+        logger.info(
+            "workflow plan approval: %s was already approved at %s by %s (no change)",
+            plan_id,
+            existing.approved_at,
+            existing.approved_by,
+        )
+        return {
+            "plan_id": plan_id,
+            "approved": True,
+            "changed": False,
+            "approved_at": existing.approved_at,
+            "approved_by": existing.approved_by,
+        }
+
+    approved_by = approval_provenance.local_account()
+    try:
+        await asyncio.to_thread(approval_store.grant, plan_id, approved_by)
+        recorded = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    except Exception as e:  # noqa: BLE001 — surfaced, never swallowed into a false success
+        logger.error("workflow plan approval: grant for %s failed: %s", plan_id, e)
+        raise HTTPException(status_code=500, detail=f"could not record approval: {e}")
+
+    if recorded is None:
+        # A database fault that ``approval_store`` converted to a quiet None. Correct for the GATE,
+        # which must fail closed; wrong to read here as "not approved yet, all fine".
+        logger.error("workflow plan approval: grant for %s did not persist", plan_id)
+        raise HTTPException(status_code=500, detail="approval did not persist")
+
+    logger.info("workflow plan approval: %s approved by %s", plan_id, recorded.approved_by)
+    return {
+        # Echoed VERBATIM. Returning a normalised form would teach a caller that some other
+        # spelling is equivalent, which is exactly the equivalence approval_store forbids.
+        "plan_id": plan_id,
+        "approved": True,
+        "changed": True,
+        "approved_at": recorded.approved_at,
+        "approved_by": recorded.approved_by,
+    }
+
+
+@app.get("/workflows/runs/{run_id}/plan")
+async def get_workflow_run_plan_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Report a run's plan identifier and whether it is approved (issue #583 FR-8).
+
+    READ-ONLY, and a NEW route rather than an extension of ``GET /workflows/runs/{run_id}``: adding
+    fields to a shipped response would change a surface every existing caller already parses, which
+    C-1 forbids.
+
+    This is what the read-only MCP tool consults, so an agent that meets an approval refusal can tell
+    the operator WHICH ``plan_id`` to approve. It cannot grant one — that is the CLI's, behind
+    ``cao:admin``.
+
+    ``plan_id`` is ``None`` for a YAML run (which never freezes a manifest) and for a script run whose
+    freeze failed. Both are reported as ``None`` rather than as "unapproved", because "this run has no
+    plan identifier" and "this plan is not approved" call for entirely different operator actions.
+    """
+    # Imported locally, matching the other run-row handlers in this module (see the resume endpoint).
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    # Reuses the gate's extractor rather than parsing the manifest a second way: two extractors
+    # disagreeing about what a run's plan_id is would be worse than either being wrong alone.
+    plan_id = approval_gate.plan_id_from_manifest(row.manifest_json)
+    if plan_id is None:
+        return {"run_id": run_id, "tier": row.tier, "plan_id": None, "approved": None}
+
+    approval = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    return {
+        "run_id": run_id,
+        "tier": row.tier,
+        "plan_id": plan_id,
+        "approved": approval is not None,
+        "approved_at": approval.approved_at if approval else None,
+        "approved_by": approval.approved_by if approval else None,
+    }
+
+
 @app.post("/workflows/runs")
 async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
@@ -4503,6 +4645,8 @@ async def start_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(e.findings)},
             )
+        except approval_gate.PlanApprovalRequiredError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except ValueError as e:
@@ -4656,6 +4800,24 @@ async def submit_workflow_run_endpoint(
         spec_snapshot = json.dumps(
             {"source": spec.source, "path": spec.path, "content_hash": spec.content_hash}
         )
+        # Step 4b — approval gate (issue #583 Bolt 2, ``approval-gate``). Built ONCE here and handed
+        # to the INSERT below unchanged, so the manifest that is CHECKED is byte-identical to the one
+        # STORED. Gating BEFORE the INSERT means a refused start leaves no ``workflow_run`` row: every
+        # first run of a new plan is refused by design, so recording them would durably record runs
+        # that never happened. The blocking arm in ``script_runner`` gates identically at its Step 0b,
+        # because otherwise a run's approvability would depend on which route started it. No-ops
+        # entirely when enforcement is disabled, which is the default.
+        manifest_json = await asyncio.to_thread(
+            manifest_freeze.build_manifest_json,
+            source_hash=spec.content_hash,
+            inputs=resolved,
+        )
+        try:
+            approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+        except approval_gate.PlanApprovalRequiredError as e:
+            # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
+            # caller can tell "needs approval" from "the run broke".
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         # Step 5 — the script row is a single INSERT (no seed steps), already
         # atomic on its own connection. This is the one deliberate deviation from
         # the engines' best-effort write: awaited, and its failure aborts with 500.
@@ -4670,6 +4832,15 @@ async def submit_workflow_run_endpoint(
                 started_at,
                 "script",
                 "1",
+                # issue #583 Bolt 2, ``manifest-freeze``: the frozen manifest rides the SAME
+                # INSERT as the run row (ADR-583-4's no-two-writes lesson). This is the ASYNC
+                # script arm; the blocking arm freezes in ``script_runner`` the same way, and
+                # BOTH script entry points must freeze or a run's approvability would depend on
+                # which route started it. ``build_manifest_json`` is total and returns None on
+                # failure, which writes NULL and fails CLOSED at the approval gate.
+                # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 4b and has already gated
+                # on it; reusing it rather than rebuilding is what makes checked-equals-stored true.
+                manifest_json,
             )
         except sqlite3.IntegrityError:
             # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
@@ -6031,6 +6202,13 @@ async def resume_workflow_run_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
             )
+        except approval_gate.PlanApprovalRequiredError as e:
+            # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
+            # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
+            # precisely so the trailing 400 arm cannot claim it, and not a ``ResumeNotAllowedError``
+            # because 409 means "this run cannot be resumed" — a fact about the run — whereas this is
+            # a fact about the plan, and the operator's next action is completely different.
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except workflow_service.ResumeNotAllowedError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except workflow_service.ResumeCorruptError as e:

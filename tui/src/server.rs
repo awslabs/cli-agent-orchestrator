@@ -685,6 +685,12 @@ fn route(id: CommandId) -> Option<Route> {
         // unbounded for this client's purposes.
         CommandId::WorkflowResume => None,
         CommandId::WorkflowRun => None,
+        // `cao workflow approve` is classified HIDE, so the TUI never routes it — and this arm
+        // exists only because the match is exhaustive on purpose. It is deliberately `None` rather
+        // than a real binding: routing a command the TUI does not offer would build a reachable
+        // path to a human authorisation act that nothing in the interface has reviewed.
+        // (#583 Bolt 2, approval-operation)
+        CommandId::WorkflowApprove => None,
     }
 }
 

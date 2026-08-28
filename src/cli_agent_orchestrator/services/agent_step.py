@@ -31,7 +31,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
-from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services import frozen_run_memory, terminal_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.terminal_service import OutputMode
@@ -703,7 +703,37 @@ async def run_agent_step(
     # key sends); run it off the event loop so a slow tmux call cannot freeze
     # the whole server for other requests (same hazard as issue #382, which was
     # only fixed for DELETE /sessions). Any failure raises and propagates.
-    await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
+    # issue #583 Bolt 2, ``memory-resolve-once``: hand this run's FROZEN memory block to the terminal
+    # so a replayed run sees the memory the ORIGINAL run recorded rather than the store's state today
+    # (FR-9). The run id is read from ``env_vars`` rather than taken as a new parameter, because the
+    # engine already sets ``CAO_WORKFLOW_RUN_ID`` there for the worker's ``workflow_return`` routing.
+    #
+    # Resolution happens HERE and nowhere earlier, which is the requirement rather than an
+    # optimisation: a run that never creates a terminal must resolve nothing, because an unresolved
+    # block is sensitive text that would be stored for no reason (NFR-1).
+    #
+    # ``None`` means there is no workflow manifest to honour, so use the historical live-memory path.
+    # ``""`` is different: it means an existing manifest's memory fill could not persist and MUST be
+    # passed through explicitly, suppressing ``send_input``'s live-memory fallback.
+    frozen_memory = await asyncio.to_thread(
+        frozen_run_memory.frozen_memory_for,
+        (env_vars or {}).get("CAO_WORKFLOW_RUN_ID"),
+        terminal_id,
+        prompt,
+    )
+    if frozen_memory is None:
+        # The call is left BYTE-IDENTICAL on the no-frozen-block path, rather than passing an extra
+        # `None`. Existing tests assert this exact two-argument shape, and keeping them passing
+        # unchanged is the strongest available evidence for C-1: a non-workflow step reaches
+        # ``send_input`` exactly as it did before this unit.
+        await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
+    else:
+        await asyncio.to_thread(
+            terminal_service.send_input,
+            terminal_id,
+            prompt,
+            frozen_memory=frozen_memory,
+        )
 
     # Wait for completion — IN-PROCESS poll of status_monitor (NOT the
     # HTTP-polling wait_until_terminal_status, which would reintroduce the
