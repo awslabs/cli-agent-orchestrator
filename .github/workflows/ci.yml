@@ -88,6 +88,86 @@ jobs:
         run: npm run build
         working-directory: web
 
+      # =================================================================================
+      # WHEEL-CONTENTS GATE (issue #610) — this job is the ONLY place in CI where
+      # test/test_wheel_contents.py can execute at all.
+      #
+      # THE STRUCTURAL GAP THIS ADDRESSES PREDATES #618: `Unit Tests` runs pytest but never
+      # builds the web UI, and this job built the web UI but ran no pytest until this
+      # change. The test is gated on `src/cli_agent_orchestrator/web_ui/index.html`
+      # existing, so it reported SKIPPED in all three `Unit Tests` legs and NO job in
+      # the workflow could run it. That gap would have defeated any future
+      # web_ui-dependent test too.
+      #
+      # SCOPE, so this is not read as more than it is: the step below names
+      # test_wheel_contents.py EXPLICITLY, so it closes the gap for THAT FILE and not for
+      # the class. Another web_ui-dependent test added elsewhere under test/ would still
+      # skip in `Unit Tests` and would not be collected here; wiring it in means naming it
+      # in this step too.
+      #
+      # WHY HERE and not in `Unit Tests` (measured, run 33190312634):
+      #   - Cost is NOT the discriminator. The workflow's critical path is `CAO MCP Apps`
+      #     at 731s. Adding Node to `Unit Tests` costs +14s/leg (setup-node 5s, npm ci 3s,
+      #     npm run build 6s) on ~500s legs; adding uv here costs ~+25s on a 28s job.
+      #     Neither moves total wall clock.
+      #   - The property under test is PYTHON-VERSION-INDEPENDENT (does hatchling's
+      #     `[tool.hatch.build] artifacts` glob include web_ui). In `Unit Tests` it would
+      #     run three times — on 3.10, 3.11 and 3.12 — asserting the same thing thrice and
+      #     building the web UI thrice to do it. Once is correct.
+      #   - It keeps the repo's primary test gate byte-identical, so no npm-registry
+      #     dependency is added to it. (Measured honestly: building web_ui mounts a
+      #     catch-all StaticFiles route at `/`, but test/api/ gives an identical
+      #     `1085 passed, 1 skipped` with and without it — so this is a failure-surface
+      #     and redundancy argument, NOT a measured-regression one.)
+      #   - Follows the `CAO MCP Apps` job's existing in-file pattern: a Node build plus
+      #     setup-uv/`uv python install`/`uv sync --all-extras --dev` plus ONE targeted
+      #     pytest file (see its "HTTP-only MCP boundary guard" step).
+      #
+      # `--all-extras --dev`, not plain `uv sync`: `agui` is an optional extra and every
+      # other install site in this file passes both flags. Plain `uv sync` omits it and
+      # yields ~58 spurious agui collection failures.
+      # =================================================================================
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install Python deps (for the wheel-contents packaging test)
+        run: uv sync --all-extras --dev
+
+      - name: Wheel-contents regression test (issue #610)
+        # The skip-guard is the load-bearing half. test_wheel_contents.py SKIPS when its
+        # WEB_UI_INDEX is absent, and a skip keeps this job GREEN — which is the same false
+        # assurance the test exists to remove. (The `skipif` itself is correct: a local run
+        # without a built web UI should skip, not fail.) `npm run build` exiting 0 while
+        # writing no index.html is the failure this step exists to catch, so assert the
+        # precondition instead of trusting it, and fail loudly if the test would not run.
+        #
+        # The guard IMPORTS WEB_UI_INDEX from the test module rather than hardcoding the
+        # same path a second time. A hardcoded copy drifts: change the path in the test and
+        # the guard keeps passing while the test silently skips — restoring the exact
+        # false-green this step exists to remove. One source of truth, reused.
+        #
+        # That import resolves `test` from the CURRENT DIRECTORY, so this step must stay
+        # at the repo root. Four sibling steps in this job set `working-directory: web`;
+        # adding one here would fail with `ModuleNotFoundError: No module named 'test'`.
+        # Loud rather than silent, but it would cost a debugging round to place.
+        #
+        # Only this one file: the full suite already runs in `Unit Tests`, and the wheel
+        # build here is ~2s, so duplicating the suite would be pure waste.
+        run: |
+          uv run python -c 'import test.test_wheel_contents as t; raise SystemExit(0 if t.WEB_UI_INDEX.is_file() else 1)' || {
+            echo "test_wheel_contents.WEB_UI_INDEX does not exist after 'npm run build'." >&2
+            echo "test/test_wheel_contents.py would SKIP rather than run, leaving this job" >&2
+            echo "green with the packaging assertion unexecuted (issue #610)." >&2
+            exit 1
+          }
+          uv run pytest test/test_wheel_contents.py --no-cov -q
+
   aidlc-portfolio-example:
     name: AI-DLC Portfolio Example
     runs-on: ubuntu-latest
