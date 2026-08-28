@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -2331,7 +2331,9 @@ async def store_lesson(
 
 @mcp.tool()
 async def workflow_return(
-    output: Dict[str, Any] = Field(description="The structured JSON output for this workflow step"),
+    output: Annotated[
+        Dict[str, Any], Field(description="The structured JSON output for this workflow step")
+    ],
     output_schema: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
@@ -2393,7 +2395,9 @@ async def workflow_return(
 
 @mcp.tool()
 async def workflow_run(
-    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file"),
+    name_or_path: Annotated[
+        str, Field(description="Workflow name (indexed) or path to a spec YAML file")
+    ],
     inputs: Optional[Dict[str, Any]] = Field(
         default=None, description="Run inputs, validated against the spec's declared inputs"
     ),
@@ -2464,7 +2468,7 @@ async def workflow_run(
 
 @mcp.tool()
 async def workflow_resume(
-    run_id: str = Field(description="The run id to resume (a crashed/failed prior run)"),
+    run_id: Annotated[str, Field(description="The run id to resume (a crashed/failed prior run)")],
     decisions: Optional[Dict[str, str]] = Field(
         default=None,
         description=(
@@ -2549,7 +2553,7 @@ async def workflow_resume(
 
 @mcp.tool()
 async def workflow_cancel(
-    run_id: str = Field(description="The run id to cancel (from a prior workflow_run)"),
+    run_id: Annotated[str, Field(description="The run id to cancel (from a prior workflow_run)")],
 ) -> Dict[str, Any]:
     """Cooperatively cancel a running workflow (issue #312, N5).
 
@@ -2584,7 +2588,9 @@ async def workflow_cancel(
 # ---------------------------------------------------------------------------
 @mcp.tool()
 async def workflow_start(
-    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file"),
+    name_or_path: Annotated[
+        str, Field(description="Workflow name (indexed) or path to a spec YAML file")
+    ],
     inputs: Optional[Dict[str, Any]] = Field(
         default=None, description="Run inputs, validated against the spec's declared inputs"
     ),
@@ -2642,7 +2648,9 @@ async def workflow_start(
 
 @mcp.tool()
 async def workflow_plan_approval(
-    run_id: str = Field(description="The run id to report on (from workflow_start / workflow_run)"),
+    run_id: Annotated[
+        str, Field(description="The run id to report on (from workflow_start / workflow_run)")
+    ],
 ) -> Dict[str, Any]:
     """Report a run's plan identifier and whether that plan is approved (issue #583 FR-8).
 
@@ -2695,7 +2703,9 @@ async def workflow_plan_approval(
 
 @mcp.tool()
 async def workflow_status(
-    run_id: str = Field(description="The run id to snapshot (from workflow_start / workflow_run)"),
+    run_id: Annotated[
+        str, Field(description="The run id to snapshot (from workflow_start / workflow_run)")
+    ],
 ) -> Dict[str, Any]:
     """Return a point-in-time status snapshot for a run (issue #505, U6).
 
@@ -2727,7 +2737,7 @@ async def workflow_status(
 
 @mcp.tool()
 async def workflow_result(
-    run_id: str = Field(description="The run id whose retained result to fetch"),
+    run_id: Annotated[str, Field(description="The run id whose retained result to fetch")],
 ) -> Dict[str, Any]:
     """Return the complete retained result for a run (issue #505, U6; FR-7.2).
 
@@ -2792,7 +2802,9 @@ async def workflow_list(
 
 @mcp.tool()
 async def workflow_wait(
-    run_id: str = Field(description="The run id to follow until it reaches a terminal state"),
+    run_id: Annotated[
+        str, Field(description="The run id to follow until it reaches a terminal state")
+    ],
 ) -> Dict[str, Any]:
     """Follow a submitted run to a terminal state, then return its result (issue #505, U6).
 
@@ -2896,7 +2908,7 @@ def _classify_events_404(run_id: str, detail: str) -> tuple:
 
 @mcp.tool()
 async def workflow_events(
-    run_id: str = Field(description="The run id whose live event stream to follow"),
+    run_id: Annotated[str, Field(description="The run id whose live event stream to follow")],
     after_seq: Optional[int] = Field(
         default=None,
         description=(
