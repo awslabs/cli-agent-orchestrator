@@ -1350,12 +1350,11 @@ mod tests {
     /// consistent and every test green, because nothing compared the table against the CLI. That
     /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
     ///
-    /// **And it did it again, a third time.** `cao workflow step` (issue #640) reached the Click
-    /// tree with no row here, and the guard — not review — is what said so. It is HIDE, per
-    /// `project.md`'s mandated default for a command not yet deliberately reviewed. Merging `main`
-    /// then brought `cao workflow approve` (#583 Bolt 2), also HIDE but classified deliberately
-    /// there rather than caught here, giving **24/18/29 = 71**. Three catches from one
-    /// cross-language check is the argument for it.
+    /// **And it happened again.** `cao workflow step` (issue #640) reached the Click tree with no
+    /// row here, and the guard — not review — is what said so. It is HIDE, per `project.md`'s
+    /// mandated default for a command not yet deliberately reviewed. Merging `main` then brought
+    /// `cao workflow approve` (#583 Bolt 2), also HIDE, giving **24/18/29 = 71**. The guard
+    /// catching a missing row again is the argument for keeping the cross-language check.
     #[test]
     fn the_policy_distribution_is_twentyfour_eighteen_twentynine() {
         let (in_app, handoff, hidden) = distribution();
