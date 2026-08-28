@@ -178,9 +178,7 @@ def _wait_remote_ready(base_url: str, timeout: float) -> None:
             response = requests.get(f"{base_url}/health", timeout=(2.0, 5.0))
             if response.status_code < 400:
                 if attempt > 1:
-                    logger.info(
-                        "Remote node %s answered /health on attempt %d", base_url, attempt
-                    )
+                    logger.info("Remote node %s answered /health on attempt %d", base_url, attempt)
                 return
             last_error = f"HTTP {response.status_code}"
         except requests.RequestException as exc:
