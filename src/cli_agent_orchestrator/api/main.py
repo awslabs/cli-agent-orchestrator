@@ -2985,7 +2985,7 @@ async def create_session(
         return result
 
     except TerminalLimitError as e:
-        # Node is at its live-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
@@ -3204,7 +3204,7 @@ async def create_terminal_in_session(
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
-        # Node is at its live-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request or a missing session: the caller should
         # retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
@@ -4016,7 +4016,7 @@ async def run_step(
         _settle_step(None, str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except TerminalLimitError as e:
-        # The node is at its live-terminal cap (CAO_MAX_TERMINALS) — surfaced
+        # The node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — surfaced
         # as 429 so a step scheduler can retry on a different node instead of
         # reading a kind-less 500.
         _settle_step(None, str(e))

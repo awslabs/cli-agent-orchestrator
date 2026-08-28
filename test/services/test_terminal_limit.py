@@ -1,4 +1,4 @@
-"""Tests for the per-node live-terminal cap (CAO_MAX_TERMINALS).
+"""Tests for the per-node tracked-terminal cap (CAO_MAX_TERMINALS).
 
 Covers ``settings_service.get_max_terminals`` precedence/validation and the
 enforcement in ``terminal_service.create_terminal`` (one-agent-per-pod k8s
@@ -121,4 +121,4 @@ class TestCreateTerminalCap:
                 )
         message = str(excinfo.value)
         assert "CAO_MAX_TERMINALS" in message
-        assert "1 live" in message
+        assert "1 tracked" in message

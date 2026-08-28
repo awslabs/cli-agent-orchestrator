@@ -58,7 +58,7 @@ class TerminalInputBlockedError(Exception):
 
 
 class TerminalLimitError(Exception):
-    """Raised when creating a terminal would exceed this node's live-terminal cap.
+    """Raised when creating a terminal would exceed this node's tracked-terminal cap.
 
     The cap comes from ``settings_service.get_max_terminals()`` (the
     ``CAO_MAX_TERMINALS`` env var / ``server.max_terminals`` setting; unset =

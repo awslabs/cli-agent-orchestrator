@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 from cli_agent_orchestrator.models.terminal import TerminalLimitError
 
 _LIMIT_ERROR = TerminalLimitError(
-    "Terminal limit reached: this node already has 1 live terminal(s) and "
+    "Terminal limit reached: this node already has 1 tracked terminal(s) and "
     "CAO_MAX_TERMINALS/server.max_terminals is 1. Delete a terminal or target "
     "a different node."
 )
