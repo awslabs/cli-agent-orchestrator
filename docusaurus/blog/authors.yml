@@ -1,0 +1,90 @@
+# Blog authors, referenced by key from a post's `authors:` front matter.
+#
+# `onInlineAuthors: 'throw'` in docusaurus.config.ts means every author a post
+# names MUST have an entry here. That is deliberate: author identities get
+# reviewed in a PR instead of being invented per post. Add only details you're
+# happy to publish under Apache-2.0.
+#
+# A post credits one or more people with `authors: [handle-one, handle-two]`.
+#
+# To add yourself, copy this template and use your GitHub handle as the key:
+#
+#   your-github-handle:
+#     name: Your Name
+#     title: Your role or affiliation
+#     url: https://github.com/your-github-handle
+#     image_url: https://github.com/your-github-handle.png
+#     socials:
+#       github: your-github-handle
+#
+# Optional `page:` gives you a listing page of everything you've written, and
+# adds you to the /blog/authors index. Leave it off until you've published a
+# post — otherwise you get a reachable page reading "This author has not written
+# any posts yet" and a 0 next to your name on the index. When you do add it:
+#
+#     page: true                          # -> /blog/authors/your-github-handle
+#
+# One gotcha: Docusaurus slugifies the key at letter/digit boundaries, so
+# `handle82` becomes `/blog/authors/handle-82`. Set the URL explicitly to avoid
+# that — the permalink is relative to /blog/authors, not the site root:
+#
+#     page:
+#       permalink: /handle82                # -> /blog/authors/handle82
+#
+# Entry order is intentional, not alphabetical: the /blog/authors index lists
+# authors in this file's order. Append rather than re-sorting.
+#
+# The entries below are seeded, with names taken from the contributor's public
+# GitHub profile or supplied by them directly. Edit your own freely — it's your
+# byline. `title` is deliberately left blank rather than guessed; fill in your
+# own if you want one, bearing in mind that naming an employer there reads as an
+# affiliation claim on an awslabs site.
+
+cao-maintainers:
+  name: CAO Maintainers
+  title: CLI Agent Orchestrator team
+  url: https://github.com/awslabs/cli-agent-orchestrator
+  image_url: https://github.com/awslabs.png
+  page: true
+
+haofeif:
+  name: Haofei Feng
+  url: https://github.com/haofeif
+  image_url: https://github.com/haofeif.png
+  socials:
+    github: haofeif
+
+fanhongy:
+  name: Stan Fan
+  url: https://github.com/fanhongy
+  image_url: https://github.com/fanhongy.png
+  socials:
+    github: fanhongy
+
+anilkmr-a2z:
+  name: Anil Kumar
+  url: https://github.com/anilkmr-a2z
+  image_url: https://github.com/anilkmr-a2z.png
+  socials:
+    github: anilkmr-a2z
+
+gutosantos82:
+  name: Augusto Dias
+  url: https://github.com/gutosantos82
+  image_url: https://github.com/gutosantos82.png
+  socials:
+    github: gutosantos82
+
+sujoydc:
+  name: Sujoy Datta Choudhury
+  url: https://github.com/sujoydc
+  image_url: https://github.com/sujoydc.png
+  socials:
+    github: sujoydc
+
+guojing1217:
+  name: Joe Guo
+  url: https://github.com/guojing1217
+  image_url: https://github.com/guojing1217.png
+  socials:
+    github: guojing1217

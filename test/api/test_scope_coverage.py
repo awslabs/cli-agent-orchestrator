@@ -309,3 +309,122 @@ def test_write_token_still_admitted_on_run_list(client, auth_on):
     app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
     resp = client.get("/workflows/runs")
     assert resp.status_code != 403
+
+
+# --------------------------------------------------------------------------
+# Profile write routes (#510 PR B)
+#
+# All three mutating routes accept cao:write or cao:admin, so a single credential
+# covers the create/edit/delete cycle #510 specifies. Scopes are a flat set, not
+# a hierarchy — ``require_any_scope`` tests membership — so gating DELETE on
+# admin alone would 403 a caller holding exactly cao:write and leave a client
+# able to create and edit a profile unable to remove it. Most other DELETE
+# routes here are admin-only, but they remove running or generated state
+# (sessions, terminals, workflows, flows, bulk memory); a profile is an authored
+# document, like DELETE /memory/relationships/{id}, which is also write-or-admin.
+# --------------------------------------------------------------------------
+
+
+def test_read_token_forbidden_on_profile_create(client, auth_on):
+    """A cao:read token cannot create a profile."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.post("/agents/profiles", json={"name": "x", "content": "---\nname: x\n---\n"})
+    assert resp.status_code == 403
+
+
+def test_write_token_admitted_on_profile_create(client, auth_on):
+    """A cao:write token passes the create dependency."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
+    resp = client.post("/agents/profiles", json={"name": "x", "content": "---\nname: x\n---\n"})
+    assert resp.status_code != 403
+
+
+def test_write_token_admitted_on_profile_replace(client, auth_on):
+    """A cao:write token passes the replace dependency."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
+    resp = client.put("/agents/profiles/x", json={"content": "---\nname: x\n---\n"})
+    assert resp.status_code != 403
+
+
+def test_read_token_forbidden_on_profile_delete(client, auth_on):
+    """A cao:read token cannot delete a profile — deletion is still a mutation."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.delete("/agents/profiles/x")
+    assert resp.status_code == 403
+
+
+def test_write_token_admitted_on_profile_delete(client, auth_on):
+    """A cao:write token passes the deletion dependency.
+
+    Changed during the PR #585 review. DELETE was briefly admin-only, which
+    contradicted the contract published in #510 and would have broken the
+    documented create/edit/delete workflow for a write-scoped client, since
+    holding cao:write grants no admin privilege under a flat scope set.
+    """
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
+    resp = client.delete("/agents/profiles/x")
+    assert resp.status_code != 403
+
+
+def test_admin_token_admitted_on_profile_delete(client, auth_on):
+    """A cao:admin token passes the deletion dependency."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_ADMIN])
+    resp = client.delete("/agents/profiles/x")
+    assert resp.status_code != 403
+
+
+# --------------------------------------------------------------------------
+# PR #585 review — the NEW #510 read route carries a read-scope gate.
+#
+# Scoped deliberately to the one route this PR ADDED, following the precedent
+# the #505 block above set. The pre-existing profile reads (``GET
+# /agents/profiles``, ``/search``, ``/templates``, ``/schema``, ``/{name}``) are
+# equally ungated and are left alone: tightening shipped routes could break an
+# existing unauthenticated reader.
+#
+# The gate matters more on this route than on those siblings because
+# ``_read_agent_profile_source`` returns the stored bytes verbatim, across the
+# local, provider, extra and built-in stores, including documents that fail to
+# parse. The parsed route can only return what the model accepts.
+# --------------------------------------------------------------------------
+_NEW_510_READ_ROUTES = [
+    ("GET", "/agents/profiles/{name}/source"),
+]
+
+
+@pytest.mark.parametrize("method,path", _NEW_510_READ_ROUTES)
+def test_new_510_read_routes_declare_a_scope_dependency(method, path):
+    """Structural guard: the dependency is present on the route object.
+
+    Asserting on the route table rather than on a status code, for the reason the
+    #505 version of this test spells out: ``is_auth_enabled()`` is default-off and
+    ``require_any_scope`` hands back the full scope set when auth is off, so a
+    "the route still returns 200" test passes whether or not the dependency
+    exists at all. That is exactly how this route shipped ungated.
+    """
+    matches = [
+        r
+        for r in app.routes
+        if getattr(r, "path", None) == path and method in (getattr(r, "methods", None) or set())
+    ]
+    assert matches, f"{method} {path} is not registered"
+    assert _has_scope_dependency(matches[0]), f"{method} {path} has no require_any_scope dependency"
+
+
+def test_scopeless_token_forbidden_on_profile_source(client, auth_on):
+    """Enforcement: a token holding none of read/write/admin is 403'd on the source read."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
+    resp = client.get("/agents/profiles/x/source")
+    assert resp.status_code == 403
+
+
+def test_read_token_admitted_on_profile_source(client, auth_on):
+    """A cao:read token PASSES the gate — this is an authoring read, not a mutation.
+
+    Guards the over-restriction failure mode: gating on write/admin only would
+    lock out a read-only client that legitimately needs the unresolved document,
+    which is the safe one to read since it never returns substituted secrets.
+    """
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.get("/agents/profiles/x/source")
+    assert resp.status_code != 403

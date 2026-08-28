@@ -15,8 +15,20 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, AsyncIterator, Dict, List, Literal, Optional, Tuple, cast
+from typing import (
+    Annotated,
+    Any,
+    AsyncIterator,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
+import yaml
 from fastapi import (
     BackgroundTasks,
     Body,
@@ -70,6 +82,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
+    is_http_origin_allowed,
     is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
@@ -89,7 +102,9 @@ from cli_agent_orchestrator.models.memory import (
     MemoryType,
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
@@ -99,6 +114,7 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_READ,
     SCOPE_WRITE,
     SCOPES_SUPPORTED,
+    _extract_bearer,
     extract_scopes_from_token,
     get_authorization_servers,
     get_current_scopes,
@@ -106,12 +122,20 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
+    approval_gate,
+    approval_provenance,
+    approval_store,
     flow_service,
+    manifest_freeze,
     secret_gate,
     session_service,
     terminal_service,
 )
-from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
+from cli_agent_orchestrator.services.agent_step import (
+    StepExecutionError,
+    resolve_effective_working_directory,
+    run_agent_step,
+)
 from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
@@ -322,6 +346,27 @@ class CreateSessionBody(CreateTerminalBody):
         return _check_metadata_size(v)
 
 
+RESUME_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}\Z")
+
+
+def _validate_resume_session_id(value: str) -> None:
+    """Validate a ``resume_session_id`` at the request boundary.
+
+    The id is interpolated into the provider's shell command
+    (``claude --resume <sid>``), so the charset is restricted to the shape
+    Claude Code actually emits (UUID-like) — no whitespace, quoting, or
+    shell metacharacters.
+
+    Raises:
+        ValueError: ``value`` does not match RESUME_SESSION_ID_RE.
+    """
+    if not RESUME_SESSION_ID_RE.match(value):
+        raise ValueError(
+            "invalid resume_session_id: expected 8-64 chars of [A-Za-z0-9._-] "
+            "starting with an alphanumeric"
+        )
+
+
 def _validate_model_id(value: str) -> None:
     """Validate a ``model`` override at the request boundary (PR #501 review).
 
@@ -433,6 +478,19 @@ class RunStepRequest(BaseModel):
             "model for one worker without a dedicated agent profile."
         ),
     )
+    recovery: Optional[RecoveryPolicy] = Field(
+        default=None,
+        description=(
+            "What this step's author declares about re-running it (issue #583, "
+            "FR-5/FR-7), passed to the replay gate as the declared policy. "
+            "Absent means UNDECLARED, which is a distinct state and never "
+            "coerced to 'manual': the two differ at the gate's rule 2 and at its "
+            "catch-all. "
+            "Typed as the enum so an unknown value is REJECTED with 422 at the "
+            "boundary rather than silently downgraded to undeclared, which "
+            "would change the verdict (SR-6)."
+        ),
+    )
 
     @field_validator("env_vars")
     @classmethod
@@ -527,11 +585,28 @@ class RunStepRequest(BaseModel):
 
 
 class RunStepResponse(BaseModel):
-    """Response wrapping an ``AgentStepResult`` from ``run_agent_step``."""
+    """Response wrapping an ``AgentStepResult`` from ``run_agent_step``.
+
+    ``replayed`` is the one exception to that wrapping: a replayed response is
+    built from a STORED ``StepResultEnvelope``, and no ``run_agent_step`` call
+    happened at all (issue #583, FR-1).
+    """
 
     terminal_id: str
     last_message: str
     status: str
+    replayed: bool = Field(
+        default=False,
+        description=(
+            "True when this result was REPLAYED from the workflow journal "
+            "instead of executed (issue #583, FR-1). Defaulted to False, so "
+            "every existing response and consumer is unchanged. It is "
+            "load-bearing rather than cosmetic: a replayed response carries the "
+            "ORIGINAL terminal_id, which names a terminal that no longer "
+            "exists, and this flag is the only thing that stops a consumer "
+            "reading, writing to, or waiting on a dead id."
+        ),
+    )
 
 
 class WorkflowValidateRequest(BaseModel):
@@ -564,6 +639,33 @@ class WorkflowRunRequest(BaseModel):
     run_id: Optional[str] = Field(
         default=None,
         description="Optional run id (matches WORKFLOW_NAME_RE); auto-generated if omitted",
+    )
+
+
+class ResumeRunRequest(BaseModel):
+    """Request body for ``POST /workflows/runs/{run_id}/resume`` (issue #583, FR-7).
+
+    The route had no body before this unit; it stays OPTIONAL so every existing
+    caller — the CLI, the MCP tool, an operator with ``curl`` — keeps working
+    unchanged with no body at all.
+
+    ``decisions`` is typed ``Dict[str, str]`` and NOT ``Dict[str, RecoveryDecision]``
+    ON PURPOSE (SR-4/BR-10). Pydantic would reject an unknown value at the boundary
+    with a 422 and a schema-shaped message, while a mistyped decision must land on
+    **400** with a message naming the offending ``step_id``, produced by the ONE
+    validator all three surfaces share (``parse_decision``, reached through
+    ``workflow_journal.apply_decisions``). Validating here as well would put a second
+    implementation of the closed set on the path that must agree with it.
+    """
+
+    decisions: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Per-step recovery decisions for a halted script run: "
+            "step_id -> 'rerun' (re-execute) | 'skip' (use the stored result). "
+            "Applied before the script is spawned; an unknown step id or value is a "
+            "400 and applies nothing at all."
+        ),
     )
 
 
@@ -951,6 +1053,61 @@ class ProfileValidationResponse(BaseModel):
     messages: List[ProfileValidationMessage] = Field(default_factory=list)
 
 
+class ProfileCreateRequest(BaseModel):
+    """Request body for ``POST /agents/profiles``.
+
+    ``name`` is explicit rather than parsed out of ``content`` so the conflict
+    target is unambiguous even when the document is malformed. When the
+    frontmatter also declares a ``name`` the two must agree; see
+    ``_assert_frontmatter_name_matches``.
+    """
+
+    name: str = Field(description="Profile name, used as the local-store filename stem")
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileReplaceRequest(BaseModel):
+    """Request body for ``PUT /agents/profiles/{name}``.
+
+    No ``name`` field: the path parameter is authoritative. Frontmatter that
+    declares a different name is rejected rather than silently renaming.
+    """
+
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileWriteResponse(BaseModel):
+    """Outcome of a profile create or replace.
+
+    ``warnings`` carries advisory findings that did not block the write, so a
+    client can surface them after a successful save. Errors never reach here;
+    they reject the request with 400.
+    """
+
+    name: str
+    warnings: List[ProfileValidationMessage] = Field(default_factory=list)
+
+
+class ProfileSourceResponse(BaseModel):
+    """A profile's document exactly as stored, with placeholders intact.
+
+    Distinct from ``GET /agents/profiles/{name}``, which returns the *parsed and
+    resolved* profile. That response runs ``resolve_env_vars`` over the raw text
+    before parsing, so managed ``${VAR}`` placeholders come back as their
+    substituted values. Round-tripping that through a write would persist
+    resolved secrets into a plaintext profile, so an editor must read from here.
+    """
+
+    name: str
+    content: str
+
+
 class MemorySummary(BaseModel):
     """Memory list entry. Excludes file_path (absolute server filesystem path)."""
 
@@ -986,6 +1143,22 @@ class CreateFlowRequest(BaseModel):
         """Prevent path traversal — flow name becomes a filename."""
         if "/" in v or "\\" in v or ".." in v:
             raise ValueError("Flow name must not contain '/', '\\', or '..'")
+        return v
+
+    @field_validator("schedule", "agent_profile", "provider")
+    @classmethod
+    def validate_no_control_characters(cls, v: str) -> str:
+        """Prevent YAML frontmatter injection — a newline could otherwise
+        smuggle extra keys (e.g. script) into the serialized file."""
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+            raise ValueError("must not contain control characters")
+        return v
+
+    @field_validator("agent_profile", "provider")
+    @classmethod
+    def validate_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
         return v
 
 
@@ -1240,6 +1413,58 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
+
+# Methods whose request could change server state. The Origin check only
+# guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and
+# OPTIONS preflights must reach CORSMiddleware unchanged).
+_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+class OriginCheckMiddleware:
+    """Reject state-changing HTTP requests with a disallowed ``Origin``.
+
+    CSRF / CWE-352 guard for the default-unauthenticated surface. Browsers
+    attach an ``Origin`` header on every cross-site state-changing request
+    (fetch, XHR, and form POST alike — the simple-request paths CORS can't
+    preflight-block), while non-browser clients (curl, ``requests``, MCP, the
+    ``cao`` CLI) send none, so a present-but-untrusted ``Origin`` is exactly
+    the browser-only signal this rejects. Reads and OPTIONS preflights always
+    pass through. Registered FIRST so it runs inside ``TrustedHostMiddleware``:
+    Host is validated against ``ALLOWED_HOSTS`` on the same scope before the
+    same-origin branch below can trust it (see ``is_http_origin_allowed``).
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope["method"] in _STATE_CHANGING_METHODS:
+            headers = {
+                name.decode("latin-1").lower(): value.decode("latin-1")
+                for name, value in scope.get("headers", [])
+            }
+            origin = headers.get("origin")
+            if origin and not is_http_origin_allowed(
+                origin, headers.get("host"), scope.get("scheme")
+            ):
+                logger.warning(
+                    "Rejected cross-origin %s request: disallowed Origin %r",
+                    scope["method"],
+                    origin,
+                )
+                response = JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Cross-origin request blocked"},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# Security: CSRF / Cross-Origin Request Forgery (CWE-352). See the middleware
+# docstring; the guard must sit INSIDE TrustedHostMiddleware's Host validation
+# (add_middleware stacks last-added outermost), hence it is registered first.
+app.add_middleware(OriginCheckMiddleware)
 
 # Security: DNS Rebinding Protection
 # Validate Host header to prevent DNS rebinding attacks (CVE mitigation)
@@ -1979,7 +2204,9 @@ mount_widget_static(app)
 
 
 @app.get("/agents/profiles")
-async def list_agent_profiles_endpoint() -> List[Dict]:
+async def list_agent_profiles_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List all available agent profiles from all configured directories."""
     try:
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
@@ -2184,9 +2411,111 @@ async def get_agent_profile_schema_endpoint() -> Dict:
     return load_profile_schema()
 
 
+def _profile_write_rejection(message: str, findings: Sequence[Any] = ()) -> HTTPException:
+    """Build the one 400 a profile write route may return.
+
+    Every 400 from the profile write and source routes carries this shape,
+    ``{"message", "errors"}``, so a client parses one thing rather than switching
+    on ``type(detail)``. ``errors`` is empty for a failure that is not
+    attributable to a field, but the key is always present so a caller can
+    iterate it unconditionally.
+
+    Deliberately covers the service-raised ``InvalidProfileNameError`` paths too,
+    not only schema findings. An unsafe name is a rejected input just like a
+    schema violation, and returning a bare string for one and a dict for the
+    other reintroduces exactly the type-switching this removes. The 404 and 409
+    mappings keep FastAPI's conventional bare-string ``detail``: the status code
+    already tells a client what happened and there are no findings to attach.
+    """
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "message": message,
+            "errors": [
+                {"severity": f.severity, "message": f.message, "path": f.path} for f in findings
+            ],
+        },
+    )
+
+
+def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidationMessage]:
+    """Validate a submitted profile document and enforce name identity.
+
+    Shared by ``POST /agents/profiles`` and ``PUT /agents/profiles/{name}`` so the
+    two cannot drift apart on either rule.
+
+    Runs the same validator the CLI and ``POST /agents/profiles/validate`` use, on
+    the exact document being persisted rather than on a client-side approximation
+    of it. Error-severity findings reject the write; warnings are returned so a
+    client can surface them after a successful save.
+
+    A profile has two identities: the storage key (its filename stem) and the
+    frontmatter ``name``. ``parse_agent_profile_text`` treats the stem only as a
+    fallback when frontmatter omits ``name``, so the two can diverge and nothing
+    reconciles them: ``name: foo`` in ``bar.md`` loads as ``foo`` while being
+    addressed as ``bar``. Requiring them to agree closes that without introducing
+    a rename operation, which has its own failure semantics.
+
+    Args:
+        name: The storage name, authoritative.
+        content: The full profile document.
+
+    Returns:
+        The warning-severity findings, if any.
+
+    Raises:
+        HTTPException: 400 if the document is unparseable, carries an
+            error-severity finding, or declares a conflicting ``name``. See
+            :func:`_profile_write_rejection` for the shared ``detail`` shape.
+    """
+    import frontmatter
+
+    from cli_agent_orchestrator.services.profile_validator import validate_frontmatter
+
+    def _reject(message: str, findings: Sequence[Any] = ()) -> None:
+        raise _profile_write_rejection(message, findings)
+
+    # Parsed once here, then handed to validate_frontmatter as metadata.
+    # validate_profile_text would parse it again: its docstring exists precisely
+    # to keep callers from duplicating the parse, and this function needs the
+    # metadata anyway for the name check below.
+    try:
+        parsed = frontmatter.loads(content)
+    except Exception as exc:
+        _reject(f"Profile could not be parsed and was not written: {exc}")
+
+    findings = validate_frontmatter(parsed.metadata)
+
+    errors = [f for f in findings if f.severity == "error"]
+    if errors:
+        _reject("Profile failed validation and was not written.", errors)
+
+    declared = parsed.metadata.get("name")
+    if isinstance(declared, str) and declared != name:
+        _reject(
+            f"Frontmatter name '{declared}' does not match the profile name "
+            f"'{name}'. They must agree; renaming a profile is not supported "
+            f"through this endpoint."
+        )
+
+    return [
+        ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
+        for f in findings
+        if f.severity == "warning"
+    ]
+
+
 @app.get("/agents/profiles/{name}")
-async def get_agent_profile_endpoint(name: str) -> Dict:
-    """Return the full parsed content of a named agent profile."""
+async def get_agent_profile_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the full parsed content of a named agent profile.
+
+    Note this response is *resolved*: ``load_agent_profile`` applies
+    ``resolve_env_vars`` before parsing. Use ``GET /agents/profiles/{name}/source``
+    when the document is going to be edited and written back.
+    """
     try:
         profile = load_agent_profile(name)
         return profile.model_dump(exclude_none=True)
@@ -2222,6 +2551,150 @@ async def install_agent_profile_endpoint(
     return result
 
 
+@app.post("/agents/profiles", status_code=status.HTTP_201_CREATED)
+async def create_agent_profile_endpoint(
+    request: ProfileCreateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileWriteResponse:
+    """Create a profile in the local store from a supplied document.
+
+    Named distinctly from ``POST /agents/profiles/install``, which installs from a
+    bare name or an https:// URL. This one takes the document itself in the body.
+
+    Validation runs on the exact submitted content before anything is persisted,
+    so an invalid profile never reaches disk. Conflict detection is delegated to
+    ``write_profile(overwrite=False)``, which checks for an existing file inside
+    the write lock; a pre-check here would sit outside that critical section and
+    let two concurrent creators both succeed.
+    """
+    from cli_agent_orchestrator.services.profile_store import (
+        InvalidProfileNameError,
+        ProfileExistsError,
+        write_profile,
+    )
+
+    warnings = _validate_profile_for_write(request.name, request.content)
+
+    try:
+        write_profile(request.name, request.content, overwrite=False)
+    except InvalidProfileNameError as exc:
+        raise _profile_write_rejection(str(exc))
+    except ProfileExistsError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+    return ProfileWriteResponse(name=request.name, warnings=warnings)
+
+
+@app.put("/agents/profiles/{name}")
+async def replace_agent_profile_endpoint(
+    name: str,
+    request: ProfileReplaceRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileWriteResponse:
+    """Replace an existing local-store profile. Never creates one.
+
+    Backed by ``replace_profile``, which requires the target to exist *inside* the
+    write lock. That is what makes a PUT naming a built-in or provider-managed
+    profile a 404 rather than a silent create: the local store is the only place
+    this resolves, so a built-in's name is simply not there. An upsert would
+    instead write a local file that shadows the built-in on load, manufacturing
+    exactly the condition ``duplicated_in`` exists to report.
+    """
+    from cli_agent_orchestrator.services.profile_store import (
+        InvalidProfileNameError,
+        ProfileNotFoundError,
+        replace_profile,
+    )
+
+    warnings = _validate_profile_for_write(name, request.content)
+
+    try:
+        replace_profile(name, request.content)
+    except InvalidProfileNameError as exc:
+        raise _profile_write_rejection(str(exc))
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    return ProfileWriteResponse(name=name, warnings=warnings)
+
+
+@app.delete("/agents/profiles/{name}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_agent_profile_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> None:
+    """Delete a profile from the local store.
+
+    Write-or-admin, the same guard as POST and PUT, so one credential completes
+    the whole create/edit/delete cycle that issue #510 specifies. Scopes are a
+    flat set here, not a hierarchy: ``require_any_scope`` tests membership, so
+    admin-only would 403 a caller holding exactly ``cao:write`` and leave a
+    client that can create and edit a profile unable to remove it.
+
+    Most other ``DELETE`` routes on this service do require admin alone, but they
+    remove *running or generated* state: sessions, terminals, workflows, flows,
+    and bulk memory. A profile is an authored document, closer to
+    ``DELETE /memory/relationships/{id}``, which is also write-or-admin. Removing
+    one stops no in-flight work and destroys nothing that cannot be re-authored,
+    and the deletion is already gated behind a confirmation in the UI.
+
+    Built-in and provider-managed profiles are not deletable for the same reason
+    they are not replaceable: ``delete_profile`` resolves only inside the local
+    store, so their names raise ``ProfileNotFoundError``.
+    """
+    from cli_agent_orchestrator.services.profile_store import (
+        InvalidProfileNameError,
+        ProfileNotFoundError,
+        delete_profile,
+    )
+
+    try:
+        delete_profile(name)
+    except InvalidProfileNameError as exc:
+        raise _profile_write_rejection(str(exc))
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@app.get("/agents/profiles/{name}/source")
+async def get_agent_profile_source_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileSourceResponse:
+    """Return a profile's document exactly as stored, unresolved.
+
+    The authoring counterpart to ``GET /agents/profiles/{name}``. That route calls
+    ``load_agent_profile``, which applies ``resolve_env_vars`` to the raw text
+    *before* parsing, so substitution reaches the Markdown body as well as the
+    frontmatter, and the substitution source is the managed CAO ``.env`` file.
+    Using that response to pre-fill an editor and then PUT it back would persist
+    resolved secret values into a plaintext profile. ``safe_substitute`` leaves
+    unset variables intact, which would make the damage selective and silent.
+
+    Reads across all configured stores, not only the local one, so a built-in can
+    be fetched as the starting point for a clone. Writing it back still requires
+    the local store, which is enforced by the write routes.
+
+    Scope-gated like the profile reads beside it. This route was gated on its own
+    when it was added here, on the #505 precedent that a *new* read route carries
+    the gate while already-shipped ungated siblings are left alone; #606 has since
+    gated those siblings too, so the asymmetry that reasoning managed no longer
+    exists. Gating matters at least as much here as on the parsed route because
+    this one returns the stored bytes verbatim from the local, provider, extra and
+    built-in stores, including documents that fail to parse, whereas the parsed
+    route can only return what the model accepts. Registered alongside them in
+    ``test/api/test_auth_read_gating.py::_GATED_ROUTES``.
+    """
+    from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
+
+    try:
+        return ProfileSourceResponse(name=name, content=_read_agent_profile_source(name))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except ValueError as exc:
+        raise _profile_write_rejection(str(exc))
+
+
 @app.get("/agents/providers")
 async def list_providers_endpoint() -> List[Dict]:
     """List available providers with installation status."""
@@ -2237,6 +2710,9 @@ async def list_providers_endpoint() -> List[Dict]:
         "opencode_cli": "opencode",
         "cursor_cli": "agent",
         "antigravity_cli": "agy",
+        "omp": "omp",
+        "grok_cli": "grok",
+        "mcode": "mcode",
     }
     result = []
     for provider, binary in provider_binaries.items():
@@ -2349,7 +2825,10 @@ async def set_skill_dirs_endpoint(
 
 
 @app.get("/skills/{name}", response_model=SkillContentResponse)
-async def get_skill_content(name: str) -> SkillContentResponse:
+async def get_skill_content(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> SkillContentResponse:
     """Return the full Markdown body for an installed skill."""
     try:
         skill_name = validate_skill_name(name)
@@ -2389,6 +2868,7 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -2445,6 +2925,8 @@ async def create_session(
             validate_tmux_name(effective, "session_name")
         if model is not None:
             _validate_model_id(model)
+        if resume_session_id is not None:
+            _validate_resume_session_id(resume_session_id)
         if initial_message == "":
             raise ValueError("initial_message must not be empty")
         if body and body.initial_message_orchestration_type:
@@ -2474,6 +2956,7 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
         )
@@ -2511,7 +2994,9 @@ async def create_session(
 
 
 @app.get("/sessions")
-async def list_sessions() -> List[Dict]:
+async def list_sessions(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     try:
         return session_service.list_sessions()
     except Exception as e:
@@ -2522,7 +3007,10 @@ async def list_sessions() -> List[Dict]:
 
 
 @app.get("/sessions/{session_name}")
-async def get_session(session_name: str) -> Dict:
+async def get_session(
+    session_name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     # Validate before entering the try block so a malformed name surfaces
     # as 400 instead of being mapped to 404 by the not-found handler below.
     try:
@@ -2559,7 +3047,22 @@ async def delete_session(
         result = await asyncio.to_thread(
             session_service.delete_session, session_name, registry=get_plugin_registry(request)
         )
+        deleted = result.get("deleted") or []
+        errors = result.get("errors") or []
+        deferred = (isinstance(errors, list) and bool(errors)) or (
+            isinstance(deleted, (list, tuple)) and session_name not in deleted
+        )
+        if deferred:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"cleanup deferred for session '{session_name}'; "
+                    "retry delete after residual Grok processes exit"
+                ),
+            )
         return {"success": True, **result}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2729,7 +3232,10 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 
 
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
-async def get_terminal(terminal_id: TerminalId) -> Terminal:
+async def get_terminal(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
     try:
         # get_terminal reads status_monitor.get_status(), which for a
         # PROCESSING terminal does a fresh detection that can shell out to
@@ -2884,7 +3390,10 @@ async def list_terminal_siblings(
 
 
 @app.get("/terminals/{terminal_id}/memory-context")
-async def get_terminal_memory_context(terminal_id: TerminalId):
+async def get_terminal_memory_context(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
     """Return the CAO memory context block for a terminal as plain text.
 
     Used by the Kiro AgentSpawn hook to inject memory into agent context.
@@ -2987,7 +3496,9 @@ async def send_terminal_key(
 
 @app.get("/terminals/{terminal_id}/output", response_model=TerminalOutputResponse)
 async def get_terminal_output(
-    terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
+    terminal_id: TerminalId,
+    mode: OutputMode = OutputMode.FULL,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> TerminalOutputResponse:
     try:
         # get_output does a blocking tmux capture-pane plus provider regex
@@ -2995,6 +3506,13 @@ async def get_terminal_output(
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
+    except OutputExtractionError as e:
+        # Ordered before the ValueError arm it subclasses, same as run_step: the
+        # terminal and the route both resolved -- only the response marker was
+        # missing from the scrollback -- so this is a server-side extraction
+        # failure, not a bad terminal reference. Keep it a 500, not a 404
+        # (issue #570), and a plain-string detail like the run-step arm.
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3023,13 +3541,12 @@ async def get_terminal_output_range(
     that has not logged anything yet returns 200 with empty ``data`` so playback
     degrades gracefully (BR-4), rather than 404.
 
-    Scope-gated (PR #526 review): this route is NEW in #504 and returns raw
-    terminal log bytes, the same payload class as the run read routes gated
-    alongside it. Its only caller is this repo's own web UI, so adding the gate
-    breaks nothing. The sibling ``GET /terminals/{id}/output`` is deliberately
-    left as-is — it predates #504 and the wider ``/terminals/*`` surface is
-    uniformly ungated, so gating one pre-existing member of it belongs to a
-    separate, deliberate decision about that whole surface rather than to this PR.
+    Scope-gated: this route returns raw terminal log bytes, the same payload
+    class as the run read routes gated alongside it. Its only caller is this
+    repo's own web UI, so adding the gate breaks nothing. The sibling
+    ``GET /terminals/{id}/output`` — which returns the rolling transcript — is
+    gated with the same read tier, so both output read paths enforce
+    ``require_any_scope(READ, WRITE, ADMIN)`` when auth is enabled.
     """
     try:
         # Reads a byte slice off disk — run it off the loop so a large range
@@ -3118,37 +3635,77 @@ async def run_step(
     The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
     fire (parity with the DELETE endpoint).
     """
-    # BR-31: for a script-tier run-step call, record the created terminal into the
-    # shared ScriptRunRecord's step_states AT creation time, so U4's orphan sweep
+    # BR-31: for a script-tier run-step call, record the live terminal into the
+    # shared ScriptRunRecord's step_states as soon as it exists, so U4's orphan sweep
     # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
     # callers (no run/step env or no script record in the registry).
-    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services import step_replay, workflow_service
     from cli_agent_orchestrator.services.script_runner import (
         make_step_terminal_recorder,
         record_step_completion,
+        record_step_replay,
+    )
+    from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
+    from cli_agent_orchestrator.services.workflow_errors import (
+        RecoveryDecisionRequired,
+        ReplayDivergenceError,
     )
     from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
 
-    on_terminal_created = make_step_terminal_recorder(body.env_vars)
-    # BR-31 companion: the recorder above seeds a step RUNNING at terminal
-    # creation, but nothing transitions it — so a completed script run reports
+    # Issue #583, unit ``settlement-rewire``: the recorder now also publishes the
+    # step's call fingerprint (computed inside ``run_agent_step``, in the one window
+    # BR-5 permits) and writes the durable RUNNING row — on BOTH the create and the
+    # reuse path, which is why it is no longer named for terminal creation (BR-3/BR-4).
+    on_step_terminal_ready = make_step_terminal_recorder(body.env_vars)
+    # Its companion: the recorder above seeds a step RUNNING when its terminal
+    # appears, but nothing transitions it — so a completed script run would report
     # every step frozen at running/attempts=0/output=null. ``on_step_settled``
     # transitions the shared ScriptRunRecord's step RUNNING->COMPLETED on success
-    # (or ->FAILED on a StepExecutionError), matching the YAML tier. No-op for
-    # YAML/handoff callers (same guard as the recorder). Settling is best-effort:
-    # it must never turn a successful step into an HTTP error, so ``_settle_step``
-    # swallows + logs any bookkeeping failure.
-    on_step_settled = record_step_completion(
-        body.env_vars, provider=body.provider, agent=body.agent, prompt=body.prompt
-    )
+    # (or ->FAILED on a StepExecutionError), matching the YAML tier, and settles the
+    # durable row in ONE write carrying the result envelope, the redacted+bounded
+    # output and error. No-op for YAML/handoff callers (same guard as the recorder).
+    # Settling is best-effort: it must never turn a successful step into an HTTP
+    # error, so ``_settle_step`` swallows + logs any bookkeeping failure.
+    on_step_settled = record_step_completion(body.env_vars)
 
-    def _settle_step(terminal_id: Optional[str], error: Optional[str]) -> None:
+    def _settle_step(
+        terminal_id: Optional[str],
+        error: Optional[str],
+        last_message: Optional[str] = None,
+        response_status: Optional[str] = None,
+    ) -> None:
+        # ``last_message`` is the step's own text result and defaults to None because
+        # every FAILURE arm below has none to give: the step never produced one. Only
+        # the success arm passes it, and it is what the durable result envelope is
+        # built from — an envelope built without it would satisfy FR-4 guard 1's
+        # letter (a settled row DOES carry an envelope) while leaving every future
+        # replay serving an empty result.
         if on_step_settled is None:
             return
         try:
-            on_step_settled(terminal_id, error)
+            on_step_settled(terminal_id, error, last_message, response_status)
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
+
+    # The THIRD sibling of the two callbacks above, called on the REPLAY arm only (PR #628
+    # review, Copilot F4). The replay branch returns before ``run_agent_step``, so neither
+    # callback above fires — correct, and the only way to create no terminal and write no
+    # durable row (BR-4) — but ``_finalize`` builds ``WorkflowRunResult.steps`` from
+    # ``ScriptRunRecord.step_states`` ALONE and ``resume_script_run`` rebuilds that map empty,
+    # so a fully replayed resume reported ``steps=[]`` while every journal row was intact.
+    # This records the step IN MEMORY, hydrated from its durable row; it writes nothing, so
+    # BR-4 is unchanged. Same guard as its siblings — None for every non-script-tier call.
+    on_step_replayed = record_step_replay(body.env_vars)
+
+    def _record_replayed_step() -> None:
+        if on_step_replayed is None:
+            return
+        try:
+            on_step_replayed()
+        except Exception:  # noqa: BLE001 — bookkeeping is best-effort; never fail the step
+            # A reporting loss (the step is absent from the run's step list), never a failed
+            # step: nothing ran, and there is a correct stored result to hand back regardless.
+            logger.warning("run_step: script step replay bookkeeping failed", exc_info=True)
 
     # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
     # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
@@ -3169,7 +3726,161 @@ async def run_step(
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
+    # ---- issue #583, unit ``run-step-replay-branch``: the replay branch ----------
+    #
+    # THE BRANCH ENGAGES FOR SCRIPT-TIER CALLS ONLY (BR-2/SR-5): both
+    # CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_STEP_ID present AND a live
+    # ``ScriptRunRecord`` in the registry. That last term is not re-implemented
+    # here — ``make_step_terminal_recorder`` returns None on exactly that
+    # condition, so ``on_step_terminal_ready is not None`` IS the callbacks' own
+    # guard rather than a second copy of it that could drift from them. YAML and
+    # handoff callers therefore reach no gate call at all, which is a security
+    # property as much as a compatibility one: no other tier can be handed a
+    # script run's stored result.
+    replay_run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    replay_step_id = env_vars.get("CAO_WORKFLOW_STEP_ID")
+
+    # The three values the gate needs, or None for a non-script-tier call. They
+    # travel as ONE optional triple rather than three separate Optionals so the
+    # tier test exists in one place and the branch below cannot be reached with a
+    # half-populated context.
+    replay_context: Optional[Tuple[str, str, str]] = None
+
+    # BR-10/TD-1: the effective working directory is resolved HERE, and the
+    # resolved value is what both the fingerprint and ``run_agent_step`` receive.
+    # For every non-script-tier call this stays the posted value and
+    # ``run_agent_step`` resolves exactly as it always did — no behaviour change.
+    effective_working_directory = body.working_directory
+    if replay_run_id and replay_step_id and on_step_terminal_ready is not None:
+        effective_working_directory = await resolve_effective_working_directory(
+            body.working_directory, body.caller_id
+        )
+        # TD-2: the SAME ``compute`` over the SAME effective directory that
+        # ``settlement-rewire`` hashed and ``begin_step`` stored. That is what makes
+        # the gate's comparison meaningful. Computing from the POSTED
+        # ``working_directory`` instead would not match the stored value, so rule 6
+        # would fire and every ``caller_id``-inherited step would get a false
+        # ``DIVERGED`` — a bug, not a trade-off (BR-10).
+        replay_context = (
+            replay_run_id,
+            replay_step_id,
+            compute(
+                StepCallFields(
+                    provider=body.provider,
+                    agent=body.agent,
+                    prompt=body.prompt,
+                    model=body.model,
+                    # ``StepCallFields.engine`` is the enum's ``value`` by contract —
+                    # the CALLER normalises, mirroring ``run_agent_step``.
+                    engine=(
+                        body.engine.value if isinstance(body.engine, KiroEngine) else body.engine
+                    ),
+                    allowed_tools=(
+                        None if body.allowed_tools is None else tuple(body.allowed_tools)
+                    ),
+                    effective_working_directory=effective_working_directory,
+                    use_worktree=body.use_worktree,
+                    # DERIVED, never the raw id (``step-fingerprint`` BR-6). Always
+                    # False on this tier today, because ``env_vars`` with a
+                    # ``reuse_terminal_id`` is already a 422 — computed rather than
+                    # hardcoded so it stays correct if that ever changes.
+                    reused_terminal=body.reuse_terminal_id is not None,
+                    timeout=body.timeout,
+                )
+            ),
+        )
+
     try:
+        # The branch sits AFTER the generation fence and BEFORE ``run_agent_step``,
+        # and both directions are load-bearing (BR-1). After the fence: a
+        # stale-generation zombie must get the fence's 409 rather than a cached
+        # result. Before ``run_agent_step``: not entering it is the only way to
+        # create no terminal, fire no callback and write no durable row (BR-4).
+        #
+        # It sits INSIDE this ``try`` for one reason (BR-9/SR-8): a database failure
+        # inside ``decide`` must reach the EXISTING 500 arm below and must never fall
+        # through to execution. An unreadable journal degrading to "just run it"
+        # re-runs completed work under exactly the conditions FR-1 exists to prevent.
+        # ``decide``'s ``ValueError`` precondition (a non-``v2`` fingerprint) is
+        # unreachable from here because the fingerprint above came from ``compute``,
+        # which only ever emits ``v2:``.
+        #
+        # The two halting verdicts are raised as ``workflow-errors``' two exception
+        # types and mapped in two dedicated ``except`` arms rather than raised as
+        # ``HTTPException`` here: ``HTTPException`` IS an ``Exception``, so a 409
+        # raised in this block would be swallowed by the ``except Exception`` arm,
+        # returned as a 500, and — worse — would settle a step that never ran.
+        if replay_context is not None:
+            decide_run_id, decide_step_id, call_fingerprint = replay_context
+            decision = step_replay.decide(
+                decide_run_id, decide_step_id, call_fingerprint, body.recovery
+            )
+            if decision.verdict is step_replay.ReplayVerdict.REPLAY:
+                # FR-1. The envelope is returned VERBATIM (SR-3): it was redacted and
+                # then bounded by ``build_envelope`` before it reached SQLite, and a
+                # second redaction pass could match its own ``[REDACTED:<name>]``
+                # marker. Reading ``result_json`` raw would bypass that pipeline
+                # entirely; ``decision.envelope`` is the only sanctioned payload.
+                envelope = decision.envelope
+                if envelope is None:  # pragma: no cover — see comment
+                    # Unreachable: ``ReplayDecision.envelope`` is set iff the verdict
+                    # is REPLAY and ``decide`` is its only construction site
+                    # (``replay-gate`` BR-6). Raised rather than executed, because
+                    # falling through here would re-run a completed step.
+                    raise RuntimeError(
+                        f"step '{decide_step_id}': the replay gate returned REPLAY "
+                        f"with no result envelope"
+                    )
+                if envelope.terminal_id is None:  # pragma: no cover — see comment
+                    # Unreachable through the shipped writers: a REPLAY verdict
+                    # requires a current-scheme ``call_fingerprint`` on the row, only
+                    # ``begin_step`` writes that column, and its one caller sets
+                    # ``StepRunState.terminal_id`` in the same statement — so a row
+                    # that can replay always carries the id its envelope was built
+                    # with. Raised rather than substituting a fake id, because
+                    # ``RunStepResponse.terminal_id`` is a non-optional ``str`` and
+                    # inventing one would be worse than failing.
+                    raise RuntimeError(
+                        f"step '{decide_step_id}': the stored result envelope carries "
+                        f"no terminal id, so no replayed response can be built"
+                    )
+                # Make the replayed step visible in the run's step list before answering
+                # (F4). In memory only — no terminal, no journal write, so BR-4 holds. Before
+                # the return rather than after it for the obvious reason, and best-effort so a
+                # bookkeeping failure cannot turn a correct replay into an HTTP error.
+                _record_replayed_step()
+                # ``replayed=True`` is the mitigation for the dead id (SR-4): the
+                # terminal named here no longer exists, and the flag is the only
+                # thing that stops a consumer probing it.
+                return RunStepResponse(
+                    terminal_id=envelope.terminal_id,
+                    last_message=envelope.last_message,
+                    status=envelope.status,
+                    replayed=True,
+                )
+            if decision.verdict is step_replay.ReplayVerdict.DIVERGED:
+                # FR-3's surfacing. NO fingerprint travels with it, and none can be
+                # added later (SR-2): only a digest is persisted, and
+                # ``step-fingerprint``'s SR-2 forbids echoing a digest into a message,
+                # a log or an exception — a 409 body is the most exposed of the three.
+                raise ReplayDivergenceError(step_id=decide_step_id, reason=decision.reason)
+            if decision.verdict is step_replay.ReplayVerdict.DECISION_REQUIRED:
+                # FR-7's surfacing. ``rule`` is set iff the verdict is
+                # DECISION_REQUIRED (``replay-gate`` BR-6), and this is where it
+                # reaches a human: without it an operator cannot tell which of six
+                # conditions halted the run.
+                halt_rule = decision.rule
+                if halt_rule is None:  # pragma: no cover — see comment
+                    # Unreachable for the same reason as the envelope guard above.
+                    raise RuntimeError(
+                        f"step '{decide_step_id}': the replay gate returned "
+                        f"DECISION_REQUIRED with no halting rule"
+                    )
+                raise RecoveryDecisionRequired(
+                    step_id=decide_step_id, rule=halt_rule, reason=decision.reason
+                )
+            # EXECUTE falls through — the step runs normally.
+
         result = await run_agent_step(
             provider=body.provider,
             agent=body.agent,
@@ -3178,24 +3889,70 @@ async def run_step(
             reuse_terminal_id=body.reuse_terminal_id,
             teardown=body.teardown,
             timeout=body.timeout,
-            working_directory=body.working_directory,
+            # BR-10: the ALREADY-RESOLVED directory rides the existing parameter, so
+            # ``run_agent_step``'s own ``working_directory is None and caller_id is
+            # not None`` guard simply does not fire and the resolution never runs
+            # twice. Identical to ``body.working_directory`` for every
+            # non-script-tier call.
+            working_directory=effective_working_directory,
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
             engine=body.engine,
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
-            on_terminal_created=on_terminal_created,
+            on_step_terminal_ready=on_step_terminal_ready,
             model=body.model,
             use_worktree=body.use_worktree,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
-        # is logged, not raised.
-        _settle_step(result.terminal_id, None)
+        # is logged, not raised. ``last_message`` is passed here and nowhere else:
+        # this is the only arm where the step produced one.
+        response_status = (
+            result.status.value if hasattr(result.status, "value") else str(result.status)
+        )
+        _settle_step(result.terminal_id, None, result.last_message, response_status)
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
-            status=(result.status.value if hasattr(result.status, "value") else str(result.status)),
+            status=response_status,
+        )
+    except ReplayDivergenceError as e:
+        # FR-3's surfacing (BR-6/BR-7, TD-3/TD-4). 409 rather than 502/504 because
+        # neither is a worker outcome — NOTHING RAN. ``kind`` is authoritative and
+        # three 409s are now reachable from this route (the generation fence's,
+        # this, and "decision_required"), so all three must stay distinguishable.
+        #
+        # TWO ARMS, NEVER ONE, AND NEVER A SHARED HANDLER. ``workflow-errors``' TD-1
+        # gave these two exception types no common base SPECIFICALLY so one ``except``
+        # cannot collapse two remedies FR-3 and FR-6 exist to keep apart: a divergence
+        # is reconciled by a human looking at what changed in the script, a halt by a
+        # human authorising a rerun. Parametrising them into one arm would undo that.
+        #
+        # NO ``rule`` KEY HERE — ``replay-gate`` BR-6 sets ``rule`` only on
+        # DECISION_REQUIRED, because a divergence is always the same condition and a
+        # constant attribute is the inert-field trap this issue has removed three
+        # times. NO FINGERPRINT EITHER, not even truncated (SR-2).
+        #
+        # The step is NOT settled: it never ran, so there is no outcome to record.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(e), "kind": "diverged", "step_id": e.step_id},
+        )
+    except RecoveryDecisionRequired as e:
+        # FR-7's surfacing — the second of the two arms above. ``rule`` completes a
+        # chain three units long: unit 1 built ``HaltRule``, unit 7 put it on
+        # ``ReplayDecision`` so the condition could travel, unit 12 consumes it to
+        # resolve the halt — and this is where it reaches a HUMAN. Omitting it would
+        # leave an operator guessing which of six conditions halted their run.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(e),
+                "kind": "decision_required",
+                "step_id": e.step_id,
+                "rule": e.rule.value,
+            },
         )
     except StepExecutionError as e:
         # The step did not complete successfully. Distinguish a worker that
@@ -3241,6 +3998,14 @@ async def run_step(
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OutputExtractionError as e:
+        # Also ordered before the ValueError arm it subclasses. The terminal and
+        # the route both resolved and the step ran -- only the response marker
+        # was missing -- so this is not a bad terminal reference. 500 per this
+        # endpoint's documented contract above ("any other failure -> 500",
+        # plain-string detail, no ``kind``), not 404 (issue #570).
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -3268,7 +4033,10 @@ async def run_step(
 
 
 @app.post("/workflows/validate")
-async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
+async def validate_workflow_endpoint(
+    body: WorkflowValidateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Validate a workflow spec without running it (FR-1.3/A1a). Returns ValidationResult.
 
     Extension-based dispatch (U5, A1a, BR-23a): ``.yaml``/``.yml`` calls
@@ -3324,7 +4092,10 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
 
 
 @app.get("/workflows")
-async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> List[Dict]:
+async def list_workflows_endpoint(
+    dir: Optional[str] = Query(default=None),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List indexed workflows, rebuilt from the spec files on disk (FR-2.1)."""
     from cli_agent_orchestrator.services import workflow_spec_service
 
@@ -3396,7 +4167,10 @@ async def list_workflow_runs_endpoint(
 
 
 @app.get("/workflows/{name}")
-async def get_workflow_endpoint(name: str) -> Dict:
+async def get_workflow_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Return the parsed/validated spec for a workflow name (FR-2.1, A1).
 
     Widened return: ``get_workflow`` may now resolve a ``.py`` name to a
@@ -3663,6 +4437,144 @@ async def _run_in_background(
         _failed_backstop("drive raised")
 
 
+class PlanApprovalRequest(BaseModel):
+    """Body of the approve-a-plan request (issue #583 Bolt 2, unit ``approval-operation``).
+
+    ``plan_id`` IS A BODY FIELD AND NEVER A PATH SEGMENT, on purpose. It contains a ``:``
+    (``plan-v1:…``) and ``approval_store`` requires it be stored and compared VERBATIM, never parsed
+    and never normalised — a normalisation is how two distinct plans could come to share one
+    approval. A path segment invites percent-encoding, decoding and normalisation from every layer
+    between the client and this handler; a body field makes verbatimness a property of the transport
+    instead of a hope.
+
+    THERE IS NO ``approved_by`` FIELD, also on purpose. Accepting one would create free text that
+    nothing can verify and that any caller could set to any value — the appearance of accountability
+    with none of the substance. It is resolved server-side instead, which at least makes it a true
+    statement about which local account performed the call.
+    """
+
+    plan_id: str
+
+
+@app.post("/workflows/plans/approve")
+async def approve_workflow_plan_endpoint(
+    body: PlanApprovalRequest,
+    # SCOPE_ADMIN ONLY, AND DELIBERATELY NARROWER THAN EVERY SIBLING WORKFLOW ENDPOINT, which accept
+    # ``SCOPE_WRITE, SCOPE_ADMIN``. DO NOT "align" this with them — widening it silently defeats the
+    # control. Approving a plan is an AUTHORISATION act rather than ordinary data mutation, and the
+    # MCP surface deliberately ships no grant tool so an agent cannot approve the plan it just wrote
+    # (issue #583 Bolt 2 ``approval-operation`` Q1). But the MCP boundary reaches the backplane over
+    # HTTP — that is exactly what ``test_http_only_boundary.py`` enforces — so if this endpoint
+    # accepted ``cao:write`` and an agent's token were write-scoped, the agent could grant by calling
+    # here directly and the missing tool would be a speed bump rather than a control.
+    #
+    # Honest caveat, recorded rather than implied away: ``require_any_scope`` is default-off, so in a
+    # default install this changes nothing. ``SCOPE_WRITE, SCOPE_ADMIN`` is equally inert there; the
+    # two differ ONLY when auth is enabled, which is the one case the distinction was asked for.
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict:
+    """Approve a plan identifier so its runs may start (issue #583 FR-8).
+
+    Idempotent: approving an already-approved plan changes nothing and SAYS SO, reporting the
+    ORIGINAL ``approved_at``/``approved_by``. ``approval_store.grant`` is ``INSERT OR IGNORE``
+    because an update path could transfer an existing approval to a changed plan, so a plain
+    "success" here would leave an operator unable to tell "I have just approved this" from "this was
+    approved last week by someone else and my grant did nothing".
+
+    Success is derived from a READ-BACK rather than from the absence of an exception, because
+    ``INSERT OR IGNORE`` succeeds silently whether or not it inserted. A missing row afterwards is
+    an error, never a cheerful success — this unit's worst failure mode is a command that appears to
+    work, leaving the operator to meet the same refusal on the next run with no explanation.
+    """
+    plan_id = body.plan_id
+    if not plan_id or not plan_id.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="plan_id is required")
+
+    existing = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    if existing is not None:
+        logger.info(
+            "workflow plan approval: %s was already approved at %s by %s (no change)",
+            plan_id,
+            existing.approved_at,
+            existing.approved_by,
+        )
+        return {
+            "plan_id": plan_id,
+            "approved": True,
+            "changed": False,
+            "approved_at": existing.approved_at,
+            "approved_by": existing.approved_by,
+        }
+
+    approved_by = approval_provenance.local_account()
+    try:
+        await asyncio.to_thread(approval_store.grant, plan_id, approved_by)
+        recorded = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    except Exception as e:  # noqa: BLE001 — surfaced, never swallowed into a false success
+        logger.error("workflow plan approval: grant for %s failed: %s", plan_id, e)
+        raise HTTPException(status_code=500, detail=f"could not record approval: {e}")
+
+    if recorded is None:
+        # A database fault that ``approval_store`` converted to a quiet None. Correct for the GATE,
+        # which must fail closed; wrong to read here as "not approved yet, all fine".
+        logger.error("workflow plan approval: grant for %s did not persist", plan_id)
+        raise HTTPException(status_code=500, detail="approval did not persist")
+
+    logger.info("workflow plan approval: %s approved by %s", plan_id, recorded.approved_by)
+    return {
+        # Echoed VERBATIM. Returning a normalised form would teach a caller that some other
+        # spelling is equivalent, which is exactly the equivalence approval_store forbids.
+        "plan_id": plan_id,
+        "approved": True,
+        "changed": True,
+        "approved_at": recorded.approved_at,
+        "approved_by": recorded.approved_by,
+    }
+
+
+@app.get("/workflows/runs/{run_id}/plan")
+async def get_workflow_run_plan_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Report a run's plan identifier and whether it is approved (issue #583 FR-8).
+
+    READ-ONLY, and a NEW route rather than an extension of ``GET /workflows/runs/{run_id}``: adding
+    fields to a shipped response would change a surface every existing caller already parses, which
+    C-1 forbids.
+
+    This is what the read-only MCP tool consults, so an agent that meets an approval refusal can tell
+    the operator WHICH ``plan_id`` to approve. It cannot grant one — that is the CLI's, behind
+    ``cao:admin``.
+
+    ``plan_id`` is ``None`` for a YAML run (which never freezes a manifest) and for a script run whose
+    freeze failed. Both are reported as ``None`` rather than as "unapproved", because "this run has no
+    plan identifier" and "this plan is not approved" call for entirely different operator actions.
+    """
+    # Imported locally, matching the other run-row handlers in this module (see the resume endpoint).
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    # Reuses the gate's extractor rather than parsing the manifest a second way: two extractors
+    # disagreeing about what a run's plan_id is would be worse than either being wrong alone.
+    plan_id = approval_gate.plan_id_from_manifest(row.manifest_json)
+    if plan_id is None:
+        return {"run_id": run_id, "tier": row.tier, "plan_id": None, "approved": None}
+
+    approval = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    return {
+        "run_id": run_id,
+        "tier": row.tier,
+        "plan_id": plan_id,
+        "approved": approval is not None,
+        "approved_at": approval.approved_at if approval else None,
+        "approved_by": approval.approved_by if approval else None,
+    }
+
+
 @app.post("/workflows/runs")
 async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
@@ -3733,6 +4645,8 @@ async def start_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(e.findings)},
             )
+        except approval_gate.PlanApprovalRequiredError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except ValueError as e:
@@ -3886,6 +4800,24 @@ async def submit_workflow_run_endpoint(
         spec_snapshot = json.dumps(
             {"source": spec.source, "path": spec.path, "content_hash": spec.content_hash}
         )
+        # Step 4b — approval gate (issue #583 Bolt 2, ``approval-gate``). Built ONCE here and handed
+        # to the INSERT below unchanged, so the manifest that is CHECKED is byte-identical to the one
+        # STORED. Gating BEFORE the INSERT means a refused start leaves no ``workflow_run`` row: every
+        # first run of a new plan is refused by design, so recording them would durably record runs
+        # that never happened. The blocking arm in ``script_runner`` gates identically at its Step 0b,
+        # because otherwise a run's approvability would depend on which route started it. No-ops
+        # entirely when enforcement is disabled, which is the default.
+        manifest_json = await asyncio.to_thread(
+            manifest_freeze.build_manifest_json,
+            source_hash=spec.content_hash,
+            inputs=resolved,
+        )
+        try:
+            approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+        except approval_gate.PlanApprovalRequiredError as e:
+            # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
+            # caller can tell "needs approval" from "the run broke".
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         # Step 5 — the script row is a single INSERT (no seed steps), already
         # atomic on its own connection. This is the one deliberate deviation from
         # the engines' best-effort write: awaited, and its failure aborts with 500.
@@ -3900,6 +4832,15 @@ async def submit_workflow_run_endpoint(
                 started_at,
                 "script",
                 "1",
+                # issue #583 Bolt 2, ``manifest-freeze``: the frozen manifest rides the SAME
+                # INSERT as the run row (ADR-583-4's no-two-writes lesson). This is the ASYNC
+                # script arm; the blocking arm freezes in ``script_runner`` the same way, and
+                # BOTH script entry points must freeze or a run's approvability would depend on
+                # which route started it. ``build_manifest_json`` is total and returns None on
+                # failure, which writes NULL and fails CLOSED at the approval gate.
+                # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 4b and has already gated
+                # on it; reusing it rather than rebuilding is what makes checked-equals-stored true.
+                manifest_json,
             )
         except sqlite3.IntegrityError:
             # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
@@ -5203,6 +6144,7 @@ async def cancel_workflow_run_endpoint(
 @app.post("/workflows/runs/{run_id}/resume")
 async def resume_workflow_run_endpoint(
     run_id: str,
+    body: Optional[ResumeRunRequest] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Resume a crashed/failed run from its durable journal (FR-6.2, N6, U5 A4).
@@ -5215,8 +6157,34 @@ async def resume_workflow_run_endpoint(
     script arm's typed-error catch order matches the boundary table: narrower
     ``ResumeNotAllowedError``/``ResumeCorruptError`` (both ``ValueError``
     subclasses) are caught BEFORE the bare ``ValueError`` arm.
+
+    ``recovery-decision-intake`` (issue #583, FR-7) adds the optional
+    ``decisions`` body field — the human's answer to a halted step. Three
+    properties of how it is wired here are requirements, not preferences:
+
+    * **Authorisation is INHERITED and not weakened** (SR-1). The scope
+      dependency below is untouched: a decision travels ON this request, so
+      supplying one already requires ``cao:write`` or ``cao:admin``. This unit
+      adds no second path in.
+    * **The decisions travel INTO the script arm's resume**, which applies them
+      after its own admission gates and before the spawn (SC-3/BR-7). They are
+      deliberately NOT applied here ahead of the call: this route cannot reject a
+      live run — ``resume_script_run``'s gate 2 does — so a decision written here
+      would be durable consent granted by a request that then returns 409.
+    * **A ``ValueError`` from that call still lands on 400** (SR-4), because the
+      call is inside the existing ``try`` and a bare ``ValueError`` is that arm. A
+      mistyped ``step_id`` is a client error; a 500 would tell the operator to
+      file a bug instead of fixing a typo.
+
+    Decisions are rejected for a non-script run rather than applied (INV-3, "a
+    decision never silently fails"): the replay gate that reads these states is
+    consulted by the script tier alone, and the YAML resume unconditionally resets
+    every non-completed step to ``PENDING`` and re-runs it — so a ``skip`` there
+    would re-execute the very step the operator asked to skip, silently.
     """
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    decisions = body.decisions if body is not None else None
 
     row = workflow_journal.get_run(run_id)
     if row is None:
@@ -5224,11 +6192,23 @@ async def resume_workflow_run_endpoint(
 
     if row.tier == "script":
         try:
-            result = await script_runner.resume_script_run(run_id)
+            if decisions:
+                result = await script_runner.resume_script_run(run_id, decisions=decisions)
+            else:
+                # Byte-identical to the pre-#583 call, so an ordinary resume cannot
+                # regress on a code path it never enters.
+                result = await script_runner.resume_script_run(run_id)
         except KeyError:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
             )
+        except approval_gate.PlanApprovalRequiredError as e:
+            # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
+            # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
+            # precisely so the trailing 400 arm cannot claim it, and not a ``ResumeNotAllowedError``
+            # because 409 means "this run cannot be resumed" — a fact about the run — whereas this is
+            # a fact about the plan, and the operator's next action is completely different.
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except workflow_service.ResumeNotAllowedError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except workflow_service.ResumeCorruptError as e:
@@ -5236,6 +6216,17 @@ async def resume_workflow_run_endpoint(
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         return result.model_dump()
+
+    if decisions:
+        # The YAML arm honours no decision, so it refuses one instead of accepting it
+        # and doing something else (see the docstring). Nothing is written on this path.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"run '{run_id}' is tier '{row.tier}'; recovery decisions apply to "
+                f"script-tier runs only"
+            ),
+        )
 
     try:
         result = await workflow_service.resume_from_last_completed(run_id)
@@ -5420,7 +6411,17 @@ async def delete_terminal(
             terminal_id,
             registry=get_plugin_registry(request),
         )
-        return {"success": success}
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"cleanup deferred for terminal '{terminal_id}'; "
+                    "retry delete after residual Grok processes exit"
+                ),
+            )
+        return {"success": True}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -5476,6 +6477,7 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -5534,12 +6536,29 @@ async def get_inbox_messages_endpoint(
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
 
-    Security: This endpoint provides full PTY access with no bearer/token
-    authentication. It is intended for localhost-only use and is gated by two
-    checks before accept: the peer IP must be in ``WS_ALLOWED_CLIENTS`` and,
-    for browser callers, the ``Origin`` header must be in the trusted set
-    (CWE-1385 cross-site WebSocket hijacking guard). Do NOT expose the server
-    to untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
+    Security: This endpoint provides full PTY access (keystroke injection =
+    RCE) and is gated by three checks before accept:
+
+    * the peer IP must be in ``WS_ALLOWED_CLIENTS`` (loopback by default);
+    * for browser callers, the ``Origin`` header must be same-origin with the
+      request ``Host`` or in the trusted set (CWE-1385 cross-site WebSocket
+      hijacking guard);
+    * when the HTTP auth layer is enabled (``AUTH0_DOMAIN`` /
+      ``CAO_AUTH_JWKS_URI`` set — see :func:`is_auth_enabled`), the handshake
+      must carry a valid bearer token granting at least the ``cao:read``
+      scope.
+
+    Token scheme: browsers cannot set request headers on a WebSocket
+    handshake, so the token is accepted from either ``Authorization: Bearer
+    <token>`` (native clients) or a ``?token=<token>`` query parameter (the
+    bundled web viewer). The token is verified exactly like the HTTP layer —
+    RS256 signature, issuer, audience and expiry via the JWKS cache — and a
+    missing/invalid token or one lacking ``cao:read`` closes the handshake
+    with code 4401 before accept. This closes the bypass where widening
+    ``CAO_WS_ALLOWED_CLIENTS`` / ``CAO_WS_ALLOWED_ORIGINS`` for containers,
+    devcontainers or Codespaces exposed full PTY control with no credential.
+    Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
+    without authentication.
     """
     # Reject connections from clients outside the configured allowlist.
     # Defaults to loopback; operators running cao-server inside a container can
@@ -5574,7 +6593,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # WebSocket scope first (CAO_ALLOWED_HOSTS="*" opts out of that; see
     # is_ws_origin_allowed).
     origin = websocket.headers.get("origin")
-    if not is_ws_origin_allowed(origin, websocket.headers.get("host")):
+    if not is_ws_origin_allowed(
+        origin, websocket.headers.get("host"), websocket.scope.get("scheme")
+    ):
         logger.warning(
             "Rejected WebSocket attach for terminal %r: disallowed Origin %r",
             terminal_id,
@@ -5582,6 +6603,42 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         )
         await websocket.close(code=4403, reason="WebSocket Origin not allowed")
         return
+
+    # When the HTTP auth layer is enabled, the WS handshake must also prove
+    # identity: browsers cannot set request headers on a WebSocket handshake,
+    # so the token is accepted from the Authorization header or a ``?token=``
+    # query parameter. The token is verified with the same JWKS/issuer/
+    # audience/expiry logic as the HTTP layer and must grant at least
+    # ``SCOPE_READ``. Default-off (auth disabled): no token is required and
+    # behavior is byte-for-byte unchanged.
+    if is_auth_enabled():
+        token = _extract_bearer(websocket.headers.get("authorization"))
+        if not token:
+            token = websocket.query_params.get("token")
+        if not token:
+            logger.warning(
+                "Rejected WebSocket attach for terminal %r: auth enabled, missing bearer token",
+                terminal_id,
+            )
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+        try:
+            scopes = extract_scopes_from_token(token)
+        except Exception:
+            logger.warning(
+                "Rejected WebSocket attach for terminal %r: auth enabled, invalid bearer token",
+                terminal_id,
+            )
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+        if SCOPE_READ not in scopes:
+            logger.warning(
+                "Rejected WebSocket attach for terminal %r: token lacks %r scope",
+                terminal_id,
+                SCOPE_READ,
+            )
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
 
     await websocket.accept()
 
@@ -5739,7 +6796,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
 
 
 @app.get("/flows", response_model=List[Flow])
-async def list_flows() -> List[Flow]:
+async def list_flows(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Flow]:
     """List all flows."""
     try:
         return flow_service.list_flows()
@@ -5751,7 +6810,10 @@ async def list_flows() -> List[Flow]:
 
 
 @app.get("/flows/{name}", response_model=Flow)
-async def get_flow(name: str) -> Flow:
+async def get_flow(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Flow:
     """Get a specific flow by name."""
     try:
         return flow_service.get_flow(name)
@@ -5780,16 +6842,18 @@ async def create_flow(
 
         file_path = flows_dir / f"{body.name}.flow.md"
 
-        # Build YAML frontmatter content
-        frontmatter_lines = [
-            "---",
-            f"name: {body.name}",
-            f'schedule: "{body.schedule}"',
-            f"agent_profile: {body.agent_profile}",
-            f"provider: {body.provider}",
-            "---",
-        ]
-        file_content = "\n".join(frontmatter_lines) + "\n" + body.prompt_template
+        # Serialize via yaml.safe_dump so a multi-line value becomes a quoted
+        # scalar rather than injecting a new frontmatter key.
+        frontmatter = yaml.safe_dump(
+            {
+                "name": body.name,
+                "schedule": body.schedule,
+                "agent_profile": body.agent_profile,
+                "provider": body.provider,
+            },
+            sort_keys=False,
+        )
+        file_content = "---\n" + frontmatter + "---\n" + body.prompt_template
 
         file_path.write_text(file_content)
 
@@ -5951,6 +7015,7 @@ async def list_memories_endpoint(
     memory_type: Optional[MemoryType] = Query(default=None, alias="type"),
     scope_id: Optional[MemoryScopeId] = None,
     limit: int = Query(default=50, ge=1, le=100),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[MemorySummary]:
     """List stored memories across all projects (mirrors `cao memory list --all`)."""
     _require_memory_enabled()
@@ -6241,6 +7306,7 @@ async def get_memory_endpoint(
     key: MemoryKey,
     scope: Optional[MemoryScope] = None,
     scope_id: Optional[MemoryScopeId] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> MemoryDetail:
     """Show a memory by key (mirrors `cao memory show`; first match wins)."""
     _require_memory_enabled()

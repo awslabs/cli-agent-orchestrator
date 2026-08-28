@@ -1416,6 +1416,26 @@ class TestClaudeCodeProviderMisc:
         assert "claude --dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
+    def test_build_claude_command_with_resume_session_id(self):
+        """resume_session_id maps to `claude --resume <sid>` (durable-orchestra
+        recovery: re-open a prior supervisor conversation in a new CAO session)."""
+        provider = ClaudeCodeProvider(
+            "test123",
+            "test-session",
+            "window-0",
+            resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+        )
+        command = provider._build_claude_command()
+
+        assert "--resume 11d55034-bb41-46ca-8686-59a9dbff16b5" in command
+
+    def test_build_claude_command_no_resume_by_default(self):
+        """Without resume_session_id the command must not carry --resume."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        command = provider._build_claude_command()
+
+        assert "--resume" not in command
+
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
         """Test building Claude command with system prompt."""
@@ -1687,6 +1707,55 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--agent agent" in command
         assert "--model fable-5" in command
+
+
+class TestClaudeCodeProviderClaudeConfig:
+    """Tests that profile.claudeConfig maps to Claude Code CLI flags."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_appends_effort_from_claude_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = {"effort": "xhigh"}
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--effort xhigh" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_appends_fallback_model_from_claude_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = {"fallback_model": "sonnet"}
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--fallback-model sonnet" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_omits_effort_when_claude_config_absent(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--effort" not in command
 
 
 class TestClaudeCodeProviderPermissionMode:

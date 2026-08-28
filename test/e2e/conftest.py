@@ -1,7 +1,8 @@
 """Shared fixtures for end-to-end tests.
 
 E2E tests require:
-- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, gemini, copilot)
+- The provider CLI tool installed and authenticated (for example codex,
+  claude, kiro-cli, gemini, copilot, or grok)
 - tmux available on the system
 
 The CAO server is started automatically by the ``cao_server`` fixture from
@@ -13,8 +14,10 @@ module top.
 Run with: uv run pytest -m e2e test/e2e/ -v
 """
 
+import os
 import shutil
 import time
+from pathlib import Path
 from test.fixtures.cao_server import CaoServer, _patch_api_base_url_for_e2e
 
 import pytest
@@ -111,6 +114,13 @@ def require_opencode():
 
 
 @pytest.fixture()
+def require_omp():
+    """Skip test if OMP CLI is not available."""
+    if not _cli_available("omp"):
+        pytest.skip("OMP CLI not installed")
+
+
+@pytest.fixture()
 def require_hermes():
     """Skip test if Hermes CLI is not available."""
     if not _cli_available("hermes"):
@@ -123,6 +133,79 @@ def require_cursor():
     if _cli_available("agent") or _cli_available("cursor-agent"):
         return
     pytest.skip("Cursor CLI (agent / cursor-agent) not installed")
+
+
+@pytest.fixture()
+def require_grok(require_cao_server: CaoServer):
+    """Skip unless the official Grok Build CLI is installed and authenticated."""
+    if not _cli_available("grok"):
+        pytest.skip("Grok Build CLI not installed; see docs/grok-cli.md for installation")
+
+    default_home = str(Path.home() / ".grok")
+    grok_home = Path(os.environ.get("GROK_HOME", default_home)).expanduser()
+    auth_source = grok_home / "auth.json"
+    if not os.environ.get("XAI_API_KEY") and not auth_source.is_file():
+        pytest.skip(
+            "Grok Build CLI is installed but not authenticated; run `grok login` "
+            "or set XAI_API_KEY before running Grok e2e tests"
+        )
+
+    # The managed e2e server deliberately redirects HOME to isolate CAO state.
+    # Mirror production's narrow auth reuse by linking only auth.json into that
+    # disposable HOME; never copy credential contents into test artifacts.
+    if auth_source.is_file():
+        isolated_grok_home = require_cao_server.home_dir / ".grok"
+        isolated_grok_home.mkdir(mode=0o700, exist_ok=True)
+        auth_link = isolated_grok_home / "auth.json"
+        if not auth_link.exists():
+            auth_link.symlink_to(auth_source)
+
+    # Orchestration e2e tests use the repository's assign example profiles.
+    # Seed copies into the same disposable CAO home so the managed server can
+    # resolve them without reading or modifying the developer's real store.
+    repo_root = Path(__file__).resolve().parents[2]
+    isolated_store = require_cao_server.home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    isolated_store.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for profile_name in ("analysis_supervisor", "data_analyst", "report_generator"):
+        source = repo_root / "examples" / "assign" / f"{profile_name}.md"
+        target = isolated_store / f"{profile_name}.md"
+        if not target.exists():
+            shutil.copy2(source, target)
+
+
+@pytest.fixture()
+def require_minimax_code(require_cao_server: CaoServer):
+    """Skip unless MiniMax Code is installed and has reusable local authentication."""
+    if not _cli_available("mcode"):
+        pytest.skip("MiniMax Code CLI not installed; see docs/minimax-code.md for installation")
+
+    configured = os.environ.get("MINIMAX_DATA_DIR", "").strip()
+    source_home = Path(configured).expanduser() if configured else Path.home() / ".minimax"
+    auth_names = ("config.yaml", "local-runtime.auth.json", "cli-auth")
+    if not any((source_home / name).exists() for name in auth_names):
+        pytest.skip("MiniMax Code is installed but not authenticated; run `mcode login`")
+
+    isolated_home = require_cao_server.home_dir / ".minimax"
+    isolated_home.mkdir(mode=0o700, exist_ok=True)
+    for name in ("config.yaml", "local-runtime.auth.json"):
+        source = source_home / name
+        target = isolated_home / name
+        if source.is_file() and not target.exists():
+            shutil.copy2(source, target)
+            target.chmod(0o600)
+    source_cli_auth = source_home / "cli-auth"
+    target_cli_auth = isolated_home / "cli-auth"
+    if source_cli_auth.is_dir() and not target_cli_auth.exists():
+        shutil.copytree(source_cli_auth, target_cli_auth)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    isolated_store = require_cao_server.home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    isolated_store.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for profile_name in ("analysis_supervisor", "data_analyst", "report_generator"):
+        source = repo_root / "examples" / "assign" / f"{profile_name}.md"
+        target = isolated_store / f"{profile_name}.md"
+        if not target.exists():
+            shutil.copy2(source, target)
 
 
 def create_terminal(

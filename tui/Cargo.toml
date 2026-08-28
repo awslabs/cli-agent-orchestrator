@@ -92,7 +92,30 @@ minreq = "3"
 # these are `[dependencies]`, not `[dev-dependencies]`, because the pane is production code.
 # That is unavoidable for a TUI and is the reason the feature set is narrowed rather than
 # taken as it comes. (#321)
-ratatui = { version = "0.30.2", default-features = false, features = ["std", "crossterm"] }
+#
+# `unstable-rendered-line-info` is added for `Paragraph::line_count`, which the left column's
+# viewport needs to know how tall its content is ONCE WRAPPED. It adds **zero crates**
+# (`Cargo.lock` is byte-identical with and without it — verified) and compiles on stable rustc:
+# ratatui gates the API behind an attribute, not behind a nightly feature.
+#
+# The alternative was to compute wrapped height here, and that is the worse risk: it would be a
+# second implementation of word wrapping that agrees with the one actually rendering only until a
+# line holds a long word or a wide grapheme. Measured at the 80x24 floor, 32 lines occupy 44 rows,
+# so the naive `Vec::len()` count understates height by a third and an overflow guard built on it
+# passes while content runs off screen.
+#
+# The exposure is that the API is unstable upstream (ratatui#293) and could change or vanish in a
+# minor release. `the_wrap_measurement_agrees_with_what_is_actually_drawn` (in `src/renderer.rs`)
+# pins the behaviour against a real rendered buffer rather than against the API's own claim, so an
+# upstream change surfaces as a red test rather than as a silently mis-sized viewport. The test name
+# is cited here on purpose — a reviewer is being asked to accept an unstable upstream dependency on
+# the strength of that guard, so the citation has to resolve; the name it carried before named no
+# test at all. (PR #564 review)
+ratatui = { version = "0.30.2", default-features = false, features = [
+    "std",
+    "crossterm",
+    "unstable-rendered-line-info",
+] }
 crossterm = "0.29.0"
 
 # ---------------------------------------------------------------------------------------

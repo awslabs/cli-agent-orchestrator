@@ -121,6 +121,16 @@ const SOURCES: &[(&str, &str)] = &[
     // additionally where FR-1.4's forbidden CLI fallback would be written ("the picker failed, so
     // shell out to `cao profile list`") — the `cao`-spawn needles catch that. (#321)
     ("src/renderer.rs", include_str!("../src/renderer.rs")),
+    // Added by the semantic colour layer (#556). This entry was **not** forced by a failing test:
+    // when `mod theme;` landed, `no_backend_attach_call.rs` went red immediately and this tripwire
+    // stayed green, because its coverage check is a hand-maintained count and a count cannot
+    // notice an omission. The `catalog.rs` comment above named that hole exactly, and it stayed
+    // open — so `theme.rs` sat unscanned by the HTTP-ownership guard until somebody thought to
+    // look. It is closed now: [`the_scan_set_covers_every_source_in_the_crate`] cross-checks
+    // `src/main.rs`'s `mod` declarations, so the next module is forced in rather than remembered
+    // in. Nothing in a palette wants HTTP, which is the point — the file judged least interesting
+    // is the one an omission hides in. (#556)
+    ("src/theme.rs", include_str!("../src/theme.rs")),
     // Test targets and shared test infrastructure.
     (
         "tests/binary_exits_zero.rs",
@@ -142,6 +152,16 @@ const SOURCES: &[(&str, &str)] = &[
     (
         "tests/hermeticity_tripwire.rs",
         include_str!("hermeticity_tripwire.rs"),
+    ),
+    // Added by the semantic colour layer (#556). A source-text guard needs no I/O at all, which is
+    // exactly why it is listed: the plausible regression is somebody deciding the scan would be
+    // tidier reading files from disk than embedding them with `include_str!`, and `fs` is one step
+    // from `minreq`. The `mod` cross-check above cannot force this entry — it derives from
+    // `src/main.rs`, and a test target is not a module — so a new file under `tests/` still has to
+    // be remembered. That gap is named in [`what_this_tripwire_cannot_detect`]. (#556)
+    (
+        "tests/no_colour_literal_outside_theme.rs",
+        include_str!("no_colour_literal_outside_theme.rs"),
     ),
 ];
 
@@ -847,28 +867,82 @@ fn every_needle_is_actually_findable_in_stripped_code() {
 ///
 /// The number is a literal for the usual reason — `SOURCES.len()` compared against itself proves
 /// nothing.
+///
+/// # The count was never enough, and #556 demonstrated it
+///
+/// A count reddens when a file is **added** to this list and stays green when one is **omitted**,
+/// which is the wrong direction: the unlisted file is the unscanned one. That asymmetry was
+/// documented on the `catalog.rs` entry in [`SOURCES`] and left open here, while
+/// `no_backend_attach_call.rs` closed it by cross-checking `src/main.rs`'s `mod` declarations. The
+/// consequence arrived on schedule: `mod theme;` landed, that tripwire went red and this one did
+/// not, so `src/theme.rs` was outside the HTTP-ownership scan while this test reported full
+/// coverage. The cross-check below is that repair — a `mod` declaration with no [`SOURCES`] entry
+/// is now a failing test, so the next module cannot be forgotten the same way. (#556)
 #[test]
 fn the_scan_set_covers_every_source_in_the_crate() {
     assert_eq!(
         SOURCES.len(),
-        16,
-        "expected 16 Rust sources: 10 under src/ (main, error, handoff, types, env_guard, catalog, \
-         results_pane, server, guided_flow, renderer) and 6 under tests/ (binary_exits_zero, \
-         endpoint_contract, no_backend_attach_call, pty, pty_harness/mod, hermeticity_tripwire). A \
-         new file must be added to SOURCES or the tripwire silently stops covering it"
+        18,
+        "expected 18 Rust sources: 11 under src/ (main, error, handoff, types, env_guard, catalog, \
+         results_pane, server, guided_flow, renderer, theme) and 7 under tests/ \
+         (binary_exits_zero, endpoint_contract, no_backend_attach_call, pty, pty_harness/mod, \
+         hermeticity_tripwire, no_colour_literal_outside_theme). A new file must be added to \
+         SOURCES or the tripwire silently stops covering it"
     );
 
     let production = SOURCES
         .iter()
         .filter(|(path, _)| path.starts_with("src/"))
         .count();
-    assert_eq!(production, 10, "10 production sources");
+    assert_eq!(production, 11, "11 production sources");
 
     let test_sources = SOURCES
         .iter()
         .filter(|(path, _)| path.starts_with("tests/"))
         .count();
-    assert_eq!(test_sources, 6, "6 test sources");
+    assert_eq!(test_sources, 7, "7 test sources");
+
+    // Every `mod` declared by the crate root must be listed. This is the half the count cannot
+    // do — see the note above on why `theme.rs` went unscanned. Derived from the declarations
+    // rather than from a second literal, so it closes the omission direction instead of
+    // restating the addition one.
+    let (_, crate_root) = SOURCES
+        .iter()
+        .find(|(path, _)| *path == "src/main.rs")
+        .expect("src/main.rs must be listed in SOURCES for the mod cross-check to run");
+
+    let mut declared = 0;
+    for line in crate_root.lines() {
+        let trimmed = line.trim();
+        // `pub mod`/`pub(crate) mod` are handled so this does not quietly stop matching if a
+        // module's visibility changes. An inline `mod x { .. }` is not a separate file and is
+        // skipped; today every declaration in the root is a file.
+        let Some(rest) = trimmed
+            .strip_prefix("mod ")
+            .or_else(|| trimmed.strip_prefix("pub mod "))
+            .or_else(|| trimmed.strip_prefix("pub(crate) mod "))
+        else {
+            continue;
+        };
+        let Some(module) = rest.strip_suffix(';') else {
+            continue;
+        };
+
+        declared += 1;
+        let expected = format!("src/{module}.rs");
+        assert!(
+            SOURCES.iter().any(|(path, _)| *path == expected),
+            "`src/main.rs` declares `mod {module};` but {expected} is not in SOURCES, so this \
+             tripwire does not scan it. An unlisted module is a silent hole: the count assertion \
+             above only fires when a file is ADDED to the list, never when one is omitted"
+        );
+    }
+
+    assert_eq!(
+        declared, 10,
+        "expected 10 `mod` declarations in src/main.rs (every production source except main.rs \
+         itself). If this is 0 the loop above matched nothing and its assertion is vacuous"
+    );
 
     // No duplicate paths: a duplicated entry would inflate the count above and let a real file
     // go unlisted while the assertion still passed.

@@ -92,6 +92,7 @@ use ratatui::widgets::{Block, Paragraph, Widget, Wrap};
 use thiserror::Error;
 
 use crate::catalog::Policy;
+use crate::theme::Theme;
 
 /// Retained-line cap (Q2 at 3.1, SR-3, PR-2). Oldest lines are discarded past this.
 ///
@@ -445,6 +446,16 @@ pub struct ResultsPane {
     scroll_offset: usize,
     /// The state [`Self::collapse`] left, so [`Self::expand`] can restore it.
     collapsed_from: Option<PaneState>,
+    /// The semantic palette (#556). Owned rather than passed to `render`, because
+    /// `Widget::render(self, area, buf)` has a fixed three-argument signature — see
+    /// [`Self::set_theme`].
+    ///
+    /// **Presentation-only, and it is the one field here that is.** That is a real cost to the
+    /// model/view separation this module otherwise keeps, and it is accepted for a specific
+    /// reason: the alternative is a `ThemedPane<'a>` wrapper, which pushes a lifetime into the two
+    /// `(&self.pane).render(..)` sites in `renderer.rs` to save a `Copy` field. Nothing in this
+    /// module reads it outside `render`, `body`, and `footer_line`. (#556)
+    theme: Theme,
 }
 
 /// Hand-written rather than derived, because **`vte::Parser` does not implement `Debug`**.
@@ -469,6 +480,7 @@ impl std::fmt::Debug for ResultsPane {
             .field("manual_command", &self.manual_command)
             .field("scroll_offset", &self.scroll_offset)
             .field("collapsed_from", &self.collapsed_from)
+            .field("theme", &self.theme)
             .finish()
     }
 }
@@ -494,7 +506,33 @@ impl ResultsPane {
             manual_command: None,
             scroll_offset: 0,
             collapsed_from: None,
+            // `Theme::default()` is the COLOUR theme, deliberately: a pane whose theme was never
+            // set renders in colour rather than silently monochrome, so a forgotten `set_theme`
+            // looks like working code that has colour — not like working code that lost it, which
+            // nobody would notice. `renderer` sets it from `Theme::from_env()` at startup.
+            theme: Theme::default(),
         }
+    }
+
+    /// Replaces the palette (#556).
+    ///
+    /// # Why this is a setter and not a `render` parameter
+    ///
+    /// `Widget::render(self, area: Rect, buf: &mut Buffer)` is a trait method with a fixed
+    /// three-argument signature; a theme parameter is not expressible without abandoning the trait
+    /// or wrapping the pane in a `ThemedPane<'a>` newtype. The wrapper is defensible — it keeps
+    /// presentation out of the model — but it puts a lifetime on the two `(&self.pane).render(..)`
+    /// call paths in `renderer.rs`, which today have none. [`Theme`] is `Copy` and six small
+    /// `Style` values, so owning one costs nothing at all.
+    ///
+    /// Called **once**, at construction, from `renderer`. Not per frame: `Theme::from_env` reads
+    /// the environment, and a value that cannot change mid-process has no business being re-read in
+    /// a render loop. (#556)
+    /// `pub(crate)` and not `pub`, matching [`Theme`]'s own visibility. `pub` here is a
+    /// `private_interfaces` error under `-D warnings`, which is the compiler making the same point:
+    /// a method cannot be more reachable than the type in its signature.
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// Begins a run: `collapsed` → `running`, buffer cleared, `policy` retained.
@@ -740,7 +778,12 @@ impl ResultsPane {
         true
     }
 
-    /// The footer for the current state (NFR-3: every state is textually distinguishable).
+    /// The footer text for the current state (NFR-3: every state is textually distinguishable).
+    ///
+    /// Kept separate from [`Self::footer_line`] so the **text** and the **style** are two
+    /// decisions in two places. That is what lets the strip-styling guard assert the wording is
+    /// self-sufficient without the guard being able to see a colour at all — which is the whole
+    /// property NFR-5 claims. (#556)
     fn footer(&self) -> String {
         match self.state {
             PaneState::Collapsed => String::new(),
@@ -755,6 +798,41 @@ impl ResultsPane {
             PaneState::Cancelled => CANCELLED_NOTICE.to_string(),
             PaneState::Refused => REFUSED_NOTICE.to_string(),
         }
+    }
+
+    /// The footer's semantic role. **Three-way on the exit code, not two-way** (#556).
+    ///
+    /// # `exit ?` is `warn`, and collapsing it into `error` would be a lie
+    ///
+    /// The obvious branch is "zero is good, anything else is bad", which puts a missing exit code
+    /// in the same bucket as a failure. It is not one: `None` means the pane reached a terminal
+    /// state *without* an exit code, which says nothing about whether the command succeeded. The
+    /// comment on [`Self::footer`] already draws that distinction in text — "a missing exit code is
+    /// worth showing" — and styling it `error` would assert a failure this pane has no evidence
+    /// for. Three arms, and [`the_exit_footer_distinguishes_success_failure_and_absence`] holds
+    /// them apart.
+    ///
+    /// `Cancelled` is `warn` for the same family of reason: `[k]` stopped this pane following the
+    /// stream and the command is still running (see [`CANCELLED_NOTICE`]), so it is neither a
+    /// success nor a failure.
+    fn footer_style(&self) -> Style {
+        match self.state {
+            PaneState::Collapsed => self.theme.dim,
+            PaneState::Running => self.theme.dim,
+            PaneState::Complete | PaneState::Empty => match self.exit_code {
+                Some(0) => self.theme.ok,
+                Some(_) => self.theme.error,
+                // NOT `error` — see the note above. A missing code is not a failure.
+                None => self.theme.warn,
+            },
+            PaneState::Cancelled => self.theme.warn,
+            PaneState::Refused => self.theme.error,
+        }
+    }
+
+    /// The footer as a styled line: [`Self::footer`]'s text carrying [`Self::footer_style`]'s role.
+    fn footer_line(&self) -> Line<'static> {
+        Line::styled(self.footer(), self.footer_style())
     }
 
     /// The viewport body for the current state, as display lines.
@@ -790,14 +868,19 @@ impl ResultsPane {
                     .refusal_reason
                     .as_deref()
                     .unwrap_or("the hand-off mechanism is unavailable and no reason was supplied");
-                body.push(Line::from(reason));
+                body.push(Line::styled(reason, self.theme.error));
                 // The exact argv, on its own line so a terminal's line-select copies it whole.
                 if let Some(command) = self.manual_command.as_deref() {
                     body.push(Line::from(""));
+                    // The argv is deliberately NOT `error`, even though the refusal above is: it
+                    // is the remedy, not the fault. Styling the thing the operator is meant to copy
+                    // and run the same as the failure that produced it tells them to be alarmed by
+                    // their own next step. Left unstyled rather than given a role — no role means
+                    // "ordinary text", which is exactly what a command to run is. (#556)
                     body.push(Line::from(command));
                 }
             }
-            PaneState::Empty => body.push(Line::from(EMPTY_NOTICE)),
+            PaneState::Empty => body.push(Line::styled(EMPTY_NOTICE, self.theme.dim)),
             PaneState::Complete if self.policy == Some(Policy::Handoff) => {
                 // The command's output went to the new window; an empty pane would read as a
                 // failed run, so the structured outcome line stands in for it.
@@ -807,7 +890,11 @@ impl ResultsPane {
             }
             PaneState::Running | PaneState::Complete | PaneState::Cancelled => {
                 if self.output.truncated {
-                    body.push(Line::from(TRUNCATION_MARKER));
+                    // `dim`, not `warn`. Dropping the oldest lines is disclosure of a bounded
+                    // buffer working as designed, not a problem — and SR-3 calls the marker "the
+                    // security-relevant half" of the ring buffer precisely because it must be
+                    // *present*, which is a text property no style can supply or remove.
+                    body.push(Line::styled(TRUNCATION_MARKER, self.theme.dim));
                 }
                 let lines = self.lines();
                 // The scroll offset counts up from the newest, so the window ENDS
@@ -863,7 +950,9 @@ impl Widget for &ResultsPane {
             // FR-3.3: the strip is a rendered state, and it carries the count so the operator
             // can see there is something to expand into.
             let strip = format!("{COLLAPSED_PREFIX} ({})", self.lines().len());
-            buf.set_string(area.x, area.y, strip, Style::default());
+            // `dim`: a collapsed pane is present but not where the operator is working. The `▸`
+            // and the count are what say "there is something here", and both are text. (#556)
+            buf.set_string(area.x, area.y, strip, self.theme.dim);
             return;
         }
 
@@ -875,22 +964,22 @@ impl Widget for &ResultsPane {
             .block(Block::new())
             .render(body_area, buf);
 
-        buf.set_string(
-            footer_area.x,
-            footer_area.y,
-            self.footer(),
-            Style::default(),
-        );
+        // Rendered through the `Line`, so the style travels with the text rather than being applied
+        // by position here. `set_string` with a separate `Style` argument would work identically
+        // today and would put the style decision in the render site instead of next to the text it
+        // describes — which is how a footer's wording and its meaning drift apart. (#556)
+        self.footer_line().render(footer_area, buf);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        NotRunning, PaneState, Policy, ResultsPane, BUFFER_CAPACITY, CANCELLED_NOTICE,
-        EMPTY_NOTICE, RUNNING_INDICATOR, TRUNCATION_MARKER,
+        NotRunning, PaneState, Policy, ResultsPane, Theme, BUFFER_CAPACITY, CANCELLED_NOTICE,
+        COLLAPSED_PREFIX, EMPTY_NOTICE, REFUSED_NOTICE, RUNNING_INDICATOR, TRUNCATION_MARKER,
     };
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui::Terminal;
     use std::io::Write;
     use std::sync::mpsc;
@@ -1878,6 +1967,439 @@ mod tests {
         assert!(
             !joined.contains("2J"),
             "the payload `2J` must not survive the chunk boundary. Got: {joined:?}"
+        );
+    }
+
+    // ── #556: the semantic colour layer ──────────────────────────────────────────────────────
+
+    /// One pane per [`PaneState`], each in its real state via the public API.
+    ///
+    /// Shared by the styling tests below and built by driving the pane rather than by setting
+    /// fields: a fixture that assigned `state` directly could be in a state the API cannot
+    /// actually produce, and then the tests would be about a pane that does not exist.
+    fn one_pane_per_state() -> Vec<(PaneState, ResultsPane)> {
+        let mut cases: Vec<(PaneState, ResultsPane)> = Vec::new();
+
+        cases.push((PaneState::Collapsed, ResultsPane::new()));
+
+        let mut running = ResultsPane::new();
+        running.attach(Policy::InApp);
+        running.push_bytes(b"working\n");
+        cases.push((PaneState::Running, running));
+
+        let mut complete = ResultsPane::new();
+        complete.attach(Policy::InApp);
+        complete.push_bytes(b"rows\n");
+        complete.complete(0, None);
+        cases.push((PaneState::Complete, complete));
+
+        let mut empty = ResultsPane::new();
+        empty.attach(Policy::InApp);
+        empty.complete(2, None);
+        cases.push((PaneState::Empty, empty));
+
+        let mut cancelled = ResultsPane::new();
+        cancelled.attach(Policy::InApp);
+        cancelled.push_bytes(b"partial\n");
+        cancelled.cancel().expect("running panes may be cancelled");
+        cases.push((PaneState::Cancelled, cancelled));
+
+        let mut refused = ResultsPane::new();
+        refused.attach(Policy::Handoff);
+        refused.refuse("no client".to_string(), Some("tmux ls".to_string()));
+        cases.push((PaneState::Refused, refused));
+
+        assert_eq!(
+            cases.len(),
+            6,
+            "all SIX states must be covered — the interaction spec's five plus `cancelled` from \
+             the Q1 ruling. A seventh state added without a fixture here would leave the styling \
+             guards silently covering six of seven"
+        );
+        for (expected, pane) in &cases {
+            assert_eq!(pane.state(), *expected, "fixture must be in {expected:?}");
+        }
+        cases
+    }
+
+    /// Renders `pane` and returns every cell as `(symbol, fg, bg)`.
+    ///
+    /// The style half is read from the same `Cell` the symbol comes from, so a test cannot assert
+    /// a style the terminal would not actually produce.
+    fn rendered_style_cells(
+        pane: &ResultsPane,
+        width: u16,
+        height: u16,
+    ) -> Vec<(String, Color, Color)> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("a TestBackend terminal must construct");
+        terminal
+            .draw(|frame| frame.render_widget(pane, frame.area()))
+            .expect("rendering into a TestBackend must not fail");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.fg, cell.bg))
+            .collect()
+    }
+
+    /// **FR-5.1 / FR-5.4 / NFR-5 — THE STRIP-STYLING GUARD. Read this before changing wording.**
+    ///
+    /// Every state stays identifiable when **all styling is discarded**. This is the executable
+    /// form of NFR-3's "no state conveyed by colour alone", and it is the one test in this feature
+    /// that must not be allowed to become a formality — because the property it defends is not
+    /// about colour at all. It is about whether the *text* is sufficient.
+    ///
+    /// # Why the expectations come from the constants
+    ///
+    /// [`CANCELLED_NOTICE`], [`EMPTY_NOTICE`], [`RUNNING_INDICATOR`], [`TRUNCATION_MARKER`] and
+    /// [`COLLAPSED_PREFIX`] are read from the module, not retyped here. That is the *opposite* of
+    /// the usual "never source a fixture from the value under test" rule, and the distinction is
+    /// which value is under test: this test asserts the **styling** is unnecessary, so sourcing
+    /// the **wording** from its constant cannot make it vacuous. It also stops the test reddening
+    /// on a copy edit, which is what would eventually get it deleted. The wording itself is pinned
+    /// by [`the_cancelled_wording_does_not_claim_the_command_stopped`] and by SR-4.
+    ///
+    /// `Complete` is the exception and is checked against a literal `exit 0`, because there is no
+    /// constant to read — the string is built by `format!` — and a derived expectation there would
+    /// agree with the formatter through any typo in it.
+    ///
+    /// # What "styling discarded" means here
+    ///
+    /// The cells' symbols are read and their `fg`/`bg` thrown away, which is what a screen reader,
+    /// a pipe, a `TERM=dumb` terminal, and a monochrome operator all see. The test does not render
+    /// under `monochrome()` to achieve this — that would prove something weaker, since
+    /// `monochrome()` keeps `Modifier::BOLD`. Discarding the style entirely is the stronger claim.
+    ///
+    /// **Mutation-proven (FR-5.4).** Dropping [`CANCELLED_NOTICE`] from the footer turns this red.
+    #[test]
+    fn every_state_is_identifiable_with_all_styling_discarded() {
+        for (state, pane) in one_pane_per_state() {
+            let text: String = rendered_style_cells(&pane, 70, 6)
+                .into_iter()
+                .map(|(symbol, _fg, _bg)| symbol)
+                .collect();
+
+            // The marker each state must be identifiable BY, in text alone.
+            let expected: &str = match state {
+                PaneState::Collapsed => COLLAPSED_PREFIX,
+                PaneState::Running => RUNNING_INDICATOR,
+                // No constant: built by `format!`, so a derived expectation would agree with the
+                // formatter through any typo in it.
+                PaneState::Complete => "exit 0",
+                PaneState::Empty => EMPTY_NOTICE,
+                PaneState::Cancelled => CANCELLED_NOTICE,
+                PaneState::Refused => REFUSED_NOTICE,
+            };
+
+            assert!(
+                text.contains(expected),
+                "{state:?} is NOT identifiable from text alone.\n\
+                 \n\
+                 Expected the rendered cells to contain {expected:?}, but got:\n  {text:?}\n\
+                 \n\
+                 This is FR-5.1 and NFR-3: no state may be conveyed by colour alone. An operator \
+                 on a monochrome terminal, a screen-reader user, and anyone piping this output all \
+                 see exactly the text above and no styling whatsoever. If you reached this by \
+                 moving a distinction into a colour, move it back into the words."
+            );
+        }
+    }
+
+    /// The foreground the given text is actually drawn in, located by scanning rendered rows.
+    ///
+    /// Reads the style from the same cells the text occupies rather than from a helper on the pane,
+    /// so a test using this cannot pass by agreeing with a mapping function that is itself wrong.
+    /// Panics if the text is absent, which keeps "the style is right" from silently degrading into
+    /// "the text was not there, so nothing was checked".
+    fn foreground_of(pane: &ResultsPane, width: u16, height: u16, needle: &str) -> Color {
+        let cells = rendered_style_cells(pane, width, height);
+        let rows: Vec<&[(String, Color, Color)]> = cells.chunks(width as usize).collect();
+
+        for row in &rows {
+            let text: String = row.iter().map(|(symbol, _, _)| symbol.as_str()).collect();
+            if let Some(start) = text.find(needle) {
+                // `find` returns a BYTE offset; the cells are graphemes. Every needle these tests
+                // pass is ASCII, so the two coincide — asserted rather than assumed, because a
+                // future non-ASCII needle would silently read the style of the wrong cell.
+                assert!(
+                    needle.is_ascii() && text.is_char_boundary(start),
+                    "foreground_of indexes cells by byte offset and so requires an ASCII needle; \
+                     got {needle:?}"
+                );
+                let foregrounds: Vec<Color> = row[start..start + needle.len()]
+                    .iter()
+                    .map(|(_, fg, _)| *fg)
+                    .collect();
+                let first = foregrounds[0];
+                assert!(
+                    foregrounds.iter().all(|fg| *fg == first),
+                    "{needle:?} is drawn in more than one colour ({foregrounds:?}), so there is no \
+                     single role to check"
+                );
+                return first;
+            }
+        }
+
+        let all: String = cells.iter().map(|(symbol, _, _)| symbol.as_str()).collect();
+        panic!("{needle:?} was not rendered at all, so its style could not be read. Got: {all:?}");
+    }
+
+    /// **FR-4.1 — `exit 0` carries the `ok` role.**
+    ///
+    /// Asserted on the rendered cells via [`foreground_of`], not on [`ResultsPane::footer_style`]:
+    /// a test that called the mapping helper and compared it to the theme would agree with the
+    /// helper through any error in it.
+    #[test]
+    fn a_zero_exit_footer_carries_the_ok_role() {
+        let mut pane = ResultsPane::new();
+        pane.attach(Policy::InApp);
+        pane.push_bytes(b"output\n");
+        pane.complete(0, None);
+        pane.set_theme(Theme::colour());
+
+        let expected = Theme::colour().ok.fg.expect("`ok` sets a foreground");
+        assert_eq!(
+            foreground_of(&pane, 40, 3, "exit 0"),
+            expected,
+            "a successful exit must be drawn in the `ok` role"
+        );
+    }
+
+    /// **FR-4.1 — a non-zero `exit` carries the `error` role.**
+    #[test]
+    fn a_non_zero_exit_footer_carries_the_error_role() {
+        let mut pane = ResultsPane::new();
+        pane.attach(Policy::InApp);
+        pane.push_bytes(b"output\n");
+        pane.complete(1, None);
+        pane.set_theme(Theme::colour());
+
+        let expected = Theme::colour().error.fg.expect("`error` sets a foreground");
+        assert_eq!(
+            foreground_of(&pane, 40, 3, "exit 1"),
+            expected,
+            "a failing exit must be drawn in the `error` role"
+        );
+    }
+
+    /// **FR-4.1 / A-1 — a MISSING exit code carries `warn`, not `error`.**
+    ///
+    /// Three arms, not two, and this is the third. A missing exit code does not mean the command
+    /// failed; it means the pane reached a terminal state without one. Colouring that `error` would
+    /// have the pane assert a failure it has no evidence for — and it is the likeliest defect in
+    /// this feature, because the two-way `Some(0)` / `Some(_)` branch is the obvious one to write.
+    ///
+    /// # Why this one sets the field directly
+    ///
+    /// [`ResultsPane::complete`] takes `exit_code: i32` and always stores `Some`, so `exit ?` is
+    /// **unreachable through the public API today**. It is a defensive arm. The two honest options
+    /// were to delete the arm or to test it below the API; deleting it would put a `match` on
+    /// `Option` with no `None` case, i.e. a compile error, so the arm has to exist and therefore
+    /// has to be right. This test lives inside the module, drives the pane through the real API
+    /// first, then clears the one field the API cannot clear — and says so here so nobody reads it
+    /// as evidence that `exit ?` is reachable.
+    #[test]
+    fn a_missing_exit_code_footer_carries_warn_not_error() {
+        let mut pane = ResultsPane::new();
+        pane.attach(Policy::InApp);
+        pane.push_bytes(b"output\n");
+        pane.complete(0, None);
+        pane.set_theme(Theme::colour());
+
+        assert_eq!(
+            pane.exit_code,
+            Some(0),
+            "precondition: `complete` stores the code, which is why this state needs forcing"
+        );
+        pane.exit_code = None;
+        assert_eq!(
+            pane.state(),
+            PaneState::Complete,
+            "clearing the code must not disturb the state — the footer arm under test is the \
+             `Complete`/`Empty` one"
+        );
+
+        let theme = Theme::colour();
+        let warn = theme.warn.fg.expect("`warn` sets a foreground");
+        let error = theme.error.fg.expect("`error` sets a foreground");
+        assert_ne!(
+            warn, error,
+            "precondition: if `warn` and `error` were the same colour this test could not fail"
+        );
+
+        assert_eq!(
+            foreground_of(&pane, 40, 3, "exit ?"),
+            warn,
+            "a missing exit code must be `warn`, NOT `error`: it does not mean the command failed, \
+             only that no code arrived (A-1)"
+        );
+    }
+
+    /// The three exit roles are **actually different styles**.
+    ///
+    /// Without this, [`the_exit_footer_distinguishes_success_failure_and_absence`] would pass on a
+    /// theme whose `ok`, `error` and `warn` were all the same value — the three-way distinction
+    /// asserted against a palette that does not make it. This is the anti-vacuity half.
+    ///
+    /// Note `required` and `warn` ARE the same style by design (both `Yellow`), so this checks only
+    /// the three roles the exit footer uses. A blanket "all six roles differ" would be a stronger
+    /// claim than the palette makes and would fail on a deliberate decision.
+    #[test]
+    fn the_three_exit_roles_are_mutually_distinguishable() {
+        let theme = Theme::colour();
+        assert_ne!(theme.ok, theme.error, "`exit 0` and `exit 1` must differ");
+        assert_ne!(
+            theme.error, theme.warn,
+            "`exit 1` and `exit ?` must differ, or the three-way branch is decoration"
+        );
+        assert_ne!(theme.ok, theme.warn, "`exit 0` and `exit ?` must differ");
+    }
+
+    /// **FR-3.3 end-to-end — under `NO_COLOR`, every rendered cell is `Color::Reset`.**
+    ///
+    /// The value-level version of this lives in `theme.rs`; this is the render-level one, and it is
+    /// the half that catches a style applied *outside* the theme. A `Color::Green` written inline
+    /// at a call site would satisfy every assertion in `theme.rs` and fail here.
+    ///
+    /// `bg` is checked as well as `fg`: `Cell::EMPTY` is `fg: Reset, bg: Reset`, so a monochrome
+    /// render is required to be indistinguishable from an unstyled one in both channels.
+    #[test]
+    fn under_no_color_every_rendered_cell_is_reset() {
+        for (state, mut pane) in one_pane_per_state() {
+            pane.set_theme(Theme::monochrome());
+
+            for (symbol, fg, bg) in rendered_style_cells(&pane, 70, 6) {
+                assert_eq!(
+                    fg,
+                    Color::Reset,
+                    "{state:?} rendered cell {symbol:?} with foreground {fg:?} under \
+                     NO_COLOR. Every role in the monochrome theme is Color::Reset, so a coloured \
+                     cell here means a style was applied OUTSIDE the theme — an inline colour at a \
+                     call site that `from_env` cannot switch off (FR-3.3, FR-1.4)"
+                );
+                assert_eq!(
+                    bg,
+                    Color::Reset,
+                    "{state:?} rendered cell {symbol:?} with background {bg:?} under NO_COLOR. A \
+                     background colour is still colour"
+                );
+            }
+        }
+    }
+
+    /// The colour theme **does** reach the cells — the anti-vacuity floor for the render path.
+    ///
+    /// Every styling assertion above is satisfied by a pane that applies no style at all:
+    /// [`under_no_color_every_rendered_cell_is_reset`] passes trivially if nothing is ever styled,
+    /// and the strip guard passes *by design* when styling is absent. So without this test, wave 1
+    /// of this feature could be a no-op with a green suite.
+    ///
+    /// Deliberately weak about *which* cells: it asserts only that at least one rendered cell
+    /// carries a non-`Reset` foreground drawn from the palette. Pinning positions would make it a
+    /// layout test that reddens on a wording change.
+    #[test]
+    fn the_colour_theme_actually_reaches_the_rendered_cells() {
+        let theme = Theme::colour();
+        let palette: Vec<Color> = theme
+            .roles()
+            .iter()
+            .filter_map(|(_, style)| style.fg)
+            .collect();
+
+        let mut states_with_colour = 0;
+        for (state, mut pane) in one_pane_per_state() {
+            pane.set_theme(theme);
+            let coloured: Vec<_> = rendered_style_cells(&pane, 70, 6)
+                .into_iter()
+                .filter(|(_, fg, _)| *fg != Color::Reset)
+                .collect();
+
+            if !coloured.is_empty() {
+                states_with_colour += 1;
+                for (symbol, fg, _) in coloured {
+                    assert!(
+                        palette.contains(&fg),
+                        "{state:?} rendered {symbol:?} with {fg:?}, which is not in the theme's \
+                         palette ({palette:?}). A colour that is not a role is a colour \
+                         `NO_COLOR` cannot switch off (FR-1.4)"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            states_with_colour >= 4,
+            "only {states_with_colour} of 6 states rendered any colour at all. This is the \
+             anti-vacuity floor: every other styling assertion in this module is satisfied by a \
+             pane that styles nothing, so if the palette stopped reaching the cells this is the \
+             only test that would notice"
+        );
+    }
+
+    /// A forgotten [`ResultsPane::set_theme`] leaves the pane in **colour**, not monochrome.
+    ///
+    /// The failure this guards is asymmetric. A default of `monochrome()` would make a missing
+    /// `set_theme` call look like working code that simply has no colour — invisible in review and
+    /// invisible at run time, since nothing is broken. Defaulting to colour makes the same mistake
+    /// visible as "colour is on when `NO_COLOR` is set", which somebody reports.
+    #[test]
+    fn a_pane_with_no_theme_set_renders_in_colour() {
+        let mut fresh = ResultsPane::new();
+        fresh.attach(Policy::InApp);
+        fresh.complete(1, None);
+
+        let explicit = {
+            let mut pane = ResultsPane::new();
+            pane.attach(Policy::InApp);
+            pane.complete(1, None);
+            pane.set_theme(Theme::colour());
+            rendered_style_cells(&pane, 40, 3)
+        };
+
+        assert_eq!(
+            rendered_style_cells(&fresh, 40, 3),
+            explicit,
+            "a pane whose theme was never set must render exactly as one set to Theme::colour(). \
+             Defaulting to monochrome would make a forgotten set_theme call indistinguishable from \
+             working code"
+        );
+    }
+
+    /// Adding styling did **not** open the SR-1 escape path.
+    ///
+    /// `results_pane.rs`'s module docs record two measured facts: `Span::raw` does not put an ESC
+    /// byte into a `Cell` in ratatui 0.30.2 (the grapheme filter drops control characters), but
+    /// `Cell::set_symbol` is public and bypasses that filter entirely. So "we now attach styles"
+    /// is safe only as long as the styling goes through `Line`/`Span`, which is a property of the
+    /// implementation rather than of the API.
+    ///
+    /// This asserts it from the outside for every state, styled: no rendered cell contains an ESC
+    /// byte and no cell contains the `[2J` payload residue. The residue half is the half that can
+    /// fail — see the module docs on why the ESC half alone is vacuous.
+    #[test]
+    fn styling_did_not_open_a_path_for_an_escape_to_reach_a_cell() {
+        let mut pane = ResultsPane::new();
+        pane.set_theme(Theme::colour());
+        pane.attach(Policy::InApp);
+        pane.push_bytes(b"before\x1b[2Jafter\n");
+        pane.complete(0, None);
+
+        let cells = rendered_style_cells(&pane, 60, 4);
+        let text: String = cells.iter().map(|(symbol, _, _)| symbol.as_str()).collect();
+
+        assert!(
+            !text.bytes().any(|byte| byte == 0x1b),
+            "an ESC byte reached a rendered cell. Note this half of the assertion cannot fail via \
+             Span/Paragraph in ratatui 0.30.2 — it is here to catch a switch to Cell::set_symbol, \
+             which bypasses the grapheme filter (SR-1)"
+        );
+        assert!(
+            !text.contains("2J"),
+            "the payload residue `[2J` reached a rendered cell, so the strip was bypassed. This is \
+             the half that CAN fail: got {text:?}"
         );
     }
 

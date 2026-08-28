@@ -280,9 +280,11 @@ def _translate_decision(
 ) -> Dict[str, Any]:
     """Translate a user decision into provider-specific terminal input.
 
-    Returns a dict with either:
+    Returns a dict with one of:
     - {"type": "text", "value": str} for text input
-    - {"type": "key", "value": str} for special key
+    - {"type": "key", "value": str} for one special key
+    - {"type": "keys", "value": list[str]} for an ordered key sequence
+    Existing providers retain their single-action behavior.
     """
     if decision == ApprovalDecision.EDIT:
         # Edit always sends the edited text, sanitized against terminal escape
@@ -300,6 +302,14 @@ def _translate_decision(
             return {"type": "key", "value": "Enter"}
         else:  # deny
             return {"type": "key", "value": "Escape"}
+
+    elif provider == "omp":
+        # OMP 17.2.10's selector starts with Approve selected. Enter submits
+        # approve; Down then Enter selects and submits Deny.
+        if decision == ApprovalDecision.APPROVE:
+            return {"type": "key", "value": "Enter"}
+        else:  # deny
+            return {"type": "keys", "value": ["Down", "Enter"]}
 
     elif provider == "kiro_cli":
         if decision == ApprovalDecision.APPROVE:
@@ -394,7 +404,15 @@ class AgentHandoffWithApproval(AguiConstruct):
         # JOINS the in-flight task instead of starting a second delivery, and
         # the task is SHIELDED from awaiter cancellation, so an aborted
         # /agui/v1/run stream cannot let a retry deliver a contrary decision (P1).
-        self._inflight: Dict[str, "asyncio.Future[Interrupt]"] = {}
+        self._inflight: Dict[str, asyncio.Task] = {}
+        # Number of keys in a multi-key action that have been delivered. A
+        # retry after a partial delivery resumes at the first unsent key rather
+        # than replaying a selector movement against the live terminal state.
+        self._delivery_progress: Dict[str, int] = {}
+        # Original decision for a partially delivered multi-key action. A
+        # contrary retry must continue the original terminal selection rather
+        # than applying a new decision to the already-moved selector.
+        self._delivery_decisions: Dict[str, ApprovalDecision] = {}
         # Per-terminal delivery locks. A delivery worker OUTLIVES its interrupt's
         # registry state (a status flap can expire interrupt A and open a new
         # interrupt B on the SAME terminal while A's worker is still pasting), and
@@ -519,8 +537,17 @@ class AgentHandoffWithApproval(AguiConstruct):
             # already under way. The first decision to reach here wins.
             task = self._inflight.get(interrupt_id)
             if task is None:
-                # First resume: validate THIS decision under the lock so an
-                # invalid decision is rejected without starting any delivery.
+                # Once a multi-key action has physically delivered a prefix,
+                # retries must remain pinned to that original decision. The
+                # presence of a pinned decision proves that at least one key
+                # was delivered; with zero delivered keys, callers may retry
+                # with a different valid decision.
+                pinned_decision = self._delivery_decisions.get(interrupt_id)
+                if pinned_decision is not None:
+                    decision = pinned_decision
+
+                # Validate the effective decision under the lock so an invalid
+                # decision is rejected without starting any delivery.
                 if decision.value not in interrupt.options:
                     raise ValueError(
                         f"Decision '{decision.value}' not supported for this interrupt. "
@@ -638,12 +665,28 @@ class AgentHandoffWithApproval(AguiConstruct):
                                 terminal_id,
                                 action["value"],
                             )
+                        elif action["type"] == "keys":
+                            keys = action["value"]
+                            start_index = self._delivery_progress.get(interrupt_id, 0)
+                            for index in range(start_index, len(keys)):
+                                await asyncio.to_thread(
+                                    self._answer_delivery.send_special_key,
+                                    terminal_id,
+                                    keys[index],
+                                )
+                                # Advance only after the backend call returns:
+                                # a failed key remains retryable, while a
+                                # successfully delivered prefix is not replayed.
+                                self._delivery_progress[interrupt_id] = index + 1
+                                self._delivery_decisions.setdefault(interrupt_id, decision)
                     except Exception as e:
                         # Reconcile a concurrent expire() (unlocked sync path) that
                         # resolved this interrupt while the FAILED delivery was in
                         # flight: nothing was delivered, so expiry wins and the
                         # failure is NOT advertised as retryable.
                         if interrupt.resolved:
+                            self._delivery_progress.pop(interrupt_id, None)
+                            self._delivery_decisions.pop(interrupt_id, None)
                             logger.info(
                                 "delivery failed but interrupt %s expired mid-flight;"
                                 " honoring expiry",
@@ -682,6 +725,8 @@ class AgentHandoffWithApproval(AguiConstruct):
         interrupt.resolved = True
         interrupt.outcome = decision.value
         self._resolved_at[interrupt_id] = time.monotonic()
+        self._delivery_progress.pop(interrupt_id, None)
+        self._delivery_decisions.pop(interrupt_id, None)
         if terminal_id and self._terminal_to_interrupt.get(terminal_id) == interrupt_id:
             del self._terminal_to_interrupt[terminal_id]
 
@@ -723,6 +768,8 @@ class AgentHandoffWithApproval(AguiConstruct):
         interrupt.resolved = True
         interrupt.outcome = "expired"
         self._resolved_at[interrupt_id] = time.monotonic()
+        self._delivery_progress.pop(interrupt_id, None)
+        self._delivery_decisions.pop(interrupt_id, None)
 
         # Remove from terminal map
         del self._terminal_to_interrupt[terminal_id]

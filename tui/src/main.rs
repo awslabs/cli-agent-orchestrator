@@ -44,6 +44,12 @@ mod results_pane;
 /// Six methods, six error variants, the 21-route table, and no subprocess anywhere (ADR-02).
 /// (#321)
 mod server;
+/// The semantic colour layer (#556): six roles, an ANSI-16 palette, and `NO_COLOR`. **The only
+/// module permitted to name a `Color`** — every other module says `theme.error`, and
+/// `tests/no_colour_literal_outside_theme.rs` makes that a failing test rather than a convention.
+/// Colour is decoration only: every state this crate shows is already textual, which is NFR-3 of
+/// #321 and the reason `NO_COLOR` costs nothing to honour. (#556)
+mod theme;
 /// The wire vocabulary six later units share. Declared here so every consumer imports the
 /// types from one place rather than redeclaring the server's shapes locally. (#321)
 mod types;
@@ -255,6 +261,12 @@ fn run_app() -> Result<(), TuiError> {
     let mut shell = renderer::Renderer::new(server.as_ref(), &host, cols, rows)
         .with_concurrent_pickers(Arc::clone(&server));
 
+    // `NO_COLOR` is read exactly ONCE, here, and the resolved palette is threaded down (#556).
+    // Re-reading it per frame would let a mid-session change produce a half-coloured screen, and
+    // reading it deeper in the call tree would make every unit test's output depend on the ambient
+    // environment. This is the only `from_env` call in the crate.
+    shell.set_theme(theme::Theme::from_env());
+
     // A `Fatal` here exits non-zero with one styled line — never a traceback (SR-1). Mapped into
     // `TuiError` because this function's signature is the boundary contract, and `Fatal`'s own
     // `Display` already carries the whole operator-facing sentence.
@@ -268,6 +280,17 @@ fn run_app() -> Result<(), TuiError> {
     if !interactive {
         let frame = shell.render();
         let mut out = io::stdout().lock();
+        // `{line}` on a `Line` writes its spans' content and **no SGR codes** — checked in
+        // ratatui-core 0.1.2, `Span`'s `Display` is a plain `write!` of `content`. That is what
+        // keeps a pipe free of escapes now that these are styled values (SR-1); it is relied upon
+        // here rather than merely true, so it is written down. Guarded by
+        // `renderer::tests::a_styled_line_displays_without_escape_codes` — nothing asserted this
+        // from a real piped process, and a dependency on an upstream `Display` impl with no test
+        // behind it is what silently breaks on a minor-version bump.
+        //
+        // Still header+footer only, deliberately: this is the pipe frame from #321, and widening it
+        // to `plain_lines()` would change what `cao-tui | ...` prints under cover of a colour
+        // change. (#556)
         for line in frame.header.iter().chain(&frame.footer) {
             writeln!(out, "{line}")?;
         }

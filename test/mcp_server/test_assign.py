@@ -103,27 +103,25 @@ class TestCreateTerminalProviderResolution:
     @patch(
         "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="kiro_cli")
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="mcode")
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    def test_deferred_init_sends_message_in_json_body_not_params(
+    def test_mcode_worker_omits_kiro_engine_and_forwards_model(
         self, mock_requests, mock_resolve_provider, mock_allowed_tools
     ):
-        """defer_init must carry the prompt in the JSON body (not the query
-        string) so prompt content isn't logged in HTTP access logs and isn't
-        subject to URL-length limits."""
+        """MCode workers omit Kiro-only engine but receive a terminal-local model."""
         from cli_agent_orchestrator.mcp_server.server import _create_terminal
         from cli_agent_orchestrator.models.inbox import OrchestrationType
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
-            "provider": "kiro_cli",
-            "engine": "kas",
+            "provider": "mcode",
+            "engine": None,
             "session_name": "cao-session",
             "allowed_tools": None,
         }
         metadata_response.raise_for_status.return_value = None
         post_response = MagicMock()
-        post_response.json.return_value = {"id": "worker-1", "provider": "kiro_cli"}
+        post_response.json.return_value = {"id": "worker-1", "provider": "mcode"}
         post_response.raise_for_status.return_value = None
         mock_requests.get.return_value = metadata_response
         mock_requests.post.return_value = post_response
@@ -132,17 +130,17 @@ class TestCreateTerminalProviderResolution:
             _create_terminal(
                 "reviewer",
                 working_directory=None,
+                engine="v2",
                 defer_init=True,
                 initial_message="Analyze the sensitive logs at /secret/path",
                 initial_message_orchestration_type=OrchestrationType.ASSIGN,
-                model="",
+                model="MiniMax-M2.1",
             )
 
         _, kwargs = mock_requests.post.call_args
-        # Routing flag stays in params; message payload is in the body.
         assert kwargs["params"].get("defer_init") == "true"
-        # Even an invalid empty override reaches the API validation boundary.
-        assert kwargs["params"]["model"] == ""
+        assert "engine" not in kwargs["params"]
+        assert kwargs["params"]["model"] == "MiniMax-M2.1"
         assert "initial_message" not in kwargs["params"]
         assert kwargs["json"]["initial_message"] == "Analyze the sensitive logs at /secret/path"
         assert kwargs["json"]["initial_message_orchestration_type"] == "assign"

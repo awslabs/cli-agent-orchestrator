@@ -209,6 +209,20 @@ PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRAC
 # After this many attempts, give up loudly and drop the terminal from the
 # watchdog, exactly like the rearm()-exception path already does.
 PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
+# Cap on consecutive liveness-PROBE failures per terminal (harness-control#845). The
+# probe (a tmux ``capture-pane``/``get_history``) raises — e.g. libtmux
+# ``ObjectDoesNotExist`` — when the session, window, or the whole tmux server is gone.
+# That exception path reaches NEITHER the rearm-failure NOR the cold-start counter above
+# (both sit downstream of a probe that RETURNED), so before this bound a terminal whose
+# session/server had died was re-probed every PIPE_LIVENESS_CHECK_INTERVAL_S forever, each
+# tick emitting a full-traceback ERROR — an unbounded, self-amplifying log/CPU storm across
+# every ghost terminal exactly when the box is already unhealthy (live incident: ~578k
+# error lines, a strong contributor to a near-simultaneous mass session teardown). After
+# this many consecutive probe failures, give up loudly ONCE and drop the terminal from the
+# watchdog, exactly like the rearm-exception and cold-start paths already do. The counter
+# resets on any successful probe, so a brief transient (a session momentarily unavailable
+# but not gone) never accumulates to a false drop.
+PIPE_LIVENESS_MAX_PROBE_FAILURES = _env_int("CAO_PIPE_LIVENESS_MAX_PROBE_FAILURES", 5)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
@@ -459,23 +473,83 @@ WS_ALLOWED_CLIENTS = [
 WS_ALLOWED_ORIGINS = _split_env_list("CAO_WS_ALLOWED_ORIGINS")
 
 
-def _origin_authority(origin: str) -> "str | None":
-    """Return the ``host[:port]`` authority of an http/https ``Origin``.
+# ASGI reports ``ws``/``wss`` on a WebSocket scope, while a browser always
+# serializes the ``Origin`` header with the matching ``http``/``https`` scheme.
+# Fold the WebSocket forms onto the origin forms before comparing the two.
+_REQUEST_SCHEME_AS_ORIGIN_SCHEME = {
+    "http": "http",
+    "https": "https",
+    "ws": "http",
+    "wss": "https",
+}
+
+
+def _origin_scheme_and_authority(origin: str) -> "tuple[str, str] | None":
+    """Return ``(scheme, host[:port])`` for a plain http/https ``Origin``.
 
     ``None`` for anything that is not a plain http/https origin — an opaque
     ``"null"`` origin, a ``file://``/``data:`` scheme, or a malformed value —
     so those never satisfy the same-origin match below.
     """
-    parts = urlsplit(origin)
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        # A malformed bracketed host (e.g. ``http://[``) makes ``urlsplit``
+        # raise instead of returning an unparsed result. Both callers sit on
+        # request paths that must fail closed with a 403, not propagate a 500
+        # from an unguarded parse error.
+        return None
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return None
     # ``netloc`` may carry userinfo (user:pass@host); the authority a browser
     # actually reports in ``Origin`` never does, but strip it defensively so a
     # crafted value can't smuggle the trusted host into the userinfo segment.
-    return parts.netloc.rsplit("@", 1)[-1]
+    return parts.scheme, parts.netloc.rsplit("@", 1)[-1]
 
 
-def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
+def _is_same_origin(origin: str, host: str, scheme: "str | None") -> bool:
+    """Whether ``origin`` is same-origin with the request ``host``/``scheme``.
+
+    RFC 6454 defines an origin as the (scheme, host, port) triple, so the
+    authority match alone is not sufficient: ``http://h`` and ``https://h`` are
+    different origins.
+
+    The scheme comparison is deliberately one-directional. An ``http`` Origin on
+    an ``https`` request is rejected, which is unambiguous. An ``https`` Origin
+    on a request the server sees as plain ``http`` is still accepted, because
+    that is exactly the shape an HTTPS-terminating proxy produces when its
+    address is not in ``TRUSTED_FORWARDER_IPS``: uvicorn then ignores
+    ``X-Forwarded-Proto`` and reports ``scheme="http"`` for a request the browser
+    genuinely made over TLS. Rejecting that direction would break working
+    reverse-proxy and Codespaces deployments without closing a real hole, since
+    forging it means already controlling the victim's own origin over TLS.
+
+    That leniency has a corollary worth stating: the comparison only does
+    anything where ``scheme`` is trustworthy, meaning uvicorn terminates TLS
+    itself or the proxy is listed in ``TRUSTED_FORWARDER_IPS``. Behind an
+    untrusted proxy ``scheme`` is ``"http"`` on a request the browser made over
+    TLS, and the check is then inert in both directions: the ``http`` Origin is
+    accepted as well. Operators who want it enforced should set
+    ``CAO_FORWARDED_ALLOW_IPS`` to the proxy address.
+
+    ``scheme=None`` skips the comparison entirely, preserving the behaviour
+    callers had before the scheme was threaded through.
+    """
+    parsed = _origin_scheme_and_authority(origin)
+    if parsed is None:
+        return False
+    origin_scheme, authority = parsed
+    if authority != host:
+        return False
+    if scheme is None:
+        return True
+    request_scheme = _REQUEST_SCHEME_AS_ORIGIN_SCHEME.get(scheme.lower())
+    return not (request_scheme == "https" and origin_scheme == "http")
+
+
+def is_ws_origin_allowed(
+    origin: "str | None", host: "str | None" = None, scheme: "str | None" = None
+) -> bool:
     """Whether a WebSocket handshake ``Origin`` header may open a PTY socket.
 
     Rules, tightest-safe first:
@@ -506,6 +580,10 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
       this branch too — the same explicit-opt-out tradeoff as
       ``CAO_WS_ALLOWED_CLIENTS="*"``. Keep ``ALLOWED_HOSTS`` scoped to the real
       serving hostname(s) rather than ``*`` whenever possible.
+
+      When ``scheme`` is supplied (the ASGI ``scope["scheme"]``, i.e. ``ws`` or
+      ``wss``), the match also requires the schemes to agree. See
+      ``_is_same_origin``.
     * Otherwise the ``Origin`` must appear in the explicit allowlists: the same
       ``CORS_ORIGINS`` list the HTTP API enforces plus any
       ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the
@@ -524,14 +602,61 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
         return True
     if "*" in WS_ALLOWED_ORIGINS:
         return True
-    if host:
-        authority = _origin_authority(origin)
-        if authority is not None and authority == host:
-            return True
+    if host and _is_same_origin(origin, host, scheme):
+        return True
     # Membership only — an operator's ``CAO_CORS_ORIGINS="*"`` lands as the
     # literal string "*" in this list and matches ONLY a literal "*" Origin
     # (which no browser sends), so it never widens PTY trust. See docstring.
     return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
+
+
+def is_http_origin_allowed(
+    origin: "str | None", host: "str | None" = None, scheme: "str | None" = None
+) -> bool:
+    """Whether a state-changing HTTP request ``Origin`` header is trusted.
+
+    CSRF / CWE-352 guard for the default-unauthenticated HTTP surface, mirroring
+    ``is_ws_origin_allowed`` on the read/mutation HTTP split:
+
+    * A missing / empty ``Origin`` is allowed. Browsers always attach one on a
+      cross-site state-changing request (``fetch``, XHR, and form posts alike),
+      so its absence means a non-browser client (curl, ``requests``, MCP, the
+      ``cao`` CLI) — one with no ambient credentials a foreign page could use.
+    * A literal ``*`` in ``CORS_ORIGINS`` (i.e. ``CAO_CORS_ORIGINS="*"``) allows
+      every origin — the operator-visible wildcard that ``CORSMiddleware``
+      already honors for the read surface, so a ``"*"``-configured deployment
+      behaves consistently for writes too.
+    * **Same-origin**: the ``Origin`` authority equals the request ``Host``.
+      This is the request the bundled Web UI makes when served by cao-server
+      itself, and it is exactly what a cross-site attacker CANNOT forge —
+      script-set ``Host`` is forbidden and the real ``Host`` is the CAO server
+      the request was made to, not the attacker's page. Matching on the live
+      ``Host`` lets the imported-app deployment and dynamic reverse-proxy /
+      Codespaces hostnames work without pre-registering every origin.
+
+      Like the WebSocket branch, this trusts ``Host`` and is only as safe as
+      ``Host`` itself: ``TrustedHostMiddleware`` validates ``Host`` against
+      ``ALLOWED_HOSTS`` on the same scope BEFORE the HTTP origin check runs,
+      which keeps the match DNS-rebinding-safe in the default loopback config.
+      ``CAO_ALLOWED_HOSTS="*"`` opts out of that protection, matching the WS
+      guard's documented tradeoff.
+
+      When ``scheme`` is supplied (the ASGI ``scope["scheme"]``), the match also
+      requires the schemes to agree, so an ``https`` request no longer accepts a
+      plain-``http`` Origin as same-origin. See ``_is_same_origin`` for why the
+      comparison is one-directional.
+    * Otherwise the ``Origin`` must be in ``CORS_ORIGINS``. Exact-string match
+      mirrors how the browser serializes ``Origin`` and how ``CORSMiddleware``
+      compares it, so anything the CORS layer already trusts for reads is
+      trusted for writes too.
+    """
+    if not origin:
+        return True
+    if "*" in CORS_ORIGINS:
+        return True
+    if host and _is_same_origin(origin, host, scheme):
+        return True
+    return origin in CORS_ORIGINS
 
 
 # Trusted upstream IP allowlist for uvicorn's ``proxy_headers`` and
@@ -638,11 +763,47 @@ WORKFLOW_MAX_SPEC_BYTES = 256 * 1024
 WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH = 8
 WORKFLOW_MAX_INPUTS = 64
 
+# SQLite busy-timeout for journal connections, in milliseconds (issue #583, NFR-4).
+# Journal writes are single-row upserts in one short transaction, so the realistic
+# contention window is milliseconds; 5000 gives ~3 orders of magnitude of headroom, which
+# makes "database is locked" mean a genuinely stuck writer rather than ordinary collision.
+# Per-connection (unlike WAL, which is per-database and deliberately out of scope,
+# ADR-583-10).
+WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS = 5000
+
 # Max size (bytes) of the compact-JSON resolved inputs map delivered to a script
 # run via the CAO_WORKFLOW_INPUTS spawn-env key. Enforced at the run route, on
 # the RESOLVED map, BEFORE any journal write or registry registration (ADR-5) —
 # never inside _build_env. An oversized payload is rejected as ValueError -> 400.
 WORKFLOW_INPUTS_MAX_BYTES = 32768
+
+# Byte bound on the persisted step result text (issue #583, NFR-1 / TD-2). Applied to
+# ``last_message`` AFTER redaction (never before — SR-1), on the UTF-8 encoding rather
+# than the character count, because the bound is a storage limit. Matches
+# WORKFLOW_INPUTS_MAX_BYTES rather than inventing a fourth magnitude: being slightly
+# tight is VISIBLE (``truncated=True`` on the envelope) and cheap to revise from a named
+# constant, while being loose accumulates SILENTLY in a shared database that has no
+# eviction for this column.
+WORKFLOW_JOURNAL_RESULT_MAX_BYTES = 32768
+
+# Byte bound on the persisted execution manifest envelope (issue #583 Bolt 2, NFR-1 /
+# ADR-583-12). Applied to the compact-JSON encoding AFTER redaction (never before — a
+# secret straddling the bound would otherwise survive), on the UTF-8 byte length rather
+# than the character count, because the bound is a storage limit.
+#
+# 256 KiB MATCHES WORKFLOW_MAX_SPEC_BYTES RATHER THAN THE 32768 USED BY ITS TWO
+# NEIGHBOURS, AND THE ARITHMETIC IS THE REASON. The manifest CONTAINS the resolved
+# inputs map, which is separately allowed up to WORKFLOW_INPUTS_MAX_BYTES (32768). A
+# 32 KiB manifest bound would therefore be tighter than one of its own eleven fields:
+# any workflow using its full inputs allowance would truncate on EVERY run, and what
+# gets sacrificed is the frozen memory content — FR-9's entire payload. Truncation would
+# become the normal case, destroying the ``truncated`` flag's value as a signal.
+#
+# The cost is accepted deliberately: this is the loosest of the workflow bounds, in a
+# column with no eviction. Mitigating facts — it is one row per RUN rather than per step,
+# the flag makes truncation visible when it does fire, and this is a named constant that
+# is cheap to tighten if truncation is never observed in practice.
+WORKFLOW_MANIFEST_MAX_BYTES = 256 * 1024
 
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every

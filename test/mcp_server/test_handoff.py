@@ -399,6 +399,28 @@ class TestHandoffModelOverride:
 
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_mcode_omits_kiro_engine_and_forwards_model(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("mcode")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            result = asyncio.run(
+                _handoff_impl(
+                    "report_generator",
+                    "Create a report template",
+                    engine="v2",
+                    model="MiniMax-M2.1",
+                )
+            )
+
+        assert result.success is True
+        payload = mock_requests.post.call_args[1]["json"]
+        assert "engine" not in payload
+        assert payload["model"] == "MiniMax-M2.1"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_model_is_forwarded_in_payload(self, mock_provider, _nudge):
         mock_provider.return_value = _ctx("claude_code")
 
