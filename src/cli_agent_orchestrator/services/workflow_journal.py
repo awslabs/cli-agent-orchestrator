@@ -77,6 +77,18 @@ _REQUIRED_RUN_COLUMNS = frozenset(
         "finished_at",
         "tier",
         "generation",
+        # manifest-column (issue #583 Bolt 2, ADR-583-12). Registering the column here is
+        # NOT bookkeeping — it is what gives the silent-migration risk a RUNTIME mitigation.
+        # ``_migrate_workflow_run`` swallows its own failures at debug level, so a failed
+        # ALTER leaves the column absent with no signal. With the column in this set,
+        # ``_journal_schema_is_present`` answers False for such a database, ``_connect``
+        # declines to cache the schema, and the migrators therefore keep running on later
+        # connections instead of being skipped — the path self-heals. Omitting it would make
+        # the new column drop silently out of verification, which is exactly the drift the
+        # equality assertion in
+        # ``test_workflow_journal_connection_posture.py::test_the_required_column_sets_match_what_the_migrators_produce``
+        # exists to catch.
+        "manifest_json",
     }
 )
 _REQUIRED_STEP_COLUMNS = frozenset(
@@ -111,6 +123,12 @@ class RunRow:
     finished_at: Optional[str]
     tier: str = "yaml"
     generation: str = "1"
+    # issue #583 Bolt 2, ``approval-gate``: the frozen execution manifest, readable. ``manifest-column``
+    # added the column and ``manifest-freeze`` writes it, but until now NOTHING read it back — the
+    # resume approval gate is the first reader, so it owns the read path. Additive and defaulted, the
+    # same shape ``StepRow``'s docstring describes for U1's nullable fields: a row written before this
+    # (or by a YAML run, which never freezes) reads back observably identical to its previous shape.
+    manifest_json: Optional[str] = None
 
 
 @dataclass
@@ -358,6 +376,7 @@ def insert_run(
     started_at: str,
     tier: str = "yaml",
     generation: str = "1",
+    manifest_json: Optional[str] = None,
 ) -> None:
     """INSERT the ``workflow_run`` row at ``start_run`` (lifecycle table, E1).
 
@@ -378,8 +397,8 @@ def insert_run(
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -389,6 +408,7 @@ def insert_run(
                 started_at,
                 tier,
                 generation,
+                manifest_json,
             ),
         )
 
@@ -404,6 +424,7 @@ def insert_run_with_steps(
     updated_at: str,
     tier: str = "yaml",
     generation: str = "1",
+    manifest_json: Optional[str] = None,
 ) -> None:
     """Atomically INSERT the run row AND seed its step rows in ONE transaction (U2, TR-1).
 
@@ -433,8 +454,8 @@ def insert_run_with_steps(
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -444,6 +465,7 @@ def insert_run_with_steps(
                 started_at,
                 tier,
                 generation,
+                manifest_json,
             ),
         )
         conn.executemany(
@@ -452,6 +474,23 @@ def insert_run_with_steps(
             "VALUES (?, ?, ?, 0, NULL, NULL, ?)",
             [(run_id, step_id, step_state, updated_at) for step_id, step_state in steps],
         )
+
+
+def compare_and_set_run_manifest(
+    run_id: str, expected_manifest_json: str, manifest_json: str
+) -> bool:
+    """Replace a run manifest only when it still equals the contender's snapshot.
+
+    The memory filler is the sole concurrent manifest writer. A false return is
+    a normal lost race, distinct from a SQLite exception, which callers must
+    surface as a failed persistence rather than overwrite the winner.
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE workflow_run SET manifest_json = ? " "WHERE run_id = ? AND manifest_json = ?",
+            (manifest_json, run_id, expected_manifest_json),
+        )
+        return cursor.rowcount == 1
 
 
 def insert_steps(run_id: str, steps: Sequence[Tuple[str, str]], updated_at: str) -> None:
@@ -825,7 +864,7 @@ def get_run(run_id: str) -> Optional[RunRow]:
     with _connect() as conn:
         row = conn.execute(
             "SELECT run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            "current_step_id, started_at, finished_at, tier, generation "
+            "current_step_id, started_at, finished_at, tier, generation, manifest_json "
             "FROM workflow_run WHERE run_id = ?",
             (run_id,),
         ).fetchone()
@@ -842,6 +881,9 @@ def get_run(run_id: str) -> Optional[RunRow]:
         finished_at=row[7],
         tier=row[8],
         generation=row[9],
+        # issue #583 Bolt 2, ``approval-gate``: NULL for every YAML run and for any run whose freeze
+        # failed. Both read back as None, which the resume gate refuses when enforcement is on.
+        manifest_json=row[10],
     )
 
 

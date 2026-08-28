@@ -786,6 +786,25 @@ WORKFLOW_INPUTS_MAX_BYTES = 32768
 # eviction for this column.
 WORKFLOW_JOURNAL_RESULT_MAX_BYTES = 32768
 
+# Byte bound on the persisted execution manifest envelope (issue #583 Bolt 2, NFR-1 /
+# ADR-583-12). Applied to the compact-JSON encoding AFTER redaction (never before — a
+# secret straddling the bound would otherwise survive), on the UTF-8 byte length rather
+# than the character count, because the bound is a storage limit.
+#
+# 256 KiB MATCHES WORKFLOW_MAX_SPEC_BYTES RATHER THAN THE 32768 USED BY ITS TWO
+# NEIGHBOURS, AND THE ARITHMETIC IS THE REASON. The manifest CONTAINS the resolved
+# inputs map, which is separately allowed up to WORKFLOW_INPUTS_MAX_BYTES (32768). A
+# 32 KiB manifest bound would therefore be tighter than one of its own eleven fields:
+# any workflow using its full inputs allowance would truncate on EVERY run, and what
+# gets sacrificed is the frozen memory content — FR-9's entire payload. Truncation would
+# become the normal case, destroying the ``truncated`` flag's value as a signal.
+#
+# The cost is accepted deliberately: this is the loosest of the workflow bounds, in a
+# column with no eviction. Mitigating facts — it is one row per RUN rather than per step,
+# the flag makes truncation visible when it does fire, and this is a named constant that
+# is cheap to tighten if truncation is never observed in practice.
+WORKFLOW_MANIFEST_MAX_BYTES = 256 * 1024
+
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every
 # non-sequential mode and every loop/conditional construct tags as reserved.

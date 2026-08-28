@@ -2641,6 +2641,59 @@ async def workflow_start(
 
 
 @mcp.tool()
+async def workflow_plan_approval(
+    run_id: str = Field(description="The run id to report on (from workflow_start / workflow_run)"),
+) -> Dict[str, Any]:
+    """Report a run's plan identifier and whether that plan is approved (issue #583 FR-8).
+
+    READ-ONLY. THERE IS DELIBERATELY NO TOOL THAT GRANTS AN APPROVAL, and that absence is the
+    control: an approval is a human decision about a plan, and a tool that let you approve the plan
+    you just wrote would make the approval gate decorative in exactly the case it was designed for.
+    Approving is ``cao workflow approve <plan_id>`` at a human's terminal, behind the ``cao:admin``
+    scope. Use this tool to tell the operator which ``plan_id`` to approve.
+
+    WHAT IS NOT IMPLEMENTED, stated because you may otherwise assume it: a plan identifier covers the
+    workflow's execution-affecting fields, so changing any of them yields a different ``plan_id`` that
+    needs its own approval. But **rejection of an update presenting a stale source hash is NOT yet
+    implemented** — do not rely on a stale-hash check having run. Six manifest fields (provider,
+    model, profile, permissions, limits, retry policy) are also **omitted rather than recorded**,
+    because script-tier steps are discovered by executing the Python and so have no run-level value at
+    freeze time; they are covered transitively by the source hash.
+
+    Approval enforcement is **off by default**. When it is off, an unapproved plan still runs, and
+    ``approved: false`` here is informational rather than a prediction that the run will be refused.
+
+    ``plan_id`` is ``null`` for a YAML run (which never freezes a manifest) and for a script run whose
+    freeze failed. That is reported distinctly from "not approved", because the two call for entirely
+    different actions.
+
+    Returns a structured envelope on EVERY path — never raises into the agent loop (EV-1).
+    """
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/plan",
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    data = response.json()
+    return {
+        "ok": True,
+        "run_id": data.get("run_id"),
+        "tier": data.get("tier"),
+        "plan_id": data.get("plan_id"),
+        "approved": data.get("approved"),
+        "approved_at": data.get("approved_at"),
+        "approved_by": data.get("approved_by"),
+    }
+
+
+@mcp.tool()
 async def workflow_status(
     run_id: str = Field(description="The run id to snapshot (from workflow_start / workflow_run)"),
 ) -> Dict[str, Any]:

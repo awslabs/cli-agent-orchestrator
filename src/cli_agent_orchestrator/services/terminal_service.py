@@ -116,20 +116,59 @@ _memory_injected_lock = threading.Lock()
 _deferred_init_tasks: set = set()
 
 
-def inject_memory_context(first_message: str, terminal_id: str) -> str:
+def inject_memory_context(
+    first_message: str, terminal_id: str, frozen_memory: str | None = None
+) -> str:
     """Prepend <cao-memory> context block to the first user message.
 
     Tracks which terminals have already been injected so that only the very
     first user message after init receives the memory block.
 
-    Calls MemoryService.get_memory_context_for_terminal() which returns
-    a formatted <cao-memory>...</cao-memory> block (or empty string if
-    no memories exist). Stateless — no file mutation, no backup/restore.
+    Calls MemoryService.get_curated_memory_context(), which returns a formatted
+    <cao-memory>...</cao-memory> block (or empty string if no memories exist).
+    Stateless — no file mutation, no backup/restore.
+
+    ``frozen_memory`` is an OPTIONAL PRE-RESOLVED BLOCK (issue #583 FR-9). When it
+    is not None the block is injected verbatim and MemoryService is never
+    consulted, so a replayed workflow run sees the memory the ORIGINAL run
+    recorded rather than whatever the store holds today. When it is None this
+    function behaves exactly as it always has, which is what keeps every
+    non-workflow terminal in CAO unaffected — and this module deliberately knows
+    nothing about workflows: the parameter is named for its content, not its
+    origin.
     """
     with _memory_injected_lock:
         if terminal_id in _memory_injected_terminals:
             return first_message
         _memory_injected_terminals.add(terminal_id)
+
+    if frozen_memory is not None:
+        # "" is a SUPPLIED block, not an absent one: it means the original run
+        # resolved no memory, so prepend nothing — and, crucially, do NOT fall
+        # through to the live path. Deciding the arm on `is not None` while
+        # deciding the prepend on truthiness is deliberate; collapsing the two
+        # into one truthiness test is exactly how a run that legitimately froze
+        # an empty block would pick up memories written after it, which is the
+        # drift FR-9 exists to prevent.
+        if not frozen_memory:
+            return first_message
+        # The operator's kill switch binds this path too. Skipping MemoryService
+        # would otherwise skip its is_memory_enabled() check, and a workflow run
+        # would paste memory into the context of someone who turned memory off.
+        # The cost is that a replay under a disabled switch differs from the
+        # original run — acceptable because the manifest records that memory was
+        # frozen, so the difference is explainable, whereas a bypassed control
+        # would leave no trace at all. Imported lazily for the same
+        # settings -> memory circular-import reason memory_service documents.
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        if not is_memory_enabled():
+            return first_message
+        # No try/except here on purpose: string concatenation cannot fail on I/O,
+        # so the only thing a guard could swallow is a programming error — and
+        # swallowing it would silently downgrade a replay to live memory, which
+        # is a wrong answer wearing a right answer's clothes.
+        return frozen_memory + "\n\n" + first_message
 
     try:
         svc = MemoryService()
@@ -1514,6 +1553,7 @@ def send_input(
     registry: PluginRegistry | None = None,
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
+    frozen_memory: str | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -1521,6 +1561,12 @@ def send_input(
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
+
+    ``frozen_memory`` is forwarded UNCHANGED to :func:`inject_memory_context` and
+    is otherwise none of this function's business — not inspected, not validated,
+    not logged. It is last and defaulted so existing positional callers (notably
+    ``agent_step.run_agent_step``, which passes exactly two arguments) are
+    unaffected.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -1573,7 +1619,7 @@ def send_input(
         # plugins/webhooks see what the caller sent — not the
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
-        message = inject_memory_context(message, terminal_id)
+        message = inject_memory_context(message, terminal_id, frozen_memory)
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1

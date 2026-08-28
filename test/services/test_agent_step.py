@@ -7,6 +7,7 @@ success.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,7 +15,10 @@ import pytest
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
-from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
+from cli_agent_orchestrator.services.agent_step import (
+    StepExecutionError,
+    run_agent_step,
+)
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 
 _MODULE = "cli_agent_orchestrator.services.agent_step"
@@ -66,6 +70,90 @@ def _patch_terminal_layer(
 
 
 class TestHappyPath:
+    def test_an_empty_frozen_block_is_passed_to_suppress_live_memory(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}.frozen_run_memory.frozen_memory_for", return_value=""),
+        ):
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    env_vars={"CAO_WORKFLOW_RUN_ID": "run-frozen"},
+                )
+            )
+
+        m_send.assert_called_once_with("abc12345", "x", frozen_memory="")
+
+    def test_frozen_memory_resolution_is_offloaded_from_the_event_loop(self):
+        """A polling frozen-memory resolver must leave the server loop schedulable."""
+        block = "<cao-memory>frozen</cao-memory>"
+        resolution_started = threading.Event()
+        resolution_finished = threading.Event()
+        release_resolution = threading.Event()
+        resolver_thread_ids = []
+
+        async def _run():
+            event_loop_thread_id = threading.get_ident()
+            sentinel_ran = asyncio.Event()
+
+            def _resolve(run_id, terminal_id, prompt):
+                resolver_thread_ids.append(threading.get_ident())
+                resolution_started.set()
+                release_resolution.wait(timeout=1)
+                resolution_finished.set()
+                return block
+
+            async def _sentinel():
+                sentinel_ran.set()
+
+            create, send, delete, get_output, exit_cli, get_wd, wait, status = (
+                _patch_terminal_layer()
+            )
+            with (
+                create,
+                send as m_send,
+                delete,
+                get_output,
+                exit_cli,
+                wait,
+                status,
+                patch(
+                    f"{_MODULE}.frozen_run_memory.frozen_memory_for",
+                    side_effect=_resolve,
+                ),
+            ):
+                step = asyncio.create_task(
+                    run_agent_step(
+                        "kiro_cli",
+                        "dev",
+                        "x",
+                        env_vars={"CAO_WORKFLOW_RUN_ID": "run-frozen"},
+                    )
+                )
+                await asyncio.to_thread(resolution_started.wait)
+                asyncio.create_task(_sentinel())
+                await asyncio.sleep(0)
+                assert sentinel_ran.is_set()
+                assert not resolution_finished.is_set()
+                release_resolution.set()
+                await step
+
+            m_send.assert_called_once_with("abc12345", "x", frozen_memory=block)
+            return event_loop_thread_id
+
+        event_loop_thread_id = asyncio.run(_run())
+        assert len(resolver_thread_ids) == 1
+        assert resolver_thread_ids[0] != event_loop_thread_id
+
     def test_create_per_call_runs_full_sequence_and_tears_down(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with (
@@ -93,7 +181,15 @@ class TestHappyPath:
 
     def test_teardown_false_skips_delete(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
-        with create, send, delete as m_delete, get_output, exit_cli as m_exit, wait, status:
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+        ):
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", teardown=False))
         m_delete.assert_not_called()
         m_exit.assert_not_called()
@@ -298,7 +394,16 @@ class TestHappyPath:
         """caller_id (#284 callback routing) and inherited allowed_tools must
         reach create_terminal for handoff workers."""
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
-        with create as m_create, send, delete, get_output, exit_cli, get_wd, wait, status:
+        with (
+            create as m_create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            get_wd,
+            wait,
+            status,
+        ):
             asyncio.run(
                 run_agent_step(
                     "kiro_cli",

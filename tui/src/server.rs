@@ -685,6 +685,12 @@ fn route(id: CommandId) -> Option<Route> {
         // unbounded for this client's purposes.
         CommandId::WorkflowResume => None,
         CommandId::WorkflowRun => None,
+        // `cao workflow approve` is classified HIDE, so the TUI never routes it — and this arm
+        // exists only because the match is exhaustive on purpose. It is deliberately `None` rather
+        // than a real binding: routing a command the TUI does not offer would build a reachable
+        // path to a human authorisation act that nothing in the interface has reviewed.
+        // (#583 Bolt 2, approval-operation)
+        CommandId::WorkflowApprove => None,
         // HIDE (issue #640), so it is unreachable through `commands()` and needs no route — the
         // arm exists because this `match` is exhaustive, not because a route was withheld. A route
         // does exist (`POST /workflows/runs/{run_id}/steps/{step_id}:replay`); it is unrouted here
@@ -2665,7 +2671,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 28 HIDE = 70; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 29 HIDE = 71; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

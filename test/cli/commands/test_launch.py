@@ -717,7 +717,7 @@ def test_launch_yolo_still_resolves_profile_provider():
         mock_resolve.assert_called_once_with("codex_panelist", "kiro_cli")
         # The kiro_cli-specific yolo warning text must NOT appear, because
         # the profile's provider ("claude_code") was honoured.
-        assert "kiro_cli will launch in --legacy-ui mode" not in result.output
+        assert "consent dialog will be auto-answered" not in result.output
 
 
 def test_launch_allowed_tools_still_resolves_profile_provider():
@@ -818,7 +818,7 @@ def test_launch_yolo_falls_back_to_default_when_profile_lacks_provider():
         assert result.exit_code == 0
         # The kiro_cli-specific yolo warning IS expected here because the
         # profile didn't override and the fallback is kiro_cli.
-        assert "kiro_cli will launch in --legacy-ui mode" in result.output
+        assert "consent dialog will be auto-answered" in result.output
 
 
 # ── --env forwarded env vars (issue #248) ────────────────────────────

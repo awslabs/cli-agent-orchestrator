@@ -309,46 +309,26 @@ class KiroCliProvider(BaseProvider):
         # tool invocation re-prompts, blocking assign/handoff flows.
         # --model: honor profile.model so workflows can pin a specific model.
         #
-        # UI mode selection:
-        # - Yolo (--trust-all-tools): kiro-cli 2.0.1 TUI blocks on an
-        #   interactive "Yes, I accept" consent dialog before the chat is
-        #   ready; only --legacy-ui/--classic/--no-interactive bypass it.
-        #   CAO drives kiro-cli headlessly, so we force --legacy-ui for yolo.
-        # - Non-yolo: use the default TUI (fall back to --legacy-ui on
-        #   timeout, preserving prior behavior for older kiro-cli versions).
-        yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
+        # UI mode: always the default TUI. --legacy-ui is NOT an option — see
+        # build_kiro_command's docstring: it conflicts with --agent-engine=v2
+        # and otherwise silently selects the v1 engine, which exposes no MCP
+        # tools, so the agent could not assign/handoff/report_outcome at all.
         model = self._get_profile_model()
 
         # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
         # blocks MCP tool calls that spawn subagents (e.g. cao-mcp-server's
-        # assign/handoff). Even for non-yolo profiles, CAO enforces tool
-        # scoping at its own layers (profile allowedTools + MCP allowlist),
-        # so passing --trust-all-tools is safe: it bypasses kiro's
-        # per-invocation UI prompt (there is no human at the terminal in
-        # headless orchestration to answer), while CAO still gates what
-        # tools can be called. Without this, a supervisor invoking assign()
-        # hangs indefinitely on the approval dialog.
-        if yolo:
-            logger.info(
-                "kiro_cli yolo mode: forcing --legacy-ui (kiro-cli 2.0.1 TUI "
-                "shows a non-bypassable trust-all-tools consent dialog)"
-            )
-            base_args = build_kiro_command(
-                self._engine,
-                self._agent_profile,
-                model=model,
-                yolo=True,
-                legacy_ui=True,
-            )
-        else:
-            # Current CAO policy always bypasses Kiro's interactive approval
-            # prompt; CAO still enforces the profile/MCP allowlist itself.
-            base_args = build_kiro_command(
-                self._engine,
-                self._agent_profile,
-                model=model,
-                yolo=True,
-            )
+        # assign/handoff). Current CAO policy always bypasses Kiro's
+        # interactive approval prompt regardless of the profile: CAO enforces
+        # tool scoping at its own layers (profile allowedTools + MCP
+        # allowlist), and there is no human at the terminal in headless
+        # orchestration to answer. Without this, a supervisor invoking
+        # assign() hangs indefinitely on the approval dialog.
+        base_args = build_kiro_command(
+            self._engine,
+            self._agent_profile,
+            model=model,
+            yolo=True,
+        )
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
         # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.
@@ -358,39 +338,22 @@ class KiroCliProvider(BaseProvider):
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        # _wait_ready_accepting_trust_dialog also auto-answers the
-        # --trust-all-tools startup consent dialog (see its docstring), which
-        # kiro-cli >= 2.1 shows in the default TUI *and* under --legacy-ui.
+        # _wait_ready_accepting_trust_dialog also auto-answers the trust
+        # consent dialog (see its docstring) if a wrapper version still shows
+        # one; --trust-tools='*' does not raise it, so that is now a safety net.
+        #
+        # There is no --legacy-ui retry. It used to exist for older wrappers
+        # whose TUI could not initialize headlessly, but it is no longer a
+        # usable fallback: on a v2 launch kiro-cli errors out on the flag
+        # combination, and a bare --legacy-ui retry would "succeed" into the v1
+        # engine with no MCP tools — turning a loud timeout into an agent that
+        # looks healthy and cannot orchestrate. Failing here is the honest
+        # outcome.
         if not await self._wait_ready_accepting_trust_dialog():
-            if yolo:
-                # Yolo already launched with --legacy-ui; no further fallback.
-                raise TimeoutError("Kiro CLI initialization timed out with --legacy-ui (yolo mode)")
-            # Non-yolo TUI mode failed — fall back to --legacy-ui
-            logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
-            # Exit the current session and start fresh with --legacy-ui
-            status_monitor.notify_input_sent(self.terminal_id)
-            get_backend().send_keys(self.session_name, self.window_name, "/exit")
-            init_timeout = get_server_settings()["provider_init_timeout"]
-            if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
-                raise TimeoutError(
-                    f"Shell recovery timed out after {init_timeout}s (--legacy-ui fallback)"
-                )
-            # Clear the StatusMonitor buffer so the --legacy-ui attempt is detected
-            # against a clean buffer, not one still full of stale TUI marker bytes
-            # from the failed first attempt (which would otherwise time out too).
-            status_monitor.reset_buffer(self.terminal_id)
-            legacy_args = build_kiro_command(
-                self._engine,
-                self._agent_profile,
-                model=model,
-                yolo=True,
-                legacy_ui=True,
+            raise TimeoutError(
+                "Kiro CLI initialization timed out waiting for the agent prompt "
+                f"(engine={self._engine.value}, profile={self._agent_profile!r})"
             )
-            legacy_command = shlex.join(legacy_args)
-            status_monitor.notify_input_sent(self.terminal_id)
-            get_backend().send_keys(self.session_name, self.window_name, legacy_command)
-            if not await self._wait_ready_accepting_trust_dialog():
-                raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
 
         self._initialized = True
         return True

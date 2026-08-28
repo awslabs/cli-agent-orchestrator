@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **70 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **71 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,14 +64,15 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **70 as of this branch.** `cao workflow step` (issue #640) is the third command this guard
-/// caught before review did, and the reason the count is 70 rather than 69.
-///
-/// Two separate merges from `main` each brought four new leaf commands
+/// **71 as of this branch.** Two separate merges from `main` each brought four new leaf commands
 /// that this table did not know about, and both were caught by
 /// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
 /// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
 /// the guard doing exactly what it exists for, twice.
+///
+/// `cao workflow step` (issue #640) is another command this guard caught before review did. It
+/// and `cao workflow approve`, which this merge brought in from `main`, are together the reason
+/// the count is 71 rather than 69.
 ///
 /// The four `cao workflow *` leaves — `runs`, `wait`, `result`, `events` — arrived with PR #525
 /// (issue #505, commit `e2e6318`). The four `cao memory relationships *` leaves were added by
@@ -89,7 +90,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 70;
+const COMMAND_COUNT: usize = 71;
 
 /// What the TUI does with a command.
 ///
@@ -186,7 +187,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 70 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 71 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -247,6 +248,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::SkillsList,
     CommandId::SkillsRemove,
     CommandId::TerminalRestore,
+    CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
     CommandId::WorkflowDelete,
     CommandId::WorkflowEvents,
@@ -262,7 +264,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 70**.
+/// One variant per leaf command — **all 71**.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -407,6 +409,8 @@ pub enum CommandId {
     TerminalRestore,
 
     // `cao workflow *`
+    /// `cao workflow approve`
+    WorkflowApprove,
     /// `cao workflow cancel`
     WorkflowCancel,
     /// `cao workflow delete`
@@ -1053,6 +1057,20 @@ fn entry(id: CommandId) -> Command {
             // HIDE: human ruled out; recovery-by-terminal-ID tooling, not a launcher action
         },
 
+        CommandId::WorkflowApprove => Command {
+            id: CommandId::WorkflowApprove,
+            parent: Some("workflow"),
+            leaf_name: "approve",
+            summary: "Approve a plan identifier so runs of that plan may start.",
+            // Hidden per the mandated default: an unclassified command defaults to HIDE so an
+            // unvetted command cannot surface half-working. Not reviewed for in-app use, and there
+            // is a reason not to rush that review — approving a plan is a deliberate human
+            // authorisation act, and surfacing it as a one-click pane entry is exactly the shape
+            // that would make it casual. (#583 Bolt 2, approval-operation)
+            policy: Policy::Hidden,
+            params: &[Param { name: "plan_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
         CommandId::WorkflowCancel => Command {
             id: CommandId::WorkflowCancel,
             parent: Some("workflow"),
@@ -1295,7 +1313,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 28 HIDE, totalling 70.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 29 HIDE, totalling 71.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1334,30 +1352,32 @@ mod tests {
     ///
     /// **And it did it again, a third time.** `cao workflow step` (issue #640) reached the Click
     /// tree with no row here, and the guard — not review — is what said so. It is HIDE, per
-    /// `project.md`'s mandated default for a command not yet deliberately reviewed, giving
-    /// **24/18/28 = 70**. Three catches from one cross-language check is the argument for it.
+    /// `project.md`'s mandated default for a command not yet deliberately reviewed. Merging `main`
+    /// then brought `cao workflow approve` (#583 Bolt 2), also HIDE but classified deliberately
+    /// there rather than caught here, giving **24/18/29 = 71**. Three catches from one
+    /// cross-language check is the argument for it.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_twentyeight() {
+    fn the_policy_distribution_is_twentyfour_eighteen_twentynine() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 28, "expected 28 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 29, "expected 29 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            70,
-            "the three policy counts must account for all 70 leaf commands of the Click tree"
+            71,
+            "the three policy counts must account for all 71 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 70 does not prove 70 *distinct* commands were counted: a
+        // The three counts summing to 71 does not prove 71 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            70,
-            "DISPLAY_ORDER must list 70 DISTINCT commands; a duplicate would let one command go \
+            71,
+            "DISPLAY_ORDER must list 71 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1379,7 +1399,7 @@ mod tests {
     ///
     /// Neither existing guard catches it. [`the_policy_distribution_is_twentytwo_sixteen_twentythree`]
     /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
-    /// counted; and its `distinct.len() == 70` assertion detects a **duplicate**, which is the
+    /// counted; and its `distinct.len() == 71` assertion detects a **duplicate**, which is the
     /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
     ///
     /// # Why an exhaustive match and NOT a discriminant trick
@@ -1481,6 +1501,7 @@ mod tests {
                     CommandId::SkillsList => CommandId::SkillsList,
                     CommandId::SkillsRemove => CommandId::SkillsRemove,
                     CommandId::TerminalRestore => CommandId::TerminalRestore,
+                    CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
                     CommandId::WorkflowDelete => CommandId::WorkflowDelete,
                     CommandId::WorkflowEvents => CommandId::WorkflowEvents,
@@ -1556,6 +1577,7 @@ mod tests {
                 CommandId::SkillsList,
                 CommandId::SkillsRemove,
                 CommandId::TerminalRestore,
+                CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,
                 CommandId::WorkflowEvents,

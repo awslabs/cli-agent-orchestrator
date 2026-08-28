@@ -136,10 +136,11 @@ long description and PyPI disallows `<picture>`.
 
 That same constraint applies to the card. It is light, which matches PyPI, the
 official artwork, and GitHub's light theme, and it shows as a bright panel on
-GitHub's dark theme. Its text colors deviate from the palette on purpose: brand
-teal on white measures 3.1:1 and only scrapes past WCAG as large text, so the
-URL uses the brand blue at 4.6:1 instead. Regenerate it after editing the
-source:
+GitHub's dark theme. It carries the name and tagline only, not the repo URL: as
+a README banner the URL would sit on the page it points at, and in an unfurl the
+link is already the thing being unfurled. Regenerate the card after editing the
+source — the text baselines are measured against the mark's ink box, so re-check
+the centering if you change the type sizes or the mark's transform:
 
 ```bash
 cd static/img
