@@ -90,6 +90,14 @@ class MockCliProvider(BaseProvider):
 
     def get_status(self, buffer: str) -> TerminalStatus:
         """Pattern-match the binary's output buffer to determine current state."""
+        native = self._resolve_native_status(buffer)
+        if native is not None:
+            return native
+
+        # Herdr does not feed the StatusMonitor pipe buffer. BaseProvider's
+        # resolver reads the live pane history when native status is unknown,
+        # so the mock provider follows the same backend contract as real CLIs.
+        buffer = self._resolve_buffer(buffer)
         if not buffer:
             return TerminalStatus.UNKNOWN
 

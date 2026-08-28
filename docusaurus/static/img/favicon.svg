@@ -1,0 +1,39 @@
+<!--
+  Favicon variant of the CLI Agent Orchestrator mark.
+
+  Deliberately NOT the same drawing as cao-mark.svg. The outlined mark relies
+  on an 11-unit ring and 7-unit connectors; at 16px those land on roughly one
+  physical pixel each and the whole thing turns to mush. So this variant
+  inverts the figure: the hexagon becomes a solid mass carrying the blue to
+  teal gradient, and the agent graph is knocked out of it in white.
+
+  Solid mass also solves the surface problem. A favicon has no color-mode hook,
+  so the same file is drawn on Chrome's light tab strip, Safari's dark one, and
+  a bookmark bar. An outlined navy mark disappears against dark chrome. A
+  saturated fill reads on all of them, so no dark counterpart is needed here.
+
+  The corner rounding comes from stroking the fill with itself under a round
+  linejoin, which is also why the circumradius is 52 rather than 56: the
+  4-unit stroke halo is what reaches the edge of the viewBox.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img"
+     aria-label="CLI Agent Orchestrator">
+  <defs>
+    <linearGradient id="caoFavicon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0F73E0"/>
+      <stop offset="1" stop-color="#16A0B5"/>
+    </linearGradient>
+  </defs>
+  <path d="M60 8l45.03 26v52L60 112l-45.03-26V34z" fill="url(#caoFavicon)"
+        stroke="url(#caoFavicon)" stroke-width="8" stroke-linejoin="round"/>
+  <g fill="none" stroke="#FFF" stroke-width="7" stroke-linecap="round">
+    <path d="M67 42L32 79"/>
+    <path d="M72 79L41 50"/>
+    <path d="M41 50l26-8"/>
+  </g>
+  <g fill="#FFF">
+    <circle cx="41" cy="50" r="8"/>
+    <circle cx="72" cy="79" r="10"/>
+    <circle cx="67" cy="42" r="11"/>
+  </g>
+</svg>

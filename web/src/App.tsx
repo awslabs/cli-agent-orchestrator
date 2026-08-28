@@ -8,6 +8,7 @@ import { FlowsPanel } from './components/FlowsPanel'
 import { MemoryPanel } from './components/MemoryPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowsPanel } from './components/WorkflowsPanel'
+import { CaoMark } from './components/CaoMark'
 import { Bot, Home, Clock, Settings, Brain, Workflow, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
 
 type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows'
@@ -88,9 +89,7 @@ export default function App() {
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
-              <Bot size={18} className="text-white" />
-            </div>
+            <CaoMark size={32} />
             <h1 className="text-lg font-bold text-white">CLI Agent Orchestrator</h1>
           </div>
           <div className="flex items-center gap-4">

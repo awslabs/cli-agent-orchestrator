@@ -1,6 +1,6 @@
 [project]
 name = "cli-agent-orchestrator"
-version = "2.4.1"
+version = "2.5.0"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,18 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    # POSIX only, and stated rather than left to be discovered at runtime: the package
+    # imports `fcntl`/`termios` at module scope and orchestrates through tmux, neither of
+    # which exists on Windows.
+    #
+    # These are INFORMATIONAL. No installer enforces an `Operating System` classifier, and
+    # metadata has no way to express an OS constraint the way `requires-python` expresses an
+    # interpreter one. What a Windows operator actually hits is: no matching wheel -> pip
+    # falls back to the sdist -> the sdist installs (the Rust hook is inert without cargo)
+    # -> the first `cao` command raises. `cli_agent_orchestrator/__init__.py` carries the
+    # guard that makes that last step say why.
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
@@ -148,9 +160,24 @@ path = "scripts/hatch_build_tui_tag.py"
 # binary cannot execute on. Per-platform wheels make pip REFUSE an incompatible wheel
 # rather than install a broken one — that refusal is the whole feature.
 #
-# The 4 targets (interview Q2): macOS arm64, macOS x86_64, Linux x86_64, Windows AMD64.
-# Each is built on its own runner in publish-to-pypi.yml; this repo had ZERO non-Linux
-# runners before this change (measured: 25 of 25 `runs-on:` were ubuntu-latest).
+# The targets: macOS arm64 and Linux x86_64. Each is built on its own runner in
+# publish-to-pypi.yml, and each is then installed from TestPyPI and EXECUTED by the
+# `smoke-test` job — so every wheel this project publishes has been both built and run by CI.
+# This repo had ZERO non-Linux runners before this change (measured: 25 of 25 `runs-on:` were
+# ubuntu-latest).
+#
+# Interview Q2 named two more, and v2.5.0 tried to ship both. Neither is built:
+#
+#   * Windows AMD64 — `cli_agent_orchestrator` cannot be imported on Windows (`fcntl` at module
+#     scope in four modules, plus a tmux-only backend), so the smoke test rejected the wheel —
+#     correctly.
+#   * macOS x86_64 — `cryptography` ships no Intel-macOS wheel at 49.0.0 or above, and this
+#     project's CVE floor is `cryptography>=50.0.0`, so an Intel Mac cannot resolve its
+#     dependencies from wheels at all. The leg died inside cibuildwheel's own test venv.
+#
+# Both are BUILDABLE — that was never the problem. The Rust half of each was fine; what fails
+# is the install on the platform the wheel claims to serve. See the `build-wheels` matrix in
+# publish-to-pypi.yml for the measurements and what restoring either would require.
 # ---------------------------------------------------------------------------------------
 [tool.cibuildwheel]
 # ONE wheel per platform, not one per Python version. The wheel contains a Rust binary and
@@ -170,7 +197,15 @@ archs = ["auto64"]
 # here executes Alpine, so shipping one would be an unexercised wheel. An Alpine operator
 # gets a clean "no matching distribution" from pip — the correct, loud outcome — rather
 # than a wheel whose binary is dynamically linked against glibc. (#321)
-skip = ["*-musllinux_*"]
+#
+# Windows and Intel macOS are skipped for the reasons in the header: the package cannot be
+# imported on the former, and cannot resolve `cryptography>=50` from wheels on the latter.
+# Belt to the removed matrix legs' suspenders — the workflow provides neither runner nor arch,
+# so neither can trigger in CI, but this also stops a LOCAL `cibuildwheel` run (on a Windows
+# host, or on an Intel Mac, or with `--archs x86_64` on Apple silicon) from producing a wheel
+# that installs and then fails. A skip here is inert when the matrix agrees and load-bearing
+# when a human runs the tool by hand.
+skip = ["*-musllinux_*", "*-win*", "*-macosx_x86_64"]
 
 # Stage the Rust binary BEFORE hatchling evaluates the artifacts glob. Ordering is
 # load-bearing: hatchling treats a glob matching nothing as a SILENT no-op (defect D1's
@@ -197,20 +232,29 @@ before-build = "python {project}/scripts/build_tui.py build"
 # anyway, since `cao-tui` is a standalone executable, not a linked extension module. (#321)
 test-command = "python {project}/scripts/smoke_test_wheel.py --wheel {wheel} --max-binary-bytes 10485760"
 
-# macOS AND Windows need NO platform-specific keys, and deliberately have no
-# `[tool.cibuildwheel.macos]` / `[...windows]` table: an empty table holding only comments
-# reads like active configuration while setting nothing, so the notes live here instead.
+# macOS needs NO platform-specific keys, and deliberately has no `[tool.cibuildwheel.macos]`
+# table: an empty table holding only comments reads like active configuration while setting
+# nothing, so the notes live here instead. (There is no `[...windows]` table either, but for
+# a different reason — Windows is not built at all; see `skip` above.)
 #
-# - Neither has a build container, so `before-build` runs on the host and needs cargo on
+# - macOS has no build container, so `before-build` runs on the host and needs cargo on
 #   PATH. The publish workflow installs it with a SHA-pinned dtolnay/rust-toolchain step
 #   before invoking cibuildwheel (skipped on Linux, where the toolchain must go INSIDE the
 #   container — see `[tool.cibuildwheel.linux] before-all`).
 # - `repair-wheel-command` is NOT overridden, so cibuildwheel's platform DEFAULT runs
-#   (`delocate-wheel --require-archs {delocate_archs}` on macOS, `delvewheel repair` on
-#   Windows). Those tools vendor shared libraries by inspecting a wheel's extension modules,
-#   and there are none here — `cao-tui` is a standalone executable, not a linked `.so`/`.pyd`
-#   (verified: the built wheel contains zero `.so`/`.pyd` files, and the binary links only
-#   `/usr/lib/libSystem.B.dylib`).
+#   (`delocate-wheel --require-archs {delocate_archs}` on macOS). That tool vendors shared
+#   libraries by inspecting a wheel's extension modules, and there are none here — `cao-tui`
+#   is a standalone executable, not a linked `.so`/`.pyd` (verified: the built wheel contains
+#   zero `.so`/`.pyd` files, and the binary links only `/usr/lib/libSystem.B.dylib`).
+#
+#   IT DOES MORE THAN VENDOR, THOUGH, AND THAT BIT IS LOAD-BEARING: delocate also checks
+#   every Mach-O member's minimum OS version against the wheel's platform tag and REFUSES a
+#   wheel where the binary's floor is higher. That is how v2.5.0's x86_64 leg first failed:
+#   cibuildwheel's default x86_64 tag is 10.9, rustc's `x86_64-apple-darwin` output declares
+#   10.12, and the result was
+#   `DelocationError: Library dependencies do not satisfy target MacOS version 10.9`. The fix
+#   was the per-leg `macos-target` in the workflow matrix, NOT a change here — see there. It
+#   still guards the arm64 leg, whose 11.0 floor is pinned for the same reason.
 #
 #   The default was left in place rather than blanked because it was MEASURED to be
 #   beneficial, not merely harmless: run against the real wheel, `delocate-wheel` exits 0 and
@@ -219,19 +263,39 @@ test-command = "python {project}/scripts/smoke_test_wheel.py --wheel {wheel} --m
 #   still `Mach-O 64-bit executable arm64`) and the smoke test passes on the repaired wheel.
 #   Blanking this would have shipped a needlessly narrow macOS floor. (#321)
 #
-# THE macOS x86_64 WHEEL IS CROSS-COMPILED, AND THAT HAS A CONSEQUENCE.
-# GitHub's `macos-latest` is arm64; the x86_64 labels (`macos-15-intel`, `*-large`) are
-# separate images. cibuildwheel drives the cross-build by setting ARCHFLAGS and
-# _PYTHON_HOST_PLATFORM per build identifier; hatchling's tag inference honours both
-# (verified locally: ARCHFLAGS='-arch x86_64' yields a `macosx_*_x86_64` tag), and
-# scripts/build_tui.py maps the same ARCHFLAGS to `--target x86_64-apple-darwin`.
+# THE macOS x86_64 WHEEL WAS CROSS-COMPILED, AND IT IS NO LONGER BUILT AT ALL.
+# The original design cross-built it from the arm64 runner: GitHub's `macos-latest` is arm64
+# and the x86_64 labels (`macos-15-intel`, `*-large`) are separate images, so cibuildwheel
+# drove the cross-build via ARCHFLAGS and _PYTHON_HOST_PLATFORM, hatchling's tag inference
+# honoured both (verified locally: ARCHFLAGS='-arch x86_64' yields a `macosx_*_x86_64` tag),
+# and scripts/build_tui.py mapped the same ARCHFLAGS to `--target x86_64-apple-darwin`.
 #
-# CONSEQUENCE, stated rather than glossed: an x86_64 binary cannot be EXECUTED on an arm64
-# runner without Rosetta, so cibuildwheel skips that arch's test and only warns
-# (platforms/macos.py:659-688). The macOS x86_64 wheel is therefore BUILT but NOT executed by
-# this configuration — exactly the state SR-1 names as unacceptable for a shipped wheel. It
-# is recorded as an explicitly UNVERIFIED platform rather than assumed good; closing it needs
-# a native x86_64 runner. (#321)
+# That design was recorded here as an explicitly unverified platform, because an x86_64 binary
+# cannot be EXECUTED on an arm64 runner without Rosetta and cibuildwheel skips that arch's test
+# with only a warning (platforms/macos.py:659-688). v2.5.0 was its first real run, and the
+# outcome was worse than "untested" TWICE OVER:
+#
+#   1. It failed during REPAIR, before any test could be skipped — the deployment-target
+#      mismatch described under `repair-wheel-command` above.
+#   2. With that fixed, it failed inside cibuildwheel's TEST VENV, where pip had to build
+#      `cryptography` from source for x86_64 and `openssl-sys` reported `pkg-config has not
+#      been configured to support cross-compilation`.
+#
+# CONSEQUENCE, stated rather than glossed: (2) is not a CI artifact. Measured over every
+# `cryptography` release on PyPI, 48.0.1 and earlier ship `macosx_10_9_universal2` and 49.0.0
+# onward ship `macosx_11_0_arm64` and nothing else for macOS. The floor above is
+# `cryptography>=50.0.0` for two HIGH CVEs, so an Intel Mac must compile it from source
+# regardless of what this project publishes. A wheel we shipped would fail on the operator's
+# machine exactly as it failed in CI, just later. So the leg was DROPPED rather than
+# `test-skip`ped, and pip now returns a clean "no matching distribution" instead.
+#
+# NET EFFECT ON HONESTY: no platform is shipped unverified any more. Every wheel published is
+# built by `build-wheels`, installed from TestPyPI by `smoke-test`, and executed there. The one
+# remaining UNVERIFIED item is a COVERAGE gap, not a platform: `smoke-test` is gated on
+# `github.event_name == 'release'` and is therefore SKIPPED on a `workflow_dispatch` publish,
+# while `publish-pypi` accepts a skipped smoke test on that path. A manual dispatch ships
+# without the install-and-exec check. Closing it means requiring the release event for PyPI
+# publishes, or running the smoke test on dispatch too. (#321)
 
 [tool.cibuildwheel.linux]
 # The manylinux CONTAINER has no Rust toolchain, and `before-build` runs inside it — so

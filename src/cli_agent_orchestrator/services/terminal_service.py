@@ -133,20 +133,59 @@ _memory_injected_lock = threading.Lock()
 _deferred_init_tasks: set = set()
 
 
-def inject_memory_context(first_message: str, terminal_id: str) -> str:
+def inject_memory_context(
+    first_message: str, terminal_id: str, frozen_memory: str | None = None
+) -> str:
     """Prepend <cao-memory> context block to the first user message.
 
     Tracks which terminals have already been injected so that only the very
     first user message after init receives the memory block.
 
-    Calls the configured memory backend, which returns
-    a formatted <cao-memory>...</cao-memory> block (or empty string if
-    no memories exist). Stateless — no file mutation, no backup/restore.
+    Calls the configured memory backend, which returns a formatted
+    <cao-memory>...</cao-memory> block (or empty string if no memories exist).
+    Stateless — no file mutation, no backup/restore.
+
+    ``frozen_memory`` is an OPTIONAL PRE-RESOLVED BLOCK (issue #583 FR-9). When it
+    is not None the block is injected verbatim and MemoryService is never
+    consulted, so a replayed workflow run sees the memory the ORIGINAL run
+    recorded rather than whatever the store holds today. When it is None this
+    function behaves exactly as it always has, which is what keeps every
+    non-workflow terminal in CAO unaffected — and this module deliberately knows
+    nothing about workflows: the parameter is named for its content, not its
+    origin.
     """
     with _memory_injected_lock:
         if terminal_id in _memory_injected_terminals:
             return first_message
         _memory_injected_terminals.add(terminal_id)
+
+    if frozen_memory is not None:
+        # "" is a SUPPLIED block, not an absent one: it means the original run
+        # resolved no memory, so prepend nothing — and, crucially, do NOT fall
+        # through to the live path. Deciding the arm on `is not None` while
+        # deciding the prepend on truthiness is deliberate; collapsing the two
+        # into one truthiness test is exactly how a run that legitimately froze
+        # an empty block would pick up memories written after it, which is the
+        # drift FR-9 exists to prevent.
+        if not frozen_memory:
+            return first_message
+        # The operator's kill switch binds this path too. Skipping MemoryService
+        # would otherwise skip its is_memory_enabled() check, and a workflow run
+        # would paste memory into the context of someone who turned memory off.
+        # The cost is that a replay under a disabled switch differs from the
+        # original run — acceptable because the manifest records that memory was
+        # frozen, so the difference is explainable, whereas a bypassed control
+        # would leave no trace at all. Imported lazily for the same
+        # settings -> memory circular-import reason memory_service documents.
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        if not is_memory_enabled():
+            return first_message
+        # No try/except here on purpose: string concatenation cannot fail on I/O,
+        # so the only thing a guard could swallow is a programming error — and
+        # swallowing it would silently downgrade a replay to live memory, which
+        # is a wrong answer wearing a right answer's clothes.
+        return frozen_memory + "\n\n" + first_message
 
     try:
         if remote_memory_url():
@@ -355,6 +394,7 @@ async def create_terminal(
     engine: Optional[KiroEngine | str] = None,
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
     use_worktree: bool = False,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -815,6 +855,7 @@ async def create_terminal(
             skill_prompt=skill_prompt,
             model=model or (profile.model if profile else None),
             engine=resolved_engine,
+            resume_session_id=resume_session_id,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -1141,7 +1182,14 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the delivered message is still sitting in the input box.
+    """True when the delivered message is still visible in the rendered pane.
+
+    Despite the name, this matches against ``get_output`` — the whole rendered
+    pane, which includes the transcript above the composer, not just the input
+    box. A prompt echoed in the transcript therefore also reads as "visible",
+    which is safe for the Enter-vs-full-resend decision (both actions are
+    recovery for a worker believed idle) but must not be read as proof the
+    text sits unsubmitted in the composer.
 
     Decides the resubmit action: if our text is there the paste landed and only
     the Enter was dropped (send a bare Enter); if it is absent the paste itself
@@ -1160,6 +1208,96 @@ def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     except Exception:
         return False
     return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+
+def redeliver_dropped_message(
+    terminal_id: str,
+    message: str,
+    attempt: int,
+    provider=None,
+    *,
+    full_resend_requires_probe: bool = False,
+    registry: "PluginRegistry | None" = None,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> bool:
+    """Re-deliver a message the TUI never accepted (blocking; to_thread it).
+
+    One attempt of the confirm-and-redeliver loop shared by the deferred-init
+    path (#479) and the synchronous step path (#562). First, when the provider
+    opts in via ``supports_direct_status_probe``, a live capture-pane check
+    catches a worker that IS already running but whose cached status lags
+    behind (#496) — returns True (started) without sending anything. A caller
+    that already holds the provider instance passes it; otherwise it is
+    resolved from the registry, best-effort (a resolution failure means no
+    probe, never a failed redelivery). Then the box check picks the
+    redelivery: if the delivered text is still visible in the rendered pane
+    only the Enter was swallowed (send a bare Enter); if it is absent the
+    paste itself was dropped (re-deliver in full). See
+    ``_message_visible_in_box`` for why guessing wrong must be avoided.
+
+    ``full_resend_requires_probe`` gates the full re-send on the provider
+    being probe-capable. Reason: ``_message_visible_in_box`` scans the whole
+    rendered pane, and under the pyte screen path status detection runs only
+    at rising-edge/quiescence — a whole turn can process inside one burst,
+    leaving the cached status IDLE throughout while the prompt scrolls off —
+    so for a provider without a direct status probe there is no way to
+    distinguish "paste dropped" from "worker already ran" — and re-pasting
+    the full message into a working worker silently runs the task twice.
+    When the gate is on and the provider is not probe-capable, the
+    bare-Enter branch (which cannot duplicate a task) is still taken
+    whenever the text is visible; otherwise nothing is sent and False is
+    returned, leaving the caller's own timeout to classify the outcome. The
+    deferred-init path keeps the default (off) because it loops on
+    ``wait_until_status`` for the PROCESSING edge before ever reaching here,
+    and that pre-existing behavior is unchanged by this helper's extraction.
+
+    Returns True when the worker was found already started and nothing was
+    sent; False when a redelivery was attempted (or deliberately skipped).
+    """
+    if provider is None:
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+    probe_capable = provider is not None and getattr(
+        provider, "supports_direct_status_probe", False
+    )
+    if probe_capable:
+        if _worker_is_started_direct(terminal_id, provider):
+            return True
+    if _message_visible_in_box(terminal_id, message):
+        logger.warning(
+            "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        send_special_key(terminal_id, "Enter")
+        return False
+    if full_resend_requires_probe and not probe_capable:
+        # No probe → cannot rule out a working worker whose prompt left the
+        # pane; a full re-send could silently duplicate the task. Skip the
+        # re-send and let the caller's own deadline classify the outcome.
+        logger.warning(
+            "Delivery to %s not accepted and provider is not probe-capable; "
+            "skipping full re-send to avoid a duplicate task (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        return False
+    logger.warning(
+        "Delivery to %s not accepted (paste dropped); " "re-delivering message (attempt %d)",
+        terminal_id,
+        attempt,
+    )
+    send_input(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+    )
+    return False
 
 
 async def _confirm_worker_started_or_resubmit(
@@ -1185,40 +1323,21 @@ async def _confirm_worker_started_or_resubmit(
         return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
-        # The cached status_monitor status is event-driven (pyte screener at
-        # rising-edge/quiescence only) and can lag behind reality. Before
-        # re-delivering, do a direct capture-pane / visible-screen check via
-        # the provider to catch cases where the worker IS processing but the
-        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
-        # footer appearing between pyte detection edges). Only providers that
-        # opt in via ``supports_direct_status_probe = True`` take this path.
-        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
-            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
-                return True
-
-        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
-            logger.warning(
-                "Deferred assign to %s unsubmitted (Enter swallowed); "
-                "re-submitting via Enter (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
-        else:
-            logger.warning(
-                "Deferred assign to %s not accepted (paste dropped); "
-                "re-delivering message (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(
-                send_input,
-                terminal_id,
-                message,
-                registry=registry,
-                sender_id=sender_id,
-                orchestration_type=orchestration_type,
-            )
+        # The redelivery decision (box check + #496's direct-probe guard for
+        # providers that opt in) lives in ``redeliver_dropped_message`` —
+        # shared with the synchronous step path (#562).
+        already_started = await asyncio.to_thread(
+            redeliver_dropped_message,
+            terminal_id,
+            message,
+            attempt,
+            provider,
+            registry=registry,
+            sender_id=sender_id,
+            orchestration_type=orchestration_type,
+        )
+        if already_started:
+            return True
         if await wait_until_status(
             terminal_id,
             _DEFERRED_STARTED_STATUSES,
@@ -1519,6 +1638,7 @@ def send_input(
     registry: PluginRegistry | None = None,
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
+    frozen_memory: str | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -1526,6 +1646,12 @@ def send_input(
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
+
+    ``frozen_memory`` is forwarded UNCHANGED to :func:`inject_memory_context` and
+    is otherwise none of this function's business — not inspected, not validated,
+    not logged. It is last and defaulted so existing positional callers (notably
+    ``agent_step.run_agent_step``, which passes exactly two arguments) are
+    unaffected.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -1578,7 +1704,7 @@ def send_input(
         # plugins/webhooks see what the caller sent — not the
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
-        message = inject_memory_context(message, terminal_id)
+        message = inject_memory_context(message, terminal_id, frozen_memory)
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1

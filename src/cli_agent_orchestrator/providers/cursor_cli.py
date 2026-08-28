@@ -289,8 +289,8 @@ class CursorCliProvider(BaseProvider):
         orchestration (handoff / assign) continues to work because the
         inbox / MCP tools are the same across all profiles.
 
-        Returns a properly escaped shell command string suitable for
-        :func:`tmux_client.send_keys`. Uses :func:`shlex.join` to handle
+        Returns a properly escaped shell command string suitable for the
+        configured terminal backend's ``send_keys`` method. Uses :func:`shlex.join` to handle
         multiline strings and special characters correctly.
         """
         profile = None
