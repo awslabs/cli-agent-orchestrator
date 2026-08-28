@@ -8,8 +8,8 @@ WHY A COUNT IS NOT ENOUGH, AND WHY A GREEN MATRIX IS NOT EITHER
 ---------------------------------------------------------------
 The wheel matrix runs with ``fail-fast: false`` so one platform's failure does not hide the
 others. The trade-off is that a partial result looks almost identical to a complete one in
-a run summary — three green legs and one red is easy to skim past, and the publish job would
-then upload three platforms as if that were the release.
+a run summary — a column of green with one red is easy to skim past, and the publish job
+would then upload whatever survived as if that were the release.
 
 Worse, a matrix leg can succeed while producing the WRONG artifact. The defect this unit
 fixes is precisely that: a build that reported success and emitted a ``py3-none-any`` wheel
@@ -17,9 +17,9 @@ containing a ``Mach-O 64-bit arm64`` executable. Every job was green.
 
 So this script asserts the *artifacts*, not the job outcomes:
 
-1. **Every expected platform is present.** Missing macOS x86_64 means Intel-Mac operators
-   get no wheel — pip falls back to the sdist and builds from source, which needs a Rust
-   toolchain they may not have.
+1. **Every expected platform is present.** A platform the matrix builds but fails to deliver
+   leaves its operators with no wheel — pip falls back to the sdist and builds from source,
+   which needs a Rust toolchain they may not have.
 2. **No wheel is tagged ``any``.** A single ``*-any.whl`` in ``dist/`` is the original defect
    reaching PyPI, where it OUTRANKS the platform wheels for every installer: pip prefers a
    more specific tag, but an ``any`` wheel is compatible everywhere, so any host whose
@@ -33,7 +33,7 @@ against — the same authority the installer uses.
 Usage
 -----
     python scripts/assert_wheel_matrix.py --dist dist/
-    python scripts/assert_wheel_matrix.py --dist dist/ --expect macosx_arm64 win_amd64
+    python scripts/assert_wheel_matrix.py --dist dist/ --expect macosx_11_0_arm64
 
 Exits 0 on success; non-zero with an explanatory report on failure.
 """
@@ -48,11 +48,18 @@ from typing import Dict, List, Optional, Sequence
 # The platform set this repo's wheel matrix builds, as patterns matched against the wheel
 # filename's platform tag.
 #
-# WINDOWS IS DELIBERATELY ABSENT. Interview Q2 named four platforms, but
-# `cli_agent_orchestrator` cannot be imported on Windows — four modules import `fcntl` at
-# module scope and the backend is tmux — so `win_amd64` is not built and must not be
-# required here. Requiring a platform the matrix does not build would fail every publish;
-# accepting one that cannot run would be worse. See `build-wheels` in publish-to-pypi.yml.
+# WINDOWS AND macOS x86_64 ARE DELIBERATELY ABSENT. Interview Q2 named four platforms; two of
+# them cannot be delivered as a working install:
+#
+#   * `win_amd64` — `cli_agent_orchestrator` cannot be imported on Windows at all (four
+#     modules import `fcntl` at module scope, and the backend is tmux).
+#   * `macosx_*_x86_64` — this project floors at `cryptography>=50.0.0` for two HIGH CVEs, and
+#     cryptography ships no Intel-macOS wheel at 49.0.0 or above, so an Intel Mac must compile
+#     it from source no matter what we publish.
+#
+# Neither is built, and neither may be REQUIRED here. Requiring a platform the matrix does not
+# build would fail every publish; accepting one that cannot run would be worse. See
+# `build-wheels` in publish-to-pypi.yml for the measurements behind both.
 #
 # Patterns rather than literals because the tags carry version numbers that legitimately
 # move with the runner image — `macosx_26_0_arm64` tracks the macOS SDK, and a Linux tag may
@@ -77,7 +84,6 @@ from typing import Dict, List, Optional, Sequence
 # required one makes the check unfalsifiable. (#321)
 REQUIRED_PLATFORM_PATTERNS: Dict[str, List[str]] = {
     "macOS arm64": ["macosx_*_arm64"],
-    "macOS x86_64": ["macosx_*_x86_64"],
     "Linux x86_64": ["manylinux_*_x86_64", "linux_x86_64"],
 }
 

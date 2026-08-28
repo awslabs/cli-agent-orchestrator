@@ -128,12 +128,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - install a host Python in build-wheels so the post-build wheel assertion can run at all
   (the macOS runners ship only `python3`, so `python scripts/build_tui.py check` exited 127)
 
-- set MACOSX_DEPLOYMENT_TARGET per matrix leg (11.0 arm64, 10.12 x86_64) so delocate's
-  minimum-OS check matches the Rust binary's actual floor instead of cibuildwheel's 10.9 default
+- set MACOSX_DEPLOYMENT_TARGET per matrix leg so delocate's minimum-OS check matches the Rust
+  binary's actual floor instead of cibuildwheel's 10.9 default
 
 - stop building and requiring a Windows wheel, and refuse Windows at import with an
   explanation: four modules import `fcntl` at module scope and the backend is tmux, so the
   sdist fallback installed but could not import
+
+- stop building and requiring a macOS x86_64 (Intel) wheel: `cryptography` ships no
+  Intel-macOS wheel at 49.0.0 or above, and CAO floors at `cryptography>=50.0.0` for two HIGH
+  CVEs, so an Intel Mac cannot resolve its dependencies from wheels at all. Intel Macs now get
+  a clean "no matching distribution" from pip rather than a wheel that installs and then fails.
+  Every wheel CAO publishes is now both built and executed by CI.
 
 
 ### Other

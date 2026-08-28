@@ -50,18 +50,18 @@ jobs:
           # `test_wheel_matrix.py` asserts that agreement rather than trusting it. (#321)
           #
           # `macos-target` is this leg's MACOSX_DEPLOYMENT_TARGET, and it is REQUIRED, not a
-          # tuning knob. cibuildwheel defaults it to 10.9 for x86_64 and 11.0 for arm64, but
-          # rustc's `x86_64-apple-darwin` emits a binary whose LC_BUILD_VERSION minimum is
-          # 10.12. `delocate-wheel` compares the two and REFUSES the wheel:
+          # tuning knob. `delocate-wheel` compares every bundled Mach-O member's
+          # LC_BUILD_VERSION minimum against the wheel's platform tag and REFUSES a wheel whose
+          # binary floor is higher:
           #
           #   DelocationError: Library dependencies do not satisfy target MacOS version 10.9:
           #     .../cao-tui has a minimum target of 10.12
           #
-          # That is what failed the v2.5.0 x86_64 leg — at REPAIR time, before the smoke test
-          # this config expected to be the x86_64 gap. It is set PER LEG and not once for all
-          # of macOS on purpose: a blanket 10.12 would put arm64 BELOW its own binary's 11.0
-          # floor and break the one macOS leg that already works. Empty on Linux, where the
-          # variable is meaningless. (#321)
+          # That is verbatim what failed v2.5.0's x86_64 leg — at REPAIR time, before the smoke
+          # test that config expected to be the x86_64 gap. That leg is gone now (see below),
+          # but the key stays PER LEG rather than collapsing to one macOS-wide value: rustc's
+          # floor differs by target, so a blanket value correct for one arch puts another BELOW
+          # its own binary's floor. Empty on Linux, where the variable is meaningless. (#321)
           #
           # macOS arm64 — native on GitHub's `macos-latest` (arm64 since macOS 14). 11.0 is
           # cibuildwheel's own arm64 default, pinned here so the pair stays visible and a
@@ -71,20 +71,34 @@ jobs:
             archs: arm64
             rust-target: ''
             macos-target: '11.0'
-          # macOS x86_64 — CROSS-COMPILED from the same arm64 runner. cibuildwheel sets
-          # ARCHFLAGS, hatchling's tag inference honours it, and scripts/build_tui.py maps it
-          # to `--target x86_64-apple-darwin`. See the UNVERIFIED note below: the binary
-          # cannot be EXECUTED here, so its smoke test is skipped by cibuildwheel.
-          - os: macos-latest
-            label: macOS x86_64
-            archs: x86_64
-            rust-target: x86_64-apple-darwin
-            macos-target: '10.12'
           - os: ubuntu-latest
             label: Linux x86_64
             archs: x86_64
             rust-target: ''
             macos-target: ''
+          # NO macOS x86_64 (INTEL) LEG. Not because it cannot be BUILT — v2.5.0's cross-build
+          # produced a correctly tagged wheel once the deployment target above was fixed — but
+          # because the wheel cannot be INSTALLED on the platform it targets.
+          #
+          # Measured over every `cryptography` release on PyPI: 48.0.1 and earlier ship
+          # `macosx_10_9_universal2`; 49.0.0 onward ship `macosx_11_0_arm64` and nothing else
+          # for macOS. This project floors at `cryptography>=50.0.0` (49.0.0 fixes
+          # CVE-2026-69249, 50.0.0 fixes CVE-2026-69247, both HIGH, and Trivy's gate is
+          # blocking) — so EVERY version we are permitted to resolve is one with no Intel wheel,
+          # and an Intel Mac must build it from source, which needs OpenSSL headers and a Rust
+          # toolchain.
+          #
+          # That is where v2.5.0's leg actually died: inside cibuildwheel's own test venv, where
+          # pip tried to build cryptography for x86_64 from an arm64 host and `openssl-sys`
+          # reported `pkg-config has not been configured to support cross-compilation`
+          # ($HOST = aarch64-apple-darwin, $TARGET = x86_64-apple-darwin).
+          #
+          # `test-skip` was considered and REJECTED: silencing the test would have published a
+          # wheel whose install fails the same way on the operator's machine, only later and
+          # with no CI record. Dropping the leg means an Intel Mac gets a clean "no matching
+          # distribution" from pip instead. Restoring it needs cryptography to ship Intel wheels
+          # again (or a vendored OpenSSL) AND a native x86_64 runner to execute the result.
+          #
           # NO WINDOWS LEG. `cli_agent_orchestrator` cannot be IMPORTED on Windows: four
           # modules import `fcntl` at module scope (services/memory_reconciliation.py,
           # services/memory_service.py, services/wiki_healer.py, api/main.py — which also
@@ -141,13 +155,16 @@ jobs:
       # `@stable` re-resolves on every run and is unreviewable supply chain. The toolchain
       # channel is selected by the `toolchain` input, which is what `@stable` really did.
       #
-      # `targets:` is what makes the macOS x86_64 leg compile at all. `build_tui.py` passes
-      # `--target x86_64-apple-darwin` whenever cibuildwheel sets `ARCHFLAGS=-arch x86_64`,
-      # and cargo cannot build for a target whose std is not installed. Without this the leg
-      # dies on "target may not be installed", and because `publish-testpypi` `needs:
-      # build-wheels`, the FIRST release after this lands would fail outright. The action
-      # expands the input to `rustup toolchain install <channel> --target <triple>`; an empty
-      # value expands to nothing, which is correct for the three host-target legs.
+      # `targets:` installs the target std a CROSS-BUILD needs before cargo runs; cargo cannot
+      # build for a target whose std is absent, and the failure is "target may not be
+      # installed". EVERY LEG IS CURRENTLY HOST-TARGET, so `matrix.rust-target` is empty
+      # throughout and the action expands the input to nothing.
+      #
+      # The plumbing stays rather than being deleted with the cross-compiled leg it was added
+      # for: `build_tui.py` still maps ARCHFLAGS to `--target <triple>`, so the day a
+      # cross-build returns, omitting this input fails the leg — and because
+      # `publish-testpypi` `needs: build-wheels`, it fails at release time, where no PR check
+      # can see it. `test_wheel_matrix.py` asserts the matrix and the arch map agree.
       # (Reported by review on PR #547.)
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable @ 2026-07-16
         if: runner.os != 'Linux'
@@ -162,10 +179,11 @@ jobs:
       - uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
-          # See `macos-target` in the matrix: this is what keeps delocate from rejecting the
-          # x86_64 wheel over the Rust binary's 10.12 floor. cibuildwheel reads
-          # MACOSX_DEPLOYMENT_TARGET from the environment and only supplies its own default
-          # when unset, so an explicit value wins. Empty on Linux, where it is inert.
+          # See `macos-target` in the matrix: this is what keeps delocate from rejecting a
+          # macOS wheel whose Rust binary declares a higher minimum than the wheel's tag.
+          # cibuildwheel reads MACOSX_DEPLOYMENT_TARGET from the environment and only supplies
+          # its own default when unset, so an explicit value wins. Empty on Linux, where it is
+          # inert.
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos-target }}
 
       # Belt-and-braces on top of cibuildwheel's own test-command: assert the binary is
@@ -187,7 +205,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           # Per-platform artifact names, merged by the publish jobs via `pattern:` +
-          # `merge-multiple:`. A shared name would make the four uploads race.
+          # `merge-multiple:`. A shared name would make the legs race each other.
           name: dist-${{ matrix.os }}-${{ matrix.archs }}
           path: wheelhouse/*.whl
           if-no-files-found: error
@@ -281,8 +299,10 @@ jobs:
             label: macOS arm64
           - os: ubuntu-latest
             label: Linux x86_64
-          # No Windows leg, for the reason given on the `build-wheels` matrix: the package
-          # cannot be imported on Windows at all, so there is no wheel to smoke-test.
+          # One leg per PUBLISHED wheel, and no more: there is no Windows or Intel-macOS wheel
+          # to smoke-test, for the reasons given on the `build-wheels` matrix. Keeping this
+          # matrix in step with that one is what makes "every wheel we ship is installed and
+          # executed by CI" true rather than aspirational.
     steps:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:

@@ -9,11 +9,11 @@ Every test here either (a) exercises the tag-selection logic that produces the p
 or (b) asserts a guard actually FAILS on the bad input it exists to catch. The second kind
 matters more: a guard that cannot fail is worse than no guard, because it reports success.
 
-What these tests deliberately do NOT claim: that the Linux or macOS x86_64 wheels work.
-Neither can be built or executed on the development machine (macOS arm64), and no test here
-pretends otherwise — see `test_wheel_matrix_documents_unverified_platforms`. Windows is not
-built at all; the `win_amd64` cases below exercise the tag-selection logic and the assertion
-gate on that input, not a shippable artifact.
+What these tests deliberately do NOT claim: that the Linux wheel works. It cannot be built
+or executed on the development machine (macOS arm64), and no test here pretends otherwise —
+see `test_wheel_matrix_documents_unverified_platforms`. Windows and Intel macOS are not built
+at all; their tags still appear below because the tag-selection logic and the assertion gate
+must behave correctly on any input hatchling hands them, not because either is shippable.
 """
 
 from __future__ import annotations
@@ -194,10 +194,15 @@ class TestPlatformTagSelection:
             ("cp310-cp310-win_amd64", "win_amd64"),
         ],
     )
-    def test_platform_component_is_preserved_for_every_matrix_target(
+    def test_platform_component_is_preserved_for_any_platform_hatchling_infers(
         self, tmp_path, monkeypatch, best_tag, expected_platform
     ):
-        """The platform half comes from hatchling and must pass through untouched."""
+        """The platform half comes from hatchling and must pass through untouched.
+
+        Deliberately broader than the shipped matrix: two of these platforms are not built,
+        but the hook must not special-case a platform list it cannot see, and a tag it
+        mangled would be worse than one it refused.
+        """
         _stage_binary(tmp_path)
         monkeypatch.setenv(hatch_hook.FORCE_ENV, "1")
 
@@ -632,16 +637,16 @@ class TestAutobuildStagesTheBinary:
 
 
 class TestAssertWheelMatrix:
-    def test_full_platform_set_passes_without_a_windows_wheel(self, tmp_path):
-        """The three platforms the matrix builds are the whole requirement.
+    def test_full_platform_set_passes_without_windows_or_intel_macos_wheels(self, tmp_path):
+        """The two platforms the matrix builds are the whole requirement.
 
-        Doubles as the regression test for the v2.5.0 publish gate: while `Windows AMD64` was
-        still in ``REQUIRED_PLATFORM_PATTERNS``, this exact directory — every wheel the matrix
-        can actually produce — would have been rejected as incomplete.
+        Doubles as the regression test for the v2.5.0 publish gate: while `Windows AMD64` and
+        `macOS x86_64` were still in ``REQUIRED_PLATFORM_PATTERNS``, this exact directory —
+        every wheel the matrix can actually produce — would have been rejected as incomplete,
+        blocking the publish on artifacts nothing builds.
         """
         for tag in (
             "py3-none-macosx_26_0_arm64",
-            "py3-none-macosx_26_0_x86_64",
             "py3-none-linux_x86_64",
         ):
             _wheel_with_tag(tmp_path, tag)
@@ -649,18 +654,26 @@ class TestAssertWheelMatrix:
 
     def test_missing_one_platform_fails(self, tmp_path):
         """A partial matrix must not publish. `fail-fast: false` makes this easy to miss."""
-        for tag in (
-            "py3-none-macosx_26_0_arm64",
-            "py3-none-linux_x86_64",
-        ):
-            _wheel_with_tag(tmp_path, tag)
+        _wheel_with_tag(tmp_path, "py3-none-macosx_26_0_arm64")
         assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 1
+
+    def test_the_gate_still_fails_on_a_platform_it_is_asked_to_require(self, tmp_path):
+        """The shrunken required set must not be mistaken for a gate that cannot fail.
+
+        Two platforms were removed from ``REQUIRED_PLATFORM_PATTERNS`` for good reasons; this
+        pins that the remaining mechanism is still load-bearing by asking it, via ``--expect``,
+        for a platform the directory does not have.
+        """
+        _wheel_with_tag(tmp_path, "py3-none-macosx_26_0_arm64")
+        assert (
+            assert_wheel_matrix.main(["--dist", str(tmp_path), "--expect", "macosx_26_0_x86_64"])
+            == 1
+        )
 
     def test_an_any_wheel_in_the_set_fails(self, tmp_path):
         """An 'any' wheel OUTRANKS the platform wheels for any unmatched host."""
         for tag in (
             "py3-none-macosx_26_0_arm64",
-            "py3-none-macosx_26_0_x86_64",
             "py3-none-linux_x86_64",
             "py3-none-any",
         ):
@@ -689,7 +702,6 @@ class TestAssertWheelMatrix:
         """
         for tag in (
             "py3-none-macosx_26_0_arm64",
-            "py3-none-macosx_26_0_x86_64",
             "py3-none-manylinux_2_28_x86_64",
         ):
             _wheel_with_tag(tmp_path, tag)
@@ -705,7 +717,6 @@ class TestAssertWheelMatrix:
         """
         for tag in (
             "py3-none-macosx_26_0_arm64",
-            "py3-none-macosx_26_0_x86_64",
             "py3-none-musllinux_1_2_x86_64",
         ):
             _wheel_with_tag(tmp_path, tag)
@@ -715,7 +726,6 @@ class TestAssertWheelMatrix:
         """The suffix pins the ARCH; an aarch64 wheel must not stand in for x86_64."""
         for tag in (
             "py3-none-macosx_26_0_arm64",
-            "py3-none-macosx_26_0_x86_64",
             "py3-none-manylinux_2_28_aarch64",
         ):
             _wheel_with_tag(tmp_path, tag)
@@ -837,8 +847,14 @@ class TestReleaseToolchainInstallsEveryCrossTarget:
     ``workflow_dispatch``. (Reported by review on PR #547.)
 
     Asserted against the PARSED yaml and against ``build_tui.py``'s own arch map, not against
-    a string in the file. A grep for ``targets:`` would keep passing if a fifth leg were added
-    later without one, which is the same silence the original defect had.
+    a string in the file. A grep for ``targets:`` would keep passing if a leg were added later
+    without one, which is the same silence the original defect had.
+
+    NO LEG CROSS-COMPILES TODAY — the one that did (macOS x86_64) was dropped in v2.5.0 for a
+    dependency reason, not because cross-compiling stopped working. So the arch-map agreement
+    tests below are currently vacuous by construction, and the load-bearing assertion is
+    ``test_the_toolchain_step_installs_the_matrix_target``: it fails if the plumbing that a
+    restored leg would need is deleted as dead config.
     """
 
     WORKFLOW = PUBLISH_WORKFLOW
@@ -1032,12 +1048,11 @@ class TestConfigurationInvariants:
         )
         assert text.count("timeout-minutes:") >= 5
 
-    def test_matrix_covers_the_three_supported_platforms(self):
-        """Interview Q2 named four; Windows is not one of them. See the next test."""
+    def test_matrix_covers_the_two_shippable_platforms(self):
+        """Interview Q2 named four. Two are not shippable — see the next two tests."""
         legs = _wheel_matrix_legs()
         assert {leg["label"] for leg in legs} == {
             "macOS arm64",
-            "macOS x86_64",
             "Linux x86_64",
         }
         assert {leg["os"] for leg in legs} == {"macos-latest", "ubuntu-latest"}
@@ -1095,31 +1110,70 @@ class TestConfigurationInvariants:
             lambda s: "python scripts/build_tui.py check" in s.get("run", "")
         )
 
-    def test_macos_deployment_target_clears_the_rust_binary_floor_per_leg(self):
+    def test_macos_deployment_target_is_declared_per_leg_and_reaches_cibuildwheel(self):
         """The v2.5.0 macOS x86_64 failure, in delocate:
 
             DelocationError: Library dependencies do not satisfy target MacOS version 10.9:
               .../cao-tui has a minimum target of 10.12
 
-        cibuildwheel defaults x86_64 to 10.9, but rustc's `x86_64-apple-darwin` output
-        declares 10.12, and delocate refuses the wheel. Asserted PER LEG rather than as one
-        macOS-wide value: a blanket 10.12 would drop arm64 below its own binary's 11.0 floor
-        and break the leg that already worked, so a single shared value is itself the bug.
+        delocate compares the bundled binary's minimum-OS against the wheel's platform tag, so
+        each leg's MACOSX_DEPLOYMENT_TARGET has to clear its own binary's floor. It is declared
+        PER LEG because cibuildwheel's defaults differ by arch (10.9 x86_64, 11.0 arm64) and so
+        do the floors — one macOS-wide value is necessarily wrong for one of them.
+
+        Only the arm64 leg remains (the Intel leg is gone; see the test below), so what is
+        pinned here is the value AND the plumbing. Without the env line the matrix key would be
+        inert config that reads as if it were doing something.
         """
         targets = {leg["label"]: leg["macos-target"] for leg in _wheel_matrix_legs()}
-        assert targets["macOS x86_64"] == "10.12", (
-            "the x86_64 leg's deployment target must clear rustc's 10.12 floor or "
-            "delocate-wheel rejects the wheel during repair"
-        )
         assert (
             targets["macOS arm64"] == "11.0"
-        ), "arm64's binary floor is 11.0; lowering this leg to match x86_64 would break it"
+        ), "arm64's binary floor is 11.0; a lower value here is rejected by delocate at repair"
         assert targets["Linux x86_64"] == "", "the variable is meaningless on Linux"
+        assert all(
+            "macos-target" in leg for leg in _wheel_matrix_legs()
+        ), "every leg must declare the key, so an added platform has to make the choice"
 
         # And the value has to actually reach cibuildwheel.
         steps = _build_wheels_steps()
         cibw = next(s for s in steps if "pypa/cibuildwheel@" in s.get("uses", ""))
         assert cibw["env"]["MACOSX_DEPLOYMENT_TARGET"] == "${{ matrix.macos-target }}"
+
+    def test_no_intel_macos_wheel_is_built_or_required(self):
+        """cryptography ships no Intel-macOS wheel at the versions we are allowed to use.
+
+        Measured over every cryptography release on PyPI: 48.0.1 and earlier ship
+        `macosx_10_9_universal2`; 49.0.0 onward ship `macosx_11_0_arm64` and nothing else for
+        macOS. This project floors at `cryptography>=50.0.0` because 49.0.0 fixes
+        CVE-2026-69249 and 50.0.0 fixes CVE-2026-69247, both HIGH — so every permitted version
+        is one with no Intel wheel, and an Intel-Mac install must compile it from source.
+
+        v2.5.0's x86_64 leg died on exactly that inside cibuildwheel's test venv: pkg-config
+        cannot supply an x86_64 OpenSSL from an arm64 host. Suppressing the leg's test would
+        have shipped a wheel that fails the same way on the operator's machine, so the leg is
+        gone instead.
+
+        Pinned in three places, because restoring it in any one alone either publishes a wheel
+        that cannot install or deadlocks the publish gate on an artifact nobody builds.
+        """
+        legs = _wheel_matrix_legs()
+        intel = [
+            leg["label"]
+            for leg in legs
+            if str(leg["os"]).startswith("macos") and leg["archs"] == "x86_64"
+        ]
+        assert not intel, (
+            f"an Intel-macOS leg is back in build-wheels ({intel}); cryptography>=50 has no "
+            "Intel-macOS wheel, so the leg's test venv cannot resolve it and neither can an "
+            "operator's Intel Mac"
+        )
+        assert (
+            "macOS x86_64" not in assert_wheel_matrix.REQUIRED_PLATFORM_PATTERNS
+        ), "the publish gate would block forever on a wheel the matrix no longer builds"
+        assert "*-macosx_x86_64" in self._pyproject()["tool"]["cibuildwheel"]["skip"], (
+            "a local cibuildwheel run on an Intel Mac would otherwise emit the wheel that "
+            "CI deliberately does not"
+        )
 
     def test_wheelhouse_is_gitignored(self):
         """cibuildwheel's output dir holds multi-MB binaries; it must not enter history."""
@@ -1169,11 +1223,15 @@ class TestWindowsIsRefusedAtImport:
 def test_wheel_matrix_documents_unverified_platforms():
     """The honesty requirement, asserted rather than left to a report.
 
-    Three of the four platform wheels CANNOT be built or executed on the development machine
-    (macOS arm64), and the operator declined Docker/QEMU emulation. The configuration must
-    therefore state which platforms remain CI's to prove — a config that reads as though all
-    four were verified is exactly the "passed CI but partially worked" failure this intent
-    exists to eliminate, made worse because wheels reach operators.
+    The Linux wheel CANNOT be built or executed on the development machine (macOS arm64), and
+    the operator declined Docker/QEMU emulation. The configuration must therefore state what
+    remains CI's to prove — a config that reads as though everything were verified is exactly
+    the "passed CI but partially worked" failure this intent exists to eliminate, made worse
+    because wheels reach operators.
+
+    Since v2.5.0 the remaining admission is no longer about a PLATFORM: both unverifiable
+    platforms were dropped rather than shipped unverified, so every wheel published is built
+    and executed by CI. What is left is the smoke-test-on-dispatch coverage gap.
 
     This test fails if those admissions are removed from the config, so the caveat cannot be
     quietly dropped by a later edit.
@@ -1181,6 +1239,7 @@ def test_wheel_matrix_documents_unverified_platforms():
     text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert "CONSEQUENCE, stated rather than glossed" in text, (
         "the pyproject cibuildwheel section must keep naming the known gaps (the "
-        "linux_x86_64/PyPI rejection, and the untested cross-compiled macOS x86_64 binary)"
+        "linux_x86_64/PyPI rejection, why the Intel-macOS leg was dropped rather than "
+        "shipped untested, and the smoke-test-on-dispatch hole)"
     )
     assert "UNVERIFIED" in text
