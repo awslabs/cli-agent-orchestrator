@@ -338,3 +338,20 @@ python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 addopts = "--cov=src --cov-report=term-missing -m 'not e2e'"
+
+# NFR-3's 80% line floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
+#
+# `fail_under` deliberately does NOT live in this file, and the reason was measured
+# rather than assumed. `--cov` is in `addopts` above, so it applies to EVERY pytest
+# invocation -- and a single test file reports ~24% coverage of the whole package. A
+# `fail_under = 80` here would therefore fail `pytest test/some_file.py` for every
+# developer on every targeted run, while the number it checks is only meaningful for
+# the full suite. A check that fires on the ordinary case is indistinguishable from
+# no check at all.
+#
+# It is enforced instead by `--cov-fail-under=80` on the full-suite invocation in
+# `.github/workflows/ci.yml`, which is the only place the figure means anything.
+# Coverage stood at 91.3% when the floor was added, so it has 11 points of headroom.
+#
+# NOTE for anyone reading ci.yml: the separate "Coverage ratchet" step there belongs
+# to cao_mcp_apps (the TypeScript subproject), not to this suite.
