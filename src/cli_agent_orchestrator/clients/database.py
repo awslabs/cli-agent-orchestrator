@@ -1418,6 +1418,52 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         return False
 
 
+def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]:
+    """List terminals for several tmux sessions in one query.
+
+    Exists so ``list_sessions`` can enrich N sessions without N queries (issue
+    #629) while still reading only the rows it will use. ``list_all_terminals``
+    would also collapse the query count, but its cost scales with the whole
+    table — including rows for sessions tmux no longer reports, which accumulate
+    because ``cleanup_service.cleanup_old_data`` only runs at server startup, so
+    a long-uptime server never sweeps them. Bounding the read by the live
+    session names keeps the cost proportional to the workload instead of to the
+    leak.
+
+    Ordered by ``id`` explicitly. The caller picks a session's "first known
+    terminal", so the pick is order-sensitive, and without an ``ORDER BY`` the
+    order is whatever plan the engine plans: today every plan is a rowid scan
+    (there is no index on ``tmux_session``), but adding one — the obvious
+    reaction to a slow per-session lookup — can reorder an equality probe when
+    the index carries a DESC component. Ordering here makes the pick specified
+    rather than incidental.
+
+    Returns an empty list without querying when given no session names.
+    """
+    if not tmux_sessions:
+        return []
+    with SessionLocal() as db:
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session.in_(tmux_sessions))
+            .order_by(TerminalModel.id)
+            .all()
+        )
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
+                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
 def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:

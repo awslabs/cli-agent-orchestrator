@@ -31,6 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids_older_than,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    list_terminals_in_sessions,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
@@ -1768,3 +1769,96 @@ class TestProjectAliasMigration:
         with sqlite3.connect(str(db_file)) as conn:
             rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
         assert rows == [("a1", "p1")], "current-schema table must be left intact"
+
+
+class TestListTerminalsInSessions:
+    """Real-SQLite tests for the batched terminal read (issue #629).
+
+    Mocked-``SessionLocal`` tests cannot cover what matters here — that the
+    ``IN`` filter and the ``ORDER BY`` are actually applied by SQL — so these
+    run against a real database.
+    """
+
+    @pytest.fixture
+    def db(self, tmp_path, monkeypatch):
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'terminals.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(bind=engine)
+        Local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.SessionLocal",
+            Local,
+        )
+        return Local
+
+    @staticmethod
+    def _add(Local, terminal_id, tmux_session):
+        with Local() as s:
+            s.add(
+                TerminalModel(
+                    id=terminal_id,
+                    tmux_session=tmux_session,
+                    tmux_window=f"win-{terminal_id}",
+                    provider="kiro_cli",
+                    agent_profile="developer",
+                    working_directory=f"/w/{terminal_id}",
+                    last_active=datetime.now(),
+                )
+            )
+            s.commit()
+
+    def test_returns_only_the_requested_sessions(self, db):
+        """Rows for other sessions are not read — this is what bounds the query.
+
+        Rows for sessions tmux no longer reports are only swept at server
+        startup by ``cleanup_service.cleanup_old_data``, so on a long-uptime
+        server they accumulate. A whole-table read would make every caller pay
+        for them.
+        """
+        self._add(db, "a1", "cao-alpha")
+        self._add(db, "b1", "cao-beta")
+        for n in range(25):
+            self._add(db, f"dead{n:02d}", f"cao-dead-{n}")
+
+        result = list_terminals_in_sessions(["cao-alpha", "cao-beta"])
+
+        assert {t["id"] for t in result} == {"a1", "b1"}
+        assert {t["tmux_session"] for t in result} == {"cao-alpha", "cao-beta"}
+
+    def test_no_session_names_does_not_query(self, db):
+        """An empty request short-circuits rather than degenerating to a scan.
+
+        ``IN ()`` is a SQLAlchemy warning and an empty result anyway; the guard
+        makes it explicit and free.
+        """
+        self._add(db, "a1", "cao-alpha")
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_local:
+            assert list_terminals_in_sessions([]) == []
+            mock_local.assert_not_called()
+
+    def test_orders_by_id_within_a_session(self, db):
+        """The order is specified, not whatever plan the engine picks.
+
+        The caller (``_enrich_session_ownership``) takes a session's *first*
+        known terminal, so this order decides which terminal supplies the
+        reported agent_profile/working_directory. Rows are inserted in reverse
+        id order here so insertion order cannot be what makes it pass.
+        """
+        for terminal_id in ("z9", "m5", "a1"):
+            self._add(db, terminal_id, "cao-alpha")
+
+        result = list_terminals_in_sessions(["cao-alpha"])
+
+        assert [t["id"] for t in result] == ["a1", "m5", "z9"]
+
+    def test_matches_the_per_session_read_shape(self, db):
+        """Same keys as ``list_terminals_by_session``, so callers are interchangeable."""
+        self._add(db, "a1", "cao-alpha")
+
+        batched = list_terminals_in_sessions(["cao-alpha"])
+        per_session = list_terminals_by_session("cao-alpha")
+
+        assert batched == per_session
