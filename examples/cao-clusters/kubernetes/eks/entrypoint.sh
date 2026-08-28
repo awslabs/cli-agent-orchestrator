@@ -30,7 +30,7 @@
 #                         the state directory is empty.
 #   CAO_STATE_SEED_ROOT   the CAO_HOME_DIR the seed was built for. The seed is
 #                         only used when CAO_HOME_DIR matches it exactly.
-#   CAO_MAX_TERMINALS     optional cap on live terminals this node will host
+#   CAO_MAX_TERMINALS     optional cap on terminals this node will track
 #                         (unset = unlimited). Worker pods set 1 so each pod
 #                         hosts exactly one agent; extra placements get HTTP 429.
 #   CAO_ADVERTISED_URL    base URL at which PEERS can reach this node's

@@ -285,7 +285,7 @@ def get_server_settings() -> Dict[str, Any]:
 
 
 def get_max_terminals() -> Optional[int]:
-    """Max live terminals this node will host, or None for unlimited.
+    """Max terminals this node will track, or None for unlimited.
 
     Precedence: ``CAO_MAX_TERMINALS`` env var > ``server.max_terminals`` in
     settings.json > None (unlimited — the pre-cap default, so existing
@@ -294,6 +294,15 @@ def get_max_terminals() -> Optional[int]:
     Used by ``terminal_service.create_terminal`` to reject creation when the
     node is full. The one-agent-per-pod Kubernetes topology sets
     ``CAO_MAX_TERMINALS=1`` on worker pods so each pod hosts exactly one agent.
+
+    Counts TRACKED terminals, meaning rows in the terminals table, not probed
+    liveness: a terminal row is only removed by an explicit ``delete_terminal``,
+    so a terminal whose process died without cleanup still occupies a slot. That
+    is harmless in the topology the cap exists for (a worker pod is a disposable
+    Job, so its rows die with it) but an operator who sets ``server.max_terminals``
+    on a long-lived node may have to delete a stale row by hand. Deliberately not
+    probed here: this check runs before anything is allocated precisely so it can
+    stay cheap, and per-row liveness probing would put tmux calls in that path.
 
     Not folded into ``_SERVER_DEFAULTS`` because that table's validation forces
     every key to a positive int default; this setting's default is "absent"

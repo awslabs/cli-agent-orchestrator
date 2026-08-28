@@ -453,7 +453,7 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
-        TerminalLimitError: If the node's live-terminal cap (CAO_MAX_TERMINALS /
+        TerminalLimitError: If the node's tracked-terminal cap (CAO_MAX_TERMINALS /
             server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
@@ -465,10 +465,10 @@ async def create_terminal(
     # which is acceptable for the cap's placement-guard purpose.
     max_terminals = get_max_terminals()
     if max_terminals is not None:
-        live_count = len(list_all_terminals())
-        if live_count >= max_terminals:
+        tracked_count = len(list_all_terminals())
+        if tracked_count >= max_terminals:
             raise TerminalLimitError(
-                f"Terminal limit reached: this node already has {live_count} live "
+                f"Terminal limit reached: this node already has {tracked_count} tracked "
                 f"terminal(s) and CAO_MAX_TERMINALS/server.max_terminals is "
                 f"{max_terminals}. Delete a terminal or target a different node."
             )

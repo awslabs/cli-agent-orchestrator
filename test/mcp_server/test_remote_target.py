@@ -290,7 +290,7 @@ class TestAssignRemoteErrorSurface:
             429,
             {
                 "detail": (
-                    "Terminal limit reached: this node already has 1 live "
+                    "Terminal limit reached: this node already has 1 tracked "
                     "terminal(s) ... target a different node."
                 )
             },
