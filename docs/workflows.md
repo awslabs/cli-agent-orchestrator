@@ -313,11 +313,13 @@ a sentinel where a human decision was required. Re-raise when `.status == 409`.
 
 ## CLI reference
 
-All thirteen verbs live under `cao workflow`.
+All fifteen verbs live under `cao workflow`.
 
 | Verb | Flags | Description |
 | --- | --- | --- |
 | `validate <file>` | `--json` | Validate a spec file without running it. Exit 0 valid, 1 invalid. |
+| `create <name>` | `--from-file <path>` (required), `--json` | Create a **new** Python spec named `<name>` from a source file. Refuses to overwrite an existing spec — use `update`. Python only; a YAML-tier name is refused with a message naming the restriction. The source is sent as text and the **server** decides where it lands (validation, lint gate, path containment, atomic write, index update all happen server-side). Prints the new `content_hash`, which is what `update` wants next. Exit 0 created, 1 refused/errored. |
+| `update <name>` | `--from-file <path>` (required), `--expected-hash <hash>` (required), `--json` | Replace an **existing** spec's source, refusing a stale update. Refuses to create — use `create`. `--expected-hash` is required and is never computed for you: it is your assertion about what you believe you are replacing, and a hash derived from the file about to be overwritten would always match. There is no `--force`. Get the current hash from `get <name>` (the `Hash:` line). |
 | `list` | `--dir <path>`, `--json` | List indexed workflows (rebuilt from spec files on disk). Script-tier rows show `-` for step count. |
 | `get <name>` | `--json` | Show the parsed/validated spec for a name or file path. |
 | `delete <name>` | `--yes` / `-y` | Delete a workflow's spec file and index row (prompts unless `--yes`). |
@@ -333,11 +335,15 @@ All thirteen verbs live under `cao workflow`.
 
 ## MCP tool reference (from inside an agent session)
 
-Eleven workflow tools are exposed over MCP. Each returns a structured `{ok, ...}` envelope on
+Fifteen workflow tools are exposed over MCP. Each returns a structured `{ok, ...}` envelope on
 every path and never raises into the agent loop.
 
 | Tool | Description |
 | --- | --- |
+| `workflow_create` | Create a **new** Python spec from source **text** (not a path). Thin client over `POST /workflows`; refuses to overwrite an existing spec. |
+| `workflow_update` | Replace an existing spec's source, refusing a stale update. Requires `expected_hash` — the hash you believe the spec currently has. |
+| `workflow_get` | Read a spec back, including its source and `content_hash`. FR-10's "inspect" operation: what the workflow currently **is**, not what you last sent. |
+| `workflow_validate` | Lint spec source **without creating anything**. Takes text, so a draft can be checked before it exists anywhere — validate, revise, then create. |
 | `workflow_run` | Run a workflow to completion **inline** (blocking). Bounded by the MCP host's per-tool-call timeout — see the ceiling note above. |
 | `workflow_start` | Submit a run **asynchronously**; returns the run id immediately without waiting. |
 | `workflow_status` | Point-in-time status snapshot for one run. |
@@ -357,6 +363,10 @@ before assuming a verb and a tool with similar names do the same thing:
 
 | Concept | CLI verb | MCP tool |
 | --- | --- | --- |
+| Create a spec | `create --from-file <path>` | `workflow_create` (source **text**) |
+| Update a spec | `update --from-file <path> --expected-hash` | `workflow_update` (source **text**) |
+| Read a spec | `get <name>` | `workflow_get` |
+| Validate a draft | `validate <file>` | `workflow_validate` (source **text**) |
 | List workflow **specs** | `list` | *(none — MCP has no spec-listing tool)* |
 | List workflow **runs** | `runs` | `workflow_list` |
 | Submit asynchronously | `run` (the default) | `workflow_start` |
@@ -364,6 +374,12 @@ before assuming a verb and a tool with similar names do the same thing:
 | **Grant** a plan approval | `approve <plan_id>` | *(none — deliberately)* |
 | **Report** a plan's approval | *(none)* | `workflow_plan_approval` |
 
+> **The four authoring pairs line up by name but not by input.** `create`, `update` and `validate`
+> take a **file path** on the CLI and **source text** over MCP. That is deliberate — an agent holds a
+> draft in context and has nowhere to put a file, whereas a person already has one on disk — but it
+> means the CLI flag and the tool argument are not interchangeable. In both directions the server does
+> the validating, containment-checking and writing; neither surface writes to the spec directory itself.
+>
 > **`list` and `workflow_list` are false friends.** The CLI's `list` lists **specs**; the
 > MCP `workflow_list` lists **runs**. An agent reaching for "the list tool" expecting specs
 > gets runs. The CLI equivalent of `workflow_list` is `cao workflow runs`.
