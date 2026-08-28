@@ -851,7 +851,11 @@ async def _handoff_impl(
         # allowed_tools are all "ignored when reusing" per run_agent_step's own
         # contract (already applied at create time above); engine is NOT
         # ignored -- it is validated against what got persisted, so it is
-        # still forwarded here to match.
+        # still forwarded here to match. Forwarded under the same Kiro-only
+        # guard as the create path below, for exactly that reason: engine is a
+        # Kiro-only concept and the create path only ever persists it for
+        # kiro_cli, so sending it for any other provider could only ever
+        # mismatch what is stored.
         shaped_message = _shape_handoff_message(provider, message)
         payload = {
             "provider": provider,
@@ -870,7 +874,7 @@ async def _handoff_impl(
             "teardown": False,
             "timeout": float(timeout),
         }
-        if engine is not None:
+        if provider == ProviderType.KIRO_CLI.value and engine is not None:
             payload["engine"] = engine
         result = await _run_step_and_build_result(
             payload, agent_profile, provider, timeout, start_time
