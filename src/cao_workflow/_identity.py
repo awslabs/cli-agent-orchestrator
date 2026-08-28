@@ -16,11 +16,17 @@ _GENERATION_VAR = "CAO_WORKFLOW_GENERATION"
 _BASE_URL_VAR = "CAO_API_BASE_URL"
 
 
-def _read_identity_env() -> "tuple[str, str, str]":
+def _read_identity_env(surface: str) -> "tuple[str, str, str]":
     """Resolve (run_id, generation, base_url) from os.environ.
 
     Raises ``ShimIdentityError`` naming only the missing var(s) — never
     echoes a value that WAS present.
+
+    ``surface`` is the public function the author actually called (``"step"``
+    or ``"run_step"``) and is interpolated into the message so this shared
+    helper never names a function the author did not call (BR-7). It is the
+    ONLY thing it adds to that message: the ``missing`` list is computed
+    exactly as before and no present value enters the text (SR-2).
     """
     run_id = os.environ.get(_RUN_ID_VAR)
     generation = os.environ.get(_GENERATION_VAR)
@@ -37,7 +43,7 @@ def _read_identity_env() -> "tuple[str, str, str]":
     ]
     if missing:
         raise ShimIdentityError(
-            f"missing {', '.join(missing)} — run_step() must be called from a "
+            f"missing {', '.join(missing)} — {surface}() must be called from a "
             "script spawned by `cao workflow run` (see the authoring guide's "
             "contract section)"
         )

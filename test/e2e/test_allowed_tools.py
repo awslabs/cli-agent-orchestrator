@@ -933,3 +933,29 @@ class TestGrokCliAllowedTools:
             agent_profile="developer",
             allowed_tools="@builtin,fs_*,execute_bash,web_fetch,@cao-mcp-server",
         )
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeAllowedTools:
+    """E2E allowedTools tests for MiniMax Code's advisory prompt policy."""
+
+    @pytest.mark.xfail(
+        reason="MiniMax Code has prompt-level rather than native tool enforcement",
+        strict=False,
+    )
+    def test_restricted_supervisor_refuses_bash(self, require_minimax_code):
+        _run_restricted_tool_test(
+            provider="mcode",
+            agent_profile="code_supervisor",
+            allowed_tools="@cao-mcp-server",
+        )
+
+    def test_unrestricted_developer_can_bash(self, require_minimax_code):
+        _run_unrestricted_tool_test(provider="mcode", agent_profile="developer")
+
+    def test_allowed_tools_stored_in_metadata(self, require_minimax_code):
+        _run_allowed_tools_stored_test(
+            provider="mcode",
+            agent_profile="developer",
+            allowed_tools="@builtin,fs_read,@cao-mcp-server",
+        )

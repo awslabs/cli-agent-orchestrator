@@ -708,3 +708,27 @@ class TestGrokCliAssign:
     def test_assign_with_callback(self, require_grok):
         """A Grok worker sends its result back to the supervisor inbox."""
         _run_assign_with_callback_test(provider="grok_cli")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeAssign:
+    """E2E assign tests for MiniMax Code using the examples/assign profiles."""
+
+    def test_assign_data_analyst(self, require_minimax_code):
+        _run_assign_test(
+            provider="mcode",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_minimax_code):
+        _run_assign_test(
+            provider="mcode",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_minimax_code):
+        _run_assign_with_callback_test(provider="mcode")

@@ -67,6 +67,14 @@ Every workflow follows the same path. No step is optional.
      value at module top level differs on replay and raises `ReplayDivergenceError`.
      Derive IDs from inputs, not from the clock or an RNG. (See the authoring guide for
      why there is no retry.)
+   - **`missing-recovery-policy` is a blocking error.** A `step()` call that declares no
+     `recovery=` fails validation. Two sibling warnings do not block:
+     `unverifiable-recovery-policy` (a `step()` call passing `**kwargs`, where the linter
+     cannot see whether a policy is inside) and `unenforced-recovery-policy` (a
+     `recovery=` on `run_step`, which resume honours and the server validates with a
+     `422`, but which the shim does not check before sending — so a typo fails that step
+     mid-run rather than up front). See the authoring guide's recovery-policy section — a
+     policy is a *declaration*, never a permission.
 3. **Run** — with an explicit, pre-announced `--run-id` so it can be cancelled.
    **Workflows are NEVER auto-run by an agent.** The user approves each run.
 4. **Status / cancel / resume** — `cao workflow status <run-id>`,
@@ -247,16 +255,65 @@ end-to-end.
 
 ## Resume
 
-`cao workflow resume <run-id>` re-drives an interrupted run: it replays already-completed
-steps from the durable journal and re-runs only the rest. Your script never checks "am I
-resuming?" — it re-executes from the top, and the server transparently returns journaled
-results for calls that already completed. A **deterministic** script (see Validate)
-resumes cleanly with no code change; a nondeterministic one surfaces
-`ReplayDivergenceError`.
+`cao workflow resume <run-id>` re-drives an interrupted run. Your script never checks "am I
+resuming?" — it **re-executes from the top**, every time, and the server decides each step
+call as it arrives. Each step lands on one of three outcomes:
+
+| Outcome | What happens |
+| --- | --- |
+| **replayed** | the stored result is returned and **nothing runs**. `StepHandle.replayed` is `True` |
+| **executed** | the step runs again for real |
+| **halted** | CAO will not decide this one alone: the run stops at that step and waits for a human |
+
+A fourth outcome ends the run rather than one step: if the script changed at a step's key,
+that step **diverges** and the run fails with `ReplayDivergenceError`. A **deterministic**
+script (see Validate) resumes cleanly with no code change; a nondeterministic one diverges.
+
+> **`replayed` qualifies `terminal_id`.** A replayed step's handle carries the ORIGINAL
+> `terminal_id`, and that terminal **no longer exists**. `replayed` is the only thing that
+> stops you reading, writing to, or waiting on a dead id — check it before you touch
+> `terminal_id`.
+
+Which steps can replay is decided from the step's *execution-affecting* inputs — the
+provider, the agent profile name, the prompt, and the other fields that determine what
+actually runs. Change one of them at the same step key and the step diverges rather than
+replaying. That is why the determinism rules above are load-bearing.
+
+### Halts and `--decide`
+
+A step halts when its outcome is genuinely unknown or unverifiable: it was dispatched and
+never settled and no declared recovery policy permits re-execution; its stored result is
+unreadable; its recorded provenance cannot be verified under the current scheme; or its
+author declared `recovery="manual"` and asked to see it. Inside the script the halt arrives
+as a `409` — a `ShimHTTPError` whose body names `kind: "decision_required"`, the `step_id`,
+and which condition fired.
+
+Resolve it by naming a decision per halted step and resuming again:
+
+```bash
+cao workflow resume <run-id> --decide <step_id>=rerun   # re-execute that step
+cao workflow resume <run-id> --decide <step_id>=skip    # accept its stored result
+```
+
+`--decide` is repeatable — one per halted step. Over MCP, `workflow_resume` takes the same
+thing as a `decisions` map, `{step_id: "rerun"|"skip"}`.
+
+> **A decision authorises exactly ONE attempt.** If that attempt crashes before it settles,
+> the next resume asks again rather than re-executing on the old consent. **Consent does not
+> persist across resumes** — one `rerun` is never standing authorisation for a later one.
+
+Whether re-running a step is acceptable at all is something *you* declare with `step()`'s
+`recovery=` keyword. CAO cannot verify such a claim and does not try: a recovery policy
+declares what re-running the step would mean, and never grants permission to do it. See
+[the authoring guide](workflow-scripts-authoring-guide.md) before declaring one.
+
+Two warnings for the blanket `except ShimError` in the fan-out pattern above: `ShimHTTPError`
+is a `ShimError`, so a catch-all absorbs a halt or a divergence and lets the run finish with
+a sentinel where a human decision was required. Re-raise when `.status == 409`.
 
 ## CLI reference
 
-All twelve verbs live under `cao workflow`.
+All thirteen verbs live under `cao workflow`.
 
 | Verb | Flags | Description |
 | --- | --- | --- |
@@ -270,12 +327,13 @@ All twelve verbs live under `cao workflow`.
 | `wait <run_id>` | `--json` | Follow an already-submitted run by polling until terminal. Same exit codes as `run`. |
 | `result <run_id>` | `--json` | The complete `WorkflowRunResult` for a run — the full-detail surface `run --json` no longer prints. Answers for an **in-flight** run too (the steps settled so far), not only a finished one, and works for a detached or post-restart run because it is assembled from the journal. |
 | `events <run_id>` | `--follow/--no-follow`, `--after-seq <n>`, `--json` | Stream live per-run ordered progress (SSE). `--no-follow` does a one-shot batch read. Requires the events route from issue #504 — on a build without it, both modes report that the stream is unavailable and point at `wait`/`status`, rather than claiming the run is unknown. |
-| `resume <run_id>` | `--json` | Resume a crashed/failed run from its journal (blocks). |
+| `resume <run_id>` | `--decide STEP_ID=rerun\|skip` (repeatable), `--json` | Resume a crashed/failed run from its journal (blocks). Each step is replayed, executed, or halted. `--decide` resolves a halted step and authorises **exactly one attempt** — see Halts and `--decide` above. |
 | `cancel <run_id>` | — | Cooperatively cancel a running workflow. |
+| `approve <plan_id>` | `--json` | Approve a plan identifier so runs of that plan may start. Idempotent — a repeat reports the original approver and timestamp rather than overwriting them. **There is no revoke.** Requires the `cao:admin` scope when auth is enabled. Exit 0 approved (whether newly or already), 1 rejected/unreachable. See [Plan approval](#plan-approval-script-tier) below. |
 
 ## MCP tool reference (from inside an agent session)
 
-Ten workflow tools are exposed over MCP. Each returns a structured `{ok, ...}` envelope on
+Eleven workflow tools are exposed over MCP. Each returns a structured `{ok, ...}` envelope on
 every path and never raises into the agent loop.
 
 | Tool | Description |
@@ -287,9 +345,10 @@ every path and never raises into the agent loop.
 | `workflow_result` | The complete retained result for a run; answerable for a detached or post-restart run. |
 | `workflow_list` | List recorded **runs** from the durable journal (not specs). |
 | `workflow_events` | Read live per-run ordered progress. Needs the events route from issue #504. |
-| `workflow_resume` | Resume a crashed/failed run from its journal. |
+| `workflow_resume` | Resume a crashed/failed run from its journal. Each step is replayed, executed, or halted; a `decisions` map (`{step_id: "rerun"\|"skip"}`) resolves a halted step and authorises **exactly one attempt**. |
 | `workflow_cancel` | Cooperatively cancel a running workflow. |
 | `workflow_return` | Called by a worker to hand its structured step output back to the run. |
+| `workflow_plan_approval` | **Read-only.** Report a run's plan identifier and whether that plan is approved. There is deliberately **no MCP tool that grants an approval** — see the asymmetry note below. |
 
 ### CLI ↔ MCP name mapping
 
@@ -302,6 +361,8 @@ before assuming a verb and a tool with similar names do the same thing:
 | List workflow **runs** | `runs` | `workflow_list` |
 | Submit asynchronously | `run` (the default) | `workflow_start` |
 | Run inline / blocking | `run --wait` | `workflow_run` |
+| **Grant** a plan approval | `approve <plan_id>` | *(none — deliberately)* |
+| **Report** a plan's approval | *(none)* | `workflow_plan_approval` |
 
 > **`list` and `workflow_list` are false friends.** The CLI's `list` lists **specs**; the
 > MCP `workflow_list` lists **runs**. An agent reaching for "the list tool" expecting specs
@@ -310,6 +371,103 @@ before assuming a verb and a tool with similar names do the same thing:
 > `run` and `workflow_run` are also not equivalent: the CLI's bare `run` submits
 > asynchronously and follows, whereas the MCP `workflow_run` blocks inline. The MCP
 > counterpart of the CLI default is `workflow_start`.
+>
+> **Approval is asymmetric on purpose, not by omission.** The CLI can grant an approval and MCP
+> cannot; MCP can report one and the CLI has no dedicated verb for that (`cao workflow approve`
+> reports the existing record when it finds one). An MCP grant tool would let an agent approve the
+> plan it just wrote, which is precisely what the approval gate exists to prevent. An agent that meets
+> a refusal should call `workflow_plan_approval` and ask the human to run `cao workflow approve`.
+
+## Plan approval (script tier)
+
+**Nothing in this section applies to YAML workflows**, and nothing in it is active by default.
+
+A script-tier run freezes an **execution manifest** at run start — the workflow's source hash, its
+resolved inputs, and the repository/worktree baseline — and derives a **plan identifier** (`plan_id`,
+of the form `plan-v1:<digest>`) from the execution-affecting fields. Change any of them and the
+`plan_id` changes, which is the mechanism by which a changed plan needs its own approval.
+
+### Enabling it
+
+Approval enforcement is **off by default**. With it off, `plan_id`s are still computed and frozen, and
+runs start regardless of whether an approval exists.
+
+```bash
+# start the CAO server with approval enforcement enabled
+CAO_WORKFLOW_REQUIRE_APPROVAL=1 cao-server
+
+# invoke the CLI client normally
+cao workflow run my-script
+
+# alternatively, persist workflow.require_approval = true in the server's settings.json
+```
+
+> **The variable configures the server, not the CLI client.** Setting
+> `CAO_WORKFLOW_REQUIRE_APPROVAL=1` only on a short-lived `cao workflow run` invocation does not
+> configure an already-running CAO server. Set it in the environment that launches that server, or use
+> `settings.json`.
+
+> **The environment variable can only turn enforcement ON.** Setting it to `0`/`false` does **not**
+> disable a gate that `settings.json` has enabled — only `settings.json` can turn it off. This departs
+> from every other CAO setting, where the environment variable wins outright. The reason is that a
+> control anything able to set an environment variable could switch off is not a control.
+
+### The first run of any plan is refused
+
+A `plan_id` does not exist until a run starts and computes it, so **a new or changed plan cannot have
+been approved yet**. The loop is:
+
+```bash
+cao workflow run my-script          # refused; the error carries the plan_id
+cao workflow approve plan-v1:<digest>
+cao workflow run my-script          # starts
+```
+
+This friction is temporary rather than intrinsic — the authoring sequence that presents a plan and
+takes approval *before* running is a later piece of work.
+
+### What approval is, and is not
+
+- **Idempotent.** Approving twice changes nothing and reports the original approver and timestamp, so
+  "I just approved this" is distinguishable from "this was approved earlier by someone else".
+- **Not revocable.** There is deliberately no revoke, update or expiry. An update path could point an
+  existing approval at a changed plan, which would let work nobody reviewed execute with a genuine
+  approval behind it.
+- **Recorded with the local OS account as the approver.** That value is **provenance, not identity** —
+  nothing verifies it.
+- **A same-user local control, not a privilege boundary.** CAO runs as the invoking user, so a
+  determined local script can edit the settings or the approval record directly. What the gate provides
+  is that a changed plan cannot execute *unnoticed* under an approval granted for a different plan.
+- **Fail-closed while enabled**: a run whose manifest is missing or unreadable is refused rather than
+  admitted.
+
+### Memory is frozen too, and the copy the agent sees is redacted
+
+A script-tier run resolves CAO memory **once**, at its first terminal, and records the content, its source and a
+hash of the **full** resolved content into the same manifest. Every later terminal of that run — and every resume,
+however long afterwards — is given that recorded copy. **Editing CAO memory after a failure therefore does not
+change what a resumed run sees.**
+
+One consequence is worth stating plainly, because it differs from a non-workflow terminal:
+
+> **On a workflow-driven terminal the injected memory block is the frozen, REDACTED copy**, and it is truncated if
+> the manifest's size bound bites (recorded as `memory.truncated`). A terminal you start yourself still receives
+> the live, unredacted block. The frozen copy is what makes a replay byte-identical to the original run — and it
+> means a secret sitting in curated memory stops reaching the agent's context on this path.
+
+The recorded hash covers the full resolved content, taken **before** redaction, so it identifies what was resolved
+rather than what survived the redaction rules of the day.
+
+### Two things not yet implemented
+
+Stated here because their absence is easy to assume away:
+
+1. **Stale source-hash rejection.** A `plan_id` changes when the source changes, but an update
+   presenting a stale expected source hash is **not** rejected. Do not rely on such a check running.
+2. **Six manifest fields are omitted rather than recorded** — provider, model, profile, permissions,
+   limits and retry policy. Script-tier steps are discovered by executing the Python, so those values
+   have no run-level existence at freeze time; they are covered transitively by the source hash,
+   because changing any of them means editing the script.
 
 ## See also
 

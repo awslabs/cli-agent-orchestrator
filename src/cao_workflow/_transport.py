@@ -1,4 +1,7 @@
-"""HTTP transport — the shim's one call site (A5, BR-8, BR-9).
+"""HTTP transport — the shim's one call site (A5, and the original WorkflowShim
+design's BR-8/BR-9, which are urllib-transport rules — NOT issue #583's
+``shim-step-surface`` BR-8/BR-9 of the same numbers, which govern the recovery
+key and the shared step core).
 
 stdlib ``urllib`` only, no third-party HTTP client, no connection pooling, no
 retry. The socket timeout carries a fixed slack over the caller's/base

@@ -86,6 +86,24 @@ def test_create_provider_grok_forwards_launch_configuration():
     )
 
 
+def test_create_provider_minimax_code_forwards_launch_configuration():
+    from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.MINIMAX_CODE.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile="developer",
+        allowed_tools=["fs_read", "fs_list"],
+        skill_prompt="runtime skill catalog",
+    )
+
+    assert isinstance(provider, MiniMaxCodeProvider)
+    assert manager.get_provider("t1") is provider
+
+
 def test_create_provider_unknown_type_raises():
     manager = ProviderManager()
     with pytest.raises(ValueError, match="Unknown provider type"):
@@ -246,6 +264,30 @@ def test_cleanup_provider_recovers_grok_home_after_restart():
         manager.cleanup_provider("restored-grok")
 
     provider_cls.assert_called_once_with("restored-grok", "s1", "w1", "developer")
+    cleanup_only_provider.cleanup.assert_called_once()
+
+
+def test_cleanup_provider_recovers_minimax_code_data_after_restart():
+    manager = ProviderManager()
+    cleanup_only_provider = MagicMock()
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.MINIMAX_CODE.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "developer",
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.MiniMaxCodeProvider",
+            return_value=cleanup_only_provider,
+        ) as provider_cls,
+    ):
+        manager.cleanup_provider("restored-mcode")
+
+    provider_cls.assert_called_once_with("restored-mcode", "s1", "w1", "developer")
     cleanup_only_provider.cleanup.assert_called_once()
 
 
@@ -419,3 +461,35 @@ def test_create_provider_omp_stores_mapping():
 
     assert isinstance(provider, OmpProvider)
     assert manager.get_provider("t1") is provider
+
+
+def test_create_provider_resume_session_id_reaches_claude_code():
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        terminal_id="t-resume",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+    )
+
+    assert isinstance(provider, ClaudeCodeProvider)
+    assert provider._resume_session_id == "11d55034-bb41-46ca-8686-59a9dbff16b5"
+
+
+def test_create_provider_resume_session_id_rejected_for_other_providers():
+    """resume_session_id is claude_code-only; other providers must fail closed
+    instead of silently starting a fresh conversation."""
+    manager = ProviderManager()
+    with pytest.raises(Exception, match="resume_session_id is only supported"):
+        manager.create_provider(
+            ProviderType.CODEX.value,
+            terminal_id="t-bad",
+            tmux_session="s1",
+            tmux_window="w1",
+            agent_profile=None,
+            resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+        )

@@ -35,6 +35,19 @@ def reset_version_cache():
     TmuxClient._paste_buffer_sanitizes = None
 
 
+def payload_calls(mock_subprocess):
+    """The paste pipeline minus the copy-mode cancels.
+
+    Every send_keys call cancels any active pane mode before the paste and
+    again immediately before each submitting Enter, so a wheel-scrolled pane
+    sitting in copy mode cannot eat the delivery or the submission (#654);
+    those guards are pinned by their own tests in test_tmux_client.py. The
+    tests here assert the payload pipeline threaded between them, at the
+    same indices as before the guards existed.
+    """
+    return [c for c in mock_subprocess.run.call_args_list if c[0][0][-2:] != ["-X", "cancel"]]
+
+
 @pytest.fixture
 def sanitizing_tmux():
     """Host tmux >= 3.7 (vis(3)-sanitizes pasted buffers)."""
@@ -53,11 +66,12 @@ class TestSendKeys:
     """Tests for the paste-buffer based send_keys implementation."""
 
     def test_basic_message(self, client, mock_subprocess, mock_uuid):
-        """Sends load-buffer, paste-buffer -p, send-keys Enter, delete-buffer."""
+        """Sends copy-mode cancel, load-buffer, paste-buffer -p, another
+        cancel, send-keys Enter, delete-buffer."""
         client.send_keys("sess", "win", "hello")
 
-        assert mock_subprocess.run.call_count == 4
-        calls = mock_subprocess.run.call_args_list
+        assert mock_subprocess.run.call_count == 6
+        calls = payload_calls(mock_subprocess)
 
         # load-buffer with unique name and message as stdin
         assert calls[0] == call(
@@ -86,7 +100,7 @@ class TestSendKeys:
         msg = "line 1\nline 2\nline 3"
         client.send_keys("sess", "win", msg)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call == call(
             ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
             input=msg.encode(),
@@ -98,20 +112,21 @@ class TestSendKeys:
         msg = """He said "hello" and ran `cmd` with $VAR"""
         client.send_keys("sess", "win", msg)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == msg.encode()
 
     def test_empty_message(self, client, mock_subprocess, mock_uuid):
         """Empty string still goes through the full pipeline."""
         client.send_keys("sess", "win", "")
 
-        assert mock_subprocess.run.call_count == 4
-        load_call = mock_subprocess.run.call_args_list[0]
+        assert mock_subprocess.run.call_count == 6
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == b""
 
     def test_buffer_cleanup_on_error(self, client, mock_subprocess, mock_uuid):
         """Buffer is deleted even when paste-buffer fails."""
         mock_subprocess.run.side_effect = [
+            None,  # copy-mode cancel
             None,  # load-buffer succeeds
             Exception("paste failed"),  # paste-buffer fails
             None,  # delete-buffer in finally
@@ -137,17 +152,20 @@ class TestSendKeys:
             client.send_keys("sess", "win", "msg2")
 
         calls = mock_subprocess.run.call_args_list
-        # First call uses cao_aaaa1111
-        assert calls[0][0][0][3] == "cao_aaaa1111"
-        # Second call (index 4, after 4 calls from first send_keys) uses cao_cccc2222
-        assert calls[4][0][0][3] == "cao_cccc2222"
+        # First send's load-buffer (index 1, after its leading copy-mode
+        # cancel) uses cao_aaaa1111
+        assert calls[1][0][0][3] == "cao_aaaa1111"
+        # Second send's load-buffer (index 7, after 6 calls from the first
+        # send_keys and the second's leading cancel) uses cao_cccc2222
+        assert calls[7][0][0][3] == "cao_cccc2222"
 
     def test_double_enter(self, client, mock_subprocess, mock_uuid):
         """When enter_count=2, two Enter keys are sent after pasting."""
         client.send_keys("sess", "win", "hello", enter_count=2)
 
-        assert mock_subprocess.run.call_count == 5  # load + paste + 2 Enter + delete
-        calls = mock_subprocess.run.call_args_list
+        # cancel + load + paste + 2 x (cancel + Enter) + delete
+        assert mock_subprocess.run.call_count == 8
+        calls = payload_calls(mock_subprocess)
         # Both Enters
         assert calls[2] == call(
             ["tmux", "send-keys", "-t", "sess:win", "Enter"],
@@ -163,9 +181,9 @@ class TestSendKeys:
         msg = "X" * 50000
         client.send_keys("sess", "win", msg)
 
-        # Still exactly 4 subprocess calls — no chunking
-        assert mock_subprocess.run.call_count == 4
-        load_call = mock_subprocess.run.call_args_list[0]
+        # Still exactly 6 subprocess calls — no chunking
+        assert mock_subprocess.run.call_count == 6
+        load_call = payload_calls(mock_subprocess)[0]
         assert len(load_call[1]["input"]) == 50000
 
 
@@ -186,7 +204,7 @@ class TestSendKeysNoHandCraftedMarkersOnModernTmux:
         """Loaded buffer contains only raw message bytes — no ESC, no markers."""
         client.send_keys("sess", "win", "hello world", force_bracketed_paste=True)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         buf_content = load_call[1]["input"]
         assert b"\x1b" not in buf_content
         assert b"[200~" not in buf_content
@@ -199,7 +217,7 @@ class TestSendKeysNoHandCraftedMarkersOnModernTmux:
         """paste-buffer is invoked with -p and never -r or -S."""
         client.send_keys("sess", "win", "hello", force_bracketed_paste=True)
 
-        paste_call = mock_subprocess.run.call_args_list[1]
+        paste_call = payload_calls(mock_subprocess)[1]
         paste_argv = paste_call[0][0]
         assert paste_argv[:2] == ["tmux", "paste-buffer"]
         assert "-p" in paste_argv
@@ -213,7 +231,7 @@ class TestSendKeysNoHandCraftedMarkersOnModernTmux:
         msg = "line 1\nline 2\n\nline 4 with \x03 control char"
         client.send_keys("sess", "win", msg, force_bracketed_paste=True)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call == call(
             ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
             input=msg.encode(),
@@ -247,7 +265,7 @@ class TestSendKeysLegacyWrapOnOldTmux:
         msg = "task line 1\n\n[Assigned by terminal abc]"
         client.send_keys("sess", "win", msg, force_bracketed_paste=True)
 
-        calls = mock_subprocess.run.call_args_list
+        calls = payload_calls(mock_subprocess)
         assert calls[0] == call(
             ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
             input=b"\x1b[200~" + msg.encode() + b"\x1b[201~",
@@ -262,7 +280,7 @@ class TestSendKeysLegacyWrapOnOldTmux:
         """Init-time shell commands keep the raw + -p path on every version."""
         client.send_keys("sess", "win", "ls -la", force_bracketed_paste=False)
 
-        calls = mock_subprocess.run.call_args_list
+        calls = payload_calls(mock_subprocess)
         assert calls[0][1]["input"] == b"ls -la"
         assert calls[1] == call(
             ["tmux", "paste-buffer", "-p", "-b", "cao_abcd1234", "-t", "sess:win"],
@@ -287,12 +305,12 @@ class TestSendKeysForcedBracketedPasteShellDetection:
         with patch.object(client, "get_pane_current_command", return_value="node"):
             client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
 
-        paste_call = mock_subprocess.run.call_args_list[1]
+        paste_call = payload_calls(mock_subprocess)[1]
         assert paste_call == call(
             ["tmux", "paste-buffer", "-r", "-b", "cao_abcd1234", "-t", "sess:win"],
             check=True,
         )
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == b"\x1b[200~claude --continue\x1b[201~"
 
     @pytest.mark.parametrize("shell", ["sh", "dash", "bash", "zsh", "fish"])
@@ -307,9 +325,9 @@ class TestSendKeysForcedBracketedPasteShellDetection:
         with patch.object(client, "get_pane_current_command", return_value=shell):
             client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == b"claude --continue"
-        paste_call = mock_subprocess.run.call_args_list[1]
+        paste_call = payload_calls(mock_subprocess)[1]
         assert paste_call == call(
             ["tmux", "paste-buffer", "-b", "cao_abcd1234", "-t", "sess:win"],
             check=True,
@@ -327,7 +345,7 @@ class TestSendKeysForcedBracketedPasteShellDetection:
         with patch.object(client, "get_pane_current_command", return_value=None):
             client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == b"\x1b[200~claude --continue\x1b[201~"
 
     def test_non_forced_calls_are_unaffected_by_shell_detection(
@@ -341,7 +359,7 @@ class TestSendKeysForcedBracketedPasteShellDetection:
             client.send_keys("sess", "win", "echo ready")
 
         mock_get.assert_not_called()
-        paste_call = mock_subprocess.run.call_args_list[1]
+        paste_call = payload_calls(mock_subprocess)[1]
         assert paste_call == call(
             ["tmux", "paste-buffer", "-p", "-b", "cao_abcd1234", "-t", "sess:win"],
             check=True,
@@ -363,9 +381,9 @@ class TestSendKeysShellDetectionCrossedWithTmuxVersion:
         with patch.object(client, "get_pane_current_command", return_value="bash"):
             client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == b"claude --continue"
-        paste_call = mock_subprocess.run.call_args_list[1]
+        paste_call = payload_calls(mock_subprocess)[1]
         assert paste_call == call(
             ["tmux", "paste-buffer", "-b", "cao_abcd1234", "-t", "sess:win"],
             check=True,
@@ -381,10 +399,10 @@ class TestSendKeysShellDetectionCrossedWithTmuxVersion:
         with patch.object(client, "get_pane_current_command", return_value="node"):
             client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == b"claude --continue"
         assert b"\x1b" not in load_call[1]["input"]
-        paste_call = mock_subprocess.run.call_args_list[1]
+        paste_call = payload_calls(mock_subprocess)[1]
         assert paste_call == call(
             ["tmux", "paste-buffer", "-p", "-b", "cao_abcd1234", "-t", "sess:win"],
             check=True,

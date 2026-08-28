@@ -31,6 +31,7 @@ import requests
 from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
@@ -299,9 +300,9 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
-        if engine is not None:
+        if provider == ProviderType.KIRO_CLI.value and engine is not None:
             params["engine"] = engine
-        if model is not None:
+        if model and model.strip():
             params["model"] = model
         if use_worktree:
             params["use_worktree"] = "true"
@@ -352,9 +353,9 @@ def _create_terminal(
         }
         if working_directory:
             params["working_directory"] = working_directory
-        if engine is not None:
+        if provider == ProviderType.KIRO_CLI.value and engine is not None:
             params["engine"] = engine
-        if model is not None:
+        if model and model.strip():
             params["model"] = model
         if use_worktree:
             params["use_worktree"] = "true"
@@ -790,9 +791,9 @@ async def _handoff_impl(
                 payload["allowed_tools"] = ctx.allowed_tools
             if working_directory:
                 payload["working_directory"] = working_directory
-            if engine is not None:
+            if provider == ProviderType.KIRO_CLI.value and engine is not None:
                 payload["engine"] = engine
-            if model:
+            if model and model.strip():
                 payload["model"] = model
             return await _run_step_and_build_result(
                 payload, agent_profile, provider, timeout, start_time
