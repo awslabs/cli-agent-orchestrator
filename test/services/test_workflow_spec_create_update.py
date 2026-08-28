@@ -17,6 +17,7 @@ Two properties are asserted that a weaker suite would skip:
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -95,6 +96,38 @@ def test_rejects_an_invalid_name_without_writing(tmp_path: Path, bad_name: str) 
     with pytest.raises(ValueError):
         svc.create_workflow(bad_name, GOOD, scan_dir=str(tmp_path))
     assert _entries(tmp_path) == []
+
+
+def test_create_rejects_trailing_newline_and_preserves_name_boundaries(tmp_path: Path) -> None:
+    for name in ("good_name-1", "x" * 64):
+        spec = svc.create_workflow(name, GOOD, scan_dir=str(tmp_path))
+        assert spec.name == name
+        assert (tmp_path / f"{name}.py").read_text() == GOOD
+
+    entries_before = _entries(tmp_path)
+    with pytest.raises(ValueError, match="invalid"):
+        svc.create_workflow("trailing-newline\n", GOOD, scan_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="invalid"):
+        svc.create_workflow("x" * 65, GOOD, scan_dir=str(tmp_path))
+
+    assert _entries(tmp_path) == entries_before
+
+
+def test_update_rejects_a_trailing_newline_name_without_modifying_its_file(tmp_path: Path) -> None:
+    target = tmp_path / "trailing-newline\n.py"
+    target.write_text(GOOD)
+    entries_before = _entries(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid"):
+        svc.update_workflow(
+            "trailing-newline\n",
+            "# attempted update\nINPUTS = {}\n",
+            hashlib.sha256(GOOD.encode("utf-8")).hexdigest(),
+            scan_dir=str(tmp_path),
+        )
+
+    assert _entries(tmp_path) == entries_before
+    assert target.read_text() == GOOD
 
 
 @pytest.mark.parametrize("yaml_name", ["thing.yaml", "thing.yml", "THING.YAML"])

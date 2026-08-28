@@ -86,7 +86,7 @@ def _validate_name(name: str) -> str:
         raise ValueError(f"workflow name '{name}' is not allowed (traversal token)")
     if os.path.basename(name) != name:
         raise ValueError(f"workflow name '{name}' must not contain path separators")
-    if not _NAME_RE.match(name):
+    if not _NAME_RE.fullmatch(name):
         raise ValueError(f"workflow name '{name}' is invalid (must match {WORKFLOW_NAME_RE})")
     return name
 
@@ -283,13 +283,14 @@ def _write_contained_spec_bytes(
 
     Ordering is load-bearing and every step is placed deliberately:
 
-    1. **Reject a symlink target BEFORE resolution** (SR-3A2-2). ``realpath``
-       collapses links, so a check after it can never see one — and following a
-       link on a WRITE means the caller's bytes land in a spec it did not name,
-       which containment cannot catch because both paths are inside the base.
-       This is the one operation here that legitimately reads the caller's own
-       string rather than the resolved path; it neither opens nor writes.
-    2. **Containment guard.** The SafeAccessCheck, dominating every sink below.
+    1. **Containment guard.** The SafeAccessCheck, dominating every sink below.
+    2. **Reject a symlink target after containment** (SR-3A2-2). ``realpath``
+       collapses links, so this check must remain on the caller's original path
+       rather than the resolved path — and following a link on a WRITE means the
+       caller's bytes land in a spec it did not name, which containment cannot
+       catch because both paths are inside the base. This is the one operation
+       here that legitimately reads the caller's own string rather than the
+       resolved path; it neither opens nor writes.
     3. **Size cap BEFORE any file is created** (SR-3A2-3). An oversized payload
        must not leave a temp file behind, and the bound is the SAME constant the
        read path enforces so this cannot write a spec ``load_and_validate``
@@ -340,16 +341,20 @@ def _write_contained_spec_bytes(
 
     safe_base = _safe_dir(base_dir)
 
-    # (1) Symlink check on the CALLER's path, before realpath collapses it.
+    # Capture the CALLER's path before resolution. ``realpath`` does not mutate it,
+    # so it still detects a caller-supplied symlink after containment succeeds.
     user_path = os.fspath(path)
-    if os.path.islink(user_path):
-        raise ValueError(f"workflow spec path '{path}' is a symlink; refusing to write through it")
 
     real_path = _resolve_contained_spec_path(path, safe_base)
-    # (2) SafeAccessCheck — single positive containment guard, colocated with every
+    # (1) SafeAccessCheck — single positive containment guard, colocated with every
     # sink below. A spec FILE is always strictly UNDER its base dir.
     if not real_path.startswith(safe_base + os.sep):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+
+    # (2) Symlink check on the CALLER's original path, after containment and before
+    # any sink. Checking real_path would miss a symlink realpath already collapsed.
+    if os.path.islink(user_path):
+        raise ValueError(f"workflow spec path '{path}' is a symlink; refusing to write through it")
 
     # (3) Bound the payload before anything touches the filesystem.
     if len(data) > WORKFLOW_MAX_SPEC_BYTES:

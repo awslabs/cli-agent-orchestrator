@@ -84,7 +84,7 @@ def test_rejects_a_symlink_inside_the_base_pointing_out(tmp_path: Path) -> None:
     link = tmp_path / "link.py"
     link.symlink_to(target)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="escapes its validated directory"):
         svc._write_contained_spec_bytes(str(link), b"x", base_dir=str(tmp_path))
     assert not target.exists()
     assert _dir_entries(tmp_path) == ["link.py"], "no temp file created"
