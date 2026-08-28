@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +29,19 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def load_fixture(filename: str) -> str:
     with open(FIXTURES_DIR / filename, "r") as f:
         return f.read()
+
+
+def fake_clock(*values: float) -> SimpleNamespace:
+    """A stand-in for codex's ``time`` module yielding a fixed ``monotonic`` series.
+
+    Patch ``providers.codex.time`` with this rather than
+    ``providers.codex.time.monotonic``: ``codex.time`` IS the shared stdlib
+    module, so patching the attribute mutates it process-wide and asyncio's own
+    event loop — which calls ``time.monotonic()`` on every step — consumes the
+    ``side_effect`` sequence, raising StopIteration inside the loop instead of
+    in the code under test. Replacing the module reference keeps it local.
+    """
+    return SimpleNamespace(monotonic=MagicMock(side_effect=values))
 
 
 def read_developer_instructions_file(command: str) -> str:
@@ -2151,14 +2165,14 @@ class TestCodexProviderTrustPrompt:
 
     @pytest.mark.asyncio
     @patch(
-        "cli_agent_orchestrator.providers.codex.time.time",
-        side_effect=[0.0, 0.0, 20.0],
+        "cli_agent_orchestrator.providers.codex.time",
+        new_callable=lambda: fake_clock(0.0, 0.0, 0.0),
     )
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.logger.error")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_handle_trust_prompt_returns_on_v0149_idle_composer(
-        self, mock_backend, mock_error, mock_sleep, _mock_time
+        self, mock_backend, mock_error, mock_sleep, _fake_time
     ):
         mock_backend.return_value.get_history.return_value = (
             "OpenAI Codex (v0.149.0)\n"
@@ -2167,7 +2181,7 @@ class TestCodexProviderTrustPrompt:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(timeout=20.0)
+        await provider._handle_trust_prompt(outer_timeout=20.0)
 
         mock_backend.return_value.get_history.assert_called_once()
         mock_sleep.assert_not_awaited()
@@ -2177,14 +2191,14 @@ class TestCodexProviderTrustPrompt:
 
     @pytest.mark.asyncio
     @patch(
-        "cli_agent_orchestrator.providers.codex.time.time",
-        side_effect=[0.0, 0.0, 20.0],
+        "cli_agent_orchestrator.providers.codex.time",
+        new_callable=lambda: fake_clock(0.0, 0.0, 0.0),
     )
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.logger.error")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_handle_trust_prompt_returns_on_v0145_idle_composer(
-        self, mock_backend, mock_error, mock_sleep, _mock_time
+        self, mock_backend, mock_error, mock_sleep, _fake_time
     ):
         """Codex 0.145's placeholder composer is a ready state, not a timeout."""
         mock_backend.return_value.get_history.return_value = load_fixture(
@@ -2192,7 +2206,7 @@ class TestCodexProviderTrustPrompt:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(timeout=20.0)
+        await provider._handle_trust_prompt(outer_timeout=20.0)
 
         mock_backend.return_value.get_history.assert_called_once()
         mock_sleep.assert_not_awaited()
@@ -2202,14 +2216,14 @@ class TestCodexProviderTrustPrompt:
 
     @pytest.mark.asyncio
     @patch(
-        "cli_agent_orchestrator.providers.codex.time.time",
-        side_effect=[0.0, 0.0, 1.0, 2.0, 20.0],
+        "cli_agent_orchestrator.providers.codex.time",
+        new_callable=lambda: fake_clock(0.0, 0.0, 0.0, 1.0, 2.0),
     )
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.logger.error")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_handle_trust_prompt_waits_for_complete_v0145_composer_frame(
-        self, mock_backend, mock_error, mock_sleep, _mock_time
+        self, mock_backend, mock_error, mock_sleep, _fake_time
     ):
         """Chunked redraws are not ready until composer and footer are both visible."""
         fixture = load_fixture("codex_v0145_idle_output.txt")
@@ -2221,7 +2235,7 @@ class TestCodexProviderTrustPrompt:
         ]
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(timeout=20.0)
+        await provider._handle_trust_prompt(outer_timeout=20.0)
 
         assert mock_backend.return_value.get_history.call_count == 3
         assert mock_sleep.await_count == 2
@@ -2275,19 +2289,20 @@ class TestCodexProviderTrustPrompt:
     )
     @pytest.mark.asyncio
     @patch(
-        "cli_agent_orchestrator.providers.codex.time.time",
-        side_effect=[0.0, 0.0, 20.0],
+        # One poll (not ready), then the outer cap ends the loop.
+        "cli_agent_orchestrator.providers.codex.time",
+        new_callable=lambda: fake_clock(0.0, 0.0, 0.0, 20.0),
     )
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.logger.error")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_handle_trust_prompt_does_not_treat_non_ready_output_as_idle(
-        self, mock_backend, mock_error, mock_sleep, _mock_time, output
+        self, mock_backend, mock_error, mock_sleep, _fake_time, output
     ):
         mock_backend.return_value.get_history.return_value = output
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(timeout=20.0)
+        await provider._handle_trust_prompt(outer_timeout=20.0)
 
         mock_sleep.assert_awaited_once_with(1.0)
         mock_error.assert_called_once()
@@ -2309,7 +2324,7 @@ class TestCodexProviderTrustPrompt:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(timeout=2.0)
+        await provider._handle_trust_prompt(outer_timeout=2.0)
 
         mock_tmux.return_value.send_special_key.assert_called_once_with(
             "test-session", "window-0", "Enter"
@@ -2322,9 +2337,139 @@ class TestCodexProviderTrustPrompt:
         mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)\n› "
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(timeout=2.0)
+        await provider._handle_trust_prompt(outer_timeout=2.0)
 
         mock_tmux.return_value.send_special_key.assert_not_called()
+
+    # ── startup_prompt_handler_timeout is an IDLE GAP, not a total budget ──
+    #
+    # The setting documents itself (settings_service.py) as the gap between
+    # consecutive startup prompts, reset each time one is answered, with total
+    # time bounded by provider_init_timeout. kimi_cli/antigravity_cli implement
+    # exactly that. Codex read it as a fixed total budget, so lowering the gap
+    # for another provider silently truncated codex's whole handler and left a
+    # late dialog undismissed -- and because initialize() accepts
+    # WAITING_USER_ANSWER as success, send_input then raised
+    # TerminalInputBlockedError and the initial message was never delivered.
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_small_idle_gap_does_not_truncate_the_handler(self, mock_backend, mock_sleep):
+        """A dialog rendered later than the idle gap is still dismissed.
+
+        Regression guard: with the gap used as a total budget, a 2s gap meant a
+        dialog first visible on the 4th poll was never answered.
+        """
+        blank = "OpenAI Codex (v0.98.0)\n"
+        trust = (
+            "> You are running Codex in /Users/test/project\n"
+            "\n"
+            "  Since this folder is version controlled, you may wish to "
+            "allow Codex to work in this folder without asking for approval.\n"
+            "\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. No, ask me to approve edits and commands\n"
+        )
+        mock_backend.return_value.get_history.side_effect = [blank, blank, blank, trust]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        # Gap far shorter than the time the dialog takes to appear; the outer cap
+        # is what governs, so the handler must still be polling when it arrives.
+        with patch(
+            "cli_agent_orchestrator.providers.codex.time",
+            fake_clock(0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 60.0),
+        ):
+            await provider._handle_trust_prompt(idle_gap=2.0, outer_timeout=120.0)
+
+        mock_backend.return_value.send_special_key.assert_called_once_with(
+            "test-session", "window-0", "Enter"
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_idle_gap_resets_after_each_answered_prompt(self, mock_backend, mock_sleep):
+        """Answering the trust dialog restarts the gap, so a later update dialog
+        still gets dismissed rather than being cut off by the first gap."""
+        trust = (
+            "  Since this folder is version controlled, you may wish to "
+            "allow Codex to work in this folder without asking for approval.\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+        )
+        update = (
+            "✨ Update available! 0.142.5 -> 0.144.5\n"
+            "1. Update now (runs npm install -g @openai/codex)\n"
+            "2. Skip\n"
+            "3. Skip until next version\n"
+            "Press enter to continue\n"
+        )
+        mock_backend.return_value.get_history.side_effect = [trust, update, "quiet tail"]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        # Poll 1 answers trust at t=10, which RESETS the gap; poll 2 at t=12 is
+        # only 2s past that reset, so it is still inside the 5s gap. Without the
+        # reset the gap would be measured from t=0 -- already 10s, past the 5s
+        # gap -- so the loop would have returned before ever seeing the update
+        # dialog. That asymmetry is what makes this a guard rather than a
+        # restatement of the happy path.
+        with patch(
+            "cli_agent_orchestrator.providers.codex.time",
+            fake_clock(0.0, 0.0, 10.0, 10.0, 12.0, 12.0, 100.0),
+        ):
+            await provider._handle_trust_prompt(idle_gap=5.0, outer_timeout=120.0)
+
+        # '3' + Enter dismisses the update dialog; a blind Enter would pick
+        # "1. Update now".
+        mock_backend.return_value.send_keys.assert_called_once_with(
+            "test-session", "window-0", "3", enter_count=0
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_idle_gap_ends_the_loop_once_startup_is_quiet(self, mock_backend, mock_sleep):
+        """After a prompt is answered, no new prompt within the gap returns —
+        the handler must not sit until the outer cap on a healthy start."""
+        trust = (
+            "  Since this folder is version controlled, you may wish to "
+            "allow Codex to work in this folder without asking for approval.\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+        )
+        mock_backend.return_value.get_history.return_value = trust
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch(
+            "cli_agent_orchestrator.providers.codex.time",
+            fake_clock(0.0, 0.0, 0.0, 0.0, 10.0),
+        ):
+            await provider._handle_trust_prompt(idle_gap=5.0, outer_timeout=600.0)
+
+        # Returned on the gap, not the outer cap: only the one poll happened.
+        assert mock_backend.return_value.get_history.call_count == 1
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_bounds_default_to_their_documented_settings(self, mock_backend):
+        """idle_gap defaults to startup_prompt_handler_timeout and the outer cap
+        to provider_init_timeout — not both to the same setting."""
+        mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)\n› "
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch(
+            "cli_agent_orchestrator.providers.codex.get_server_settings",
+            return_value={
+                "startup_prompt_handler_timeout": 7.0,
+                "provider_init_timeout": 99.0,
+            },
+        ) as mock_settings:
+            with patch(
+                "cli_agent_orchestrator.providers.codex.time",
+                fake_clock(0.0, 0.0, 0.0),
+            ):
+                await provider._handle_trust_prompt()
+
+        assert mock_settings.called
 
     def test_get_status_trust_prompt_is_waiting_user_answer(self):
         """Test that trust prompt reports WAITING_USER_ANSWER, not PROCESSING."""
@@ -2619,7 +2764,7 @@ class TestCodexProviderUpdateDialog:
         ]
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(timeout=5.0)
+        await provider._handle_trust_prompt(outer_timeout=5.0)
 
         mock_tmux.return_value.send_keys.assert_any_call(
             "test-session", "window-0", "3", enter_count=0
@@ -2633,7 +2778,7 @@ class TestCodexProviderUpdateDialog:
         mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.142.5)\n› "
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(timeout=2.0)
+        await provider._handle_trust_prompt(outer_timeout=2.0)
 
         mock_tmux.return_value.send_keys.assert_not_called()
         mock_tmux.return_value.send_special_key.assert_not_called()
@@ -2709,7 +2854,7 @@ class TestCodexProviderUpdateDialog:
         ]
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(timeout=10.0)
+        await provider._handle_trust_prompt(outer_timeout=10.0)
 
         # Trust was dismissed with Enter
         mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
@@ -4135,13 +4280,19 @@ class TestCodexInitConfiguredTimeouts:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_initialize_uses_configured_startup_prompt_timeout(
+    async def test_initialize_passes_provider_init_timeout_as_the_outer_cap(
         self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings
     ):
-        """The trust-prompt budget comes from settings, not a hard-coded 20.0.
+        """The handler's hard cap is ``provider_init_timeout``, not the idle gap.
 
-        An operator on a slow/containerized host must be able to widen it via
-        ``startup_prompt_handler_timeout`` without a code change.
+        Both bounds come from settings rather than a hard-coded 20.0, so an
+        operator on a slow/containerized host can widen them without a code
+        change. But they are DIFFERENT settings doing different jobs:
+        ``startup_prompt_handler_timeout`` is the idle gap (read inside the
+        handler) and ``provider_init_timeout`` is the outer cap passed here.
+        Passing the gap as the total budget — as this call used to — meant
+        lowering the gap for another provider silently truncated codex's whole
+        handler, leaving a late dialog undismissed.
         """
         mock_settings.return_value = {
             "provider_init_timeout": 60,
@@ -4155,7 +4306,8 @@ class TestCodexInitConfiguredTimeouts:
         with patch.object(provider, "_handle_trust_prompt", new_callable=AsyncMock) as mock_trust:
             await provider.initialize()
 
-        mock_trust.assert_awaited_once_with(timeout=45.0)
+        # The gap (45) must NOT be what bounds the handler's total run.
+        mock_trust.assert_awaited_once_with(outer_timeout=60.0)
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.get_server_settings")

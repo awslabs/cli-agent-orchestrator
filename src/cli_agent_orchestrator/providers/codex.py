@@ -1035,8 +1035,32 @@ class CodexProvider(BaseProvider):
             command = f"{command} {developer_instructions_fragment}"
         return command
 
-    async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
+    async def _handle_trust_prompt(
+        self,
+        idle_gap: Optional[float] = None,
+        outer_timeout: Optional[float] = None,
+    ) -> None:
         """Dismiss startup prompts that block readiness.
+
+        Args:
+            idle_gap: Seconds with no new prompt before startup is considered
+                settled. Defaults to the ``startup_prompt_handler_timeout``
+                setting. Per that setting's contract this is an IDLE GAP, not a
+                total budget: it is reset every time a prompt is answered, and
+                it only starts counting once at least one prompt has been
+                handled. Mirrors ``kimi_cli``/``antigravity_cli``.
+            outer_timeout: Hard cap on total time this handler may run.
+                Defaults to the ``provider_init_timeout`` setting, which is
+                what that setting documents itself as bounding.
+
+        Before this split, ``startup_prompt_handler_timeout`` was used as a
+        FIXED TOTAL budget here, contradicting its documented semantics: an
+        operator who lowered it to make another provider settle faster silently
+        capped codex's whole handler, so a dialog rendered after the gap was
+        never dismissed. ``initialize()`` treats WAITING_USER_ANSWER as success,
+        so the undismissed dialog then made ``send_input`` raise
+        ``TerminalInputBlockedError`` and the initial message was never
+        delivered.
 
         Every backend call here (get_history/send_keys/send_special_key) is a
         blocking subprocess exec, and this loop makes one per second for up to
@@ -1063,10 +1087,22 @@ class CodexProvider(BaseProvider):
            Dismissed with '3'+Enter ("Skip until next version"). A blind Enter
            would select "1. Update now" (global npm install).
         """
-        start_time = time.time()
+        if idle_gap is None:
+            idle_gap = float(get_server_settings()["startup_prompt_handler_timeout"])
+        if outer_timeout is None:
+            outer_timeout = float(get_server_settings()["provider_init_timeout"])
+        outer_deadline = time.monotonic() + outer_timeout
+        last_prompt_time = time.monotonic()
+        any_prompt_handled = False
         trust_dismissed = False
         update_dismissed = False
-        while time.time() - start_time < timeout:
+        while True:
+            now = time.monotonic()
+            if now >= outer_deadline:
+                break
+            if any_prompt_handled and now - last_prompt_time >= idle_gap:
+                # No new prompt within the idle gap — startup settled.
+                return
             output = await asyncio.to_thread(
                 get_backend().get_history, self.session_name, self.window_name
             )
@@ -1085,6 +1121,8 @@ class CodexProvider(BaseProvider):
                     get_backend().send_special_key, self.session_name, self.window_name, "Enter"
                 )
                 trust_dismissed = True
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()  # reset idle timer
                 await asyncio.sleep(1.0)
                 continue
 
@@ -1103,6 +1141,8 @@ class CodexProvider(BaseProvider):
                     get_backend().send_special_key, self.session_name, self.window_name, "Enter"
                 )
                 trust_dismissed = True
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()  # reset idle timer
                 await asyncio.sleep(1.0)
                 continue
 
@@ -1126,6 +1166,8 @@ class CodexProvider(BaseProvider):
                     get_backend().send_special_key, self.session_name, self.window_name, "Enter"
                 )
                 update_dismissed = True
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()  # reset idle timer
                 await asyncio.sleep(1.0)
                 continue
 
@@ -1157,8 +1199,9 @@ class CodexProvider(BaseProvider):
         except Exception:
             pass
         logger.error(
-            "Codex startup prompt handler timed out — no prompt or welcome banner detected. "
-            "Pane tail:\n%s",
+            "Codex startup prompt handler hit its provider_init_timeout outer cap (%ss) — "
+            "no prompt or welcome banner detected. Pane tail:\n%s",
+            outer_timeout,
             pane_tail,
         )
 
@@ -1202,16 +1245,17 @@ class CodexProvider(BaseProvider):
         )
 
         # Handle workspace trust prompt if it appears (new/untrusted directories).
-        # Timeout comes from settings — matching kimi_cli / antigravity_cli /
-        # claude_code, which all read ``startup_prompt_handler_timeout`` — so an
-        # operator on a slow or containerized host can widen it. The hard-coded
-        # 20.0 could not be raised without a code change, and a cold start that
-        # renders its first frame later than that falls through to "startup
-        # prompt handler timed out" and has to be rescued by the
-        # wait_until_status below.
-        await self._handle_trust_prompt(
-            timeout=float(get_server_settings()["startup_prompt_handler_timeout"])
-        )
+        # The handler's bounds now come from settings rather than a hard-coded
+        # 20.0 that could not be raised without a code change, so an operator on
+        # a slow or containerized host can widen them. It reads
+        # ``startup_prompt_handler_timeout`` itself as the IDLE GAP between
+        # consecutive prompts; ``provider_init_timeout`` (resolved above as
+        # ``init_timeout``) is passed as the hard outer cap. Keeping those two
+        # roles distinct is what those settings document, and matches
+        # kimi_cli/antigravity_cli/claude_code — so an operator who lowers the
+        # gap for one provider cannot silently truncate codex's whole handler
+        # and leave a late dialog undismissed.
+        await self._handle_trust_prompt(outer_timeout=float(init_timeout))
 
         # WAITING_USER_ANSWER is included here specifically for the first-run login/auth
         # menu (see LOGIN_MENU_PATTERN's own comment) — an account with no credentials

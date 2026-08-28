@@ -230,7 +230,7 @@ async def _codex_trust_prompt_run() -> int:
     mock_backend = MagicMock()
     mock_backend.get_history.side_effect = _blocking_history(_CODEX_READY_FRAME)
     with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=mock_backend):
-        return await _run_with_heartbeat_probe(provider._handle_trust_prompt(timeout=5.0))
+        return await _run_with_heartbeat_probe(provider._handle_trust_prompt(outer_timeout=5.0))
 
 
 async def _codex_initialize_run() -> tuple[int, float]:
