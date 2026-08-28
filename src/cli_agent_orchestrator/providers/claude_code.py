@@ -582,8 +582,9 @@ class ClaudeCodeProvider(BaseProvider):
            – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
            The settings-based fix (``_ensure_skip_bypass_prompt_setting``) prevents
            this in most cases; this handler is a defensive fallback.
-        2. **Workspace trust dialog** – shows "Yes, I trust this folder";
-           requires ``Enter``.
+        2. **Workspace trust dialog** – shows "Yes, I trust this folder".
+           Older releases preselect "Yes"; v2.1.250 preselects "No, exit".
+           The handler moves to "Yes" only when needed, then presses ``Enter``.
         3. **Bedrock model-upgrade nudge** – offers to repoint a pinned
            ``ANTHROPIC_*_MODEL`` at a newer default. DECLINED with ``Esc``, and
            this is the one prompt here that is not auto-accepted. Its default
@@ -676,11 +677,10 @@ class ClaudeCodeProvider(BaseProvider):
                 # Send Down arrow to move cursor to "Yes, I accept", then Enter.
                 status_monitor.notify_input_sent(self.terminal_id)
                 await asyncio.to_thread(
-                    get_backend().send_keys,
+                    get_backend().send_special_key,
                     self.session_name,
                     self.window_name,
-                    "\x1b[B",
-                    enter_count=0,
+                    "Down",
                 )
                 await asyncio.sleep(0.5)
                 status_monitor.notify_input_sent(self.terminal_id)
@@ -704,6 +704,30 @@ class ClaudeCodeProvider(BaseProvider):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Workspace trust prompt detected, auto-accepting")
+                # Claude Code used to preselect "Yes", but v2.1.250 changed the
+                # default to "No, exit". Inspect the latest matching option line
+                # so we remain compatible with both layouts. The prompt's prior
+                # rendering can remain in scrollback, hence rfind rather than
+                # examining the first occurrence.
+                trust_pos = clean_output.rfind("Yes, I trust this folder")
+                line_start = clean_output.rfind("\n", 0, trust_pos) + 1
+                line_end = clean_output.find("\n", trust_pos)
+                if line_end == -1:
+                    line_end = len(clean_output)
+                trust_line = clean_output[line_start:line_end]
+                yes_selected = (
+                    re.search(r"[>❯]", trust_line[: trust_pos - line_start]) is not None
+                    or "No, exit" not in clean_output
+                )
+                if not yes_selected:
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    await asyncio.to_thread(
+                        get_backend().send_special_key,
+                        self.session_name,
+                        self.window_name,
+                        "Down",
+                    )
+                    await asyncio.sleep(0.5)
                 status_monitor.notify_input_sent(self.terminal_id)
                 await asyncio.to_thread(
                     get_backend().send_special_key, self.session_name, self.window_name, "Enter"

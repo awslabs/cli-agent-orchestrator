@@ -13,7 +13,8 @@
 # matches how Dockerfile.broker ships a single-purpose service.
 #
 # Build from the REPOSITORY ROOT so both directories are in context:
-#   docker build -f docker/Dockerfile.panel -t cao-fleet-panel:<tag> .
+#   docker build -f examples/cao-clusters/kubernetes/eks/Dockerfile.panel \
+#     -t cao-fleet-panel:<tag> .
 FROM python:3.12-slim
 
 # Pinned to the floors declared in examples/fleet/panel/pyproject.toml.

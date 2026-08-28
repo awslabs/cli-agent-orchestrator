@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cao-entrypoint — start one CAO node inside a container.
 #
-# In the k8s one-agent-per-pod topology (k8s/), the same entrypoint serves two
+# In this EKS one-agent-per-pod topology, the same entrypoint serves two
 # roles distinguished purely by env: the SUPERVISOR pod (code_supervisor
 # profile, CAO_ADVERTISED_URL set, no terminal cap) delegates work to WORKER
 # pods (worker profile, CAO_MAX_TERMINALS=1 — exactly one agent per pod) via
@@ -56,7 +56,7 @@ PORT="${CAO_API_PORT:-9889}"
 # `cao install` another ~1.9s — around 3.8s of a 22s placement spent producing a
 # tree that is byte-identical every time.
 #
-# So it is produced once at BUILD time (docker/Dockerfile) and extracted here.
+# So it is produced once at BUILD time (Dockerfile) and extracted here.
 # Three conditions, all of them load-bearing:
 #
 #   - the seed exists. Absent (an older image, or a plain `docker build` of an

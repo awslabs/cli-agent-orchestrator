@@ -4,7 +4,7 @@
 #
 # All three are also Pod Identity subjects. Pod Identity keys on a (namespace,
 # serviceAccount) pair, so each name here must match an association in
-# iac/infrastructure.yaml - a name that matches nothing is a scheduling success
+# iac/cfn-infrastructure.yaml - a name that matches nothing is a scheduling success
 # and an auth failure, which reads as a broken model rather than a broken binding.
 ---
 # The supervisor: the pod a participant actually talks to. No Role and no

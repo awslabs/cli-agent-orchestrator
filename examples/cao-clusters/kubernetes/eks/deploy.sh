@@ -21,12 +21,12 @@
 # already holds.
 #
 # Usage:
-#   k8s/deploy.sh [stack-name] [image-tag]
+#   examples/cao-clusters/kubernetes/eks/deploy.sh [stack-name] [image-tag]
 #
 # Defaults: stack cao-workshop, tag taken from kustomization.yaml.
 # Honours the usual AWS_PROFILE / AWS_REGION environment.
 #
-# Rendering happens into a temporary directory; the tree under k8s/ is never
+# Rendering happens into a temporary directory; this source directory is never
 # modified, so a failed run leaves nothing to clean up and `git status` stays
 # clean.
 set -euo pipefail

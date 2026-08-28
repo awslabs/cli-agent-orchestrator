@@ -92,8 +92,8 @@ class TestClaudeCodeIdleGap:
         # Bypass at t=18 (Down + Enter) and the late trust prompt at t=35 (Enter)
         # are both handled — proving the idle-gap reset kept the loop polling past
         # the old 20s window. Under old logic send_special_key would fire once.
-        assert mock_backend.send_keys.call_count == 1  # bypass Down arrow
-        assert mock_backend.send_special_key.call_count == 2  # bypass Enter + trust Enter
+        assert mock_backend.send_keys.call_count == 0
+        assert mock_backend.send_special_key.call_count == 3  # bypass Down/Enter + trust Enter
 
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
     @pytest.mark.asyncio
@@ -194,8 +194,8 @@ class TestClaudeCodeIdleGap:
         await p._handle_startup_prompts()
 
         # Bypass accepted once
-        mock_backend.send_keys.assert_called_once()
-        mock_backend.send_special_key.assert_called_once()
+        mock_backend.send_keys.assert_not_called()
+        assert mock_backend.send_special_key.call_count == 2
 
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
     @pytest.mark.asyncio
@@ -223,10 +223,9 @@ class TestClaudeCodeIdleGap:
         p = self._make()
         await p._handle_startup_prompts()
 
-        # Bypass: send_keys (Down arrow) + send_special_key (Enter)
-        # Trust: send_special_key (Enter)
-        assert mock_backend.send_keys.call_count == 1
-        assert mock_backend.send_special_key.call_count == 2
+        # Bypass: special-key Down + Enter. Trust: special-key Enter.
+        assert mock_backend.send_keys.call_count == 0
+        assert mock_backend.send_special_key.call_count == 3
 
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
     @pytest.mark.asyncio
@@ -258,8 +257,8 @@ class TestClaudeCodeIdleGap:
         await p._handle_startup_prompts()
 
         # Both prompts handled
-        assert mock_backend.send_keys.call_count == 1  # bypass Down arrow
-        assert mock_backend.send_special_key.call_count == 2  # bypass Enter + trust Enter
+        assert mock_backend.send_keys.call_count == 0
+        assert mock_backend.send_special_key.call_count == 3  # bypass Down/Enter + trust Enter
 
 
 # ---------------------------------------------------------------------------

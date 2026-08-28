@@ -1,4 +1,4 @@
-# Build context for docker/Dockerfile.panel only.
+# Build context for examples/cao-clusters/kubernetes/eks/Dockerfile.panel only.
 #
 # BuildKit prefers `<dockerfile-path>.dockerignore` over the context-root
 # `.dockerignore`, which is what this file exists for. The root file excludes

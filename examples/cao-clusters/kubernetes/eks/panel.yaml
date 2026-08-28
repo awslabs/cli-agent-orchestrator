@@ -1,4 +1,4 @@
-# Fleet panel — the web console for the fleet, built by docker/Dockerfile.panel.
+# Fleet panel — the web console for the fleet, built by Dockerfile.panel.
 #
 # The fleet registry it mounts, `cao-fleet-config`, is jointly owned:
 # configmap-fleet.yaml supplies the supervisor entry, and the broker adds and

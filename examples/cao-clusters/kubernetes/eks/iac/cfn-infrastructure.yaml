@@ -24,7 +24,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 #
 # Deploy (about 15 minutes, most of it the control plane):
 #   aws cloudformation deploy \
-#     --template-file k8s/iac/infrastructure.yaml \
+#     --template-file examples/cao-clusters/kubernetes/eks/iac/cfn-infrastructure.yaml \
 #     --stack-name cao-workshop \
 #     --capabilities CAPABILITY_NAMED_IAM \
 #     --parameter-overrides ClusterName=cao-workshop
@@ -176,7 +176,7 @@ Parameters:
   # Set this to enable the API-key path — `cao/kiro-api-key` is the conventional
   # value for kiro-cli — and the secret, its read policy, the ESO role and the
   # Pod Identity association are all created. You must also add
-  # `external-secret.yaml` to ../kustomization.yaml and install ESO in the
+  # `../external-secret.yaml` to ../kustomization.yaml and install ESO in the
   # cluster; the manifest is shipped but not applied by default because its CRDs
   # are absent on a cluster that has no ESO.
   ProviderSecretName:
@@ -187,7 +187,7 @@ Parameters:
       providers that use Pod Identity (Claude Code on Bedrock). Set it to create
       the secret and the External Secrets Operator plumbing; created empty, so
       set the value before deploying the manifests. Use
-      cao/provider-credentials, which is the key k8s/external-secret.yaml
+      cao/provider-credentials, which is the key in ../external-secret.yaml
       extracts - any other value has to be changed there too.
 
   ExternalSecretsNamespace:
@@ -950,7 +950,7 @@ Resources:
             ]
           }
 
-  # The broker image, from docker/Dockerfile.broker. A separate repository rather
+  # The broker image, from Dockerfile.broker. A separate repository rather
   # than a second tag in the one above, because the two images share nothing: the
   # server image is a ~310 MiB arm64 build carrying a provider CLI, the broker is
   # python:3.12-slim plus one file. Same tag in both, always, since one CodeBuild
@@ -1005,7 +1005,7 @@ Resources:
   # Only the cluster's own nodes may mount the workspace. Being in the same stack
   # as the cluster, this can reference the security group EKS created rather than
   # taking it as a parameter.
-  # Image for the fleet panel, built by ../../docker/Dockerfile.panel. Separate
+  # Image for the fleet panel, built by Dockerfile.panel. Separate
   # from the server repository because the panel is an operator console with its
   # own release cadence, and IMMUTABLE like the others so a deployed tag always
   # names one image.

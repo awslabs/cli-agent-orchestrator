@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline exercise of docker/entrypoint.sh: state seeding, install skipping, and
+# Offline exercise of entrypoint.sh: state seeding, install skipping, and
 # the three provider warm-up modes.
 #
 # Stubs `cao`, `claude`, `cao-server` and `timeout` on PATH so the whole script
@@ -11,7 +11,7 @@
 # NOT part of the CAO test suite - it exercises a shell script, and pytest has
 # nothing to say about it. Run it directly:
 #
-#     docker/test_entrypoint.sh
+#     examples/cao-clusters/kubernetes/eks/test_entrypoint.sh
 #
 # Prints a PASS/FAIL line per check and exits non-zero if any failed.
 #
@@ -90,7 +90,7 @@ chmod +x "${BIN}"/*
 
 export PATH="${BIN}:${PATH}"
 
-# --- build a seed tar the way docker/Dockerfile does -------------------------
+# --- build a seed tar the way Dockerfile does --------------------------------
 SEED_ROOT="${ROOT}/work/.cao/state"
 mkdir -p "$(dirname "${SEED_ROOT}")"
 CAO_HOME_DIR="${SEED_ROOT}" cao init >/dev/null
