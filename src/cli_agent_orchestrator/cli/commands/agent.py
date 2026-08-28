@@ -162,7 +162,12 @@ def assign_cmd(agent_profile, message, working_directory, engine, model, use_wor
     "--idempotency-key",
     "idempotency_key",
     default=None,
-    help="Make a retry with this same value safe -- reattaches instead of creating a duplicate.",
+    help=(
+        "Make a retry of THIS SAME command safe -- reattaches instead of creating a "
+        "duplicate. Matched together with the request, so reusing a key for a "
+        "different command fails with a conflict rather than returning the earlier "
+        "worker."
+    ),
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def handoff_cmd(
@@ -199,6 +204,17 @@ def handoff_cmd(
     response that never reached this process at all, not just a `Ctrl-C`
     after the terminal_id was already printed above. Omit it (the default)
     and a retry creates a new worker, same as today.
+
+    The key alone does not identify the request. It is matched together with
+    the agent profile, provider, session, working directory, model and
+    worktree flag, so a key you already used for a DIFFERENT command fails
+    with a conflict instead of handing you back that earlier, unrelated
+    worker -- the keys people actually pick (`retry`, `job-1`) collide
+    otherwise, and two agents on one cao-server pick the same ones. Reusing a
+    key whose worker has since been torn down is not a conflict; it just
+    creates a fresh one. Note the request, not the MESSAGE, is what is
+    matched: the same command with a different message reuses the worker, on
+    the grounds that a real retry re-sends the same message.
 
     --no-wait: returns as soon as the worker exists and has been sent MESSAGE,
     without waiting for -- or extracting -- its result, and without tearing it

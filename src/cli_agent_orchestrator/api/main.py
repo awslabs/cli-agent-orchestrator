@@ -157,6 +157,7 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
+    IdempotencyKeyConflict,
     OutputMode,
     TerminalInputBlockedError,
 )
@@ -2919,6 +2920,12 @@ async def create_session(
     instead of creating a second one -- see
     ``terminal_service.create_terminal``'s docstring for the mechanics.
     Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -3004,6 +3011,14 @@ async def create_session(
 
         return result
 
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
+        # rather than silently serving the first call's terminal to a caller
+        # who asked for something else. IdempotencyKeyConflict subclasses
+        # Exception and NOT ValueError precisely so this arm cannot be
+        # shadowed by the 400 arm below -- which, note, sits FIRST here.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except WorktreeError as e:
@@ -3154,6 +3169,12 @@ async def create_terminal_in_session(
     instead of creating a second one -- see
     ``terminal_service.create_terminal``'s docstring for the mechanics.
     Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -3229,6 +3250,13 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616) — 409, not the 404 the generic ValueError arm below would
+        # give it. Unlike the Kiro arm, this one does not depend on preceding
+        # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
+        # of the ValueError family can shadow it.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (KiroPhase0KASError, KiroCapabilityError) as e:
         # Both subclass ValueError, so they must precede the generic arm below —
         # a rejected engine is a bad request, not a missing resource. Matches

@@ -20,6 +20,10 @@ from cli_agent_orchestrator.api.main import (
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services.inbox_service import inbox_service
+from cli_agent_orchestrator.services.terminal_service import (
+    IdempotencyKeyConflict,
+    TerminalRecordCorruptError,
+)
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
 # ── Health endpoint ──────────────────────────────────────────────────
@@ -423,6 +427,73 @@ class TestCreateSession:
 
         assert response.status_code == 201
         assert mock_svc.create_session.call_args.kwargs["idempotency_key"] == "retry-1"
+
+    def test_idempotency_key_conflict_is_409_not_400(self, client):
+        """A reused key for a DIFFERENT request must surface as 409.
+
+        Review on PR #634, issue #616. This endpoint is the sharper of the two:
+        its generic ``ValueError`` arm is FIRST, so a conflict subclassing
+        ``ValueError`` would be swallowed into a 400 before any 409 arm could
+        run. ``IdempotencyKeyConflict`` subclasses ``Exception`` for exactly
+        that reason, and this test is what pins it.
+        """
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=IdempotencyKeyConflict(
+                    "idempotency_key 'job-1' was already used for a different request; "
+                    "use a distinct key"
+                )
+            )
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 409
+        assert "already used for a different request" in response.json()["detail"]
+
+    def test_plain_value_error_still_maps_to_400(self, client):
+        """Ordering regression guard for the 409 arm (review on PR #634).
+
+        Paired with the 409 test above: this endpoint must keep mapping a plain
+        ``ValueError`` to 400. Without both halves pinned, making the conflict a
+        ``ValueError`` subclass -- or reordering the arms -- silently downgrades
+        the 409 and nothing fails.
+        """
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=ValueError("Session 'test-session' already exists")
+            )
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+            )
+
+        assert response.status_code == 400
+
+    def test_corrupt_terminal_row_is_500_not_400(self, client):
+        """The other endpoint: 500 rather than this one's 400 (review on PR #634)."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=TerminalRecordCorruptError("stored row does not validate")
+            )
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 500
 
     def test_create_session_passes_explicit_kiro_engine(self, client):
         """An explicit engine reaches the session service and the response."""
@@ -948,6 +1019,83 @@ class TestCreateTerminalInSession:
 
         assert response.status_code == 500
         assert "Failed to create terminal" in response.json()["detail"]
+
+    def test_idempotency_key_conflict_is_409_not_404(self, client):
+        """A reused key for a DIFFERENT request must surface as 409.
+
+        Review on PR #634, issue #616. This endpoint maps the generic
+        ``ValueError`` to 404, so a conflict that subclassed ``ValueError``
+        would arrive as "not found" -- which reads as a missing session and
+        tells the operator nothing about the real problem. Asserting the exact
+        code is the point of this test.
+        """
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=IdempotencyKeyConflict(
+                    "idempotency_key 'job-1' was already used for a different request; "
+                    "use a distinct key"
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 409
+        assert "already used for a different request" in response.json()["detail"]
+
+    def test_plain_value_error_still_maps_to_404(self, client):
+        """Ordering regression guard for the 409 arm (review on PR #634).
+
+        The new ``IdempotencyKeyConflict`` arm sits ahead of this endpoint's
+        ``ValueError`` arm. If someone later reorders them, or makes the
+        conflict a ``ValueError`` subclass, the conflict silently downgrades to
+        404 and only a test that pins BOTH mappings notices. This is the other
+        half of that pair: a plain ``ValueError`` must keep its 404.
+        """
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=ValueError("Session 'test-session' not found")
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+            )
+
+        assert response.status_code == 404
+
+    def test_corrupt_terminal_row_is_500_not_404(self, client):
+        """Pin a mapping that rests on the ABSENCE of an arm (review on PR #634).
+
+        A corrupt stored row is a server-data fault, so it must be 500 -- not
+        the 404 this endpoint gives a bare ValueError. `TerminalRecordCorruptError`
+        gets there by NOT being a ValueError and falling to the catch-all, which
+        means no `except` arm asserts this today and adding a narrower one later
+        would silently re-blame the caller for the server's bad data -- the exact
+        defect the commit below this one fixes -- with nothing failing. This test
+        is what fails instead.
+        """
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=TerminalRecordCorruptError("stored row does not validate")
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 500
 
 
 class TestListTerminalsInSession:

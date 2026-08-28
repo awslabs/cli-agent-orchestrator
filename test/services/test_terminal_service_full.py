@@ -6,17 +6,24 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.clients.database import (
+    IdempotencyRecord,
+)
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
-from cli_agent_orchestrator.clients.database import get_terminal_id_by_idempotency_key
+from cli_agent_orchestrator.clients.database import (
+    get_idempotency_record,
+)
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.services.terminal_service import (
+    IdempotencyKeyConflict,
     OutputMode,
     TerminalInputBlockedError,
     TerminalRecordCorruptError,
+    _request_fingerprint,
     create_terminal,
     delete_terminal,
     get_output,
@@ -198,6 +205,8 @@ class TestCreateTerminal:
             metadata=None,
             working_directory=os.path.realpath(os.getcwd()),
             idempotency_key=None,
+            # No key supplied, so no fingerprint is computed (review on PR #634).
+            request_fingerprint=None,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
@@ -894,7 +903,7 @@ class TestCreateTerminalIdempotencyKey:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_id_by_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -906,7 +915,7 @@ class TestCreateTerminalIdempotencyKey:
         mock_lookup,
         mock_get_terminal,
     ):
-        mock_lookup.return_value = "prior-terminal"
+        mock_lookup.return_value = _record(terminal_id="prior-terminal")
         mock_get_terminal.return_value = {
             "id": "prior-terminal",
             "name": "developer-abcd",
@@ -946,7 +955,7 @@ class TestCreateTerminalIdempotencyKey:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_id_by_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
     async def test_unseen_key_creates_normally_and_forwards_to_db(
         self,
         mock_lookup,
@@ -985,7 +994,7 @@ class TestCreateTerminalIdempotencyKey:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_id_by_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
@@ -1015,7 +1024,7 @@ class TestCreateTerminalIdempotencyKey:
         completed handoff, retried long after) is gone -- get_terminal raises
         ValueError for it. That must not crash the caller; it must create a
         fresh terminal exactly as if the key had never been used."""
-        mock_lookup.return_value = "long-gone-terminal"
+        mock_lookup.return_value = _record(terminal_id="long-gone-terminal")
         mock_get_terminal.side_effect = ValueError("Terminal 'long-gone-terminal' not found")
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -1065,7 +1074,7 @@ class TestCreateTerminalIdempotencyKey:
         primary key and raised ``IntegrityError``, which tore down the
         just-allocated tmux/provider resources and surfaced as a 500. This
         test leaves ``db_create_terminal`` and
-        ``get_terminal_id_by_idempotency_key`` real (module-level
+        ``get_idempotency_record`` real (module-level
         ``isolated_memory_db`` fixture) to prove the fix against an actual
         PK collision, not a mock.
         """
@@ -1097,12 +1106,12 @@ class TestCreateTerminalIdempotencyKey:
         # Not just "didn't crash" -- the replacement's OWN mapping actually
         # landed, so a future retry with this key finds test1234, not a
         # second-generation orphan.
-        assert get_terminal_id_by_idempotency_key("stale-key") == "test1234"
+        assert get_idempotency_record("stale-key").terminal_id == "test1234"
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_idempotency_key")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_id_by_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -1130,7 +1139,7 @@ class TestCreateTerminalIdempotencyKey:
         (session_name / name, and no working_directory at all) -- the drift
         that actually happens on a column rename.
         """
-        mock_lookup.return_value = "live-terminal"
+        mock_lookup.return_value = _record(terminal_id="live-terminal")
         mock_get_terminal.return_value = {
             "id": "live-terminal",
             "tmux_session": "cao-session",
@@ -1157,6 +1166,245 @@ class TestCreateTerminalIdempotencyKey:
         mock_tmux.create_session.assert_not_called()
         mock_provider_manager.create_provider.assert_not_called()
         mock_db_create.assert_not_called()
+
+
+def _record(terminal_id="prior-terminal", **overrides):
+    """An IdempotencyRecord whose fingerprint matches the baseline request.
+
+    The fingerprint is computed with the SAME helper production uses, so these
+    tests assert the match/mismatch DECISION rather than re-deriving the digest
+    (which would just restate the implementation and pass even if it changed).
+    """
+    fields = {
+        "provider": "kiro_cli",
+        "agent_profile": "developer",
+        "session_name": None,
+        "working_directory": None,
+        "caller_id": None,
+        "model": None,
+        "use_worktree": False,
+        "engine": None,
+        "allowed_tools": None,
+    }
+    fields.update(overrides)
+    return IdempotencyRecord(
+        terminal_id=terminal_id,
+        request_fingerprint=_request_fingerprint(**fields),
+    )
+
+
+def _valid_row(terminal_id="prior-terminal"):
+    """A stored row that satisfies the Terminal model."""
+    return {
+        "id": terminal_id,
+        "name": "developer-abcd",
+        "provider": "kiro_cli",
+        "session_name": "cao-session",
+        "agent_profile": "developer",
+        "caller_id": None,
+        "allowed_tools": None,
+        "engine": None,
+        "group": None,
+        "metadata": None,
+        "status": "idle",
+        "last_active": datetime.now(),
+    }
+
+
+class TestIdempotencyKeyRequestFingerprint:
+    """The key identifies a REQUEST, not just a string (review on PR #634).
+
+    Before the fingerprint, a key meant "some earlier call anywhere on this
+    server used this string": a second operator reusing a common key (`retry`,
+    `job-1`) was handed the FIRST operator's terminal, and `_handoff_impl` fed
+    it straight into `reuse_terminal_id` -- delivering this caller's prompt
+    into someone else's running worker, then deleting it on teardown.
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_identical_request_still_returns_the_same_terminal(
+        self, mock_tmux, mock_provider_manager, mock_db_create, mock_lookup, mock_get_terminal
+    ):
+        """The already-reviewed retry-safety must not regress.
+
+        The fingerprint is a guard on an existing behaviour, not a replacement
+        for it -- same key AND same request is still a no-real-work short
+        circuit.
+        """
+        mock_lookup.return_value = _record()
+        mock_get_terminal.return_value = _valid_row()
+
+        result = await create_terminal(
+            "kiro_cli", "developer", new_session=True, idempotency_key="retry-key-1"
+        )
+
+        assert result.id == "prior-terminal"
+        mock_tmux.create_session.assert_not_called()
+        mock_provider_manager.create_provider.assert_not_called()
+        mock_db_create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("provider", "claude_code"),
+            ("agent_profile", "reviewer"),
+            ("session_name", "cao-other"),
+            ("working_directory", "/somewhere/else"),
+            ("caller_id", "supervisor-A"),
+            ("model", "fable-5"),
+            ("use_worktree", True),
+            # Review on PR #634: both are persisted `terminals` columns and
+            # both are reachable in the same call as idempotency_key, so
+            # leaving either unhashed was a live escalation / validation hole.
+            ("engine", "v2"),
+            ("allowed_tools", ["send_message", "execute_bash"]),
+        ],
+    )
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_any_differing_field_conflicts(
+        self,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_create,
+        mock_lookup,
+        mock_get_terminal,
+        field,
+        value,
+    ):
+        """Each of the nine fields, varied ALONE, must conflict.
+
+        Parametrized rather than one test per field so that adding a field to
+        the fingerprint without adding it here is visible as a gap. ``caller_id``
+        is the one that turns a cross-operator collision into a loud 409 instead
+        of a silent hand-off of someone else's worker.
+        """
+        # The STORED record was written for the baseline request; this call
+        # varies exactly one field, so the fingerprints must differ.
+        mock_lookup.return_value = _record()
+        mock_get_terminal.return_value = _valid_row()
+
+        kwargs = {"new_session": True, "idempotency_key": "job-1"}
+        args = ["kiro_cli", "developer"]
+        if field == "provider":
+            args[0] = value
+        elif field == "agent_profile":
+            args[1] = value
+        else:
+            kwargs[field] = value
+
+        with pytest.raises(IdempotencyKeyConflict) as exc:
+            await create_terminal(*args, **kwargs)
+
+        assert "different request" in str(exc.value)
+        # The conflict is raised BEFORE any terminal is created,
+        # so there is no orphan tmux window, provider, or row to clean up.
+        mock_tmux.create_session.assert_not_called()
+        mock_provider_manager.create_provider.assert_not_called()
+        mock_db_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_two_anonymous_callers_with_identical_requests_reuse(
+        self, mock_tmux, mock_provider_manager, mock_db_create, mock_lookup, mock_get_terminal
+    ):
+        """Pins an ACCEPTED RESIDUAL, not a bug.
+
+        Two callers both with ``caller_id=None`` and identical in all other six
+        fields are indistinguishable by fingerprint, so the second reuses the
+        first's terminal. That is the documented, intended outcome: by every
+        property the server can observe these are the same request. Pinned so
+        nobody later "fixes" it into a conflict without a decision.
+        """
+        mock_lookup.return_value = _record(caller_id=None)
+        mock_get_terminal.return_value = _valid_row()
+
+        result = await create_terminal(
+            "kiro_cli", "developer", new_session=True, idempotency_key="job-1", caller_id=None
+        )
+
+        assert result.id == "prior-terminal"
+        mock_db_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_stale_key_with_a_different_request_does_not_conflict(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_create,
+        mock_lookup,
+        mock_get_terminal,
+        mock_delete_key,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """STALE beats CONFLICT -- the ordering that would bite.
+
+        The fingerprint comparison deliberately runs AFTER the stale-terminal
+        branch. Reversed, an operator reusing a key from a job that already
+        finished would get a 409 -- breaking the exact case the feature was
+        built to serve. Here the key maps to a DELETED terminal AND the request
+        differs, and the correct outcome is a fresh create, not a conflict.
+        """
+        mock_lookup.return_value = _record(terminal_id="long-gone")
+        mock_get_terminal.side_effect = ValueError("Terminal 'long-gone' not found")
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="reviewer", description="Reviewer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        # `reviewer` vs the record's `developer`: a DIFFERENT request.
+        result = await create_terminal(
+            "kiro_cli", "reviewer", new_session=True, idempotency_key="stale-key"
+        )
+
+        assert result.id == "test1234"
+        mock_delete_key.assert_called_once_with("stale-key", "long-gone")
+        # The replacement stores the fingerprint of the request that actually
+        # created it, so a later retry of THAT request matches. Note
+        # session_name is None, not the generated "cao-session": the
+        # fingerprint is taken from the REQUEST, and the request did not name a
+        # session. A retry re-sends the same None and matches; fingerprinting
+        # the generated name would never match anything.
+        assert mock_db_create.call_args.kwargs["request_fingerprint"] == _request_fingerprint(
+            "kiro_cli", "reviewer", None, None, None, None, False, None, None
+        )
 
 
 class TestCreateTerminalWorktree:

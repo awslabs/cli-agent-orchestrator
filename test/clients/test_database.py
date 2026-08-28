@@ -24,10 +24,10 @@ from cli_agent_orchestrator.clients.database import (
     delete_terminal,
     delete_terminals_by_session,
     get_flow,
+    get_idempotency_record,
     get_inbox_messages,
     get_pending_messages,
     get_terminal_group,
-    get_terminal_id_by_idempotency_key,
     get_terminal_metadata,
     init_db,
     list_flows,
@@ -381,31 +381,65 @@ class TestIdempotencyKey:
 
         mock_session.add.assert_called_once()
 
-    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_get_terminal_id_by_idempotency_key_found(self, mock_session_class):
-        mock_session = MagicMock()
-        mock_session.__enter__ = MagicMock(return_value=mock_session)
-        mock_session.__exit__ = MagicMock(return_value=False)
-        mock_row = MagicMock()
-        mock_row.terminal_id = "test123"
-        mock_query = MagicMock()
-        mock_query.filter.return_value.first.return_value = mock_row
-        mock_session.query.return_value = mock_query
-        mock_session_class.return_value = mock_session
+    def test_get_idempotency_record_returns_none_for_an_unused_key(self, test_db):
+        """The DB layer's own contract for a miss (review on PR #634)."""
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert get_idempotency_record("never-seen") is None
 
-        assert get_terminal_id_by_idempotency_key("retry-key-1") == "test123"
+    def test_fingerprint_round_trips_through_a_real_database(self, test_db):
+        """The WRITE->READ seam, against real SQLite (review on PR #634).
 
-    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_get_terminal_id_by_idempotency_key_not_found(self, mock_session_class):
-        mock_session = MagicMock()
-        mock_session.__enter__ = MagicMock(return_value=mock_session)
-        mock_session.__exit__ = MagicMock(return_value=False)
-        mock_query = MagicMock()
-        mock_query.filter.return_value.first.return_value = None
-        mock_session.query.return_value = mock_query
-        mock_session_class.return_value = mock_session
+        Both halves of this were already pinned in isolation -- the service
+        asserts the fingerprint it hands to ``create_terminal``, and the
+        comparison logic is unit-tested against a stubbed lookup -- but nothing
+        exercised the seam BETWEEN them. A column that is written but not read
+        back (or read from the wrong attribute) would leave every stored
+        fingerprint blank, every comparison a mismatch, and every retry a 409,
+        while both halves' own tests stayed green. A mock cannot catch that;
+        only a real write followed by a real read can.
+        """
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-fp",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="fp-key",
+                request_fingerprint="deadbeef",
+            )
 
-        assert get_terminal_id_by_idempotency_key("never-seen") is None
+            record = get_idempotency_record("fp-key")
+
+        assert record is not None
+        assert record.terminal_id == "term-fp"
+        # The exact value survives -- not merely "something non-empty", which a
+        # column defaulting to "" would also satisfy.
+        assert record.request_fingerprint == "deadbeef"
+
+    def test_a_key_persisted_without_a_fingerprint_reads_back_blank(self, test_db):
+        """The `or ""` in create_terminal, pinned.
+
+        `request_fingerprint` is NOT NULL with no server default, so a caller
+        that supplies a key but no fingerprint must still produce a readable
+        row rather than an IntegrityError. It reads back blank, which every
+        real comparison then mismatches -- the deliberate fail-loud choice
+        (there is no skip-on-blank branch to test).
+        """
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-blank",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="blank-key",
+            )
+
+            record = get_idempotency_record("blank-key")
+
+        assert record is not None
+        assert record.request_fingerprint == ""
 
     def test_same_key_twice_is_atomic_second_attempt_persists_nothing(self, test_db):
         """The core atomicity property: two create_terminal calls with the
@@ -437,7 +471,7 @@ class TestIdempotencyKey:
 
             # The winner's mapping and terminal both survive the second
             # call's failed transaction.
-            assert get_terminal_id_by_idempotency_key("shared-key") == "term-first"
+            assert get_idempotency_record("shared-key").terminal_id == "term-first"
             assert get_terminal_metadata("term-first") is not None
             # The loser's terminal row must NOT exist. If it did, the two
             # inserts were not actually atomic -- only the idempotency insert
@@ -464,8 +498,8 @@ class TestIdempotencyKey:
                 idempotency_key="key-b",
             )
 
-            assert get_terminal_id_by_idempotency_key("key-a") == "term-a"
-            assert get_terminal_id_by_idempotency_key("key-b") == "term-b"
+            assert get_idempotency_record("key-a").terminal_id == "term-a"
+            assert get_idempotency_record("key-b").terminal_id == "term-b"
             assert get_terminal_metadata("term-a") is not None
             assert get_terminal_metadata("term-b") is not None
 
@@ -514,7 +548,7 @@ class TestIdempotencyKey:
 
             assert delete_idempotency_key("shared-key", "term-stale-guess") is False
             # The real, current mapping survives untouched.
-            assert get_terminal_id_by_idempotency_key("shared-key") == "term-winner"
+            assert get_idempotency_record("shared-key").terminal_id == "term-winner"
 
     def test_delete_idempotency_key_removes_a_real_row(self, test_db):
         with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
@@ -528,7 +562,7 @@ class TestIdempotencyKey:
             )
 
             assert delete_idempotency_key("reused-key", "term-old") is True
-            assert get_terminal_id_by_idempotency_key("reused-key") is None
+            assert get_idempotency_record("reused-key") is None
 
 
 class TestGroupAndMetadata:

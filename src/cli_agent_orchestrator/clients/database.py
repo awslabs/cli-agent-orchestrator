@@ -4,7 +4,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, NamedTuple, Optional, cast
 
 from sqlalchemy import (
     Boolean,
@@ -293,6 +293,24 @@ class IdempotencyKeyModel(Base):
 
     key = Column(String, primary_key=True)
     terminal_id = Column(String, nullable=False)
+    # sha256 hexdigest of the REQUESTED create fields (review on PR #634).
+    # Without it a key means only "some earlier call anywhere on this server
+    # used this string", not "this is a retry of THIS request" -- so a second
+    # caller reusing a common key (`retry`, `job-1`) was handed the first
+    # caller's terminal, and `_handoff_impl` then delivered its prompt into
+    # someone else's running worker. `terminal_service._request_fingerprint`
+    # owns the computation; see its docstring for why REQUESTED and not
+    # resolved values.
+    #
+    # `nullable=False` with NO default, deliberately: this column and this
+    # TABLE ship in the same create-table DDL (neither `idempotency_keys` nor
+    # `IdempotencyKeyModel` exists on main or in ANY released tag through
+    # v2.5.0), so no pre-existing database can hold a row without one and
+    # there is nothing to migrate. A blank fingerprint is therefore not a
+    # legacy row to tolerate -- it can only come from a scratch sqlite built
+    # from an earlier revision of this branch, whose fix is deleting the file.
+    # It is compared like any other value and simply mismatches, loudly.
+    request_fingerprint = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.now)
 
 
@@ -1181,6 +1199,7 @@ def create_terminal(
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
     idempotency_key: Optional[str] = None,
+    request_fingerprint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -1220,7 +1239,19 @@ def create_terminal(
         )
         db.add(terminal)
         if idempotency_key:
-            db.add(IdempotencyKeyModel(key=idempotency_key, terminal_id=terminal_id))
+            # `or ""` keeps this insert in the SAME transaction as the terminal
+            # row (the property haofeif approved) without a nullable column: a
+            # caller that supplies a key but no fingerprint stores a blank one,
+            # which every later comparison simply mismatches. Failing loud beats
+            # a skip-on-blank branch that would silently hand back a terminal
+            # nobody verified.
+            db.add(
+                IdempotencyKeyModel(
+                    key=idempotency_key,
+                    terminal_id=terminal_id,
+                    request_fingerprint=request_fingerprint or "",
+                )
+            )
         db.commit()
         return {
             "id": terminal.id,
@@ -1244,17 +1275,37 @@ def create_terminal(
         }
 
 
-def get_terminal_id_by_idempotency_key(key: str) -> Optional[str]:
-    """Return the terminal a prior ``create_terminal`` call already produced
-    for ``key``, or ``None`` if this key has never been used.
+class IdempotencyRecord(NamedTuple):
+    """A key's stored mapping: which terminal, and for WHICH request."""
+
+    terminal_id: str
+    request_fingerprint: str
+
+
+def get_idempotency_record(key: str) -> Optional[IdempotencyRecord]:
+    """Return the full mapping for ``key``, or ``None`` if never used.
 
     Review on PR #634, issue #616. A plain read, no locking: the caller
     (``terminal_service.create_terminal``) uses this to decide whether to do
     any real work at all, before generating a terminal id or touching tmux.
+
+    Returns the fingerprint together with the terminal id in ONE read, so the
+    caller can tell a genuine retry (same key, same request) from a key
+    COLLISION (same key, different request) rather than returning a terminal
+    that answers a question this caller never asked. This deliberately
+    REPLACES an earlier ``get_terminal_id_by_idempotency_key`` that returned
+    the id alone (review on PR #634): keeping a fingerprint-BLIND public
+    lookup beside this one would invite a future caller to reintroduce exactly
+    the bug class the fingerprint exists to close.
     """
     with SessionLocal() as db:
         row = db.query(IdempotencyKeyModel).filter(IdempotencyKeyModel.key == key).first()
-        return cast(Optional[str], row.terminal_id) if row else None
+        if row is None:
+            return None
+        return IdempotencyRecord(
+            terminal_id=cast(str, row.terminal_id),
+            request_fingerprint=cast(str, row.request_fingerprint),
+        )
 
 
 def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
