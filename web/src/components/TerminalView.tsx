@@ -45,7 +45,12 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
 
     // Connect WebSocket
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${protocol}//${location.host}/terminals/${terminalId}/ws`)
+    // BASE_URL carries the build-time `--base` and always ends in "/", so it
+    // joins straight onto `terminals/`. A `fetch` shim cannot cover this call,
+    // which is why the prefix is read here rather than patched in one place.
+    const ws = new WebSocket(
+      `${protocol}//${location.host}${import.meta.env.BASE_URL}terminals/${terminalId}/ws`,
+    )
     ws.binaryType = 'arraybuffer'
 
     ws.onopen = () => {
