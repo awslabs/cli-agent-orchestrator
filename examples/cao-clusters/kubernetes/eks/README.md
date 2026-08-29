@@ -175,11 +175,31 @@ The panel image copies the source tree instead of installing the wheel that
 frontend as a sibling of the app package:
 
 ```python
-_STATIC = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+_ROOT = os.path.dirname(os.path.dirname(__file__))
 ```
 
 An installed wheel does not preserve that layout, so the panel would start and
 then serve 404 for every asset.
+
+The panel serves CAO's own dashboard, so a fleet is operated with the same UI a
+single server serves. A first build stage (`node:24-slim` — vite 8 builds
+through rolldown, which ships no binding for Node 20) runs `npm run build` in
+`web/` and the result is copied to `/panel/web_ui`. The panel prefers it and
+falls back to its own `static/` UI when that directory holds no `index.html`,
+which is what `examples/fleet/panel` does when run straight from a checkout.
+
+Vite resolves the app's base path at build time, so an image reached under a
+reverse-proxy prefix needs it baked in:
+
+```bash
+docker buildx build --platform linux/arm64 \
+  --build-arg WEB_BASE=/proxy/panel/ \
+  -f examples/cao-clusters/kubernetes/eks/Dockerfile.panel \
+  -t "${REGISTRY}/cao-fleet-panel:${TAG}" --push .
+```
+
+The default is `/`, which is what the `kubectl port-forward` below wants. A
+trailing slash is required — the value is emitted verbatim.
 
 ## Provider credentials
 
