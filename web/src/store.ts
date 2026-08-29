@@ -1,6 +1,9 @@
 import { create } from 'zustand'
 import {
   api,
+  fleet,
+  setActiveNode,
+  FleetNode,
   Session,
   SessionDetail,
   TerminalMeta,
@@ -68,6 +71,36 @@ interface Store {
   setSelectedIndex: (index: number) => void
   setFollowConnected: (connected: boolean) => void
   clearSelectedRun: () => void
+
+  // ── Fleet slice ───────────────────────────────────────────────────────
+  // Populated only when the app is served by the fleet panel. A cao-server does
+  // not answer /api/fleet, so `fleetNodes` stays empty, `activeNode` stays null,
+  // and every request goes to the origin exactly as it did before — the
+  // single-node app is the same app with an empty fleet.
+  fleetNodes: FleetNode[]
+  // Mirrors api.ts's module-level active node so components re-render on a
+  // switch. api.ts owns the value the transports read; this is the view of it.
+  activeNode: string | null
+  // Discovery has finished (either way). Lets the UI hold the first render until
+  // requests have a node to carry, instead of firing a wave that 404s.
+  fleetReady: boolean
+
+  discoverFleet: () => Promise<void>
+  refreshFleet: () => Promise<void>
+  selectNode: (name: string) => Promise<void>
+}
+
+/**
+ * The node to open on: the one that coordinates the fleet, else any node that
+ * answered, else the first registered. Never undefined for a non-empty fleet —
+ * an app with no active node would send every request to the panel itself.
+ */
+function defaultNode(nodes: FleetNode[]): FleetNode | undefined {
+  return (
+    nodes.find(n => n.role === 'supervisor' || n.role === 'central') ??
+    nodes.find(n => n.online) ??
+    nodes[0]
+  )
 }
 
 export const useStore = create<Store>((set, get) => ({
@@ -85,6 +118,10 @@ export const useStore = create<Store>((set, get) => ({
   wfGaps: [],
   selectedIndex: 0,
   followConnected: false,
+
+  fleetNodes: [],
+  activeNode: null,
+  fleetReady: false,
 
   fetchSessions: async () => {
     try {
@@ -280,4 +317,70 @@ export const useStore = create<Store>((set, get) => ({
       selectedIndex: 0,
       followConnected: false,
     }),
+
+  // ── Fleet actions ─────────────────────────────────────────────────────
+  discoverFleet: async () => {
+    try {
+      const { machines } = await fleet.list()
+      const node = defaultNode(machines)
+      // Set the route BEFORE anything else reads it, so the first session fetch
+      // already carries a node.
+      setActiveNode(node?.name ?? null)
+      set({ fleetNodes: machines, activeNode: node?.name ?? null, fleetReady: true })
+    } catch {
+      // No /api/fleet: a cao-server is serving this app directly. Not an error
+      // and deliberately not a snackbar — it is the single-node case.
+      setActiveNode(null)
+      set({ fleetNodes: [], activeNode: null, fleetReady: true })
+    }
+  },
+
+  refreshFleet: async () => {
+    try {
+      const { machines } = await fleet.list()
+      if (!jsonEqual(get().fleetNodes, machines)) set({ fleetNodes: machines })
+      // A node can leave the fleet under us — elastic workers are ephemeral by
+      // design. Fall back rather than keep routing to a name the panel no longer
+      // knows, which would 404 every request with nothing on screen to explain it.
+      const active = get().activeNode
+      if (active && !machines.some(m => m.name === active)) {
+        const node = defaultNode(machines)
+        if (node) {
+          await get().selectNode(node.name)
+        } else {
+          setActiveNode(null)
+          set({ activeNode: null })
+        }
+        get().showSnackbar({ type: 'info', message: `${active} left the fleet` })
+      }
+    } catch {
+      // Leave the last good listing up; the panel may just be restarting.
+    }
+  },
+
+  selectNode: async (name) => {
+    if (get().activeNode === name) return
+    setActiveNode(name)
+    // Everything below is node-scoped: sessions, terminals and workflow runs all
+    // live on one cao-server. Clearing it is what makes a switch a switch rather
+    // than one node's data relabelled with another node's name.
+    set({
+      activeNode: name,
+      sessions: [],
+      activeSession: null,
+      activeSessionDetail: null,
+      terminalStatuses: {},
+      workflowRuns: [],
+      selectedRun: null,
+      selectedRunId: null,
+      wfEvents: [],
+      wfGaps: [],
+      selectedIndex: 0,
+      followConnected: false,
+      // Not "disconnected" — nothing has been asked of the new node yet. The
+      // next fetchSessions decides.
+      connected: false,
+    })
+    await get().fetchSessions()
+  },
 }))
