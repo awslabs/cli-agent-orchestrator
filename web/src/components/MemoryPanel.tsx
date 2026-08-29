@@ -37,7 +37,7 @@ function rowId(m: MemorySummary): string {
 }
 
 export function MemoryPanel() {
-  const { showSnackbar } = useStore()
+  const { showSnackbar, activeNode } = useStore()
 
   // Memory list state
   const [memories, setMemories] = useState<MemorySummary[]>([])
@@ -77,9 +77,11 @@ export function MemoryPanel() {
     }
   }
 
+  // The node belongs in here with the filters: memories live in the node's own
+  // store, so a switch changes the result set exactly as a filter change does.
   useEffect(() => {
     fetchMemories()
-  }, [scopeFilter, typeFilter])
+  }, [scopeFilter, typeFilter, activeNode])
 
   // Default the graph's project scope_id from the listed memories when one is
   // discoverable and the user hasn't typed their own. Keeps the graph view

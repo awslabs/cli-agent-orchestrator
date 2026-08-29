@@ -23,7 +23,7 @@ function cronToLabel(cron: string): string {
 }
 
 export function FlowsPanel() {
-  const { showSnackbar } = useStore()
+  const { showSnackbar, activeNode } = useStore()
 
   // Flow list state
   const [flows, setFlows] = useState<Flow[]>([])
@@ -61,19 +61,24 @@ export function FlowsPanel() {
     }
   }
 
+  // All three are per-node: flows are scheduled on one cao-server and the
+  // dropdowns have to describe that same one. Keyed on the node so a switch
+  // reloads instead of leaving the previous node's flows listed as this
+  // node's, and each failure clears rather than keeping a stale list.
   useEffect(() => {
+    setLoading(true)
     fetchFlows()
     api.listProfiles()
       .then(p => setProfiles(p))
-      .catch(() => {})
+      .catch(() => setProfiles([]))
     api.listProviders()
       .then(p => {
         setProviders(p)
         const firstInstalled = p.find(prov => prov.installed)
         if (firstInstalled) setProvider(firstInstalled.name)
       })
-      .catch(() => {})
-  }, [])
+      .catch(() => setProviders([]))
+  }, [activeNode])
 
   const resetForm = () => {
     setName('')
