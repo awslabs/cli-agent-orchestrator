@@ -320,10 +320,24 @@ seconds. The alternative -- gating the fleet view on `CAO_ELASTIC_GATE_ON_READY`
 The panel reads that ConfigMap from the **API server**, not from its mount, so a
 published worker is visible within its poll interval (5s by default) and no
 restart is needed. The mount would work but not well enough: a mounted ConfigMap
-only refreshes on the kubelet's sync period -- 15 seconds in testing, with no
-guaranteed ceiling -- and a leased worker can be placed, used and released inside
-that window. The view would then show a worker that had already gone while missing
-the one that was running.
+only refreshes on the kubelet's sync period, and a leased worker can be placed,
+used and released inside that window. The view would then show a worker that had
+already gone while missing the one that was running.
+
+Measured on a 1.35 cluster, leasing one elastic worker and releasing it while
+watching both views at once -- `/api/fleet` against `/config/fleet.json` inside
+the panel pod:
+
+| | panel reads the API server | panel reads its mount |
+|---|---|---|
+| lease appears | 7.9s | 24.1s |
+| lease disappears | 4.1s | 87.5s |
+
+The withdrawal is the direction that matters and the one that is worse: for 83
+seconds the mounted copy advertised a worker whose Service had already been
+deleted, so the panel would have proxied terminal traffic to an address that no
+longer resolved. There is no upper bound on that number to design against -- it
+is a resync, not a delivery guarantee.
 
 The mount is kept as a fallback. If the panel's RoleBinding is missing or wrong it
 logs the failure and serves the mounted copy, so you get a stale panel rather than
@@ -334,11 +348,26 @@ curl -fsS -H "Authorization: Bearer ${TOKEN}" http://127.0.0.1:9888/api/fleet \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["source"])'
 ```
 
-`{"kind": "configmap", ..., "live": true}` is the intended state. `"live": false`
-with an `error` means it has fallen back -- check the `cao-fleet-panel` Role and
-RoleBinding in `rbac.yaml`, and the API-server egress rule in
-`networkpolicy.yaml`. Both failures are quiet: the panel comes up, the probes
-pass, and workers simply seem not to register.
+`{"kind": "configmap", ..., "live": true, "error": null}` is the intended state.
+
+**Read `error`, not `live`.** A non-null `error` is the signal that reads are
+failing now; `live` only says whether the fleet on screen came from a successful
+read at some point, and it stays `true` while a last-good snapshot is being
+served. A panel that read the ConfigMap once and has been failing ever since
+reports `live: true` with an error -- which is the correct answer to both
+questions, but only the second one tells you to go and fix something.
+
+The error text names which of the two quiet failures you have:
+
+| `error` | cause |
+|---|---|
+| `403 Forbidden` | the `cao-fleet-panel` Role or RoleBinding in `rbac.yaml` |
+| `ConnectTimeout` | the API-server egress rule in `networkpolicy.yaml` |
+
+Both were confirmed by removing each in turn on a live cluster, and both recover
+on the next poll once restored -- no restart. Without this field they are
+indistinguishable from a fleet whose workers are not registering: the panel comes
+up, the probes pass, and no worker ever appears.
 
 The grant is one `get` on one ConfigMap by name. `list` and `watch` are not
 granted -- `resourceNames` cannot restrict them, so either would widen it to every
