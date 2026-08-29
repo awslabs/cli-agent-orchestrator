@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import types
 
 import httpx
 import pytest
@@ -546,15 +547,23 @@ class _FakeNodeSocket:
         self._queue.put_nowait(_EOF)
 
 
-def _patch_node_socket(monkeypatch, frames=(), echo=False, fail=False):
+def _patch_node_socket(monkeypatch, frames=(), echo=False, fail=False, reject=None):
     """Stand in for the upstream WebSocket client.
 
     Returns the list of sockets the panel opened — empty is the assertion that
     matters for every rejection test: a refused handshake must not reach a node.
+
+    `fail` is a node that cannot be reached at all; `reject` is a node that
+    answered the handshake with that HTTP status, which is the only trace
+    cao-server's pre-accept close leaves on the wire.
     """
     opened = []
 
     async def fake_connect(url, **kwargs):
+        if reject is not None:
+            raise main.websockets.exceptions.InvalidStatus(
+                types.SimpleNamespace(status_code=reject)
+            )
         if fail:
             raise OSError("connection refused")
         sock = _FakeNodeSocket(list(frames), echo=echo)
@@ -643,6 +652,23 @@ def test_terminal_ws_reports_an_unreachable_node(monkeypatch):
         with pytest.raises(WebSocketDisconnect) as exc:
             ws.receive_bytes()
     assert exc.value.code == 1011
+    assert "unreachable" in exc.value.reason
+
+
+def test_terminal_ws_distinguishes_a_node_that_refused(monkeypatch):
+    """A node that ANSWERED and said no is not a node that is down.
+
+    cao-server closes 4004 for an unknown terminal before accepting, which
+    uvicorn collapses into a bare HTTP 403 — so the status is the only signal
+    left, and 1011 ("internal error") would misreport it as the panel's fault.
+    """
+    _patch_node_socket(monkeypatch, reject=403)
+    tc = TestClient(main.app)
+    with tc.websocket_connect("/nodes/node-a/terminals/abcd1234/ws") as ws:
+        with pytest.raises(WebSocketDisconnect) as exc:
+            ws.receive_bytes()
+    assert exc.value.code == 1008
+    assert "refused" in exc.value.reason and "403" in exc.value.reason
 
 
 def test_terminal_ws_closes_the_browser_when_the_pty_ends(monkeypatch):
