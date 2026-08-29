@@ -362,9 +362,10 @@ spec:
         - port: 80
           protocol: TCP
 ---
-# The panel reaches nothing but DNS and the fleet's own API port. It is the only
-# component here that serves a human, so leaving it unbounded would make it the
-# soft spot in a namespace where everything else is fenced.
+# The panel reaches nothing but DNS, the fleet's own API port, and the Kubernetes
+# API server. It is the only component here that serves a human, so leaving it
+# unbounded would make it the soft spot in a namespace where everything else is
+# fenced.
 #
 # There is deliberately no matching ingress policy. Access is by port-forward,
 # which arrives from the node rather than from a pod, so an ingress allowlist
@@ -404,4 +405,22 @@ spec:
               app.kubernetes.io/name: cao-elastic-worker
       ports:
         - port: 9889
+          protocol: TCP
+    # Kubernetes API server: one `get` of the fleet ConfigMap, polled. Same shape
+    # as the broker's rule and for the same reason — `kubernetes.default` resolves
+    # to 172.20.0.1 and the control plane ENIs sit inside the VPC CIDR, so both
+    # ranges have to be allowed explicitly. Copying the agents' `0.0.0.0/0` +
+    # private-range-`except` rule here would block it.
+    #
+    # Failing this rule is quiet rather than obvious: the panel comes up, the
+    # readiness probe passes, and it serves the mounted ConfigMap forever. Check
+    # `source` in /api/fleet — `live: false` with an error is what a blocked
+    # egress rule looks like from outside the pod.
+    - to:
+        - ipBlock:
+            cidr: <vpc-cidr>
+        - ipBlock:
+            cidr: 172.20.0.0/16
+      ports:
+        - port: 443
           protocol: TCP

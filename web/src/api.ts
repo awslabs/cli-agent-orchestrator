@@ -645,6 +645,30 @@ export interface FleetNode {
 }
 
 /**
+ * Where the panel got its node list. Diagnostic only — the UI routes on
+ * `machines` regardless.
+ *
+ * Worth having because the two interesting states are indistinguishable from the
+ * outside: a panel reading its Kubernetes ConfigMap live, and one that has been
+ * denied that read and is serving a mounted copy instead. The second still looks
+ * healthy while being up to a kubelet sync period behind, which presents as
+ * elastic workers that never appear. `live: false` with an `error` is the tell.
+ *
+ * Optional because a panel from before this field existed omits it, and because a
+ * cao-server serving the app directly has no fleet at all.
+ */
+export interface FleetSource {
+  kind: 'file' | 'configmap'
+  path?: string
+  name?: string
+  namespace?: string | null
+  live?: boolean
+  age?: number | null
+  reads?: number
+  error?: string | null
+}
+
+/**
  * The fleet panel's own API. Served only when the panel is what serves the app;
  * a cao-server answers 404, which is how the app detects it is single-node and
  * leaves the active node null.
@@ -653,5 +677,9 @@ export const fleet = {
   // The panel probes every node in parallel under its own 8s per-node ceiling,
   // so the client waits longer than the 10s default: a slow node must not turn
   // the whole fleet listing into a timeout.
-  list: () => fetchJSON<{ machines: FleetNode[] }>('/api/fleet', { direct: true, timeoutMs: 20000 }),
+  list: () =>
+    fetchJSON<{ machines: FleetNode[]; source?: FleetSource }>('/api/fleet', {
+      direct: true,
+      timeoutMs: 20000,
+    }),
 }

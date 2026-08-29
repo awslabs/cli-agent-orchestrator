@@ -66,11 +66,51 @@ starts on a fresh checkout). Format:
 IP or DNS name); `port` defaults to `9889`. `fleet.json` is git-ignored so your node
 addresses stay local.
 
+### Reading the registry from a Kubernetes ConfigMap
+
+Set `CAO_FLEET_CONFIGMAP` and the panel reads that ConfigMap from the API server
+instead of a file, using its pod's own ServiceAccount. Same JSON, under the key
+`fleet.json`.
+
+This is not a convenience over mounting the ConfigMap — mounting it does not work
+well enough. On Kubernetes the registry is rewritten at runtime by the worker
+broker as elastic workers take and release leases, and a mounted ConfigMap only
+refreshes on the kubelet's sync period. A worker can be created, used and released
+inside that window, so the mounted file can list a fleet that has already gone
+while omitting the one that is running. The API server has no such lag.
+
+Reads happen on a background poll (`CAO_FLEET_CONFIGMAP_INTERVAL`, default 5s),
+not per request: `load_machines()` is called from inside request handlers, so
+reaching for the network there would put the API server's latency on every proxied
+route. One panel makes one request per interval however many browsers are watching.
+
+Three fallbacks, in the order you will meet them:
+
+- The first read is awaited at startup, before the panel serves anything, so the
+  readiness probe's own `/api/fleet` is already answering from the API server.
+- If that read fails the panel still starts and serves `CAO_FLEET_CONFIG`, so a
+  missing RoleBinding leaves you with a stale panel rather than a CrashLooping one.
+- If reads start failing later, the last good snapshot stays up. An API server blip
+  should not blank the fleet, which would read as the whole cluster going away.
+
+`/api/fleet` reports which source answered in its `source` field — check `live` and
+`error` there first, because a panel silently serving a mounted file looks exactly
+like one whose workers never register.
+
+RBAC: one `get`, on one ConfigMap, by name. `list`/`watch` are deliberately not
+granted — `resourceNames` cannot restrict them, so either would widen the grant to
+every ConfigMap in the namespace, and that is why the panel polls rather than
+watches. See `examples/cao-clusters/kubernetes/eks/rbac.yaml`.
+
 ## Configuration
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `CAO_FLEET_CONFIG` | `../fleet.json` → `../fleet.example.json` | Path to the node registry. |
+| `CAO_FLEET_CONFIG` | `../fleet.json` → `../fleet.example.json` | Path to the node registry. Also the fallback when a ConfigMap read fails. |
+| `CAO_FLEET_CONFIGMAP` | _(unset)_ | Read the registry from this Kubernetes ConfigMap instead of a file. |
+| `CAO_FLEET_CONFIGMAP_KEY` | `fleet.json` | Key within that ConfigMap. |
+| `CAO_FLEET_NAMESPACE` | the pod's own namespace | Namespace to read it from. |
+| `CAO_FLEET_CONFIGMAP_INTERVAL` | `5` | Seconds between re-reads. |
 | `CAO_PANEL_HOST` | `127.0.0.1` | Address to bind the panel to. |
 | `CAO_PANEL_PORT` | `9888` | Port to bind the panel to. |
 | `CAO_PANEL_TOKEN` | _(unset)_ | Shared secret required on every request. Unset = no auth. |

@@ -368,9 +368,32 @@ probes what it is given, so a worker still booting shows as unreachable for a fe
 seconds. The alternative -- gating the fleet view on `CAO_ELASTIC_GATE_ON_READY`
 -- would hide every worker on the default non-blocking path.
 
-The panel re-reads the file on every request, so no restart is needed. A mounted
-ConfigMap refreshes on the kubelet's sync period; in testing it appeared within
-15 seconds.
+The panel reads that ConfigMap from the **API server**, not from its mount, so a
+published worker is visible within its poll interval (5s by default) and no
+restart is needed. The mount would work but not well enough: a mounted ConfigMap
+only refreshes on the kubelet's sync period -- 15 seconds in testing, with no
+guaranteed ceiling -- and a leased worker can be placed, used and released inside
+that window. The view would then show a worker that had already gone while missing
+the one that was running.
+
+The mount is kept as a fallback. If the panel's RoleBinding is missing or wrong it
+logs the failure and serves the mounted copy, so you get a stale panel rather than
+a CrashLooping one. Which source answered is reported by `/api/fleet`:
+
+```bash
+curl -fsS -H "Authorization: Bearer ${TOKEN}" http://127.0.0.1:9888/api/fleet \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["source"])'
+```
+
+`{"kind": "configmap", ..., "live": true}` is the intended state. `"live": false`
+with an `error` means it has fallen back -- check the `cao-fleet-panel` Role and
+RoleBinding in `rbac.yaml`, and the API-server egress rule in
+`networkpolicy.yaml`. Both failures are quiet: the panel comes up, the probes
+pass, and workers simply seem not to register.
+
+The grant is one `get` on one ConfigMap by name. `list` and `watch` are not
+granted -- `resourceNames` cannot restrict them, so either would widen it to every
+ConfigMap in the namespace -- which is why the panel polls rather than watches.
 
 Re-running `deploy.sh` resets that ConfigMap to the supervisor alone. The broker
 republishes on the next lease, but a worker running at that moment drops off the
