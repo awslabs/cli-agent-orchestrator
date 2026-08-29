@@ -520,11 +520,23 @@ async def node_terminal_ws(ws: WebSocket, name: str, terminal_id: str):
         # default frame cap, and the library's answer to an oversized frame is to
         # drop the connection.
         upstream = await websockets.connect(upstream_url, max_size=None, open_timeout=8)
-    except Exception:
-        # The node refused or is gone. Accept-then-close so the browser sees a
-        # close code rather than a failed handshake it cannot read.
+    except Exception as exc:
+        # Accept-then-close, so the browser gets a close event it can read rather
+        # than a failed handshake it cannot.
+        #
+        # "Refused" and "unreachable" are told apart because they are different
+        # operator problems — a terminal that no longer exists versus a node that
+        # is down — and because cao-server cannot tell them apart FOR us: it
+        # closes 4003/4004/4401/4403 before accepting, which uvicorn turns into a
+        # bare HTTP 403 on the handshake, so its close code never reaches the
+        # wire. The status is all that survives, and it is worth relaying.
+        rejected = isinstance(exc, websockets.exceptions.InvalidStatus)
         await ws.accept()
-        await ws.close(code=1011)
+        await ws.close(
+            code=1008 if rejected else 1011,
+            reason=(f"node refused the attach (HTTP {exc.response.status_code})"
+                    if rejected else "node unreachable"),
+        )
         return
 
     await ws.accept()
