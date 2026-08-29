@@ -127,7 +127,9 @@ export function useEventFollow(
       if (closed) return
       controller = new AbortController()
       const q = lastSeq != null ? `?after_seq=${lastSeq}` : ''
-      const url = `/workflows/runs/${encodeURIComponent(runId)}/events${q}`
+      // A bare `fetch` rather than an `api.ts` call, so it needs the path
+      // prefix applied here too. BASE_URL always ends in "/".
+      const url = `${import.meta.env.BASE_URL}workflows/runs/${encodeURIComponent(runId)}/events${q}`
       try {
         const res = await fetch(url, {
           headers: { Accept: 'text/event-stream' },

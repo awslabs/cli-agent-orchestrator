@@ -1,4 +1,14 @@
-const BASE = ''  // Vite proxy handles routing to backend
+// Every API path in this file is root-absolute, which breaks when the app is
+// served under a path prefix (a reverse proxy publishing it at /proxy/panel/,
+// say): the request leaves the app and lands on whatever owns the origin root.
+// Vite bakes the build-time `--base` in here, so one prefix covers all ~40
+// call sites — they all funnel through `fetchJSON`. Empty in a dev server and
+// in a root-served build, where BASE_URL is "/" and this trims to "".
+//
+// The two network calls that do NOT go through `fetchJSON` — the terminal
+// WebSocket and the workflow event stream — read `BASE_URL` directly for the
+// same reason. See TerminalView.tsx and workflow/useEventFollow.ts.
+const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
 
 /**
  * Error thrown by fetchJSON on a non-OK response. Carries the HTTP status and
