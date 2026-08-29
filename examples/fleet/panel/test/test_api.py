@@ -1,3 +1,5 @@
+import os
+
 import httpx
 from fastapi.testclient import TestClient
 from app import client, config, main
@@ -299,6 +301,59 @@ def test_rejects_unsafe_session_name():
 def test_rejects_unsafe_terminal_id():
     tc = TestClient(main.app)
     assert tc.get("/api/machines/node-a/terminals/bad;id/screen").status_code == 400
+
+
+# --- front end -------------------------------------------------------------
+#
+# The panel serves CAO's own dashboard from `web_ui/` when the image has built
+# it, and its own `static/` UI otherwise. These tests are written against
+# whichever one is on disk, so they pass in a bare checkout (no build) and in
+# the image alike.
+
+def test_index_serves_the_resolved_front_end():
+    tc = TestClient(main.app)
+    r = tc.get("/")
+    assert r.status_code == 200
+    with open(os.path.join(main._UI_ROOT, "index.html"), "rb") as f:
+        assert r.content == f.read()
+
+
+def test_ui_root_prefers_web_ui_only_when_built():
+    # The selection is a file check, not a guess: a checkout with no build must
+    # fall back rather than serve 404 for every asset.
+    built = os.path.isfile(os.path.join(main._WEB_UI, "index.html"))
+    assert main._UI_ROOT == (main._WEB_UI if built else main._STATIC)
+
+
+def test_root_asset_served_by_name():
+    # index.html is present under either front end, so it is the one root-level
+    # file this test can name without assuming a build.
+    tc = TestClient(main.app)
+    assert tc.get("/index.html").status_code == 200
+
+
+def test_root_asset_rejects_traversal():
+    tc = TestClient(main.app)
+    # encoded separators, and a name the charset disallows outright
+    for path in ("/..%2f..%2fapp%2fmain.py", "/%2e%2e%2fpyproject.toml", "/.env"):
+        assert tc.get(path).status_code == 404, path
+
+
+def test_root_asset_cannot_read_outside_the_ui_root():
+    # pyproject.toml sits in the panel root, one level above _UI_ROOT. The name
+    # satisfies the charset, so only the containment check keeps it out.
+    tc = TestClient(main.app)
+    assert tc.get("/pyproject.toml").status_code == 404
+
+
+def test_root_asset_does_not_shadow_the_api(monkeypatch):
+    # The catch-all is the last route registered; an API path still routes to
+    # its handler (404 here is "unknown machine", from the API, not the file
+    # route — a 200 or a file body would mean the catch-all won).
+    _patch_fleet(monkeypatch, online_health={}, sessions_by_machine={})
+    tc = TestClient(main.app)
+    assert tc.get("/api/fleet").status_code == 200
+    assert tc.get("/api/machines/nope/providers").status_code == 404
 
 
 # --- opt-in shared-token auth ---------------------------------------------
