@@ -62,6 +62,20 @@ spec:
               value: "9889"
             - name: CAO_ALLOWED_HOSTS
               value: "cao-supervisor,cao-supervisor.cao-cluster.svc.cluster.local,localhost"
+            # The terminal socket's peer is the panel pod, whose IP is assigned at
+            # schedule time and cannot be written into a manifest. `*` disables
+            # only the IP check, and it is the redundant one here: ingress to 9889
+            # is already restricted by `cao-supervisor-ingress`, which names its
+            # callers by pod label rather than by address. Without this the
+            # dashboard's terminal is the one surface that does not work in the
+            # cluster, closing 4003 on every attach.
+            #
+            # The two checks that matter are untouched: cao-server still enforces
+            # its Origin rule (the panel forwards no Origin, which is the
+            # non-browser path), and the panel does the browser-side same-origin
+            # check itself before it dials.
+            - name: CAO_WS_ALLOWED_CLIENTS
+              value: "*"
             - name: CAO_ADVERTISED_URL
               value: "http://cao-supervisor.cao-cluster.svc.cluster.local:9889"
             - name: CAO_HOME_DIR

@@ -52,3 +52,8 @@ def load_machines():
 def base_url(machine):
     """http://<host>:<port> for a node dict."""
     return f"http://{machine['host']}:{machine['port']}"
+
+
+def ws_url(machine):
+    """ws://<host>:<port> for a node dict — the terminal socket's upstream."""
+    return f"ws://{machine['host']}:{machine['port']}"
