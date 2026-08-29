@@ -18,6 +18,7 @@
 //     would send as `Last-Event-ID` — we pass it explicitly.
 
 import { useEffect, useRef } from 'react'
+import { eventStreamUrl } from '../../api'
 import type { WorkflowEvent, GapMarker } from '../../api'
 
 export interface EventFollowHandlers {
@@ -126,10 +127,10 @@ export function useEventFollow(
     const connect = async () => {
       if (closed) return
       controller = new AbortController()
-      const q = lastSeq != null ? `?after_seq=${lastSeq}` : ''
-      // A bare `fetch` rather than an `api.ts` call, so it needs the path
-      // prefix applied here too. BASE_URL always ends in "/".
-      const url = `${import.meta.env.BASE_URL}workflows/runs/${encodeURIComponent(runId)}/events${q}`
+      // A bare `fetch` rather than an `api.ts` call (SSE needs the raw stream),
+      // so the URL comes from api.ts to pick up the path prefix and the active
+      // node's route.
+      const url = eventStreamUrl(runId, lastSeq)
       try {
         const res = await fetch(url, {
           headers: { Accept: 'text/event-stream' },

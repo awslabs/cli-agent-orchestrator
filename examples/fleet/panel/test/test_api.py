@@ -1,3 +1,4 @@
+import json
 import os
 
 import httpx
@@ -301,6 +302,179 @@ def test_rejects_unsafe_session_name():
 def test_rejects_unsafe_terminal_id():
     tc = TestClient(main.app)
     assert tc.get("/api/machines/node-a/terminals/bad;id/screen").status_code == 400
+
+
+# --- node pass-through -----------------------------------------------------
+#
+# Upstream is an httpx.MockTransport rather than a fake client, so the assertions
+# are made against real httpx.Request objects — the URL, headers and body the
+# node would actually receive.
+
+def _stream(*chunks):
+    """An async byte stream, which is what an unread streaming response holds.
+
+    A response built with eager `content=`/`json=` is already marked consumed, so
+    `aiter_raw()` on it raises StreamConsumed — an artefact of the mock, not of
+    the proxy: a real transport hands back an unread body.
+    """
+    async def gen():
+        for chunk in chunks:
+            yield chunk
+    return gen()
+
+
+def _upstream_json(status, payload, headers=None):
+    return httpx.Response(
+        status,
+        content=_stream(json.dumps(payload).encode()),
+        headers={"content-type": "application/json", **(headers or {})},
+    )
+
+
+def _mock_upstream(monkeypatch, handler):
+    """Route every client the app builds to `handler`. Returns the seen requests."""
+    seen = []
+    real = httpx.AsyncClient
+
+    def transport_handler(request):
+        seen.append(request)
+        return handler(request)
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(transport_handler)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", factory)
+    return seen
+
+
+def test_proxy_forwards_to_the_named_node(monkeypatch):
+    seen = _mock_upstream(monkeypatch, lambda r: _upstream_json(200, {"ok": True}))
+    tc = TestClient(main.app)
+    r = tc.get("/nodes/node-b/sessions?limit=5")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    # node-b's registry entry, not node-a's, and the query string survives
+    assert str(seen[0].url) == "http://100.64.0.12:9889/sessions?limit=5"
+
+
+def test_proxy_unknown_node_404(monkeypatch):
+    seen = _mock_upstream(monkeypatch, lambda r: _upstream_json(200, {}))
+    tc = TestClient(main.app)
+    assert tc.get("/nodes/nope/sessions").status_code == 404
+    assert seen == []  # rejected before any request left the panel
+
+
+def test_proxy_rejects_unlisted_namespace(monkeypatch):
+    seen = _mock_upstream(monkeypatch, lambda r: _upstream_json(200, {}))
+    tc = TestClient(main.app)
+    # the agent-facing memory RPC and the AG-UI transport are not browser calls
+    for path in ("internal/memory/store", "agui/v1/run", ".well-known/x", "events"):
+        assert tc.get(f"/nodes/node-a/{path}").status_code == 404, path
+    assert seen == []
+
+
+def test_proxy_rejects_dot_segments(monkeypatch):
+    seen = _mock_upstream(monkeypatch, lambda r: _upstream_json(200, {}))
+    tc = TestClient(main.app)
+    # passes the namespace check, then would climb out of it upstream
+    # percent-encoded, so no client on the way in normalises it away
+    r = tc.get("/nodes/node-a/sessions/%2e%2e/internal/memory/store")
+    assert r.status_code == 400
+    assert seen == []
+
+
+def test_proxy_never_forwards_the_panel_credential(monkeypatch):
+    seen = _mock_upstream(monkeypatch, lambda r: _upstream_json(200, {}))
+    tc = TestClient(main.app)
+    tc.get(
+        "/nodes/node-a/sessions",
+        headers={
+            "Authorization": "Bearer panel-token",
+            "Cookie": "session=abc",
+            "Accept": "application/json",
+        },
+    )
+    # report only WHETHER the header travelled, never its value
+    assert "authorization" not in seen[0].headers
+    assert "cookie" not in seen[0].headers
+    assert seen[0].headers["accept"] == "application/json"
+    # Host is the node's, set by httpx from the upstream URL — not the browser's
+    assert seen[0].headers["host"] == "100.64.0.11:9889"
+
+
+def test_proxy_forwards_method_body_and_content_type(monkeypatch):
+    seen = _mock_upstream(monkeypatch, lambda r: _upstream_json(201, {"id": "t1"}))
+    tc = TestClient(main.app)
+    r = tc.post("/nodes/node-a/terminals/t1/input", json={"text": "hi"})
+    assert r.status_code == 201
+    assert seen[0].method == "POST"
+    assert seen[0].headers["content-type"] == "application/json"
+    assert json.loads(seen[0].read()) == {"text": "hi"}
+
+
+def test_proxy_passes_upstream_status_and_detail_through(monkeypatch):
+    _mock_upstream(monkeypatch, lambda r: _upstream_json(404, {"detail": "no such terminal"}))
+    tc = TestClient(main.app)
+    r = tc.get("/nodes/node-a/terminals/gone/output")
+    # the node's own answer, not a 502 wrapper — the dashboard branches on this
+    assert r.status_code == 404
+    assert r.json()["detail"] == "no such terminal"
+
+
+def test_proxy_drops_hop_by_hop_response_headers(monkeypatch):
+    def handler(request):
+        return _upstream_json(
+            200, {}, headers={"Connection": "keep-alive", "X-Cao-Node": "kept"}
+        )
+    _mock_upstream(monkeypatch, handler)
+    tc = TestClient(main.app)
+    r = tc.get("/nodes/node-a/sessions")
+    # hop-by-hop describes the panel<->node connection, not this one
+    assert "connection" not in {k.lower() for k in r.headers}
+    assert r.headers["x-cao-node"] == "kept"
+    assert r.headers["content-type"].startswith("application/json")
+
+
+def test_proxy_streams_an_event_stream(monkeypatch):
+    frames = [b"event: step.started\ndata: {\"seq\": 1}\n\n", b"data: {\"seq\": 2}\n\n"]
+
+    def handler(request):
+        assert request.headers["accept"] == "text/event-stream"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_stream(*frames),
+        )
+
+    _mock_upstream(monkeypatch, handler)
+    tc = TestClient(main.app)
+    with tc.stream(
+        "GET",
+        "/nodes/node-a/workflows/runs/r1/events",
+        headers={"Accept": "text/event-stream"},
+    ) as r:
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "text/event-stream"
+        assert b"".join(r.iter_bytes()) == b"".join(frames)
+
+
+def test_proxy_timeout_matches_the_call():
+    # a stream may go quiet for minutes; only a read timeout would kill it
+    assert main._proxy_timeout("GET", "workflows/runs/r1/events", "text/event-stream").read is None
+    # session launch blocks on the agent CLI reaching a ready prompt
+    assert main._proxy_timeout("POST", "sessions", "") is client.LAUNCH_TIMEOUT
+    assert main._proxy_timeout("GET", "sessions", "") is client.TIMEOUT
+
+
+def test_proxy_offline_node_502(monkeypatch):
+    def handler(request):
+        raise httpx.ConnectError("down", request=request)
+    _mock_upstream(monkeypatch, handler)
+    tc = TestClient(main.app)
+    r = tc.get("/nodes/node-c/sessions")
+    assert r.status_code == 502
+    assert "node-c" in r.json()["detail"]
 
 
 # --- front end -------------------------------------------------------------

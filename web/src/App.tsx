@@ -8,6 +8,7 @@ import { FlowsPanel } from './components/FlowsPanel'
 import { MemoryPanel } from './components/MemoryPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowsPanel } from './components/WorkflowsPanel'
+import { NodeSwitcher } from './components/NodeSwitcher'
 import { Bot, Home, Clock, Settings, Brain, Workflow, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
 
 type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows'
@@ -57,18 +58,37 @@ export default function App() {
   const [tab, setTab] = useState<TabKey>('home')
   // Default false (fail-closed): a dead backend hides the tab rather than showing a broken panel
   const [memoryEnabled, setMemoryEnabled] = useState(false)
-  const { sessions, connected, fetchSessions } = useStore()
+  const { sessions, connected, fetchSessions, fleetNodes, discoverFleet, refreshFleet } = useStore()
 
   const visibleTabs = TABS.filter(t => t.key !== 'memory' || memoryEnabled)
 
   useEffect(() => {
-    fetchSessions()
-    api.getMemoryStatus()
-      .then(s => setMemoryEnabled(s.enabled))
-      .catch(() => {})
-    const interval = setInterval(fetchSessions, 10000)
-    return () => clearInterval(interval)
+    let cancelled = false
+    let interval: ReturnType<typeof setInterval> | undefined
+    // Fleet discovery FIRST. Requests only carry a node once it resolves, so
+    // polling before that would send the opening wave to whatever serves the
+    // origin — the panel, which answers none of these paths.
+    discoverFleet().then(() => {
+      if (cancelled) return
+      fetchSessions()
+      api.getMemoryStatus()
+        .then(s => setMemoryEnabled(s.enabled))
+        .catch(() => {})
+      interval = setInterval(fetchSessions, 10000)
+    })
+    return () => {
+      cancelled = true
+      if (interval) clearInterval(interval)
+    }
   }, [])
+
+  // Re-list the fleet while it exists: elastic workers join and leave on their
+  // own, so the switcher would otherwise show a fleet that has moved on.
+  useEffect(() => {
+    if (fleetNodes.length === 0) return
+    const interval = setInterval(refreshFleet, 10000)
+    return () => clearInterval(interval)
+  }, [fleetNodes.length === 0])
 
   // Keyboard shortcuts: Alt+1-N over the visible tabs
   useEffect(() => {
@@ -94,6 +114,7 @@ export default function App() {
             <h1 className="text-lg font-bold text-white">CLI Agent Orchestrator</h1>
           </div>
           <div className="flex items-center gap-4">
+            <NodeSwitcher />
             <span className="text-xs text-gray-500">{sessions.length} session{sessions.length !== 1 ? 's' : ''}</span>
             <div className="flex items-center gap-1.5" title={connected ? 'Connected' : 'Disconnected'}>
               {connected ? (

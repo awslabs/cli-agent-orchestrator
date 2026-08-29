@@ -6,9 +6,57 @@
 // in a root-served build, where BASE_URL is "/" and this trims to "".
 //
 // The two network calls that do NOT go through `fetchJSON` — the terminal
-// WebSocket and the workflow event stream — read `BASE_URL` directly for the
-// same reason. See TerminalView.tsx and workflow/useEventFollow.ts.
+// WebSocket and the workflow event stream — build their URLs from
+// `terminalSocketUrl` / `eventStreamUrl` below, so the prefix and the node route
+// are applied in exactly one place for all three transports.
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
+
+// --- fleet routing ---------------------------------------------------------
+//
+// The same app drives one cao-server or a whole fleet, and which one is decided
+// at runtime rather than at build time.
+//
+// Served BY a cao-server (or the dev server), the active node stays null and
+// every path is sent as written — the behaviour this file has always had.
+// Served by the fleet panel, the browser picks a node and each request is
+// rewritten to `/nodes/{name}<path>`, the panel's pass-through, which forwards
+// it to that node's cao-server. The dashboard's ~40 endpoints then work against
+// any node in the fleet without a per-endpoint fleet API behind them.
+//
+// A module-level value rather than React state on purpose: it has to be readable
+// from `fetchJSON`, from the terminal socket and from the SSE follow loop, none
+// of which are components. The store owns changing it (see `store.ts`), so the
+// UI still re-renders through the usual path.
+let ACTIVE_NODE: string | null = null
+
+/** Route subsequent requests to `name`, or to the origin server when null. */
+export function setActiveNode(name: string | null): void {
+  ACTIVE_NODE = name
+}
+
+export function getActiveNode(): string | null {
+  return ACTIVE_NODE
+}
+
+/** Apply the active node's pass-through route to a cao-server path. */
+export function nodePath(path: string): string {
+  return ACTIVE_NODE === null ? path : `/nodes/${encodeURIComponent(ACTIVE_NODE)}${path}`
+}
+
+/**
+ * Absolute ws:// URL for a terminal's socket. A WebSocket takes no relative
+ * URL, so this is the one place that needs `location`.
+ */
+export function terminalSocketUrl(terminalId: string): string {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${location.host}${BASE}${nodePath(`/terminals/${terminalId}/ws`)}`
+}
+
+/** URL for a run's SSE event stream, resuming strictly after `afterSeq`. */
+export function eventStreamUrl(runId: string, afterSeq?: number): string {
+  const query = afterSeq != null ? `?after_seq=${afterSeq}` : ''
+  return `${BASE}${nodePath(`/workflows/runs/${encodeURIComponent(runId)}/events`)}${query}`
+}
 
 /**
  * Error thrown by fetchJSON on a non-OK response. Carries the HTTP status and
@@ -24,11 +72,16 @@ export interface ApiError extends Error {
   detailMeta?: Record<string, unknown>
 }
 
-async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number }): Promise<T> {
+// `direct: true` addresses the server that owns the origin instead of a node —
+// the panel's own aggregate API (`/api/fleet`), which no node serves.
+type FetchOpts = RequestInit & { timeoutMs?: number; direct?: boolean }
+
+async function fetchJSON<T>(url: string, opts?: FetchOpts): Promise<T> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 10000)
   try {
-    const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
+    const path = opts?.direct ? url : nodePath(url)
+    const res = await fetch(`${BASE}${path}`, { ...opts, signal: controller.signal })
     if (!res.ok) {
       // Best-effort read of the JSON error body to expose the server's
       // `detail` without leaking a full response. A non-JSON body is fine —
@@ -571,4 +624,34 @@ export const api = {
     fetchJSON<TerminalOutputRange>(
       `/terminals/${encodeURIComponent(terminalId)}/output/range?offset=${offset}&length=${length}`,
     ),
+}
+
+/**
+ * One node as the fleet panel reports it. `online: false` is a normal steady
+ * state, not an error: the panel probes every registered node in parallel and
+ * isolates the ones that do not answer, so a fleet with a node down still
+ * renders. `error` is the exception TYPE only — never a message that could
+ * carry a host's response.
+ */
+export interface FleetNode {
+  name: string
+  label: string
+  host: string
+  role?: string | null
+  online: boolean
+  claude?: string | null
+  sessions: Session[]
+  error?: string
+}
+
+/**
+ * The fleet panel's own API. Served only when the panel is what serves the app;
+ * a cao-server answers 404, which is how the app detects it is single-node and
+ * leaves the active node null.
+ */
+export const fleet = {
+  // The panel probes every node in parallel under its own 8s per-node ceiling,
+  // so the client waits longer than the 10s default: a slow node must not turn
+  // the whole fleet listing into a timeout.
+  list: () => fetchJSON<{ machines: FleetNode[] }>('/api/fleet', { direct: true, timeoutMs: 20000 }),
 }
