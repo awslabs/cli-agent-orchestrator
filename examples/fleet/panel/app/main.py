@@ -127,8 +127,30 @@ _DROP_RESPONSE_HEADERS = frozenset({
 })
 
 # A stream has no idea when it will next produce a byte, so it gets no read
-# timeout. Everything else keeps the fleet-wide 8s ceiling.
+# timeout.
 _STREAM_TIMEOUT = httpx.Timeout(30.0, connect=4.0, read=None)
+
+# The pass-through proxy's timeout, and the reason it is not the 8s ceiling the
+# endpoints above use. Those fan out across the whole fleet, so one slow node must
+# not stall the page. A proxied request is the browser asking ONE node for one
+# thing, and nothing else on the page waits behind it.
+#
+# What detects a node that has gone away is `connect`, not `read`: a released
+# worker's Service stops resolving, and that fails in seconds either way. `read`
+# is how long a node is allowed to THINK, and the client already declares that
+# per call — web/src/api.ts sets its own AbortController on every request, from
+# 10s by default up to 120s for a memory graph. So the client is the authority on
+# how long the user waits, and an abort propagates: FastAPI raises on the closed
+# request and the `client.stream` block below exits, which releases the upstream
+# connection. The panel's only job is to not be the tighter of the two.
+#
+# It was, at 8s for everything except POST /sessions, which turned six
+# legitimately slow routes — add-terminal, create/run flow, graph, graph export,
+# run diagnostics — into `502 ReadTimeout`. That reads as a broken node rather
+# than a slow operation, and two of them only look healthy on an empty node.
+# The value here is a backstop against holding a socket forever, not a policy:
+# it sits just above the largest deadline any client asks for.
+_PROXY_TIMEOUT = httpx.Timeout(125.0, connect=4.0)
 
 
 def _safe_segment(value, kind):
@@ -409,13 +431,13 @@ async def terminal_wd(name: str, terminal_id: str):
             raise HTTPException(status_code=502, detail=f"{name}: {exc}")
 
 
-def _proxy_timeout(method, path, accept):
+def _proxy_timeout(accept):
+    # Only one distinction is worth making here: a stream is open indefinitely by
+    # design, everything else is a request with an answer. See _PROXY_TIMEOUT for
+    # why the proxy does not try to guess a per-route budget.
     if "text/event-stream" in accept:
         return _STREAM_TIMEOUT
-    # POST /sessions blocks until the agent CLI reaches a ready prompt.
-    if method == "POST" and path == "sessions":
-        return client.LAUNCH_TIMEOUT
-    return client.TIMEOUT
+    return _PROXY_TIMEOUT
 
 
 @app.api_route(
@@ -445,7 +467,7 @@ async def node_proxy(name: str, path: str, request: Request):
     }
     body = await request.body()
 
-    c = httpx.AsyncClient(timeout=_proxy_timeout(request.method, path, accept))
+    c = httpx.AsyncClient(timeout=_proxy_timeout(accept))
     try:
         upstream = await c.send(
             c.build_request(
