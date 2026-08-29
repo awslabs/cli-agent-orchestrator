@@ -58,7 +58,8 @@ export default function App() {
   const [tab, setTab] = useState<TabKey>('home')
   // Default false (fail-closed): a dead backend hides the tab rather than showing a broken panel
   const [memoryEnabled, setMemoryEnabled] = useState(false)
-  const { sessions, connected, fetchSessions, fleetNodes, discoverFleet, refreshFleet } = useStore()
+  const { sessions, connected, fetchSessions, fleetNodes, fleetReady, discoverFleet, refreshFleet } =
+    useStore()
 
   const visibleTabs = TABS.filter(t => t.key !== 'memory' || memoryEnabled)
 
@@ -164,12 +165,34 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-6 py-6">
         <ErrorBoundary>
           <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
-            {tab === 'home' && <DashboardHome onNavigate={(t) => setTab(t as TabKey)} />}
-            {tab === 'agents' && <AgentPanel />}
-            {tab === 'flows' && <FlowsPanel />}
-            {tab === 'settings' && <SettingsPanel />}
-            {tab === 'memory' && <MemoryPanel />}
-            {tab === 'workflows' && <WorkflowsPanel />}
+            {/*
+              Nothing that fetches may mount before discovery resolves. Sequencing
+              this component's OWN fetches behind `discoverFleet()` above is not
+              enough: a child's `useEffect(…, [])` runs on the same commit, long
+              before that promise settles, so it sends its request with no node on
+              it. Against the panel that 404s, and a `.catch(() => {})` — the right
+              handler for an optional stat — turns it into a number that is wrong
+              forever, because empty deps never re-run once the node arrives.
+              (`DashboardHome`'s profile count did exactly this: a permanent 0.)
+
+              Gating here rather than adding `activeNode` to every effect's deps:
+              one place, and it holds for components not written yet. The header
+              and tabs still render, so this is a brief empty content area, not a
+              blank page - and `fleetReady` is set on the single-server path too,
+              where discovery fails fast and nothing waits on a network round trip.
+            */}
+            {!fleetReady ? (
+              <div className="text-gray-500 text-sm py-12 text-center">Loading...</div>
+            ) : (
+              <>
+                {tab === 'home' && <DashboardHome onNavigate={(t) => setTab(t as TabKey)} />}
+                {tab === 'agents' && <AgentPanel />}
+                {tab === 'flows' && <FlowsPanel />}
+                {tab === 'settings' && <SettingsPanel />}
+                {tab === 'memory' && <MemoryPanel />}
+                {tab === 'workflows' && <WorkflowsPanel />}
+              </>
+            )}
           </Suspense>
         </ErrorBoundary>
       </main>
