@@ -526,7 +526,28 @@ def _worker_service(worker_id: str, workload: client.V1Deployment) -> client.V1S
             ],
         ),
         spec=client.V1ServiceSpec(
-            selector={"cao.aws/worker-id": worker_id},
+            # `cao.aws/worker-id` alone would select exactly the same single pod,
+            # so the app.kubernetes.io/name label looks redundant. It is not, and
+            # leaving it out costs the fleet panel every worker.
+            #
+            # The VPC CNI resolves a NetworkPolicy podSelector into concrete
+            # addresses in a PolicyEndpoint, and it includes a Service's ClusterIP
+            # only when that Service's selector carries the labels the policy
+            # selects on. networkpolicy.yaml selects workers by
+            # `app.kubernetes.io/name: cao-elastic-worker`, so a Service selecting
+            # only on worker-id never contributes its ClusterIP: the panel's
+            # PolicyEndpoint lists the worker's POD ip and not its SERVICE ip, and
+            # the panel — which reaches every node by Service DNS — gets a
+            # ConnectTimeout on a worker that is Running, Ready and directly
+            # reachable at its pod IP.
+            #
+            # That failure is invisible from the supervisor, whose own egress rule
+            # is `podSelector: {}`, and invisible in any test that only drives the
+            # supervisor node.
+            selector={
+                "app.kubernetes.io/name": "cao-elastic-worker",
+                "cao.aws/worker-id": worker_id,
+            },
             ports=[client.V1ServicePort(name="http", port=9889, target_port=9889)],
         ),
     )
