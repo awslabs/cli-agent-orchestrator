@@ -1,8 +1,11 @@
+import asyncio
 import json
 import os
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 from app import client, config, main
 
 
@@ -304,6 +307,19 @@ def test_rejects_unsafe_terminal_id():
     assert tc.get("/api/machines/node-a/terminals/bad;id/screen").status_code == 400
 
 
+def test_rejects_a_dot_segment_the_charset_would_allow():
+    # `.` and `..` are made of legal characters, so only the explicit exclusion
+    # stops them. Percent-encoded, which is the form that reaches the handler —
+    # `%2e%2e` interpolated into an upstream path resolves to a different
+    # endpoint on the node.
+    tc = TestClient(main.app)
+    for encoded in ("%2e%2e", "%2e"):
+        assert tc.get(f"/api/machines/node-a/terminals/{encoded}/screen").status_code == 400
+        assert tc.get(f"/api/machines/node-a/sessions/{encoded}").status_code == 400
+    # and a name that merely CONTAINS dots is still fine
+    assert tc.get("/api/machines/nope/sessions/my.session-1").status_code == 404
+
+
 # --- node pass-through -----------------------------------------------------
 #
 # Upstream is an httpx.MockTransport rather than a fake client, so the assertions
@@ -475,6 +491,261 @@ def test_proxy_offline_node_502(monkeypatch):
     r = tc.get("/nodes/node-c/sessions")
     assert r.status_code == 502
     assert "node-c" in r.json()["detail"]
+
+
+# --- terminal socket pass-through ------------------------------------------
+#
+# The one route where a node's response cannot be proxied over HTTP: the
+# dashboard's xterm.js attaches to a live PTY. Full PTY access means keystroke
+# injection means RCE, so most of what follows is about who is allowed to open
+# it — and the socket is guarded HERE rather than by the app's HTTP middleware,
+# which ASGI does not run for a WebSocket scope at all.
+
+_EOF = object()
+
+
+class _FakeNodeSocket:
+    """A node's terminal socket, as the panel's upstream client sees it.
+
+    Frames the node sends are queued at construction (`_EOF` ends the stream, as
+    a real PTY exiting would); frames the panel forwards to the node land in
+    `sent`. `echo` bounces the first forwarded frame back and then ends the
+    stream, which is how a test synchronises on a round trip instead of sleeping
+    on one — and it ends the stream because TestClient cancels the app task the
+    instant the `with` block exits, so a bridge still running there is torn down
+    mid-await rather than through its own teardown path.
+    """
+
+    def __init__(self, frames, echo=False):
+        self.sent = []
+        self.closed = False
+        self.echo = echo
+        # Built inside the app's event loop (see `fake_connect`), never in the
+        # test thread, so the queue belongs to the loop that awaits it.
+        self._queue = asyncio.Queue()
+        for frame in frames:
+            self._queue.put_nowait(frame)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        frame = await self._queue.get()
+        if frame is _EOF:
+            raise StopAsyncIteration
+        return frame
+
+    async def send(self, frame):
+        self.sent.append(frame)
+        if self.echo:
+            self._queue.put_nowait(f"echo:{frame}")
+            self._queue.put_nowait(_EOF)
+
+    async def close(self):
+        self.closed = True
+        self._queue.put_nowait(_EOF)
+
+
+def _patch_node_socket(monkeypatch, frames=(), echo=False, fail=False):
+    """Stand in for the upstream WebSocket client.
+
+    Returns the list of sockets the panel opened — empty is the assertion that
+    matters for every rejection test: a refused handshake must not reach a node.
+    """
+    opened = []
+
+    async def fake_connect(url, **kwargs):
+        if fail:
+            raise OSError("connection refused")
+        sock = _FakeNodeSocket(list(frames), echo=echo)
+        sock.url = url
+        sock.kwargs = kwargs
+        opened.append(sock)
+        return sock
+
+    monkeypatch.setattr(main.websockets, "connect", fake_connect)
+    return opened
+
+
+def test_terminal_ws_bridges_frames_both_ways(monkeypatch):
+    opened = _patch_node_socket(monkeypatch, frames=[b"\x1b[2Jhello"], echo=True)
+    tc = TestClient(main.app)
+    with tc.websocket_connect("/nodes/node-b/terminals/abcd1234/ws") as ws:
+        # node -> browser: cao-server sends terminal bytes as binary
+        assert ws.receive_bytes() == b"\x1b[2Jhello"
+        # browser -> node: cao-server takes JSON control messages as text
+        ws.send_text('{"type": "input", "data": "ls\\r"}')
+        assert ws.receive_text() == 'echo:{"type": "input", "data": "ls\\r"}'
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_text()
+    assert opened[0].sent == ['{"type": "input", "data": "ls\\r"}']
+    # dialled the node the URL named, not the panel's own port
+    assert opened[0].url == "ws://100.64.0.12:9889/terminals/abcd1234/ws"
+
+
+def test_terminal_ws_sends_no_origin_upstream(monkeypatch):
+    opened = _patch_node_socket(monkeypatch, frames=[_EOF])
+    tc = TestClient(main.app)
+    with tc.websocket_connect(
+        "/nodes/node-a/terminals/abcd1234/ws",
+        headers={"Origin": "http://testserver"},
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+    # Forwarding the browser's Origin would make the node compare it against ITS
+    # own Host and reject every proxied terminal. A header-less handshake is what
+    # cao-server treats as a non-browser client.
+    assert "origin" not in {k.lower() for k in opened[0].kwargs}
+    assert "additional_headers" not in opened[0].kwargs
+    # a repaint after a resize can exceed the library's 1 MiB default frame cap
+    assert opened[0].kwargs["max_size"] is None
+
+
+def test_terminal_ws_forwards_the_query_string(monkeypatch):
+    # cao-server reads `?token=` when ITS auth layer is on — the node's
+    # credential, which the panel has no business dropping.
+    opened = _patch_node_socket(monkeypatch, frames=[_EOF])
+    tc = TestClient(main.app)
+    with tc.websocket_connect("/nodes/node-a/terminals/abcd1234/ws?token=xyz") as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+    assert opened[0].url == "ws://100.64.0.11:9889/terminals/abcd1234/ws?token=xyz"
+
+
+def test_terminal_ws_rejects_an_unknown_node(monkeypatch):
+    opened = _patch_node_socket(monkeypatch)
+    tc = TestClient(main.app)
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with tc.websocket_connect("/nodes/nope/terminals/abcd1234/ws"):
+            pass
+    assert exc.value.code == 1008
+    assert opened == []
+
+
+def test_terminal_ws_rejects_an_unsafe_terminal_id(monkeypatch):
+    # Percent-encoded, because that is the form that survives the trip: nothing
+    # between the browser and the route decodes it back into path segments.
+    opened = _patch_node_socket(monkeypatch)
+    tc = TestClient(main.app)
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with tc.websocket_connect("/nodes/node-a/terminals/%2e%2e/ws"):
+            pass
+    assert exc.value.code == 1008
+    assert opened == []
+
+
+def test_terminal_ws_reports_an_unreachable_node(monkeypatch):
+    _patch_node_socket(monkeypatch, fail=True)
+    tc = TestClient(main.app)
+    # Accepted, then closed with 1011: a browser can read a close code but not
+    # the body of a failed handshake.
+    with tc.websocket_connect("/nodes/node-c/terminals/abcd1234/ws") as ws:
+        with pytest.raises(WebSocketDisconnect) as exc:
+            ws.receive_bytes()
+    assert exc.value.code == 1011
+
+
+def test_terminal_ws_closes_the_browser_when_the_pty_ends(monkeypatch):
+    opened = _patch_node_socket(monkeypatch, frames=[b"bye", _EOF])
+    tc = TestClient(main.app)
+    with tc.websocket_connect("/nodes/node-a/terminals/abcd1234/ws") as ws:
+        assert ws.receive_bytes() == b"bye"
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+        # and the bridge released the node rather than leaking the attach
+        assert opened[0].closed is True
+
+
+def test_terminal_ws_rejects_a_cross_site_origin(monkeypatch):
+    # CWE-1385. A page on any site the operator visits can open a WebSocket —
+    # the Same-Origin Policy does not stop it and CORS middleware never sees the
+    # scope — so without this check it gets keystroke injection on a node.
+    opened = _patch_node_socket(monkeypatch)
+    tc = TestClient(main.app)
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with tc.websocket_connect(
+            "/nodes/node-a/terminals/abcd1234/ws",
+            headers={"Origin": "https://evil.example"},
+        ):
+            pass
+    assert exc.value.code == 1008
+    assert opened == []
+
+
+def test_terminal_ws_accepts_the_proxied_origin(monkeypatch):
+    # Behind a reverse proxy the Host is the upstream it dialled, so the
+    # browser's Origin only ever matches X-Forwarded-Host. JavaScript cannot set
+    # any header on a handshake, so the attacker page above cannot send it.
+    opened = _patch_node_socket(monkeypatch, frames=[_EOF])
+    tc = TestClient(main.app)
+    with tc.websocket_connect(
+        "/nodes/node-a/terminals/abcd1234/ws",
+        headers={"Origin": "https://cao.example", "X-Forwarded-Host": "cao.example"},
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+    assert len(opened) == 1
+
+
+def test_terminal_ws_requires_the_token(monkeypatch):
+    monkeypatch.setattr(config, "PANEL_TOKEN", "s3cret")
+    opened = _patch_node_socket(monkeypatch)
+    tc = TestClient(main.app)
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with tc.websocket_connect("/nodes/node-a/terminals/abcd1234/ws"):
+            pass
+    assert exc.value.code == 1008
+    assert opened == []
+    # a stale or guessed cookie is no better than none
+    tc.cookies.set(main._WS_COOKIE, "nope")
+    with pytest.raises(WebSocketDisconnect):
+        with tc.websocket_connect("/nodes/node-a/terminals/abcd1234/ws"):
+            pass
+    assert opened == []
+
+
+def test_terminal_ws_accepts_either_credential(monkeypatch):
+    monkeypatch.setattr(config, "PANEL_TOKEN", "s3cret")
+    opened = _patch_node_socket(monkeypatch, frames=[_EOF, _EOF])
+    tc = TestClient(main.app)
+    # native clients and reverse proxies set the header
+    with tc.websocket_connect(
+        "/nodes/node-a/terminals/abcd1234/ws",
+        headers={"Authorization": "Bearer s3cret"},
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+    # browsers cannot, so they present the cookie the panel handed them
+    tc.cookies.set(main._WS_COOKIE, "s3cret")
+    with tc.websocket_connect("/nodes/node-a/terminals/abcd1234/ws") as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+    assert len(opened) == 2
+
+
+def test_panel_hands_an_authenticated_browser_the_ws_cookie(monkeypatch):
+    monkeypatch.setattr(config, "PANEL_TOKEN", "s3cret")
+    tc = TestClient(main.app)
+    r = tc.get("/", auth=("panel", "s3cret"))
+    assert r.status_code == 200
+    cookie = r.headers["set-cookie"]
+    assert main._WS_COOKIE in cookie
+    # not readable by script, and not sent from another site at all
+    assert "HttpOnly" in cookie
+    assert "samesite=strict" in cookie.lower()
+
+
+def test_panel_never_hands_out_the_cookie_unauthenticated(monkeypatch):
+    monkeypatch.setattr(config, "PANEL_TOKEN", "s3cret")
+    tc = TestClient(main.app)
+    assert "set-cookie" not in tc.get("/").headers
+
+
+def test_no_cookie_when_the_panel_is_open():
+    # Nothing to hand out, and the socket is open too — same posture as the
+    # rest of the panel on loopback.
+    tc = TestClient(main.app)
+    assert "set-cookie" not in tc.get("/").headers
 
 
 # --- front end -------------------------------------------------------------

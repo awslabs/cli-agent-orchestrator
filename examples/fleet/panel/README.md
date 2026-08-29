@@ -1,13 +1,24 @@
 # CAO Fleet Panel
 
-A web control panel + live console for a CAO fleet. It is the `panel/` surface of the
-[`examples/fleet`](../README.md) coordinator: a **stateless** FastAPI app that fans out
-to every node's `cao-server` REST API and serves a browser SPA — a wall of live agent
-screens, with a click-to-focus console that sends messages and control keys.
+A web control panel for a CAO fleet. It is the `panel/` surface of the
+[`examples/fleet`](../README.md) coordinator: a **stateless** FastAPI app in front of
+every node's `cao-server` REST API.
 
-It adds no state and no core changes: each node stays a plain `cao-server`, and the
-panel is just a client. Background and the execution-flow diagrams are in the
+It serves **CAO's own dashboard** — the same `web/` bundle a single `cao-server`
+serves — plus one route the dashboard would not otherwise have: `/nodes/{name}/…`,
+which forwards a cao-server call to the named node. A node picker in the header sets
+which node every request carries, so the whole dashboard drives a fleet: agents,
+flows, workflows, memory, settings, and live terminals, on any node, with the UI
+people already know rather than a second thinner one.
+
+`/api/fleet` (the node listing) is the panel's own; everything else is a node's.
+The panel adds no state and no core changes: each node stays a plain `cao-server`,
+and the panel is just a client. Background and the execution-flow diagrams are in the
 [fleet coordinator guide](../../../docs/fleet-coordinator.md).
+
+Two front ends can be on disk, resolved once at import: `web_ui/` (CAO's dashboard,
+built by `Dockerfile.panel` or by hand) when it holds an `index.html`, and the
+panel's original `static/` UI otherwise — so a bare checkout still runs.
 
 ## Requirements
 
@@ -83,6 +94,28 @@ guide](../../../docs/fleet-coordinator.md#transport-and-security)).
   substitute for network isolation. Do not expose the panel — or a node's port — to
   the public internet. For real per-request auth in front of a node, use CAO's OAuth
   layer (`AUTH0_DOMAIN` / `CAO_AUTH_JWKS_URI`).
+
+### The terminal socket
+
+`/nodes/{name}/terminals/{id}/ws` bridges the dashboard's terminal to a live PTY on a
+node. Keystroke injection is remote code execution, so it is guarded on its own rather
+than by the token middleware — ASGI does not run HTTP middleware for a WebSocket scope
+at all, which would otherwise leave it the one unguarded route on the origin.
+
+- **Two credentials, one purpose.** `Authorization` for native clients and reverse
+  proxies; for browsers, which cannot set a header on a handshake, an `HttpOnly` +
+  `SameSite=strict` cookie the panel sets on any already-authenticated HTTP response.
+  The cookie is accepted **only** here, never in place of the header, so it is out of
+  CSRF reach on every state-changing route.
+- **Same-origin only** (CWE-1385). A WebSocket is not subject to the Same-Origin
+  Policy and CORS middleware never sees the scope, so a page on any site you visit
+  could otherwise open this socket. `Origin` must match the panel's `Host` or
+  `X-Forwarded-Host`; a missing `Origin` means a non-browser caller, which had to
+  present the header credential.
+- **The node needs `CAO_WS_ALLOWED_CLIENTS`.** `cao-server` restricts terminal
+  attaches to loopback by default, so it closes 4003 on the panel unless the panel's
+  address (or `*`) is in that allowlist. Widening it is only safe behind a real
+  network boundary — everything else about the node stays unauthenticated.
 
 ## Run as a service
 
