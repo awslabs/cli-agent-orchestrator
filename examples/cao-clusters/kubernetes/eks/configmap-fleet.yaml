@@ -13,9 +13,13 @@
 # running at that moment disappear from the panel until they are released. Avoid
 # re-applying while a fleet is busy.
 #
-# The panel re-reads this file on every /api/fleet request, so edits need no
-# restart. A mounted ConfigMap refreshes on the kubelet's sync period, so a
-# change can take up to about a minute to become visible.
+# The panel reads this object from the API SERVER, not from its mount, so an edit
+# here is visible within one poll interval (a few seconds) and needs no restart.
+# That indirection exists because of the joint ownership above: a mounted
+# ConfigMap only refreshes on the kubelet's sync period, and a leased worker can
+# be created, used and released inside that window — so the mount would show a
+# fleet that had already gone while missing the one that was running. The mount is
+# retained as the fallback if the API read is denied. See panel.yaml.
 apiVersion: v1
 kind: ConfigMap
 metadata:
