@@ -38,7 +38,7 @@ export function SettingsPanel() {
   const [busy, setBusy] = useState(false)
   const [profileCount, setProfileCount] = useState<number | null>(null)
   const [dupCount, setDupCount] = useState(0)
-  const { showSnackbar } = useStore()
+  const { showSnackbar, activeNode } = useStore()
 
   const load = async () => {
     try {
@@ -56,10 +56,14 @@ export function SettingsPanel() {
     } catch {}
   }
 
+  // Keyed on the node: agent directories are filesystem paths on one node, and
+  // this panel WRITES them back. Showing the previous node's list after a
+  // switch would aim a save at the wrong machine, which is worse than a stale
+  // read.
   useEffect(() => {
     load()
     refreshProfiles()
-  }, [])
+  }, [activeNode])
 
   // Every mutation persists immediately and re-reads the effective server
   // state, so the UI never claims a save that didn't stick (GH #281).

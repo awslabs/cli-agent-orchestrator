@@ -12,7 +12,7 @@
 // child's mount effect runs on the same commit, long before that promise settles.
 // The gate is that no fetching component mounts until `fleetReady`.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, act } from '@testing-library/react'
 import App from '../App'
 import { setActiveNode } from '../api'
 import { useStore } from '../store'
@@ -131,6 +131,44 @@ describe('boot order', () => {
     // And the paths are byte-identical to the pre-fleet app: no prefix at all.
     await waitFor(() => expect(calls().some(u => u.includes('/agents/profiles'))).toBe(true))
     expect(calls().filter(u => u.includes('/nodes/'))).toEqual([])
+  })
+
+  it('refetches per-node data when the node changes', async () => {
+    // The other half of the same bug. Gating the FIRST render is not enough:
+    // an effect with empty deps runs once and never again, so a component that
+    // stays mounted across a switch — the dashboard does — keeps showing the
+    // previous node's numbers next to the new node's (empty) session list.
+    // Observed as PROFILES 1 on an offline node with 0 SESSIONS.
+    mockFetch.mockImplementation((url: string) => {
+      const u = String(url)
+      if (u.includes('/api/fleet')) {
+        return Promise.resolve(
+          ok({
+            machines: [
+              { name: 'alpha', label: 'alpha', host: '10.0.0.1', role: 'central', online: true, sessions: [] },
+              { name: 'beta', label: 'beta', host: '10.0.0.2', role: 'worker', online: true, sessions: [] },
+            ],
+          }),
+        )
+      }
+      if (u.includes('/settings/memory')) return Promise.resolve(ok({ enabled: false }))
+      return Promise.resolve(ok([]))
+    })
+
+    render(<App />)
+
+    await waitFor(() => {
+      expect(calls().some(u => u.includes('/nodes/alpha/agents/profiles'))).toBe(true)
+    })
+
+    await act(async () => {
+      await useStore.getState().selectNode('beta')
+    })
+
+    // Asked of beta, not carried over from alpha.
+    await waitFor(() => {
+      expect(calls().some(u => u.includes('/nodes/beta/agents/profiles'))).toBe(true)
+    })
   })
 
   it('holds the content area, not the whole page, while discovering', async () => {
