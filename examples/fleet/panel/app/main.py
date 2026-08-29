@@ -6,8 +6,11 @@ import hmac
 import os
 import re
 
+from urllib.parse import urlsplit
+
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Request
+import websockets
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -96,9 +99,20 @@ _STREAM_TIMEOUT = httpx.Timeout(30.0, connect=4.0, read=None)
 
 
 def _safe_segment(value, kind):
-    if not _SAFE_SEGMENT.match(value or ""):
+    # `.` and `..` are excluded by name rather than by charset: dots are legal in
+    # a session name, so the pattern must allow them, but a bare `..` arriving
+    # percent-encoded (`%2e%2e`, which nothing on the way in normalizes) would be
+    # interpolated straight into an upstream path and resolve to a DIFFERENT
+    # endpoint on the node.
+    if value in (".", "..") or not _SAFE_SEGMENT.match(value or ""):
         raise HTTPException(status_code=400, detail=f"invalid {kind}")
     return value
+
+
+# The terminal socket's credential. Set by the middleware below on any
+# already-authenticated HTTP response, and accepted on nothing but the WebSocket
+# route — see both for why the socket needs a cookie at all.
+_WS_COOKIE = "cao_panel_ws"
 
 
 def _token_ok(header):
@@ -130,7 +144,28 @@ async def _require_token(request: Request, call_next):
             status_code=401,
             headers={"WWW-Authenticate": 'Basic realm="CAO Fleet Panel"'},
         )
-    return await call_next(request)
+    response = await call_next(request)
+    if config.PANEL_TOKEN and request.cookies.get(_WS_COOKIE) != config.PANEL_TOKEN:
+        # A browser cannot set a request header on a WebSocket handshake, so the
+        # terminal socket cannot present the Authorization header this middleware
+        # demands — and ASGI does not run HTTP middleware for a WebSocket scope
+        # at all, so the socket would otherwise be the one unguarded route on the
+        # origin. Hand the already-authenticated browser a credential it WILL
+        # send on a same-origin handshake.
+        #
+        # HttpOnly so script cannot read it, SameSite=strict so it is not sent
+        # from another site at all, and accepted ONLY on the WebSocket route
+        # (never in place of the header above), which keeps it off every
+        # state-changing HTTP path and out of CSRF reach.
+        response.set_cookie(
+            _WS_COOKIE,
+            config.PANEL_TOKEN,
+            httponly=True,
+            samesite="strict",
+            secure=request.url.scheme == "https",
+            path="/",
+        )
+    return response
 
 
 def _machine_or_404(name):
@@ -399,6 +434,127 @@ async def node_proxy(name: str, path: str, request: Request):
         },
         background=BackgroundTask(_release),
     )
+
+
+def _ws_authorized(ws):
+    """Whether a terminal-socket handshake may open a PTY on a node.
+
+    Two credentials, because there are two kinds of caller. A reverse proxy or a
+    native client sets `Authorization` (nginx injecting it upstream is how the
+    published deployment works). A browser cannot set a header on a handshake, so
+    it presents the HttpOnly cookie `_require_token` gave it.
+    """
+    if not config.PANEL_TOKEN:
+        return True
+    if _token_ok(ws.headers.get("authorization")):
+        return True
+    return hmac.compare_digest(ws.cookies.get(_WS_COOKIE, ""), config.PANEL_TOKEN)
+
+
+def _ws_same_origin(ws):
+    """Whether the handshake is same-origin with the panel.
+
+    Cross-site WebSocket hijacking (CWE-1385) guard, and the reason the cookie
+    above is safe to accept: a WebSocket is not subject to the Same-Origin
+    Policy, and CORS middleware never sees a WebSocket scope, so a page on any
+    site the operator visits could otherwise open this socket and get keystroke
+    injection on a node — RCE. Absent `Origin` means a non-browser caller, which
+    had to present the header credential to get here.
+
+    `X-Forwarded-Host` counts, and is safe to trust for exactly this check: the
+    panel is normally published behind a reverse proxy, whose `Host` is the
+    upstream it dialled (`127.0.0.1:9888`) and never the name in the browser's
+    Origin — comparing against `Host` alone would reject every real terminal. It
+    cannot be abused, because JavaScript cannot set ANY request header on a
+    WebSocket handshake, so the attacker page this check exists to stop is the one
+    caller that cannot send it.
+    """
+    origin = ws.headers.get("origin")
+    if not origin:
+        return True
+    allowed = {h for h in (ws.headers.get("x-forwarded-host"), ws.headers.get("host")) if h}
+    return urlsplit(origin).netloc in allowed
+
+
+@app.websocket("/nodes/{name}/terminals/{terminal_id}/ws")
+async def node_terminal_ws(ws: WebSocket, name: str, terminal_id: str):
+    """Bridge a browser's terminal socket to a node's cao-server.
+
+    This is what makes the fleet view a terminal and not a screenshot: the
+    dashboard's xterm.js attaches to a real PTY on the node, keystrokes and all.
+    Frames are relayed verbatim in both directions — cao-server sends terminal
+    bytes as binary and takes JSON text control messages, and neither is
+    interpreted here.
+
+    The upstream connection deliberately sends NO `Origin`. Forwarding the
+    browser's would be worse than useless: the node compares it against ITS own
+    Host, which a proxied origin never matches. A header-less handshake is what
+    cao-server treats as a non-browser client, gated by its own
+    `CAO_WS_ALLOWED_CLIENTS` IP allowlist, which must include the panel. The
+    browser-side origin check above is the panel's own responsibility.
+    """
+    if not _ws_authorized(ws) or not _ws_same_origin(ws):
+        # Close before accept: no PTY is ever attached to a rejected handshake.
+        await ws.close(code=1008)
+        return
+    try:
+        machine = _machine_or_404(name)
+        _safe_segment(terminal_id, "terminal_id")
+    except HTTPException:
+        await ws.close(code=1008)
+        return
+
+    # The query string travels: cao-server reads `?token=` from it when ITS auth
+    # layer is enabled, which is the node's credential, not the panel's.
+    query = ws.scope.get("query_string", b"").decode("latin-1")
+    upstream_url = (
+        f"{config.ws_url(machine)}/terminals/{terminal_id}/ws" + (f"?{query}" if query else "")
+    )
+    try:
+        # max_size=None: a terminal repaint after a resize can exceed the 1 MiB
+        # default frame cap, and the library's answer to an oversized frame is to
+        # drop the connection.
+        upstream = await websockets.connect(upstream_url, max_size=None, open_timeout=8)
+    except Exception:
+        # The node refused or is gone. Accept-then-close so the browser sees a
+        # close code rather than a failed handshake it cannot read.
+        await ws.accept()
+        await ws.close(code=1011)
+        return
+
+    await ws.accept()
+
+    async def to_node():
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            if message.get("text") is not None:
+                await upstream.send(message["text"])
+            elif message.get("bytes") is not None:
+                await upstream.send(message["bytes"])
+
+    async def to_browser():
+        async for frame in upstream:
+            if isinstance(frame, bytes):
+                await ws.send_bytes(frame)
+            else:
+                await ws.send_text(frame)
+
+    # Either side ending ends the bridge: a closed PTY should close the browser's
+    # socket, and a closed tab should stop reading from the node.
+    tasks = [asyncio.create_task(to_node()), asyncio.create_task(to_browser())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await upstream.close()
+        try:
+            await ws.close()
+        except RuntimeError:
+            pass  # already closed by the browser
 
 
 # Mounted and declared AFTER every API route, so no front-end file can shadow
