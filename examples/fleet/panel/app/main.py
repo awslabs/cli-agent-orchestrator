@@ -468,6 +468,11 @@ def _ws_same_origin(ws):
     cannot be abused, because JavaScript cannot set ANY request header on a
     WebSocket handshake, so the attacker page this check exists to stop is the one
     caller that cannot send it.
+
+    Host and port only, not scheme. A TLS-terminating proxy gives the panel plain
+    HTTP, so the browser's `https://` Origin can never match the scheme the panel
+    sees — comparing it would reject every deployment that has TLS, which is the
+    only kind that should be reachable off a private network.
     """
     origin = ws.headers.get("origin")
     if not origin:
