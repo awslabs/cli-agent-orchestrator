@@ -2,19 +2,40 @@
 #
 # Deliberately copies the source tree instead of installing the wheel that
 # examples/fleet/panel/pyproject.toml builds. The panel resolves its frontend as
-# a SIBLING of the app package:
+# a SIBLING of the app package (app/main.py):
 #
-#   _STATIC = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+#   _ROOT = os.path.dirname(os.path.dirname(__file__))
 #
-# so it needs the on-disk layout `<root>/app` + `<root>/static` preserved. A
-# wheel built from `packages = ["app"]` installs only the package, putting
-# `static/` nowhere that path can find — the panel would start and then serve 404
-# for every asset. Copying the tree keeps the layout the code expects, and
-# matches how Dockerfile.broker ships a single-purpose service.
+# so it needs the on-disk layout `<root>/app` + `<root>/web_ui` + `<root>/static`
+# preserved. A wheel built from `packages = ["app"]` installs only the package,
+# putting the frontend nowhere that path can find — the panel would start and
+# then serve 404 for every asset. Copying the tree keeps the layout the code
+# expects, and matches how Dockerfile.broker ships a single-purpose service.
 #
 # Build from the REPOSITORY ROOT so both directories are in context:
 #   docker build -f examples/cao-clusters/kubernetes/eks/Dockerfile.panel \
 #     -t cao-fleet-panel:<tag> .
+
+# Stage 1 — CAO's own dashboard, so a fleet is operated with the same UI a
+# single server serves.
+#
+# Node 24, not 20: vite 8 builds through rolldown, which ships no binding for
+# 20 and fails with MODULE_NOT_FOUND. `npm run build` runs `tsc` first, so a
+# type error fails the image build rather than shipping a broken bundle.
+#
+# WEB_BASE is the path prefix the panel is published under, baked in at build
+# time because Vite resolves `import.meta.env.BASE_URL` statically. The default
+# suits a panel reached at the root of its own port; a reverse proxy publishing
+# it under a prefix must pass its own, e.g. --build-arg WEB_BASE=/proxy/panel/.
+# A trailing slash is required — Vite emits the value verbatim.
+FROM node:24-slim AS web
+ARG WEB_BASE=/
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build -- --base="${WEB_BASE}" --outDir /web_ui --emptyOutDir
+
 FROM python:3.12-slim
 
 # Pinned to the floors declared in examples/fleet/panel/pyproject.toml.
@@ -33,6 +54,7 @@ RUN apt-get update \
 WORKDIR /panel
 COPY examples/fleet/panel/app /panel/app
 COPY examples/fleet/panel/static /panel/static
+COPY --from=web /web_ui /panel/web_ui
 
 # Same non-root uid as Dockerfile.broker. The panel only reads its own tree and
 # the mounted fleet config, so it needs no writable path.

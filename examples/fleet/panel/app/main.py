@@ -15,7 +15,28 @@ from . import client, config
 
 app = FastAPI(title="CAO Fleet Panel")
 
-_STATIC = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+_ROOT = os.path.dirname(os.path.dirname(__file__))
+
+# Two possible front ends, resolved once at import.
+#
+# `web_ui/` is CAO's own dashboard (repository `web/`), built with
+# `--base=/proxy/panel/` and copied in beside `app/` by Dockerfile.panel. It is
+# the same UI a single cao-server serves, so a fleet is operated with the tool
+# people already know instead of a second, thinner one.
+#
+# `static/` is the panel's original hand-written UI. Kept as the fallback
+# because `examples/fleet/panel` is runnable straight from a checkout, where
+# nothing has been built and a hard dependency on `web_ui/` would serve 404 for
+# every asset — the same silent-omission trap cao-server avoids by mounting its
+# own bundle only when `index.html` is actually on disk.
+_WEB_UI = os.path.join(_ROOT, "web_ui")
+_STATIC = os.path.join(_ROOT, "static")
+_UI_ROOT = _WEB_UI if os.path.isfile(os.path.join(_WEB_UI, "index.html")) else _STATIC
+
+# Root-level files the front end asks for by name (favicons today). Narrow on
+# purpose: the route that serves these is a single path segment, so it must not
+# become a way to read arbitrary files out of the image.
+_ROOT_ASSET = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9]{1,8}\Z")
 
 # cao-server session names / terminal ids are interpolated into upstream request
 # paths; keep them to a safe charset so a crafted value can't traverse to another
@@ -262,12 +283,37 @@ async def terminal_wd(name: str, terminal_id: str):
             raise HTTPException(status_code=502, detail=f"{name}: {exc}")
 
 
+# Mounted and declared AFTER every API route, so no front-end file can shadow
+# one. `assets/` is what Vite emits; `static/` is the legacy UI's own tree and
+# stays mounted either way, since it is where the fallback's assets live.
+if os.path.isdir(os.path.join(_UI_ROOT, "assets")):
+    app.mount(
+        "/assets",
+        StaticFiles(directory=os.path.join(_UI_ROOT, "assets")),
+        name="assets",
+    )
 app.mount("/static", StaticFiles(directory=_STATIC), name="static")
 
 
 @app.get("/")
 async def index():
-    return FileResponse(os.path.join(_STATIC, "index.html"))
+    return FileResponse(os.path.join(_UI_ROOT, "index.html"))
+
+
+@app.get("/{filename}")
+async def root_asset(filename: str):
+    """Serve a root-level front-end file, e.g. `favicon.svg`.
+
+    Last route registered, so it cannot shadow `/api/...`. The name is matched
+    against `_ROOT_ASSET` and then resolved and confined to `_UI_ROOT`, so a
+    percent-encoded traversal reaches a 404 rather than the filesystem.
+    """
+    if not _ROOT_ASSET.match(filename):
+        raise HTTPException(status_code=404, detail="not found")
+    path = os.path.realpath(os.path.join(_UI_ROOT, filename))
+    if os.path.dirname(path) != os.path.realpath(_UI_ROOT) or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path)
 
 
 def run():

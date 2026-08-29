@@ -15,3 +15,10 @@ examples/fleet/panel/**/__pycache__
 examples/fleet/panel/**/*.pyc
 examples/fleet/panel/static/test
 examples/fleet/panel/static/package.json
+
+# `web/` is CAO's own dashboard, built in this image's first stage and served by
+# the panel. Source only: `node_modules` is restored by `npm ci` inside the
+# build, and shipping a host copy would both bloat the context and risk mixing
+# a darwin/arm64 tree into a linux image.
+!web
+web/node_modules
