@@ -288,6 +288,18 @@ check("owner is the Deployment by uid",
       and owners[0]["uid"] == "uid-cao-worker-deadbeef",
       json.dumps(owners))
 
+# The selector needs BOTH labels, and the redundant-looking one is the load-bearing
+# one. worker-id alone selects the same single pod, but the VPC CNI includes a
+# Service's ClusterIP in a PolicyEndpoint only when the Service selects on the
+# labels the NetworkPolicy selects on. Drop the name label and the fleet panel gets
+# a ConnectTimeout on every worker while its pod IP stays reachable — which is why
+# this is asserted here rather than left to the manifest to imply.
+sel = swire["spec"]["selector"]
+check("service selects the worker by id", sel.get("cao.aws/worker-id") == "deadbeef",
+      json.dumps(sel))
+check("service also carries the label networkpolicy.yaml selects on",
+      sel.get("app.kubernetes.io/name") == "cao-elastic-worker", json.dumps(sel))
+
 # --- 3. the lease returns before readiness; the reaper owns the deadline --
 #
 # Deliberately ABOVE the TestClient block: the reaper only runs as a thread once

@@ -422,6 +422,23 @@ spec:
           protocol: TCP
     # The fleet: the supervisor, and whichever workers hold a lease. Both answer
     # the cao-server API on 9889.
+    #
+    # This rule is only half of what makes a worker reachable. The panel dials
+    # Service DNS, so the CNI has to allow the Service's CLUSTERIP, and it derives
+    # that from the podSelector below by including the ClusterIPs of Services that
+    # select on the same labels. So a per-worker Service must carry
+    # `app.kubernetes.io/name: cao-elastic-worker` in its own selector or its
+    # ClusterIP never enters the panel's PolicyEndpoint — see _worker_service in
+    # broker.py, which sets it for exactly this reason.
+    #
+    # The failure is easy to misread. `kubectl get pod` shows Running and Ready,
+    # the pod IP answers /health, and only the Service address times out. Confirm
+    # it by listing the resolved addresses rather than re-reading this file:
+    #
+    #   kubectl get policyendpoints -n cao-cluster -o json | \
+    #     jq '.items[]|select(.metadata.name|startswith("cao-panel-egress"))|.spec.egress'
+    #
+    # A worker whose pod IP is listed but whose ClusterIP is not is this bug.
     - to:
         - podSelector:
             matchLabels:
