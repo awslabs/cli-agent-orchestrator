@@ -562,12 +562,23 @@ def test_proxy_streams_an_event_stream(monkeypatch):
         assert b"".join(r.iter_bytes()) == b"".join(frames)
 
 
-def test_proxy_timeout_matches_the_call():
-    # a stream may go quiet for minutes; only a read timeout would kill it
-    assert main._proxy_timeout("GET", "workflows/runs/r1/events", "text/event-stream").read is None
-    # session launch blocks on the agent CLI reaching a ready prompt
-    assert main._proxy_timeout("POST", "sessions", "") is client.LAUNCH_TIMEOUT
-    assert main._proxy_timeout("GET", "sessions", "") is client.TIMEOUT
+def test_proxy_timeout_is_never_tighter_than_the_client():
+    # A stream may go quiet for minutes; only a read timeout would kill it.
+    assert main._proxy_timeout("text/event-stream").read is None
+
+    # Everything else shares one budget, and the property being pinned is that it
+    # clears the longest deadline web/src/api.ts declares for itself: 120s, for
+    # building a memory graph. The regression this guards is real and was found on
+    # a live cluster — at the 8s fleet-wide ceiling, six slow-but-working routes
+    # (add-terminal, create flow, run flow, graph, graph export, run diagnostics)
+    # returned `502 ReadTimeout`, which blames the node for a working operation.
+    t = main._proxy_timeout("")
+    assert t.read >= 120.0
+
+    # Connect stays tight regardless, because THAT is what detects a node that has
+    # gone away: a released worker's Service stops resolving. Widening the read
+    # budget must not cost the fleet its liveness signal.
+    assert t.connect <= client.TIMEOUT.connect
 
 
 def test_proxy_offline_node_502(monkeypatch):
