@@ -404,8 +404,15 @@ spec:
     #
     # Failing this rule is quiet rather than obvious: the panel comes up, the
     # readiness probe passes, and it serves the mounted ConfigMap forever. Check
-    # `source` in /api/fleet — `live: false` with an error is what a blocked
-    # egress rule looks like from outside the pod.
+    # the `error` in /api/fleet's `source` — a `ConnectTimeout` is this rule, and a
+    # `403 Forbidden` is the Role in rbac.yaml instead.
+    #
+    # `error`, not `live`. Removing this rule on a live cluster left the panel
+    # reporting `live: true` alongside the ConnectTimeout, because the CNI
+    # configures policy shortly AFTER the pod starts sending: one read got out
+    # first, and a last-good snapshot is served for as long as it is the best
+    # thing available. `live` describes the fleet on screen; only `error`
+    # describes whether reads are working.
     - to:
         - ipBlock:
             cidr: <vpc-cidr>

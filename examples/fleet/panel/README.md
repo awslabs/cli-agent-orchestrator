@@ -79,6 +79,11 @@ refreshes on the kubelet's sync period. A worker can be created, used and releas
 inside that window, so the mounted file can list a fleet that has already gone
 while omitting the one that is running. The API server has no such lag.
 
+Measured on a real cluster, leasing one worker and releasing it: the API server
+showed the lease at 7.9s and its withdrawal at 4.1s, against 24.1s and 87.5s for
+the same panel's mount. The withdrawal is the worse direction — for 83 seconds the
+mount named a worker whose Service had already been deleted.
+
 Reads happen on a background poll (`CAO_FLEET_CONFIGMAP_INTERVAL`, default 5s),
 not per request: `load_machines()` is called from inside request handlers, so
 reaching for the network there would put the API server's latency on every proxied
