@@ -1,10 +1,21 @@
 # Fleet panel — the web console for the fleet, built by Dockerfile.panel.
 #
-# The fleet registry it mounts, `cao-fleet-config`, is jointly owned:
-# configmap-fleet.yaml supplies the supervisor entry, and the broker adds and
-# removes worker entries as it leases and releases them, because elastic workers
-# are created on demand with ids nothing can know in advance. See
-# configmap-fleet.yaml.
+# The fleet registry, `cao-fleet-config`, is jointly owned: configmap-fleet.yaml
+# supplies the supervisor entry, and the broker adds and removes worker entries as
+# it leases and releases them, because elastic workers are created on demand with
+# ids nothing can know in advance. See configmap-fleet.yaml.
+#
+# That joint ownership is why the panel reads the ConfigMap through the API server
+# (CAO_FLEET_CONFIGMAP) instead of relying on the mount below. A mounted ConfigMap
+# refreshes on the kubelet's sync period — tens of seconds, with no upper bound
+# guaranteed — while a leased worker may exist for less than that. So the mount
+# could show a fleet that has already been released while missing the one that is
+# running. The API server is authoritative immediately.
+#
+# The mount is KEPT as a fallback, not as the primary source. If the RoleBinding is
+# missing or wrong, app/config.py logs the failure and serves this file, so the
+# panel comes up stale rather than CrashLooping. `/api/fleet` reports which source
+# answered, in its `source` field.
 #
 # The panel is reached with a port-forward; it is not exposed through an Ingress:
 #   kubectl -n cao-cluster port-forward svc/cao-fleet-panel 9888:9888
@@ -27,6 +38,7 @@ spec:
         app.kubernetes.io/name: cao-fleet-panel
         app.kubernetes.io/part-of: cao-elastic-fleet
     spec:
+      serviceAccountName: cao-fleet-panel
       containers:
         - name: fleet-panel
           image: <panel-image>:latest
@@ -38,6 +50,17 @@ spec:
               value: "0.0.0.0"
             - name: CAO_PANEL_PORT
               value: "9888"
+            # Primary source: the live object, via the ServiceAccount above.
+            - name: CAO_FLEET_CONFIGMAP
+              value: cao-fleet-config
+            # Explicit rather than left to the pod's own namespace file. They are
+            # the same value today, and naming it means a panel moved to another
+            # namespace fails loudly on a 403 instead of silently reading a
+            # different namespace's registry.
+            - name: CAO_FLEET_NAMESPACE
+              value: cao-cluster
+            # Fallback source, used only until the first successful API read and
+            # then again only if reads start failing.
             - name: CAO_FLEET_CONFIG
               value: /config/fleet.json
             - name: CAO_PANEL_TOKEN

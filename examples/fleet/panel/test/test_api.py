@@ -42,6 +42,92 @@ def test_fleet_aggregates_and_isolates_offline(monkeypatch):
     assert by_name["node-b"]["online"] is False
 
 
+def test_fleet_reports_which_source_it_used(monkeypatch):
+    """`source` is how an operator tells a fallback from a registration failure.
+
+    A panel that has been denied its ConfigMap still serves the mounted file, so
+    it looks healthy while being up to a kubelet sync period stale — which
+    presents as elastic workers never appearing. Without this field the two are
+    indistinguishable from outside the pod.
+    """
+    _patch_fleet(monkeypatch, online_health={}, sessions_by_machine={})
+    tc = TestClient(main.app)
+    assert tc.get("/api/fleet").json()["source"] == {
+        "kind": "file", "path": config.FLEET_CONFIG,
+    }
+
+    monkeypatch.setattr(config, "FLEET_CONFIGMAP", "cao-fleet-config")
+    monkeypatch.setattr(config, "FLEET_NAMESPACE", "cao-cluster")
+    source = tc.get("/api/fleet").json()["source"]
+    assert source["kind"] == "configmap"
+    assert source["name"] == "cao-fleet-config"
+    # Nothing has been read, so it says so rather than implying a live view.
+    assert source["live"] is False
+
+
+def test_startup_reads_the_configmap_before_serving(monkeypatch):
+    """The first read is awaited in the lifespan, not left to the poll interval.
+
+    Otherwise the readiness probe's own /api/fleet — the panel's first request —
+    answers from the mounted file, and so does every browser that connects inside
+    the first interval.
+    """
+    calls = []
+
+    async def fake_refresh(client_=None):
+        calls.append("refresh")
+        return None
+
+    async def fake_watch():
+        calls.append("watch")
+        await asyncio.Event().wait()          # never returns; cancelled at exit
+
+    monkeypatch.setattr(config, "FLEET_CONFIGMAP", "cao-fleet-config")
+    monkeypatch.setattr(config, "refresh_configmap", fake_refresh)
+    monkeypatch.setattr(config, "watch_configmap", fake_watch)
+    _patch_fleet(monkeypatch, online_health={}, sessions_by_machine={})
+
+    with TestClient(main.app) as tc:
+        assert calls[0] == "refresh"
+        assert tc.get("/api/fleet").status_code == 200
+    assert "watch" in calls
+
+
+def test_startup_survives_a_configmap_it_cannot_read(monkeypatch):
+    """A denied read must not stop the panel coming up.
+
+    A CrashLooping panel while someone fixes a RoleBinding is strictly worse than
+    a panel serving a slightly stale registry.
+    """
+    async def fake_refresh(client_=None):
+        return "HTTPStatusError: 403"
+
+    async def fake_watch():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(config, "FLEET_CONFIGMAP", "cao-fleet-config")
+    monkeypatch.setattr(config, "refresh_configmap", fake_refresh)
+    monkeypatch.setattr(config, "watch_configmap", fake_watch)
+    _patch_fleet(monkeypatch, online_health={}, sessions_by_machine={})
+
+    with TestClient(main.app) as tc:
+        r = tc.get("/api/fleet")
+        assert r.status_code == 200
+        # Served from the fixture file, and honest about it.
+        assert {m["name"] for m in r.json()["machines"]} == {"node-a", "node-b", "node-c"}
+
+
+def test_no_configmap_starts_no_background_task(monkeypatch):
+    """The default path is unchanged: no cluster, no token, no poller."""
+    async def fake_watch():
+        raise AssertionError("watch_configmap must not run without CAO_FLEET_CONFIGMAP")
+
+    monkeypatch.setattr(config, "watch_configmap", fake_watch)
+    _patch_fleet(monkeypatch, online_health={}, sessions_by_machine={})
+    with TestClient(main.app) as tc:
+        assert tc.get("/api/fleet").status_code == 200
+
+
 def test_unknown_machine_404():
     tc = TestClient(main.app)
     assert tc.post("/api/machines/nope/launch", json={}).status_code == 404
