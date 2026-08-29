@@ -1,4 +1,4 @@
-"""CAO Fleet Panel — FastAPI aggregate + control API, serves the static UI."""
+"""CAO Fleet Panel — FastAPI aggregate + control API, serves CAO's own dashboard."""
 import asyncio
 import base64
 import binascii
@@ -8,8 +8,9 @@ import re
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from . import client, config
 
@@ -42,6 +43,56 @@ _ROOT_ASSET = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9]{1,8}\Z")
 # paths; keep them to a safe charset so a crafted value can't traverse to another
 # endpoint on the (already-trusted) node.
 _SAFE_SEGMENT = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+
+# --- node pass-through ------------------------------------------------------
+#
+# The dashboard the panel serves is cao-server's own, so it asks for cao-server
+# paths (`/sessions`, `/terminals/{id}/screen`, ...). `/nodes/{name}/<path>`
+# forwards one of those to the named node, which is what lets one page drive a
+# whole fleet: the browser picks a node, every request carries it, and the panel
+# resolves it against the registry.
+#
+# Whitelisted by FIRST PATH SEGMENT rather than by full path. cao-server has
+# ~100 routes and the dashboard already uses eight namespaces; enumerating every
+# one would mean editing the panel each time the dashboard gains a call, which is
+# the coupling this whole change exists to remove. Segments are stable, and the
+# line they draw is the one worth drawing:
+#
+#   - `internal/` is the agent-facing memory RPC (an in-process convenience for
+#     tooling on the node), never a browser call. Left out.
+#   - `agui/` and `events` are the AG-UI transport; the dashboard does not use
+#     them, so they stay unreachable until something does.
+#   - `.well-known/` describes the node's own OAuth resource. Meaningless when
+#     read through the panel.
+#
+# Adding a namespace is a one-line change here.
+_NODE_API_PREFIXES = frozenset({
+    "agents", "flows", "graph", "health", "memory",
+    "sessions", "settings", "skills", "terminals", "workflows",
+})
+
+# Request headers forwarded upstream. An allowlist, not a denylist, because the
+# one header that must NOT travel is `Authorization`: it carries the PANEL's
+# shared token, which is not the node's credential and has no business leaving
+# this process. `Cookie` and `Host` are dropped for the same reason.
+_FORWARD_REQUEST_HEADERS = frozenset({
+    "accept", "accept-encoding", "accept-language", "cache-control",
+    "content-type", "last-event-id",
+})
+
+# Response headers dropped on the way back. Hop-by-hop headers describe the
+# panel<->node connection, not this one, and uvicorn writes its own `date` and
+# `server`. Everything else (content-type, content-encoding, content-length,
+# cache-control, ...) is passed through untouched, so a raw byte stream stays
+# consistent with the headers that describe it.
+_DROP_RESPONSE_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade", "date", "server",
+})
+
+# A stream has no idea when it will next produce a byte, so it gets no read
+# timeout. Everything else keeps the fleet-wide 8s ceiling.
+_STREAM_TIMEOUT = httpx.Timeout(30.0, connect=4.0, read=None)
 
 
 def _safe_segment(value, kind):
@@ -281,6 +332,73 @@ async def terminal_wd(name: str, terminal_id: str):
             return await client.working_directory(c, base, terminal_id)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"{name}: {exc}")
+
+
+def _proxy_timeout(method, path, accept):
+    if "text/event-stream" in accept:
+        return _STREAM_TIMEOUT
+    # POST /sessions blocks until the agent CLI reaches a ready prompt.
+    if method == "POST" and path == "sessions":
+        return client.LAUNCH_TIMEOUT
+    return client.TIMEOUT
+
+
+@app.api_route(
+    "/nodes/{name}/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+)
+async def node_proxy(name: str, path: str, request: Request):
+    """Forward one cao-server request to a registered node.
+
+    Streams in both directions rather than buffering, so the workflow event
+    stream (SSE, open for the life of a run) arrives frame by frame instead of
+    at the end.
+    """
+    m = _machine_or_404(name)
+    segments = path.split("/")
+    if segments[0] not in _NODE_API_PREFIXES:
+        raise HTTPException(status_code=404, detail=f"'{segments[0]}' is not proxied")
+    if ".." in segments:
+        # httpx leaves dot segments in the path; a downstream server may resolve
+        # them, which would step outside the namespace just checked.
+        raise HTTPException(status_code=400, detail="invalid path")
+
+    accept = request.headers.get("accept", "")
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() in _FORWARD_REQUEST_HEADERS
+    }
+    body = await request.body()
+
+    c = httpx.AsyncClient(timeout=_proxy_timeout(request.method, path, accept))
+    try:
+        upstream = await c.send(
+            c.build_request(
+                request.method,
+                f"{config.base_url(m)}/{path}",
+                params=request.url.query,
+                content=body,
+                headers=headers,
+            ),
+            stream=True,
+        )
+    except httpx.HTTPError as exc:
+        await c.aclose()
+        raise HTTPException(status_code=502, detail=f"{name}: {type(exc).__name__}: {exc}")
+
+    async def _release():
+        await upstream.aclose()
+        await c.aclose()
+
+    return StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers={
+            k: v for k, v in upstream.headers.items()
+            if k.lower() not in _DROP_RESPONSE_HEADERS
+        },
+        background=BackgroundTask(_release),
+    )
 
 
 # Mounted and declared AFTER every API route, so no front-end file can shadow
