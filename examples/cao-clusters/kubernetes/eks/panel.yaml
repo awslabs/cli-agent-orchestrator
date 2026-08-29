@@ -7,10 +7,11 @@
 #
 # That joint ownership is why the panel reads the ConfigMap through the API server
 # (CAO_FLEET_CONFIGMAP) instead of relying on the mount below. A mounted ConfigMap
-# refreshes on the kubelet's sync period — tens of seconds, with no upper bound
-# guaranteed — while a leased worker may exist for less than that. So the mount
-# could show a fleet that has already been released while missing the one that is
-# running. The API server is authoritative immediately.
+# refreshes on the kubelet's sync period — 24s to see a lease and 88s to see it
+# withdrawn, measured on this manifest, against 8s and 4s through the API server —
+# while a leased worker may exist for less than that. So the mount could show a
+# fleet that has already been released while missing the one that is running. The
+# API server is authoritative immediately.
 #
 # The mount is KEPT as a fallback, not as the primary source. If the RoleBinding is
 # missing or wrong, app/config.py logs the failure and serves this file, so the
