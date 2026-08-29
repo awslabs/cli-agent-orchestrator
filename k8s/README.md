@@ -156,7 +156,7 @@ reverse-proxy prefix needs it baked in:
 ```bash
 docker buildx build --platform linux/arm64 \
   --build-arg WEB_BASE=/proxy/panel/ \
-  -f examples/cao-clusters/kubernetes/eks/Dockerfile.panel \
+  -f docker/Dockerfile.panel \
   -t "${REGISTRY}/cao-fleet-panel:${TAG}" --push .
 ```
 

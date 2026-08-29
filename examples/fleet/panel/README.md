@@ -105,7 +105,7 @@ like one whose workers never register.
 RBAC: one `get`, on one ConfigMap, by name. `list`/`watch` are deliberately not
 granted — `resourceNames` cannot restrict them, so either would widen the grant to
 every ConfigMap in the namespace, and that is why the panel polls rather than
-watches. See `examples/cao-clusters/kubernetes/eks/rbac.yaml`.
+watches. See `k8s/rbac.yaml`.
 
 ## Configuration
 
