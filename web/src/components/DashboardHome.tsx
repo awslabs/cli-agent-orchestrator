@@ -71,7 +71,7 @@ interface SessionWithTerminals {
 }
 
 export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => void }) {
-  const { sessions, terminalStatuses, setTerminalStatus, clearTerminalStatuses, showSnackbar, deleteSession } = useStore()
+  const { sessions, terminalStatuses, setTerminalStatus, clearTerminalStatuses, showSnackbar, deleteSession, activeNode } = useStore()
   const [profileCount, setProfileCount] = useState(0)
   const [sessionData, setSessionData] = useState<SessionWithTerminals[]>([])
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set())
@@ -173,9 +173,15 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
     return () => clearInterval(interval)
   }, [sessionData.flatMap(s => s.terminals.map(t => t.id)).join(',')])
 
+  // Keyed on the node, not on mount: profiles are per-cao-server, so a count
+  // fetched from one node is wrong the moment the switcher moves. Resetting on
+  // failure matters as much as refetching — an unreachable node must not keep
+  // showing the last reachable one's number next to a 0 session count.
   useEffect(() => {
-    api.listProfiles().then(p => setProfileCount(p.length)).catch(() => {})
-  }, [])
+    api.listProfiles()
+      .then(p => setProfileCount(p.length))
+      .catch(() => setProfileCount(0))
+  }, [activeNode])
 
   const handleDeleteTerminal = async () => {
     if (!pendingClose) return

@@ -21,7 +21,7 @@ const SOURCE_LABELS: Record<string, string> = {
 }
 
 export function AgentPanel() {
-  const { sessions, fetchSessions, activeSession, activeSessionDetail, selectSession, createSession, deleteSession, terminalStatuses, setTerminalStatus } = useStore()
+  const { sessions, fetchSessions, activeSession, activeSessionDetail, selectSession, createSession, deleteSession, terminalStatuses, setTerminalStatus, activeNode } = useStore()
   const [provider, setProvider] = useState('kiro_cli')
   const [profile, setProfile] = useState('')
   const [creating, setCreating] = useState(false)
@@ -34,6 +34,9 @@ export function AgentPanel() {
   const [loadingProfiles, setLoadingProfiles] = useState(true)
   const [providers, setProviders] = useState<ProviderInfo[]>([])
 
+  // Per-node: which providers are installed differs from node to node (that is
+  // the point of a mixed fleet), so this refetches on a switch rather than
+  // offering the previous node's list.
   useEffect(() => {
     api.listProviders()
       .then(p => {
@@ -42,8 +45,8 @@ export function AgentPanel() {
         const firstInstalled = p.find(prov => prov.installed)
         if (firstInstalled) setProvider(firstInstalled.name)
       })
-      .catch(() => {})
-  }, [])
+      .catch(() => setProviders([]))
+  }, [activeNode])
   const [pendingClose, setPendingClose] = useState<TerminalMeta | null>(null)
   const [closingTerminal, setClosingTerminal] = useState<string | null>(null)
   const [sessionSearch, setSessionSearch] = useState('')
@@ -113,11 +116,16 @@ export function AgentPanel() {
     setSendingInput(null)
   }
 
+  // Per-node, like the providers above: profiles come from the node's own
+  // ~/.cao, so the spawn form must offer the node the agent will actually
+  // land on. Back to loading on a switch, or the list reads as final while
+  // the previous node's names are still on screen.
   useEffect(() => {
+    setLoadingProfiles(true)
     api.listProfiles()
       .then(p => { setProfiles(p); setLoadingProfiles(false) })
-      .catch(() => setLoadingProfiles(false))
-  }, [])
+      .catch(() => { setProfiles([]); setLoadingProfiles(false) })
+  }, [activeNode])
 
   useEffect(() => {
     if (activeSession) {

@@ -59,10 +59,17 @@ export default function App() {
   const [tab, setTab] = useState<TabKey>('home')
   // Default false (fail-closed): a dead backend hides the tab rather than showing a broken panel
   const [memoryEnabled, setMemoryEnabled] = useState(false)
-  const { sessions, connected, fetchSessions, fleetNodes, fleetReady, discoverFleet, refreshFleet } =
+  const { sessions, connected, fetchSessions, fleetNodes, fleetReady, activeNode, discoverFleet, refreshFleet } =
     useStore()
 
   const visibleTabs = TABS.filter(t => t.key !== 'memory' || memoryEnabled)
+
+  // A node switch can take the Memory tab away while the user is standing on it.
+  // Without this the tab strip loses the button but the panel keeps rendering,
+  // stranding the user on a view with no way back to it and no node behind it.
+  useEffect(() => {
+    if (!memoryEnabled && tab === 'memory') setTab('home')
+  }, [memoryEnabled, tab])
 
   useEffect(() => {
     let cancelled = false
@@ -73,9 +80,6 @@ export default function App() {
     discoverFleet().then(() => {
       if (cancelled) return
       fetchSessions()
-      api.getMemoryStatus()
-        .then(s => setMemoryEnabled(s.enabled))
-        .catch(() => {})
       interval = setInterval(fetchSessions, 10000)
     })
     return () => {
@@ -83,6 +87,22 @@ export default function App() {
       if (interval) clearInterval(interval)
     }
   }, [])
+
+  // Whether memory is on is a per-node setting, so this is keyed on the node
+  // rather than folded into the boot effect above: one node in a mixed fleet can
+  // have it configured and another not, and the tab has to follow the switch.
+  // Gated on `fleetReady` for the same reason the content area is - before that
+  // the request would carry no node.
+  useEffect(() => {
+    if (!fleetReady) return
+    let cancelled = false
+    api.getMemoryStatus()
+      .then(s => { if (!cancelled) setMemoryEnabled(s.enabled) })
+      // Fail closed on a node that cannot answer, or the tab lingers pointing at
+      // a panel the new node has no backend for.
+      .catch(() => { if (!cancelled) setMemoryEnabled(false) })
+    return () => { cancelled = true }
+  }, [fleetReady, activeNode])
 
   // Re-list the fleet while it exists: elastic workers join and leave on their
   // own, so the switcher would otherwise show a fleet that has moved on.
