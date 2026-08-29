@@ -251,6 +251,13 @@ def _worker_job(
             name="CAO_ALLOWED_HOSTS",
             value=f"{name},{name}.{NAMESPACE}.svc.cluster.local,localhost",
         ),
+        # Lets the panel proxy a browser onto this worker's terminal. The peer is
+        # the panel pod, whose IP is assigned at schedule time, so an address
+        # allowlist cannot be written ahead of time - and it would be the
+        # redundant check anyway: `cao-worker-ingress` already restricts 9889 to
+        # the supervisor and the panel by pod label. Origin enforcement, on
+        # cao-server's side and on the panel's, is unaffected.
+        client.V1EnvVar(name="CAO_WS_ALLOWED_CLIENTS", value="*"),
         # One terminal per worker, and one worker per task. The isolation is the
         # point of the topology: a wedged agent cannot starve a sibling of a
         # terminal slot, because it has no siblings.

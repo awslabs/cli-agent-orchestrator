@@ -7,6 +7,11 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "httpx>=0.27",
+    # The terminal socket's upstream client. Already installed as a uvicorn[standard]
+    # extra, but declared because app/main.py imports it directly — and pinned to 14+,
+    # where `websockets.connect` is the asyncio implementation whose connection object
+    # is the async iterator the proxy pumps.
+    "websockets>=14",
 ]
 
 [project.scripts]

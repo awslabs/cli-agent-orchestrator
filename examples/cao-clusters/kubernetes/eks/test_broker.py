@@ -165,6 +165,11 @@ check("max terminals still 1", env.get("CAO_MAX_TERMINALS") == "1")
 check("worker memory uses the authenticated broker gateway",
       env.get("CAO_MEMORY_API_URL") == "http://cao-worker-broker:9890",
       env.get("CAO_MEMORY_API_URL"))
+# Without this the panel can proxy every HTTP call to a worker but not its
+# terminal: cao-server's WS peer-IP allowlist defaults to loopback and would
+# close code 4003 on every attach from the panel pod.
+check("terminal socket reachable from the panel",
+      env.get("CAO_WS_ALLOWED_CLIENTS") == "*", env.get("CAO_WS_ALLOWED_CLIENTS"))
 check("worker warms its providers in the background",
       env.get("CAO_WARM_PROVIDER") == "background", env.get("CAO_WARM_PROVIDER"))
 check("worker SA is cao-elastic-worker", spec["serviceAccountName"] == "cao-elastic-worker")

@@ -376,6 +376,35 @@ Re-running `deploy.sh` resets that ConfigMap to the supervisor alone. The broker
 republishes on the next lease, but a worker running at that moment drops off the
 view until it is released, so avoid re-deploying while a fleet is busy.
 
+### Terminals through the panel
+
+The dashboard's terminal attaches to a real PTY on the node, so the panel bridges
+a WebSocket rather than proxying a response. Two things in this deployment exist
+only to let that work:
+
+`CAO_WS_ALLOWED_CLIENTS="*"` on the supervisor and on every worker Job.
+`cao-server` restricts terminal attaches to loopback by default and closes 4003
+on anything else, and the peer here is the panel pod, whose IP is assigned at
+schedule time -- so no manifest can name it. `*` disables that IP check only. It
+is the redundant check in this namespace: `cao-supervisor-ingress` and
+`cao-worker-ingress` already restrict 9889 to the supervisor and the panel **by
+pod label**, which is a stronger bound than an address list and does not go stale
+when a pod is rescheduled. Origin enforcement is untouched on both sides.
+
+The panel guards the socket itself, because ASGI does not run HTTP middleware for
+a WebSocket scope -- the panel token would not have covered it. It requires the
+token (header, or the `HttpOnly`/`SameSite=strict` cookie a browser gets, since a
+browser cannot set a header on a handshake) and a same-origin `Origin`, and it
+forwards no `Origin` upstream: the node would compare it against its own `Host`,
+which a proxied origin never matches, and a header-less handshake is what
+`cao-server` treats as a non-browser client.
+
+Behind a reverse proxy the browser's `Origin` is matched against
+`X-Forwarded-Host` as well as `Host`, since a proxy's `Host` is the upstream it
+dialled. That is safe for this one check because JavaScript cannot set any header
+on a WebSocket handshake, so the cross-site page the check exists to stop is the
+one caller that cannot forge it.
+
 ## Reading the lease ledger
 
 The broker holds a ledger of every lease it has issued and why each one ended.
