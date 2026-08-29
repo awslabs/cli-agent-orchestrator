@@ -112,6 +112,12 @@ at all, which would otherwise leave it the one unguarded route on the origin.
   could otherwise open this socket. `Origin` must match the panel's `Host` or
   `X-Forwarded-Host`; a missing `Origin` means a non-browser caller, which had to
   present the header credential.
+- **Two failures, two close codes.** `1008 node refused the attach (HTTP …)` means
+  the node answered and said no — usually a terminal that no longer exists, or its
+  `CAO_WS_ALLOWED_CLIENTS` not admitting the panel. `1011 node unreachable` means the
+  node never answered. `cao-server` closes its own `4003`/`4004`/`4401`/`4403` *before*
+  accepting, which the ASGI server collapses into a bare HTTP 403, so those codes never
+  reach the wire and the status is all the panel has to relay.
 - **The node needs `CAO_WS_ALLOWED_CLIENTS`.** `cao-server` restricts terminal
   attaches to loopback by default, so it closes 4003 on the panel unless the panel's
   address (or `*`) is in that allowlist. Widening it is only safe behind a real
