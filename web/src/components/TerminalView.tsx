@@ -3,6 +3,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { X, Terminal as TermIcon } from 'lucide-react'
+import { terminalSocketUrl } from '../api'
 
 interface TerminalViewProps {
   terminalId: string
@@ -43,14 +44,9 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     term.loadAddon(fitAddon)
     term.open(el)
 
-    // Connect WebSocket
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    // BASE_URL carries the build-time `--base` and always ends in "/", so it
-    // joins straight onto `terminals/`. A `fetch` shim cannot cover this call,
-    // which is why the prefix is read here rather than patched in one place.
-    const ws = new WebSocket(
-      `${protocol}//${location.host}${import.meta.env.BASE_URL}terminals/${terminalId}/ws`,
-    )
+    // Connect WebSocket. The URL carries the app's path prefix and, when the
+    // fleet panel is serving, the active node's route — see api.ts.
+    const ws = new WebSocket(terminalSocketUrl(terminalId))
     ws.binaryType = 'arraybuffer'
 
     ws.onopen = () => {
