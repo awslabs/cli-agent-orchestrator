@@ -6,6 +6,7 @@ import hmac
 import os
 import re
 
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 import httpx
@@ -17,7 +18,39 @@ from starlette.background import BackgroundTask
 
 from . import client, config
 
-app = FastAPI(title="CAO Fleet Panel")
+
+@asynccontextmanager
+async def lifespan(_app):
+    """Keep the registry snapshot fresh when it comes from a ConfigMap.
+
+    The first read is awaited BEFORE the panel serves anything, so the readiness
+    probe's own `/api/fleet` call is already answering from the API server rather
+    than from whatever happened to be mounted. It is not fatal if it fails —
+    `load_machines()` falls back to the file, and the task below keeps trying —
+    because a panel that is up and one sync period stale is worth more than a pod
+    that CrashLoops while an operator fixes an RBAC binding.
+    """
+    if not config.FLEET_CONFIGMAP:
+        yield
+        return
+    error = await config.refresh_configmap()
+    if error:
+        print(f"[panel] fleet ConfigMap unavailable, falling back to {config.FLEET_CONFIG}: {error}")
+    task = asyncio.create_task(config.watch_configmap())
+    try:
+        yield
+    finally:
+        task.cancel()
+        # Awaited, not just cancelled: an un-awaited cancelled task logs
+        # "Task exception was never retrieved" on the way out, which reads as a
+        # shutdown fault in the pod's last lines of log.
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="CAO Fleet Panel", lifespan=lifespan)
 
 _ROOT = os.path.dirname(os.path.dirname(__file__))
 
@@ -195,7 +228,14 @@ async def fleet():
                 entry["error"] = type(exc).__name__
         return entry
 
-    return {"machines": await asyncio.gather(*[probe(m) for m in machines])}
+    # `source` is additive — every existing client reads `machines` and ignores
+    # the rest — and it is the only place a fallback to the mounted file is
+    # visible. Without it, a panel whose ConfigMap read is being denied looks
+    # identical to one whose workers are not registering.
+    return {
+        "machines": await asyncio.gather(*[probe(m) for m in machines]),
+        "source": config.configmap_status(),
+    }
 
 
 @app.post("/api/machines/{name}/launch")

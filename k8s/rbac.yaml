@@ -1,11 +1,18 @@
 # Every identity in the namespace, in one file, because the interesting property
-# is the comparison: exactly one of these three can talk to the Kubernetes API,
-# and it is the one that runs no agent.
+# is the comparison: the two that can talk to the Kubernetes API are exactly the
+# two that run no agent, and the two that run an agent hold no Kubernetes
+# permissions at all.
 #
-# All three are also Pod Identity subjects. Pod Identity keys on a (namespace,
-# serviceAccount) pair, so each name here must match an association in
-# iac/infrastructure.yaml - a name that matches nothing is a scheduling success
-# and an auth failure, which reads as a broken model rather than a broken binding.
+# The API-capable pair is also worth comparing to each other. The broker can
+# create pods; the panel can read one named object. Neither can do the other's
+# job, and neither can be reached by an agent that has been talked into trying.
+#
+# The three agent/broker identities are also Pod Identity subjects. Pod Identity
+# keys on a (namespace, serviceAccount) pair, so each of those names must match an
+# association in iac/infrastructure.yaml - a name that matches nothing is a
+# scheduling success and an auth failure, which reads as a broken model rather
+# than a broken binding. The panel is NOT such a subject: it calls no AWS API, so
+# it gets no AWS identity.
 ---
 # The supervisor: the pod a participant actually talks to. No Role and no
 # RoleBinding, so it holds no Kubernetes permissions at all. It asks the broker
@@ -101,3 +108,60 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: cao-worker-broker
+---
+# The panel: the second identity with API access, and the narrowest grant here.
+#
+# It reads the fleet registry from the API server rather than from a mounted
+# ConfigMap because the registry is not static — the broker rewrites it as elastic
+# workers take and release leases, and a mounted ConfigMap only refreshes on the
+# kubelet's sync period. A worker can be created, used and released inside that
+# window, so a mounted file can describe a fleet that no longer exists while
+# omitting the one that does. See app/config.py.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cao-fleet-panel
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-fleet-panel
+    app.kubernetes.io/part-of: cao-elastic-fleet
+automountServiceAccountToken: true
+---
+# One verb, one resource, one NAME.
+#
+# `resourceNames` is the point of this Role and not decoration: a ConfigMap `get`
+# without it is read access to every ConfigMap in the namespace, and the panel is
+# the one pod here that serves a human over a socket. Scoped this way, the worst a
+# compromised panel can read through the API is the node list it already renders.
+#
+# `list` and `watch` are absent, which is a real constraint rather than an
+# oversight: `resourceNames` cannot restrict them (a list request has no name to
+# match), so granting either would widen this back to the whole namespace. The
+# panel polls a single `get` instead, which is why app/config.py has a poll loop
+# rather than a watch.
+#
+# No `update`: the panel never writes the registry. The broker owns that.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cao-fleet-panel
+  namespace: cao-cluster
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cao-fleet-config"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cao-fleet-panel
+  namespace: cao-cluster
+subjects:
+  - kind: ServiceAccount
+    name: cao-fleet-panel
+    namespace: cao-cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cao-fleet-panel

@@ -471,12 +471,13 @@ def _wait_ready(worker_id: str) -> None:
 #
 # The panel renders whatever fleet.json lists and cannot discover an elastic
 # worker, because they are Jobs with generated names. The broker already owns that
-# lifecycle, so it publishes each leased worker into the ConfigMap the panel
-# mounts and withdraws it on release.
+# lifecycle, so it publishes each leased worker into the ConfigMap the panel reads
+# and withdraws it on release.
 #
-# The panel re-reads the file on every /api/fleet request, so no restart is
-# needed. A mounted ConfigMap is refreshed on the kubelet's sync period, so the
-# view can lag a lease.
+# The panel reads that ConfigMap from the API server rather than from a mount, so
+# what is written here is visible within its poll interval — a few seconds — and
+# not on the kubelet's sync period, which could otherwise be longer than the lease
+# itself.
 
 
 def _worker_machine(worker_id: str) -> dict[str, str]:
