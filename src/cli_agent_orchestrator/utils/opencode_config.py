@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,14 @@ def to_opencode_agent_id(profile_name: str) -> str:
 
     OpenCode treats the filename stem of an agent ``.md`` file as its agent ID
     (used for ``--agent <id>`` and keyed by the same value under
-    ``agent.<id>`` in ``opencode.json``). Profile names may contain ``/`` —
-    illegal in filenames — so the conversion replaces every slash with ``__``.
+    ``agent.<id>`` in ``opencode.json``).
+
+    Since the id becomes the ``<id>.md`` filename, any path separator left in it
+    would traverse out of ``OPENCODE_AGENTS_DIR``, so both ``/`` and ``\\`` are
+    flattened to ``__`` (backslash included because it is a separator on
+    Windows). ``install_service`` now *rejects* a resolved profile ``name:``
+    containing a separator outright, so this flatten is defence in depth rather
+    than the primary guard — and a namespaced ``name:`` is no longer installable.
 
     The output is the single source of truth for:
 
@@ -36,9 +43,9 @@ def to_opencode_agent_id(profile_name: str) -> str:
     - the ``agent.<id>.tools`` key written to ``opencode.json``
     - the value passed to ``opencode --agent <id>`` at runtime
 
-    Idempotent: inputs that contain no ``/`` are returned unchanged.
+    Idempotent: inputs that contain no separator are returned unchanged.
     """
-    return profile_name.replace("/", "__")
+    return flatten_path_separators(profile_name)
 
 
 def ensure_skills_symlink() -> None:

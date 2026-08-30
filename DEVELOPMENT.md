@@ -86,10 +86,10 @@ Unit tests are fast and use mocked dependencies:
 
 ```bash
 # Run all unit tests (excludes E2E and integration tests)
-uv run pytest test/ --ignore=test/e2e -m "not e2e and not integration" -v
+uv run pytest -v
 
 # Run with coverage report
-uv run pytest test/ --ignore=test/e2e -m "not e2e and not integration" --cov=src --cov-report=term-missing -v
+uv run pytest --cov=src --cov-report=term-missing -v
 
 # Run specific test file
 uv run pytest test/providers/test_claude_code_unit.py -v
@@ -104,16 +104,18 @@ Integration tests require the provider CLI to be installed and authenticated:
 
 ```bash
 # Run integration tests for a specific provider (example: Kiro CLI)
-uv run pytest test/providers/test_kiro_cli_integration.py -v
+uv run pytest test/providers/test_kiro_cli_integration.py -m integration -v
 
 # Skip integration tests
-uv run pytest test/providers/ -m "not e2e and not integration" -v
+uv run pytest test/providers/ -v
 ```
 
-A marker expression passed on the command line **replaces** the `-m 'not e2e'` in
-`addopts` (pyproject.toml) rather than adding to it, so every `-m` above spells out
-`not e2e` explicitly. Drop it and the 15 e2e-marked tests that live outside
-`test/e2e/` are selected — they need a running CAO server and a provider CLI.
+The default pytest configuration is the contributor unit-suite entry point and owns
+the marker selection. A regression test keeps integration tests and the 15 e2e-marked
+tests outside `test/e2e/` out of that suite. A command-line `-m` replaces the configured
+marker rather than composing with it, so use plain `uv run pytest` for this suite.
+For the same reason, running an integration suite requires opting back into its
+excluded marker explicitly with `-m integration`.
 
 ### E2E Tests
 
@@ -243,10 +245,12 @@ Add or update tests in `test/`
 
 ```bash
 # Run unit tests (fast, excludes E2E and integration)
-uv run pytest test/ --ignore=test/e2e -m "not integration" -v
+uv run pytest -v
 
-# Run all tests with coverage
-uv run pytest test/ --ignore=test/e2e --cov=src --cov-report=term-missing -v
+# Run the larger CI suite with coverage (see the exact command above)
+uv run pytest test/ --ignore=test/providers/test_kiro_cli_integration.py \
+  --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator \
+  --cov-report=term-missing -v
 ```
 
 ### 5. Check Code Quality
@@ -315,7 +319,7 @@ which kiro
 kiro --help
 
 # Run that provider's integration tests
-uv run pytest test/providers/test_kiro_cli_integration.py -v
+uv run pytest test/providers/test_kiro_cli_integration.py -m integration -v
 ```
 
 The same pattern applies to every provider that ships an `<provider>_integration.py` file — substitute the binary and the test filename.

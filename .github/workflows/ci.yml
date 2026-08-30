@@ -36,6 +36,8 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
+          # CI intentionally includes integration-marked tests except for the Kiro
+          # provider test, which requires an authenticated external CLI.
           uv run pytest test/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \

@@ -1,5 +1,6 @@
 """Service helpers for installing agent profiles."""
 
+import errno
 import logging
 import os
 import re
@@ -40,6 +41,10 @@ from cli_agent_orchestrator.utils.opencode_config import (
     upsert_mcp_server,
 )
 from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_opencode_permission
+from cli_agent_orchestrator.utils.path_validation import (
+    flatten_path_separators,
+    validate_path_component,
+)
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
@@ -219,10 +224,81 @@ def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
 
 
 def _write_context_file(agent_name: str, raw_content: str) -> Path:
-    """Write the unresolved profile source to the shared context directory."""
+    """Write the unresolved profile source to the shared context directory.
+
+    The context copy's filename derives from the profile's RESOLVED frontmatter
+    ``name:``. That value is NOT covered by ``_PROFILE_NAME_RE`` -- that regex
+    validates the install *source handle* (the URL stem / bare-name argument),
+    not the resolved name -- and a profile can be installed straight from a URL,
+    so the field is attacker-controlled. Without a guard, a name like
+    ``../../foo`` or an absolute path steers this write outside
+    ``AGENT_CONTEXT_DIR`` and can overwrite a trusted ``.md`` instruction file.
+
+    Three layers, all in this function (see the barrier note below):
+
+    1. ``validate_path_component`` -- the shared segment validator, which rejects
+       empty, ``.``/``..``, NUL, every path separator, and anything outside
+       ``[A-Za-z0-9._-]``. The allowlist also makes Unicode normalization a
+       non-issue: a fullwidth solidus (U+FF0F) is rejected outright rather than
+       having to be caught before it folds to ``/`` under NFKC.
+    2. Lexical containment under the realpath of the base directory.
+    3. ``O_NOFOLLOW`` at the open, so the kernel refuses to write *through* a
+       symlink at the final component.
+    """
     AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-    context_file = AGENT_CONTEXT_DIR / f"{agent_name}.md"
-    context_file.write_text(raw_content, encoding="utf-8")
+    # BARRIER PLACEMENT: the validation and the containment check are inlined
+    # here, in the same function as the os.open() sink, rather than factored into
+    # a helper. This mirrors the deliberate repetition in
+    # ``services/profile_store`` -- CodeQL's py/path-injection dataflow only
+    # recognises a barrier that guards, in the same function as the sink, the
+    # very variable that reaches it. A helper that returns a validated path is
+    # more readable but invisible to the analysis, and this repo has a history of
+    # that alert reopening (see profile_store._PROFILE_NAME_RE). Load-bearing,
+    # not an oversight.
+    safe_name = validate_path_component(agent_name, description="profile name")
+    # Resolve only the BASE (so a symlinked context root is handled) and keep the
+    # final component UNRESOLVED. Resolving the whole candidate -- as
+    # ``safe_join_under_base`` does -- would follow a symlink planted at the
+    # target and silently write to wherever it resolves; leaving the final
+    # component lexical means such a symlink is refused by O_NOFOLLOW below.
+    # That is why this does not simply call ``safe_join_under_base``.
+    base = os.path.realpath(AGENT_CONTEXT_DIR)
+    candidate = os.path.join(base, f"{safe_name}.md")
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise ValueError(
+            f"Refusing to write context copy: profile name {agent_name!r} resolves "
+            f"to a path outside the agent context directory ({candidate!r})."
+        )
+    context_file = Path(candidate)
+    # O_NOFOLLOW so the kernel itself refuses to write THROUGH a symlink at the
+    # final component: a plain ``write_text``/``open`` follows a symlink, so even
+    # after the containment check above, a symlink planted at the target
+    # (pre-existing, or swapped in via a check-then-write race) would let the
+    # write land outside the directory. O_TRUNC (not O_EXCL) so a normal
+    # reinstall still overwrites the profile's own regular-file copy. ELOOP on a
+    # symlink target becomes a clear refusal rather than an opaque OS error.
+    #
+    # Mode 0o600: this lives under ~/.aws/cli-agent-orchestrator/ and holds agent
+    # instruction content, so it does not need to be group/world readable.
+    #
+    # PLATFORM NOTE: os.O_NOFOLLOW does not exist on Windows, so getattr(...) is 0
+    # there and the kernel-level symlink refusal degrades to a no-op. The name
+    # validation and containment check above still hold on Windows; only the
+    # write-time symlink/race guard is POSIX-only. Acceptable because the primary
+    # deployment target is POSIX and the validation already blocks the traversal
+    # vectors; flagged so it is a conscious limitation, not a silent gap.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(context_file, flags, 0o600)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO):
+            raise ValueError(
+                f"Refusing to write context copy: {context_file} exists and is not a "
+                "regular file (symlink, directory, or device). Remove it and reinstall."
+            ) from exc
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(raw_content)
     return context_file
 
 
@@ -340,7 +416,12 @@ def install_agent(
         allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
         agent_file: Optional[Path] = None
-        safe_filename = profile.name.replace("/", "__")
+        # Defence in depth. The resolved profile name is attacker-controlled, but
+        # _write_context_file above has already REJECTED any name carrying a path
+        # separator, so nothing separator-bearing reaches these provider sinks in
+        # the normal flow. The flatten stays so each sink is independently safe if
+        # the order ever changes or a new caller appears.
+        safe_filename = flatten_path_separators(profile.name)
 
         if provider == ProviderType.KIRO_CLI.value:
             if profile.engine == KiroEngine.KAS:
