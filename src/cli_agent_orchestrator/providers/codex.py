@@ -1112,7 +1112,36 @@ class CodexProvider(BaseProvider):
 
             clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
 
-            if not trust_dismissed and re.search(TRUST_PROMPT_PATTERN, clean_output):
+            bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+            has_login = bool(
+                re.search(LOGIN_MENU_PATTERN, bottom_region)
+                and re.search(LOGIN_MENU_FOOTER, bottom_region)
+            )
+
+            # ``not has_login`` is what keeps the invariant below honest. Alone among
+            # the four signatures this loop recognises, the v1 trust check matches the
+            # WHOLE capture rather than ``bottom_region`` — so it can fire on trust
+            # copy sitting anywhere in scrollback, including text the login gate
+            # cannot see. Without this gate the handler would press Enter into a live
+            # login menu and *then* log that it was leaving the menu for the operator,
+            # which is both a lie and worse than the stall being fixed here: the
+            # keystroke selects a sign-in method, so the pane leaves the login menu
+            # and therefore the set ``initialize()`` is waiting on ({IDLE, COMPLETED,
+            # WAITING_USER_ANSWER}) — measured as PROCESSING on the API-key option;
+            # the OAuth option was not exercised. Either way a recoverable "operator
+            # must authenticate" becomes a TimeoutError and teardown.
+            #
+            # Deliberately gated here rather than by bottom-anchoring the search:
+            # anchoring would change trust-v1 detection for every codex launch, and a
+            # genuine trust prompt may legitimately sit higher than the bottom 15
+            # lines. Reading it as "if the bottom of the screen is the login menu,
+            # then whatever trust text is in the buffer is not the active dialog"
+            # keeps this scoped to the case at hand.
+            if (
+                not trust_dismissed
+                and not has_login
+                and re.search(TRUST_PROMPT_PATTERN, clean_output)
+            ):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Codex workspace trust prompt (v1) detected, auto-accepting")
@@ -1125,8 +1154,6 @@ class CodexProvider(BaseProvider):
                 last_prompt_time = time.monotonic()  # reset idle timer
                 await asyncio.sleep(1.0)
                 continue
-
-            bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
 
             if (
                 not trust_dismissed
@@ -1175,10 +1202,6 @@ class CodexProvider(BaseProvider):
             # dialog is active. The welcome banner alone is insufficient — it
             # renders as normal startup chrome BEFORE a late update dialog appears.
             has_idle = _has_startup_idle_composer(clean_output)
-            has_login = bool(
-                re.search(LOGIN_MENU_PATTERN, bottom_region)
-                and re.search(LOGIN_MENU_FOOTER, bottom_region)
-            )
             has_dialog = (
                 re.search(TRUST_PROMPT_PATTERN, bottom_region)
                 or (

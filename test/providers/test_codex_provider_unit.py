@@ -2840,6 +2840,39 @@ class TestCodexProviderUpdateDialog:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_trust_v1_does_not_fire_on_scrollback_above_a_live_login_menu(self, mock_tmux):
+        """Stale trust copy in scrollback must not make the handler answer the menu.
+
+        The v1 trust check is the only one of the four signatures matched against
+        the whole capture rather than ``bottom_region``, so before the ``not
+        has_login`` gate it could fire on text the login exit could not see. The
+        handler would then press Enter — selecting a sign-in method for the
+        operator — and log that it was leaving the menu alone, in that order.
+
+        The consequence is worse than the stall this branch fixes: the keystroke
+        selects a sign-in method, so the pane leaves the login menu and with it the
+        set ``initialize()`` waits on ({IDLE, COMPLETED, WAITING_USER_ANSWER}) —
+        measured as PROCESSING on the API-key option, with the OAuth option not
+        exercised. Either way the session is torn down on a TimeoutError instead
+        of waiting for the operator to authenticate.
+
+        One scrollback line is enough to demonstrate it, which is why the gate is
+        worth having even though no natural Codex sequence produces that line
+        today (the login menu renders *before* the trust prompt).
+        """
+        contaminated = (
+            "  $ echo 'allow Codex to work in this folder' >> notes.txt\n" + self.LOGIN_MENU_OUTPUT
+        )
+        mock_tmux.return_value.get_history.return_value = contaminated
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=20.0, outer_timeout=30.0)
+
+        mock_tmux.return_value.send_special_key.assert_not_called()
+        mock_tmux.return_value.send_keys.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_login_menu_does_not_short_circuit_a_stacked_trust_dialog(self, mock_tmux):
         """A trust dialog rendered over the login menu is still dismissed first.
 
@@ -2850,11 +2883,16 @@ class TestCodexProviderUpdateDialog:
         failure the idle-gap split in this PR exists to prevent. Hence the login
         exit is gated on no dismissable dialog being present.
         """
-        # A single stacked frame does NOT exercise the guard: the trust branch is
-        # earlier in the loop and ``continue``s, so the login check is never
-        # reached on that iteration. The guard only decides anything on a LATER
-        # iteration, once ``trust_dismissed`` is set but the dialog is still on
-        # screen — a rendering lag after Enter. Hence the same frame twice.
+        # A single stacked frame does NOT exercise the guard: the dismissal branch
+        # is earlier in the loop and ``continue``s, so the login check is never
+        # reached on that iteration. The guard decides something only on a LATER
+        # iteration, once the dialog has been answered but is still on screen — a
+        # rendering lag after Enter. Hence the same frame twice.
+        #
+        # Trust is not the only arm that gets there: ``has_dialog``'s third term is
+        # the same predicate as the update branch's condition, so a still-rendered
+        # update dialog reaches the guard once ``update_dismissed`` is set. Trust
+        # is used here because it is the cheaper frame to build.
         #
         # Both signatures must also land inside the 15-line bottom region, or
         # ``has_login`` is False and the guard is never reached: an earlier version
