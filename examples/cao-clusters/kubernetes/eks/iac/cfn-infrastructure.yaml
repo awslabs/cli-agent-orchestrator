@@ -154,14 +154,19 @@ Parameters:
   ClusterAdminPrincipalArn:
     Type: String
     Default: ""
+    AllowedPattern: "^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:(role|user)/[A-Za-z0-9+=,.@_/-]+$"
+    ConstraintDescription: >-
+      Must be empty or a permanent IAM role/user ARN. STS assumed-role session
+      ARNs are temporary and EKS access entries reject them.
     Description: >-
       Optional IAM principal to grant cluster-admin via an EKS access entry.
       REQUIRED in Workshop Studio: the stack is deployed by the WS provisioning
       role, so BootstrapClusterCreatorAdminPermissions grants admin to THAT
       principal and the participant role gets no cluster access at all - every
       kubectl command in the workshop then fails Unauthorized. Set this to the
-      participant role ARN. Leave empty when deploying by hand, where the
-      deploying principal is already the creator.
+      permanent participant IAM role ARN, never the STS assumed-role session ARN
+      returned by get-caller-identity. Leave empty when deploying by hand, where
+      the deploying principal is already the creator.
 
   # ---------------------------------------------------------------------------
   # Provider secret — only for providers that authenticate with an API key

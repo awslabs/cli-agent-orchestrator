@@ -55,6 +55,14 @@ first, speak once at the end".
   API key. Claude Code signs Bedrock requests with SigV4 using credentials from
   EKS Pod Identity, so there is no secret to sync. The one secret in the
   namespace is the broker token, minted locally by `deploy.sh`.
+- Before the first Anthropic model invocation, submit Anthropic's First Time Use
+  form from the Bedrock model catalog or with `PutUseCaseForModelAccess`.
+  Marketplace auto-subscription does not satisfy this separate prerequisite.
+  It is required once per account, or once in the AWS Organizations management
+  account where the root-account submission is inherited by member accounts;
+  opt-in Regions require a separate submission. See [Add or remove access to
+  Amazon Bedrock foundation
+  models](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html).
 - For a provider that authenticates with a key instead, see [Provider
   credentials](#provider-credentials) — read it before committing to that path.
 
@@ -74,12 +82,30 @@ pod — and it is the only thing this fleet puts in etcd.
 export AWS_REGION=us-east-1
 STACK_NAME=cao-workshop
 
+CALLER_ARN="$(aws sts get-caller-identity --query Arn --output text)"
+if [[ "${CALLER_ARN}" == arn:*:sts::*:assumed-role/*/* ]]; then
+  ROLE_NAME="${CALLER_ARN#*:assumed-role/}"
+  ROLE_NAME="${ROLE_NAME%%/*}"
+  CLUSTER_ADMIN_PRINCIPAL_ARN="$(
+    aws iam get-role --role-name "${ROLE_NAME}" --query Role.Arn --output text
+  )"
+else
+  CLUSTER_ADMIN_PRINCIPAL_ARN="${CALLER_ARN}"
+fi
+case "${CLUSTER_ADMIN_PRINCIPAL_ARN}" in
+  arn:*:iam::*:role/*|arn:*:iam::*:user/*) ;;
+  *)
+    echo "Cluster admin must be a permanent IAM role or user ARN" >&2
+    exit 1
+    ;;
+esac
+
 aws cloudformation deploy \
   --region "${AWS_REGION}" \
   --template-file examples/cao-clusters/kubernetes/eks/iac/cfn-infrastructure.yaml \
   --stack-name "${STACK_NAME}" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides ClusterAdminPrincipalArn="$(aws sts get-caller-identity --query Arn --output text)"
+  --parameter-overrides ClusterAdminPrincipalArn="${CLUSTER_ADMIN_PRINCIPAL_ARN}"
 
 aws eks update-kubeconfig --region "${AWS_REGION}" --name cao-workshop
 ```
@@ -88,6 +114,10 @@ aws eks update-kubeconfig --region "${AWS_REGION}" --name cao-workshop
 different principal from the one running `kubectl`:
 `BootstrapClusterCreatorAdminPermissions` grants admin to the *deploying*
 principal only, so without this every `kubectl` command fails `Unauthorized`.
+EKS access entries reject temporary `arn:...:sts::...:assumed-role/...` session
+principals. The command above resolves that session to its permanent IAM role
+with `iam:GetRole`; if that permission is unavailable, set
+`CLUSTER_ADMIN_PRINCIPAL_ARN` explicitly to the participant role ARN.
 
 Nodes are Graviton (`m7g.xlarge`, `AL2023_ARM_64_STANDARD`), matching the arm64
 code editor the images are built on. Build for the same architecture: a mismatch

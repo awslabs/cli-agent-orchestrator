@@ -34,7 +34,9 @@ def _response(status_code=200, json_body=None):
     resp.status_code = status_code
     resp.json.return_value = json_body if json_body is not None else {}
     if status_code >= 400:
-        resp.raise_for_status.side_effect = Exception(f"status {status_code}")
+        resp.raise_for_status.side_effect = requests.HTTPError(
+            f"status {status_code}", response=resp
+        )
     else:
         resp.raise_for_status.return_value = None
     return resp
@@ -77,6 +79,20 @@ class TestResolveRemoteProvider:
 
         mock_requests.get.return_value = _response(404)
         assert _resolve_remote_provider("http://x:9889", "ghost") == DEFAULT_PROVIDER
+
+    @patch(f"{_SRV}.requests")
+    def test_unpinned_remote_profile_falls_back_to_default(self, mock_requests):
+        from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
+
+        mock_requests.get.return_value = _response(200, {"name": "developer"})
+        assert _resolve_remote_provider("http://x:9889", "developer") == DEFAULT_PROVIDER
+
+    @pytest.mark.parametrize("status_code", [401, 429, 503])
+    @patch(f"{_SRV}.requests")
+    def test_remote_profile_http_error_is_not_treated_as_missing(self, mock_requests, status_code):
+        mock_requests.get.return_value = _response(status_code)
+        with pytest.raises(requests.HTTPError, match=f"status {status_code}"):
+            _resolve_remote_provider("http://x:9889", "developer")
 
     def test_unreachable_node_raises_instead_of_falling_back(self):
         """A connection-level failure must fail FAST (it doubles as the

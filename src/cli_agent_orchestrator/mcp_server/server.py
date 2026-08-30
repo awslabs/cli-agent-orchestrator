@@ -200,9 +200,11 @@ def _resolve_remote_provider(base_url: str, agent_profile: str) -> str:
     Mirrors ``utils.agent_profiles.resolve_provider`` but over HTTP: profiles
     are installed per node, so the caller's local store is the wrong place to
     look for a profile that will run remotely (the supervisor node typically
-    only installs supervisor profiles). Falls back to DEFAULT_PROVIDER when the
-    remote profile is missing or does not pin a provider — the remote node's
-    provider init will surface a clear error if that guess is wrong.
+    only installs supervisor profiles). Falls back to DEFAULT_PROVIDER only when
+    the remote profile is missing (404) or a successful response does not pin a
+    provider — the remote node's provider init will surface a clear error if that
+    guess is wrong. Other HTTP failures are raised rather than silently changing
+    providers.
 
     A CONNECTION-level failure raises instead of falling back: it doubles as
     the reachability probe for the whole remote call, and guessing a provider
@@ -210,7 +212,10 @@ def _resolve_remote_provider(base_url: str, agent_profile: str) -> str:
     full timeout budget on a node we already know is unreachable.
 
     Raises:
-        ValueError: the remote node could not be reached at all.
+        ValueError: the remote node could not be reached at all, or returned an
+            unexpected non-error status.
+        requests.HTTPError: the profile lookup returned an HTTP error other than
+            404.
     """
     try:
         response = requests.get(
@@ -222,10 +227,17 @@ def _resolve_remote_provider(base_url: str, agent_profile: str) -> str:
             f"cannot reach remote CAO node at {base_url} ({exc}); check "
             f"target_host and that the node's cao-server is up"
         )
-    if response.status_code == 200:
-        provider = response.json().get("provider")
-        if provider:
-            return str(provider)
+    if response.status_code == 404:
+        return DEFAULT_PROVIDER
+    if response.status_code != 200:
+        response.raise_for_status()
+        raise ValueError(
+            f"remote profile lookup at {base_url} returned unexpected "
+            f"HTTP {response.status_code}"
+        )
+    provider = response.json().get("provider")
+    if provider:
+        return str(provider)
     return DEFAULT_PROVIDER
 
 
