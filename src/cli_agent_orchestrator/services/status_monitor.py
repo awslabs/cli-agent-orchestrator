@@ -120,9 +120,20 @@ class StatusMonitor:
         # Per-terminal (status, monotonic) candidate from a stale-PROCESSING capture,
         # awaiting a second confirming read before being honored (see
         # _fresh_capture_pane_status). Cleared on confirm, on an intervening
-        # PROCESSING/UNKNOWN read, on expiry past STALE_PROCESSING_CONFIRM_TTL_S, and by
-        # notify_input_sent — a new turn invalidates whatever the pane showed before it.
+        # PROCESSING/UNKNOWN read, on expiry past STALE_PROCESSING_CONFIRM_TTL_S, by
+        # a real chunk landing in _process_chunk, and by notify_input_sent — new
+        # input or new output means whatever the pane showed before no longer
+        # describes the terminal.
         self._pending_stale_capture: Dict[str, Tuple[TerminalStatus, float]] = {}
+        # Per-terminal turn/output generation. Bumped under the lock by
+        # notify_input_sent (a new turn began) and by _process_chunk (real output
+        # arrived). A capture-pane verdict is only applied if the generation it was
+        # sampled under is still current at apply time: checking _last_status alone
+        # cannot see a new turn, because notify_input_sent deliberately leaves
+        # _last_status == PROCESSING while arming the revert — a stale ready verdict
+        # applied across that boundary would consume the arm and latch-block the new
+        # turn's genuine PROCESSING.
+        self._capture_generation: Dict[str, int] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -204,8 +215,14 @@ class StatusMonitor:
                 buffer = buffer[-state_buffer_max:]
             self._buffers[terminal_id] = buffer
             # Real new output just landed — the stale-PROCESSING quiet gate keys off this
-            # (see STALE_PROCESSING_BUFFER_QUIET_S).
+            # (see STALE_PROCESSING_BUFFER_QUIET_S). It also advances the capture
+            # generation and kills any pending capture candidate: output arriving
+            # means the terminal is demonstrably alive, so a ready verdict sampled
+            # before this chunk no longer describes it and must not be confirmable
+            # by a later read.
             self._buffer_changed_at[terminal_id] = time.monotonic()
+            self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            self._pending_stale_capture.pop(terminal_id, None)
             if use_screen:
                 self._feed_screen_locked(terminal_id, chunk)
 
@@ -234,53 +251,67 @@ class StatusMonitor:
         paste into a busy agent).
         """
         with self._lock:
-            last = self._last_status.get(terminal_id)
+            changed = self._apply_detection_locked(terminal_id, detected)
+        if changed:
+            # Publish outside the lock — subscribers must never be able to
+            # re-enter StatusMonitor while the latch state is mid-update.
+            bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
+            logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
 
-            # UNKNOWN is "no signal", not a state: never let it overwrite a known
-            # status. Mid-turn the screen can momentarily show neither a spinner
-            # nor the prompt (e.g. while a tool runs), which the detector reports
-            # as UNKNOWN; downgrading a known PROCESSING to UNKNOWN there is a
-            # spurious transition (observed live as processing->unknown->completed).
-            #
-            # Do NOT narrow this to "suppress only when not armed" (to let an
-            # armed new turn clear a stale ready status). It does not actually
-            # close that window — the rising-edge frame right after a paste still
-            # composites the PREVIOUS turn's COMPLETED box, so get_status() reports
-            # ready whether or not UNKNOWN is let through — and it opens a worse
-            # one: an armed ready->UNKNOWN->ready re-render (torn paste frame, then
-            # the prior turn repainted before the new spinner draws) makes the
-            # bounce back to COMPLETED a non-ready->ready upgrade that CONSUMES the
-            # revert arm. The genuine PROCESSING that follows is then latch-blocked
-            # and the terminal reads ready for the entire busy turn — exactly what
-            # InboxService must never paste into. See
-            # test_armed_unknown_then_ready_rerender_keeps_processing. The initial
-            # UNKNOWN (last is None, nothing detected yet) is still allowed through.
-            if detected == TerminalStatus.UNKNOWN and last is not None:
-                return
+    def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> bool:
+        """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
-            armed = self._allow_processing_revert.get(terminal_id, False)
-            if not armed:
-                if last in _STICKY_READY_STATUSES and detected in (
-                    TerminalStatus.PROCESSING,
-                    TerminalStatus.UNKNOWN,
-                ):
-                    return
-                if last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE:
-                    return
+        Split out so callers that need to validate a precondition and apply in
+        ONE critical section (the stale-PROCESSING capture path revalidating its
+        generation) can do so without a check-then-apply gap for
+        notify_input_sent to slip through. Returns True when the status changed;
+        the caller must then publish the change on the bus AFTER releasing the
+        lock (see _apply_detection for why).
+        """
+        last = self._last_status.get(terminal_id)
 
-            if detected == last:
-                return
+        # UNKNOWN is "no signal", not a state: never let it overwrite a known
+        # status. Mid-turn the screen can momentarily show neither a spinner
+        # nor the prompt (e.g. while a tool runs), which the detector reports
+        # as UNKNOWN; downgrading a known PROCESSING to UNKNOWN there is a
+        # spurious transition (observed live as processing->unknown->completed).
+        #
+        # Do NOT narrow this to "suppress only when not armed" (to let an
+        # armed new turn clear a stale ready status). It does not actually
+        # close that window — the rising-edge frame right after a paste still
+        # composites the PREVIOUS turn's COMPLETED box, so get_status() reports
+        # ready whether or not UNKNOWN is let through — and it opens a worse
+        # one: an armed ready->UNKNOWN->ready re-render (torn paste frame, then
+        # the prior turn repainted before the new spinner draws) makes the
+        # bounce back to COMPLETED a non-ready->ready upgrade that CONSUMES the
+        # revert arm. The genuine PROCESSING that follows is then latch-blocked
+        # and the terminal reads ready for the entire busy turn — exactly what
+        # InboxService must never paste into. See
+        # test_armed_unknown_then_ready_rerender_keeps_processing. The initial
+        # UNKNOWN (last is None, nothing detected yet) is still allowed through.
+        if detected == TerminalStatus.UNKNOWN and last is not None:
+            return False
 
-            self._last_status[terminal_id] = detected
-            if detected == TerminalStatus.PROCESSING:
-                self._allow_processing_revert[terminal_id] = False
-            elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
-                self._allow_processing_revert[terminal_id] = False
+        armed = self._allow_processing_revert.get(terminal_id, False)
+        if not armed:
+            if last in _STICKY_READY_STATUSES and detected in (
+                TerminalStatus.PROCESSING,
+                TerminalStatus.UNKNOWN,
+            ):
+                return False
+            if last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE:
+                return False
 
-        # Publish outside the lock — subscribers must never be able to
-        # re-enter StatusMonitor while the latch state is mid-update.
-        bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
-        logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
+        if detected == last:
+            return False
+
+        self._last_status[terminal_id] = detected
+        if detected == TerminalStatus.PROCESSING:
+            self._allow_processing_revert[terminal_id] = False
+        elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
+            self._allow_processing_revert[terminal_id] = False
+
+        return True
 
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 
@@ -536,8 +567,12 @@ class StatusMonitor:
             # A new turn is starting: whatever ready state a stale-PROCESSING capture saw
             # before this input no longer describes the terminal. Left armed, that candidate
             # could be "confirmed" by a single post-input read and latch ready against the
-            # new turn's genuine PROCESSING.
+            # new turn's genuine PROCESSING. The generation bump additionally invalidates
+            # any capture verdict already CONFIRMED but not yet applied — an in-flight
+            # get_status() that sampled the pane before this input must not stamp its
+            # stale verdict over the new turn (and consume the revert arm just set).
             self._pending_stale_capture.pop(terminal_id, None)
+            self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
         if assume_processing:
             self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
 
@@ -589,6 +624,7 @@ class StatusMonitor:
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
+            self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -612,6 +648,7 @@ class StatusMonitor:
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
+            self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -680,6 +717,10 @@ class StatusMonitor:
             # not wedged, and must not cost a subprocess call.
             with self._lock:
                 changed_at = self._buffer_changed_at.get(terminal_id)
+                # Pin the turn/output generation BEFORE the capture read. The pane
+                # is sampled outside the lock; only a verdict whose generation is
+                # still current at apply time may be applied (see below).
+                generation = self._capture_generation.get(terminal_id, 0)
             buffer_is_quiet = (
                 changed_at is not None
                 and time.monotonic() - changed_at >= STALE_PROCESSING_BUFFER_QUIET_S
@@ -697,20 +738,41 @@ class StatusMonitor:
                     ):
                         # The capture-pane read above ran OUTSIDE the lock — a real
                         # subprocess call, tens of milliseconds rather than microseconds —
-                        # so real new output can have arrived and genuinely resumed
-                        # PROCESSING in the meantime. Re-validate under the lock that this
-                        # is STILL the same stale-PROCESSING terminal before applying: a
-                        # capture taken against a since-superseded state must never
-                        # downgrade a terminal that is, right now, processing again.
+                        # so the world can have moved: real new output can have resumed
+                        # PROCESSING, or notify_input_sent can have started a whole new
+                        # turn. The latter is invisible to a _last_status check (a new
+                        # turn deliberately KEEPS _last_status == PROCESSING while arming
+                        # the revert), which is why the generation pinned before the read
+                        # is the authority here. Validate and apply in ONE critical
+                        # section — a check-then-apply gap would let notify_input_sent
+                        # slip between them, and the stale verdict would consume the arm
+                        # it just set, latch-blocking the new turn's genuine PROCESSING.
                         with self._lock:
                             current_last_status = self._last_status.get(terminal_id)
-                        if current_last_status == TerminalStatus.PROCESSING:
-                            self._apply_detection(terminal_id, fresh_capture)
+                            generation_current = (
+                                self._capture_generation.get(terminal_id, 0) == generation
+                            )
+                            apply_ok = (
+                                generation_current
+                                and current_last_status == TerminalStatus.PROCESSING
+                            )
+                            if apply_ok:
+                                changed = self._apply_detection_locked(terminal_id, fresh_capture)
+                        if apply_ok:
+                            if changed:
+                                bus.publish(
+                                    f"terminal.{terminal_id}.status",
+                                    {"status": fresh_capture.value},
+                                )
+                                logger.info(
+                                    f"Terminal {terminal_id} status changed: "
+                                    f"{fresh_capture.value}"
+                                )
                             return fresh_capture
                         logger.debug(
                             f"get_status [{terminal_id}]: fresh capture-pane result "
-                            "discarded — terminal status changed while the capture-pane "
-                            "read was in flight"
+                            "discarded — the terminal moved on (new input or new "
+                            "output) while the capture-pane read was in flight"
                         )
                         # The pipeline got there first: hand back ITS status rather than
                         # the `cached` value snapshotted at entry, which is now one step
@@ -744,8 +806,10 @@ class StatusMonitor:
         safe on rendered snapshots — the same contract terminal_service's deferred-init
         direct probe relies on), and providers with neither flag fail CLOSED: no capture,
         no verdict, the terminal stays PROCESSING until the pipeline resolves it.
-        Bounding the read to PYTE_SCREEN_ROWS also keeps stale scrollback from an earlier
-        turn out of whole-text matches (kiro's ERROR indicator is one such match).
+        The read is viewport-only (``visible_only=True`` — capture-pane ``-S 0``): a
+        ``tail_lines`` read would include scrollback ABOVE the viewport, and detectors
+        that match anywhere in their input (kimi/kiro ERROR indicators) would resurrect
+        text from finished turns. Only the currently rendered screen is evidence.
 
         A single capture is still not trusted even on a routed detector: Ink-style TUIs
         repaint by clear-then-rewrite, and a sample caught between those two steps can
@@ -794,11 +858,16 @@ class StatusMonitor:
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
 
+            # visible_only, NOT tail_lines: capture-pane's -S -N means "N history
+            # lines ABOVE the viewport, plus the viewport" — a tail_lines read
+            # includes scrollback, and detectors that match anywhere in their input
+            # (kiro/kimi ERROR indicators) would resurrect text from finished turns.
+            # Only the currently rendered screen is evidence about the current turn.
             fresh_output = get_backend().get_history(
                 provider.session_name,
                 provider.window_name,
-                tail_lines=PYTE_SCREEN_ROWS,
                 strip_escapes=True,
+                visible_only=True,
             )
         except Exception as e:
             logger.debug(

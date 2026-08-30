@@ -170,14 +170,13 @@ class TestStaleProcessingCapturePane:
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
-    def test_capture_is_bounded_to_viewport_and_escape_free(self, mock_pm, mock_get_backend):
-        """The pane read must be bounded to the rendered viewport (PYTE_SCREEN_ROWS) and
-        escape-free -- the input shape the routed detectors are calibrated for. An
-        unbounded read drags scrollback from earlier turns into whole-text matches (a
-        stale kiro error string surviving in scrollback would parse as ERROR, which is
-        sticky and makes agent_step raise)."""
-        from cli_agent_orchestrator.constants import PYTE_SCREEN_ROWS
-
+    def test_capture_is_viewport_only_and_escape_free(self, mock_pm, mock_get_backend):
+        """The pane read must be exactly the rendered viewport, escape-free -- the input
+        shape the routed detectors are calibrated for. A tail_lines read is NOT that:
+        capture-pane's ``-S -N`` starts N lines of scrollback ABOVE the viewport, so text
+        from finished turns rides along, and detectors that match anywhere in their input
+        resurrect it (a stale kimi/kiro error string in scrollback parses as ERROR, which
+        is sticky and makes agent_step raise -- while the actual visible pane is IDLE)."""
         provider = self._probe_provider(TerminalStatus.IDLE)
         mock_pm.get_provider.return_value = provider
         backend = _backend(event_inbox=False)
@@ -192,7 +191,7 @@ class TestStaleProcessingCapturePane:
         sm.get_status("t1")
 
         backend.get_history.assert_called_once_with(
-            "s1", "w1", tail_lines=PYTE_SCREEN_ROWS, strip_escapes=True
+            "s1", "w1", strip_escapes=True, visible_only=True
         )
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
@@ -435,6 +434,95 @@ class TestStaleProcessingCapturePane:
         )
         assert sm.get_status("t1") == TerminalStatus.PROCESSING
         assert backend.get_history.call_count == 1
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_real_chunk_between_reads_invalidates_the_candidate(
+        self, mock_pm, mock_get_backend, mock_settings
+    ):
+        """Real output arriving between the candidate read and the confirming read means
+        the terminal is demonstrably alive -- the earlier ready verdict no longer
+        describes it, and it must not be confirmable even after the buffer goes quiet
+        again. Otherwise a candidate from before the burst pairs with a read from after
+        it, and the two-read confirm degrades back to a single-frame latch."""
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = self._probe_provider(TerminalStatus.IDLE)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "idle-looking pane"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        # Read 1 records the IDLE candidate.
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.IDLE
+
+        # A real chunk lands via the real ingestion path -- provider reports PROCESSING
+        # for the buffer-driven detection so only the candidate bookkeeping is exercised.
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        sm._process_chunk("t1", "fresh spinner frame")
+        assert "t1" not in sm._pending_stale_capture
+
+        # Quiet returns, rate limit reset, and the pane reads IDLE again: this must be a
+        # FRESH candidate (returns PROCESSING), never a confirmation of the pre-chunk one.
+        # Empty the rolling buffer again so the cheap buffer re-check can't resolve the
+        # status on its own -- this test is about the capture path's candidate bookkeeping.
+        provider.get_status.return_value = TerminalStatus.IDLE
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_new_turn_during_the_confirming_read_discards_the_verdict(
+        self, mock_pm, mock_get_backend
+    ):
+        """notify_input_sent deliberately leaves _last_status == PROCESSING while arming
+        the revert, so a status re-check alone cannot see a new turn. If new input lands
+        while the confirming capture is in flight, the confirmed-but-stale verdict must
+        be discarded: applying it would stamp a pre-turn IDLE over the new turn AND
+        consume the revert arm it just set, latch-blocking the new turn's genuine
+        PROCESSING -- the exact failure the self-heal must never introduce."""
+        provider = self._probe_provider(TerminalStatus.IDLE)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "idle-looking pane"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        # Land the new input in the EXACT window: after _fresh_capture_pane_status has
+        # confirmed and popped the candidate, before get_status applies the verdict.
+        # (Input during the capture read itself is covered separately -- the candidate
+        # pop handles that; this pins the later, narrower window.)
+        real_probe = sm._fresh_capture_pane_status
+
+        def probe_then_new_turn(terminal_id):
+            verdict = real_probe(terminal_id)
+            if verdict == TerminalStatus.IDLE:
+                sm.notify_input_sent("t1")
+            return verdict
+
+        sm._fresh_capture_pane_status = probe_then_new_turn  # type: ignore[method-assign]
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING  # read 1: candidate only
+        sm._last_stale_capture_check["t1"] = None
+        result = sm.get_status("t1")  # read 2: confirmed, then the new turn intervenes
+
+        assert result == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        # The arm set by notify_input_sent must survive untouched for the new turn.
+        assert sm._allow_processing_revert["t1"] is True
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
