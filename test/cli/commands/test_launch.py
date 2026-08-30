@@ -9,9 +9,11 @@ from click.testing import CliRunner
 from cli_agent_orchestrator.cli.commands.launch import (
     _HEADLESS_TASK_TIMEOUT,
     _READINESS_WAIT_TIMEOUT,
+    _is_waiting_on_user,
     _parse_env_pairs,
     launch,
 )
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 # ── Backend auto-detection (issue #308) ──────────────────────────────
 
@@ -375,6 +377,143 @@ def test_launch_non_headless_attaches_even_if_wait_times_out():
         assert result.exit_code == 0
         assert "did not reach idle within 120s" in result.output
         mock_get_backend.return_value.attach_session.assert_called_once_with("test-session")
+
+
+# ── A screen that legitimately needs the operator is settled, not a stall ──
+#
+# A provider can finish init on a prompt only a human can answer (Codex's
+# first-run login menu is the case that forced this). Such a screen never
+# becomes IDLE on its own, so a readiness poll that accepts only
+# {IDLE, COMPLETED} burned the full _READINESS_WAIT_TIMEOUT and then blamed
+# init for a pane that was merely waiting — while telling the operator nothing
+# about the sign-in they had to complete.
+
+
+def test_readiness_poll_accepts_waiting_user_answer():
+    """WAITING_USER_ANSWER is in the pre-attach target set.
+
+    This is the assertion that matters: it pins the set itself, so narrowing it
+    back to {IDLE, COMPLETED} fails here rather than only showing up as a 120s
+    stall nothing in the suite waits around for.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch._is_waiting_on_user") as mock_waiting,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+        mock_waiting.return_value = False
+        mock_get_backend.return_value.attach_session.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        target_set = mock_wait.call_args[0][1]
+        assert TerminalStatus.WAITING_USER_ANSWER in target_set, (
+            "pre-attach poll must treat WAITING_USER_ANSWER as settled, or a "
+            f"first-run sign-in stalls for {_READINESS_WAIT_TIMEOUT}s; got {target_set}"
+        )
+        # The pre-existing members must survive the widening.
+        assert {TerminalStatus.IDLE, TerminalStatus.COMPLETED} <= target_set
+
+
+def test_launch_tells_the_operator_when_the_pane_awaits_an_answer():
+    """On a settled WAITING_USER_ANSWER the operator is told to finish it, not warned.
+
+    The "did not reach idle" warning would be actively wrong here: init did
+    finish, and the only thing outstanding is the human's answer.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch._is_waiting_on_user") as mock_waiting,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+        mock_waiting.return_value = True
+        mock_get_backend.return_value.attach_session.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert "waiting for an answer in the pane" in result.output
+        assert "did not reach idle" not in result.output
+        mock_get_backend.return_value.attach_session.assert_called_once_with("test-session")
+
+
+def test_launch_stays_quiet_when_the_terminal_settles_idle():
+    """The new hint must not fire on the ordinary path."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch._is_waiting_on_user") as mock_waiting,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+        mock_waiting.return_value = False
+        mock_get_backend.return_value.attach_session.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert "waiting for an answer" not in result.output
+        assert "did not reach idle" not in result.output
+
+
+def test_is_waiting_on_user_reads_the_live_status():
+    """True only for WAITING_USER_ANSWER."""
+    with patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "status": TerminalStatus.WAITING_USER_ANSWER.value
+        }
+        assert _is_waiting_on_user("t1") is True
+
+        mock_get.return_value.json.return_value = {"status": TerminalStatus.IDLE.value}
+        assert _is_waiting_on_user("t1") is False
+
+
+def test_is_waiting_on_user_swallows_transport_errors():
+    """A blip must not turn a successful launch into "Failed to connect to cao-server".
+
+    This helper only decides which advisory line to print, and it runs inside the
+    command's ``RequestException`` handler — so letting one escape would report a
+    connection failure to a server the poll just finished talking to.
+    """
+    import requests as _requests
+
+    with patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get:
+        mock_get.side_effect = _requests.exceptions.ConnectionError("boom")
+        assert _is_waiting_on_user("t1") is False
+
+    with patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get:
+        mock_get.return_value.status_code = 500
+        assert _is_waiting_on_user("t1") is False
 
 
 def test_launch_workspace_confirmation_accepted():

@@ -63,6 +63,35 @@ _READINESS_WAIT_TIMEOUT = 120
 _HEADLESS_TASK_TIMEOUT = 300
 
 
+def _is_waiting_on_user(terminal_id: str) -> bool:
+    """Return True when the terminal's live status is WAITING_USER_ANSWER.
+
+    Read separately because ``wait_until_terminal_status`` reports only whether
+    one of its target statuses was reached, not which one, and the pre-attach
+    poll accepts three.
+
+    Best-effort by design: this only decides which advisory line to print before
+    attaching, so a transport blip must not turn a successful launch into a
+    ``ClickException``. Hence the local except rather than letting it reach the
+    caller's ``RequestException`` handler, which reports "Failed to connect to
+    cao-server" — untrue here, since the poll above just talked to it.
+
+    ``RequestException`` alone is sufficient breadth, including for a non-JSON
+    body: ``requests.exceptions.JSONDecodeError`` subclasses both it and
+    ``ValueError``, and has since requests 2.27 — comfortably below this
+    project's ``requests>=2.32.0`` floor.
+    """
+    try:
+        resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+        if resp.status_code == 200:
+            # bool(): ``resp.json()`` is Any, so the comparison is too, and this
+            # function is annotated ``-> bool``.
+            return bool(resp.json().get("status") == TerminalStatus.WAITING_USER_ANSWER.value)
+    except requests.exceptions.RequestException:
+        pass
+    return False
+
+
 def _parse_env_pairs(pairs):
     """Parse repeated ``KEY=VALUE`` entries into a dict, validating each.
 
@@ -374,6 +403,21 @@ def launch(
         # silently drops keystrokes. See issue #220. The wait is advisory:
         # if it times out we still attach so the user can inspect the
         # half-initialized session rather than orphan it in tmux.
+        #
+        # WAITING_USER_ANSWER counts as settled here, not as a stall. A provider
+        # can finish initializing on a screen that legitimately needs the
+        # operator — Codex's first-run login menu is the case that forced this —
+        # and such a screen never becomes IDLE on its own, so waiting for IDLE
+        # burned the full ``_READINESS_WAIT_TIMEOUT`` and then blamed init for a
+        # pane that was simply waiting for a human. Safe because non-headless
+        # ``POST /sessions`` initializes synchronously (no ``initial_message``,
+        # see ``server_delivers_message`` above), so by the time this poll runs
+        # every provider's startup handler has already returned: a
+        # WAITING_USER_ANSWER here is a settled prompt, not a dialog caught
+        # mid-dismissal. If non-headless init is ever deferred, this poll would
+        # race the startup handler and attaching early would resize the pty
+        # mid-init — issue #220 again — so that change must gate attach on init
+        # completion rather than reuse this set.
         if not headless:
             # Align the CLI's backend singleton with the running server.
             # Without this, ``cao-server --terminal herdr`` + no config.json
@@ -381,7 +425,11 @@ def launch(
             sync_backend_from_server()
             ready = wait_until_terminal_status(
                 terminal["id"],
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+                {
+                    TerminalStatus.IDLE,
+                    TerminalStatus.COMPLETED,
+                    TerminalStatus.WAITING_USER_ANSWER,
+                },
                 timeout=_READINESS_WAIT_TIMEOUT,
             )
             if not ready:
@@ -390,6 +438,15 @@ def launch(
                         f"  Warning: {terminal['id']} did not reach idle within "
                         f"{_READINESS_WAIT_TIMEOUT}s — attaching anyway; input may be "
                         "unreliable until init completes.",
+                        fg="yellow",
+                    )
+                )
+            elif _is_waiting_on_user(terminal["id"]):
+                click.echo(
+                    click.style(
+                        f"  {terminal['id']} is waiting for an answer in the pane "
+                        "(a first-run sign-in, for example) — complete it after "
+                        "attaching.",
                         fg="yellow",
                     )
                 )
