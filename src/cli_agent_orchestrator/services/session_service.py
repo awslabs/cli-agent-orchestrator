@@ -251,7 +251,16 @@ def list_sessions() -> List[Dict]:
 
 
 def get_session(session_name: str) -> Dict:
-    """Get session with terminals."""
+    """Get session with terminals, oldest first.
+
+    ``terminals`` carries the same ordering contract as
+    ``list_terminals_by_session`` (see it): index 0 is the session's oldest
+    surviving terminal, normally its conductor. Stated here because this is the
+    path that reaches it over HTTP via ``GET /sessions/{name}`` --
+    ``examples/fleet/panel`` routes a user's message to ``terminals[0]``, and
+    ``ops_mcp_server.get_session_info`` hands the array to an external
+    supervisor that will read the first entry as the conductor.
+    """
     try:
         if not get_backend().session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")

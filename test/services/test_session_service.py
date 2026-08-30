@@ -133,6 +133,24 @@ class TestCreateSession:
         mock_create_terminal.assert_not_called()
 
 
+def _swallowed_log(caplog, message):
+    """Return the record ``session_service`` emitted for ``message``.
+
+    Selecting by logger name AND message, not by level: a level-only scan
+    (``any(r.exc_info for r in caplog.records if r.levelname == ...)``) passes
+    when ANY logger emits a record with a traceback at that level, so the
+    handler under test can lose its own ``exc_info`` and the assertion still
+    holds. ``caplog.text`` does not save it either — traceback text is included
+    in ``.text``, so a substring check is satisfiable by the traceback alone.
+    """
+    return next(
+        r
+        for r in caplog.records
+        if r.name == "cli_agent_orchestrator.services.session_service"
+        and r.getMessage().startswith(message)
+    )
+
+
 class TestListSessions:
     """Tests for list_sessions function."""
 
@@ -579,7 +597,7 @@ class TestListSessions:
         # The traceback must survive the swallow, or a DB problem here is
         # undiagnosable without reproducing locally.
         assert "database is locked" in caplog.text
-        assert any(r.exc_info for r in caplog.records if r.levelname == "WARNING")
+        assert _swallowed_log(caplog, "Failed to load terminal metadata").exc_info
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -608,7 +626,7 @@ class TestListSessions:
         assert result[0]["working_directory"] is None
         assert result[0]["agent_profile"] == "developer"
         assert "pane vanished" in caplog.text
-        assert any(r.exc_info for r in caplog.records if r.levelname == "WARNING")
+        assert _swallowed_log(caplog, "Failed to resolve working directory").exc_info
 
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_whole_listing_failure_logs_a_traceback(self, mock_get_backend, caplog):
@@ -627,7 +645,7 @@ class TestListSessions:
 
         assert result == []
         assert "tmux is gone" in caplog.text
-        assert any(r.exc_info for r in caplog.records if r.levelname == "ERROR")
+        assert _swallowed_log(caplog, "Failed to list sessions").exc_info
 
 
 @pytest.fixture
@@ -1127,3 +1145,47 @@ class TestDeleteSession:
             mock_capture.assert_any_call(tid)
             mock_dismantle.assert_any_call(tid, ANY, kill_window=False)
             mock_delete_row.assert_any_call(tid, ANY, registry=ANY)
+
+
+def test_list_sessions_reports_the_creator_as_owner(real_session_db, monkeypatch):
+    """End-to-end guard for #629's regression, at the layer users actually see.
+
+    The regression that prompted this test was caught by review, not by CI: the
+    unit test covering the batched read was GREEN while asserting the wrong
+    contract, because it pinned ``ORDER BY id`` — the very thing that broke
+    ownership. A test one layer up, on ``list_sessions()`` itself, would have
+    failed instead of endorsing it.
+
+    The ids matter: the creator's uuid4 prefix sorts ABOVE its worker's, so
+    ordering by ``id`` reports the worker's profile and worktree as the
+    session's, while creation order reports the creator's.
+    """
+    session_name = "cao-owner"
+    db_mod.create_terminal(
+        terminal_id="f0000000",
+        tmux_session=session_name,
+        tmux_window="supervisor-aaaa",
+        provider="kiro_cli",
+        agent_profile="supervisor",
+        working_directory="/repo/owner",
+    )
+    db_mod.create_terminal(
+        terminal_id="10000000",
+        tmux_session=session_name,
+        tmux_window="developer-bbbb",
+        provider="kiro_cli",
+        agent_profile="developer",
+        working_directory="/tmp/child-worktree",
+    )
+
+    backend = MagicMock()
+    backend.list_sessions.return_value = [{"id": session_name, "name": session_name}]
+    backend.get_pane_working_directory.side_effect = AssertionError(
+        "working_directory is persisted; the pane fallback must not be reached"
+    )
+    monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+
+    reported = list_sessions()[0]
+
+    assert reported["agent_profile"] == "supervisor"
+    assert reported["working_directory"] == "/repo/owner"

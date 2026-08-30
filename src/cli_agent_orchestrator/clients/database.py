@@ -57,9 +57,12 @@ class TerminalModel(Base):
     metadata_json = Column("metadata", Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
-    # ORDERING CONTRACT: reads of this table order by SQLite's implicit ``rowid``
-    # (``list_terminals_by_session`` / ``list_terminals_in_sessions``), so index 0
-    # of a session's terminals is its OLDEST SURVIVING row. Several consumers
+    # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
+    # and ``list_terminals_in_sessions`` -- order by SQLite's implicit ``rowid``,
+    # so index 0 of a session's terminals is its OLDEST SURVIVING row.
+    # (``list_siblings_by_group_prefix`` also reads this table by session and is
+    # deliberately NOT ordered: its consumer matches on group prefixes and does
+    # not take a first element. Order it too if that ever changes.) Several consumers
     # treat that as the session's conductor and one of them kills sessions on it.
     # rowid is not declared above, so the dependency is invisible here. Three
     # things break it SILENTLY:
@@ -1431,19 +1434,25 @@ def list_siblings_by_group_prefix(
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List a tmux session's terminals, oldest first.
 
-    **Index 0 is the session's oldest surviving terminal -- its conductor.**
-    That is a contract, not an accident of the query plan: ``session_service``
-    reports index 0's profile and directory as the SESSION's (#497),
+    **Index 0 is the session's oldest surviving terminal -- normally its
+    conductor.** That is a contract, not an accident of the query plan:
     ``flow_service`` decides whether to kill a session by whether index 0 is
-    busy, and ``cao session status``/``list`` label index 0 as the Conductor
-    over HTTP. Callers should cite this docstring rather than restate the rule.
+    busy, ``cao session status``/``list`` label index 0 as the Conductor over
+    HTTP, and ``session_service`` derives a session's reported profile and
+    directory from the earliest terminal that HAS either (#497) -- a first-match
+    scan rather than a bare index, so a conductor row with both fields NULL
+    still cedes ownership to a worker. Callers should cite this docstring rather
+    than restate the rule.
 
     Ordered by ``rowid``, which is insertion order, and normally creation order:
     every row is written at one site (``db_create_terminal``, called from
-    ``terminal_service.create_terminal``) and a child cannot be spawned by a
-    caller that has no row yet, because the MCP handoff path 404s on
-    ``GET /terminals/{caller_id}``. Reuse after deletion does not reorder
-    surviving rows -- see ``TerminalModel`` for the mechanism and its limits.
+    ``terminal_service.create_terminal``), and a worker's row cannot precede its
+    conductor's because the MCP handoff either resolves a caller that already
+    has a row (``GET /terminals/{caller_id}``, which raises if the id is stale)
+    or, when it is running outside a CAO terminal, records no caller at all and
+    starts a NEW session in which the worker is itself the conductor. Reuse
+    after deletion does not reorder surviving rows -- see ``TerminalModel`` for
+    the mechanism and its limits.
 
     Two known gaps, both pre-existing and neither introduced here:
 

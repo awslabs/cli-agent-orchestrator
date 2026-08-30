@@ -914,8 +914,11 @@ Prompt.
 
         assert result is False, "a busy conductor must block flow recycling"
         mock_get_backend.return_value.kill_session.assert_not_called()
-        # The whole point: the conductor's id was the one consulted.
-        assert mock_status_monitor.get_status.call_args_list[0].args[0] == "conductor"
+        # The whole point: the conductor's id was consulted, and ONLY it --
+        # assert_called_once_with also pins the docstring's "only check the
+        # first (conductor) terminal", which an index into call_args_list would
+        # miss, and it does not break if the call ever becomes keyword-style.
+        mock_status_monitor.get_status.assert_called_once_with("conductor")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")

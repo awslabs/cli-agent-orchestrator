@@ -1869,9 +1869,12 @@ class TestListTerminalsInSessions:
                 s.commit()
             # Sanity: with the index, an unordered read really does put the
             # worker first — so this case is exercising the ORDER BY and not
-            # asserting a no-op. Measured: plain ASC ``(tmux_session, id)``
-            # reorders the probe; a DESC one does not, which is the opposite of
-            # what you would guess.
+            # asserting a no-op. Which index shapes reorder is unintuitive and
+            # is a property of these ids rather than a general rule: measured
+            # for this pair, ``(tmux_session, id)`` and ``(tmux_session DESC,
+            # id)`` reorder the probe while ``(tmux_session, id DESC)`` and
+            # ``(tmux_session)`` alone do not. Hence the guard below rather than
+            # an assumption.
             # Probe with the SAME column list the production read selects. A
             # bare ``SELECT id`` gets a covering-index plan, which could keep
             # reordering after the production plan stopped — leaving the real
@@ -1890,6 +1893,36 @@ class TestListTerminalsInSessions:
             assert (
                 probe[0] == "10000000"
             ), "index no longer reorders; case has stopped discriminating"
+
+        for read in (
+            list_terminals_in_sessions(["cao-alpha"]),
+            list_terminals_by_session("cao-alpha"),
+        ):
+            assert [t["id"] for t in read] == ["f0000000", "10000000"]
+            assert read[0]["agent_profile"] == "supervisor"
+
+    def test_order_is_creation_order_not_recent_activity(self, db):
+        """Activity must not reorder a session. Pins the case against ``last_active``.
+
+        ``last_active`` is the obvious-looking "cleanup" for an implicit rowid
+        order — a real, declared column instead of a storage detail — and it is
+        exactly wrong. It is written only on input delivery
+        (``send_input``/``send_special_key``), so the conductor, which receives
+        operator input plus every worker callback, ends up with the LATEST value
+        and sorts LAST. ``TerminalModel`` argues this in prose; without this test
+        nothing enforces it, because every other test here happens to write
+        ``last_active`` in creation order, which makes the two orderings agree.
+
+        One keystroke to the conductor is enough to tell them apart: after it,
+        ``ORDER BY last_active`` returns the worker first while creation order
+        does not move. It also covers any write that re-inserts the row rather
+        than updating it in place (a delete-plus-insert reassigns rowid), which
+        the source-level upsert guard cannot see.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+
+        update_last_active("f0000000")  # the conductor receives one keystroke
 
         for read in (
             list_terminals_in_sessions(["cao-alpha"]),
@@ -1928,12 +1961,28 @@ class TestListTerminalsInSessions:
         """
         self._add(db, "zzz", "cao-alpha", agent_profile="supervisor")
         self._add(db, "aaa", "cao-alpha")
+        # A row in ANOTHER session, so "same result" is a real claim: without it,
+        # dropping either read's session filter is indistinguishable from keeping
+        # it, and only a mock call-shape assertion elsewhere notices.
+        self._add(db, "other", "cao-beta")
 
         batched = list_terminals_in_sessions(["cao-alpha"])
         per_session = list_terminals_by_session("cao-alpha")
 
         assert batched == per_session
         assert [t["id"] for t in batched] == ["zzz", "aaa"]
+        # Keys pinned absolutely, not just against each other — a key dropped
+        # from BOTH projections would otherwise pass while breaking consumers.
+        assert set(batched[0]) == {
+            "id",
+            "tmux_session",
+            "tmux_window",
+            "provider",
+            "agent_profile",
+            "working_directory",
+            "engine",
+            "last_active",
+        }
 
     def test_an_upsert_would_break_the_ordering_contract(self, db):
         """Demonstrates the one operation that moves a row within its session.

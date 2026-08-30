@@ -1,5 +1,6 @@
 """Tests for the session CLI command."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -222,6 +223,59 @@ class TestStatus:
 
         assert result.exit_code == 0
         assert "work5678" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_status_resolves_the_conductor_from_index_zero(self, mock_get, runner):
+        """``status`` must label index 0 as the Conductor, not any other terminal.
+
+        The sibling tests above return the SAME terminal payload for every
+        ``requests.get``, so they never observe *which* id was fetched — reading
+        ``terminals[-1]`` instead of ``terminals[0]`` passes all of them. This
+        routes by URL so the id actually gets pinned, which is what makes the
+        oldest-first guarantee on ``GET /sessions/{name}/terminals`` enforceable
+        from the client side rather than only documented.
+        """
+        listing = MagicMock(status_code=200)
+        listing.json.return_value = [
+            {"id": "cond1234", "agent_profile": "conductor", "provider": "kiro_cli"},
+            {"id": "work5678", "agent_profile": "dev", "provider": "kiro_cli"},
+        ]
+        by_id = {
+            "cond1234": {
+                "id": "cond1234",
+                "agent_profile": "conductor",
+                "provider": "kiro_cli",
+                "status": "idle",
+            },
+            "work5678": {
+                "id": "work5678",
+                "agent_profile": "dev",
+                "provider": "kiro_cli",
+                "status": "processing",
+            },
+        }
+
+        def _route(url, *args, **kwargs):
+            if url.endswith("/terminals"):
+                return listing
+            if "/output" in url:
+                out = MagicMock(status_code=200)
+                out.json.return_value = {"output": None}
+                return out
+            resp = MagicMock(status_code=200)
+            resp.json.return_value = by_id[url.rstrip("/").rsplit("/", 1)[-1]]
+            return resp
+
+        mock_get.side_effect = _route
+
+        result = runner.invoke(session, ["status", "cao-test", "--json"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        conductor = payload.get("conductor") or payload
+        assert (
+            conductor["id"] == "cond1234"
+        ), f"conductor must be terminals[0]; got {conductor['id']}"
 
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_status_workers_json(self, mock_get, runner):
