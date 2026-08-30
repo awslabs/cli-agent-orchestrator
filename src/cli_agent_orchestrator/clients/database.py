@@ -18,6 +18,8 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     literal_column,
+    select,
+    update,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
@@ -1712,6 +1714,55 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
     return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
+
+
+def claim_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
+    """Atomically move up to `limit` PENDING messages for receiver_id to DELIVERED.
+
+    Picks the oldest PENDING rows and flips them to DELIVERED in a single
+    ``UPDATE ... WHERE status = 'pending' ... RETURNING``, so concurrent callers
+    (the status-event path, the immediate-delivery path, and the retry sweep
+    can all reach the same receiver_id) never select and mark the same row
+    twice: whichever transaction's UPDATE lands first claims it, and every
+    later one finds it already DELIVERED and returns nothing for it.
+    """
+    with SessionLocal() as db:
+        pick = (
+            select(InboxModel.id)
+            .where(
+                InboxModel.receiver_id == receiver_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .order_by(InboxModel.created_at.asc())
+            .limit(limit)
+        )
+        stmt = (
+            update(InboxModel)
+            .where(InboxModel.id.in_(pick))
+            .values(status=MessageStatus.DELIVERED.value)
+            .returning(
+                InboxModel.id,
+                InboxModel.sender_id,
+                InboxModel.receiver_id,
+                InboxModel.message,
+                InboxModel.created_at,
+            )
+        )
+        rows = db.execute(stmt).all()
+        db.commit()
+        claimed = [
+            InboxMessage(
+                id=row.id,
+                sender_id=row.sender_id,
+                receiver_id=row.receiver_id,
+                message=row.message,
+                status=MessageStatus.DELIVERED,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
+        claimed.sort(key=lambda m: m.created_at)
+        return claimed
 
 
 def get_inbox_messages(

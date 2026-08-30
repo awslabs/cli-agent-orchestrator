@@ -5,10 +5,14 @@ Consumer: terminal.{id}.status
 
 import asyncio
 import logging
+import threading
+from contextlib import contextmanager
 from itertools import groupby
+from typing import Dict, Iterator, Tuple
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
+    claim_pending_messages,
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
@@ -29,6 +33,40 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+# terminal_id -> (lock, refcount). Same refcounted-per-key pattern as
+# session_lock.py's session_lifecycle_lock, kept separate rather than shared:
+# this guards a different critical section (message delivery, not session
+# create/teardown) and the two have no reason to block each other.
+_delivery_registry_guard = threading.Lock()
+_delivery_locks: Dict[str, Tuple[threading.Lock, int]] = {}
+
+
+@contextmanager
+def _terminal_delivery_lock(terminal_id: str) -> Iterator[None]:
+    """Serialize deliver_pending end to end for one terminal.
+
+    Claiming a row is atomic (#164, #406), but claim and delivery are two
+    separate steps: two concurrent callers can each claim a different PENDING
+    row for the same terminal and then both call terminal_service.send_input,
+    interleaving their paste/delay/Enter sequences at the tmux pane (#709).
+    Holding this lock across the whole read-check-claim-send-reset sequence
+    makes deliveries to one terminal fully sequential again; other terminals
+    are unaffected since each gets its own lock.
+    """
+    with _delivery_registry_guard:
+        lock, count = _delivery_locks.get(terminal_id, (threading.Lock(), 0))
+        _delivery_locks[terminal_id] = (lock, count + 1)
+    try:
+        with lock:
+            yield
+    finally:
+        with _delivery_registry_guard:
+            lock, count = _delivery_locks[terminal_id]
+            if count <= 1:
+                del _delivery_locks[terminal_id]
+            else:
+                _delivery_locks[terminal_id] = (lock, count - 1)
 
 
 class InboxService:
@@ -71,72 +109,73 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
-        limit = num_messages if num_messages > 0 else 100
-        messages = get_pending_messages(terminal_id, limit=limit)
-        if not messages:
-            return
-
-        status = status_monitor.get_status(terminal_id)
-        if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
-            # Not ready on the normal path. Eager delivery (#251) lets providers
-            # that accept input mid-turn receive messages while PROCESSING or
-            # WAITING_USER_ANSWER; only in that case do we need the provider.
-            eager_eligible = False
-            if EAGER_INBOX_DELIVERY and status in (
-                TerminalStatus.PROCESSING,
-                TerminalStatus.WAITING_USER_ANSWER,
-            ):
-                provider = provider_manager.get_provider(terminal_id)
-                eager_eligible = provider is not None and getattr(
-                    provider, "accepts_input_while_processing", False
-                )
-            if not eager_eligible:
+        with _terminal_delivery_lock(terminal_id):
+            limit = num_messages if num_messages > 0 else 100
+            messages = get_pending_messages(terminal_id, limit=limit)
+            if not messages:
                 return
 
-        # Mark DELIVERED before sending (#164). send_input() types into the tmux
-        # pane; that output flows back through the FIFO/StatusMonitor pipeline and
-        # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
-        # If the messages were still PENDING then, they would be delivered twice.
-        # Marking them DELIVERED first closes that window; the except path resets
-        # them to FAILED.
-        for message in messages:
-            update_message_status(message.id, MessageStatus.DELIVERED)
-
-        # Deliver in contiguous runs of the same sender. With the default
-        # num_messages=1 this is a single run; when draining all pending messages
-        # (num_messages=0) a batch can span multiple senders, so each run is sent
-        # separately to keep PostSendMessageEvent attribution correct — otherwise
-        # every message would be attributed to messages[0].sender_id.
-        for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
-            batch = list(group)
-            combined = "\n".join(m.message for m in batch)
-            try:
-                if registry is None:
-                    terminal_service.send_input(terminal_id, combined)
-                else:
-                    terminal_service.send_input(
-                        terminal_id,
-                        combined,
-                        registry=registry,
-                        sender_id=sender_id,
-                        orchestration_type=OrchestrationType.SEND_MESSAGE,
+            status = status_monitor.get_status(terminal_id)
+            if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                # Not ready on the normal path. Eager delivery (#251) lets providers
+                # that accept input mid-turn receive messages while PROCESSING or
+                # WAITING_USER_ANSWER; only in that case do we need the provider.
+                eager_eligible = False
+                if EAGER_INBOX_DELIVERY and status in (
+                    TerminalStatus.PROCESSING,
+                    TerminalStatus.WAITING_USER_ANSWER,
+                ):
+                    provider = provider_manager.get_provider(terminal_id)
+                    eager_eligible = provider is not None and getattr(
+                        provider, "accepts_input_while_processing", False
                     )
-                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
-            except TerminalNotFoundError as e:
-                # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
-                # for this window). Treat as transient: reset to PENDING so the
-                # reconcile sweep retries rather than marking FAILED. These were
-                # optimistically set to DELIVERED above. (#271 semantic.)
-                for message in batch:
-                    update_message_status(message.id, MessageStatus.PENDING)
-                logger.warning(
-                    f"Pane not resolvable for terminal {terminal_id}; leaving "
-                    f"{len(batch)} message(s) pending for retry: {e}"
-                )
-            except Exception as e:
-                for message in batch:
-                    logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
-                    update_message_status(message.id, MessageStatus.FAILED)
+                if not eager_eligible:
+                    return
+
+            # Claim atomically (#164, #406): a concurrent deliver_pending call for this
+            # terminal can reach this point before this one commits, so only an atomic
+            # UPDATE, not a prior read, decides who delivers each message.
+            messages = claim_pending_messages(terminal_id, limit=limit)
+            if not messages:
+                return
+
+            # Deliver in contiguous runs of the same sender. With the default
+            # num_messages=1 this is a single run; when draining all pending messages
+            # (num_messages=0) a batch can span multiple senders, so each run is sent
+            # separately to keep PostSendMessageEvent attribution correct: otherwise
+            # every message would be attributed to messages[0].sender_id.
+            for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
+                batch = list(group)
+                combined = "\n".join(m.message for m in batch)
+                try:
+                    if registry is None:
+                        terminal_service.send_input(terminal_id, combined)
+                    else:
+                        terminal_service.send_input(
+                            terminal_id,
+                            combined,
+                            registry=registry,
+                            sender_id=sender_id,
+                            orchestration_type=OrchestrationType.SEND_MESSAGE,
+                        )
+                    logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                except TerminalNotFoundError as e:
+                    # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
+                    # for this window). Treat as transient: reset to PENDING so the
+                    # reconcile sweep retries rather than marking FAILED. These were
+                    # optimistically set to DELIVERED above. (#271 semantic.)
+                    for message in batch:
+                        update_message_status(message.id, MessageStatus.PENDING)
+                    logger.warning(
+                        f"Pane not resolvable for terminal {terminal_id}; leaving "
+                        f"{len(batch)} message(s) pending for retry: {e}"
+                    )
+                except Exception as e:
+                    for message in batch:
+                        logger.error(
+                            f"Failed to deliver message {message.id} to {terminal_id}: {e}"
+                        )
+                        update_message_status(message.id, MessageStatus.FAILED)
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.
