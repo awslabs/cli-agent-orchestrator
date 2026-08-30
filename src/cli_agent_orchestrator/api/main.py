@@ -3023,7 +3023,13 @@ async def get_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        return session_service.get_session(session_name)
+        # session_service.get_session() calls status_monitor.get_status() once per
+        # terminal in the session, which for a PROCESSING terminal can shell out to a
+        # real tmux capture-pane subprocess (the stale-PROCESSING fallback). A session
+        # with N processing terminals would otherwise fork N times inline on the event
+        # loop per request — and the web UI polls this endpoint. Run it off the loop,
+        # matching GET /terminals/{id}'s established pattern for the identical hazard.
+        return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -6504,7 +6510,12 @@ async def create_inbox_message_endpoint(
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+        # deliver_pending reads status_monitor.get_status() (which can fork a tmux
+        # capture-pane via the stale-PROCESSING fallback) and, on delivery, paste-bombs
+        # the pane — blocking I/O either way, so keep it off the event loop.
+        await asyncio.to_thread(
+            inbox_service.deliver_pending, receiver_id, registry=get_plugin_registry(request)
+        )
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 

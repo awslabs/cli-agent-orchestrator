@@ -7,6 +7,7 @@ Publisher: terminal.{id}.status
 import asyncio
 import logging
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
@@ -45,6 +46,38 @@ _STICKY_READY_STATUSES = frozenset(
     }
 )
 
+# Stale-PROCESSING self-heal (#558). get_status()'s cheap re-check re-derives from the SAME
+# rolling buffer the FIFO pipeline feeds — and the moment a process goes genuinely idle it also
+# stops emitting output, so that buffer stops changing. If its final content never happened to
+# parse as a ready state (the idle marker rotated out of the bounded window, or a truncated
+# escape corrupted the tail), re-running detection on the unchanging buffer returns
+# PROCESSING/UNKNOWN forever: the pane already shows the finished response while every poller
+# sees PROCESSING. The #397 pipe-liveness watchdog cannot see this either — the FIFO delivered
+# its bytes, so the pipe looks healthy. Observed live: a queued message sat undelivered for
+# ~10 minutes until a manual tmux resize forced a redraw. The self-heal reads the pane directly
+# via get_backend().get_history() (a real ``tmux capture-pane``, NOT the FIFO-fed buffer — tmux
+# always holds the current rendered state regardless of output volume) and re-detects from that.
+# This constant rate-limits those reads: get_status() is a hot path (every wait_until_status
+# poll, every UI refresh, fleet-wide) and a capture-pane is a real subprocess fork — unbounded,
+# it would recreate the fork-storm class run()'s own docstring documents.
+STALE_PROCESSING_CAPTURE_INTERVAL_S = 3.0
+
+# The interval above bounds how OFTEN the fallback re-runs; this gates WHETHER it runs at all.
+# Without it, every genuinely busy terminal would eat a capture-pane subprocess every ~3s for
+# the entire duration of every ordinary turn, on top of the fifo watchdog's own probing. The
+# wedge's actual signature is "the rolling buffer stopped changing", so require exactly that:
+# only attempt a capture once no new chunk has been appended for this long. A terminal
+# mid-burst never reaches the fallback at all.
+STALE_PROCESSING_BUFFER_QUIET_S = 3.0
+
+# A ready verdict from a single capture is never honored on its own — it must repeat on the
+# next eligible read (see _fresh_capture_pane_status). This bounds how far apart those two
+# reads may be: a candidate older than this is dropped and confirmation starts over. Without
+# the bound, a candidate recorded during one turn could sit in the map indefinitely and be
+# "confirmed" by one lone mid-repaint frame much later — exactly the single-frame latch the
+# two-read confirm exists to prevent.
+STALE_PROCESSING_CONFIRM_TTL_S = 2 * STALE_PROCESSING_CAPTURE_INTERVAL_S
+
 
 class StatusMonitor:
     """Accumulates terminal output into rolling buffers and detects status changes."""
@@ -74,6 +107,22 @@ class StatusMonitor:
         # IDLE/COMPLETED would freeze the terminal forever even when the
         # agent is genuinely processing new work.
         self._allow_processing_revert: Dict[str, bool] = {}
+        # Per-terminal monotonic timestamp of the last stale-PROCESSING capture-pane
+        # attempt — the STALE_PROCESSING_CAPTURE_INTERVAL_S rate limit. Absence is None,
+        # deliberately NOT 0.0: time.monotonic()'s reference point is arbitrary, so a 0.0
+        # sentinel is indistinguishable from a genuine reading and could rate-limit the
+        # very first check before it ever runs.
+        self._last_stale_capture_check: Dict[str, Optional[float]] = {}
+        # Per-terminal monotonic timestamp of the last time _process_chunk actually
+        # appended a chunk (i.e. the buffer changed) — the STALE_PROCESSING_BUFFER_QUIET_S
+        # quiet gate reads this. Same None-vs-0.0 sentinel rule as above.
+        self._buffer_changed_at: Dict[str, Optional[float]] = {}
+        # Per-terminal (status, monotonic) candidate from a stale-PROCESSING capture,
+        # awaiting a second confirming read before being honored (see
+        # _fresh_capture_pane_status). Cleared on confirm, on an intervening
+        # PROCESSING/UNKNOWN read, on expiry past STALE_PROCESSING_CONFIRM_TTL_S, and by
+        # notify_input_sent — a new turn invalidates whatever the pane showed before it.
+        self._pending_stale_capture: Dict[str, Tuple[TerminalStatus, float]] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -154,6 +203,9 @@ class StatusMonitor:
             if len(buffer) > state_buffer_max:
                 buffer = buffer[-state_buffer_max:]
             self._buffers[terminal_id] = buffer
+            # Real new output just landed — the stale-PROCESSING quiet gate keys off this
+            # (see STALE_PROCESSING_BUFFER_QUIET_S).
+            self._buffer_changed_at[terminal_id] = time.monotonic()
             if use_screen:
                 self._feed_screen_locked(terminal_id, chunk)
 
@@ -481,6 +533,11 @@ class StatusMonitor:
         """
         with self._lock:
             self._allow_processing_revert[terminal_id] = True
+            # A new turn is starting: whatever ready state a stale-PROCESSING capture saw
+            # before this input no longer describes the terminal. Left armed, that candidate
+            # could be "confirmed" by a single post-input read and latch ready against the
+            # new turn's genuine PROCESSING.
+            self._pending_stale_capture.pop(terminal_id, None)
         if assume_processing:
             self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
 
@@ -529,6 +586,9 @@ class StatusMonitor:
             self._allow_processing_revert.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._last_stale_capture_check.pop(terminal_id, None)
+            self._buffer_changed_at.pop(terminal_id, None)
+            self._pending_stale_capture.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -549,6 +609,9 @@ class StatusMonitor:
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._last_stale_capture_check.pop(terminal_id, None)
+            self._buffer_changed_at.pop(terminal_id, None)
+            self._pending_stale_capture.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -606,7 +669,186 @@ class StatusMonitor:
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
                 self._apply_detection(terminal_id, fresh)
                 return fresh
+
+        if cached == TerminalStatus.PROCESSING:
+            # The cheap re-check above re-derives from the SAME rolling buffer the FIFO
+            # pipeline feeds — once the process stops emitting output, that buffer stops
+            # changing too, so the re-check can return PROCESSING/UNKNOWN forever while
+            # the real pane already shows the finished response (#558; the module
+            # constants above carry the full incident rationale). Consult the quiet gate
+            # BEFORE anything that could fork: a terminal still streaming chunks is busy,
+            # not wedged, and must not cost a subprocess call.
+            with self._lock:
+                changed_at = self._buffer_changed_at.get(terminal_id)
+            buffer_is_quiet = (
+                changed_at is not None
+                and time.monotonic() - changed_at >= STALE_PROCESSING_BUFFER_QUIET_S
+            )
+            if buffer_is_quiet:
+                fresh_capture = self._fresh_capture_pane_status(terminal_id)
+                if fresh_capture is not None:
+                    logger.debug(
+                        f"get_status [{terminal_id}]: cached=PROCESSING stale-buffer re-check "
+                        f"still PROCESSING/UNKNOWN, fresh capture-pane={fresh_capture.value}"
+                    )
+                    if (
+                        fresh_capture != TerminalStatus.PROCESSING
+                        and fresh_capture != TerminalStatus.UNKNOWN
+                    ):
+                        # The capture-pane read above ran OUTSIDE the lock — a real
+                        # subprocess call, tens of milliseconds rather than microseconds —
+                        # so real new output can have arrived and genuinely resumed
+                        # PROCESSING in the meantime. Re-validate under the lock that this
+                        # is STILL the same stale-PROCESSING terminal before applying: a
+                        # capture taken against a since-superseded state must never
+                        # downgrade a terminal that is, right now, processing again.
+                        with self._lock:
+                            current_last_status = self._last_status.get(terminal_id)
+                        if current_last_status == TerminalStatus.PROCESSING:
+                            self._apply_detection(terminal_id, fresh_capture)
+                            return fresh_capture
+                        logger.debug(
+                            f"get_status [{terminal_id}]: fresh capture-pane result "
+                            "discarded — terminal status changed while the capture-pane "
+                            "read was in flight"
+                        )
+                        # The pipeline got there first: hand back ITS status rather than
+                        # the `cached` value snapshotted at entry, which is now one step
+                        # stale.
+                        if current_last_status is not None:
+                            return current_last_status
         return cached
+
+    def _fresh_capture_pane_status(self, terminal_id: str) -> Optional[TerminalStatus]:
+        """Re-detect a stuck-PROCESSING terminal from a fresh pane capture (#558).
+
+        Reads the pane directly via ``get_backend().get_history()`` (a real ``tmux
+        capture-pane``, not the FIFO-fed rolling buffer) and re-runs provider detection
+        against it. tmux always holds the correct, current rendered pane state regardless
+        of output volume, so this can see the ready state a stale buffer cannot.
+
+        Detector routing: a capture-pane snapshot is RENDERED content — cursor moves
+        resolved, lines in on-screen order — a different input shape from the raw byte
+        stream most ``get_status()`` detectors are tuned against (see BaseProvider.
+        get_status's input contract). Feeding a rendered frame to a raw-stream detector
+        produces systematic misreads, not noise: in a rendered busy kiro frame the
+        always-drawn composer placeholder sits physically BELOW the working line and the
+        credits line, which its raw-stream ordering checks parse as COMPLETED — and a
+        deterministic misread sails straight through the two-read confirm below, because
+        both reads see the same bytes. Applied, that false ready sticky-latches, disarms
+        _allow_processing_revert, and blocks the agent's genuine PROCESSING for the rest
+        of the turn. So the capture is routed through the two existing opt-in predicates:
+        ``supports_screen_detection`` providers get their purpose-built
+        ``get_status_from_screen()`` (calibrated for exactly this composited-viewport
+        shape), ``supports_direct_status_probe`` providers get ``get_status()`` (declared
+        safe on rendered snapshots — the same contract terminal_service's deferred-init
+        direct probe relies on), and providers with neither flag fail CLOSED: no capture,
+        no verdict, the terminal stays PROCESSING until the pipeline resolves it.
+        Bounding the read to PYTE_SCREEN_ROWS also keeps stale scrollback from an earlier
+        turn out of whole-text matches (kiro's ERROR indicator is one such match).
+
+        A single capture is still not trusted even on a routed detector: Ink-style TUIs
+        repaint by clear-then-rewrite, and a sample caught between those two steps can
+        miss the spinner while the previous response box parses ready. The screen path
+        never samples mid-burst for exactly this reason (_schedule_screen_detection);
+        since this read fires at an arbitrary moment instead, it requires the SAME ready
+        status on two consecutive reads — the confirming read arriving within
+        STALE_PROCESSING_CONFIRM_TTL_S — before honoring it. The same confirm-don't-trust
+        pattern claude_code's wait_until_input_ready uses. The confirm still earns its
+        keep despite the quiet gate: the gate watches the FIFO-fed buffer, so a pane that
+        repaints without reaching the wedged FIFO can differ between reads.
+
+        Returns ``None`` when skipped (rate-limited, no provider, unroutable detector,
+        unconfirmed candidate, or any read/detection failure) — the caller treats that
+        identically to "still PROCESSING", never as a signal to change status. Only ever
+        called when cached status is already PROCESSING, so every failure path degrades
+        to today's behavior, never past it.
+        """
+        now = time.monotonic()
+        with self._lock:
+            last_check = self._last_stale_capture_check.get(terminal_id)
+            if last_check is not None and now - last_check < STALE_PROCESSING_CAPTURE_INTERVAL_S:
+                return None
+            self._last_stale_capture_check[terminal_id] = now
+
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception as e:
+            # get_provider() raises (not returns None) for a terminal it doesn't
+            # recognize (not yet / no longer in the DB) — same defensive shape as
+            # get_status()'s own event-inbox branch.
+            logger.debug(f"_fresh_capture_pane_status [{terminal_id}]: get_provider failed: {e}")
+            return None
+        if provider is None:
+            return None
+
+        use_screen = getattr(provider, "supports_screen_detection", False)
+        if not use_screen and not getattr(provider, "supports_direct_status_probe", False):
+            # Raw-stream-tuned detector with no snapshot-safe alternative (kiro_cli,
+            # cursor_cli): a rendered frame cannot be trusted as its input — see the
+            # docstring — so don't capture at all. Self-heal is opt-in via either flag,
+            # never a guess; these providers stay PROCESSING until the pipeline resolves
+            # them.
+            return None
+
+        try:
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            fresh_output = get_backend().get_history(
+                provider.session_name,
+                provider.window_name,
+                tail_lines=PYTE_SCREEN_ROWS,
+                strip_escapes=True,
+            )
+        except Exception as e:
+            logger.debug(
+                f"_fresh_capture_pane_status [{terminal_id}]: capture-pane read failed: {e}"
+            )
+            return None
+        if not fresh_output:
+            return None
+
+        try:
+            if use_screen:
+                detected = provider.get_status_from_screen(fresh_output.splitlines())
+            else:
+                detected = provider.get_status(fresh_output)
+        except Exception as e:
+            logger.debug(f"_fresh_capture_pane_status [{terminal_id}]: detection failed: {e}")
+            return None
+
+        if detected == TerminalStatus.PROCESSING or detected == TerminalStatus.UNKNOWN:
+            # Not a ready candidate — nothing to confirm. Clear any pending one: a busy
+            # read BETWEEN two ready reads means the terminal is genuinely still working,
+            # so the earlier candidate no longer describes a settled pane.
+            with self._lock:
+                self._pending_stale_capture.pop(terminal_id, None)
+            return detected
+
+        now = time.monotonic()
+        with self._lock:
+            pending = self._pending_stale_capture.get(terminal_id)
+            if (
+                pending is not None
+                and pending[0] == detected
+                and now - pending[1] <= STALE_PROCESSING_CONFIRM_TTL_S
+            ):
+                # Second consecutive matching read, in time — honor it.
+                self._pending_stale_capture.pop(terminal_id, None)
+                confirmed = True
+            else:
+                # First sighting, a different candidate than the pending one, or a
+                # candidate that aged out — (re)record with a fresh timestamp and wait
+                # for the next read to agree.
+                self._pending_stale_capture[terminal_id] = (detected, now)
+                confirmed = False
+        if not confirmed:
+            logger.debug(
+                f"_fresh_capture_pane_status [{terminal_id}]: candidate {detected.value} "
+                "recorded, awaiting a second confirming read before honoring it"
+            )
+            return None
+        return detected
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""
