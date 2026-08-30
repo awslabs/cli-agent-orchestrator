@@ -212,6 +212,7 @@ Parameters:
 Conditions:
   HasClusterAdminPrincipal: !Not [!Equals [!Ref ClusterAdminPrincipalArn, ""]]
   HasProviderSecret: !Not [!Equals [!Ref ProviderSecretName, ""]]
+  UseBedrock: !Equals [!Ref ProviderSecretName, ""]
 
 Resources:
   # ===========================================================================
@@ -674,14 +675,9 @@ Resources:
 
   # Bedrock access for the agent pods.
   #
-  # Created unconditionally, and it is a real trade-off worth stating rather than
-  # burying. The kiro-cli design this stack grew from gave the agent pods NO AWS
-  # identity at all, and bounded them further by blocking IMDS in
-  # ../networkpolicy.yaml. Claude Code on Bedrock authenticates with SigV4, which
-  # needs a real AWS identity on the pod — so this role is strictly more than the
-  # API-key path grants the agents, in exchange for needing no human: an API-key
-  # CLI whose only login is an interactive device flow cannot start a disposable
-  # pod unattended.
+  # Created only on the default Bedrock path. Setting ProviderSecretName selects
+  # API-key mode, where only the External Secrets Operator receives AWS identity
+  # and the agent pods remain credential-free.
   #
   # The mitigation is scope, not absence. This role grants model invocation and
   # nothing else: no S3, no Secrets Manager, no IAM, no EC2. A prompt-injected
@@ -694,6 +690,7 @@ Resources:
   # startup, prefer that path.
   AgentBedrockPolicy:
     Type: AWS::IAM::ManagedPolicy
+    Condition: UseBedrock
     Properties:
       ManagedPolicyName: !Sub "${NamePrefix}-agent-bedrock"
       Description: >-
@@ -739,6 +736,7 @@ Resources:
 
   AgentBedrockRole:
     Type: AWS::IAM::Role
+    Condition: UseBedrock
     Properties:
       RoleName: !Sub "${NamePrefix}-agent-bedrock-role"
       Description: Assumed by the CAO supervisor and worker pods through EKS Pod Identity.
@@ -769,6 +767,7 @@ Resources:
   # rollout restart.
   SupervisorPodIdentity:
     Type: AWS::EKS::PodIdentityAssociation
+    Condition: UseBedrock
     DependsOn: PodIdentityAgentAddon
     Properties:
       ClusterName: !Ref Cluster
@@ -778,6 +777,7 @@ Resources:
 
   WorkerPodIdentity:
     Type: AWS::EKS::PodIdentityAssociation
+    Condition: UseBedrock
     DependsOn: PodIdentityAgentAddon
     Properties:
       ClusterName: !Ref Cluster
@@ -1150,6 +1150,7 @@ Outputs:
     Value: !Sub "aws eks update-kubeconfig --region ${AWS::Region} --name ${Cluster}"
 
   AgentBedrockRoleArn:
+    Condition: UseBedrock
     Description: >-
       IAM role the supervisor and worker pods assume through Pod Identity. Their
       only AWS permission is Bedrock model invocation.

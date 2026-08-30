@@ -10,7 +10,7 @@ import requests
 
 from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.security.auth import get_local_bearer
-from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError, MemoryService
 
 
 def remote_memory_url() -> Optional[str]:
@@ -37,6 +37,24 @@ def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
         headers=_headers() or None,
         timeout=_timeout(),
     )
+    if response.status_code >= 400:
+        try:
+            error = response.json()
+        except (TypeError, ValueError):
+            error = {}
+        if error.get("error_kind") == MemoryPartialWriteError.error_kind:
+            partial = error.get("partial_write")
+            if isinstance(partial, dict):
+                required = ("key", "scope", "file_path")
+                if all(isinstance(partial.get(field), str) for field in required):
+                    scope_id = partial.get("scope_id")
+                    if scope_id is None or isinstance(scope_id, str):
+                        raise MemoryPartialWriteError(
+                            key=partial["key"],
+                            scope=partial["scope"],
+                            scope_id=scope_id,
+                            file_path=partial["file_path"],
+                        )
     response.raise_for_status()
     result: dict[str, Any] = response.json()
     return result

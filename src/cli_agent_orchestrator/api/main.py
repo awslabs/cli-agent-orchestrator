@@ -28,6 +28,7 @@ from typing import (
     cast,
 )
 
+import requests
 import yaml
 from fastapi import (
     BackgroundTasks,
@@ -3608,6 +3609,44 @@ async def exit_terminal(
         )
 
 
+def _notify_elastic_terminal_ended(terminal_id: str) -> None:
+    """Tell the broker that a one-shot worker terminal ended without assuming success."""
+    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
+    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
+    if not worker_id or not broker_url or not release_token:
+        return
+    try:
+        response = requests.post(
+            f"{broker_url}/workers/{worker_id}/terminal-ended",
+            json={"terminal_id": terminal_id},
+            headers={"X-CAO-Release-Token": release_token},
+            timeout=5.0,
+        )
+        # A completed lease may already have deleted its Job before this
+        # post-response task runs. The signal is then redundant.
+        if response.status_code != status.HTTP_404_NOT_FOUND:
+            response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning(
+            "Could not report terminal %s ending for elastic worker %s: %s",
+            terminal_id,
+            worker_id,
+            exc,
+        )
+
+
+def _schedule_elastic_terminal_ended(
+    background_tasks: BackgroundTasks,
+    terminal_id: str,
+    *,
+    teardown: bool,
+    reuse_terminal_id: Optional[str],
+) -> None:
+    if teardown and reuse_terminal_id is None:
+        background_tasks.add_task(_notify_elastic_terminal_ended, terminal_id)
+
+
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
@@ -3624,6 +3663,7 @@ async def exit_terminal(
 )
 async def run_step(
     request: Request,
+    background_tasks: BackgroundTasks,
     body: RunStepRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> RunStepResponse:
@@ -3934,6 +3974,12 @@ async def run_step(
             result.status.value if hasattr(result.status, "value") else str(result.status)
         )
         _settle_step(result.terminal_id, None, result.last_message, response_status)
+        _schedule_elastic_terminal_ended(
+            background_tasks,
+            result.terminal_id,
+            teardown=body.teardown,
+            reuse_terminal_id=body.reuse_terminal_id,
+        )
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
@@ -6984,6 +7030,25 @@ def _get_memory_service():
     return MemoryService()
 
 
+def _memory_partial_write_response(error: Any) -> JSONResponse:
+    """Preserve the typed partial-write contract across the HTTP boundary."""
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error_kind": error.error_kind,
+            "error": str(error),
+            "partial_write": {
+                "key": error.key,
+                "scope": error.scope,
+                "scope_id": error.scope_id,
+                "file_path": error.file_path,
+                "completed_phases": error.completed_phases,
+                "repair_command": error.repair_command,
+            },
+        },
+    )
+
+
 class InternalMemoryContext(BaseModel):
     terminal_id: Optional[str] = None
     session_name: Optional[str] = None
@@ -7027,19 +7092,26 @@ class InternalMemoryInjectionRequest(BaseModel):
 async def internal_memory_store(
     body: InternalMemoryStoreRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Dict[str, Any]:
+) -> Any:
     """Store memory on this node for a remote CAO worker."""
+    from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
+
     _require_memory_enabled()
-    memory = await _get_memory_service().store(
-        content=body.content,
-        scope=body.scope.value,
-        memory_type=body.memory_type.value,
-        key=body.key,
-        tags=body.tags,
-        terminal_context=(
-            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
-        ),
-    )
+    try:
+        memory = await _get_memory_service().store(
+            content=body.content,
+            scope=body.scope.value,
+            memory_type=body.memory_type.value,
+            key=body.key,
+            tags=body.tags,
+            terminal_context=(
+                body.terminal_context.model_dump(exclude_none=True)
+                if body.terminal_context
+                else None
+            ),
+        )
+    except MemoryPartialWriteError as error:
+        return _memory_partial_write_response(error)
     return {
         "memory": memory.model_dump(mode="json"),
         "action": memory.action,

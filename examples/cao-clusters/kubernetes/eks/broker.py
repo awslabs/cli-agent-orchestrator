@@ -126,7 +126,7 @@ config.load_incluster_config()
 batch_api = client.BatchV1Api()
 core_api = client.CoreV1Api()
 
-# worker_id -> {"state", "reason", "leased_at", "settled_at", "profile", "provider"}
+# worker_id -> lease lifecycle and placement observations
 _leases: dict[str, dict] = {}
 _leases_lock = threading.Lock()
 
@@ -180,6 +180,10 @@ class WorkerStatus(BaseModel):
     agent_profile: Optional[str] = None
     provider: Optional[str] = None
     age_seconds: int
+
+
+class TerminalEndedRequest(BaseModel):
+    terminal_id: str = Field(pattern=r"^[a-f0-9]{8}$")
 
 
 def _require_broker_token(value: Optional[str]) -> None:
@@ -563,16 +567,17 @@ def _release(worker_id: str) -> None:
             raise
 
 
-def _settle(worker_id: str, state: str, reason: Optional[str] = None) -> None:
+def _settle(worker_id: str, state: str, reason: Optional[str] = None) -> bool:
     with _leases_lock:
         lease = _leases.get(worker_id)
         if lease is None:
-            return
-        if lease["state"] != "leased":
-            return
+            return False
+        if lease["state"] not in {"creating", "leased"}:
+            return False
         lease["state"] = state
         lease["reason"] = reason
         lease["settled_at"] = time.monotonic()
+        return True
 
 
 def _release_and_settle(worker_id: str, state: str, reason: Optional[str] = None) -> None:
@@ -588,10 +593,10 @@ def _reap_once() -> None:
 
     Three distinct failures land here, and none of them is visible to the caller:
 
-    - `terminated`: the worker's pod ended while the lease was still open. The
-      usual cause is the TUI-watching turn detector firing on a preamble, which
-      kills the agent's window; `assign_elastic` has already reported success by
-      then, so nothing upstream knows the work did not happen.
+    - `terminated`: the one-shot terminal ended without `complete_assignment`,
+      or a pod that had already been observed disappeared/ended while leased.
+      The terminal-ended signal catches the TUI turn-detection race directly;
+      Pod phase cannot see a dead tmux window while cao-server remains running.
     - `failed`: the pod never reported Ready within READY_TIMEOUT - unschedulable,
       ImagePullBackOff, a crash-looping entrypoint. This case used to be caught
       synchronously inside POST /workers, which is why the lease could be handed
@@ -621,6 +626,7 @@ def _reap_once() -> None:
                 continue
             age = now - lease["leased_at"]
             ever_ready = lease.get("ready_at") is not None
+            pod_observed = lease.get("pod_observed_at") is not None
 
         selector = f"cao.aws/worker-id={worker_id}"
         try:
@@ -630,11 +636,30 @@ def _reap_once() -> None:
             continue
 
         if not pods:
-            _release_and_settle(
-                worker_id, "terminated", "worker pod disappeared while leased"
-            )
-            log.warning("worker %s: pod gone while leased, released", worker_id)
+            if pod_observed:
+                _release_and_settle(
+                    worker_id, "terminated", "worker pod disappeared while leased"
+                )
+                log.warning("worker %s: pod gone while leased, released", worker_id)
+            elif age > READY_TIMEOUT:
+                _release_and_settle(
+                    worker_id,
+                    "failed",
+                    f"worker pod was not created within {READY_TIMEOUT}s - check "
+                    "the Job controller, scheduling, and pod events",
+                )
+                log.warning(
+                    "worker %s: no pod created after %ss, released",
+                    worker_id,
+                    int(age),
+                )
             continue
+
+        if not pod_observed:
+            with _leases_lock:
+                lease = _leases.get(worker_id)
+                if lease is not None and lease["pod_observed_at"] is None:
+                    lease["pod_observed_at"] = now
 
         phase = pods[0].status.phase
         if phase in {"Failed", "Succeeded"}:
@@ -770,11 +795,12 @@ def create_worker(
     name = _job_name(worker_id)
     with _leases_lock:
         _leases[worker_id] = {
-            "state": "leased",
+            "state": "creating",
             "reason": None,
             "leased_at": time.monotonic(),
             "settled_at": None,
             "ready_at": None,
+            "pod_observed_at": None,
             "agent_profile": request.agent_profile,
             "provider": request.provider,
         }
@@ -788,6 +814,14 @@ def create_worker(
             _worker_job(worker_id, release_token, request),
         )
         core_api.create_namespaced_service(NAMESPACE, _worker_service(worker_id, job))
+        # The reaper ignores `creating` leases. Job-to-Pod creation is
+        # asynchronous, so `leased` still does not imply a Pod exists; the
+        # separate pod_observed_at marker distinguishes "not created yet" from
+        # "disappeared after creation".
+        with _leases_lock:
+            lease = _leases.get(worker_id)
+            if lease is not None and lease["state"] == "creating":
+                lease["state"] = "leased"
         # Published here rather than after readiness, because this call no longer
         # waits for it: a lease asserts PLACED, not ready. The panel therefore
         # shows a booting worker as unreachable for the seconds it takes to come
@@ -838,3 +872,23 @@ def complete_worker(
     _settle(worker_id, "completed", None)
     background_tasks.add_task(_release, worker_id)
     return {"release_scheduled": True}
+
+
+@app.post("/workers/{worker_id}/terminal-ended")
+def terminal_ended(
+    worker_id: str,
+    body: TerminalEndedRequest,
+    background_tasks: BackgroundTasks,
+    x_cao_release_token: Optional[str] = Header(default=None),
+) -> dict[str, bool]:
+    """Settle a one-shot worker whose terminal ended without completion."""
+    _require_release_token(worker_id, x_cao_release_token)
+    settled = _settle(
+        worker_id,
+        "terminated",
+        f"terminal {body.terminal_id} ended without calling complete_assignment; "
+        "the task was not confirmed complete",
+    )
+    if settled:
+        background_tasks.add_task(_release, worker_id)
+    return {"release_scheduled": settled}

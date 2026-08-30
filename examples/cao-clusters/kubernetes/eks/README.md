@@ -70,8 +70,8 @@ first, speak once at the end".
 
 The template creates a two-AZ VPC, an EKS cluster and managed node group, the
 required add-ons, two ECR repositories, the EFS workspace, the KMS key that
-envelope-encrypts Kubernetes Secrets, and the Pod Identity associations that give
-the supervisor and the workers Bedrock access.
+envelope-encrypts Kubernetes Secrets, and, on the default Bedrock path, the Pod
+Identity associations that give the supervisor and workers model access.
 
 The KMS key is worth one note: `EncryptionConfig` is **create-time only** on an
 EKS cluster, so a cluster built without it has to be replaced to get it. It is
@@ -223,7 +223,9 @@ resulting Kubernetes Secret with `envFrom` and `optional: true`, so no manifest
 learns about a new variable — whatever keys the Secrets Manager JSON holds become
 environment variables in the pods. `optional: true` is what keeps the default path
 free: on Bedrock the Secret is absent, and a required `secretRef` would hold every
-pod in `CreateContainerConfigError`.
+pod in `CreateContainerConfigError`. Setting `ProviderSecretName` also omits the
+Bedrock policy, role, and both agent Pod Identity associations, so only ESO
+receives AWS credentials in API-key mode.
 
 *The provider name.* Set `CAO_ELASTIC_WORKER_PROVIDER` on the broker Deployment to
 match the CLI in the image. It must match: a delegation resolves the provider from

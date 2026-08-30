@@ -52,6 +52,7 @@ STATE = {"jobs": {}, "services": {}, "pods": {}, "deleted_jobs": [], "deleted_sv
 # owns the deadline - so both "came up" and "never came up" have to be expressible.
 STATE["new_pods_ready"] = True
 STATE["new_pods_phase"] = "Running"
+STATE["create_pods"] = True
 
 
 class FakeBatch:
@@ -59,17 +60,18 @@ class FakeBatch:
         body.metadata.uid = "uid-" + body.metadata.name
         STATE["jobs"][body.metadata.name] = body
         wid = body.metadata.labels["cao.aws/worker-id"]
-        conditions = ([k8s.V1PodCondition(type="Ready", status="True")]
-                      if STATE["new_pods_ready"] else [])
-        pod = k8s.V1Pod(
-            metadata=k8s.V1ObjectMeta(name=body.metadata.name + "-abcde",
-                                      labels=dict(body.metadata.labels)),
-            status=k8s.V1PodStatus(
-                phase=STATE["new_pods_phase"],
-                conditions=conditions,
-            ),
-        )
-        STATE["pods"][wid] = pod
+        if STATE["create_pods"]:
+            conditions = ([k8s.V1PodCondition(type="Ready", status="True")]
+                          if STATE["new_pods_ready"] else [])
+            pod = k8s.V1Pod(
+                metadata=k8s.V1ObjectMeta(name=body.metadata.name + "-abcde",
+                                          labels=dict(body.metadata.labels)),
+                status=k8s.V1PodStatus(
+                    phase=STATE["new_pods_phase"],
+                    conditions=conditions,
+                ),
+            )
+            STATE["pods"][wid] = pod
         return body
 
     def read_namespaced_job(self, name, ns):
@@ -197,6 +199,72 @@ check("owner is the Job by uid",
 # these transitions can be driven a tick at a time instead of waited for.
 check("readiness gating is off by default", broker.GATE_ON_READY is False)
 
+# A reaper tick can overlap Kubernetes object creation. The lease must not be
+# considered active until both the Job and Service exist.
+with broker._leases_lock:
+    broker._leases["cafefeed"] = {
+        "state": "creating",
+        "reason": None,
+        "leased_at": time.monotonic() - (broker.READY_TIMEOUT + 1),
+        "settled_at": None,
+        "ready_at": None,
+        "pod_observed_at": None,
+        "agent_profile": "developer",
+        "provider": "claude_code",
+    }
+broker._reap_once()
+check(
+    "reaper ignores a lease while Kubernetes objects are being created",
+    broker._leases["cafefeed"]["state"] == "creating",
+    broker._leases["cafefeed"]["state"],
+)
+with broker._leases_lock:
+    del broker._leases["cafefeed"]
+
+# A Job exists before its controller creates a Pod. Empty Pod lists are normal
+# in that window and must not be called disappearance.
+STATE["create_pods"] = False
+lease_waiting_for_pod = broker.create_worker(
+    broker.WorkerRequest(agent_profile="developer"), "test-token"
+)
+waiting_id = lease_waiting_for_pod.worker_id
+broker._reap_once()
+check(
+    "no Pod before first observation is left alone inside READY_TIMEOUT",
+    broker._leases[waiting_id]["state"] == "leased",
+    broker._leases[waiting_id]["state"],
+)
+with broker._leases_lock:
+    broker._leases[waiting_id]["leased_at"] = time.monotonic() - (broker.READY_TIMEOUT + 1)
+broker._reap_once()
+check(
+    "a Pod never created by the deadline is failed, not terminated",
+    broker._leases[waiting_id]["state"] == "failed",
+    broker._leases[waiting_id]["state"],
+)
+check(
+    "never-created reason names Pod creation",
+    "was not created" in (broker._leases[waiting_id]["reason"] or ""),
+    str(broker._leases[waiting_id]["reason"]),
+)
+STATE["create_pods"] = True
+
+# Once a Pod has been observed, an empty list really does mean disappearance.
+observed_lease = broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+observed_id = observed_lease.worker_id
+broker._reap_once()
+check(
+    "reaper records the first Pod observation",
+    broker._leases[observed_id]["pod_observed_at"] is not None,
+)
+STATE["pods"].pop(observed_id)
+broker._reap_once()
+check(
+    "an observed Pod that disappears is terminated",
+    broker._leases[observed_id]["state"] == "terminated",
+    broker._leases[observed_id]["state"],
+)
+
 STATE["new_pods_ready"] = False
 _t0 = time.monotonic()
 lease0 = broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
@@ -299,7 +367,34 @@ with TestClient(broker.app) as c:
     check("ledger records completion",
           any(w["worker_id"] == wid and w["state"] == "completed" for w in r.json()), r.text[:300])
 
-    # --- 5. the false-success race: pod dies, complete never arrives ------
+    # --- 5. a one-shot terminal ends, complete never arrives --------------
+    r = c.post("/workers", json={"agent_profile": "developer"}, headers=H)
+    terminal_ended_lease = r.json()
+    terminal_ended_id = terminal_ended_lease["worker_id"]
+    r = c.post(
+        f"/workers/{terminal_ended_id}/terminal-ended",
+        json={"terminal_id": "abc12345"},
+        headers={"X-CAO-Release-Token": terminal_ended_lease["release_token"]},
+    )
+    check("terminal-ended signal is accepted", r.status_code == 200, r.text[:200])
+    check(
+        "terminal-ended signal settles the lease immediately",
+        broker._leases[terminal_ended_id]["state"] == "terminated",
+        broker._leases[terminal_ended_id]["state"],
+    )
+    check(
+        "terminal-ended reason names missing completion",
+        "without calling complete_assignment"
+        in (broker._leases[terminal_ended_id]["reason"] or ""),
+        str(broker._leases[terminal_ended_id]["reason"]),
+    )
+    check(
+        "terminal-ended signal releases the worker Job",
+        f"cao-worker-{terminal_ended_id}" in STATE["deleted_jobs"],
+        str(STATE["deleted_jobs"]),
+    )
+
+    # --- 6. pod terminal phase fallback, complete never arrives -----------
     r = c.post("/workers", json={"agent_profile": "developer"}, headers=H)
     wid2 = r.json()["worker_id"]
     STATE["pods"][wid2].status.phase = "Succeeded"
@@ -318,7 +413,7 @@ with TestClient(broker.app) as c:
     check("reaper released the squatting job", f"cao-worker-{wid2}" in STATE["deleted_jobs"],
           str(STATE["deleted_jobs"]))
 
-    # --- 6. completion deadline on a still-healthy pod --------------------
+    # --- 7. completion deadline on a still-healthy pod --------------------
     r = c.post("/workers", json={"agent_profile": "developer"}, headers=H)
     wid3 = r.json()["worker_id"]
     deadline = time.time() + 12
@@ -331,7 +426,7 @@ with TestClient(broker.app) as c:
     check("a healthy pod that never completes expires", st["state"] == "expired", json.dumps(st))
     check("expired job is released", f"cao-worker-{wid3}" in STATE["deleted_jobs"])
 
-    # --- 7. input validation still bounded -------------------------------
+    # --- 8. input validation still bounded -------------------------------
     r = c.post("/workers", json={"agent_profile": "../../etc/passwd"}, headers=H)
     check("path-ish profile rejected", r.status_code == 422, str(r.status_code))
     r = c.post("/workers", json={"agent_profile": "developer", "provider": "a b"}, headers=H)
@@ -345,7 +440,7 @@ with TestClient(broker.app) as c:
                .spec.template.spec.containers[0].image == os.environ["CAO_ELASTIC_WORKER_IMAGE"]),
           r.text[:200])
 
-# --- 8. a missing model pin must stop the broker, not the first task -----
+# --- 9. a missing model pin must stop the broker, not the first task -----
 import subprocess
 
 _env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_DEFAULT_HAIKU_MODEL"}
