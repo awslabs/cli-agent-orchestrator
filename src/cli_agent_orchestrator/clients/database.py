@@ -75,6 +75,19 @@ class TerminalModel(Base):
     # input delivery (send_input/send_special_key), so it is LATEST for the
     # busiest terminal, which is usually the conductor, and backfilling from it
     # inverts the very order this contract exists to preserve.
+    #
+    # Deliberately NOT ordered by ``caller_id IS NULL`` either, though it is
+    # tempting: a conductor created through ``create_session`` records no caller,
+    # while an MCP-spawned worker records its supervisor, so "no caller" looks
+    # like root-terminal identity. It is not total. ``caller_id`` is an OPTIONAL
+    # parameter of ``POST /sessions/{name}/terminals``, so a session whose root
+    # was created WITH an explicit caller (direct API use) and which later gains
+    # an operator-added terminal WITHOUT one would rank the operator's terminal
+    # ahead of the real root -- a failure that is reachable today. Ordering by
+    # rowid has no such case: its only hazard is the upsert named above, which
+    # nothing does and which ``test_no_upsert_against_the_terminals_table``
+    # guards. ``caller_id`` remains the right thing to read when you want the
+    # spawn parent of a specific terminal; it is not a sound sort key.
 
 
 class InboxModel(Base):

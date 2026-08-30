@@ -1839,7 +1839,15 @@ class TestListTerminalsInSessions:
             assert list_terminals_in_sessions([]) == []
             mock_local.assert_not_called()
 
-    def test_session_creator_is_first_not_the_lowest_uuid(self, db):
+    # ``indexed`` is not a detail — it is what makes this test discriminating.
+    # Without an index on ``tmux_session`` an UNORDERED read already scans in
+    # rowid order, so the unindexed case alone would pass with no ``ORDER BY``
+    # at all: it pins "not ordered by id" but not "ordered at all". The indexed
+    # case closes that, because the index makes an unordered probe return the
+    # lower-sorting worker first. Both cases are run so a reader can see which
+    # guarantee each one buys.
+    @pytest.mark.parametrize("indexed", [False, True], ids=["no_index", "with_index"])
+    def test_session_creator_is_first_not_the_lowest_uuid(self, db, indexed):
         """The conductor wins the ownership pick even when its id sorts last.
 
         ``_enrich_session_ownership`` takes a session's *first* terminal, so this
@@ -1851,54 +1859,36 @@ class TestListTerminalsInSessions:
         REACHABLE one: the creator is inserted first (a child cannot be spawned
         by a caller that has no row yet — the MCP handoff 404s on
         ``GET /terminals/{caller_id}``) but its uuid sorts ABOVE the child's. So
-        ``ORDER BY id`` fails this and creation order passes it.
+        ``ORDER BY id`` fails this, and with ``indexed`` so does no ORDER BY.
         """
         self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
         self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+        if indexed:
+            with db() as s:
+                s.execute(text("CREATE INDEX ix_probe ON terminals (tmux_session, id)"))
+                s.commit()
+            # Sanity: with the index, an unordered read really does put the
+            # worker first — so this case is exercising the ORDER BY and not
+            # asserting a no-op. Measured: plain ASC ``(tmux_session, id)``
+            # reorders the probe; a DESC one does not, which is the opposite of
+            # what you would guess.
+            with db() as s:
+                probe = [
+                    r[0]
+                    for r in s.execute(
+                        text("SELECT id FROM terminals WHERE tmux_session = 'cao-alpha'")
+                    )
+                ]
+            assert (
+                probe[0] == "10000000"
+            ), "index no longer reorders; case has stopped discriminating"
 
-        result = list_terminals_in_sessions(["cao-alpha"])
-
-        assert [t["id"] for t in result] == ["f0000000", "10000000"]
-        assert result[0]["agent_profile"] == "supervisor"
-
-    def test_order_survives_an_index_that_would_reorder_the_probe(self, db):
-        """An index added later must not change which terminal is the conductor.
-
-        This is what makes the ``ORDER BY`` load-bearing rather than decoration.
-        Today there is no index on ``tmux_session``, so an unordered read happens
-        to scan in rowid order and would pass the test above by luck. Adding the
-        obvious index — the natural reaction to a slow per-session lookup —
-        makes an UNORDERED read return the lower-sorting worker first. Measured:
-        a plain ASC ``(tmux_session, id)`` reorders the probe; a DESC one does
-        not, which is the opposite of what you would guess.
-        """
-        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
-        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
-        with db() as s:
-            s.execute(text("CREATE INDEX ix_probe ON terminals (tmux_session, id)"))
-            s.commit()
-
-        # Sanity: the index really does reorder an unordered read, so this test
-        # is exercising the ORDER BY rather than asserting a no-op.
-        with db() as s:
-            unordered = [
-                r[0]
-                for r in s.execute(
-                    text("SELECT id FROM terminals WHERE tmux_session = 'cao-alpha'")
-                )
-            ]
-        assert (
-            unordered[0] == "10000000"
-        ), "index no longer reorders; test has stopped discriminating"
-
-        assert [t["id"] for t in list_terminals_in_sessions(["cao-alpha"])] == [
-            "f0000000",
-            "10000000",
-        ]
-        assert [t["id"] for t in list_terminals_by_session("cao-alpha")] == [
-            "f0000000",
-            "10000000",
-        ]
+        for read in (
+            list_terminals_in_sessions(["cao-alpha"]),
+            list_terminals_by_session("cao-alpha"),
+        ):
+            assert [t["id"] for t in read] == ["f0000000", "10000000"]
+            assert read[0]["agent_profile"] == "supervisor"
 
     def test_rowid_reuse_after_deletion_does_not_reorder(self, db):
         """Deleting the newest terminal and adding another keeps the creator first.
@@ -1936,3 +1926,77 @@ class TestListTerminalsInSessions:
 
         assert batched == per_session
         assert [t["id"] for t in batched] == ["zzz", "aaa"]
+
+    def test_an_upsert_would_break_the_ordering_contract(self, db):
+        """Demonstrates the one operation that moves a row within its session.
+
+        ``INSERT OR REPLACE`` (and any upsert on the primary key) is a delete
+        plus an insert, so the replaced row is assigned a NEW rowid and jumps to
+        the END of its session — which would silently make a session report the
+        wrong conductor. This is not a bug being asserted as correct: it is the
+        documented limit of the ordering contract on ``TerminalModel``, pinned so
+        the consequence is visible rather than folded into a comment.
+
+        The companion guard below is what actually prevents it: this test shows
+        WHY that guard exists.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+        assert [t["id"] for t in list_terminals_by_session("cao-alpha")] == [
+            "f0000000",
+            "10000000",
+        ]
+
+        with db() as s:
+            s.execute(
+                text(
+                    "INSERT OR REPLACE INTO terminals "
+                    "(id, tmux_session, tmux_window, provider, agent_profile) "
+                    "VALUES ('f0000000', 'cao-alpha', 'win-f0000000', 'kiro_cli', 'supervisor')"
+                )
+            )
+            s.commit()
+
+        assert [t["id"] for t in list_terminals_by_session("cao-alpha")] == [
+            "10000000",
+            "f0000000",
+        ], "an upsert must be understood to move the row; if this ever passes unchanged, re-read the contract"
+
+
+def test_no_upsert_against_the_terminals_table():
+    """No code path may upsert ``terminals`` — it would silently reassign rowid.
+
+    The ownership contract (index 0 of a terminals read is a session's conductor)
+    rests on rowid being insertion order. ``INSERT OR REPLACE`` / ``REPLACE INTO``
+    / ``ON CONFLICT DO UPDATE`` / ``Session.merge`` all delete-and-reinsert, which
+    moves the row to the end of its session and hands the conductor role to a
+    worker — silently, with no test failing anywhere near the change.
+
+    A comment on the model cannot prevent that, so this scans the source instead.
+    Same shape as ``test/test_no_ffi_guard.py``: a cheap structural guard for an
+    invariant that no unit test can express. Use an ``UPDATE`` on ``terminals``.
+    """
+    import re
+
+    src_root = Path(__file__).resolve().parents[2] / "src"
+    assert src_root.is_dir(), src_root
+
+    # Upsert spellings. ``merge(`` is matched loosely and filtered below, since
+    # the word appears in unrelated contexts (dict merges, markdown merges).
+    upsert = re.compile(r"INSERT\s+OR\s+REPLACE|REPLACE\s+INTO|on_conflict_do_update", re.I)
+    offenders = []
+    for path in src_root.rglob("*.py"):
+        text_ = path.read_text(encoding="utf-8", errors="replace")
+        for match in upsert.finditer(text_):
+            line_no = text_.count("\n", 0, match.start()) + 1
+            line = text_.splitlines()[line_no - 1]
+            # Only care when the statement targets terminals. Comments that
+            # merely discuss the hazard (the TerminalModel contract) are fine.
+            window = text_[max(0, match.start() - 200) : match.start() + 200]
+            if "terminals" in window.lower() and not line.lstrip().startswith("#"):
+                offenders.append(f"{path.relative_to(src_root)}:{line_no}: {line.strip()}")
+
+    assert not offenders, (
+        "upsert against terminals would break the ownership ordering contract "
+        "(see TerminalModel); use UPDATE instead:\n  " + "\n  ".join(offenders)
+    )
