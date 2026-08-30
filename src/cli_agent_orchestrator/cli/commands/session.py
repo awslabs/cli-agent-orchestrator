@@ -45,8 +45,10 @@ def _get_terminal_output(terminal_id):
 def _resolve_conductor(session_name):
     """Return (conductor, all_terminals) for a session.
 
-    Index 0 is the conductor per the oldest-first order guaranteed by
-    ``GET /sessions/{name}/terminals`` — see that endpoint's description.
+    Index 0 is the session's oldest surviving terminal — normally its conductor
+    — per the order guaranteed by ``GET /sessions/{name}/terminals``; see that
+    endpoint's description, including why it is best-effort rather than an
+    identity.
     """
     terminals = _get_terminals(session_name)
     if not terminals:

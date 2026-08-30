@@ -1872,11 +1872,19 @@ class TestListTerminalsInSessions:
             # asserting a no-op. Measured: plain ASC ``(tmux_session, id)``
             # reorders the probe; a DESC one does not, which is the opposite of
             # what you would guess.
+            # Probe with the SAME column list the production read selects. A
+            # bare ``SELECT id`` gets a covering-index plan, which could keep
+            # reordering after the production plan stopped — leaving the real
+            # assertions below vacuous while this guard still passed.
             with db() as s:
                 probe = [
                     r[0]
                     for r in s.execute(
-                        text("SELECT id FROM terminals WHERE tmux_session = 'cao-alpha'")
+                        text(
+                            "SELECT id, tmux_session, tmux_window, provider, agent_profile, "
+                            "working_directory, engine, last_active FROM terminals "
+                            "WHERE tmux_session = 'cao-alpha'"
+                        )
                     )
                 ]
             assert (
