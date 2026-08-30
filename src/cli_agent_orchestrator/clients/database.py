@@ -17,6 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    literal_column,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
@@ -55,6 +56,25 @@ class TerminalModel(Base):
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+
+    # ORDERING CONTRACT: reads of this table order by SQLite's implicit ``rowid``
+    # (``list_terminals_by_session`` / ``list_terminals_in_sessions``), because a
+    # session's FIRST terminal is its conductor and several consumers depend on
+    # that -- one of them kills sessions on it. rowid is not declared above, so
+    # the dependency is invisible here; three things would silently break it:
+    #   * declaring this table WITHOUT ROWID (rowid ceases to exist),
+    #   * giving ``id`` INTEGER affinity (rowid becomes an alias for it),
+    #   * an ``INSERT OR REPLACE``/upsert against terminals -- a replace deletes
+    #     and re-inserts, so the row is assigned a NEW rowid and jumps to the end
+    #     of its session. Nothing does this today (the only INSERT OR REPLACE in
+    #     the tree is on workflow_run_step); use an UPDATE if that changes.
+    # Deliberately NOT a ``created_at`` column: rowid already records insertion
+    # order exactly and correctly for every row in every existing database,
+    # whereas a new column has to invent the value for rows that predate it, and
+    # there is no honest source for it -- ``last_active`` is written only on
+    # input delivery (send_input/send_special_key), so it is LATEST for the
+    # busiest terminal, which is usually the conductor, and backfilling from it
+    # inverts the very order this contract exists to preserve.
 
 
 class InboxModel(Base):
@@ -1378,9 +1398,37 @@ def list_siblings_by_group_prefix(
 
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
-    """List all terminals in a tmux session."""
+    """List a tmux session's terminals, oldest first.
+
+    **Index 0 is the session's oldest surviving terminal -- its conductor.**
+    That is a contract, not an accident of the query plan: ``session_service``
+    reports index 0's profile and directory as the SESSION's (#497),
+    ``flow_service`` decides whether to kill a session by whether index 0 is
+    busy, and ``cao session status``/``list`` label index 0 as the Conductor
+    over HTTP. Callers should cite this docstring rather than restate the rule.
+
+    Ordered by ``rowid``, which is insertion order, which is creation order:
+    a terminal's row is committed inside ``session_lifecycle_lock`` before the
+    terminal can do anything (terminal_service.create_terminal), and a child
+    cannot be spawned by a caller that has no row yet -- the MCP handoff path
+    404s on ``GET /terminals/{caller_id}``. So the root's rowid is always below
+    its workers'. Reuse after deletion cannot invert this: SQLite assigns
+    ``max(rowid)+1`` over the whole table, so a new row outranks every LIVE row
+    including all of its own session's. See ``TerminalModel`` for what would
+    break the contract.
+
+    This ORDER BY does not change what this function returned before it was
+    added -- an unordered scan of a rowid table already yielded rowid order.
+    It states the order instead of inheriting it, so an index added later
+    cannot quietly change which terminal is the conductor.
+    """
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
         return [
             {
                 "id": t.id,
@@ -1430,13 +1478,25 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
     session names keeps the cost proportional to the workload instead of to the
     leak.
 
-    Ordered by ``id`` explicitly. The caller picks a session's "first known
-    terminal", so the pick is order-sensitive, and without an ``ORDER BY`` the
-    order is whatever plan the engine plans: today every plan is a rowid scan
-    (there is no index on ``tmux_session``), but adding one — the obvious
-    reaction to a slow per-session lookup — can reorder an equality probe when
-    the index carries a DESC component. Ordering here makes the pick specified
-    rather than incidental.
+    Ordered by ``rowid``, identically to ``list_terminals_by_session`` -- see
+    that function for the index-0-is-the-conductor contract and why rowid
+    expresses creation order. The two MUST order the same way: the caller picks
+    a session's "first known terminal", so the pick is order-sensitive, and an
+    ordered batched read beside an unordered per-session read is what let this
+    function silently disagree with the one it replaced.
+
+    The ORDER BY is not decoration. Without it the order is whatever the engine
+    plans: today every plan is a rowid scan (there is no index on
+    ``tmux_session``), but adding one -- the obvious reaction to a slow
+    per-session lookup -- reorders the probe. Measured, a plain ASC index on
+    ``(tmux_session, id)`` makes an unordered read return a worker ahead of the
+    session creator; ordering here is what keeps the conductor first.
+
+    Ordering by ``id`` would NOT do that: ``id`` is ``uuid4().hex[:8]``
+    (utils/terminal.generate_terminal_id), so it makes the conductor a
+    deterministic *random* terminal, and a session whose creator happens to sort
+    above one of its own workers advertises the worker's profile and directory as
+    the session's.
 
     Returns an empty list without querying when given no session names.
     """
@@ -1446,7 +1506,7 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
         terminals = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session.in_(tmux_sessions))
-            .order_by(TerminalModel.id)
+            .order_by(literal_column("terminals.rowid"))
             .all()
         )
         return [

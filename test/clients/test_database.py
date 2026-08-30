@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import (
@@ -219,7 +219,7 @@ class TestTerminalOperations:
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.all.return_value = [mock_terminal]
+        mock_query.filter.return_value.order_by.return_value.all.return_value = [mock_terminal]
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -1794,7 +1794,7 @@ class TestListTerminalsInSessions:
         return Local
 
     @staticmethod
-    def _add(Local, terminal_id, tmux_session):
+    def _add(Local, terminal_id, tmux_session, agent_profile="developer"):
         with Local() as s:
             s.add(
                 TerminalModel(
@@ -1802,7 +1802,7 @@ class TestListTerminalsInSessions:
                     tmux_session=tmux_session,
                     tmux_window=f"win-{terminal_id}",
                     provider="kiro_cli",
-                    agent_profile="developer",
+                    agent_profile=agent_profile,
                     working_directory=f"/w/{terminal_id}",
                     last_active=datetime.now(),
                 )
@@ -1839,26 +1839,98 @@ class TestListTerminalsInSessions:
             assert list_terminals_in_sessions([]) == []
             mock_local.assert_not_called()
 
-    def test_orders_by_id_within_a_session(self, db):
-        """The order is specified, not whatever plan the engine picks.
+    def test_session_creator_is_first_not_the_lowest_uuid(self, db):
+        """The conductor wins the ownership pick even when its id sorts last.
 
-        The caller (``_enrich_session_ownership``) takes a session's *first*
-        known terminal, so this order decides which terminal supplies the
-        reported agent_profile/working_directory. Rows are inserted in reverse
-        id order here so insertion order cannot be what makes it pass.
+        ``_enrich_session_ownership`` takes a session's *first* terminal, so this
+        order decides which terminal's agent_profile/working_directory is
+        reported as the session's. Ordering by ``id`` would decide it by
+        ``uuid4().hex[:8]`` — a deterministic *random* terminal.
+
+        The ids are the ones from the #703 review, and the insertion order is the
+        REACHABLE one: the creator is inserted first (a child cannot be spawned
+        by a caller that has no row yet — the MCP handoff 404s on
+        ``GET /terminals/{caller_id}``) but its uuid sorts ABOVE the child's. So
+        ``ORDER BY id`` fails this and creation order passes it.
         """
-        for terminal_id in ("z9", "m5", "a1"):
-            self._add(db, terminal_id, "cao-alpha")
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
 
         result = list_terminals_in_sessions(["cao-alpha"])
 
-        assert [t["id"] for t in result] == ["a1", "m5", "z9"]
+        assert [t["id"] for t in result] == ["f0000000", "10000000"]
+        assert result[0]["agent_profile"] == "supervisor"
 
-    def test_matches_the_per_session_read_shape(self, db):
-        """Same keys as ``list_terminals_by_session``, so callers are interchangeable."""
-        self._add(db, "a1", "cao-alpha")
+    def test_order_survives_an_index_that_would_reorder_the_probe(self, db):
+        """An index added later must not change which terminal is the conductor.
+
+        This is what makes the ``ORDER BY`` load-bearing rather than decoration.
+        Today there is no index on ``tmux_session``, so an unordered read happens
+        to scan in rowid order and would pass the test above by luck. Adding the
+        obvious index — the natural reaction to a slow per-session lookup —
+        makes an UNORDERED read return the lower-sorting worker first. Measured:
+        a plain ASC ``(tmux_session, id)`` reorders the probe; a DESC one does
+        not, which is the opposite of what you would guess.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+        with db() as s:
+            s.execute(text("CREATE INDEX ix_probe ON terminals (tmux_session, id)"))
+            s.commit()
+
+        # Sanity: the index really does reorder an unordered read, so this test
+        # is exercising the ORDER BY rather than asserting a no-op.
+        with db() as s:
+            unordered = [
+                r[0]
+                for r in s.execute(
+                    text("SELECT id FROM terminals WHERE tmux_session = 'cao-alpha'")
+                )
+            ]
+        assert unordered[0] == "10000000", "index no longer reorders; test has stopped discriminating"
+
+        assert [t["id"] for t in list_terminals_in_sessions(["cao-alpha"])] == [
+            "f0000000",
+            "10000000",
+        ]
+        assert [t["id"] for t in list_terminals_by_session("cao-alpha")] == [
+            "f0000000",
+            "10000000",
+        ]
+
+    def test_rowid_reuse_after_deletion_does_not_reorder(self, db):
+        """Deleting the newest terminal and adding another keeps the creator first.
+
+        ``rowid`` is not ``AUTOINCREMENT``, so a deleted row's rowid can be handed
+        out again — the one property that could plausibly make insertion order an
+        unsafe key. It cannot invert a session's order, because SQLite assigns
+        ``max(rowid)+1`` over the whole table and so a new row outranks every
+        LIVE row, including all of its own session's.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "20000000", "cao-alpha", agent_profile="developer")
+        delete_terminal("20000000")  # frees the max rowid
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+
+        result = list_terminals_in_sessions(["cao-alpha"])
+
+        assert [t["id"] for t in result] == ["f0000000", "10000000"]
+        assert result[0]["agent_profile"] == "supervisor"
+
+    def test_matches_the_per_session_read_shape_and_order(self, db):
+        """Same keys AND same order as ``list_terminals_by_session``.
+
+        Callers are documented as interchangeable, and an ordered batched read
+        beside an unordered per-session read is exactly what let the two
+        disagree about the conductor. Uses a multi-row session whose creation
+        order disagrees with id order, so a single-row check cannot pass this by
+        proving nothing.
+        """
+        self._add(db, "zzz", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "aaa", "cao-alpha")
 
         batched = list_terminals_in_sessions(["cao-alpha"])
         per_session = list_terminals_by_session("cao-alpha")
 
         assert batched == per_session
+        assert [t["id"] for t in batched] == ["zzz", "aaa"]
