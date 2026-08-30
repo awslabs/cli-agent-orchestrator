@@ -3,6 +3,7 @@
 import os
 import re
 import shlex
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2782,6 +2783,118 @@ class TestCodexProviderUpdateDialog:
 
         mock_tmux.return_value.send_keys.assert_not_called()
         mock_tmux.return_value.send_special_key.assert_not_called()
+
+    # ── The first-run login menu is a settled state, not a stall ──
+    #
+    # It is neither a dismissable dialog nor the idle composer, so before this it
+    # matched no exit condition and the handler ran to its outer cap. That cap is
+    # ``provider_init_timeout`` (60s by default) while a non-headless ``cao launch``
+    # sends no ``initial_message`` — so ``POST /sessions`` initializes synchronously
+    # against the client's ``mcp_request_timeout`` (30s), and the client raised
+    # ReadTimeout before the operator could attach and authenticate.
+
+    LOGIN_MENU_OUTPUT = (
+        "  Welcome to Codex, OpenAI's command-line coding agent\n"
+        "\n"
+        "  Sign in with ChatGPT to use Codex as part of your paid plan\n"
+        "  or connect an API key for usage-based billing\n"
+        "\n"
+        "> 1. Sign in with ChatGPT\n"
+        "     Usage included with Plus, Pro, Business, and Enterprise plans\n"
+        "\n"
+        "  2. Sign in with Device Code\n"
+        "     Sign in from another device with a one-time code\n"
+        "\n"
+        "  3. Provide your own API key\n"
+        "     Pay for what you use\n"
+        "\n"
+        "  Press enter to continue\n"
+    )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_returns_on_login_menu(self, mock_tmux, mock_error):
+        """The handler returns promptly, having sent nothing, and logs no error.
+
+        Returning matters because ``initialize()``'s next ``wait_until_status``
+        already accepts this state as WAITING_USER_ANSWER — every second spent
+        here is spent against a client budget half the size of the outer cap.
+        Sending nothing matters more: choosing a sign-in method on the operator's
+        behalf is not this handler's call. The outer cap is set high here so a
+        timeout exit cannot be mistaken for a pass.
+        """
+        mock_tmux.return_value.get_history.return_value = self.LOGIN_MENU_OUTPUT
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        started = time.monotonic()
+        await provider._handle_trust_prompt(idle_gap=20.0, outer_timeout=30.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, f"handler waited {elapsed:.1f}s on a settled login menu"
+        mock_tmux.return_value.send_keys.assert_not_called()
+        mock_tmux.return_value.send_special_key.assert_not_called()
+        # The old behaviour ended in "no prompt or welcome banner detected" —
+        # about a screen that plainly showed one.
+        mock_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_login_menu_does_not_short_circuit_a_stacked_trust_dialog(self, mock_tmux):
+        """A trust dialog rendered over the login menu is still dismissed first.
+
+        This is the hazard in returning early on a recognized-but-unanswerable
+        screen: ``initialize()`` treats WAITING_USER_ANSWER as success, so exiting
+        with a trust dialog still up would make the following ``send_input`` raise
+        ``TerminalInputBlockedError`` and drop the initial message — the exact
+        failure the idle-gap split in this PR exists to prevent. Hence the login
+        exit is gated on no dismissable dialog being present.
+        """
+        # A single stacked frame does NOT exercise the guard: the trust branch is
+        # earlier in the loop and ``continue``s, so the login check is never
+        # reached on that iteration. The guard only decides anything on a LATER
+        # iteration, once ``trust_dismissed`` is set but the dialog is still on
+        # screen — a rendering lag after Enter. Hence the same frame twice.
+        #
+        # Both signatures must also land inside the 15-line bottom region, or
+        # ``has_login`` is False and the guard is never reached: an earlier version
+        # of this test appended the dialog to the full-height menu, which pushed
+        # "Sign in with ChatGPT" out of the window and passed whether the guard
+        # existed or not. This frame is 10 lines, so all of it is in the window:
+        # has_login holds, and so do BOTH trust signatures — TRUST_PROMPT_PATTERN
+        # via the option-1 line ("allow Codex to work in this folder") and the v2
+        # pattern with its footer — so has_dialog stays True on frame 2 either way.
+        #
+        # Condensed rather than observed — this is a defensive guard for frame
+        # interleavings the TUI controls, not a transcript of one.
+        stacked = (
+            "> 1. Sign in with ChatGPT\n"
+            "  2. Sign in with Device Code\n"
+            "  3. Provide your own API key\n"
+            "\n"
+            "  Do you trust the contents of this directory?\n"
+            "\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. No, ask me to approve edits and commands\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+        settled = "OpenAI Codex (v0.149.0)\n› \n"
+        mock_tmux.return_value.get_history.side_effect = [stacked, stacked, settled]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
+
+        # Frame 1 dismissed the dialog.
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+        # Frame 2 still shows it. The handler must NOT take the login exit there —
+        # if it does, initialize() succeeds on WAITING_USER_ANSWER with a live
+        # dialog and the next send_input raises TerminalInputBlockedError. Reaching
+        # frame 3 is the observable proof it kept waiting.
+        assert mock_tmux.return_value.get_history.call_count == 3, (
+            "handler returned while a dismissable dialog was still on screen "
+            f"(read {mock_tmux.return_value.get_history.call_count} frames, expected 3)"
+        )
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")

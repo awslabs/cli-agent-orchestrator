@@ -1175,6 +1175,10 @@ class CodexProvider(BaseProvider):
             # dialog is active. The welcome banner alone is insufficient — it
             # renders as normal startup chrome BEFORE a late update dialog appears.
             has_idle = _has_startup_idle_composer(clean_output)
+            has_login = bool(
+                re.search(LOGIN_MENU_PATTERN, bottom_region)
+                and re.search(LOGIN_MENU_FOOTER, bottom_region)
+            )
             has_dialog = (
                 re.search(TRUST_PROMPT_PATTERN, bottom_region)
                 or (
@@ -1183,6 +1187,28 @@ class CodexProvider(BaseProvider):
                 )
                 or _has_update_dialog_in_bottom(clean_output)
             )
+            # First-run login menu: this handler must NOT answer it (picking a
+            # sign-in method for the operator is not ours to do), but it is a
+            # settled startup state, and ``initialize()``'s next wait already
+            # accepts it as WAITING_USER_ANSWER. Without this branch it matches
+            # no exit condition — not a dismissable dialog, not the idle
+            # composer — so the loop ran to the outer cap and then logged
+            # "no prompt or welcome banner detected" about a screen that plainly
+            # showed one. With the default 60s cap and a 30s ``mcp_request_timeout``,
+            # a non-headless ``cao launch`` (which sends no initial_message, so
+            # ``POST /sessions`` initializes synchronously) had its client raise
+            # ReadTimeout before the operator could ever attach to authenticate.
+            # Still gated on ``not has_dialog``: a trust or update dialog stacked
+            # over the menu must be dismissed first, or ``initialize()`` would
+            # succeed on WAITING_USER_ANSWER and the next ``send_input`` would
+            # raise ``TerminalInputBlockedError`` — the exact failure this
+            # handler's idle-gap split exists to prevent.
+            if has_login and not has_dialog:
+                logger.info(
+                    "Codex first-run login menu detected — startup is settled, leaving the "
+                    "menu for the operator to answer"
+                )
+                return
             if has_idle and not has_dialog:
                 logger.info("Codex started — idle prompt visible, no blocking dialog")
                 return
