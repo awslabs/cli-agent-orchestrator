@@ -516,6 +516,23 @@ def test_is_waiting_on_user_swallows_transport_errors():
         assert _is_waiting_on_user("t1") is False
 
 
+@pytest.mark.parametrize("payload", [[], ["a"], None, "waiting_user_answer", 3])
+def test_is_waiting_on_user_survives_a_200_that_is_not_a_json_object(payload):
+    """A parseable-but-non-object body must not abort the launch.
+
+    ``AttributeError`` from ``[].get`` is no kind of ``RequestException``, so
+    without the isinstance check it escapes this function, reaches the command's
+    generic handler, and exits 1 *after* ``POST /sessions`` has already created
+    the session — orphaning it in tmux, which is the exact outcome the local
+    except exists to prevent. Parametrized because each JSON scalar type reaches
+    ``.get`` by a different route.
+    """
+    with patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = payload
+        assert _is_waiting_on_user("t1") is False
+
+
 def test_launch_workspace_confirmation_accepted():
     """Test workspace confirmation is shown for claude_code provider and accepted."""
     runner = CliRunner()

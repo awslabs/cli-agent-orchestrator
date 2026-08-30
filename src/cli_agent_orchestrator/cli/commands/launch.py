@@ -76,17 +76,25 @@ def _is_waiting_on_user(terminal_id: str) -> bool:
     caller's ``RequestException`` handler, which reports "Failed to connect to
     cao-server" — untrue here, since the poll above just talked to it.
 
-    ``RequestException`` alone is sufficient breadth, including for a non-JSON
-    body: ``requests.exceptions.JSONDecodeError`` subclasses both it and
-    ``ValueError``, and has since requests 2.27 — comfortably below this
-    project's ``requests>=2.32.0`` floor.
+    An *unparseable* body is covered by the except:
+    ``requests.exceptions.JSONDecodeError`` subclasses ``RequestException`` (and
+    ``ValueError``) and has since requests 2.27, below this project's
+    ``requests>=2.32.0`` floor. A body that parses but isn't an object is not —
+    ``[].get`` raises ``AttributeError``, which is no kind of
+    ``RequestException`` — so the shape is checked rather than assumed. Without
+    that check a 200 carrying a JSON array, string or ``null`` escapes to the
+    caller's generic handler and aborts the launch with ``exit 1`` *after* the
+    session exists, leaving it orphaned in tmux: the precise failure this
+    function's local except is here to prevent.
     """
     try:
         resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
         if resp.status_code == 200:
-            # bool(): ``resp.json()`` is Any, so the comparison is too, and this
-            # function is annotated ``-> bool``.
-            return bool(resp.json().get("status") == TerminalStatus.WAITING_USER_ANSWER.value)
+            payload = resp.json()
+            if isinstance(payload, dict):
+                # bool(): ``payload.get`` is Any, so the comparison is too, and
+                # this function is annotated ``-> bool``.
+                return bool(payload.get("status") == TerminalStatus.WAITING_USER_ANSWER.value)
     except requests.exceptions.RequestException:
         pass
     return False

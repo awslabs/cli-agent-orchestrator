@@ -2871,6 +2871,85 @@ class TestCodexProviderUpdateDialog:
         mock_tmux.return_value.send_special_key.assert_not_called()
         mock_tmux.return_value.send_keys.assert_not_called()
 
+    # ── ``has_login``'s conjunction is load-bearing in BOTH directions ──
+    #
+    # Since it now gates the v1 trust dismissal, a ``has_login`` that is too
+    # EAGER suppresses a dismissal that should happen — the mirror of the
+    # scrollback bug above, and not covered by tests that only check the login
+    # exit. It is easy to be too eager by accident: ``LOGIN_MENU_FOOTER`` IS
+    # ``TRUST_PROMPT_FOOTER``, so a footer-only ``has_login`` reads True on any
+    # frame carrying "Press enter to continue". Each test below feeds a frame
+    # where a real trust prompt must still be answered, and asserts it is.
+
+    _SETTLED = "OpenAI Codex (v0.149.0)\n› \n"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_shared_footer_alone_does_not_suppress_trust_dismissal(self, mock_tmux):
+        """The footer is shared with the trust prompt, so it cannot imply a login menu.
+
+        Kills a ``has_login`` weakened to the footer alone: this frame has the
+        footer and the v1 trust copy but no menu text, so the trust prompt must
+        still be auto-accepted.
+        """
+        frame = (
+            "  Do you trust this workspace?\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. No, ask me to approve edits and commands\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+        mock_tmux.return_value.get_history.side_effect = [frame, self._SETTLED]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
+
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_menu_text_without_the_footer_does_not_suppress_trust_dismissal(self, mock_tmux):
+        """Kills a ``has_login`` weakened to the menu pattern alone.
+
+        A menu line with no footer is not a live login menu — Codex's own
+        ``get_status`` requires both — so a trust prompt on the same screen must
+        still be answered.
+        """
+        frame = (
+            "  1. Sign in with ChatGPT\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. No, ask me to approve edits and commands\n"
+        )
+        mock_tmux.return_value.get_history.side_effect = [frame, self._SETTLED]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
+
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_login_menu_only_in_scrollback_does_not_suppress_trust_dismissal(self, mock_tmux):
+        """Kills a ``has_login`` matched against the whole capture.
+
+        ``has_login`` must stay bottom-anchored. A login menu that has scrolled
+        out of the bottom region is history, not a live prompt, so a trust dialog
+        at the bottom must still be dismissed — otherwise the gate that fixes the
+        scrollback bug above reintroduces it with the roles reversed.
+        """
+        frame = (
+            self.LOGIN_MENU_OUTPUT
+            + "\n".join(f"  build step {i}" for i in range(20))
+            + "\n  Do you trust this workspace?\n"
+            + "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+        )
+        mock_tmux.return_value.get_history.side_effect = [frame, self._SETTLED]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
+
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_login_menu_does_not_short_circuit_a_stacked_trust_dialog(self, mock_tmux):
