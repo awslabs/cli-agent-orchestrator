@@ -43,6 +43,11 @@ def _get_terminal_output(terminal_id):
 
 
 def _resolve_conductor(session_name):
+    """Return (conductor, all_terminals) for a session.
+
+    Index 0 is the conductor per the oldest-first order guaranteed by
+    ``GET /sessions/{name}/terminals`` — see that endpoint's description.
+    """
     terminals = _get_terminals(session_name)
     if not terminals:
         raise click.ClickException(f"No terminals found for session '{session_name}'")
@@ -74,6 +79,7 @@ def list_sessions(as_json):
     for s in sessions:
         try:
             terminals = _get_terminals(s["name"])
+            # Index 0 is the conductor — see _resolve_conductor.
             conductor = terminals[0] if terminals else None
             if conductor:
                 conductor = _get_terminal(conductor["id"])

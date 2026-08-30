@@ -279,6 +279,14 @@ async def execute_flow(name: str) -> bool:
             # Only check the first (conductor) terminal for busy status.
             # Worker terminals spawned by the conductor may have stale status
             # after /exit and should not block flow recycling.
+            #
+            # Index 0 is the conductor because of the oldest-first ordering
+            # contract documented on ``list_terminals_by_session`` -- do not
+            # restate the rule here, and do not reorder that read. This is the
+            # consumer with real blast radius: if index 0 is a quiet WORKER
+            # rather than the conductor, the busy check passes and the
+            # kill_session below tears down a session whose conductor is
+            # mid-run.
             conductor = terminals[0] if terminals else None
             if conductor and _is_terminal_busy(conductor["id"]):
                 logger.info(f"Flow {name}: session {session_name} is busy, skipping")

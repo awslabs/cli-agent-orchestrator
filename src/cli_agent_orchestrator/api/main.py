@@ -3215,7 +3215,16 @@ async def create_terminal_in_session(
 
 @app.get("/sessions/{session_name}/terminals")
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
-    """List all terminals in a session."""
+    """List a session's terminals, oldest first.
+
+    The order is significant and part of this endpoint's contract: **index 0 is
+    the session's oldest surviving terminal, its conductor.** `cao session
+    status` and `cao session list` both rely on it to label the Conductor, and
+    they reach it through this endpoint rather than the database, so the
+    guarantee has to be stated here too. Clients that need a different order
+    (most-recently-active first, say) should sort client-side on `last_active`
+    rather than assume this one will change.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:

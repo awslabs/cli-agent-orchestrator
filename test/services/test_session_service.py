@@ -610,6 +610,25 @@ class TestListSessions:
         assert "pane vanished" in caplog.text
         assert any(r.exc_info for r in caplog.records if r.levelname == "WARNING")
 
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_whole_listing_failure_logs_a_traceback(self, mock_get_backend, caplog):
+        """The outer handler keeps its traceback too — it blanks the ENTIRE response.
+
+        The two tests above cover the WARNING-level handlers, which degrade one
+        session's metadata. This one covers the ERROR-level net around the whole
+        function: callers get `[]` and cannot tell "no sessions" from "the
+        backend failed", so the traceback in the log is the only evidence the
+        failure happened at all.
+        """
+        mock_get_backend.return_value.list_sessions.side_effect = RuntimeError("tmux is gone")
+
+        with caplog.at_level(logging.ERROR):
+            result = list_sessions()
+
+        assert result == []
+        assert "tmux is gone" in caplog.text
+        assert any(r.exc_info for r in caplog.records if r.levelname == "ERROR")
+
 
 @pytest.fixture
 def real_session_db(tmp_path, monkeypatch):

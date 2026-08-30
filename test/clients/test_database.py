@@ -1887,7 +1887,9 @@ class TestListTerminalsInSessions:
                     text("SELECT id FROM terminals WHERE tmux_session = 'cao-alpha'")
                 )
             ]
-        assert unordered[0] == "10000000", "index no longer reorders; test has stopped discriminating"
+        assert (
+            unordered[0] == "10000000"
+        ), "index no longer reorders; test has stopped discriminating"
 
         assert [t["id"] for t in list_terminals_in_sessions(["cao-alpha"])] == [
             "f0000000",
