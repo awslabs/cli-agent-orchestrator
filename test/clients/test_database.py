@@ -1974,35 +1974,55 @@ class TestListTerminalsInSessions:
 def test_no_upsert_against_the_terminals_table():
     """No code path may upsert ``terminals`` — it would silently reassign rowid.
 
-    The ownership contract (index 0 of a terminals read is a session's conductor)
-    rests on rowid being insertion order. ``INSERT OR REPLACE`` / ``REPLACE INTO``
-    / ``ON CONFLICT DO UPDATE`` / ``Session.merge`` all delete-and-reinsert, which
-    moves the row to the end of its session and hands the conductor role to a
-    worker — silently, with no test failing anywhere near the change.
+    The ownership contract (index 0 of a terminals read is a session's oldest
+    surviving row) rests on rowid being insertion order. A replace is a delete
+    plus an insert, so the row gets a NEW rowid and jumps to the end of its
+    session, handing the conductor slot to a worker — silently, with no test
+    failing anywhere near the change. A comment on the model cannot prevent that,
+    so this scans the source instead: same shape as ``test/test_no_ffi_guard.py``,
+    a cheap structural guard for an invariant no unit test can express. Use an
+    ``UPDATE``.
 
-    A comment on the model cannot prevent that, so this scans the source instead.
-    Same shape as ``test/test_no_ffi_guard.py``: a cheap structural guard for an
-    invariant that no unit test can express. Use an ``UPDATE`` on ``terminals``.
+    Covers the three spellings that actually reassign rowid, each required to
+    name ``terminals`` directly. Deliberately does NOT cover ``Session.merge``:
+    it emits an UPDATE for an existing primary key, so the rowid — and the order
+    — survive. Verified rather than assumed.
+
+    Known limitation: a docstring that spells one of these statements verbatim
+    against ``terminals`` will trip this. ``#`` comments are skipped (which is
+    why the ``TerminalModel`` contract can discuss the hazard), so use one, or
+    break up the phrase.
     """
     import re
 
     src_root = Path(__file__).resolve().parents[2] / "src"
     assert src_root.is_dir(), src_root
 
-    # Upsert spellings. ``merge(`` is matched loosely and filtered below, since
-    # the word appears in unrelated contexts (dict merges, markdown merges).
-    upsert = re.compile(r"INSERT\s+OR\s+REPLACE|REPLACE\s+INTO|on_conflict_do_update", re.I)
+    quote = r"""["'`]?"""
+    upsert = re.compile(
+        # SQL text: the table name must follow the verb, so an upsert on some
+        # other table cannot be dragged in by the word "terminals" appearing
+        # nearby -- which a proximity window did, making the pre-existing
+        # workflow_run_step upsert safe only by distance.
+        rf"(?:INSERT\s+OR\s+REPLACE\s+INTO|REPLACE\s+INTO)\s+{quote}terminals\b"
+        # SQLAlchemy construct: the table is not adjacent, so fall back to
+        # requiring TerminalModel/terminals in the same statement.
+        r"|on_conflict_do_update[^\n]*",
+        re.I,
+    )
     offenders = []
     for path in src_root.rglob("*.py"):
         text_ = path.read_text(encoding="utf-8", errors="replace")
         for match in upsert.finditer(text_):
             line_no = text_.count("\n", 0, match.start()) + 1
             line = text_.splitlines()[line_no - 1]
-            # Only care when the statement targets terminals. Comments that
-            # merely discuss the hazard (the TerminalModel contract) are fine.
-            window = text_[max(0, match.start() - 200) : match.start() + 200]
-            if "terminals" in window.lower() and not line.lstrip().startswith("#"):
-                offenders.append(f"{path.relative_to(src_root)}:{line_no}: {line.strip()}")
+            if line.lstrip().startswith("#"):
+                continue
+            if match.group(0).lower().startswith("on_conflict") and not re.search(
+                r"TerminalModel|\bterminals\b", match.group(0), re.I
+            ):
+                continue
+            offenders.append(f"{path.relative_to(src_root)}:{line_no}: {line.strip()}")
 
     assert not offenders, (
         "upsert against terminals would break the ownership ordering contract "
