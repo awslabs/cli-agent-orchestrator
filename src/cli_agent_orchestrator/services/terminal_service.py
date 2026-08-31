@@ -178,6 +178,76 @@ _memory_injected_lock = threading.Lock()
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
 
+# Terminals whose deferred initial message has been ACCEPTED but not yet
+# dispatched to the pane. Written on the event loop by _schedule_deferred_init,
+# read from worker threads by the status-reporting helpers below, hence the lock
+# (mirrors _memory_injected_lock above).
+_pending_initial_delivery: set = set()
+_pending_initial_delivery_lock = threading.Lock()
+
+# Statuses a poller may read as "there is nothing left to wait for". While an
+# initial message is still pending these are exactly the readings that must not
+# escape: see reported_status().
+_COMPLETABLE_STATUSES = (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+
+
+def _mark_initial_delivery_pending(terminal_id: str) -> None:
+    """Record that an accepted initial message has not been dispatched yet."""
+    with _pending_initial_delivery_lock:
+        _pending_initial_delivery.add(terminal_id)
+
+
+def _clear_initial_delivery_pending(terminal_id: str) -> None:
+    """Release the pending mark. Idempotent — every exit path may call it."""
+    with _pending_initial_delivery_lock:
+        _pending_initial_delivery.discard(terminal_id)
+
+
+def initial_delivery_pending(terminal_id: str) -> bool:
+    """True while an accepted initial message has not reached the pane yet."""
+    with _pending_initial_delivery_lock:
+        return terminal_id in _pending_initial_delivery
+
+
+def reported_status(terminal_id: str, status: TerminalStatus) -> TerminalStatus:
+    """Mask a completable status while the initial message is still undispatched.
+
+    PR #566 review (haofeif), P1. A client that polls for completion decides
+    "done" from the terminal's status alone, and every such poller needs the same
+    thing: evidence that is causally DOWNSTREAM of the send it is waiting on.
+    Provider startup does not qualify. On the deferred path the pane can sit at a
+    perfectly genuine IDLE for seconds after ``initialize()`` returns while
+    ``_schedule_deferred_init`` resolves shell_baseline and metadata and
+    ``send_input`` runs ``inject_memory_context`` — all strictly BEFORE any
+    keystroke is dispatched. A poller sampling that window sees a stable IDLE and
+    concludes the agent finished a task it was never given: the synchronous
+    ``cao launch`` printed empty output and exited 0.
+
+    Reporting UNKNOWN closes that window at the source, for every client at once,
+    rather than asking each one to remember to wait for a separate handshake.
+    UNKNOWN is the honest reading — the terminal exists but is not tracking the
+    task yet — and pollers already treat it as neither progress nor completion
+    (``utils.terminal.poll_until_done``, ``services.agent_step``), so no number
+    of pre-dispatch samples can satisfy an idle gate.
+
+    Deliberately NOT masked:
+
+    - **WAITING_USER_ANSWER / PROCESSING / ERROR.** Masking WAITING_USER_ANSWER
+      would hide a pane genuinely parked on a prompt, which is the one state an
+      operator has to see to clear it (and which ``send_input``'s own guard turns
+      into a TerminalInputBlockedError that releases the pending mark anyway).
+      Letting it through is harmless here: it flips a poller's "has started" flag
+      early, but with IDLE masked no idle streak can accumulate to act on it.
+    - **The internal callers of ``status_monitor.get_status``.** send_input's
+      ERROR/WAITING_USER_ANSWER guards, inbox/flow/memory services and the
+      deferred path's own retry loop all need the RAW state; masking there would
+      change delivery decisions, not just reporting. This is a reporting-layer
+      concern only, applied where a status crosses the API boundary.
+    """
+    if status in _COMPLETABLE_STATUSES and initial_delivery_pending(terminal_id):
+        return TerminalStatus.UNKNOWN
+    return status
+
 
 def inject_memory_context(
     first_message: str, terminal_id: str, frozen_memory: str | None = None
@@ -1984,14 +2054,27 @@ def _schedule_deferred_init(
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
-                await asyncio.to_thread(
-                    send_input,
-                    terminal_id,
-                    initial_message,
-                    registry=registry,
-                    sender_id=caller_id,
-                    orchestration_type=effective_orchestration_type,
-                )
+                try:
+                    await asyncio.to_thread(
+                        send_input,
+                        terminal_id,
+                        initial_message,
+                        registry=registry,
+                        sender_id=caller_id,
+                        orchestration_type=effective_orchestration_type,
+                    )
+                finally:
+                    # The dispatch boundary, and the earliest point at which a
+                    # completion poller's evidence can be downstream of this send.
+                    # Released here rather than at the end of _run so a task that
+                    # finishes DURING _confirm_worker_started_or_resubmit is still
+                    # observable — holding the mark across the confirm/resubmit
+                    # window would hide a genuine early completion and strand the
+                    # poller until its timeout. In ``finally`` because a raising
+                    # send_input (TerminalInputBlockedError: the pane is parked on
+                    # a prompt) must also stop masking: the terminal is then
+                    # honestly WAITING_USER_ANSWER and the operator has to see it.
+                    _clear_initial_delivery_pending(terminal_id)
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
                 # started and re-submit if not; if it never starts, surface the
@@ -2068,12 +2151,28 @@ def _schedule_deferred_init(
                 registry,
                 delete_worker=True,
             )
+        finally:
+            # Safety net for every path that never reached the send at all —
+            # initialize() raising, or the loop being torn down — so a terminal
+            # can't be left permanently masked. Idempotent: the happy path has
+            # already cleared it at the dispatch boundary above.
+            _clear_initial_delivery_pending(terminal_id)
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
         return
+    # Mirrors _run's own ``if initial_message`` condition: defer_init is also used
+    # with no message at all (see the create_terminal call site), and there is
+    # nothing pending to mask on that path.
+    #
+    # Set here rather than inside _run so the mark is established by the time this
+    # function returns — the point at which the message has been accepted and the
+    # caller is free to start polling. That keeps the invariant independent of when
+    # the event loop first schedules _run instead of relying on it winning a race.
+    if initial_message:
+        _mark_initial_delivery_pending(terminal_id)
     task = loop.create_task(_run())
     _deferred_init_tasks.add(task)
     task.add_done_callback(_deferred_init_tasks.discard)
@@ -2086,7 +2185,7 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        status = status_monitor.get_status(terminal_id).value
+        status = reported_status(terminal_id, status_monitor.get_status(terminal_id)).value
 
         return {
             "id": metadata["id"],
@@ -2180,7 +2279,9 @@ def list_siblings(
         caller_id, prefix, caller_session=caller_session, cross_session=cross_session
     )
     for sibling in siblings:
-        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+        sibling["status"] = reported_status(
+            sibling["id"], status_monitor.get_status(sibling["id"])
+        ).value
     return siblings
 
 

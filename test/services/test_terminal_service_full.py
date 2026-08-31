@@ -3146,3 +3146,360 @@ class TestDeferredInitWaitingUserAnswerSurvival:
         mock_tmux.send_keys.assert_not_called()
         mock_notify.assert_called_once()
         assert mock_notify.call_args.kwargs["delete_worker"] is False
+
+
+class TestDeferredDeliveryNotCompletableBeforeDispatch:
+    """PR #566 review (haofeif), BLOCKING P1: the synchronous headless
+    ``cao launch`` path must not be able to return before the initial message
+    has actually been dispatched.
+
+    ``launch``'s ``poll_until_done`` starts the moment the deferred
+    ``POST /sessions`` returns, so its ``observed_working`` evidence is not
+    causally downstream of the send. Provider startup on its own reports
+    WAITING_USER_ANSWER (kiro-cli's consent dialog is the common case), which
+    flips ``observed_working=True``; once ``initialize()`` finishes the pane
+    reads IDLE while ``_schedule_deferred_init`` still has to resolve
+    shell_baseline and metadata and then run ``inject_memory_context`` inside
+    ``send_input`` (a curated-memory lookup widens that to seconds). Three IDLE
+    samples inside that window and the CLI returns, reads empty output, and
+    exits 0 with the task never delivered.
+
+    The invariant under test is the ordering one, not a wall-clock one: while an
+    initial delivery is still pending, the terminal must not report a
+    *completable* status, so no number of samples taken before dispatch can
+    satisfy the idle gate.
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit",
+        new_callable=AsyncMock,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_poll_until_done_cannot_return_before_initial_send_is_issued(
+        self,
+        mock_meta,
+        mock_status_monitor,
+        mock_send_input,
+        mock_confirm_started,
+        mock_update_shell,
+        mock_notify,
+    ):
+        """The reviewer's reproduction, driven through the real reporting path.
+
+        Real ``_schedule_deferred_init``, real ``terminal_service.get_terminal``
+        (the status every client polls), and the real ``poll_until_done`` the CLI
+        calls, run concurrently against one valid startup sequence:
+        WAITING_USER_ANSWER while initializing, then IDLE, then PROCESSING once
+        the message is dispatched.
+
+        Against the unfixed head this fails: ``poll_until_done`` returns while
+        ``dispatched`` is still False. The polling interval is compressed only to
+        keep the test fast — what makes the bug reproduce is that the
+        pre-dispatch IDLE window outlasts ``idle_stable_polls`` samples, which is
+        exactly the real-world condition.
+        """
+        import asyncio
+        import threading
+        import time as _time
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+            get_terminal,
+        )
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        TERMINAL_ID = "abcd1234"
+        INIT_SECONDS = 0.10
+        PRE_DISPATCH_SECONDS = 0.60
+        POST_DISPATCH_WORK_SECONDS = 0.10
+        POLL_INTERVAL = 0.02
+
+        mock_meta.return_value = {
+            "id": TERMINAL_ID,
+            "tmux_window": "developer-abcd",
+            "tmux_session": "cao-session",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "caller_id": None,
+            "allowed_tools": None,
+            "engine": None,
+            "group": None,
+            "metadata": None,
+            "last_active": datetime.now(),
+        }
+
+        init_done = threading.Event()
+        dispatched = threading.Event()
+        dispatched_at = {}
+
+        def fake_get_status(terminal_id):
+            # One valid startup sequence, then one ordinary turn:
+            #   WAITING_USER_ANSWER (consent dialog, real startup activity but
+            #   NOT evidence the assigned task was picked up)
+            #     -> IDLE (init finished; nothing dispatched yet)
+            #       -> PROCESSING (the agent is working on the delivered task)
+            #         -> IDLE (turn finished, the only legitimate exit)
+            if dispatched.is_set():
+                if _time.monotonic() - dispatched_at["t"] < POST_DISPATCH_WORK_SECONDS:
+                    return TerminalStatus.PROCESSING
+                return TerminalStatus.IDLE
+            if init_done.is_set():
+                return TerminalStatus.IDLE
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        mock_status_monitor.get_status.side_effect = fake_get_status
+
+        def fake_send_input(terminal_id, message, **kwargs):
+            # Stands in for send_input's pre-dispatch work — most of it
+            # inject_memory_context — before any keystroke reaches the pane.
+            _time.sleep(PRE_DISPATCH_SECONDS)
+            dispatched_at["t"] = _time.monotonic()
+            dispatched.set()
+            return True
+
+        mock_send_input.side_effect = fake_send_input
+        mock_confirm_started.return_value = True
+
+        async def fake_initialize():
+            await asyncio.sleep(INIT_SECONDS)
+            init_done.set()
+            return True
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.side_effect = fake_initialize
+        provider_instance.shell_baseline = None
+
+        # Route the CLI's status poll through the real server-side reporting
+        # path instead of a scripted list, so this test pins the behaviour of
+        # get_terminal rather than a restatement of the fixture.
+        def fake_requests_get(url, **kwargs):
+            resp = MagicMock()
+            resp.raise_for_status.return_value = None
+            resp.json.return_value = {"status": get_terminal(TERMINAL_ID)["status"]}
+            return resp
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, TERMINAL_ID, "do the task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before_tasks
+
+        dispatched_when_poll_returned = {}
+
+        def run_poll():
+            with patch("cli_agent_orchestrator.utils.terminal.requests.get", fake_requests_get):
+                poll_until_done(
+                    TERMINAL_ID,
+                    timeout=30.0,
+                    polling_interval=POLL_INTERVAL,
+                )
+            dispatched_when_poll_returned["value"] = dispatched.is_set()
+
+        await asyncio.gather(task, asyncio.to_thread(run_poll))
+
+        mock_notify.assert_not_called()
+        assert dispatched.is_set(), "fixture bug: the initial send never ran"
+        assert dispatched_when_poll_returned["value"] is True, (
+            "poll_until_done returned before the initial message was dispatched — "
+            "the synchronous `cao launch` would print empty output and exit 0 "
+            "with the task never delivered"
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit",
+        new_callable=AsyncMock,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_mask_is_released_at_dispatch_not_after_delivery_confirmation(
+        self,
+        mock_meta,
+        mock_status_monitor,
+        mock_send_input,
+        mock_confirm_started,
+        mock_update_shell,
+        mock_notify,
+    ):
+        """The mask must be released when the send is ISSUED, not when
+        ``_confirm_worker_started_or_resubmit`` finishes.
+
+        Holding it across the confirm/resubmit window would swap this bug for its
+        mirror image: a short task can finish while that window is still open, and
+        a poller masked for the whole of it would sit through a completion that
+        already happened — stranded until its own timeout. The dispatch boundary is
+        the narrowest mark that still makes the poller's evidence causal.
+
+        Fails if ``_clear_initial_delivery_pending`` is moved to the end of
+        ``_run`` (or into the outer ``finally`` alone): the poll then cannot
+        return until confirmation is over.
+        """
+        import asyncio
+        import threading
+        import time as _time
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+            get_terminal,
+        )
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        TERMINAL_ID = "beef5678"
+        POST_DISPATCH_WORK_SECONDS = 0.10
+        CONFIRM_SECONDS = 1.50
+        POLL_INTERVAL = 0.02
+
+        mock_meta.return_value = {
+            "id": TERMINAL_ID,
+            "tmux_window": "developer-beef",
+            "tmux_session": "cao-session",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "caller_id": None,
+            "allowed_tools": None,
+            "engine": None,
+            "group": None,
+            "metadata": None,
+            "last_active": datetime.now(),
+        }
+
+        dispatched = threading.Event()
+        confirm_finished = threading.Event()
+        dispatched_at = {}
+
+        def fake_get_status(terminal_id):
+            if not dispatched.is_set():
+                return TerminalStatus.IDLE
+            if _time.monotonic() - dispatched_at["t"] < POST_DISPATCH_WORK_SECONDS:
+                return TerminalStatus.PROCESSING
+            return TerminalStatus.IDLE
+
+        mock_status_monitor.get_status.side_effect = fake_get_status
+
+        def fake_send_input(terminal_id, message, **kwargs):
+            dispatched_at["t"] = _time.monotonic()
+            dispatched.set()
+            return True
+
+        mock_send_input.side_effect = fake_send_input
+
+        async def fake_confirm(*args, **kwargs):
+            # A probe-capable provider's verification, plus the pickup grace the
+            # resubmit path waits out. The agent's turn completes inside it.
+            await asyncio.sleep(CONFIRM_SECONDS)
+            confirm_finished.set()
+            return True
+
+        mock_confirm_started.side_effect = fake_confirm
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+
+        def fake_requests_get(url, **kwargs):
+            resp = MagicMock()
+            resp.raise_for_status.return_value = None
+            resp.json.return_value = {"status": get_terminal(TERMINAL_ID)["status"]}
+            return resp
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, TERMINAL_ID, "do the task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before_tasks
+
+        observed = {}
+
+        def run_poll():
+            with patch("cli_agent_orchestrator.utils.terminal.requests.get", fake_requests_get):
+                poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=POLL_INTERVAL)
+            observed["dispatched"] = dispatched.is_set()
+            observed["confirm_finished"] = confirm_finished.is_set()
+
+        await asyncio.gather(task, asyncio.to_thread(run_poll))
+
+        mock_notify.assert_not_called()
+        assert observed["dispatched"] is True, "poll returned before dispatch (the P1 itself)"
+        assert observed["confirm_finished"] is False, (
+            "poll_until_done did not return until delivery confirmation had finished — "
+            "the pending mark is being held past the dispatch boundary, so a task that "
+            "completes during the confirm/resubmit window is invisible to the caller"
+        )
+
+
+class TestReportedStatusMasking:
+    """The masking matrix ``reported_status`` documents, pinned.
+
+    Which statuses are masked is the whole safety argument: mask too little and
+    the #566 P1 is back; mask too much and a pane parked on a real prompt, or a
+    dead provider, becomes invisible to the operator who has to act on it.
+    """
+
+    def _pending(self, terminal_id):
+        from cli_agent_orchestrator.services import terminal_service
+
+        return patch.object(terminal_service, "_pending_initial_delivery", {terminal_id})
+
+    @pytest.mark.parametrize(
+        "raw",
+        [TerminalStatus.IDLE, TerminalStatus.COMPLETED],
+    )
+    def test_completable_statuses_are_masked_while_delivery_pending(self, raw):
+        from cli_agent_orchestrator.services.terminal_service import reported_status
+
+        with self._pending("aaaa1111"):
+            assert reported_status("aaaa1111", raw) is TerminalStatus.UNKNOWN
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            TerminalStatus.WAITING_USER_ANSWER,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.ERROR,
+            TerminalStatus.UNKNOWN,
+        ],
+    )
+    def test_actionable_statuses_are_never_masked(self, raw):
+        """WAITING_USER_ANSWER in particular: masking it would hide the one state
+        an operator must see to unblock the pane, and send_input's own guard
+        converts it into a TerminalInputBlockedError that releases the mark."""
+        from cli_agent_orchestrator.services.terminal_service import reported_status
+
+        with self._pending("aaaa1111"):
+            assert reported_status("aaaa1111", raw) is raw
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+            TerminalStatus.WAITING_USER_ANSWER,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.ERROR,
+            TerminalStatus.UNKNOWN,
+        ],
+    )
+    def test_nothing_is_masked_once_no_delivery_is_pending(self, raw):
+        """The mask is scoped to the pending window only — the ordinary steady
+        state of every terminal must be reported verbatim."""
+        from cli_agent_orchestrator.services.terminal_service import reported_status
+
+        assert reported_status("aaaa1111", raw) is raw
+
+    def test_mask_is_per_terminal_not_global(self):
+        """A pending delivery on one terminal must not mask a sibling's IDLE."""
+        from cli_agent_orchestrator.services.terminal_service import reported_status
+
+        with self._pending("aaaa1111"):
+            assert reported_status("aaaa1111", TerminalStatus.IDLE) is TerminalStatus.UNKNOWN
+            assert reported_status("bbbb2222", TerminalStatus.IDLE) is TerminalStatus.IDLE
