@@ -621,7 +621,7 @@ def _request_fingerprint(
     # a handoff retry still reuses its worker. That asymmetry is the honest one:
     # these endpoints own delivery and can therefore conflict on it; the handoff
     # path does not, and deduplicating ITS submission needs the durable run
-    # record tracked separately (#636), not this fingerprint.
+    # record tracked separately (#715), not this fingerprint.
     if initial_message_orchestration_type is None:
         orchestration_value = ""
     elif isinstance(initial_message_orchestration_type, OrchestrationType):

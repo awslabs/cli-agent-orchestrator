@@ -224,7 +224,7 @@ def handoff_cmd(
     task does conflict.) The consequence: if a retry cannot tell whether the
     first attempt's message ever landed, this reattaches and sends again.
     Making the SUBMISSION idempotent too needs a durable run record keyed by
-    this same key, tracked in #636.
+    this same key, tracked in #715.
 
     --no-wait: returns as soon as the worker exists and has been sent MESSAGE,
     without waiting for -- or extracting -- its result, and without tearing it
