@@ -28,8 +28,11 @@ no `pods/exec` and no `secrets` — it cannot shell into a worker it created, no
 read the token it authenticates callers with. The same boundary protects the
 persistent supervisor: workers cannot reach its port at all. They present their
 per-lease release token to the broker, which forwards only inbox delivery and
-the four memory operations. Local CAO remains authentication-free by default;
-this credential and routing behavior activates only inside elastic worker pods.
+the four memory operations. The lease also binds the only callback receiver and
+the worker's memory session/profile context; the broker validates or replaces
+those identity fields rather than trusting the worker's request. Local CAO
+remains authentication-free by default; this credential and routing behavior
+activates only inside elastic worker pods.
 
 **A worker cannot drift.** Its profile store is a fresh `emptyDir`, and
 `CAO_INSTALL_PROFILES` is set per Job to `<profile>:<provider>`. On a fixed fleet

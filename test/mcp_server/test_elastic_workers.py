@@ -18,6 +18,7 @@ def test_assign_elastic_provisions_then_assigns(monkeypatch):
         "worker_id": "deadbeef",
         "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
         "working_directory": "/home/cao/workspace/jobs/deadbeef",
+        "session_name": "cao-worker-deadbeef",
         "release_token": "release-token",
     }
     with (
@@ -36,6 +37,7 @@ def test_assign_elastic_provisions_then_assigns(monkeypatch):
     assert result["elastic"] is True
     assert assign.call_args.args[2].endswith("/deadbeef")
     assert assign.call_args.kwargs["target_host"].startswith("cao-worker-deadbeef")
+    assert assign.call_args.kwargs["remote_session_name"] == "cao-worker-deadbeef"
     assert "complete_assignment" in assign.call_args.args[1]
 
 
@@ -52,10 +54,14 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
         "worker_id": "deadbeef",
         "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
         "working_directory": "/home/cao/workspace/jobs/deadbeef",
+        "session_name": "cao-worker-deadbeef",
         "release_token": "release-token",
     }
     session = Mock(status_code=200)
-    session.json.return_value = {"id": "def67890", "session_name": "cao-remote"}
+    session.json.return_value = {
+        "id": "def67890",
+        "session_name": "cao-worker-deadbeef",
+    }
     ok = Mock(status_code=200)
     ok.raise_for_status.return_value = None
     posts = []
@@ -100,7 +106,7 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
         patch.object(
             terminal_service,
             "get_terminal_metadata",
-            return_value={"caller_id": None, "tmux_session": "cao-remote"},
+            return_value={"caller_id": None, "tmux_session": "cao-worker-deadbeef"},
         ),
         patch.object(
             terminal_service,
@@ -117,6 +123,7 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
     urls = [url for url, _ in posts]
     assert any(url.endswith("/sessions") for url in urls)
     session_request = next(kwargs for url, kwargs in posts if url.endswith("/sessions"))
+    assert session_request["params"]["session_name"] == "cao-worker-deadbeef"
     assert session_request["json"]["env_vars"]["CAO_CALLBACK_URL"] == "http://broker:9890"
     callback = next(
         kwargs for url, kwargs in posts if url.endswith("/terminals/abc12345/inbox/messages")
@@ -140,6 +147,7 @@ def _lease_response():
         "worker_id": "deadbeef",
         "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
         "working_directory": "/home/cao/workspace/jobs/deadbeef",
+        "session_name": "cao-worker-deadbeef",
         "release_token": "release-token",
     }
     return response
@@ -161,7 +169,10 @@ def test_assign_elastic_omits_provider_so_the_broker_default_wins(monkeypatch):
     ):
         asyncio.run(server.assign_elastic("developer", "Implement it"))
 
-    assert post.call_args.kwargs["json"] == {"agent_profile": "developer"}
+    assert post.call_args.kwargs["json"] == {
+        "agent_profile": "developer",
+        "callback_terminal_id": "abc12345",
+    }
 
 
 def test_assign_elastic_forwards_an_explicit_provider(monkeypatch):
@@ -176,6 +187,7 @@ def test_assign_elastic_forwards_an_explicit_provider(monkeypatch):
 
     assert post.call_args.kwargs["json"] == {
         "agent_profile": "developer",
+        "callback_terminal_id": "abc12345",
         "provider": "claude_code",
     }
 
@@ -210,6 +222,7 @@ def test_assign_elastic_releases_when_assignment_fails(monkeypatch):
         "worker_id": "deadbeef",
         "target_host": "worker",
         "working_directory": "/workspace/deadbeef",
+        "session_name": "cao-worker-deadbeef",
         "release_token": "release-token",
     }
     delete_response = Mock(status_code=200)

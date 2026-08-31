@@ -118,13 +118,27 @@ def check(label, cond, detail=""):
         FAILS.append(label)
 
 
+def worker_request():
+    return broker.WorkerRequest(
+        agent_profile="developer",
+        callback_terminal_id="abc12345",
+    )
+
+
 # --- 1. the Job body survives the real serializer -------------------------
-job = broker._worker_job("deadbeef", "rt", broker.WorkerRequest(agent_profile="developer"))
+job = broker._worker_job("deadbeef", "rt", worker_request())
 wire = k8s.ApiClient().sanitize_for_serialization(job)
 spec = wire["spec"]["template"]["spec"]
 env = {e["name"]: e.get("value") for e in spec["containers"][0]["env"]}
 
 check("job serializes to a dict", isinstance(wire, dict))
+annotations = wire["metadata"]["annotations"]
+check("job persists the authorized callback receiver",
+      annotations["cao.aws/callback-terminal-id"] == "abc12345")
+check("job persists the authorized memory session",
+      annotations["cao.aws/session-name"] == "cao-worker-deadbeef")
+check("job persists the authorized memory profile",
+      annotations["cao.aws/agent-profile"] == "developer")
 check("default provider is claude_code", env["CAO_INSTALL_PROFILES"] == "developer:claude_code",
       env.get("CAO_INSTALL_PROFILES"))
 # A credential must never be a literal in the Job body - the broker's Role has no
@@ -230,7 +244,7 @@ with broker._leases_lock:
 # in that window and must not be called disappearance.
 STATE["create_pods"] = False
 lease_waiting_for_pod = broker.create_worker(
-    broker.WorkerRequest(agent_profile="developer"), "test-token"
+    worker_request(), "test-token"
 )
 waiting_id = lease_waiting_for_pod.worker_id
 broker._reap_once()
@@ -255,7 +269,7 @@ check(
 STATE["create_pods"] = True
 
 # Once a Pod has been observed, an empty list really does mean disappearance.
-observed_lease = broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+observed_lease = broker.create_worker(worker_request(), "test-token")
 observed_id = observed_lease.worker_id
 broker._reap_once()
 check(
@@ -272,7 +286,7 @@ check(
 
 STATE["new_pods_ready"] = False
 _t0 = time.monotonic()
-lease0 = broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+lease0 = broker.create_worker(worker_request(), "test-token")
 _elapsed = time.monotonic() - _t0
 w0 = lease0.worker_id
 # Under the old gate this call could not return at all until the pod was Ready,
@@ -302,7 +316,7 @@ check("failed worker's job is released", f"cao-worker-{w0}" in STATE["deleted_jo
 # Once Ready has been SEEN, the readiness deadline is spent: a worker that goes
 # NotReady later is a completion problem, and must expire rather than fail.
 STATE["new_pods_ready"] = True
-lease1 = broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+lease1 = broker.create_worker(worker_request(), "test-token")
 w1 = lease1.worker_id
 broker._reap_once()
 check("reaper records the first Ready sighting", broker._leases[w1]["ready_at"] is not None)
@@ -317,14 +331,14 @@ check("a worker that was once Ready expires rather than fails",
 # caller of a model in the account.
 broker.GATE_ON_READY = True
 try:
-    lease2 = broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+    lease2 = broker.create_worker(worker_request(), "test-token")
     check("GATE_ON_READY=1 returns a lease with readiness already recorded",
           broker._leases[lease2.worker_id]["ready_at"] is not None)
 
     STATE["new_pods_ready"] = False
     STATE["new_pods_phase"] = "Succeeded"
     try:
-        broker.create_worker(broker.WorkerRequest(agent_profile="developer"), "test-token")
+        broker.create_worker(worker_request(), "test-token")
         check("GATE_ON_READY=1 surfaces a pod that dies before readiness", False,
               "no error raised")
     except RuntimeError as exc:
@@ -341,11 +355,15 @@ finally:
 
 # --- 4. lease lifecycle over HTTP ---------------------------------------
 with TestClient(broker.app) as c:
-    r = c.post("/workers", json={"agent_profile": "developer"})
+    worker_payload = {
+        "agent_profile": "developer",
+        "callback_terminal_id": "abc12345",
+    }
+    r = c.post("/workers", json=worker_payload)
     check("unauthenticated create is rejected", r.status_code == 401, str(r.status_code))
 
     H = {"X-CAO-Broker-Token": "test-token"}
-    r = c.post("/workers", json={"agent_profile": "developer"}, headers=H)
+    r = c.post("/workers", json=worker_payload, headers=H)
     check("create returns a lease", r.status_code == 200, r.text[:300])
     lease = r.json()
     wid = lease["worker_id"]
@@ -354,6 +372,8 @@ with TestClient(broker.app) as c:
     check("target_host is the per-worker service FQDN",
           lease["target_host"] == f"cao-worker-{wid}.cao-cluster.svc.cluster.local",
           lease["target_host"])
+    check("lease returns its bound session name",
+          lease["session_name"] == f"cao-worker-{wid}", lease["session_name"])
 
     r = c.get("/workers", headers=H)
     check("ledger lists the open lease",
@@ -375,16 +395,30 @@ with TestClient(broker.app) as c:
         content=b'{"success":true}',
         headers={"content-type": "application/json"},
     )
+    with patch.object(broker.requests, "post") as post:
+        r = c.post(
+            "/terminals/ffffffff/inbox/messages",
+            params={"sender_id": "eeeeeeee", "message": "lateral"},
+            headers=gateway_headers,
+        )
+    check("gateway rejects a different callback receiver", r.status_code == 403, r.text[:200])
+    check("rejected callback never reaches the supervisor", not post.called, str(post.call_args))
+
     with patch.object(broker.requests, "post", return_value=upstream) as post:
         r = c.post(
             "/terminals/abc12345/inbox/messages",
-            params={"sender_id": "feed0001", "message": "done"},
+            params={"sender_id": "eeeeeeee", "message": "done"},
             headers=gateway_headers,
         )
     check("authenticated callback is forwarded", r.status_code == 200, r.text[:200])
     check(
         "callback forwards only to the fixed supervisor inbox route",
         post.call_args.args[0] == "http://cao-supervisor:9889/terminals/abc12345/inbox/messages",
+        str(post.call_args),
+    )
+    check(
+        "callback sender is derived from the authenticated worker",
+        post.call_args.kwargs["params"]["sender_id"] == wid,
         str(post.call_args),
     )
 
@@ -396,13 +430,34 @@ with TestClient(broker.app) as c:
     with patch.object(broker.requests, "post", return_value=memory_upstream) as post:
         r = c.post(
             "/internal/memory/context",
-            json={"terminal_context": {"cwd": "/workspace"}, "budget_chars": 3000},
+            json={
+                "terminal_context": {
+                    "terminal_id": "ffffffff",
+                    "session_name": "cao-other-session",
+                    "provider": "other_provider",
+                    "agent_profile": "other_profile",
+                    "cwd": "/workspace/other",
+                },
+                "budget_chars": 3000,
+            },
             headers=gateway_headers,
         )
     check("authenticated memory request is forwarded", r.status_code == 200, r.text[:200])
     check(
         "memory forwards only to the fixed supervisor route",
         post.call_args.args[0] == "http://cao-supervisor:9889/internal/memory/context",
+        str(post.call_args),
+    )
+    check(
+        "memory identity is derived from the authenticated lease",
+        post.call_args.kwargs["json"]["terminal_context"]
+        == {
+            "terminal_id": wid,
+            "session_name": f"cao-worker-{wid}",
+            "provider": "claude_code",
+            "agent_profile": "developer",
+            "cwd": f"/home/cao/workspace/jobs/{wid}",
+        },
         str(post.call_args),
     )
 
@@ -422,7 +477,7 @@ with TestClient(broker.app) as c:
           any(w["worker_id"] == wid and w["state"] == "completed" for w in r.json()), r.text[:300])
 
     # --- 5. a one-shot terminal ends, complete never arrives --------------
-    r = c.post("/workers", json={"agent_profile": "developer"}, headers=H)
+    r = c.post("/workers", json=worker_payload, headers=H)
     terminal_ended_lease = r.json()
     terminal_ended_id = terminal_ended_lease["worker_id"]
     r = c.post(
@@ -449,7 +504,7 @@ with TestClient(broker.app) as c:
     )
 
     # --- 6. pod terminal phase fallback, complete never arrives -----------
-    r = c.post("/workers", json={"agent_profile": "developer"}, headers=H)
+    r = c.post("/workers", json=worker_payload, headers=H)
     wid2 = r.json()["worker_id"]
     STATE["pods"][wid2].status.phase = "Succeeded"
     STATE["pods"][wid2].status.conditions = []
@@ -468,7 +523,7 @@ with TestClient(broker.app) as c:
           str(STATE["deleted_jobs"]))
 
     # --- 7. completion deadline on a still-healthy pod --------------------
-    r = c.post("/workers", json={"agent_profile": "developer"}, headers=H)
+    r = c.post("/workers", json=worker_payload, headers=H)
     wid3 = r.json()["worker_id"]
     deadline = time.time() + 12
     while time.time() < deadline:
@@ -481,11 +536,12 @@ with TestClient(broker.app) as c:
     check("expired job is released", f"cao-worker-{wid3}" in STATE["deleted_jobs"])
 
     # --- 8. input validation still bounded -------------------------------
-    r = c.post("/workers", json={"agent_profile": "../../etc/passwd"}, headers=H)
+    r = c.post("/workers",
+               json={**worker_payload, "agent_profile": "../../etc/passwd"}, headers=H)
     check("path-ish profile rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/workers", json={"agent_profile": "developer", "provider": "a b"}, headers=H)
+    r = c.post("/workers", json={**worker_payload, "provider": "a b"}, headers=H)
     check("provider with a space rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/workers", json={"agent_profile": "developer", "image": "evil:latest"},
+    r = c.post("/workers", json={**worker_payload, "image": "evil:latest"},
                headers=H)
     check("caller cannot inject an image",
           r.status_code in (200, 422)

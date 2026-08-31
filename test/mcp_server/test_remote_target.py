@@ -155,7 +155,7 @@ class TestAssignRemote:
     @patch(f"{_SRV}.requests")
     def test_elastic_callback_url_overrides_the_full_control_api(self, mock_requests):
         mock_requests.post.return_value = _response(
-            201, {"id": "beef0001", "session_name": "cao-remote"}
+            201, {"id": "beef0001", "session_name": "cao-worker-deadbeef"}
         )
         with patch.dict(os.environ, self._ENV, clear=False):
             result = _assign_impl(
@@ -163,13 +163,36 @@ class TestAssignRemote:
                 "Analyze the logs",
                 target_host="cao-worker-0",
                 callback_url="http://cao-worker-broker:9890",
+                remote_session_name="cao-worker-deadbeef",
             )
 
         assert result["success"] is True
+        assert mock_requests.post.call_args.kwargs["params"]["session_name"] == (
+            "cao-worker-deadbeef"
+        )
         assert mock_requests.post.call_args.kwargs["json"]["env_vars"] == {
             "CAO_CALLBACK_URL": "http://cao-worker-broker:9890",
             "CAO_CALLBACK_TERMINAL_ID": "a1b2c3d4",
         }
+
+    @patch(f"{_SRV}.requests")
+    def test_elastic_assignment_rejects_a_different_remote_session(self, mock_requests):
+        mock_requests.post.return_value = _response(
+            201, {"id": "beef0001", "session_name": "cao-unexpected"}
+        )
+        with patch.dict(os.environ, self._ENV, clear=False):
+            result = _assign_impl(
+                "developer",
+                "Analyze the logs",
+                target_host="cao-worker-0",
+                callback_url="http://cao-worker-broker:9890",
+                remote_session_name="cao-worker-deadbeef",
+            )
+
+        assert result["success"] is False
+        assert result["terminal_id"] == "beef0001"
+        assert "cao-worker-deadbeef" in result["message"]
+        assert "cao-unexpected" in result["message"]
 
     @patch(f"{_SRV}.requests")
     def test_fails_fast_without_advertised_url(self, mock_requests):

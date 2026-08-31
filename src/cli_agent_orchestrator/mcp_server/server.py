@@ -1411,6 +1411,7 @@ def _assign_remote(
     use_worktree: bool,
     ready_wait_seconds: float = 0.0,
     callback_url: Optional[str] = None,
+    remote_session_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create an assign worker on a REMOTE CAO node (one-agent-per-pod topology).
 
@@ -1427,6 +1428,10 @@ def _assign_remote(
     remote assign uses this node's ``CAO_ADVERTISED_URL``; elastic assign passes
     its authenticated broker gateway as ``callback_url`` so workers never learn
     the supervisor control API URL.
+
+    Elastic assign also passes the broker-issued ``remote_session_name``. The
+    broker binds memory authorization to that immutable session identity before
+    the worker exists, avoiding a registration race with deferred initialization.
 
     ``ready_wait_seconds`` > 0 waits for the target's ``/health`` before posting
     (see ``_wait_remote_ready``). It defaults to 0, which keeps every existing
@@ -1463,6 +1468,8 @@ def _assign_remote(
     if ready_wait_seconds > 0:
         _wait_remote_ready(base_url, ready_wait_seconds)
     params: Dict[str, Any] = {"agent_profile": agent_profile}
+    if remote_session_name:
+        params["session_name"] = remote_session_name
     if working_directory:
         # Interpreted on the REMOTE node's filesystem; the supervisor's own
         # cwd is deliberately NOT inherited cross-node (it is meaningless
@@ -1500,6 +1507,16 @@ def _assign_remote(
     data = response.json()
     terminal_id = data["id"]
     session_name = data.get("session_name")
+    if remote_session_name and session_name != remote_session_name:
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "target_host": target_host,
+            "message": (
+                f"Assignment failed on node {target_host}: requested bound session "
+                f"{remote_session_name!r}, but remote node returned {session_name!r}"
+            ),
+        }
     # Ready-made cleanup route. NOTE: DELETE /sessions/{name} requires the
     # admin scope (SCOPE_ADMIN) when the node's OAuth layer is enabled;
     # DELETE /terminals/{id} (write scope) is the lighter alternative.
@@ -1543,6 +1560,7 @@ def _assign_impl(
     target_host: Optional[str] = None,
     ready_wait_seconds: float = 0.0,
     callback_url: Optional[str] = None,
+    remote_session_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1612,6 +1630,7 @@ def _assign_impl(
                 use_worktree=use_worktree,
                 ready_wait_seconds=ready_wait_seconds,
                 callback_url=callback_url,
+                remote_session_name=remote_session_name,
             )
 
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
@@ -1884,7 +1903,8 @@ async def assign_elastic(
     when a delegation reports success and produces no artifact.
     """
     try:
-        if not _current_terminal_id():
+        callback_terminal_id = _current_terminal_id()
+        if not callback_terminal_id:
             raise ValueError("assign_elastic must run from inside a CAO terminal")
         broker_url, broker_token = _elastic_broker_config()
         # `provider` is omitted rather than defaulted here on purpose. A default
@@ -1898,7 +1918,10 @@ async def assign_elastic(
         # `provider` arrives resolved to a string or None; called directly - as
         # the tests do - the unfilled default is the `FieldInfo` object itself,
         # which a plain truthiness test would happily place into the request body.
-        payload: Dict[str, Any] = {"agent_profile": agent_profile}
+        payload: Dict[str, Any] = {
+            "agent_profile": agent_profile,
+            "callback_terminal_id": callback_terminal_id,
+        }
         if isinstance(provider, str) and provider.strip():
             payload["provider"] = provider.strip()
         # `requests` is blocking, and this coroutine runs on the MCP server's
@@ -1948,6 +1971,7 @@ async def assign_elastic(
             target_host=str(lease["target_host"]),
             ready_wait_seconds=_elastic_ready_wait(),
             callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
+            remote_session_name=str(lease["session_name"]),
         )
         result["worker_id"] = worker_id
         result["elastic"] = True

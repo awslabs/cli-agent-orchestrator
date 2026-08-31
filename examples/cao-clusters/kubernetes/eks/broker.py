@@ -166,6 +166,7 @@ FLEET_CONFIG_RETRIES = 3
 
 class WorkerRequest(BaseModel):
     agent_profile: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")
+    callback_terminal_id: str = Field(pattern=r"^[a-f0-9]{8}$")
     provider: str = Field(
         default_factory=lambda: DEFAULT_WORKER_PROVIDER,
         pattern=r"^[a-zA-Z0-9_-]{1,64}$",
@@ -176,6 +177,7 @@ class WorkerLease(BaseModel):
     worker_id: str
     target_host: str
     working_directory: str
+    session_name: str
     release_token: str
 
 
@@ -192,6 +194,23 @@ class TerminalEndedRequest(BaseModel):
     terminal_id: str = Field(pattern=r"^[a-f0-9]{8}$")
 
 
+class WorkerAuthorization(BaseModel):
+    worker_id: str
+    callback_terminal_id: str
+    session_name: str
+    agent_profile: str
+    provider: str
+    working_directory: str
+
+
+_RELEASE_TOKEN_ANNOTATION = "cao.aws/release-token"
+_CALLBACK_TERMINAL_ANNOTATION = "cao.aws/callback-terminal-id"
+_SESSION_NAME_ANNOTATION = "cao.aws/session-name"
+_AGENT_PROFILE_ANNOTATION = "cao.aws/agent-profile"
+_PROVIDER_ANNOTATION = "cao.aws/provider"
+_WORKING_DIRECTORY_ANNOTATION = "cao.aws/working-directory"
+
+
 def _require_broker_token(value: Optional[str]) -> None:
     if not value or not hmac.compare_digest(value, BROKER_TOKEN):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
@@ -199,6 +218,14 @@ def _require_broker_token(value: Optional[str]) -> None:
 
 def _job_name(worker_id: str) -> str:
     return f"cao-worker-{worker_id}"
+
+
+def _session_name(worker_id: str) -> str:
+    return f"cao-worker-{worker_id}"
+
+
+def _working_directory(worker_id: str) -> str:
+    return f"{WORKSPACE_ROOT}/{worker_id}"
 
 
 def _labels(worker_id: str) -> dict[str, str]:
@@ -216,7 +243,7 @@ def _worker_job(
 ) -> client.V1Job:
     name = _job_name(worker_id)
     labels = _labels(worker_id)
-    working_directory = f"{WORKSPACE_ROOT}/{worker_id}"
+    working_directory = _working_directory(worker_id)
     env = [
         client.V1EnvVar(name="CAO_BIND_HOST", value="0.0.0.0"),
         client.V1EnvVar(name="CAO_API_PORT", value="9889"),
@@ -385,7 +412,14 @@ def _worker_job(
         metadata=client.V1ObjectMeta(
             name=name,
             labels=labels,
-            annotations={"cao.aws/release-token": release_token},
+            annotations={
+                _RELEASE_TOKEN_ANNOTATION: release_token,
+                _CALLBACK_TERMINAL_ANNOTATION: request.callback_terminal_id,
+                _SESSION_NAME_ANNOTATION: _session_name(worker_id),
+                _AGENT_PROFILE_ANNOTATION: request.agent_profile,
+                _PROVIDER_ANNOTATION: request.provider,
+                _WORKING_DIRECTORY_ANNOTATION: working_directory,
+            },
         ),
         spec=client.V1JobSpec(
             template=template,
@@ -738,26 +772,42 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="CAO Elastic Worker Broker", lifespan=lifespan)
 
 
-def _require_release_token(worker_id: str, value: Optional[str]) -> None:
+def _require_release_token(worker_id: str, value: Optional[str]) -> client.V1Job:
     try:
         job = batch_api.read_namespaced_job(_job_name(worker_id), NAMESPACE)
     except ApiException as exc:
         if exc.status == 404:
             raise HTTPException(status_code=404, detail="worker not found") from exc
         raise
-    expected = (job.metadata.annotations or {}).get("cao.aws/release-token", "")
+    expected = (job.metadata.annotations or {}).get(_RELEASE_TOKEN_ANNOTATION, "")
     if not value or not hmac.compare_digest(value, expected):
         raise HTTPException(status_code=401, detail="invalid release token")
+    return job
 
 
 def _require_worker_gateway(
     worker_id: Optional[str],
     release_token: Optional[str],
-) -> str:
+) -> WorkerAuthorization:
     if not worker_id or not re.fullmatch(r"[a-f0-9]{8}", worker_id):
         raise HTTPException(status_code=401, detail="invalid worker identity")
-    _require_release_token(worker_id, release_token)
-    return worker_id
+    job = _require_release_token(worker_id, release_token)
+    annotations = job.metadata.annotations or {}
+    try:
+        return WorkerAuthorization(
+            worker_id=worker_id,
+            callback_terminal_id=annotations[_CALLBACK_TERMINAL_ANNOTATION],
+            session_name=annotations[_SESSION_NAME_ANNOTATION],
+            agent_profile=annotations[_AGENT_PROFILE_ANNOTATION],
+            provider=annotations[_PROVIDER_ANNOTATION],
+            working_directory=annotations[_WORKING_DIRECTORY_ANNOTATION],
+        )
+    except (KeyError, ValueError) as exc:
+        log.error("worker %s has incomplete gateway authorization annotations", worker_id)
+        raise HTTPException(
+            status_code=403,
+            detail="worker gateway authorization is incomplete",
+        ) from exc
 
 
 def _proxy_to_supervisor(
@@ -802,14 +852,14 @@ def gateway_inbox_message(
     x_cao_release_token: Optional[str] = Header(default=None),
 ) -> Response:
     """Authenticated worker callback; only this inbox route is forwarded."""
-    _require_worker_gateway(x_cao_worker_id, x_cao_release_token)
-    if not re.fullmatch(r"[a-f0-9]{8}", receiver_id):
-        raise HTTPException(status_code=422, detail="invalid receiver terminal id")
-    if not re.fullmatch(r"[a-f0-9]{8}", sender_id):
-        raise HTTPException(status_code=422, detail="invalid sender terminal id")
+    authorization = _require_worker_gateway(x_cao_worker_id, x_cao_release_token)
+    if receiver_id != authorization.callback_terminal_id:
+        raise HTTPException(status_code=403, detail="callback receiver is not authorized")
     return _proxy_to_supervisor(
         f"/terminals/{receiver_id}/inbox/messages",
-        params={"sender_id": sender_id, "message": message},
+        # Never trust the caller's sender_id. The authenticated lease identity
+        # is the only identity this worker may assert on the supervisor.
+        params={"sender_id": authorization.worker_id, "message": message},
     )
 
 
@@ -819,8 +869,19 @@ def _gateway_memory(
     worker_id: Optional[str],
     release_token: Optional[str],
 ) -> Response:
-    _require_worker_gateway(worker_id, release_token)
-    return _proxy_to_supervisor(path, body=body)
+    authorization = _require_worker_gateway(worker_id, release_token)
+    bound_body = dict(body)
+    # The worker controls its request body, including terminal_context. Replace
+    # every identity-bearing field with the immutable lease claims persisted on
+    # the Job so session/agent scopes cannot be redirected laterally.
+    bound_body["terminal_context"] = {
+        "terminal_id": authorization.worker_id,
+        "session_name": authorization.session_name,
+        "provider": authorization.provider,
+        "agent_profile": authorization.agent_profile,
+        "cwd": authorization.working_directory,
+    }
+    return _proxy_to_supervisor(path, body=bound_body)
 
 
 @app.post("/internal/memory/store")
@@ -905,6 +966,7 @@ def create_worker(
             "pod_observed_at": None,
             "agent_profile": request.agent_profile,
             "provider": request.provider,
+            "callback_terminal_id": request.callback_terminal_id,
         }
     try:
         # Job first, so the Service can be created owned by it. The pod does not
@@ -948,7 +1010,8 @@ def create_worker(
     return WorkerLease(
         worker_id=worker_id,
         target_host=f"{name}.{NAMESPACE}.svc.cluster.local",
-        working_directory=f"{WORKSPACE_ROOT}/{worker_id}",
+        working_directory=_working_directory(worker_id),
+        session_name=_session_name(worker_id),
         release_token=release_token,
     )
 
