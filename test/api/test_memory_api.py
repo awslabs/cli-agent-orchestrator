@@ -115,7 +115,6 @@ class TestInternalMemoryStore:
         assert response.status_code == 500
         assert json.loads(response.body) == {
             "error_kind": "memory_metadata_partial_write",
-            "error": str(error),
             "partial_write": {
                 "key": "partial-topic",
                 "scope": "global",

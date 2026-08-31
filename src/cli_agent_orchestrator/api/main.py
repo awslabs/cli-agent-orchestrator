@@ -7036,7 +7036,6 @@ def _memory_partial_write_response(error: Any) -> JSONResponse:
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "error_kind": error.error_kind,
-            "error": str(error),
             "partial_write": {
                 "key": error.key,
                 "scope": error.scope,
