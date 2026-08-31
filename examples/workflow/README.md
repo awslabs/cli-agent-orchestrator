@@ -33,9 +33,15 @@ README only covers what's specific to this example.
 2. **Sequential then concurrent** — one `run_step` plan call, then a
    `ThreadPoolExecutor` fan-out over a fixed check list, each with an explicit,
    pairwise-distinct `step_id` derived from `target` and the check name
-   (`check-<target>-<check>`, with `target` sanitized to the
-   `[A-Za-z0-9_-]` charset `/terminals/run-step` requires) — the shape used in
+   (`check-<target>-<check>`, with `target` put through `_slug` to satisfy both
+   halves of what `/terminals/run-step` requires: the `[A-Za-z0-9_-]` charset and
+   the 1-64 character length) — the shape used in
    [`docs/examples/fanout_example.py`](../../docs/examples/fanout_example.py).
+   A `target` short enough to fit is only charset-mapped, so it keeps a readable
+   `step_id`. One long enough to overflow the budget is truncated and given a
+   short digest of the original, because bare truncation would map every long
+   `target` sharing a prefix onto a single `step_id` — and a reused `step_id` in a
+   fan-out is a correctness bug rather than a cosmetic one.
 3. **Per-unit fault tolerance** — each fan-out call is wrapped in its own
    `try`/`except ShimHTTPError`; one failing check is dropped into
    `failed_checks` and the run still completes with the survivors.

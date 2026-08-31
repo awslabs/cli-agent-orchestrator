@@ -16,6 +16,7 @@ cancel) and examples/workflow/run.sh for a non-interactive entry point.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -42,10 +43,41 @@ CHECKS = ["style", "security", "performance"]
 # be embedded in a step_id.
 _STEP_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 
+# WORKFLOW_NAME_RE bounds length as well as charset: 1-64 characters. The
+# longest step_id this script emits is "check-" + slug + "-" + the longest
+# CHECKS entry, so that fixed cost is what the slug has to fit inside.
+# Deriving the budget from CHECKS rather than hardcoding it keeps the bound
+# correct if the catalogue grows.
+_STEP_ID_MAX = 64
+_SLUG_MAX = _STEP_ID_MAX - len("check--") - max(len(c) for c in CHECKS)
+
+# Spent only on the truncation path (see _slug). sha256 and not the builtin
+# hash(): hash() is salted per interpreter, and a step_id that changes between
+# processes would break replay, which keys on the step_id.
+_SLUG_HASH_LEN = 7
+_SLUG_KEEP = _SLUG_MAX - 1 - _SLUG_HASH_LEN
+
 
 def _slug(value: str) -> str:
-    """Map ``value`` onto the charset CAO_WORKFLOW_STEP_ID requires."""
-    return _STEP_ID_UNSAFE.sub("_", value)
+    """Map ``value`` onto the charset and length CAO_WORKFLOW_STEP_ID requires.
+
+    A value that already fits is only charset-mapped, so ordinary targets keep a
+    readable step_id. A value that would overflow the budget is truncated and
+    given a short digest of the original, because bare truncation collapses
+    every long target sharing a prefix onto a single step_id — and in a fan-out
+    a silently reused step_id is a correctness bug, not a cosmetic one. This
+    file is the copy-paste template for other people's workflows, so it ships
+    the collision-safe shape.
+
+    Note this bounds the truncation path only. Two distinct targets can still
+    map to one slug at short lengths (``a b`` and ``a/b`` both give ``a_b``);
+    that is inherent to charset mapping and unchanged here.
+    """
+    mapped = _STEP_ID_UNSAFE.sub("_", value)
+    if len(mapped) <= _SLUG_MAX:
+        return mapped
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:_SLUG_HASH_LEN]
+    return f"{mapped[:_SLUG_KEEP]}-{digest}"
 
 
 def _tone(strict: bool) -> str:

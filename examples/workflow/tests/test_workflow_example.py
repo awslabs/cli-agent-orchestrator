@@ -13,6 +13,7 @@ directly proves rejection happens before any worker/step exists.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import subprocess
@@ -29,6 +30,18 @@ from cli_agent_orchestrator.services.workflow_spec_service import _extract_input
 
 _WORKFLOW_PATH = Path(__file__).resolve().parents[1] / "workflow.py"
 _WORKFLOW_SOURCE = _WORKFLOW_PATH.read_text(encoding="utf-8")
+
+
+def _load_workflow_module():
+    """Import workflow.py from its path, for the few pure helpers worth unit-testing.
+
+    Everything else here drives the script as a real subprocess; this exists so a
+    pure function can be tested as one without putting examples/ on sys.path.
+    """
+    spec = importlib.util.spec_from_file_location("_workflow_under_test", _WORKFLOW_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class _SpecStub:
@@ -102,6 +115,47 @@ async def test_concurrent_fanout_uses_pairwise_distinct_step_ids(
     assert result.output["failed_checks"] == []
     # concurrency defaulted to 2 and the cap is a no-op at the default itself.
     assert result.output["max_workers"] == 2
+
+
+@pytest.mark.asyncio
+async def test_overlong_target_stays_inside_the_step_id_length_bound(
+    api_base_url, fake_run_step_server
+):
+    """The 1-64 half of the step_id contract, which a "myapp" target never reaches.
+
+    The charset assertion above is already written as ``{1,64}``, but only a
+    target long enough to overflow the budget actually exercises the length half.
+    """
+    target = "svc/" + ("long-target-name" * 8)  # unsafe chars AND far over the bound
+    spec = _RealSpec(_WORKFLOW_PATH, "workflow-example")
+    inputs = _resolved_inputs({"target": target})
+
+    result = await run_script_workflow(spec, inputs, "test-longtarget")
+
+    assert result.state == RunState.COMPLETED
+    step_ids = [c["env_vars"]["CAO_WORKFLOW_STEP_ID"] for c in fake_run_step_server.recorded_calls]
+    assert len(step_ids) == 4  # one plan + three checks
+    for step_id in step_ids:
+        assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", step_id), step_id
+    assert len(set(step_ids)) == len(step_ids)
+
+
+def test_slug_truncation_is_collision_safe_and_stable():
+    """Bare truncation would collapse targets sharing a prefix onto one step_id.
+
+    That is why ``_slug`` spends its tail on a digest. Both properties matter:
+    distinctness (a fan-out must not reuse a step_id) and stability across
+    processes (replay keys on the step_id, so a per-process value would break it).
+    """
+    slug = _load_workflow_module()._slug
+    prefix = "p" * 60
+
+    assert slug(prefix + "AAAA") != slug(prefix + "BBBB")
+    assert slug(prefix + "AAAA") == slug(prefix + "AAAA")
+    # Short targets keep the plain readable slug — no digest, so this change
+    # cannot alter step_ids for any target that already fit.
+    assert slug("myapp") == "myapp"
+    assert slug("my app/v2") == "my_app_v2"
 
 
 @pytest.mark.asyncio
