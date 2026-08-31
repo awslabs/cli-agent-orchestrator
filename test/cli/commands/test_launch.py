@@ -511,8 +511,20 @@ def test_is_waiting_on_user_swallows_transport_errors():
         mock_get.side_effect = _requests.exceptions.ConnectionError("boom")
         assert _is_waiting_on_user("t1") is False
 
+
+@pytest.mark.parametrize("status_code", [201, 204, 400, 401, 404, 500, 503])
+def test_is_waiting_on_user_ignores_a_non_200_even_with_a_waiting_body(status_code):
+    """Only a 200 is believed — and the body must be a real dict to prove it.
+
+    Leaving ``json()`` as an unconfigured MagicMock would make this pass on the
+    isinstance guard alone, so deleting the status check would not fail any test.
+    A concrete waiting body is what makes the status check the thing under test.
+    """
     with patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get:
-        mock_get.return_value.status_code = 500
+        mock_get.return_value.status_code = status_code
+        mock_get.return_value.json.return_value = {
+            "status": TerminalStatus.WAITING_USER_ANSWER.value
+        }
         assert _is_waiting_on_user("t1") is False
 
 

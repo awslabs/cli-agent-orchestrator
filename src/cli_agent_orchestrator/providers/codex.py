@@ -1118,28 +1118,67 @@ class CodexProvider(BaseProvider):
                 and re.search(LOGIN_MENU_FOOTER, bottom_region)
             )
 
-            # ``not has_login`` is what keeps the invariant below honest. Alone among
-            # the four signatures this loop recognises, the v1 trust check matches the
-            # WHOLE capture rather than ``bottom_region`` — so it can fire on trust
-            # copy sitting anywhere in scrollback, including text the login gate
-            # cannot see. Without this gate the handler would press Enter into a live
-            # login menu and *then* log that it was leaving the menu for the operator,
-            # which is both a lie and worse than the stall being fixed here: the
-            # keystroke selects a sign-in method, so the pane leaves the login menu
-            # and therefore the set ``initialize()`` is waiting on ({IDLE, COMPLETED,
-            # WAITING_USER_ANSWER}) — measured as PROCESSING on the API-key option;
-            # the OAuth option was not exercised. Either way a recoverable "operator
-            # must authenticate" becomes a TimeoutError and teardown.
+            # The v1 trust check is the only one of the four signatures matched
+            # against the WHOLE capture rather than ``bottom_region``, so on its own
+            # it fires on trust copy sitting anywhere in scrollback — text the login
+            # gate below cannot see. Ungated, the handler would press Enter into a
+            # live login menu and *then* log that it was leaving that menu for the
+            # operator: the keystroke selects a sign-in method, so the pane leaves
+            # the set ``initialize()`` waits on ({IDLE, COMPLETED,
+            # WAITING_USER_ANSWER}) and a recoverable "operator must authenticate"
+            # becomes a TimeoutError and teardown. (Measured as PROCESSING on the
+            # API-key option; the OAuth option was not exercised.)
             #
-            # Deliberately gated here rather than by bottom-anchoring the search:
-            # anchoring would change trust-v1 detection for every codex launch, and a
-            # genuine trust prompt may legitimately sit higher than the bottom 15
-            # lines. Reading it as "if the bottom of the screen is the login menu,
-            # then whatever trust text is in the buffer is not the active dialog"
-            # keeps this scoped to the case at hand.
+            # So the gate has to separate a LIVE v1 dialog from stale v1 copy, and
+            # position is what separates them — hence ``v1_is_live``. Suppressing on
+            # ``has_login`` alone would be wrong in the other direction: a genuine v1
+            # dialog stacked over a live login menu satisfies BOTH ``has_login`` and
+            # ``has_dialog``, so neither this branch nor the login exit could fire and
+            # the handler would live-lock to its outer cap — reproducing, in that one
+            # frame class, the exact stall this commit's sibling exists to remove.
+            #
+            # Where the asymmetry actually lies: this branch's TRIGGER is the only
+            # whole-capture match in the loop (the final conjunct below), while
+            # liveness and every term of ``has_dialog`` are confined to
+            # ``bottom_region`` — including ``_has_update_dialog_in_bottom``, which
+            # takes the same 15-line slice internally. So the whole capture decides
+            # only *whether trust copy exists at all*; position inside the bottom
+            # region decides whether it is live.
+            #
+            # Presence in ``bottom_region`` is not enough to call a v1 dialog live: it
+            # would still answer trust copy sitting in the last 15 lines ABOVE a live
+            # menu, which is the original bug with a smaller window rather than a
+            # closed one. POSITION settles it — Codex draws the active modal last, so
+            # the lower block is the one on screen. Hence "live" means the v1 copy
+            # appears below the menu text, which is also why the shared footer is no
+            # use here: ``LOGIN_MENU_FOOTER is TRUST_PROMPT_FOOTER``, so the footer
+            # cannot attribute itself to either block.
+            # Both sides take the LAST occurrence, and that symmetry is the whole
+            # correctness argument. Comparing the FIRST v1 match against the LAST menu
+            # match misreads a frame carrying stale v1 copy above the menu AND a live
+            # v1 dialog below it: the stale copy wins the comparison, ``v1_is_live``
+            # goes false, and because ``has_dialog`` shares that predicate the login
+            # exit fires with a live dialog on screen — the exact failure ``not
+            # has_dialog`` exists to prevent. Only the lowest occurrence of each block
+            # can be the one currently drawn, so only those two may be compared.
+            _v1_all = list(re.finditer(TRUST_PROMPT_PATTERN, bottom_region))
+            _v1_match = _v1_all[-1] if _v1_all else None
+            _menu_matches = list(re.finditer(LOGIN_MENU_PATTERN, bottom_region))
+            # Offsets are only comparable because both matches come from
+            # ``bottom_region``. Sourcing either from ``clean_output`` would compare
+            # positions in two different strings and silently produce nonsense.
+            #
+            # ``is not None`` rather than ``bool()``: mypy narrows the Optional through
+            # the former only, and ``.start()`` below needs the narrowing.
+            v1_is_live = _v1_match is not None and (
+                # Short-circuits before the index, which is only safe to take when
+                # has_login held (it requires a menu match in this same region).
+                not has_login
+                or _v1_match.start() > _menu_matches[-1].start()
+            )
             if (
                 not trust_dismissed
-                and not has_login
+                and (v1_is_live or not has_login)
                 and re.search(TRUST_PROMPT_PATTERN, clean_output)
             ):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -1202,8 +1241,23 @@ class CodexProvider(BaseProvider):
             # dialog is active. The welcome banner alone is insufficient — it
             # renders as normal startup chrome BEFORE a late update dialog appears.
             has_idle = _has_startup_idle_composer(clean_output)
+            # ``v1_is_live`` rather than a bare presence test, so ONE notion of
+            # liveness governs both the dismissal above and this blocking check.
+            # With two notions they disagreed exactly where it hurt: stale v1 copy
+            # above a live menu was (correctly) too stale to dismiss, yet still
+            # counted here as a blocking dialog — so neither the dismissal nor the
+            # login exit could fire and the handler burned its whole cap, which at
+            # the 60s default against a 30s ``mcp_request_timeout`` is this PR's own
+            # P1 again. Sharing the predicate is what makes the invariant hold:
+            # every term in ``has_dialog`` has a dismissal arm that can actually
+            # fire on it.
+            #
+            # This only changes behaviour when a login menu is present. Without one,
+            # ``not has_login`` makes ``v1_is_live`` true whenever the copy is in
+            # ``bottom_region``, which is the previous meaning exactly — so the
+            # ``has_idle`` exit below still sees a live trust dialog as blocking.
             has_dialog = (
-                re.search(TRUST_PROMPT_PATTERN, bottom_region)
+                v1_is_live
                 or (
                     re.search(TRUST_PROMPT_PATTERN_V2, bottom_region)
                     and re.search(TRUST_PROMPT_FOOTER, bottom_region)
@@ -1221,11 +1275,25 @@ class CodexProvider(BaseProvider):
             # a non-headless ``cao launch`` (which sends no initial_message, so
             # ``POST /sessions`` initializes synchronously) had its client raise
             # ReadTimeout before the operator could ever attach to authenticate.
-            # Still gated on ``not has_dialog``: a trust or update dialog stacked
-            # over the menu must be dismissed first, or ``initialize()`` would
-            # succeed on WAITING_USER_ANSWER and the next ``send_input`` would
-            # raise ``TerminalInputBlockedError`` — the exact failure this
+            # Still gated on ``not has_dialog``: a dialog stacked over the menu gets
+            # dismissed by a branch above first, and only then does this exit fire.
+            # Returning while one is still up would let ``initialize()`` succeed on
+            # WAITING_USER_ANSWER, and a delivery landing in that window is refused
+            # with ``TerminalInputBlockedError`` and dropped — the failure this
             # handler's idle-gap split exists to prevent.
+            #
+            # "dismissed first" is load-bearing, and it is why the v1 term of
+            # ``has_dialog`` shares the dismissal's ``v1_is_live`` predicate. With two
+            # different notions of liveness, a live v1 dialog could satisfy
+            # ``has_dialog`` while being suppressed above as stale — neither branch
+            # fires and this loop live-locks to its cap. One predicate keeps the
+            # invariant that every term here has a dismissal arm able to fire on it.
+            #
+            # Stale copy is therefore not merely tolerated, it is invisible, whether it
+            # scrolled out of ``bottom_region`` entirely or still sits inside it above
+            # the menu. Both leave ``has_dialog`` false and this exit fires at once
+            # (measured: 0.00s, no keystroke, for either). Before the two predicates
+            # were unified, the second of those burned the whole cap.
             if has_login and not has_dialog:
                 logger.info(
                     "Codex first-run login menu detected — startup is settled, leaving the "

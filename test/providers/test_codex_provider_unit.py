@@ -14,6 +14,11 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
     APPROVAL_PROMPT_FOOTER,
+    LOGIN_MENU_FOOTER,
+    LOGIN_MENU_PATTERN,
+    STARTUP_PROMPT_BOTTOM_LINES,
+    TRUST_PROMPT_PATTERN,
+    TRUST_PROMPT_PATTERN_V2,
     CodexProvider,
     ProviderError,
     _find_response_marker,
@@ -2871,6 +2876,240 @@ class TestCodexProviderUpdateDialog:
         mock_tmux.return_value.send_special_key.assert_not_called()
         mock_tmux.return_value.send_keys.assert_not_called()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_live_v1_dialog_over_a_login_menu_is_dismissed_not_live_locked(
+        self, mock_tmux, mock_error
+    ):
+        """A *live* v1 dialog stacked on the menu must still be answered.
+
+        This is why the v1 dismissal is bottom-anchored rather than simply
+        suppressed whenever ``has_login`` holds. Such a frame satisfies BOTH
+        ``has_login`` (menu text + footer in the bottom region) and ``has_dialog``
+        (the v1 copy), so under a ``not has_login`` gate neither the dismissal nor
+        the login exit could fire and the handler live-locked to its outer cap —
+        reproducing the very stall the login branch exists to remove, and in the
+        non-headless case the original ReadTimeout with it, since the handler's cap
+        is twice the client's request budget.
+
+        Asserting on the ORDER matters: dismiss first, then exit on the menu. That
+        is exactly what the login exit's ``not has_dialog`` comment claims happens.
+        """
+        stacked_live = (
+            "> 1. Sign in with ChatGPT\n"
+            "  2. Sign in with Device Code\n"
+            "  3. Provide your own API key\n"
+            "\n"
+            "  Do you trust this workspace?\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. No, ask me to approve edits and commands\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+        # Precondition: this frame really does set both predicates, or the test
+        # would be pinning nothing. Computed against the module's own patterns.
+        bottom = "\n".join(stacked_live.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        assert re.search(LOGIN_MENU_PATTERN, bottom) and re.search(LOGIN_MENU_FOOTER, bottom)
+        assert re.search(TRUST_PROMPT_PATTERN, bottom)
+
+        mock_tmux.return_value.get_history.side_effect = self._frames(
+            stacked_live, self.LOGIN_MENU_OUTPUT
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=20.0, outer_timeout=30.0)
+
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+        # Did not run to the cap: the cap exit is the only thing that logs an error.
+        mock_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_trust_copy_above_a_live_menu_inside_the_window_is_not_answered(
+        self, mock_tmux, mock_error
+    ):
+        """Nearby stale trust copy is still stale — presence in the window isn't liveness.
+
+        Anchoring the v1 dismissal to ``bottom_region`` alone would only shrink the
+        scrollback exploit from "anywhere in the capture" to "the last 15 lines",
+        not close it. Position closes it: Codex draws the active modal last, so
+        trust copy ABOVE the menu text is history no matter how close it sits.
+
+        What distinguishes this from
+        ``test_live_v1_dialog_over_a_login_menu_is_dismissed_not_live_locked`` is the
+        ORDER of the two blocks — that fixture also carries an inert
+        "Do you trust this workspace?" line, which matches no pattern in this module,
+        so order is the only difference that any predicate can see. Reversing the
+        comparison therefore fails both, which is what pins the comparison rather
+        than mere containment.
+        """
+        trust_above = (
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. No, ask me to approve edits and commands\n"
+            "\n"
+            "> 1. Sign in with ChatGPT\n"
+            "  2. Sign in with Device Code\n"
+            "  3. Provide your own API key\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+        bottom = "\n".join(trust_above.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        # Both signatures are inside the window; only their ORDER differs from the
+        # live-dialog case. Without that assertion this test could pass by losing
+        # one of them to the 15-line cut.
+        assert re.search(TRUST_PROMPT_PATTERN, bottom), "v1 copy must be in the window"
+        assert re.search(LOGIN_MENU_PATTERN, bottom) and re.search(LOGIN_MENU_FOOTER, bottom)
+
+        mock_tmux.return_value.get_history.side_effect = self._frames(trust_above)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        started = time.monotonic()
+        await provider._handle_trust_prompt(idle_gap=20.0, outer_timeout=30.0)
+        elapsed = time.monotonic() - started
+
+        mock_tmux.return_value.send_special_key.assert_not_called()
+        mock_tmux.return_value.send_keys.assert_not_called()
+        # Sending nothing is only half of it. Asserting the keystroke alone let this
+        # test pass while the handler still burned its whole cap: the copy was too
+        # stale to dismiss, yet a bare presence test still counted it in
+        # ``has_dialog`` and blocked the login exit — so neither branch fired and, at
+        # the production 60s cap against a 30s client budget, this PR's own P1
+        # recurred in this frame class. Both assertions together are what pin it.
+        assert elapsed < 5.0, f"handler burned {elapsed:.1f}s instead of taking the login exit"
+        mock_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_v1_twin_login_exit_waits_for_a_dismissed_v1_dialog_to_clear(self, mock_tmux):
+        """``has_dialog`` must count a live v1 dialog, not just the v2 variant.
+
+        The v2 sibling of this test passes even with the v1 term removed from
+        ``has_dialog`` entirely — its fixture is a v2 frame, so the v2 term covers
+        for the v1 one. That left the v1 term unpinned: dropping it would let the
+        login exit fire on a frame where a just-answered v1 dialog is still
+        rendered, and since ``initialize()`` treats WAITING_USER_ANSWER as success,
+        a delivery landing in that window is refused with
+        ``TerminalInputBlockedError`` and dropped.
+
+        Frame 1 dismisses (the v1 copy is below the menu, so it is live). Frame 2
+        still shows it, and the handler must NOT take the login exit there.
+        Reaching frame 3 is the observable proof it kept waiting.
+        """
+        stacked_v1 = (
+            "> 1. Sign in with ChatGPT\n"
+            "  2. Sign in with Device Code\n"
+            "  3. Provide your own API key\n"
+            "\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. No, ask me to approve edits and commands\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+        bottom = "\n".join(stacked_v1.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        assert re.search(LOGIN_MENU_PATTERN, bottom) and re.search(LOGIN_MENU_FOOTER, bottom)
+        assert re.search(TRUST_PROMPT_PATTERN, bottom)
+        # No v2 signature anywhere, or the v2 term would cover for the v1 one and
+        # this test would pin nothing — which is the gap it exists to close.
+        assert not re.search(TRUST_PROMPT_PATTERN_V2, stacked_v1)
+
+        mock_tmux.return_value.get_history.side_effect = self._frames(
+            stacked_v1, stacked_v1, self._SETTLED
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
+
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+        assert mock_tmux.return_value.get_history.call_count == 3, (
+            "login exit fired while a dismissed v1 dialog was still rendered "
+            f"(read {mock_tmux.return_value.get_history.call_count} frames, expected 3)"
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_stale_copy_above_and_live_dialog_below_dismisses(self, mock_tmux):
+        """Both sides of the position test must take the LAST occurrence.
+
+        Frame C: stale v1 copy above the menu AND a live v1 dialog below it. If the
+        v1 side takes the FIRST match while the menu side takes the LAST, the stale
+        copy wins the comparison, ``v1_is_live`` goes false, and — because
+        ``has_dialog`` shares that predicate — the login exit fires with a live
+        dialog still on screen. ``initialize()`` then succeeds on
+        WAITING_USER_ANSWER and the following ``send_input`` is refused with
+        ``TerminalInputBlockedError``, dropping the message: the exact failure ``not
+        has_dialog`` exists to prevent, and worse than the stall it replaced.
+
+        This frame does NOT discriminate ``_menu_matches[-1]`` from ``[0]`` — the last
+        v1 copy sits below both menu matches, so either index gives the same answer.
+        ``test_v1_copy_between_two_menu_renders_is_not_live`` covers that.
+        """
+        frame_c = (
+            "  $ grep 'allow Codex to work in this folder' audit.log\n"
+            "\n"
+            "> 1. Sign in with ChatGPT\n"
+            "  2. Sign in with Device Code\n"
+            "  3. Sign in with ChatGPT (retry)\n"
+            "\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. No, ask me to approve edits and commands\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+        bottom = "\n".join(frame_c.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        # The frame must genuinely contain the interleaving, or this pins nothing:
+        # two v1 occurrences straddling two menu occurrences.
+        assert len(list(re.finditer(TRUST_PROMPT_PATTERN, bottom))) == 2
+        assert len(list(re.finditer(LOGIN_MENU_PATTERN, bottom))) == 2
+        assert re.search(LOGIN_MENU_FOOTER, bottom)
+
+        mock_tmux.return_value.get_history.side_effect = self._frames(
+            frame_c, self.LOGIN_MENU_OUTPUT
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=20.0, outer_timeout=30.0)
+
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_v1_copy_between_two_menu_renders_is_not_live(self, mock_tmux):
+        """The menu side must take the LAST occurrence, not the first.
+
+        Frame: menu line, then v1 copy, then a second menu line. The lowest block is
+        the menu, so the v1 copy between them is stale and must not be answered.
+        Comparing against the FIRST menu match instead would put the v1 copy below it,
+        call it live, and press Enter into the menu.
+
+        This is the frame that discriminates ``_menu_matches[-1]`` from ``[0]``; the
+        stale-above/live-below test does not.
+        """
+        frame = (
+            "> 1. Sign in with ChatGPT\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. Sign in with ChatGPT\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+        bottom = "\n".join(frame.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        menus = list(re.finditer(LOGIN_MENU_PATTERN, bottom))
+        v1s = list(re.finditer(TRUST_PROMPT_PATTERN, bottom))
+        # The interleaving is the whole point: the last v1 must sit strictly between
+        # the first and last menu matches, or the two indices agree and this pins
+        # nothing.
+        assert len(menus) == 2 and len(v1s) == 1
+        assert menus[0].start() < v1s[-1].start() < menus[-1].start()
+
+        mock_tmux.return_value.get_history.side_effect = self._frames(frame)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=20.0, outer_timeout=30.0)
+
+        mock_tmux.return_value.send_special_key.assert_not_called()
+        mock_tmux.return_value.send_keys.assert_not_called()
+
     # ── ``has_login``'s conjunction is load-bearing in BOTH directions ──
     #
     # Since it now gates the v1 trust dismissal, a ``has_login`` that is too
@@ -2882,6 +3121,27 @@ class TestCodexProviderUpdateDialog:
     # where a real trust prompt must still be answered, and asserts it is.
 
     _SETTLED = "OpenAI Codex (v0.149.0)\n› \n"
+
+    @staticmethod
+    def _frames(*sequence):
+        """A ``get_history`` side effect that yields ``sequence``, then repeats the last.
+
+        Never use a bare list here. A plain ``side_effect`` list raises
+        ``StopIteration`` once exhausted, and this handler reads through
+        ``asyncio.to_thread`` — which cannot deliver ``StopIteration`` out of its
+        future, so the test HANGS instead of failing. That turns "a guard
+        regressed" into "the suite stopped", which is how a regression gets
+        mistaken for infrastructure flake. Repeating the final frame means an
+        unexpected extra read looks like a pane that stopped changing: the handler
+        runs to its ``outer_timeout`` and the test fails on its own assertion,
+        with its own message, in bounded time.
+        """
+        frames = list(sequence)
+
+        def _next(*_args, **_kwargs):
+            return frames.pop(0) if len(frames) > 1 else frames[0]
+
+        return _next
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
@@ -2899,7 +3159,7 @@ class TestCodexProviderUpdateDialog:
             "\n"
             "  Press enter to continue\n"
         )
-        mock_tmux.return_value.get_history.side_effect = [frame, self._SETTLED]
+        mock_tmux.return_value.get_history.side_effect = self._frames(frame, self._SETTLED)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
@@ -2915,12 +3175,20 @@ class TestCodexProviderUpdateDialog:
         ``get_status`` requires both — so a trust prompt on the same screen must
         still be answered.
         """
+        # The v1 copy must sit ABOVE the menu line. With it below, ``v1_is_live`` is
+        # true on position alone and the dismissal fires whether or not the footer is
+        # required — which is how commit 5 silently un-covered this guard. Above the
+        # menu, a menu-only ``has_login`` suppresses the dismissal and this fails.
         frame = (
-            "  1. Sign in with ChatGPT\n"
             "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
             "  2. No, ask me to approve edits and commands\n"
+            "  1. Sign in with ChatGPT\n"
         )
-        mock_tmux.return_value.get_history.side_effect = [frame, self._SETTLED]
+        _bottom = "\n".join(frame.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        assert re.search(LOGIN_MENU_PATTERN, _bottom) and not re.search(
+            LOGIN_MENU_FOOTER, _bottom
+        ), "fixture must carry the menu pattern WITHOUT the footer"
+        mock_tmux.return_value.get_history.side_effect = self._frames(frame, self._SETTLED)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
@@ -2943,7 +3211,7 @@ class TestCodexProviderUpdateDialog:
             + "\n  Do you trust this workspace?\n"
             + "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
         )
-        mock_tmux.return_value.get_history.side_effect = [frame, self._SETTLED]
+        mock_tmux.return_value.get_history.side_effect = self._frames(frame, self._SETTLED)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
@@ -2996,8 +3264,18 @@ class TestCodexProviderUpdateDialog:
             "\n"
             "  Press enter to continue\n"
         )
-        settled = "OpenAI Codex (v0.149.0)\n› \n"
-        mock_tmux.return_value.get_history.side_effect = [stacked, stacked, settled]
+        # Precondition, asserted rather than asserted-in-prose: an earlier version of
+        # this test lost has_login to the 15-line window and passed regardless. The
+        # comment above documented that trap; this line is what actually defends
+        # against it, and it fails loudly if the fixture ever drifts.
+        _bottom = "\n".join(stacked.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        assert re.search(LOGIN_MENU_PATTERN, _bottom) and re.search(
+            LOGIN_MENU_FOOTER, _bottom
+        ), "fixture no longer sets has_login; this test would pin nothing"
+
+        mock_tmux.return_value.get_history.side_effect = self._frames(
+            stacked, stacked, self._SETTLED
+        )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
