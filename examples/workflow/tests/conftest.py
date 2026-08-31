@@ -84,7 +84,8 @@ def _temp_db(tmp_path, monkeypatch):
 
     ``run_script_workflow`` journals to the configured SQLite file — without
     this override these tests would write into whatever CAO home the machine
-    running them has configured (mirrors ``test/e2e/examples/conftest.py``).
+    running them has configured (mirrors the ``_temp_db`` fixture in
+    ``test/e2e/examples/test_examples_gallery_e2e.py``).
     """
     from cli_agent_orchestrator.clients.database import (
         _migrate_workflow_run,

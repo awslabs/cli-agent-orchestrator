@@ -16,8 +16,9 @@ README only covers what's specific to this example.
   via `get_inputs()`, runs one sequential `run_step` (a review plan), then fans out
   three more `run_step` calls concurrently (`style`/`security`/`performance` checks)
   via `ThreadPoolExecutor`, and calls `emit_output()` with a structured result.
-- [`fixtures/inputs.json`](fixtures/inputs.json) — the canonical demo inputs used by
-  the commands below.
+- [`fixtures/inputs.json`](fixtures/inputs.json) — the demo input values for reference.
+  `cao workflow run` takes inputs only as repeated `--input k=v` flags, so the commands
+  below and `run.sh` mirror these values by hand rather than reading this file.
 - [`run.sh`](run.sh) — non-interactive entry point: copies `workflow.py` into the CAO
   workflows directory, validates it, then runs it and exits with the run's own exit
   code. Needs a real `cao-server` and an authenticated `claude_code` CLI.
@@ -140,12 +141,25 @@ that's `cao schedule`.
 ## Resume — current behavior
 
 `cao workflow resume demo-1` re-executes the **frozen script from the top** on a new
-generation. It does **not** currently skip `run_step` calls that already completed:
-a replay-lookup primitive exists in the journal layer, but it is not yet wired into
-the run-step route, so every `run_step` call — including the plan step and every
-check that already finished — runs again. This example's steps are read-only
-(`reviewer`, no file writes), so a resume is safe to try, but do not expect
-replay-safe, exactly-once behavior yet. See
+generation, and every `run_step` call makes a real HTTP request — there is no
+`if resuming:` branch in the script. What changes is what the *server* does with each
+request. Each call lands on one of three outcomes: **replayed** (the journaled result
+is returned and nothing runs), **executed** (the step runs again for real), or
+**halted** (the server stops the run at that step and waits for a human). A fourth
+outcome ends the run rather than one step: if the script changed at a step's key, that
+step diverges and the run fails with `ReplayDivergenceError`.
+
+So a resume does **not** repeat completed work by default. What that means for this
+example specifically: it calls only `run_step`, never `step(...)`, so every step here
+is **undeclared** — it has no `recovery=` policy. An undeclared step still replays,
+because replay executes nothing; but wherever the alternative would be re-execution,
+it **halts for a human** instead of silently running again. Concretely, if a check was
+dispatched but never settled before the run died, resuming stops there rather than
+re-dispatching it.
+
+One trap worth knowing when you copy this example: a replayed `StepHandle` has
+`.replayed == True` and its `.terminal_id` names a terminal that no longer exists, so
+check `replayed` before you touch `terminal_id`. See
 "Resume re-executes the script, and the server decides each step" in
 [docs/workflow-scripts-authoring-guide.md](../../docs/workflow-scripts-authoring-guide.md#resume-re-executes-the-script-and-the-server-decides-each-step)
 for the full explanation.
@@ -161,8 +175,11 @@ uv run pytest --no-cov -p no:cacheprovider -q examples/workflow/tests/test_workf
 CAO_RUN_LIVE_PROVIDER_TESTS=1 uv run pytest --no-cov -q examples/workflow/tests/test_workflow_live.py
 ```
 
-`test_workflow_example.py` reuses the `_RunStepFakeHandler` pattern from
-[`test/e2e/examples/test_examples_gallery_e2e.py`](../../test/e2e/examples/test_examples_gallery_e2e.py):
+`test_workflow_example.py` adapts the `_RunStepFakeHandler` pattern from
+[`test/e2e/examples/test_examples_gallery_e2e.py`](../../test/e2e/examples/test_examples_gallery_e2e.py),
+with one deliberate difference: this fake also emits `replayed`, because the shim reads
+`data["replayed"]` by direct indexing and raises `KeyError` without it. Otherwise the
+approach is the same:
 a minimal stdlib `http.server` stands in for `/terminals/run-step`, so the real
 `cao_workflow` HTTP transport and the real `run_script_workflow` subprocess engine
 are exercised without a live tmux-backed `cao-server` or provider credentials. It

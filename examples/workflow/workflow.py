@@ -36,7 +36,8 @@ INPUTS = {
 CHECKS = ["style", "security", "performance"]
 
 # /terminals/run-step validates CAO_WORKFLOW_STEP_ID against this exact
-# charset (api/main.py's RunStepRequest.validate_env_var_shape) — `target` is
+# charset (api/main.py's RunStepRequest.validate_env_vars, which checks every
+# workflow env-var value against constants.WORKFLOW_NAME_RE) — `target` is
 # an arbitrary author-supplied string, so it must be sanitized before it can
 # be embedded in a step_id.
 _STEP_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
