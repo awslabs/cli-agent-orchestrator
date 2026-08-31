@@ -15,14 +15,17 @@ description: Contribute changes to the CAO (CLI Agent Orchestrator) codebase —
 How to make a change to the **cli-agent-orchestrator** codebase and get it through CI
 cleanly. Read this before pushing a branch or opening a PR. The canonical human docs are
 [`DEVELOPMENT.md`](../../DEVELOPMENT.md), [`CONTRIBUTING.md`](../../CONTRIBUTING.md), and
-[`AGENTS.md`](../../AGENTS.md) — this skill is the operational checklist that mirrors what
+[`CODEBASE.md`](../../CODEBASE.md) — this skill is the operational checklist that mirrors what
 CI actually enforces.
 
 ## Golden rules (read these first)
 
-1. **`uv` is mandatory.** Run everything through it: `uv sync --all-extras --dev`,
-   `uv run pytest …`, `uv run mypy src/`, `uv run cao …`. There is no bare
-   `pip`/`python` workflow.
+1. **Run Python tooling through `uv`.** `uv sync --all-extras --dev`, `uv run pytest …`,
+   `uv run mypy src/`, `uv run cao …`. There is no bare `pip` workflow, and the venv CI
+   builds is the one `uv` manages. Repo scripts are documented in their own text as plain
+   `python scripts/<name>.py` (for example `scripts/sync_skills.py`, whose fix-up message
+   and `test_skill_packaging_parity.py` both quote that form) — run them as
+   `uv run python scripts/<name>.py`, which satisfies both.
 2. **Verify the *actual* CI run after every push — never declare "done" on local tests
    alone.** Poll it: `gh run list --branch <branch> --workflow CI` then
    `gh run view <id>` / `gh run view <id> --log-failed`.
@@ -53,15 +56,29 @@ expected to stay at 100% for changed lines.
 
 ## The CI gate map (`.github/workflows/ci.yml`)
 
-Know which jobs are **blocking** vs **tolerated** so you can tell a real failure from noise.
+Know which jobs are **blocking** vs **tolerated** so you can tell a real failure from
+noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts from
+`ci.yml`, so trust it — and if you rename a job, update it here.
 
 | Job | Runs | Blocking? |
 |-----|------|-----------|
-| **Unit Tests** (3.10 / 3.11 / 3.12) | `uv run pytest` (`--cov=src`, `-m 'not e2e'`) | **Yes** |
+| **Unit Tests** (3.10 / 3.11 / 3.12) | `uv run pytest test/ -m "not e2e" --cov=src/cli_agent_orchestrator --cov-report=term-missing` | **Yes** |
+| ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
 | **Code Quality** | black `--check`, isort `--check-only`, then `uv run mypy src/` | black/isort **yes**; **mypy is non-blocking** (`continue-on-error: true`) |
-| **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, asserts components render / off-list refused | **Yes** |
-| **CAO MCP Apps** + **E2E (Playwright)** | MCP Apps build/coverage + browser E2E | **Yes** |
-| **Web UI Build**, **Security Scan** | frontend build, Trivy | **Yes** |
+| **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
+| **AG-UI construct demos (shift-left recordings)** | same pattern for the L2 construct library | **Yes** |
+| **AG-UI stock-client live (AC3)** | drives a real third-party AG-UI client against the surface | **Yes** |
+| **CAO MCP Apps** | MCP Apps build + backend coverage ratchet floor | **Yes** |
+| **CAO MCP Apps E2E (Playwright)** | browser E2E over the `ui://cao/*` views | **Yes** |
+| **Rust TUI** (Linux x86_64 / macOS arm64) | `cargo test` for the `tui/` crate | **Yes** |
+| **Web UI Build** | frontend build | **Yes** |
+| **AI-DLC Portfolio Example** | example project builds | **Yes** |
+| **Security Scan** | Trivy | **Yes** |
+
+> **The `-m "not e2e"` on the CI command overrides your local `addopts`.** CI deselects
+> *only* `e2e`, so **integration tests run in CI**. If your local config also deselects
+> `integration`, your local run is a strict subset of CI's and can be green while CI is
+> red. Compare deselected counts, not just pass counts.
 
 > **mypy is intentionally non-blocking.** The repo has **known, pre-existing, repo-wide
 > mypy errors** (historically in `services/agent_scaffold.py`, `cli/commands/profile.py`,
@@ -82,26 +99,43 @@ Know which jobs are **blocking** vs **tolerated** so you can tell a real failure
   and real CLI binaries, and can hit a flaky OTel/gRPC abort. Run **targeted test files**
   while iterating and **trust CI** (the Unit Tests job) for the full suite; get
   authoritative missing-coverage lines from that job's `term-missing` output ∩ your diff.
+- **A test that touches CAO's own state can pass only on your machine.** If a code path
+  reaches the real database, config dir, or a live session, it will be green on a
+  developer box that has an initialised CAO install and red on a clean runner with
+  `sqlite3.OperationalError: no such table: terminals`. Mock the store/DB seam explicitly;
+  when a test exercises a service function, check what that function calls *today* — a
+  rebase can introduce a new unmocked DB write into a path your test already covered.
+  Verify by running with an isolated `HOME`:
+  ```bash
+  TMPH=$(mktemp -d); HOME="$TMPH" uv run pytest test/path/to/test_x.py; rm -rf "$TMPH"
+  ```
+- **Local green and CI green are different claims, in both directions.** A local suite can
+  hide real failures (see above) *and* invent ones CI never sees (macOS-only, missing
+  optional binaries). When they disagree, CI is authoritative — read the job log rather
+  than reasoning from the local result.
 - **FastAPI `TestClient` must use `base_url="http://localhost"`** — the Host-header /
   DNS-rebinding guard returns `400` otherwise.
 - **Provider status detection is screen-scraping** — provider tests are fixture-driven
   state machines; when a CLI tool changes its TUI, update the regexes **and** add a fixture.
-- **The AG-UI demo recorder** (`examples/agui-eventsource-viewer/tools/`) needs a Chromium
-  `headless_shell` matching the pinned `@playwright/test` version (`npm run
-  playwright:install`) plus `ffmpeg`; it boots its own `CAO_AGUI_ENABLED` server with
-  `CAO_CORS_ORIGINS=http://localhost:8123`. It gates in CI, so you don't have to run it
-  locally to land a change.
+- **The AG-UI demo recorder** (`examples/ag-ui/ag-ui-eventsource-viewer/tools`) needs a
+  Chromium `headless_shell` matching the pinned `@playwright/test` version (`npm run
+  playwright:install`) plus `ffmpeg`, and boots its own `CAO_AGUI_ENABLED` server. It gates
+  in CI, so you don't have to run it locally to land a change. The construct-demo recorder
+  is the sibling at `examples/ag-ui/ag-ui-construct-demos/tools`.
 
 ## Pre-PR checklist
 
 1. `uv run black src/ test/ && uv run isort src/ test/` (or `--check` to verify).
 2. `uv run mypy src/` — confirm **no *new* errors** vs the base (pre-existing ones are OK).
 3. `uv run pytest <targeted files>` green; add/keep tests for changed behavior.
-4. If you touched `skills/`, run `python scripts/sync_skills.py` so the packaged mirror
+4. If you touched **any** `.md`, run `uv run python scripts/validate_markdown_links.py` —
+   a dead relative link fails the Unit Tests job, and `skills/` is in scope. CAO has no
+   root `AGENTS.md`; the contributor map is `CODEBASE.md`.
+5. If you touched `skills/`, run `uv run python scripts/sync_skills.py` so the packaged mirror
    stays in lockstep (`test/test_skill_packaging_parity.py` enforces it).
-5. **Commits:** only when asked; sign if the repo expects it; keep the subject concise and
+6. **Commits:** only when asked; sign if the repo expects it; keep the subject concise and
    Conventional-Commits style; never force-push to `main`.
-6. **Open the PR, then watch its CI run to completion** and fix any red gate before calling
+7. **Open the PR, then watch its CI run to completion** and fix any red gate before calling
    it done (rule #2 and #4). Use `gh pr create` / `gh pr checks`.
 
 ## Not what you want?
