@@ -792,6 +792,18 @@ class CodexProvider(BaseProvider):
     # the live frame rather than stale redraw history.
     supports_screen_detection = True
 
+    # Opt-in for the deferred-init direct status probe (capture-pane bypass,
+    # #659). The event-driven cache detects only at rising-edge/quiescence, so
+    # a repainting Working spinner can leave the cached status IDLE past the
+    # whole confirm window — the retry loop then re-delivers the task into the
+    # already-working pane and eventually tears the worker down. get_status()
+    # is line-oriented text analysis of exactly this rendered shape (the same
+    # frames the screen-detection route above feeds it in production), so a
+    # live capture-pane snapshot is a valid input; there is no dispatch
+    # bookkeeping that a fresh capture would bypass (the kiro_cli-style
+    # disqualifier documented on _worker_is_started_direct).
+    supports_direct_status_probe = True
+
     def __init__(
         self,
         terminal_id: str,

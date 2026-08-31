@@ -373,3 +373,69 @@ class TestWorkerIsStartedDirect:
             patch.object(ts, "get_backend") as mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is False
+
+
+class TestCodexDirectProbeOptIn:
+    """#659: Codex deferred assign — the cached status can sit IDLE for the whole
+    confirm window while the real pane already shows the TUI Working spinner
+    (detection fires only at rising-edge/quiescence, and a repainting spinner
+    defers quiescence). Without the direct-probe opt-in the confirm loop
+    re-delivers the task into the working pane up to three times and then tears
+    the worker down. These pin the opt-in end to end with the REAL provider and
+    a real rendered frame, so removing the flag (or breaking the detector on
+    this shape) goes red here — not just in a unit assert on the attribute.
+    """
+
+    # The shape from the issue report: handoff prompt in the transcript, live
+    # Working spinner, TUI footer. Same frame family the codex provider unit
+    # tests pin as PROCESSING.
+    _WORKING_FRAME = (
+        "› [CAO Handoff] Supervisor terminal ID: sup-123. Do the task.\n"
+        "\n"
+        "• Working (3s • esc to interrupt)\n"
+        "\n"
+        "› Use /skills to list available skills\n"
+        "\n"
+        "  ? for shortcuts                     100% context left\n"
+    )
+
+    def test_codex_opts_into_direct_status_probe(self):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        assert CodexProvider.supports_direct_status_probe is True
+
+    @pytest.mark.asyncio
+    async def test_codex_confirm_succeeds_from_live_frame_without_redelivery(self):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider("t1", "s1", "w0")
+        backend = MagicMock()
+        backend.get_history.return_value = self._WORKING_FRAME
+        with (
+            # Cached status stays IDLE past every poll — the #496-class lag.
+            patch.object(ts, "wait_until_status", new=AsyncMock(return_value=False)),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "s1", "tmux_window": "w0"},
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            ok = await ts._confirm_worker_started_or_resubmit(
+                "t1",
+                "Do the task",
+                None,
+                "sup",
+                None,
+                provider=provider,
+            )
+
+        # Started: the caller must not classify this as a dropped submit, so the
+        # delete_worker teardown arm never fires...
+        assert ok is True
+        # ...and nothing was typed into the already-working pane: no full
+        # re-delivery (which would run the task twice) and no blind Enter.
+        send.assert_not_called()
+        key.assert_not_called()
