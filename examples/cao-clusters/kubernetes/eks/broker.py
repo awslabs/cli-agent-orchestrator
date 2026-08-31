@@ -13,6 +13,11 @@ on a task needing 36s). The supervisor cannot tell that apart from real success,
 so it never releases the lease. The broker can: it holds the lease, it knows
 `complete_assignment` never arrived, and it reaps on a deadline and records WHY.
 `GET /workers` is where that truth is legible - see the reaper below.
+
+The broker is also the workers' narrow gateway to supervisor-owned state.
+NetworkPolicy denies workers any direct route to the supervisor control API;
+the broker authenticates each worker's release token and forwards only inbox
+delivery and the four explicit memory operations.
 """
 
 from __future__ import annotations
@@ -21,13 +26,16 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
+import requests
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, status
+from fastapi.responses import Response
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, Field
@@ -41,16 +49,14 @@ log = logging.getLogger("cao.broker")
 NAMESPACE = os.environ.get("CAO_ELASTIC_NAMESPACE", "cao-cluster")
 WORKER_IMAGE = os.environ["CAO_ELASTIC_WORKER_IMAGE"]
 WORKSPACE_PVC = os.environ.get("CAO_ELASTIC_WORKSPACE_PVC", "cao-elastic-workspace")
-MEMORY_API_URL = os.environ.get("CAO_MEMORY_API_URL", "http://cao-supervisor:9889")
+SUPERVISOR_API_URL = os.environ.get("CAO_SUPERVISOR_API_URL", "http://cao-supervisor:9889").rstrip(
+    "/"
+)
 BROKER_PUBLIC_URL = os.environ.get("CAO_ELASTIC_BROKER_URL", "http://cao-worker-broker:9890")
 BROKER_TOKEN = os.environ["CAO_ELASTIC_BROKER_TOKEN"]
-WORKSPACE_ROOT = os.environ.get(
-    "CAO_ELASTIC_WORKSPACE_ROOT", "/home/cao/workspace/jobs"
-)
+WORKSPACE_ROOT = os.environ.get("CAO_ELASTIC_WORKSPACE_ROOT", "/home/cao/workspace/jobs")
 PROJECT_ID = os.environ.get("CAO_ELASTIC_PROJECT_ID", "cao-cluster")
-WORKER_SERVICE_ACCOUNT = os.environ.get(
-    "CAO_ELASTIC_WORKER_SERVICE_ACCOUNT", "cao-elastic-worker"
-)
+WORKER_SERVICE_ACCOUNT = os.environ.get("CAO_ELASTIC_WORKER_SERVICE_ACCOUNT", "cao-elastic-worker")
 # Outer bound enforced by Kubernetes itself, as a backstop for a broker that
 # dies before it can reap.
 WORKER_TIMEOUT = int(os.environ.get("CAO_ELASTIC_WORKER_TIMEOUT", "3600"))
@@ -239,7 +245,9 @@ def _worker_job(
         # the blocking default, so the account is still activated by something
         # whose startup nobody is timing.
         client.V1EnvVar(name="CAO_WARM_PROVIDER", value="background"),
-        client.V1EnvVar(name="CAO_MEMORY_API_URL", value=MEMORY_API_URL),
+        # Workers reach supervisor-owned memory only through the authenticated
+        # broker gateway; they have no NetworkPolicy path to port 9889.
+        client.V1EnvVar(name="CAO_MEMORY_API_URL", value=BROKER_PUBLIC_URL),
         client.V1EnvVar(name="CAO_PROJECT_ID", value=PROJECT_ID),
         client.V1EnvVar(name="CAO_ELASTIC_WORKER_ID", value=worker_id),
         client.V1EnvVar(name="CAO_ELASTIC_BROKER_URL", value=BROKER_PUBLIC_URL),
@@ -251,8 +259,7 @@ def _worker_job(
     # forward. A key-authenticated provider gets its credential from
     # PROVIDER_CREDENTIALS_SECRET via env_from below.
     env.extend(
-        client.V1EnvVar(name=name_, value=os.environ[name_])
-        for name_ in WORKER_ENV_PASSTHROUGH
+        client.V1EnvVar(name=name_, value=os.environ[name_]) for name_ in WORKER_ENV_PASSTHROUGH
     )
     mounts = [
         client.V1VolumeMount(name="state", mount_path="/home/cao/.cao"),
@@ -338,9 +345,7 @@ def _worker_job(
                         pod_affinity_term=client.V1PodAffinityTerm(
                             topology_key="kubernetes.io/hostname",
                             label_selector=client.V1LabelSelector(
-                                match_labels={
-                                    "app.kubernetes.io/name": "cao-supervisor"
-                                }
+                                match_labels={"app.kubernetes.io/name": "cao-supervisor"}
                             ),
                         ),
                     ),
@@ -349,9 +354,7 @@ def _worker_job(
                         pod_affinity_term=client.V1PodAffinityTerm(
                             topology_key="kubernetes.io/hostname",
                             label_selector=client.V1LabelSelector(
-                                match_labels={
-                                    "app.kubernetes.io/name": "cao-elastic-worker"
-                                }
+                                match_labels={"app.kubernetes.io/name": "cao-elastic-worker"}
                             ),
                         ),
                     ),
@@ -407,9 +410,7 @@ def _worker_service(worker_id: str, job: client.V1Job) -> client.V1Service:
         # Only reachable if this is called with an unsubmitted Job; the API
         # server always assigns a uid on create. Refuse rather than fall back to
         # an unowned Service, which would leak silently.
-        raise RuntimeError(
-            f"cannot own worker Service {name}: Job has no uid (not created?)"
-        )
+        raise RuntimeError(f"cannot own worker Service {name}: Job has no uid (not created?)")
     return client.V1Service(
         metadata=client.V1ObjectMeta(
             name=name,
@@ -637,9 +638,7 @@ def _reap_once() -> None:
 
         if not pods:
             if pod_observed:
-                _release_and_settle(
-                    worker_id, "terminated", "worker pod disappeared while leased"
-                )
+                _release_and_settle(worker_id, "terminated", "worker pod disappeared while leased")
                 log.warning("worker %s: pod gone while leased, released", worker_id)
             elif age > READY_TIMEOUT:
                 _release_and_settle(
@@ -723,8 +722,7 @@ async def lifespan(_app: FastAPI):
     thread = threading.Thread(target=_reaper, name="cao-lease-reaper", daemon=True)
     thread.start()
     log.info(
-        "broker up: namespace=%s image=%s completion_timeout=%ss "
-        "lease_returns=%s forwarding=%s",
+        "broker up: namespace=%s image=%s completion_timeout=%ss " "lease_returns=%s forwarding=%s",
         NAMESPACE,
         WORKER_IMAGE,
         COMPLETION_TIMEOUT,
@@ -752,9 +750,113 @@ def _require_release_token(worker_id: str, value: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="invalid release token")
 
 
+def _require_worker_gateway(
+    worker_id: Optional[str],
+    release_token: Optional[str],
+) -> str:
+    if not worker_id or not re.fullmatch(r"[a-f0-9]{8}", worker_id):
+        raise HTTPException(status_code=401, detail="invalid worker identity")
+    _require_release_token(worker_id, release_token)
+    return worker_id
+
+
+def _proxy_to_supervisor(
+    path: str,
+    *,
+    body: Optional[dict[str, Any]] = None,
+    params: Optional[dict[str, str]] = None,
+) -> Response:
+    try:
+        upstream = requests.post(
+            f"{SUPERVISOR_API_URL}{path}",
+            json=body,
+            params=params,
+            allow_redirects=False,
+            timeout=(5.0, 30.0),
+        )
+    except requests.RequestException as exc:
+        log.warning("supervisor gateway request failed for %s: %s", path, exc)
+        raise HTTPException(status_code=502, detail="supervisor gateway unavailable") from exc
+    headers = {}
+    content_type = upstream.headers.get("content-type")
+    if content_type:
+        headers["content-type"] = content_type
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=headers,
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/terminals/{receiver_id}/inbox/messages")
+def gateway_inbox_message(
+    receiver_id: str,
+    sender_id: str,
+    message: str,
+    x_cao_worker_id: Optional[str] = Header(default=None),
+    x_cao_release_token: Optional[str] = Header(default=None),
+) -> Response:
+    """Authenticated worker callback; only this inbox route is forwarded."""
+    _require_worker_gateway(x_cao_worker_id, x_cao_release_token)
+    if not re.fullmatch(r"[a-f0-9]{8}", receiver_id):
+        raise HTTPException(status_code=422, detail="invalid receiver terminal id")
+    if not re.fullmatch(r"[a-f0-9]{8}", sender_id):
+        raise HTTPException(status_code=422, detail="invalid sender terminal id")
+    return _proxy_to_supervisor(
+        f"/terminals/{receiver_id}/inbox/messages",
+        params={"sender_id": sender_id, "message": message},
+    )
+
+
+def _gateway_memory(
+    path: str,
+    body: dict[str, Any],
+    worker_id: Optional[str],
+    release_token: Optional[str],
+) -> Response:
+    _require_worker_gateway(worker_id, release_token)
+    return _proxy_to_supervisor(path, body=body)
+
+
+@app.post("/internal/memory/store")
+def gateway_memory_store(
+    body: dict[str, Any],
+    x_cao_worker_id: Optional[str] = Header(default=None),
+    x_cao_release_token: Optional[str] = Header(default=None),
+) -> Response:
+    return _gateway_memory("/internal/memory/store", body, x_cao_worker_id, x_cao_release_token)
+
+
+@app.post("/internal/memory/recall")
+def gateway_memory_recall(
+    body: dict[str, Any],
+    x_cao_worker_id: Optional[str] = Header(default=None),
+    x_cao_release_token: Optional[str] = Header(default=None),
+) -> Response:
+    return _gateway_memory("/internal/memory/recall", body, x_cao_worker_id, x_cao_release_token)
+
+
+@app.post("/internal/memory/forget")
+def gateway_memory_forget(
+    body: dict[str, Any],
+    x_cao_worker_id: Optional[str] = Header(default=None),
+    x_cao_release_token: Optional[str] = Header(default=None),
+) -> Response:
+    return _gateway_memory("/internal/memory/forget", body, x_cao_worker_id, x_cao_release_token)
+
+
+@app.post("/internal/memory/context")
+def gateway_memory_context(
+    body: dict[str, Any],
+    x_cao_worker_id: Optional[str] = Header(default=None),
+    x_cao_release_token: Optional[str] = Header(default=None),
+) -> Response:
+    return _gateway_memory("/internal/memory/context", body, x_cao_worker_id, x_cao_release_token)
 
 
 @app.get("/workers", response_model=list[WorkerStatus])

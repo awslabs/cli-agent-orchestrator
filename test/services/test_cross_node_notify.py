@@ -8,6 +8,7 @@ supervisor node's inbox instead of dropping it into a log nobody reads —
 otherwise assign returned success=True and the promised callback never comes.
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 from cli_agent_orchestrator.services.terminal_service import _notify_caller_of_deferred_failure
@@ -51,6 +52,41 @@ class TestCrossNodeDeferredFailureNotify:
         }
         mock_env.assert_called_once_with("cao-remote")
         # The local inbox path must not be attempted (no local caller row).
+        mock_inbox.assert_not_called()
+
+    @patch(f"{_TS}.create_inbox_message")
+    @patch(f"{_TS}.requests")
+    @patch(
+        f"{_TS}.get_session_env",
+        return_value={
+            "CAO_CALLBACK_URL": "http://cao-worker-broker:9890",
+            "CAO_CALLBACK_TERMINAL_ID": "a1b2c3d4",
+        },
+    )
+    @patch(
+        f"{_TS}.get_terminal_metadata",
+        return_value={"caller_id": None, "tmux_session": "cao-remote"},
+    )
+    def test_elastic_failure_callback_carries_gateway_credentials(
+        self, mock_meta, mock_env, mock_requests, mock_inbox
+    ):
+        mock_requests.post.return_value = _ok_response()
+        with patch.dict(
+            os.environ,
+            {
+                "CAO_ELASTIC_WORKER_ID": "deadbeef",
+                "CAO_ELASTIC_RELEASE_TOKEN": "release-token",
+            },
+            clear=False,
+        ):
+            _notify_caller_of_deferred_failure(
+                "feed0001", "provider failed", registry=None, delete_worker=False
+            )
+
+        assert mock_requests.post.call_args.kwargs["headers"] == {
+            "X-CAO-Worker-ID": "deadbeef",
+            "X-CAO-Release-Token": "release-token",
+        }
         mock_inbox.assert_not_called()
 
     @patch(f"{_TS}.requests")

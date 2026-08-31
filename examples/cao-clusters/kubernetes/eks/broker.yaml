@@ -58,7 +58,10 @@ spec:
               value: /home/cao/workspace/jobs
             - name: CAO_ELASTIC_PROJECT_ID
               value: cao-cluster
-            - name: CAO_MEMORY_API_URL
+            # Fixed upstream for the broker's allowlisted callback/memory
+            # gateway. Workers receive the broker URL instead and cannot reach
+            # this supervisor URL through NetworkPolicy.
+            - name: CAO_SUPERVISOR_API_URL
               value: http://cao-supervisor.cao-cluster.svc.cluster.local:9889
             - name: CAO_ELASTIC_BROKER_URL
               value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890

@@ -3,6 +3,7 @@ FROM python:3.12-slim
 RUN pip install --no-cache-dir \
     "fastapi>=0.104.0" \
     "kubernetes>=30.0.0,<35.0.0" \
+    "requests>=2.32.0" \
     "uvicorn[standard]>=0.24.0"
 
 WORKDIR /app

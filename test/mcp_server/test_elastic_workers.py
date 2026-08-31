@@ -44,6 +44,7 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
     monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
     monkeypatch.setenv(server.ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
+    monkeypatch.setenv("CAO_ELASTIC_CALLBACK_URL", "http://broker:9890")
 
     lease = Mock(status_code=200)
     lease.raise_for_status.return_value = None
@@ -105,7 +106,7 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
             terminal_service,
             "get_session_env",
             return_value={
-                "CAO_CALLBACK_URL": "http://cao-supervisor:9889",
+                "CAO_CALLBACK_URL": "http://broker:9890",
                 "CAO_CALLBACK_TERMINAL_ID": "abc12345",
             },
         ),
@@ -115,6 +116,15 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
 
     urls = [url for url, _ in posts]
     assert any(url.endswith("/sessions") for url in urls)
+    session_request = next(kwargs for url, kwargs in posts if url.endswith("/sessions"))
+    assert session_request["json"]["env_vars"]["CAO_CALLBACK_URL"] == "http://broker:9890"
+    callback = next(
+        kwargs for url, kwargs in posts if url.endswith("/terminals/abc12345/inbox/messages")
+    )
+    assert callback["headers"] == {
+        "X-CAO-Worker-ID": "deadbeef",
+        "X-CAO-Release-Token": "release-token",
+    }
     assert "http://broker:9890/workers/deadbeef/terminal-ended" in urls
     terminal_ended = next(
         kwargs for url, kwargs in posts if url.endswith("/workers/deadbeef/terminal-ended")

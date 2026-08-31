@@ -153,6 +153,25 @@ class TestAssignRemote:
         }
 
     @patch(f"{_SRV}.requests")
+    def test_elastic_callback_url_overrides_the_full_control_api(self, mock_requests):
+        mock_requests.post.return_value = _response(
+            201, {"id": "beef0001", "session_name": "cao-remote"}
+        )
+        with patch.dict(os.environ, self._ENV, clear=False):
+            result = _assign_impl(
+                "developer",
+                "Analyze the logs",
+                target_host="cao-worker-0",
+                callback_url="http://cao-worker-broker:9890",
+            )
+
+        assert result["success"] is True
+        assert mock_requests.post.call_args.kwargs["json"]["env_vars"] == {
+            "CAO_CALLBACK_URL": "http://cao-worker-broker:9890",
+            "CAO_CALLBACK_TERMINAL_ID": "a1b2c3d4",
+        }
+
+    @patch(f"{_SRV}.requests")
     def test_fails_fast_without_advertised_url(self, mock_requests):
         env = {"CAO_TERMINAL_ID": "a1b2c3d4"}
         with patch.dict(os.environ, env, clear=True):
@@ -246,6 +265,26 @@ class TestWorkerSideCallbackRouting:
         args, kwargs = mock_requests.post.call_args
         assert args[0] == "http://cao-supervisor:9889/terminals/a1b2c3d4/inbox/messages"
         assert kwargs["params"]["sender_id"] == "feed0001"
+        assert kwargs["headers"] is None
+
+    @patch(f"{_SRV}.requests")
+    def test_elastic_callback_carries_per_worker_gateway_credentials(self, mock_requests):
+        mock_requests.post.return_value = _response(200, {"success": True})
+        env = {
+            **self._CB_ENV,
+            "CAO_CALLBACK_URL": "http://cao-worker-broker:9890",
+            "CAO_ELASTIC_WORKER_ID": "deadbeef",
+            "CAO_ELASTIC_RELEASE_TOKEN": "release-token",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            _send_to_inbox("a1b2c3d4", "results")
+
+        args, kwargs = mock_requests.post.call_args
+        assert args[0] == "http://cao-worker-broker:9890/terminals/a1b2c3d4/inbox/messages"
+        assert kwargs["headers"] == {
+            "X-CAO-Worker-ID": "deadbeef",
+            "X-CAO-Release-Token": "release-token",
+        }
 
     @patch(f"{_SRV}.requests")
     def test_inbox_post_stays_local_without_callback_env(self, mock_requests):

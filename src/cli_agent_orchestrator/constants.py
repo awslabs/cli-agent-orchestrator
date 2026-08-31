@@ -377,12 +377,19 @@ MCP_REQUEST_TIMEOUT = 30
 #
 #   ADVERTISED_URL_ENV        set on a SUPERVISOR node: base URL at which peers
 #                             (worker pods) can reach this node's cao-server.
+#   ELASTIC_CALLBACK_URL_ENV  set on an elastic SUPERVISOR: narrow broker URL
+#                             workers use instead of the supervisor control API.
 #   CALLBACK_URL_ENV /        injected by the supervisor into a REMOTE worker
 #   CALLBACK_TERMINAL_ID_ENV  terminal's env at creation: the supervisor
 #                             node's advertised URL + supervisor terminal ID.
 ADVERTISED_URL_ENV = "CAO_ADVERTISED_URL"
+ELASTIC_CALLBACK_URL_ENV = "CAO_ELASTIC_CALLBACK_URL"
 CALLBACK_URL_ENV = "CAO_CALLBACK_URL"
 CALLBACK_TERMINAL_ID_ENV = "CAO_CALLBACK_TERMINAL_ID"
+ELASTIC_WORKER_ID_ENV = "CAO_ELASTIC_WORKER_ID"
+ELASTIC_RELEASE_TOKEN_ENV = "CAO_ELASTIC_RELEASE_TOKEN"
+ELASTIC_WORKER_ID_HEADER = "X-CAO-Worker-ID"
+ELASTIC_RELEASE_TOKEN_HEADER = "X-CAO-Release-Token"
 
 
 # Operators can extend network allowlists via the env vars handled below.

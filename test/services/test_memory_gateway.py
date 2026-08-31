@@ -119,3 +119,21 @@ def test_remote_non_typed_error_still_raises_http_error(monkeypatch):
         pytest.raises(requests.HTTPError, match="503"),
     ):
         memory_gateway._post("/internal/memory/store", {})
+
+
+def test_remote_memory_uses_elastic_gateway_credentials(monkeypatch):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://cao-worker-broker:9890")
+    monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "deadbeef")
+    monkeypatch.setenv("CAO_ELASTIC_RELEASE_TOKEN", "release-token")
+    response = Mock(status_code=200)
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"context": "shared"}
+
+    with patch.object(memory_gateway.requests, "post", return_value=response) as post:
+        result = memory_gateway._post("/internal/memory/context", {})
+
+    assert result == {"context": "shared"}
+    assert post.call_args.kwargs["headers"] == {
+        "X-CAO-Worker-ID": "deadbeef",
+        "X-CAO-Release-Token": "release-token",
+    }

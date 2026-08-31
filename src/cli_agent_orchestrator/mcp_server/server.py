@@ -18,6 +18,7 @@ from cli_agent_orchestrator.constants import (
     CALLBACK_URL_ENV,
     DEFAULT_PROVIDER,
     DISCOVERY_TOOL_MARKER,
+    ELASTIC_CALLBACK_URL_ENV,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -30,6 +31,9 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
+from cli_agent_orchestrator.services.elastic_worker_gateway import (
+    elastic_worker_gateway_headers,
+)
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
@@ -70,6 +74,9 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 #                             Required for remote assign — without it the
 #                             remote worker would have no reachable address to
 #                             send results back to.
+#   CAO_ELASTIC_CALLBACK_URL  optional narrow broker gateway used only by
+#                             assign_elastic workers, so they never receive the
+#                             supervisor control API URL.
 #   CAO_CALLBACK_URL /        injected by the supervisor into the REMOTE worker
 #   CAO_CALLBACK_TERMINAL_ID  terminal's environment at creation time: the
 #                             supervisor cao-server's advertised URL and the
@@ -850,10 +857,11 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     created remotely, the supervisor's terminal lives on ANOTHER node — its row
     does not exist in this node's DB, so a local POST would 404. If the
     receiver is the recorded cross-node supervisor (CAO_CALLBACK_TERMINAL_ID),
-    deliver straight to the supervisor's cao-server (CAO_CALLBACK_URL). A local
-    404 for any other receiver is also retried against the callback URL once,
-    so an explicitly quoted supervisor ID still routes. Single-node behavior
-    (no callback env) is unchanged.
+    deliver through CAO_CALLBACK_URL. For ordinary remote workers that is the
+    supervisor's cao-server; elastic workers use the authenticated broker
+    gateway. A local 404 for any other receiver is also retried against the
+    callback URL once, so an explicitly quoted supervisor ID still routes.
+    Single-node behavior (no callback env) is unchanged.
 
     Args:
         receiver_id: Target terminal ID
@@ -876,9 +884,11 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         base_url = callback_url
 
     params = {"sender_id": sender_id, "message": message}
+    gateway_headers = elastic_worker_gateway_headers() or None
     response = requests.post(
         f"{base_url}/terminals/{receiver_id}/inbox/messages",
         params=params,
+        headers=gateway_headers,
         timeout=_mcp_timeout(),
     )
     if response.status_code == 404 and callback_url and base_url != callback_url:
@@ -888,6 +898,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         response = requests.post(
             f"{callback_url}/terminals/{receiver_id}/inbox/messages",
             params=params,
+            headers=gateway_headers,
             timeout=_mcp_timeout(),
         )
     response.raise_for_status()
@@ -1399,6 +1410,7 @@ def _assign_remote(
     model: Optional[str],
     use_worktree: bool,
     ready_wait_seconds: float = 0.0,
+    callback_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create an assign worker on a REMOTE CAO node (one-agent-per-pod topology).
 
@@ -1410,12 +1422,11 @@ def _assign_remote(
 
     Callback routing: assign is non-blocking, so results come back via the
     worker's ``send_message``. The worker's node has no DB row for this
-    supervisor terminal, so we inject ``CAO_CALLBACK_URL`` (this node's
-    ``CAO_ADVERTISED_URL``) and ``CAO_CALLBACK_TERMINAL_ID`` into the remote
-    terminal's environment — the worker-side MCP server routes replies to
-    that URL. Without an advertised URL the results could never route back,
-    so that misconfiguration fails fast here instead of creating a stranded
-    worker.
+    supervisor terminal, so we inject ``CAO_CALLBACK_URL`` and
+    ``CAO_CALLBACK_TERMINAL_ID`` into the remote terminal's environment. Plain
+    remote assign uses this node's ``CAO_ADVERTISED_URL``; elastic assign passes
+    its authenticated broker gateway as ``callback_url`` so workers never learn
+    the supervisor control API URL.
 
     ``ready_wait_seconds`` > 0 waits for the target's ``/health`` before posting
     (see ``_wait_remote_ready``). It defaults to 0, which keeps every existing
@@ -1424,7 +1435,7 @@ def _assign_remote(
     rather than after a wait. Only a caller that just CREATED the target - the
     elastic path - has reason to expect it to arrive shortly.
     """
-    advertised_url = os.environ.get(ADVERTISED_URL_ENV)
+    advertised_url = callback_url or os.environ.get(ADVERTISED_URL_ENV)
     if not advertised_url:
         return {
             "success": False,
@@ -1531,6 +1542,7 @@ def _assign_impl(
     use_worktree: bool = False,
     target_host: Optional[str] = None,
     ready_wait_seconds: float = 0.0,
+    callback_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1599,6 +1611,7 @@ def _assign_impl(
                 model=model,
                 use_worktree=use_worktree,
                 ready_wait_seconds=ready_wait_seconds,
+                callback_url=callback_url,
             )
 
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
@@ -1934,6 +1947,7 @@ async def assign_elastic(
             model=model,
             target_host=str(lease["target_host"]),
             ready_wait_seconds=_elastic_ready_wait(),
+            callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
         )
         result["worker_id"] = worker_id
         result["elastic"] = True

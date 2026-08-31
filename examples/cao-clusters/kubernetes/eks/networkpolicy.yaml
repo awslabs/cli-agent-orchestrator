@@ -41,7 +41,7 @@ spec:
 #
 # Two callers, and both are needed for a lease to complete its cycle:
 #   supervisor      POST /workers        to take a lease (assign_elastic)
-#   elastic worker  POST /workers/{id}/complete  to give it back
+#   elastic worker  completion, terminal-ended, inbox and memory gateway calls
 #
 # Leaving the worker out is a tempting simplification and a bad one: the worker's
 # release call would be dropped, the reaper would eventually mark the lease
@@ -76,9 +76,10 @@ spec:
 #
 # Deliberately NOT a copy of the agent egress rules. The broker runs no agent and
 # holds no credentials, so it needs neither vendor HTTPS nor the Pod Identity
-# endpoint — it needs DNS and the Kubernetes API server, and nothing else. That
-# makes it the most tightly bounded pod in the namespace despite being the only
-# one that can create another pod.
+# endpoint — it needs DNS, the Kubernetes API server, and one fixed path to the
+# supervisor pod for its allowlisted worker gateway. That makes it the most
+# tightly bounded pod in the namespace despite being the only one that can
+# create another pod.
 #
 # The API server rule is the subtle part. Copying the agents' `0.0.0.0/0` +
 # private-range-`except` rule onto the broker BLOCKS it: `kubernetes.default`
@@ -101,6 +102,16 @@ spec:
   policyTypes:
     - Egress
   egress:
+    # Narrow gateway upstream. Workers cannot reach the supervisor directly;
+    # the broker authenticates their per-worker release token and forwards only
+    # the explicit inbox and memory routes.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-supervisor
+      ports:
+        - port: 9889
+          protocol: TCP
     - to:
         - namespaceSelector: {}
           podSelector:
@@ -152,8 +163,8 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Intra-namespace: supervisor callbacks (send_message results to
-    # cao-supervisor:9889) and any other cao-fleet pod in this namespace.
+    # Intra-namespace: the authenticated broker gateway and peer services.
+    # The supervisor's ingress policy independently rejects worker pods.
     - to:
         - podSelector: {}
     # DNS: workers resolve the supervisor's/peers' service DNS names.
@@ -228,12 +239,13 @@ spec:
           protocol: TCP
 ---
 # NetworkPolicy — restrict access to supervisor pod.
-# Only worker pods may reach it, for cross-pod send_message callbacks to
-# supervisor:9889 — required for the one-agent-per-pod assign flow.
+# Workers deliberately cannot reach this port. Their callbacks and shared-memory
+# calls go to the broker's authenticated, allowlisted gateway; only the broker
+# can forward those requests here.
 #
-# The broker is deliberately NOT allowed in. It receives the supervisor's URL as
-# a string to forward (CAO_MEMORY_API_URL) and never dials it itself, so the pod
-# that can create pods has no path to the pod holding the conversation.
+# The panel still needs the full API for fleet probes. The broker runs no agent
+# and forwards only five fixed routes, so it is the narrow application-layer
+# boundary NetworkPolicy itself cannot express.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -249,11 +261,9 @@ spec:
     - Ingress
   ingress:
     - from:
-        # Workers deliver assign results back to the supervisor's inbox
-        # (POST /terminals/{id}/inbox/messages via CAO_CALLBACK_URL).
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: cao-elastic-worker
+              app.kubernetes.io/name: cao-worker-broker
         # The panel probes every node in its fleet registry to build the view.
         # Without this it renders the node as permanently unreachable.
         - podSelector:

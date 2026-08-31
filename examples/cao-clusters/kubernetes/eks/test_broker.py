@@ -23,10 +23,12 @@ import os
 import sys
 import time
 import types
+from unittest.mock import Mock, patch
 
 os.environ.update({
     "CAO_ELASTIC_WORKER_IMAGE": "111122223333.dkr.ecr.us-east-1.amazonaws.com/cao-server:2.4.1-cc3",
     "CAO_ELASTIC_BROKER_TOKEN": "test-token",
+    "CAO_SUPERVISOR_API_URL": "http://cao-supervisor:9889",
     "CLAUDE_CODE_USE_BEDROCK": "1",
     "AWS_REGION": "us-east-1",
     "ANTHROPIC_MODEL": "global.anthropic.claude-opus-4-6-v1",
@@ -146,6 +148,9 @@ check("all four model tiers pinned",
 check("both timeouts forwarded",
       env.get("CAO_PROVIDER_INIT_TIMEOUT") == "180" and env.get("CAO_MCP_REQUEST_TIMEOUT") == "240")
 check("max terminals still 1", env.get("CAO_MAX_TERMINALS") == "1")
+check("worker memory uses the authenticated broker gateway",
+      env.get("CAO_MEMORY_API_URL") == "http://cao-worker-broker:9890",
+      env.get("CAO_MEMORY_API_URL"))
 check("worker warms its providers in the background",
       env.get("CAO_WARM_PROVIDER") == "background", env.get("CAO_WARM_PROVIDER"))
 check("worker SA is cao-elastic-worker", spec["serviceAccountName"] == "cao-elastic-worker")
@@ -354,6 +359,55 @@ with TestClient(broker.app) as c:
     check("ledger lists the open lease",
           r.status_code == 200 and any(w["worker_id"] == wid and w["state"] == "leased"
                                        for w in r.json()), r.text[:300])
+
+    gateway_headers = {
+        "X-CAO-Worker-ID": wid,
+        "X-CAO-Release-Token": lease["release_token"],
+    }
+    r = c.post(
+        "/terminals/abc12345/inbox/messages",
+        params={"sender_id": "feed0001", "message": "done"},
+    )
+    check("gateway rejects an unauthenticated callback", r.status_code == 401, r.text[:200])
+
+    upstream = Mock(
+        status_code=200,
+        content=b'{"success":true}',
+        headers={"content-type": "application/json"},
+    )
+    with patch.object(broker.requests, "post", return_value=upstream) as post:
+        r = c.post(
+            "/terminals/abc12345/inbox/messages",
+            params={"sender_id": "feed0001", "message": "done"},
+            headers=gateway_headers,
+        )
+    check("authenticated callback is forwarded", r.status_code == 200, r.text[:200])
+    check(
+        "callback forwards only to the fixed supervisor inbox route",
+        post.call_args.args[0] == "http://cao-supervisor:9889/terminals/abc12345/inbox/messages",
+        str(post.call_args),
+    )
+
+    memory_upstream = Mock(
+        status_code=200,
+        content=b'{"context":"shared"}',
+        headers={"content-type": "application/json"},
+    )
+    with patch.object(broker.requests, "post", return_value=memory_upstream) as post:
+        r = c.post(
+            "/internal/memory/context",
+            json={"terminal_context": {"cwd": "/workspace"}, "budget_chars": 3000},
+            headers=gateway_headers,
+        )
+    check("authenticated memory request is forwarded", r.status_code == 200, r.text[:200])
+    check(
+        "memory forwards only to the fixed supervisor route",
+        post.call_args.args[0] == "http://cao-supervisor:9889/internal/memory/context",
+        str(post.call_args),
+    )
+
+    r = c.post("/sessions", headers=gateway_headers)
+    check("gateway exposes no supervisor session route", r.status_code == 404, r.text[:200])
 
     r = c.post(f"/workers/{wid}/complete", headers={"X-CAO-Release-Token": "wrong"})
     check("wrong release token is rejected", r.status_code == 401, str(r.status_code))

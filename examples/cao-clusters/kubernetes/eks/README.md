@@ -10,9 +10,10 @@ owns durable CAO memory on its EBS claim. Both mount the shared EFS workspace.
 | `cao-worker-broker` | Deployment, one replica | None | Persistent |
 | `cao-worker-<id>` | One Job per assignment | `emptyDir` state + shared EFS workspace | Released on callback |
 
-The broker creates each worker Job and its temporary Service. Workers send memory
-operations to the supervisor API, so project memory has one durable owner instead
-of being split across per-pod state directories.
+The broker creates each worker Job and its temporary Service. Workers send
+authenticated memory and callback requests through the broker's narrow gateway;
+the broker forwards only those five routes to the supervisor, so project memory
+has one durable owner without exposing the supervisor control API.
 
 Three properties are worth understanding before changing anything here.
 
@@ -24,7 +25,11 @@ service account and resource limits are all broker-controlled. So a
 prompt-injected supervisor can ask for "a worker running the reviewer profile"
 and cannot ask for "a privileged pod mounting the host filesystem". Its Role has
 no `pods/exec` and no `secrets` — it cannot shell into a worker it created, nor
-read the token it authenticates callers with.
+read the token it authenticates callers with. The same boundary protects the
+persistent supervisor: workers cannot reach its port at all. They present their
+per-lease release token to the broker, which forwards only inbox delivery and
+the four memory operations. Local CAO remains authentication-free by default;
+this credential and routing behavior activates only inside elastic worker pods.
 
 **A worker cannot drift.** Its profile store is a fresh `emptyDir`, and
 `CAO_INSTALL_PROFILES` is set per Job to `<profile>:<provider>`. On a fixed fleet
@@ -527,10 +532,11 @@ than at the first lease on a live cluster.
 ```bash
 uv venv /tmp/brokertest --python 3.12
 VIRTUAL_ENV=/tmp/brokertest uv pip install \
-  "fastapi>=0.104.0" "kubernetes>=30.0.0,<35.0.0" httpx
+  "fastapi>=0.104.0" "kubernetes>=30.0.0,<35.0.0" "requests>=2.32.0" httpx
 /tmp/brokertest/bin/python examples/cao-clusters/kubernetes/eks/test_broker.py
 ```
 
-It covers the lease lifecycle over HTTP, both token checks, both reaper paths,
-the `ownerReference` on the per-worker Service, and the startup check that
-refuses to boot when a forwarded model pin is missing.
+It covers the lease lifecycle over HTTP, broker and per-worker token checks,
+the allowlisted callback/memory gateway, both reaper paths, the
+`ownerReference` on the per-worker Service, and the startup check that refuses
+to boot when a forwarded model pin is missing.

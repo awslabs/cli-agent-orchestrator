@@ -10,6 +10,9 @@ import requests
 
 from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.services.elastic_worker_gateway import (
+    elastic_worker_gateway_headers,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError, MemoryService
 
 
@@ -19,8 +22,11 @@ def remote_memory_url() -> Optional[str]:
 
 
 def _headers() -> dict[str, str]:
+    headers = elastic_worker_gateway_headers()
     token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def _timeout() -> float:

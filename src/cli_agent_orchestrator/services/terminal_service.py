@@ -78,6 +78,9 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import worktree_service
+from cli_agent_orchestrator.services.elastic_worker_gateway import (
+    elastic_worker_gateway_headers,
+)
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_gateway import (
@@ -1027,10 +1030,12 @@ def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str)
     ``caller_id`` row — its supervisor's terminal lives on ANOTHER node. The
     creating supervisor injected ``CAO_CALLBACK_URL`` / ``CAO_CALLBACK_TERMINAL_ID``
     into the session env at creation time (persisted via ``set_session_env``),
-    so read them back and POST the failure straight to the supervisor node's
-    inbox endpoint. Best-effort; returns True only when the remote POST
-    succeeded. Note the session-env store is process-local — after a cao-server
-    restart the route is gone and this degrades to the log-only path.
+    so read them back and POST the failure through that callback endpoint.
+    Elastic workers use the authenticated broker gateway; ordinary remote
+    workers call the supervisor directly. Best-effort; returns True only when
+    the remote POST succeeded. Note the session-env store is process-local -
+    after a cao-server restart the route is gone and this degrades to the
+    log-only path.
     """
     try:
         session_env = get_session_env(session_name)
@@ -1041,6 +1046,7 @@ def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str)
         response = requests.post(
             f"{callback_url}/terminals/{callback_terminal_id}/inbox/messages",
             params={"sender_id": terminal_id, "message": message},
+            headers=elastic_worker_gateway_headers() or None,
             timeout=CROSS_NODE_NOTIFY_TIMEOUT,
         )
         response.raise_for_status()
