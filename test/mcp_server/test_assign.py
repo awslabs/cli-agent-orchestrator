@@ -585,6 +585,76 @@ class TestCreateTerminalUseWorktree:
         _, kwargs = mock_requests.post.call_args
         assert kwargs["params"]["idempotency_key"] == "retry-1"
 
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_two_keyed_fresh_session_retries_send_the_same_session_name(
+        self, mock_requests, mock_resolve_provider
+    ):
+        """A keyed retry outside a CAO terminal must reattach, not 409.
+
+        Review on PR #634. The test above pins ``generate_session_name`` to one
+        value and calls once, so it cannot see this: the server fingerprints
+        ``session_name``, and this branch used to mint a fresh uuid4 per
+        invocation, so two retries of the same command produced DIFFERENT
+        fingerprints and the retry conflicted with its own first attempt.
+
+        Deliberately does NOT patch the name generator -- pinning it is exactly
+        what hid the bug. Two real calls, and the session name they send must
+        match.
+        """
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        sent = []
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            for _ in range(2):
+                _create_terminal("reviewer", idempotency_key="retry-1")
+                sent.append(mock_requests.post.call_args.kwargs["params"]["session_name"])
+
+        assert sent[0] == sent[1], "a keyed retry must re-send the same session_name"
+
+        # A DIFFERENT key must still get its own session, or one key would
+        # capture every fresh-session request on the node.
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal("reviewer", idempotency_key="retry-2")
+        assert mock_requests.post.call_args.kwargs["params"]["session_name"] != sent[0]
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_unkeyed_fresh_sessions_still_get_unique_names(
+        self, mock_requests, mock_resolve_provider
+    ):
+        """No key means the old uuid4 behaviour, unchanged.
+
+        Pinned because deriving the name from the key must not leak into the
+        default path: two unkeyed handoffs are unrelated requests and sharing a
+        session name would collide them.
+        """
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        sent = []
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            for _ in range(2):
+                _create_terminal("reviewer")
+                sent.append(mock_requests.post.call_args.kwargs["params"]["session_name"])
+
+        assert sent[0] != sent[1]
+
     @patch("cli_agent_orchestrator.mcp_server.server._assign_impl")
     def test_assign_tool_forwards_use_worktree_to_impl(self, mock_impl):
         """The public `assign` MCP tool itself threads use_worktree through to

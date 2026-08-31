@@ -46,7 +46,10 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
-from cli_agent_orchestrator.utils.terminal import generate_session_name
+from cli_agent_orchestrator.utils.terminal import (
+    generate_session_name,
+    generate_session_name_for_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -547,7 +550,28 @@ def _create_terminal(
                 "defer_init requires initial_message when creating a new session "
                 "(no current CAO_TERMINAL_ID)"
             )
-        session_name = generate_session_name()
+        # A KEYED request derives its session name FROM the key instead of a
+        # fresh uuid4, and without this a keyed retry on this branch could never
+        # match (review on PR #634, issue #616). The server fingerprints
+        # session_name, and this branch mints a new one per invocation, so two
+        # retries of one `cao agent handoff --idempotency-key K` from outside a
+        # CAO terminal produced different fingerprints for the same logical
+        # request: the retry 409'd against its own first attempt instead of
+        # reattaching to it. Deriving the name makes the request byte-identical
+        # across attempts, which is the precondition the fingerprint check has
+        # always assumed.
+        #
+        # sha256 of the key, truncated to the same 8 hex chars
+        # `generate_session_name` uses, so the result is indistinguishable in
+        # shape from a generated name and satisfies the same tmux-name rules.
+        # Two DIFFERENT requests sharing a key collide on this name, which is
+        # correct: that is the conflict case, and it surfaces as the 409 the key
+        # is supposed to produce rather than as two sessions.
+        session_name = (
+            generate_session_name_for_key(idempotency_key)
+            if idempotency_key
+            else generate_session_name()
+        )
         provider = resolve_provider(agent_profile, fallback_provider=provider)
         params = {
             "provider": provider,
