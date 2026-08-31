@@ -117,14 +117,18 @@ class StatusMonitor:
         # appended a chunk (i.e. the buffer changed) — the STALE_PROCESSING_BUFFER_QUIET_S
         # quiet gate reads this. Same None-vs-0.0 sentinel rule as above.
         self._buffer_changed_at: Dict[str, Optional[float]] = {}
-        # Per-terminal (status, monotonic) candidate from a stale-PROCESSING capture,
-        # awaiting a second confirming read before being honored (see
-        # _fresh_capture_pane_status). Cleared on confirm, on an intervening
-        # PROCESSING/UNKNOWN read, on expiry past STALE_PROCESSING_CONFIRM_TTL_S, by
-        # a real chunk landing in _process_chunk, and by notify_input_sent — new
-        # input or new output means whatever the pane showed before no longer
-        # describes the terminal.
-        self._pending_stale_capture: Dict[str, Tuple[TerminalStatus, float]] = {}
+        # Per-terminal (status, monotonic, generation) candidate from a
+        # stale-PROCESSING capture, awaiting a second confirming read before being
+        # honored (see _fresh_capture_pane_status). Cleared on confirm, on an
+        # intervening PROCESSING/UNKNOWN read, on expiry past
+        # STALE_PROCESSING_CONFIRM_TTL_S, by a real chunk landing in
+        # _process_chunk, and by notify_input_sent — new input or new output means
+        # whatever the pane showed before no longer describes the terminal. The
+        # third element is the generation sampled BEFORE the candidate's pane
+        # read: every mutation of this map is rejected unless that generation is
+        # still current, so a read that straddled a turn/output boundary can never
+        # seed (or confirm) a candidate — see _fresh_capture_pane_status.
+        self._pending_stale_capture: Dict[str, Tuple[TerminalStatus, float, int]] = {}
         # Per-terminal turn/output generation. Bumped under the lock by
         # notify_input_sent (a new turn began) and by _process_chunk (real output
         # arrived). A capture-pane verdict is only applied if the generation it was
@@ -726,7 +730,7 @@ class StatusMonitor:
                 and time.monotonic() - changed_at >= STALE_PROCESSING_BUFFER_QUIET_S
             )
             if buffer_is_quiet:
-                fresh_capture = self._fresh_capture_pane_status(terminal_id)
+                fresh_capture = self._fresh_capture_pane_status(terminal_id, generation)
                 if fresh_capture is not None:
                     logger.debug(
                         f"get_status [{terminal_id}]: cached=PROCESSING stale-buffer re-check "
@@ -781,8 +785,22 @@ class StatusMonitor:
                             return current_last_status
         return cached
 
-    def _fresh_capture_pane_status(self, terminal_id: str) -> Optional[TerminalStatus]:
+    def _fresh_capture_pane_status(
+        self, terminal_id: str, generation: int
+    ) -> Optional[TerminalStatus]:
         """Re-detect a stuck-PROCESSING terminal from a fresh pane capture (#558).
+
+        ``generation`` is the turn/output generation the caller pinned BEFORE
+        deciding to capture. The pane read below runs unlocked, so
+        notify_input_sent or _process_chunk can bump the generation (and clear the
+        candidate map) while it is in flight; a verdict from such a read describes
+        the pane from BEFORE that boundary. The caller's apply-time check cannot
+        see this alone: it only rejects CONFIRMED verdicts, while a straddling
+        first read would re-seed the candidate map AFTER the boundary cleared it,
+        and the next poll — pinning the new, by-then-stable generation — would
+        treat that pre-boundary entry as its matching first read and confirm it.
+        So every candidate-map mutation here (seed, confirm-pop, busy-pop) is
+        performed only if ``generation`` is still current under the lock.
 
         Reads the pane directly via ``get_backend().get_history()`` (a real ``tmux
         capture-pane``, not the FIFO-fed rolling buffer) and re-runs provider detection
@@ -889,27 +907,46 @@ class StatusMonitor:
         if detected == TerminalStatus.PROCESSING or detected == TerminalStatus.UNKNOWN:
             # Not a ready candidate — nothing to confirm. Clear any pending one: a busy
             # read BETWEEN two ready reads means the terminal is genuinely still working,
-            # so the earlier candidate no longer describes a settled pane.
+            # so the earlier candidate no longer describes a settled pane. Only if this
+            # read didn't straddle a boundary, though — a busy verdict from BEFORE a
+            # notify_input_sent/_process_chunk bump says nothing about a candidate
+            # legitimately seeded after it.
             with self._lock:
-                self._pending_stale_capture.pop(terminal_id, None)
+                if self._capture_generation.get(terminal_id, 0) == generation:
+                    self._pending_stale_capture.pop(terminal_id, None)
             return detected
 
         now = time.monotonic()
         with self._lock:
+            if self._capture_generation.get(terminal_id, 0) != generation:
+                # The pane read straddled a turn/output boundary: the boundary already
+                # cleared the candidate map, and this verdict describes the pane from
+                # before it. Seeding it anyway would hand the NEXT poll (which pins the
+                # new generation before its read) a pre-boundary first read to "confirm"
+                # against — the exact single-frame latch the two-read confirm exists to
+                # prevent. No mutation, no verdict.
+                logger.debug(
+                    f"_fresh_capture_pane_status [{terminal_id}]: candidate "
+                    f"{detected.value} discarded — the terminal moved on (new input or "
+                    "new output) while the capture-pane read was in flight"
+                )
+                return None
             pending = self._pending_stale_capture.get(terminal_id)
             if (
                 pending is not None
                 and pending[0] == detected
+                and pending[2] == generation
                 and now - pending[1] <= STALE_PROCESSING_CONFIRM_TTL_S
             ):
-                # Second consecutive matching read, in time — honor it.
+                # Second consecutive matching read, in time and within the same
+                # turn/output generation — honor it.
                 self._pending_stale_capture.pop(terminal_id, None)
                 confirmed = True
             else:
                 # First sighting, a different candidate than the pending one, or a
                 # candidate that aged out — (re)record with a fresh timestamp and wait
                 # for the next read to agree.
-                self._pending_stale_capture[terminal_id] = (detected, now)
+                self._pending_stale_capture[terminal_id] = (detected, now, generation)
                 confirmed = False
         if not confirmed:
             logger.debug(

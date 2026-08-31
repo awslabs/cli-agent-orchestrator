@@ -503,12 +503,13 @@ class TestStaleProcessingCapturePane:
 
         # Land the new input in the EXACT window: after _fresh_capture_pane_status has
         # confirmed and popped the candidate, before get_status applies the verdict.
-        # (Input during the capture read itself is covered separately -- the candidate
-        # pop handles that; this pins the later, narrower window.)
+        # (Input during the capture read itself is pinned separately by
+        # test_new_turn_during_the_seeding_read_rejects_the_candidate; this pins the
+        # later, narrower window.)
         real_probe = sm._fresh_capture_pane_status
 
-        def probe_then_new_turn(terminal_id):
-            verdict = real_probe(terminal_id)
+        def probe_then_new_turn(terminal_id, generation):
+            verdict = real_probe(terminal_id, generation)
             if verdict == TerminalStatus.IDLE:
                 sm.notify_input_sent("t1")
             return verdict
@@ -523,6 +524,95 @@ class TestStaleProcessingCapturePane:
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
         # The arm set by notify_input_sent must survive untouched for the new turn.
         assert sm._allow_processing_revert["t1"] is True
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_new_turn_during_the_seeding_read_rejects_the_candidate(
+        self, mock_pm, mock_get_backend
+    ):
+        """New input landing while the FIRST (candidate-seeding) capture is in flight
+        must reject that candidate outright, not merely fail to confirm it.
+        notify_input_sent's own candidate pop cannot help here -- the pop runs while the
+        read is still in flight, and the seeding write lands AFTER it. If that
+        pre-boundary IDLE were seeded anyway, the next poll would pin the new (by then
+        stable) generation, take its own IDLE read as the "second" of the pair, confirm,
+        and apply -- consuming the revert arm the new turn just set and latch-blocking
+        its genuine PROCESSING. The seeding mutation itself must be generation-gated."""
+        provider = self._probe_provider(TerminalStatus.IDLE)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        # New input arrives DURING the first pane read -- inside the unlocked
+        # subprocess window, after the caller pinned its generation.
+        def new_turn_then_return_history(*args, **kwargs):
+            sm.notify_input_sent("t1")
+            return "idle-looking pane"
+
+        backend.get_history.side_effect = new_turn_then_return_history
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        # The straddling read must not have (re)seeded the candidate map.
+        assert "t1" not in sm._pending_stale_capture
+
+        # Next poll reads the same idle-looking pane cleanly: with the stale candidate
+        # correctly rejected this is a FIRST sighting, so nothing confirms, nothing is
+        # applied, and the new turn's revert arm is still intact.
+        backend.get_history.side_effect = None
+        backend.get_history.return_value = "idle-looking pane"
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert sm._allow_processing_revert["t1"] is True
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_real_chunk_during_the_seeding_read_rejects_the_candidate(
+        self, mock_pm, mock_get_backend, mock_settings
+    ):
+        """Same straddling window as above, other boundary source: a real chunk through
+        _process_chunk while the seeding capture is in flight. The chunk's candidate pop
+        runs before the seeding write lands, so without the generation gate the
+        pre-burst IDLE would be seeded after it and confirmable by the next quiet
+        poll."""
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = self._probe_provider(TerminalStatus.IDLE)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        def chunk_then_return_history(*args, **kwargs):
+            # The buffer-driven detection must keep reporting busy so only the
+            # capture path's candidate bookkeeping is exercised.
+            provider.get_status.return_value = TerminalStatus.PROCESSING
+            sm._process_chunk("t1", "fresh spinner frame")
+            provider.get_status.return_value = TerminalStatus.IDLE
+            return "idle-looking pane"
+
+        backend.get_history.side_effect = chunk_then_return_history
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert "t1" not in sm._pending_stale_capture
+
+        # Quiet again; the next clean read is a FIRST sighting, never a confirmation.
+        backend.get_history.side_effect = None
+        backend.get_history.return_value = "idle-looking pane"
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
@@ -640,10 +730,11 @@ class TestStaleProcessingCapturePane:
         assert sm.get_status("t1") == TerminalStatus.PROCESSING  # candidate recorded
 
         # Age the candidate past the TTL, as if the confirming read never arrived on time.
-        pending_status, pending_ts = sm._pending_stale_capture["t1"]
+        pending_status, pending_ts, pending_gen = sm._pending_stale_capture["t1"]
         sm._pending_stale_capture["t1"] = (
             pending_status,
             pending_ts - (STALE_PROCESSING_CONFIRM_TTL_S + 0.5),
+            pending_gen,
         )
 
         # The next matching read must NOT confirm the expired candidate -- it starts a
