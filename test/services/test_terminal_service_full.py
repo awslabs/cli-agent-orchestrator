@@ -2238,12 +2238,16 @@ class TestDeferredInitFailureNotification:
 
         mock_meta.return_value = {"caller_id": "super123"}
 
-        _notify_caller_of_deferred_failure(
-            "worker99", "waiting on prompt", None, delete_worker=False
-        )
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._notify_elastic_terminal_ended"
+        ) as mock_terminal_ended:
+            _notify_caller_of_deferred_failure(
+                "worker99", "waiting on prompt", None, delete_worker=False
+            )
 
         mock_create_inbox.assert_called_once()
         mock_delete.assert_not_called()
+        mock_terminal_ended.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
@@ -2280,6 +2284,75 @@ class TestDeferredInitFailureNotification:
 
         mock_create_inbox.assert_not_called()
         mock_delete.assert_called_once()
+
+    def test_broker_notification_failure_does_not_block_local_teardown(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "deadbeef")
+        monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
+        monkeypatch.setenv("CAO_ELASTIC_RELEASE_TOKEN", "release-token")
+
+        with (
+            patch.object(
+                terminal_service,
+                "get_terminal_metadata",
+                return_value={"caller_id": "super123"},
+            ),
+            patch.object(terminal_service, "create_inbox_message"),
+            patch.object(terminal_service, "delete_terminal") as mock_delete,
+            patch.object(
+                terminal_service.requests,
+                "post",
+                side_effect=terminal_service.requests.ConnectionError("broker unavailable"),
+            ),
+        ):
+            terminal_service._notify_caller_of_deferred_failure(
+                "worker99", "provider startup failed", None, delete_worker=True
+            )
+
+        mock_delete.assert_called_once_with("worker99", registry=None)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_elastic_terminal_ended")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_deferred_session_failure_reports_terminal_ended(
+        self,
+        mock_meta,
+        mock_create_inbox,
+        mock_terminal_ended,
+        mock_delete,
+        monkeypatch,
+    ):
+        """The POST /sessions deferred-init path must release its elastic lease."""
+        from cli_agent_orchestrator.services import terminal_service
+
+        async def inline_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        # Exercise the actual deferred task without leaving pytest's event-loop
+        # executor alive after this focused test.
+        monkeypatch.setattr(terminal_service.asyncio, "to_thread", inline_to_thread)
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        provider_instance = AsyncMock()
+        provider_instance.initialize.side_effect = RuntimeError("provider startup failed")
+
+        before_tasks = set(terminal_service._deferred_init_tasks)
+        terminal_service._schedule_deferred_init(
+            provider_instance,
+            "worker99",
+            "do the task",
+            OrchestrationType.ASSIGN,
+            None,
+        )
+        (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
+        await task
+
+        mock_create_inbox.assert_called_once()
+        mock_delete.assert_called_once_with("worker99", registry=None)
+        mock_terminal_ended.assert_called_once_with("worker99")
 
 
 class TestDeferredInitWaitingUserAnswerSurvival:

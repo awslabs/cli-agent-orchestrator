@@ -28,7 +28,6 @@ from typing import (
     cast,
 )
 
-import requests
 import yaml
 from fastapi import (
     BackgroundTasks,
@@ -160,6 +159,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     OutputMode,
     TerminalInputBlockedError,
+    _notify_elastic_terminal_ended,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
     _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
@@ -3606,33 +3606,6 @@ async def exit_terminal(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to exit terminal: {str(e)}",
-        )
-
-
-def _notify_elastic_terminal_ended(terminal_id: str) -> None:
-    """Tell the broker that a one-shot worker terminal ended without assuming success."""
-    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
-    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
-    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
-    if not worker_id or not broker_url or not release_token:
-        return
-    try:
-        response = requests.post(
-            f"{broker_url}/workers/{worker_id}/terminal-ended",
-            json={"terminal_id": terminal_id},
-            headers={"X-CAO-Release-Token": release_token},
-            timeout=5.0,
-        )
-        # A completed lease may already have deleted its Job before this
-        # post-response task runs. The signal is then redundant.
-        if response.status_code != status.HTTP_404_NOT_FOUND:
-            response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning(
-            "Could not report terminal %s ending for elastic worker %s: %s",
-            terminal_id,
-            worker_id,
-            exc,
         )
 
 

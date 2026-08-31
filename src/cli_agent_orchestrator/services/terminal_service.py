@@ -1054,6 +1054,33 @@ def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str)
         return False
 
 
+def _notify_elastic_terminal_ended(terminal_id: str) -> None:
+    """Tell the broker that a one-shot worker terminal ended without completion."""
+    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
+    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
+    if not worker_id or not broker_url or not release_token:
+        return
+    try:
+        response = requests.post(
+            f"{broker_url}/workers/{worker_id}/terminal-ended",
+            json={"terminal_id": terminal_id},
+            headers={"X-CAO-Release-Token": release_token},
+            timeout=5.0,
+        )
+        # A completion or another teardown signal may already have released the
+        # lease. In that case this notification is redundant.
+        if response.status_code != 404:
+            response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning(
+            "Could not report terminal %s ending for elastic worker %s: %s",
+            terminal_id,
+            worker_id,
+            exc,
+        )
+
+
 def _notify_caller_of_deferred_failure(
     terminal_id: str,
     message: str,
@@ -1119,6 +1146,10 @@ def _notify_caller_of_deferred_failure(
                 terminal_id,
                 exc,
             )
+        # This process is PID 1 in an elastic worker pod, so deleting its tmux
+        # terminal does not change the pod phase. Tell the broker explicitly or
+        # the failed lease remains Ready until its completion timeout.
+        _notify_elastic_terminal_ended(terminal_id)
 
 
 # --- deferred-init submit verification ----------------------------------------

@@ -2,9 +2,11 @@
 
 import asyncio
 import time
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from cli_agent_orchestrator.mcp_server import server
+from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.services import terminal_service
 
 
 def test_assign_elastic_provisions_then_assigns(monkeypatch):
@@ -35,6 +37,90 @@ def test_assign_elastic_provisions_then_assigns(monkeypatch):
     assert assign.call_args.args[2].endswith("/deadbeef")
     assert assign.call_args.kwargs["target_host"].startswith("cao-worker-deadbeef")
     assert "complete_assignment" in assign.call_args.args[1]
+
+
+def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
+    """Exercise the real elastic placement and deferred-session failure path."""
+    monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
+    monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
+    monkeypatch.setenv(server.ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
+
+    lease = Mock(status_code=200)
+    lease.raise_for_status.return_value = None
+    lease.json.return_value = {
+        "worker_id": "deadbeef",
+        "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
+        "working_directory": "/home/cao/workspace/jobs/deadbeef",
+        "release_token": "release-token",
+    }
+    session = Mock(status_code=200)
+    session.json.return_value = {"id": "def67890", "session_name": "cao-remote"}
+    ok = Mock(status_code=200)
+    ok.raise_for_status.return_value = None
+    posts = []
+
+    def post(url, *args, **kwargs):
+        posts.append((url, kwargs))
+        if url == "http://broker:9890/workers":
+            return lease
+        if url.endswith("/sessions"):
+            return session
+        return ok
+
+    async def inline_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    async def exercise():
+        result = await server.assign_elastic("developer", "Implement it")
+        assert result["success"] is True
+
+        # These are pod-level variables in production, injected by the broker
+        # before the remote POST /sessions creates the terminal.
+        monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "deadbeef")
+        monkeypatch.setenv("CAO_ELASTIC_RELEASE_TOKEN", "release-token")
+        provider = AsyncMock()
+        provider.initialize.side_effect = RuntimeError("provider startup failed")
+        before_tasks = set(terminal_service._deferred_init_tasks)
+        terminal_service._schedule_deferred_init(
+            provider,
+            "def67890",
+            "Implement it",
+            OrchestrationType.ASSIGN,
+            None,
+        )
+        (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
+        await task
+
+    with (
+        patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        patch.object(server.requests, "get", return_value=Mock(status_code=200)),
+        patch.object(server.requests, "post", side_effect=post),
+        patch.object(terminal_service.asyncio, "to_thread", inline_to_thread),
+        patch.object(
+            terminal_service,
+            "get_terminal_metadata",
+            return_value={"caller_id": None, "tmux_session": "cao-remote"},
+        ),
+        patch.object(
+            terminal_service,
+            "get_session_env",
+            return_value={
+                "CAO_CALLBACK_URL": "http://cao-supervisor:9889",
+                "CAO_CALLBACK_TERMINAL_ID": "abc12345",
+            },
+        ),
+        patch.object(terminal_service, "delete_terminal") as delete,
+    ):
+        asyncio.run(exercise())
+
+    urls = [url for url, _ in posts]
+    assert any(url.endswith("/sessions") for url in urls)
+    assert "http://broker:9890/workers/deadbeef/terminal-ended" in urls
+    terminal_ended = next(
+        kwargs for url, kwargs in posts if url.endswith("/workers/deadbeef/terminal-ended")
+    )
+    assert terminal_ended["headers"] == {"X-CAO-Release-Token": "release-token"}
+    delete.assert_called_once_with("def67890", registry=None)
 
 
 def _lease_response():

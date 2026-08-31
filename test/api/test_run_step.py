@@ -119,13 +119,14 @@ class TestRunStepEndpoint:
 
     def test_elastic_terminal_ended_signal_uses_release_token(self, monkeypatch):
         from cli_agent_orchestrator.api import main
+        from cli_agent_orchestrator.services import terminal_service
 
         monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "deadbeef")
         monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890/")
         monkeypatch.setenv("CAO_ELASTIC_RELEASE_TOKEN", "release-token")
         response = Mock(status_code=200)
 
-        with patch.object(main.requests, "post", return_value=response) as post:
+        with patch.object(terminal_service.requests, "post", return_value=response) as post:
             main._notify_elastic_terminal_ended("abc12345")
 
         post.assert_called_once_with(
