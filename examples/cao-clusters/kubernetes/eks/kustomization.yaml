@@ -1,0 +1,89 @@
+# Canonical elastic-worker deployment: one long-lived supervisor, one narrow
+# privileged broker, and worker pods that exist only for the duration of a task.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - storageclass-gp3.yaml
+  - storage.yaml
+  - rbac.yaml
+  # Base fleet registry the panel mounts. Jointly owned: this supplies the
+  # supervisor entry, and the broker adds and removes the worker entries as it
+  # leases and releases them, so the live object diverges from the file by design.
+  - configmap-fleet.yaml
+  - broker.yaml
+  - supervisor.yaml
+  - panel.yaml
+  - networkpolicy.yaml
+  # A provider that authenticates with a key rather than Pod Identity is selected
+  # through an optional Component, not by adding its ExternalSecret here. See
+  # components/kiro and `deploy.sh ... kiro`. Keeping the CRD out of the default
+  # resources lets Bedrock mode deploy on a cluster with no External Secrets
+  # Operator installed.
+  #
+  # The Component switches the supervisor profile and broker default together,
+  # removes Bedrock-only environment and egress, and adds the ExternalSecret.
+  # deploy.sh enables it in a temporary rendered copy so this file remains the
+  # canonical Bedrock default.
+
+# There is no statefulset-workers.yaml and no service-workers-headless.yaml: a
+# worker is a Job the broker mints per task, and the broker gives each one its
+# own ClusterIP Service, so there is no fixed fleet to address by ordinal.
+#
+# Claude Code on Bedrock needs no ExternalSecret at all - the pods authenticate
+# as their own Pod Identity, so there is nothing to fetch from Secrets Manager.
+# The one secret that path does use, the broker token, is generated locally by
+# deploy.sh.
+
+images:
+  # Pin an IMMUTABLE tag. A mutable `latest` tag once left the cluster running a
+  # build that predated cross-node placement while these manifests advertised
+  # it, with nothing to indicate the mismatch. Bump this deliberately when you
+  # push a new image.
+  #
+  # The repository part is a placeholder, not a literal. It is rendered by
+  # deploy.sh from the stack's own ServerRepositoryUri / WorkerBrokerRepositoryUri
+  # / PanelRepositoryUri outputs, because the repositories are named
+  # ${NamePrefix}-server and friends: hardcoding `cao-server` here worked only
+  # while NamePrefix kept its default, and any other value produced three
+  # ImagePullBackOffs while deploy.sh reported the correct URIs it had read and
+  # then not used.
+  #
+  # deploy.sh rewrites EVERY `newTag:` line to the tag it is given, so all three
+  # images below always move together. They are built from the same commit by
+  # the same CodeBuild run, so a split tag would only ever mean a mistake.
+  - name: <server-image>
+    # Built from Dockerfile, which installs Claude Code from public npm
+    # and carries the entrypoint that runs `cao init`, installs the profiles
+    # named in CAO_INSTALL_PROFILES, and execs cao-server.
+    newTag: 2.4.1-el1
+  - name: <broker-image>
+    # Built from Dockerfile.broker.
+    newTag: 2.4.1-el1
+  - name: <panel-image>
+    # Built from Dockerfile.panel, which copies the panel's source tree
+    # rather than installing its wheel: the frontend is resolved as a sibling of
+    # the app package, which an installed wheel does not preserve.
+    newTag: 2.4.1-el1
+
+# The `images:` block above rewrites container `image:` fields. It does NOT
+# rewrite an image name that happens to sit in an env var - and the broker takes
+# the image for the workers it mints in exactly that form. Left alone, the
+# supervisor would move to a new tag while the broker kept minting workers on the
+# old one, with nothing in `kubectl get pods` to show it.
+#
+# So the value is not written anywhere by hand: this copies the supervisor's
+# already-rewritten image into the broker's env. `replacements` is evaluated
+# after `images`, so what lands in the env carries the final tag (verified with
+# kustomize 5.7.1, `kubectl kustomize`).
+replacements:
+  - source:
+      kind: StatefulSet
+      name: cao-supervisor
+      fieldPath: spec.template.spec.containers.[name=cao-node].image
+    targets:
+      - select:
+          kind: Deployment
+          name: cao-worker-broker
+        fieldPaths:
+          - spec.template.spec.containers.[name=broker].env.[name=CAO_ELASTIC_WORKER_IMAGE].value

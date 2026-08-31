@@ -428,6 +428,86 @@ class TestCreateSession:
         assert response.status_code == 201
         assert mock_svc.create_session.call_args.kwargs["idempotency_key"] == "retry-1"
 
+    def test_memory_manager_sidecar_gets_a_key_derived_from_the_callers(self, client):
+        """A keyed retry must not spawn a SECOND memory_manager (review on PR #634).
+
+        The sidecar spawn is unconditional -- it runs after ``create_session``
+        whether the primary was created or resolved from an existing key -- and
+        the returned ``Terminal`` cannot say which. So two identical keyed
+        requests used to produce two sidecars for one primary, which is the
+        no-duplicate-workers criterion the key exists to hold.
+
+        Asserted at the DERIVED KEY rather than by counting spawns, because the
+        key is what makes the sidecar create idempotent in its own right: given
+        it, the second request reuses the first sidecar inside
+        ``create_terminal`` even in the races a created-vs-reused boolean would
+        miss. Suffixed so it can never collide with the caller's own key.
+        """
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="cao-primary",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.create_terminal"
+            ) as mock_create,
+        ):
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+            mock_create.return_value = mock_terminal
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "memory_manager": "true",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_create.call_args.kwargs["agent_profile"] == "memory_manager"
+        assert mock_create.call_args.kwargs["idempotency_key"] == "job-1:memory-manager-sidecar"
+
+    def test_unkeyed_session_leaves_the_sidecar_unkeyed(self, client):
+        """No caller key means no sidecar key -- the default path is unchanged.
+
+        Pinned because deriving `f"{key}:..."` from a `None` key would silently
+        claim the literal string `"None:memory-manager-sidecar"` for every
+        unkeyed request on the server, permanently, after the first one.
+        """
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="cao-primary",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.create_terminal"
+            ) as mock_create,
+        ):
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+            mock_create.return_value = mock_terminal
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "memory_manager": "true",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_create.call_args.kwargs["idempotency_key"] is None
+
     def test_idempotency_key_conflict_is_409_not_400(self, client):
         """A reused key for a DIFFERENT request must surface as 409.
 

@@ -212,9 +212,19 @@ def handoff_cmd(
     worker -- the keys people actually pick (`retry`, `job-1`) collide
     otherwise, and two agents on one cao-server pick the same ones. Reusing a
     key whose worker has since been torn down is not a conflict; it just
-    creates a fresh one. Note the request, not the MESSAGE, is what is
-    matched: the same command with a different message reuses the worker, on
-    the grounds that a real retry re-sends the same message.
+    creates a fresh one.
+
+    What the key does NOT cover, stated plainly because it is the one place
+    this is weaker than it reads: MESSAGE is not part of what is matched here,
+    so the same command with a different message reuses the worker and sends
+    the new text rather than conflicting. That is because this command delivers
+    MESSAGE as a separate step AFTER the worker exists -- only the creation is
+    keyed, so only the creation is deduplicated. (Where a task IS part of the
+    create, as with the API's initial_message, it IS matched and a different
+    task does conflict.) The consequence: if a retry cannot tell whether the
+    first attempt's message ever landed, this reattaches and sends again.
+    Making the SUBMISSION idempotent too needs a durable run record keyed by
+    this same key, tracked in #636.
 
     --no-wait: returns as soon as the worker exists and has been sent MESSAGE,
     without waiting for -- or extracting -- its result, and without tearing it

@@ -1,0 +1,24 @@
+# Keep the Docker build context to what the EKS Dockerfile actually copies:
+# pyproject.toml, README.md, LICENSE, NOTICE, scripts/hatch_build_tui_tag.py,
+# src/, the EKS example, and test/providers/fixtures/bin/mock_cli.
+.git
+.github
+.devcontainer
+.venv
+docusaurus
+web/node_modules
+web/dist
+cao_mcp_apps/node_modules
+tui/target
+examples/*
+!examples/cao-clusters/
+examples/cao-clusters/*
+!examples/cao-clusters/kubernetes/
+examples/cao-clusters/kubernetes/*
+!examples/cao-clusters/kubernetes/eks/
+!examples/cao-clusters/kubernetes/eks/**
+docs
+skills
+**/__pycache__
+**/*.pyc
+build.log

@@ -1187,6 +1187,8 @@ def _record(terminal_id="prior-terminal", **overrides):
         "allowed_tools": None,
         "env_vars": None,
         "resume_session_id": None,
+        "initial_message": None,
+        "initial_message_orchestration_type": None,
     }
     fields.update(overrides)
     return IdempotencyRecord(
@@ -1273,6 +1275,12 @@ class TestIdempotencyKeyRequestFingerprint:
             # workflow run was handed a terminal carrying another run's tokens.
             ("env_vars", {"CAO_WORKFLOW_RUN_ID": "run-BBB"}),
             ("resume_session_id", "01234567-89ab-cdef-0123-456789abcdef"),
+            # Review on PR #634: create_terminal DELIVERS initial_message, and a
+            # key hit returns above that scheduling -- so unhashed, a retry
+            # carrying a different task got the old terminal and the new task
+            # was discarded with no conflict and no delivery.
+            ("initial_message", "a different task"),
+            ("initial_message_orchestration_type", OrchestrationType.HANDOFF),
         ],
     )
     @pytest.mark.asyncio
@@ -1291,7 +1299,7 @@ class TestIdempotencyKeyRequestFingerprint:
         field,
         value,
     ):
-        """Each of the nine fields, varied ALONE, must conflict.
+        """Each fingerprinted field, varied ALONE, must conflict.
 
         Parametrized rather than one test per field so that adding a field to
         the fingerprint without adding it here is visible as a gap. ``caller_id``
@@ -1322,6 +1330,50 @@ class TestIdempotencyKeyRequestFingerprint:
         mock_provider_manager.create_provider.assert_not_called()
         mock_db_create.assert_not_called()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_second_task_under_one_key_conflicts_instead_of_being_dropped(
+        self,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_create,
+        mock_lookup,
+        mock_get_terminal,
+        mock_deferred_init,
+    ):
+        """A key hit must not swallow a DIFFERENT task (review on PR #634).
+
+        The reviewer's reproduction, kept verbatim as the regression: seed a key
+        for task A, then retry the otherwise identical request with task B. The
+        old behaviour returned A's terminal while `_schedule_deferred_init` was
+        never called, so B was discarded with no conflict, no delivery and no log
+        line -- the one failure mode a caller cannot detect. Both assertions
+        matter: raising is only correct if delivery also did not happen, and a
+        test that checked the raise alone would still pass if the conflict were
+        thrown AFTER B had already been sent somewhere.
+        """
+        mock_lookup.return_value = _record(initial_message="task A")
+        mock_get_terminal.return_value = _valid_row()
+
+        with pytest.raises(IdempotencyKeyConflict):
+            await create_terminal(
+                "kiro_cli",
+                "developer",
+                new_session=True,
+                idempotency_key="job-1",
+                initial_message="task B",
+            )
+
+        # Task B was neither delivered into A's terminal nor silently dropped:
+        # the caller is told, and nothing was scheduled for either task.
+        mock_deferred_init.assert_not_called()
+        mock_db_create.assert_not_called()
+
     def test_env_vars_none_and_empty_dict_are_the_same_request(self):
         """`None` and `{}` deliberately share an encoding (review on PR #634).
 
@@ -1334,9 +1386,21 @@ class TestIdempotencyKeyRequestFingerprint:
         false conflict on a legitimate retry.
         """
         assert _request_fingerprint(
-            "kiro_cli", "developer", None, None, None, None, False, None, None, None, None
+            "kiro_cli",
+            "developer",
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ) == _request_fingerprint(
-            "kiro_cli", "developer", None, None, None, None, False, None, None, {}, None
+            "kiro_cli", "developer", None, None, None, None, False, None, None, {}, None, None, None
         )
 
     @pytest.mark.asyncio
@@ -1430,7 +1494,19 @@ class TestIdempotencyKeyRequestFingerprint:
         # session. A retry re-sends the same None and matches; fingerprinting
         # the generated name would never match anything.
         assert mock_db_create.call_args.kwargs["request_fingerprint"] == _request_fingerprint(
-            "kiro_cli", "reviewer", None, None, None, None, False, None, None, None, None
+            "kiro_cli",
+            "reviewer",
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -2790,12 +2866,16 @@ class TestDeferredInitFailureNotification:
 
         mock_meta.return_value = {"caller_id": "super123"}
 
-        _notify_caller_of_deferred_failure(
-            "worker99", "waiting on prompt", None, delete_worker=False
-        )
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._notify_elastic_terminal_ended"
+        ) as mock_terminal_ended:
+            _notify_caller_of_deferred_failure(
+                "worker99", "waiting on prompt", None, delete_worker=False
+            )
 
         mock_create_inbox.assert_called_once()
         mock_delete.assert_not_called()
+        mock_terminal_ended.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
@@ -2832,6 +2912,75 @@ class TestDeferredInitFailureNotification:
 
         mock_create_inbox.assert_not_called()
         mock_delete.assert_called_once()
+
+    def test_broker_notification_failure_does_not_block_local_teardown(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "deadbeef")
+        monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
+        monkeypatch.setenv("CAO_ELASTIC_RELEASE_TOKEN", "release-token")
+
+        with (
+            patch.object(
+                terminal_service,
+                "get_terminal_metadata",
+                return_value={"caller_id": "super123"},
+            ),
+            patch.object(terminal_service, "create_inbox_message"),
+            patch.object(terminal_service, "delete_terminal") as mock_delete,
+            patch.object(
+                terminal_service.requests,
+                "post",
+                side_effect=terminal_service.requests.ConnectionError("broker unavailable"),
+            ),
+        ):
+            terminal_service._notify_caller_of_deferred_failure(
+                "worker99", "provider startup failed", None, delete_worker=True
+            )
+
+        mock_delete.assert_called_once_with("worker99", registry=None)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_elastic_terminal_ended")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_deferred_session_failure_reports_terminal_ended(
+        self,
+        mock_meta,
+        mock_create_inbox,
+        mock_terminal_ended,
+        mock_delete,
+        monkeypatch,
+    ):
+        """The POST /sessions deferred-init path must release its elastic lease."""
+        from cli_agent_orchestrator.services import terminal_service
+
+        async def inline_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        # Exercise the actual deferred task without leaving pytest's event-loop
+        # executor alive after this focused test.
+        monkeypatch.setattr(terminal_service.asyncio, "to_thread", inline_to_thread)
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        provider_instance = AsyncMock()
+        provider_instance.initialize.side_effect = RuntimeError("provider startup failed")
+
+        before_tasks = set(terminal_service._deferred_init_tasks)
+        terminal_service._schedule_deferred_init(
+            provider_instance,
+            "worker99",
+            "do the task",
+            OrchestrationType.ASSIGN,
+            None,
+        )
+        (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
+        await task
+
+        mock_create_inbox.assert_called_once()
+        mock_delete.assert_called_once_with("worker99", registry=None)
+        mock_terminal_ended.assert_called_once_with("worker99")
 
 
 class TestDeferredInitWaitingUserAnswerSurvival:

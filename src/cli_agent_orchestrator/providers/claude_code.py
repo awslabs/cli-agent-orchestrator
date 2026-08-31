@@ -162,6 +162,21 @@ WAITING_USER_ANSWER_PATTERN = r"↑/↓ to navigate|Enter to confirm[ \t]*·"
 PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
+# Bedrock model-upgrade nudge, e.g.
+#
+#   Newer Opus model available
+#   Currently pinned: Opus 4.6
+#   Latest available: Opus 5 (au.anthropic.claude-opus-5)
+#   Update settings to use Opus 5? Claude Code will restart to apply.
+#   ❯ 1. Yes
+#     2. No
+#
+# Shown once per tier when the pinned ANTHROPIC_*_MODEL is older than the CLI's
+# own default AND the account can actually invoke that newer model, so it is
+# specific to Bedrock deployments that pin their models — exactly what a
+# containerized fleet does. The title is matched (not the option labels) because
+# the tier name varies and up to three of these can queue up back to back.
+MODEL_UPGRADE_PROMPT_PATTERN = r"Newer \S+ model available"
 _DIALOG_BOTTOM_LINES = 15
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
@@ -571,16 +586,34 @@ class ClaudeCodeProvider(BaseProvider):
     async def _handle_startup_prompts(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
-        """Auto-accept startup prompts that may appear before the REPL is ready.
+        """Answer startup prompts that may appear before the REPL is ready.
 
-        Claude Code may show up to two prompts during startup:
+        Claude Code may show up to three prompts during startup:
 
         1. **Bypass permissions confirmation** (``--dangerously-skip-permissions``)
            – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
            The settings-based fix (``_ensure_skip_bypass_prompt_setting``) prevents
            this in most cases; this handler is a defensive fallback.
-        2. **Workspace trust dialog** – shows "Yes, I trust this folder";
-           requires ``Enter``.
+        2. **Workspace trust dialog** – shows "Yes, I trust this folder".
+           Older releases preselect "Yes"; v2.1.250 preselects "No, exit".
+           The handler moves to "Yes" only when needed, then presses ``Enter``.
+        3. **Bedrock model-upgrade nudge** – offers to repoint a pinned
+           ``ANTHROPIC_*_MODEL`` at a newer default. DECLINED with ``Esc``, and
+           this is the one prompt here that is not auto-accepted. Its default
+           selection is "1. Yes", so the blind ``Enter`` that clears the other two
+           would silently rewrite the deployment's model pins and restart the CLI
+           mid-init. Declining is also the only safe answer without asking the
+           operator: the pins may be deliberate (cost, or an account entitled to
+           4.6 but not to the newer model the probe found on some other tier),
+           and CAO cannot tell an intentional pin from a stale one. ``Esc`` maps
+           to the dialog's own cancel path, which persists the refusal in
+           ``bedrockDeclinedUpgrades``, so it is asked at most once per
+           tier-transition rather than on every launch.
+
+        Note that only the FIRST of these is prevented by config. The trust
+        dialog and the upgrade nudge are dismissed here, at the TUI, because
+        both are keyed on state this provider does not own — the trust dialog on
+        the working directory, the nudge on which models the account can invoke.
 
         Idle-gap semantics (see issue #400): a cold or containerized start can
         render these dialogs LATE and in sequence, past the old fixed ~20s
@@ -623,6 +656,13 @@ class ClaudeCodeProvider(BaseProvider):
         last_prompt_time = time.monotonic()
         any_prompt_handled = False
         bypass_accepted = False
+        trust_accepted = False
+        # Keyed on the matched title ("Newer Opus model available"), not a bool:
+        # one nudge can be shown PER TIER, so a single flag would swallow the
+        # second and third and leave init blocked behind an unanswered dialog.
+        # Keying on the title also stops the dismissed dialog's own text, which
+        # stays in the capture buffer, from being answered again forever.
+        upgrade_declined: set[str] = set()
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -649,11 +689,10 @@ class ClaudeCodeProvider(BaseProvider):
                 # Send Down arrow to move cursor to "Yes, I accept", then Enter.
                 status_monitor.notify_input_sent(self.terminal_id)
                 await asyncio.to_thread(
-                    get_backend().send_keys,
+                    get_backend().send_special_key,
                     self.session_name,
                     self.window_name,
-                    "\x1b[B",
-                    enter_count=0,
+                    "Down",
                 )
                 await asyncio.sleep(0.5)
                 status_monitor.notify_input_sent(self.terminal_id)
@@ -666,18 +705,87 @@ class ClaudeCodeProvider(BaseProvider):
                 await asyncio.sleep(1.0)
                 continue
 
-            # 2) Handle workspace trust prompt
-            if re.search(TRUST_PROMPT_PATTERN, clean_output):
+            # 2) Handle workspace trust prompt.
+            #    Guarded and `continue`d rather than returned: the trust dialog is
+            #    not necessarily the LAST one — the model-upgrade nudge below
+            #    renders after it — and returning here left that nudge sitting
+            #    unanswered until init timed out. The guard is what makes the
+            #    `continue` safe, since the accepted dialog's text stays in the
+            #    capture buffer and would otherwise be re-answered every second.
+            if not trust_accepted and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Workspace trust prompt detected, auto-accepting")
+                # Claude Code used to preselect "Yes", but v2.1.250 changed the
+                # default to "No, exit". Inspect the latest matching option line
+                # so we remain compatible with both layouts. The prompt's prior
+                # rendering can remain in scrollback, hence rfind rather than
+                # examining the first occurrence.
+                trust_pos = clean_output.rfind("Yes, I trust this folder")
+                line_start = clean_output.rfind("\n", 0, trust_pos) + 1
+                line_end = clean_output.find("\n", trust_pos)
+                if line_end == -1:
+                    line_end = len(clean_output)
+                trust_line = clean_output[line_start:line_end]
+                yes_selected = (
+                    re.search(r"[>❯]", trust_line[: trust_pos - line_start]) is not None
+                    or "No, exit" not in clean_output
+                )
+                if not yes_selected:
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    await asyncio.to_thread(
+                        get_backend().send_special_key,
+                        self.session_name,
+                        self.window_name,
+                        "Down",
+                    )
+                    await asyncio.sleep(0.5)
                 status_monitor.notify_input_sent(self.terminal_id)
                 await asyncio.to_thread(
                     get_backend().send_special_key, self.session_name, self.window_name, "Enter"
                 )
-                return
+                trust_accepted = True
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()  # reset — upgrade nudge may follow
+                await asyncio.sleep(1.0)
+                continue
 
-            # 3) Claude Code fully started — no prompts needed.
+            # 3) Decline the Bedrock model-upgrade nudge. Checked BEFORE the
+            #    banner below because this dialog renders in place of the banner,
+            #    not alongside it — the REPL only draws once it is answered.
+            #    finditer, not search: a second tier's nudge renders BELOW the
+            #    already-answered first one, which stays in the capture buffer.
+            #    re.search would keep returning that stale first title, find it
+            #    in upgrade_declined, and skip — leaving the live dialog
+            #    unanswered until init timed out. The LAST unanswered match is
+            #    taken because the live dialog is the bottom-most one.
+            title = next(
+                (
+                    m.group(0)
+                    for m in reversed(list(re.finditer(MODEL_UPGRADE_PROMPT_PATTERN, clean_output)))
+                    if m.group(0) not in upgrade_declined
+                ),
+                None,
+            )
+            if title is not None:
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info("Model upgrade nudge detected (%s), declining", title)
+                # Esc, NOT Enter: "1. Yes" is the pre-selected option, so Enter
+                # would accept the upgrade and restart the CLI. Esc is also
+                # preferred over Down+Enter because it does not depend on the
+                # option ordering staying "Yes" first.
+                status_monitor.notify_input_sent(self.terminal_id)
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Escape"
+                )
+                upgrade_declined.add(title)
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()  # reset — another tier may follow
+                await asyncio.sleep(1.0)
+                continue
+
+            # 4) Claude Code fully started — no prompts needed.
             #    The version banner is the ONLY reliable "ready" signal here: it
             #    renders only once the REPL is up and cannot appear in the echoed
             #    launch command. The old bare IDLE_PROMPT_PATTERN ("> "/"❯ ") check
@@ -959,8 +1067,15 @@ class ClaudeCodeProvider(BaseProvider):
         # trust/bypass dialog through as WAITING_USER_ANSWER.
         bottom_chrome = "\n".join(lines[-6:])
 
-        if not re.search(TRUST_PROMPT_PATTERN, bottom_region) and not re.search(
-            BYPASS_PROMPT_PATTERN, bottom_region
+        if (
+            not re.search(TRUST_PROMPT_PATTERN, bottom_region)
+            and not re.search(BYPASS_PROMPT_PATTERN, bottom_region)
+            # Same reason as trust/bypass: _handle_startup_prompts declines this
+            # one itself, so surfacing it as WAITING_USER_ANSWER would ask an
+            # operator to answer a dialog that is about to answer itself. Its
+            # footer is "Enter to confirm · Esc to cancel", which the WAITING
+            # match below would otherwise hit.
+            and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, bottom_region)
         ):
             # AskUserQuestion: "↑/↓ to navigate" in bottom chrome (last 6 lines).
             # Known residual: agent prose containing this exact string in the
@@ -1148,6 +1263,7 @@ class ClaudeCodeProvider(BaseProvider):
             re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
             and not re.search(TRUST_PROMPT_PATTERN, joined)
             and not re.search(BYPASS_PROMPT_PATTERN, joined)
+            and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, joined)
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 

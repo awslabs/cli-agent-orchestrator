@@ -138,6 +138,8 @@ provider override while keeping the same sequence.
   parallel AI-DLC intents across repositories and isolated worktrees.
 - [Tool restrictions](docs/tool-restrictions.md): roles, allowlists, and
   provider enforcement.
+- [Kubernetes deployment](examples/cao-clusters/kubernetes/eks/README.md): run a supervisor and worker fleet on
+  Amazon EKS, with shared workspace, per-pod state, and credential delivery.
 - [Updating CAO](docs/updating.md): update an installed uv tool.
 
 ### Configure and integrate

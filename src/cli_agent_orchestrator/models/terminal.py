@@ -57,6 +57,21 @@ class TerminalInputBlockedError(Exception):
     """
 
 
+class TerminalLimitError(Exception):
+    """Raised when creating a terminal would exceed this node's tracked-terminal cap.
+
+    The cap comes from ``settings_service.get_max_terminals()`` (the
+    ``CAO_MAX_TERMINALS`` env var / ``server.max_terminals`` setting; unset =
+    unlimited, preserving pre-cap behavior). It exists for the one-agent-per-pod
+    Kubernetes topology: worker pods set ``CAO_MAX_TERMINALS=1`` so each pod
+    hosts exactly one agent and a second placement is rejected loudly instead
+    of silently oversubscribing the pod. Deliberately NOT a ``ValueError``
+    subclass — the API layer maps ValueError from terminal creation to 404
+    ("session not found"), whereas a capacity rejection must surface as its own
+    status (429) so a scheduler/supervisor can retry on a different node.
+    """
+
+
 class Terminal(BaseModel):
     """Terminal model - represents a tmux window."""
 

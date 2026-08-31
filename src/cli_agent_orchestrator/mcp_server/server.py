@@ -4,15 +4,17 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
 from pydantic import Field
 
 from cli_agent_orchestrator.constants import (
+    ADVERTISED_URL_ENV,
     API_BASE_URL,
     DISCOVERY_TOOL_MARKER,
+    ELASTIC_CALLBACK_URL_ENV,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -23,6 +25,9 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
+from cli_agent_orchestrator.services.elastic_worker_gateway import (
+    elastic_worker_gateway_headers,
+)
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
@@ -32,6 +37,7 @@ from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_ME
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.utils.orchestration import (
     ENABLE_SENDER_ID_INJECTION,
+    REMOTE_CONNECT_TIMEOUT,
     _assign_impl,
     _current_terminal_id,
     _delete_terminal_impl,
@@ -233,7 +239,19 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
         return {"success": False, "error": f"Failed to retrieve skill: {str(exc)}"}
 
 
-# Shared by both handoff and assign's tool signatures below.
+# Shared field descriptions for both handoff and assign's tool signatures below.
+_target_host_field_desc = (
+    "Optional remote CAO node to place the worker on (one-agent-per-pod "
+    "cluster topologies): a DNS name (e.g. 'cao-worker-0.cao-workers'), a "
+    "'host:port' pair, or a full 'http://host:port' URL of that node's "
+    "cao-server (IPv6 literals must use the bracketed-URL form). When set, "
+    "the worker terminal is created on that node in a fresh session via its "
+    "REST API; working_directory (if given) refers to the remote filesystem. "
+    "Not combinable with use_worktree (remote nodes have no shared git "
+    "checkout to provision from — same rule for assign and handoff). Omit "
+    "for the default local placement (behavior unchanged)."
+)
+
 _model_field_desc = (
     "Optional model override for the worker agent (e.g. a concrete model name/id "
     "accepted by the resolved provider's own --model flag). Takes precedence over "
@@ -280,6 +298,7 @@ if ENABLE_WORKING_DIRECTORY:
                 "repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -336,6 +355,7 @@ if ENABLE_WORKING_DIRECTORY:
             working_directory: Optional directory path where agent should execute
             model: Optional model override (not honored by every provider)
             use_worktree: If true, isolate this handoff in its own git worktree
+            target_host: Optional remote CAO node to run the worker on
 
         Returns:
             HandoffResult with success status, message, and agent output
@@ -348,6 +368,7 @@ if ENABLE_WORKING_DIRECTORY:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
 
 else:
@@ -380,6 +401,7 @@ else:
                 "supervisor's current directory to be inside a git repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -424,6 +446,7 @@ else:
             timeout: Maximum wait time in seconds
             model: Optional model override (not honored by every provider)
             use_worktree: If true, isolate this handoff in its own git worktree
+            target_host: Optional remote CAO node to run the worker on
 
         Returns:
             HandoffResult with success status, message, and agent output
@@ -436,6 +459,7 @@ else:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
 
 
@@ -502,6 +526,10 @@ Args:
     desc += """
     model: Optional model override for the worker (not honored by every provider)
     use_worktree: If true, isolate this worker in its own git worktree
+    target_host: Optional remote CAO node to place the worker on (one-agent-per-pod
+        topologies). The worker is created on that node in a fresh session; results
+        route back automatically via send_message (requires CAO_ADVERTISED_URL on
+        this node). Not combinable with use_worktree.
 
 Returns:
     Dict with success status, worker terminal_id, and message"""
@@ -544,6 +572,7 @@ if ENABLE_WORKING_DIRECTORY:
                 "resolved working directory to be inside a git repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
         return _assign_impl(
             agent_profile,
@@ -552,6 +581,7 @@ if ENABLE_WORKING_DIRECTORY:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
 
 else:
@@ -577,6 +607,7 @@ else:
                 "supervisor's current directory to be inside a git repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
         return _assign_impl(
             agent_profile,
@@ -585,9 +616,171 @@ else:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
 
 
+def _elastic_broker_config() -> Tuple[str, str]:
+    url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    token = os.environ.get("CAO_ELASTIC_BROKER_TOKEN", "").strip()
+    if not url or not token:
+        raise ValueError(
+            "elastic workers are not configured: set CAO_ELASTIC_BROKER_URL "
+            "and CAO_ELASTIC_BROKER_TOKEN on the supervisor"
+        )
+    return url, token
+
+
+# How long the elastic path waits for a freshly leased worker to answer through
+# its Service. The broker returns a lease as soon as the Job and Service objects
+# exist, so this covers the worker's whole boot plus endpoint propagation - and it
+# is the ONE place that wait now happens, instead of once in the broker (on pod
+# readiness) and then implicitly again here (on a connect timeout, unretried).
+#
+# Generous rather than tight: the failure this replaces was a 10s connect timeout
+# on a worker that was 3 seconds from being usable, and the cost of waiting too
+# long is a slow delegation, while the cost of waiting too little is a destroyed
+# worker and a failed task. The broker's own READY_TIMEOUT (300s) remains the
+# outer bound - it settles the lease `failed` whether or not anyone is waiting.
+def _elastic_ready_wait() -> float:
+    try:
+        return max(0.0, float(os.environ.get("CAO_ELASTIC_WORKER_READY_WAIT", "120")))
+    except ValueError:
+        return 120.0
+
+
+def _release_elastic_worker(broker_url: str, broker_token: str, worker_id: str) -> bool:
+    try:
+        response = requests.delete(
+            f"{broker_url}/workers/{worker_id}",
+            headers={"X-CAO-Broker-Token": broker_token},
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+        return response.status_code < 400 or response.status_code == 404
+    except requests.RequestException as exc:
+        logger.warning("Failed to release elastic worker %s: %s", worker_id, exc)
+        return False
+
+
+@mcp.tool()
+async def assign_elastic(
+    agent_profile: str = Field(
+        description='Agent profile for the disposable worker (for example "developer")'
+    ),
+    message: str = Field(description="Task for the disposable worker"),
+    provider: Optional[str] = Field(
+        default=None,
+        description=(
+            "Provider to install in the worker. Omit to use the broker's "
+            "configured default, which is what the deployment's image actually "
+            "contains."
+        ),
+    ),
+    engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
+) -> Dict[str, Any]:
+    """Provision one Kubernetes Job and assign one task to it.
+
+    The worker must call ``complete_assignment`` exactly once after producing
+    its final result. That tool durably delivers the callback before releasing
+    this worker's Job.
+
+    A successful return means the task was PLACED, not that it finished - the
+    result arrives later through the supervisor's inbox. So a worker that dies
+    before calling ``complete_assignment`` is indistinguishable from a slow one
+    here, and nothing on this side can tell them apart. The broker resolves it:
+    it holds the lease, reaps a worker whose pod ended or whose completion never
+    arrived, and records which happened. Query ``GET /workers`` on the broker
+    when a delegation reports success and produces no artifact.
+    """
+    try:
+        callback_terminal_id = _current_terminal_id()
+        if not callback_terminal_id:
+            raise ValueError("assign_elastic must run from inside a CAO terminal")
+        broker_url, broker_token = _elastic_broker_config()
+        # `provider` is omitted rather than defaulted here on purpose. A default
+        # baked into this signature silently overrides the broker's, so a fleet
+        # whose image ships one provider would still be asked for another - and
+        # the failure names a CLI the caller never mentioned. The provider a
+        # worker can actually run is a property of the deployment, so the
+        # deployment decides it.
+        #
+        # The isinstance check is not defensive noise. Called through FastMCP,
+        # `provider` arrives resolved to a string or None; called directly - as
+        # the tests do - the unfilled default is the `FieldInfo` object itself,
+        # which a plain truthiness test would happily place into the request body.
+        payload: Dict[str, Any] = {
+            "agent_profile": agent_profile,
+            "callback_terminal_id": callback_terminal_id,
+        }
+        if isinstance(provider, str) and provider.strip():
+            payload["provider"] = provider.strip()
+        # `requests` is blocking, and this coroutine runs on the MCP server's
+        # event loop. Called once that costs nothing; called five times in one
+        # LLM turn - the fan-out this tool exists for - the awaits could not
+        # interleave, so five placements ran strictly one after another. Measured
+        # from the broker's access log: the five POSTs never overlapped, 16-17s
+        # apart, 76s from first to last, and a failed worker's DELETE landed
+        # before the next POST was even sent.
+        #
+        # to_thread moves the block off the loop so the gather actually gathers.
+        # It changes nothing for a single delegation - that call was never the
+        # latency, the worker's boot was - and the broker was always ready for it:
+        # `create_worker` is a sync `def`, so Starlette already runs it in its own
+        # threadpool worker.
+        response = await asyncio.to_thread(
+            lambda: requests.post(
+                f"{broker_url}/workers",
+                headers={"X-CAO-Broker-Token": broker_token},
+                json=payload,
+                timeout=(REMOTE_CONNECT_TIMEOUT, 360),
+            )
+        )
+        response.raise_for_status()
+        lease = response.json()
+        worker_id = str(lease["worker_id"])
+        worker_message = (
+            message + "\n\n[Elastic worker lifecycle: make every tool call you "
+            "need BEFORE you write any prose. Text that settles before your first "
+            "tool call is read as the end of your turn, and this terminal is then "
+            "killed with the task unfinished. When the task is fully complete, "
+            "call complete_assignment with your final result. Do not use "
+            "send_message for the final result; complete_assignment acknowledges "
+            "delivery before terminating this disposable worker.]"
+        )
+        # Also off the loop: _assign_impl waits for the new worker to answer and
+        # then posts the task to it, both blocking. This is the longer of the two
+        # blocks, so threading only the broker call above would have left the
+        # serialisation almost entirely in place.
+        result = await asyncio.to_thread(
+            _assign_impl,
+            agent_profile,
+            worker_message,
+            str(lease["working_directory"]),
+            engine=engine,
+            model=model,
+            target_host=str(lease["target_host"]),
+            ready_wait_seconds=_elastic_ready_wait(),
+            callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
+            remote_session_name=str(lease["session_name"]),
+        )
+        result["worker_id"] = worker_id
+        result["elastic"] = True
+        if not result.get("success"):
+            result["worker_released"] = await asyncio.to_thread(
+                _release_elastic_worker, broker_url, broker_token, worker_id
+            )
+        return result
+    except Exception as exc:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "elastic": True,
+            "message": f"Elastic assignment failed: {exc}",
+        }
+
+
+# Implementation function for send_message
 @mcp.tool()
 async def send_message(
     message: str = Field(description="Message content to send"),
@@ -616,6 +809,48 @@ async def send_message(
         Dict with success status and message details
     """
     return _send_message_impl(receiver_id, message)
+
+
+@mcp.tool()
+async def complete_assignment(
+    message: str = Field(description="Final result to deliver to the assigning supervisor"),
+) -> Dict[str, Any]:
+    """Deliver an elastic worker's final result, then release its Kubernetes Job."""
+    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
+    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
+    if not worker_id or not broker_url or not release_token:
+        return {
+            "success": False,
+            "error": "complete_assignment is only available inside an elastic worker",
+        }
+
+    delivered = _send_message_impl(None, message)
+    if not delivered.get("success"):
+        return {
+            "success": False,
+            "delivered": delivered,
+            "error": "result delivery failed; worker was not released",
+        }
+    try:
+        response = requests.post(
+            f"{broker_url}/workers/{worker_id}/complete",
+            headers={"X-CAO-Release-Token": release_token},
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "delivered": delivered,
+            "error": f"result delivered but worker release failed: {exc}",
+        }
+    return {
+        "success": True,
+        "delivered": delivered,
+        "worker_id": worker_id,
+        "release_scheduled": True,
+    }
 
 
 @mcp.tool()
@@ -696,6 +931,15 @@ def delete_terminal(
     terminal_id: str = Field(
         description="The terminal ID to delete (obtained from assign or handoff results)"
     ),
+    target_host: Optional[str] = Field(
+        default=None,
+        description=(
+            "Remote CAO node hosting the terminal (same format as assign/handoff "
+            "target_host: DNS name, host:port, or URL). Required to delete a "
+            "terminal created remotely — its record lives on that node, not "
+            "this one. Omit for local terminals (behavior unchanged)."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Delete a terminal that is no longer needed, freeing system resources.
 
@@ -704,15 +948,31 @@ def delete_terminal(
     removes the terminal record.
 
     Handoff terminals are automatically cleaned up on success — you only need
-    to call this for assign terminals.
+    to call this for assign terminals, or for a REMOTE terminal a failed
+    handoff/assign left behind on a target_host node (on CAO_MAX_TERMINALS=1
+    worker pods a leftover terminal — including one stuck in ERROR — occupies
+    the pod's only slot until deleted).
 
     Args:
         terminal_id: The terminal ID to delete
+        target_host: Remote CAO node hosting the terminal; omit for local
 
     Returns:
         Dict with success status and message
     """
-    return _delete_terminal_impl(terminal_id)
+    # Direct (non-MCP) invocation — e.g. existing unit tests calling the
+    # function positionally — receives the pydantic FieldInfo object as the
+    # default instead of None. Normalize anything that isn't a usable host
+    # string to "local", preserving the pre-target_host behavior exactly.
+    #
+    # This normalization stays in the TOOL WRAPPER rather than moving into
+    # _delete_terminal_impl with the rest of the body: the FieldInfo leak is an
+    # artifact of FastMCP's Field default, so it is server.py's problem, and
+    # _delete_terminal_impl's other caller (`cao agent cancel --delete`) passes
+    # a real Optional[str] that needs no laundering.
+    if not isinstance(target_host, str) or not target_host.strip():
+        target_host = None
+    return _delete_terminal_impl(terminal_id, target_host=target_host)
 
 
 def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
@@ -1060,19 +1320,29 @@ async def memory_store(
     Use this to persist facts, decisions, user preferences, and project conventions
     that should be available across agent sessions.
     """
+    from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, store_memory
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        memory = await service.store(
-            content=content,
-            scope=scope,
-            memory_type=memory_type,
-            key=key,
-            tags=tags or "",
-            terminal_context=terminal_context,
-        )
+        if remote_memory_url():
+            memory = await store_memory(
+                content=content,
+                scope=scope,
+                memory_type=memory_type,
+                key=key,
+                tags=tags or "",
+                terminal_context=terminal_context,
+            )
+        else:
+            memory = await MemoryService().store(
+                content=content,
+                scope=scope,
+                memory_type=memory_type,
+                key=key,
+                tags=tags or "",
+                terminal_context=terminal_context,
+            )
         return {
             "success": True,
             "key": memory.key,
@@ -1147,6 +1417,7 @@ async def memory_recall(
 
     Use this to check if relevant knowledge already exists before asking the user.
     """
+    from cli_agent_orchestrator.services.memory_gateway import recall_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
     from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
@@ -1159,17 +1430,23 @@ async def memory_recall(
         }
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        memories = await service.recall(
-            query=query,
-            scope=scope,
-            memory_type=memory_type,
-            limit=limit,
-            terminal_context=terminal_context,
-            search_mode=search_mode,
-            sort_by=sort_by,
-            include_related=bool(include_related) if isinstance(include_related, bool) else False,
+        kwargs = {
+            "query": query,
+            "scope": scope,
+            "memory_type": memory_type,
+            "limit": limit,
+            "terminal_context": terminal_context,
+            "search_mode": search_mode,
+            "sort_by": sort_by,
+            "include_related": (
+                bool(include_related) if isinstance(include_related, bool) else False
+            ),
+        }
+        memories = (
+            await recall_memory(**kwargs)
+            if remote_memory_url()
+            else await MemoryService().recall(**kwargs)
         )
         return {
             "success": True,
@@ -1207,15 +1484,23 @@ async def memory_forget(
 
     Deletes the wiki topic file and removes the entry from index.md.
     """
+    from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        deleted = await service.forget(
-            key=key,
-            scope=scope,
-            terminal_context=terminal_context,
+        deleted = (
+            await forget_memory(
+                key=key,
+                scope=scope,
+                terminal_context=terminal_context,
+            )
+            if remote_memory_url()
+            else await MemoryService().forget(
+                key=key,
+                scope=scope,
+                terminal_context=terminal_context,
+            )
         )
         return {
             "success": True,

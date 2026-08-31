@@ -181,6 +181,66 @@ class TestBm25ContentSearch:
         assert "in-scope" in keys
         assert "out-scope" not in keys
 
+    def test_unscoped_bm25_isolates_private_scope_ids(self, svc, tmp_path):
+        """BM25 must not search another session or agent's wiki files."""
+        ctx_a = {
+            "cwd": str(tmp_path / "project"),
+            "session_name": "session-a",
+            "agent_profile": "agent-a",
+        }
+        ctx_b = {
+            "cwd": str(tmp_path / "project"),
+            "session_name": "session-b",
+            "agent_profile": "agent-b",
+        }
+        for key, scope, ctx in (
+            ("session-a-key", "session", ctx_a),
+            ("session-b-key", "session", ctx_b),
+            ("agent-a-key", "agent", ctx_a),
+            ("agent-b-key", "agent", ctx_b),
+            ("global-key", "global", None),
+        ):
+            run_async(
+                svc.store(
+                    content=f"isolation-needle in {key}",
+                    key=key,
+                    scope=scope,
+                    memory_type="reference",
+                    terminal_context=ctx,
+                )
+            )
+
+        results = run_async(
+            svc.recall(
+                query="isolation-needle",
+                search_mode="bm25",
+                terminal_context=ctx_a,
+                limit=20,
+            )
+        )
+        assert {m.key for m in results} == {
+            "session-a-key",
+            "agent-a-key",
+            "global-key",
+        }
+
+        results_all = run_async(
+            svc.recall(
+                query="isolation-needle",
+                search_mode="bm25",
+                terminal_context=ctx_a,
+                scan_all=True,
+                limit=20,
+            )
+        )
+        assert {m.key for m in results_all} == {
+            "session-a-key",
+            "session-b-key",
+            "agent-a-key",
+            "agent-b-key",
+            "global-key",
+        }
+
 
 # ---------------------------------------------------------------------------
 # U6.3 — search_mode parameter
