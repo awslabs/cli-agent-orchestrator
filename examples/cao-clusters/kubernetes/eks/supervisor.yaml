@@ -41,7 +41,8 @@ spec:
               containerPort: 9889
           # Provider credentials, for a provider that authenticates with a key
           # rather than with Pod Identity (kiro-cli). Created by
-          # external-secret.yaml, which is not in the default apply.
+          # components/kiro/external-secret.yaml, which is not in the default
+          # apply.
           #
           # `optional: true` is what makes this free on the Bedrock path: that
           # Secret does not exist there, and a non-optional secretRef would hold

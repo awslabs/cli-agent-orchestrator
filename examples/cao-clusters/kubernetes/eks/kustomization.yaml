@@ -15,17 +15,16 @@ resources:
   - supervisor.yaml
   - panel.yaml
   - networkpolicy.yaml
-  # Uncomment for a provider that authenticates with a key rather than with Pod
-  # Identity (kiro-cli), and set ProviderSecretName on the infrastructure stack
-  # to create the secret and the IAM plumbing ESO reads it with. Left out of the
-  # default apply because it needs the External Secrets Operator's CRDs: on a
-  # cluster with no ESO installed, `kubectl apply -k` fails on an unknown kind
-  # before applying anything else.
+  # A provider that authenticates with a key rather than Pod Identity is selected
+  # through an optional Component, not by adding its ExternalSecret here. See
+  # components/kiro and `deploy.sh ... kiro`. Keeping the CRD out of the default
+  # resources lets Bedrock mode deploy on a cluster with no External Secrets
+  # Operator installed.
   #
-  # The supervisor and every worker already reference the Secret it produces,
-  # with `optional: true`, so uncommenting this line is the whole change on the
-  # manifest side - nothing else has to learn the credential exists.
-  # - external-secret.yaml
+  # The Component switches the supervisor profile and broker default together,
+  # removes Bedrock-only environment and egress, and adds the ExternalSecret.
+  # deploy.sh enables it in a temporary rendered copy so this file remains the
+  # canonical Bedrock default.
 
 # There is no statefulset-workers.yaml and no service-workers-headless.yaml: a
 # worker is a Job the broker mints per task, and the broker gives each one its

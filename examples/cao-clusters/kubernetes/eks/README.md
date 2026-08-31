@@ -202,6 +202,7 @@ image needed:
 docker buildx build --platform linux/arm64 \
   -f examples/cao-clusters/kubernetes/eks/Dockerfile \
   --build-arg INSTALL_KIRO_CLI=1 --build-arg INSTALL_CLAUDE_CODE=0 \
+  --build-arg CAO_PROFILE_PROVIDER=kiro_cli \
   -t "${REGISTRY}/cao-server:${TAG}" --push .
 ```
 
@@ -212,25 +213,27 @@ the image to roughly double: the archive is ~689MB for `aarch64` and installs to
 it follows the build platform and needs no change if that ever moves. The `musl` build is not a preference: the *gnu*
 archive requires glibc 2.39 and bookworm ships 2.36, so its own installer refuses
 it and points at musl, which skips the glibc check. `ARG BASE_PROVIDER_IMAGE` remains for any other provider: point it at
-an image that already carries that CLI and pass `INSTALL_CLAUDE_CODE=0`.
+an image that already carries that CLI, pass `INSTALL_CLAUDE_CODE=0`, and set
+`CAO_PROFILE_PROVIDER` to the provider name CAO uses. That last argument pins
+the image's seeded supervisor and worker profiles to the CLI the image actually
+contains instead of seeding unusable Claude profiles.
 
 *The credential.* Set `ProviderSecretName=cao/provider-credentials` on the
 infrastructure stack, which creates an empty Secrets Manager secret plus the IAM
 role and Pod Identity association the External Secrets Operator needs. Put the
-value in, install ESO, then uncomment `external-secret.yaml` in
-`kustomization.yaml`. Both the supervisor and every worker already read the
-resulting Kubernetes Secret with `envFrom` and `optional: true`, so no manifest
-learns about a new variable — whatever keys the Secrets Manager JSON holds become
-environment variables in the pods. `optional: true` is what keeps the default path
-free: on Bedrock the Secret is absent, and a required `secretRef` would hold every
-pod in `CreateContainerConfigError`. Setting `ProviderSecretName` also omits the
-Bedrock policy, role, and both agent Pod Identity associations, so only ESO
-receives AWS credentials in API-key mode.
+value and install ESO before deploying Kiro mode. Its Kustomize Component adds
+the `ExternalSecret`; both the supervisor and every worker read the resulting
+Kubernetes Secret with `envFrom` and `optional: true`, so whatever keys the
+Secrets Manager JSON holds become environment variables in the pods. Setting
+`ProviderSecretName` also omits the Bedrock policy, role, and both agent Pod
+Identity associations, so only ESO receives AWS credentials in API-key mode.
 
-*The provider name.* Set `CAO_ELASTIC_WORKER_PROVIDER` on the broker Deployment to
-match the CLI in the image. It must match: a delegation resolves the provider from
-the target's profile store, so a mismatch fails with `<cli> was not found`, naming
-a CLI the caller never asked for.
+*The provider mode.* Pass `kiro` as the third argument to `deploy.sh`. The
+Component sets the supervisor profile to `code_supervisor:kiro_cli`, sets the
+broker's worker default to `kiro_cli`, removes the Bedrock model variables and
+Pod Identity endpoint egress, and includes the credential projection. These are
+one switch because changing only the broker leaves the persistent supervisor
+trying to execute a `claude` binary the image does not contain.
 
 Whatever the provider, it has to authenticate with no human present. That is the
 constraint the whole topology imposes — pods here are disposable and nobody is at a
@@ -239,7 +242,11 @@ browser when one starts.
 ## Deploy
 
 ```bash
+# Default Claude Code on Bedrock:
 examples/cao-clusters/kubernetes/eks/deploy.sh cao-workshop "${TAG}"
+
+# Alternate image built for Kiro:
+examples/cao-clusters/kubernetes/eks/deploy.sh cao-workshop "${TAG}" kiro
 ```
 
 That is the whole deploy. Do not hand-edit the manifests — `deploy.sh` renders
@@ -253,6 +260,9 @@ is never modified and a failed run leaves nothing to clean up. It also:
 - rewrites every `newTag:` in `kustomization.yaml` to the tag you pass, and
   verifies every one of them afterwards. A no-op substitution must not be
   survivable.
+- enables `components/kiro` only when the third argument is `kiro`, and refuses
+  that mode unless the stack output confirms
+  `ProviderSecretName=cao/provider-credentials`.
 - aborts if any `<placeholder>` survives rendering. A literal `<immutable-tag>`
   in an image name otherwise surfaces ten minutes later as an
   `ImagePullBackOff`, and a literal CIDR as a policy that matches nothing.

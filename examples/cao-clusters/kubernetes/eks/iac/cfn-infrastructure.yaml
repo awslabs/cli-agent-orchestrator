@@ -178,12 +178,12 @@ Parameters:
   # from Secrets Manager and requiring the External Secrets Operator would be a
   # dependency that path never uses.
   #
-  # Set this to enable the API-key path — `cao/kiro-api-key` is the conventional
-  # value for kiro-cli — and the secret, its read policy, the ESO role and the
-  # Pod Identity association are all created. You must also add
-  # `../external-secret.yaml` to ../kustomization.yaml and install ESO in the
-  # cluster; the manifest is shipped but not applied by default because its CRDs
-  # are absent on a cluster that has no ESO.
+  # Set this to `cao/provider-credentials` to enable the API-key path; the
+  # secret, its read policy, the ESO role and the Pod Identity association are
+  # all created. Install ESO in the cluster, then select `kiro` mode in
+  # ../deploy.sh. That mode enables the component containing the ExternalSecret;
+  # it is not part of the default apply because its CRDs are absent on a cluster
+  # that has no ESO.
   ProviderSecretName:
     Type: String
     Default: ""
@@ -192,8 +192,8 @@ Parameters:
       providers that use Pod Identity (Claude Code on Bedrock). Set it to create
       the secret and the External Secrets Operator plumbing; created empty, so
       set the value before deploying the manifests. Use
-      cao/provider-credentials, which is the key in ../external-secret.yaml
-      extracts - any other value has to be changed there too.
+      cao/provider-credentials, which is the key extracted by
+      ../components/kiro/external-secret.yaml.
 
   ExternalSecretsNamespace:
     Type: String

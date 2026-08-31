@@ -27,7 +27,8 @@
 #
 #   docker build -f examples/cao-clusters/kubernetes/eks/Dockerfile \
 #     --build-arg BASE_PROVIDER_IMAGE=<image-with-kiro-cli> \
-#     --build-arg INSTALL_CLAUDE_CODE=0 .
+#     --build-arg INSTALL_CLAUDE_CODE=0 \
+#     --build-arg CAO_PROFILE_PROVIDER=<provider-name> .
 ARG BASE_PROVIDER_IMAGE=python:3.12-slim
 
 # --- Stage 1: build the pure-Python wheel -----------------------------------
@@ -105,7 +106,8 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
 # --- Provider CLI: kiro-cli (opt in) ------------------------------------------
 #
 #   docker build -f examples/cao-clusters/kubernetes/eks/Dockerfile \
-#     --build-arg INSTALL_KIRO_CLI=1 --build-arg INSTALL_CLAUDE_CODE=0 .
+#     --build-arg INSTALL_KIRO_CLI=1 --build-arg INSTALL_CLAUDE_CODE=0 \
+#     --build-arg CAO_PROFILE_PROVIDER=kiro_cli .
 #
 # Off by default because of what it costs: 722MB compressed, 1.1GB installed
 # (kiro-cli-chat alone is 943MB) against roughly 100MB for Claude Code. The node
@@ -218,24 +220,28 @@ RUN printf '{\n  "hasCompletedOnboarding": true\n}\n' > /home/cao/.claude.json \
 ENV CAO_STATE_SEED=/home/cao/cao-state-seed.tar \
     CAO_STATE_SEED_ROOT=/home/cao/.cao/state
 
-# Every built-in profile, pinned to claude_code — the only provider this image
-# contains. The broker accepts any profile name, so seeding just `developer`
-# would leave the others paying the runtime install; seeding all six costs a few
-# hundred KB. A profile the seed does not carry, or one requested for another
-# provider, still installs at start: the entrypoint matches on the resolved
-# `provider:` line, not on mere presence.
+# Every built-in profile, pinned to the provider this image contains. The
+# default remains claude_code; an alternate-provider build must set this
+# alongside the provider install args so the image never seeds profiles for a
+# CLI it does not contain. The broker accepts any profile name, so seeding just
+# `developer` would leave the others paying the runtime install; seeding all six
+# costs a few hundred KB. A profile the seed does not carry, or one requested
+# for another provider, still installs at start: the entrypoint matches on the
+# resolved `provider:` line, not on mere presence.
+ARG CAO_PROFILE_PROVIDER=claude_code
 RUN set -eux; \
     export CAO_HOME_DIR="${CAO_STATE_SEED_ROOT}"; \
     cao init; \
     for profile in code_supervisor developer memory_manager retrospector reviewer workflow_scout; do \
-        cao install "$profile" --provider claude_code; \
+        cao install "$profile" --provider "${CAO_PROFILE_PROVIDER}"; \
     done; \
     tar -cf "${CAO_STATE_SEED}" \
         -C "$(dirname "${CAO_STATE_SEED_ROOT}")" "$(basename "${CAO_STATE_SEED_ROOT}")"; \
     rm -rf "${CAO_STATE_SEED_ROOT}"; \
     # Fail the build here rather than shipping an image whose entrypoint quietly
-    # falls back to the slow path on every pod.
-    tar -tf "${CAO_STATE_SEED}" | grep -q '^state/agent-store/developer.md$'
+    # falls back to the slow path on every pod, or whose provider pin drifted.
+    tar -xOf "${CAO_STATE_SEED}" state/agent-store/developer.md \
+      | grep -qE "^provider:[[:space:]]*${CAO_PROFILE_PROVIDER}[[:space:]]*$"
 
 # ~/.cao holds SQLite state, logs, and installed profiles — mount a volume/PVC
 # here for persistence across container restarts.

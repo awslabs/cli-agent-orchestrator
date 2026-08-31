@@ -21,9 +21,10 @@
 # already holds.
 #
 # Usage:
-#   examples/cao-clusters/kubernetes/eks/deploy.sh [stack-name] [image-tag]
+#   examples/cao-clusters/kubernetes/eks/deploy.sh [stack-name] [image-tag] [mode]
 #
-# Defaults: stack cao-workshop, tag taken from kustomization.yaml.
+# Modes: bedrock (default), kiro.
+# Defaults: stack cao-workshop, tag taken from kustomization.yaml, mode bedrock.
 # Honours the usual AWS_PROFILE / AWS_REGION environment.
 #
 # Rendering happens into a temporary directory; this source directory is never
@@ -32,7 +33,19 @@
 set -euo pipefail
 
 STACK="${1:-cao-workshop}"
+MODE="${3:-bedrock}"
 K8S_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+case "$MODE" in
+  bedrock)
+    ;;
+  kiro)
+    ;;
+  *)
+    echo "error: mode must be 'bedrock' or 'kiro' (got '$MODE')" >&2
+    exit 1
+    ;;
+esac
 
 out() {
   aws cloudformation describe-stacks --stack-name "$STACK" \
@@ -58,6 +71,22 @@ HANDLE="$(out WorkspaceVolumeHandle)"
 CLUSTER="$(out ClusterName)"
 VPC_CIDR="$(out VpcCidrBlock)"
 
+# The Kiro overlay includes external-secret.yaml, whose remote key is
+# intentionally fixed to the documented name. Catch a Bedrock-mode stack, or a
+# differently named provider secret, before kubectl reaches an ExternalSecret
+# that can never become Ready.
+if [ "$MODE" = "kiro" ]; then
+  PROVIDER_SECRET="$(out ProviderSecretName)"
+  if [ -z "$PROVIDER_SECRET" ] || [ "$PROVIDER_SECRET" = "None" ]; then
+    echo "error: kiro mode requires the stack parameter ProviderSecretName=cao/provider-credentials" >&2
+    exit 1
+  fi
+  if [ "$PROVIDER_SECRET" != "cao/provider-credentials" ]; then
+    echo "error: kiro mode expects ProviderSecretName=cao/provider-credentials; stack has '$PROVIDER_SECRET'" >&2
+    exit 1
+  fi
+fi
+
 # An output that resolves to the empty string means the stack exists but is not
 # the stack these manifests expect — fail here rather than applying manifests
 # with a literal "<account-id>" in the image name, which surfaces much later as
@@ -79,6 +108,7 @@ cat <<EOF
   region      $REGION
   cluster     $CLUSTER
   vpc cidr    $VPC_CIDR
+  mode        $MODE
   images      $REPO:$TAG
               $BROKER_REPO:$TAG
               $PANEL_REPO:$TAG
@@ -88,6 +118,18 @@ EOF
 RENDER="$(mktemp -d)"
 trap 'rm -rf "$RENDER"' EXIT
 cp -R "$K8S_DIR"/. "$RENDER/"
+
+# Kustomize Components are optional overlays enabled by a parent. Keeping this
+# edit in the throwaway rendered copy means the checked-in root remains the
+# Bedrock default while kiro mode is still one deploy command, not a sequence of
+# hand-edits that can omit half the provider switch.
+if [ "$MODE" = "kiro" ]; then
+  cat >>"$RENDER/kustomization.yaml" <<'EOF'
+
+components:
+  - components/kiro
+EOF
+fi
 
 # LC_ALL=C and the -i.bak form keep this working on both GNU and BSD sed.
 find "$RENDER" -name '*.yaml' -print0 | while IFS= read -r -d '' f; do
@@ -119,10 +161,10 @@ rm -f "$RENDER/kustomization.yaml.bak"
 # above from matching - a renamed field, another sed dialect - would otherwise
 # deploy the checked-in tag while this script reported the requested one.
 #
-# EVERY newTag line is checked, not just the first. There are two images now
-# (cao-server and cao-worker-broker) and they are built from one commit by one
-# CodeBuild run, so a split tag can only mean a mistake. A `| head -1` here would
-# have reported success while the broker stayed on the checked-in tag.
+# EVERY newTag line is checked, not just the first. The server, broker, and panel
+# are built from one commit by one CodeBuild run, so a split tag can only mean a
+# mistake. A `| head -1` here would have reported success while the broker stayed
+# on the checked-in tag.
 while read -r rendered; do
   [ "$rendered" = "$TAG" ] || {
     echo "error: asked for tag '$TAG' but the manifests render '$rendered'" >&2
