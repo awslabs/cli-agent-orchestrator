@@ -6,6 +6,7 @@ Consumer: terminal.{id}.status
 import asyncio
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from itertools import groupby
 from typing import Dict, Iterator, Tuple
@@ -20,6 +21,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
+    INBOX_DISPATCH_COALESCE_WINDOW_S,
     INBOX_RECONCILE_GRACE_SECONDS,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
@@ -40,6 +42,52 @@ logger = logging.getLogger(__name__)
 # create/teardown) and the two have no reason to block each other.
 _delivery_registry_guard = threading.Lock()
 _delivery_locks: Dict[str, Tuple[threading.Lock, int]] = {}
+
+# terminal_id -> monotonic time of the last dispatch not yet confirmed by a
+# real status transition. The lock above serializes deliver_pending calls but
+# does not stop a queued caller from proceeding once it is its turn:
+# status_monitor.get_status() still returns the cached IDLE/COMPLETED from
+# before the first send, because notify_input_sent() only arms the next
+# PROCESSING detection, it does not flip the cached status itself, and the
+# real detection needs actual terminal output to run. A second caller that
+# only checks status would see the same stale ready value and dispatch its
+# own message into a terminal that has not started working on the first one
+# yet (reviewer-reproduced on #709: two IDLE checks and two sends in one
+# cycle). This marker closes that window: it is set right after a successful
+# send and normally cleared the instant InboxService.run() observes the next
+# status event for that terminal. INBOX_DISPATCH_COALESCE_WINDOW_S is only the
+# fallback for a terminal that stops producing status transitions entirely
+# after the dispatch, so this can never wedge deliver_pending shut against the
+# reconcile sweep the way an un-expiring flag would.
+_dispatch_active_guard = threading.Lock()
+_dispatch_active: Dict[str, float] = {}
+
+
+def _clear_dispatch_active(terminal_id: str) -> None:
+    """Drop the busy marker: the real status pipeline has moved past the
+    cached ready value that authorized the last dispatch."""
+    with _dispatch_active_guard:
+        _dispatch_active.pop(terminal_id, None)
+
+
+def _is_dispatch_active(terminal_id: str) -> bool:
+    """True while a dispatch for this terminal is still within its coalescing
+    window and no later status event has cleared it. Expires stale entries in
+    place so a terminal that never produces another status transition does
+    not stay wedged shut forever."""
+    with _dispatch_active_guard:
+        dispatched_at = _dispatch_active.get(terminal_id)
+        if dispatched_at is None:
+            return False
+        if time.monotonic() - dispatched_at < INBOX_DISPATCH_COALESCE_WINDOW_S:
+            return True
+        del _dispatch_active[terminal_id]
+        return False
+
+
+def _mark_dispatch_active(terminal_id: str) -> None:
+    with _dispatch_active_guard:
+        _dispatch_active[terminal_id] = time.monotonic()
 
 
 @contextmanager
@@ -80,8 +128,15 @@ class InboxService:
             try:
                 event = await queue.get()
                 status_value = event["data"]["status"]
+                terminal_id = terminal_id_from_topic(event["topic"])
+                # Any published status event means _apply_detection ran a genuine
+                # transition for this terminal (it dedupes no-op repeats), so the
+                # cached value a concurrent deliver_pending call would have seen is
+                # now stale. Clear the busy marker before deciding whether to
+                # deliver, so a real ready event right behind a dispatch is never
+                # starved by its own dispatch (#709).
+                _clear_dispatch_active(terminal_id)
                 if status_value in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
-                    terminal_id = terminal_id_from_topic(event["topic"])
                     # deliver_pending does blocking DB + tmux I/O. Offload it to a
                     # worker thread so this consumer keeps yielding to the event loop
                     # (StatusMonitor/LogWriter must not be starved — see the threading
@@ -110,6 +165,16 @@ class InboxService:
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
         with _terminal_delivery_lock(terminal_id):
+            if _is_dispatch_active(terminal_id):
+                # A prior dispatch for this terminal has not yet been confirmed
+                # by a real status transition (#709): the lock only serializes
+                # this call after that one, it does not prove the terminal has
+                # actually started working on the first message. Coalesce
+                # instead of consuming another row into the same stale ready
+                # window; the still-PENDING message is picked up by the next
+                # genuine status event or the reconcile sweep.
+                return
+
             limit = num_messages if num_messages > 0 else 100
             messages = get_pending_messages(terminal_id, limit=limit)
             if not messages:
@@ -159,6 +224,11 @@ class InboxService:
                             orchestration_type=OrchestrationType.SEND_MESSAGE,
                         )
                     logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                    # Mark busy (#709): the dispatch went through, but the cached
+                    # status will not reflect it until the real pipeline detects
+                    # the terminal's own output, so a concurrent or immediately
+                    # following call must not read the still-stale ready status.
+                    _mark_dispatch_active(terminal_id)
                 except TerminalNotFoundError as e:
                     # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                     # for this window). Treat as transient: reset to PENDING so the

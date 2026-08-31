@@ -297,6 +297,15 @@ INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
 # and missed.
 INBOX_RECONCILE_GRACE_SECONDS = 30
 
+# Upper bound on how long InboxService treats a terminal as "just dispatched
+# to, real status not confirmed yet" (#709). Normally cleared the moment the
+# next status event for that terminal arrives (real detection catches up in
+# well under a second); this is only the fallback for a terminal that stops
+# producing any status transition after the dispatch, so the busy marker
+# cannot wedge a terminal shut against the reconcile sweep above. Deliberately
+# far below INBOX_RECONCILE_GRACE_SECONDS so it never masks that safety net.
+INBOX_DISPATCH_COALESCE_WINDOW_S = 5
+
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================

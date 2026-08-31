@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+import cli_agent_orchestrator.services.inbox_service as inbox_service_module
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import InboxModel
@@ -15,6 +16,18 @@ from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import InboxService
+
+
+@pytest.fixture(autouse=True)
+def _reset_dispatch_active():
+    """_dispatch_active (#709 coalescing) is module-level state keyed by
+    terminal_id and persists until a later status event clears it. Tests
+    across this file reuse the same terminal ids (e.g. "term-1", "t1"), so
+    without a reset a dispatch marked active by one test would make an
+    unrelated later test's deliver_pending call coalesce instead of send."""
+    inbox_service_module._dispatch_active.clear()
+    yield
+    inbox_service_module._dispatch_active.clear()
 
 
 def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):
@@ -241,7 +254,18 @@ class TestConcurrentDeliverySerialization:
     """The atomic claim (#406) stops two callers from claiming the same row,
     but not from claiming two DIFFERENT rows and then both calling
     send_input at once, interleaving their tmux paste/delay/Enter sequences
-    (reviewer-reproduced race on #709)."""
+    (reviewer-reproduced race on #709, first pass).
+
+    The per-terminal lock added for that fixes the byte-level interleaving,
+    but a queued contender still ran the full delivery the instant it got the
+    lock: status_monitor.get_status() keeps returning the cached IDLE from
+    before the first send until the real pipeline observes actual terminal
+    output, so the second caller saw the same stale ready value and dispatched
+    its own message into a terminal that had not started on the first one yet
+    (reviewer-reproduced second pass: two IDLE checks, paste:first, enter:first,
+    paste:second, enter:second, both rows DELIVERED in one IDLE cycle). The
+    tests below cover the coalescing fix for that.
+    """
 
     def test_two_concurrent_deliveries_to_same_terminal_never_overlap(self, isolated_memory_db):
         with database.SessionLocal() as seed:
@@ -288,9 +312,83 @@ class TestConcurrentDeliverySerialization:
             for t in threads:
                 t.join()
 
-        assert len(intervals) == 2
-        (start_1, end_1), (start_2, end_2) = sorted(intervals)
-        assert end_1 <= start_2, f"send_input calls overlapped: {intervals}"
+        # Exactly one dispatch: the queued contender coalesces instead of
+        # sending into the same still-cached IDLE status the first caller
+        # already used (#709, second review pass). The prior version of this
+        # test asserted len(intervals) == 2, which is exactly the bug the
+        # reviewer flagged: it codified "both messages get sent" as correct.
+        assert len(intervals) == 1, f"expected exactly one dispatch, got {intervals}"
+
+        with database.SessionLocal() as check:
+            statuses = sorted(
+                m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
+            )
+        # One row delivered, the other left PENDING for a later ready event
+        # rather than being claimed and sent alongside it.
+        assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.PENDING.value])
+
+    def test_coalesced_message_delivers_on_next_status_event(self, isolated_memory_db):
+        """The row left PENDING by coalescing is not stuck forever: once the
+        real pipeline reports the next status event for the terminal,
+        InboxService.run() clears the busy marker (see TestRun) and a later
+        IDLE-triggered deliver_pending call sends the coalesced message."""
+        with database.SessionLocal() as seed:
+            seed.add_all(
+                [
+                    InboxModel(
+                        sender_id="s",
+                        receiver_id="term-1",
+                        message=f"m{i}",
+                        status=MessageStatus.PENDING.value,
+                        created_at=datetime.now(),
+                    )
+                    for i in range(2)
+                ]
+            )
+            seed.commit()
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
+        ):
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            svc = InboxService()
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+
+            # Still within the same stale-IDLE window: coalesces, does not
+            # send a second message.
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+
+            # A later status event for the terminal (any value: run() clears
+            # the marker before deciding whether to deliver) proves the real
+            # pipeline moved past the cached status the first send used.
+            inbox_service_module._clear_dispatch_active("term-1")
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 2
+
+        with database.SessionLocal() as check:
+            statuses = sorted(
+                m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
+            )
+        assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.DELIVERED.value])
+
+    def test_dispatch_marker_expires_after_coalesce_window(self):
+        """Fallback for a terminal that never produces another status
+        transition after the dispatch: the marker must not wedge
+        deliver_pending shut forever, or it would also block the reconcile
+        sweep (#131) that exists specifically to un-stick exactly that case."""
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.INBOX_DISPATCH_COALESCE_WINDOW_S",
+            0.01,
+        ):
+            inbox_service_module._mark_dispatch_active("term-1")
+            assert inbox_service_module._is_dispatch_active("term-1") is True
+            time.sleep(0.02)
+            assert inbox_service_module._is_dispatch_active("term-1") is False
 
 
 class TestEagerInboxDelivery:
@@ -601,6 +699,38 @@ class TestRun:
                 pass
 
         svc.deliver_pending.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_processing_event_clears_dispatch_active(self):
+        """A PROCESSING event does not trigger delivery, but it is exactly the
+        real pipeline catching up on a prior dispatch (#709): it must still
+        clear the busy marker so the terminal is not coalescing against a
+        cached status that has already moved on."""
+        inbox_service_module._mark_dispatch_active("abc123")
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.PROCESSING.value},
+            }
+        )
+
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
+
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert inbox_service_module._is_dispatch_active("abc123") is False
 
     @pytest.mark.asyncio
     async def test_threads_registry_to_delivery(self):
