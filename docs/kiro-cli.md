@@ -27,7 +27,7 @@ kiro-cli --version
 cao-server
 
 # Launch a Kiro CLI-backed session (agent profile is required)
-cao launch --agents developer --provider kiro_cli
+cao launch --agents developer --provider kiro_cli --engine v2
 ```
 
 Via HTTP API:
@@ -37,6 +37,10 @@ curl -X POST "http://localhost:9889/sessions?provider=kiro_cli&agent_profile=dev
 ```
 
 **Note**: Kiro CLI requires an agent profile — it cannot be launched without one.
+
+`--engine v2` is explicit but optional because v2 is the default. `--engine kas`
+is an opt-in Phase 0 selection; CAO capability-probes it and currently rejects it
+before terminal allocation rather than claiming runtime KAS support.
 
 ## Features
 
@@ -117,13 +121,15 @@ The profile name determines the prompt pattern used for status detection. Built-
 
 ### Launch Command
 
-The provider launches using kiro-cli's default UI, with automatic `--legacy-ui` fallback:
+The provider launches using kiro-cli's default UI:
 
 ```
-kiro-cli chat --agent developer
+kiro-cli chat --agent-engine v2 --agent developer
 ```
 
-The provider auto-detects whether the terminal is in legacy or TUI mode and uses the appropriate detection patterns. If initialization times out, the provider automatically exits and retries with `--legacy-ui`. Both TUI and legacy detection patterns are fully supported.
+The provider auto-detects whether the terminal is in legacy or TUI mode and uses the appropriate detection patterns, so both sets of patterns remain supported (a wrapper script may still put the terminal in legacy mode).
+
+**CAO never passes `--legacy-ui` itself, and there is no legacy-UI retry on timeout.** The flag is mutually exclusive with `--agent-engine=v2` — kiro-cli exits with `Conflicting options: --legacy-ui cannot be used with --agent-engine=v2` — and on its own it implicitly selects the **v1 engine, which exposes no MCP tools to the model**. Because CAO's orchestration surface (`assign`, `handoff`, `report_outcome`, …) is delivered entirely over MCP, a v1 launch produces an agent that starts cleanly and then cannot orchestrate at all. The failure is silent: the MCP server still boots and logs `✓ cao-mcp-server loaded`, while every one of its tools is missing from the agent's tool list. A startup timeout therefore raises instead of retrying.
 
 ## Implementation Notes
 
@@ -188,14 +194,20 @@ uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k KiroCli -o 
 4. **Prompt Pattern Not Matching**:
    - The provider supports both legacy (`[name] >`) and new TUI (`ask a question, or describe a task`) formats
    - TUI mode is the default; the provider auto-detects which format is active
-   - If you need legacy mode, add `--legacy-ui` via a wrapper script
    - Check with: `kiro-cli chat --agent your_profile`
+   - Do **not** add `--legacy-ui` via a wrapper script to work around a detection problem: it drops kiro to the v1 engine, which serves no MCP tools, so the agent will start but be unable to `assign`/`handoff`/`report_outcome`
 
 5. **JSON-Only Agent Profiles (AIM-Installed)**:
    - Agents installed via AIM (Agent Install Manager) may only have `.json` profiles (e.g., `~/.kiro/agents/librarian/agent-spec.json`)
    - CAO's `load_agent_profile()` primarily scans for `.md` files
    - If the agent is not found, CAO gracefully falls back — kiro-cli resolves `.json` profiles natively
    - As a workaround, you can create a stub `.md` file alongside the `.json` profile
+
+6. **Agent Reports "No Such Tool" for MCP Tools**:
+   - Symptom: startup logs show `✓ cao-mcp-server loaded in N s`, but the agent says it has no `assign`/`handoff`/`report_outcome` tool
+   - Cause: the session is running the **v1 agent engine**, which does not expose MCP tools. Almost always because `--legacy-ui` reached the command line (it implies v1), e.g. via a wrapper script
+   - Check: `kiro-cli mcp list` from inside the session — `cao-mcp-server` will be absent from the enabled servers
+   - Fix: remove `--legacy-ui`; CAO pins `--agent-engine v2` on its own
 
 ## kiro-cli 2.11+ Notes
 

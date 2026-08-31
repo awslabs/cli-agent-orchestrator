@@ -1,6 +1,15 @@
 ---
 name: stepfunction-agent
 description: Trigger and monitor AWS Step Functions executions
+tags:
+  - aws
+  - stepfunctions
+  - state-machine
+  - workflow
+  - execution
+capabilities:
+  - "start Step Functions state machine executions"
+  - "poll execution status until completion"
 allowedTools:
   - execute_bash
   - fs_read

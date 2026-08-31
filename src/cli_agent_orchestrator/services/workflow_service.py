@@ -66,7 +66,35 @@ from cli_agent_orchestrator.services.step_output_store import (
     step_output_store,
 )
 
+# RE-EXPORT, not a use (issue #583, unit ``workflow-errors``, BR-2/INV-5). ADR-583-9 MOVED
+# these two exceptions to the ``workflow_errors`` leaf so ``workflow_journal`` can import them
+# at module level instead of inside ``lookup_replay`` — the function-local import there was a
+# workaround for a cycle with THIS module. A move carries a compatibility obligation a
+# creation does not, and this one is verified rather than defensive:
+# ``test_script_journal_extension.py`` imports ``ReplayDivergenceError`` from here, so
+# dropping the rebind would fail that module AT COLLECTION, taking its whole file down.
+#
+# The redundant ``as`` aliases are the explicit re-export form (PEP 484): they say "this name
+# is deliberately part of this module's surface" to a reader and to a type checker, rather
+# than leaving the intent to be inferred from an import nothing in this file uses. There is no
+# Ruff in this repository, so nothing would have flagged it either way — which is the point;
+# relying on the absence of a checker is not the same as saying what you mean.
+#
+# ``StaleGenerationError`` deliberately did NOT move (BR-7): it is raised inside this module,
+# so no cycle involves it, and breaking a cycle is the leaf's only warrant.
+from cli_agent_orchestrator.services.workflow_errors import (
+    RecoveryDecisionRequired as RecoveryDecisionRequired,
+)
+from cli_agent_orchestrator.services.workflow_errors import (
+    ReplayDivergenceError as ReplayDivergenceError,
+)
+
 logger = logging.getLogger(__name__)
+
+# Event record format version stamped on every emitted ``workflow_run_event`` row
+# (FR-1.1). Bumped when the event field set changes so a reader can evolve without
+# breaking on an older-format record. U2 emits version 1.
+EVENT_SCHEMA_VERSION = 1
 
 
 class WorkflowEngineError(Exception):
@@ -112,15 +140,6 @@ class StaleGenerationError(ValueError):
     """
 
 
-class ReplayDivergenceError(Exception):
-    """The reserved replay lookup found a fingerprint mismatch (A2, DR-4).
-
-    U3 addition (issue #312, script-tier journal extension, C3). The current
-    run-step route does not call ``lookup_replay``, so this exception is not
-    mapped at an HTTP boundary or surfaced by script resume today.
-    """
-
-
 # ---------------------------------------------------------------------------
 # In-memory run aggregate (engine-internal; never crosses the HTTP seam)
 # ---------------------------------------------------------------------------
@@ -139,6 +158,19 @@ class StepRunState:
     output: Optional[StepOutputRecord] = None
     terminal_id: Optional[str] = None
     error: Optional[str] = None
+    # In-memory carrier for the step's ``v2`` call fingerprint (issue #583, unit
+    # ``settlement-rewire``, BR-2/TD-3). ``run_agent_step`` COMPUTES the value in the one
+    # window BR-5 permits — after working-directory resolution, before terminal creation —
+    # and cannot publish it itself: this module imports ``run_agent_step``, so the reverse
+    # import would be circular. It therefore travels as the terminal-ready hook's second
+    # argument and is published here by ``script_runner``'s hook closure, beside the
+    # ``terminal_id`` that closure already writes.
+    #
+    # IN-MEMORY ONLY — no schema change, no migration. The DURABLE
+    # ``workflow_run_step.call_fingerprint`` column already exists and is
+    # ``workflow_journal.begin_step``'s to write (unit 6 BR-7/BR-9); this field only carries
+    # the value between two callbacks inside one process.
+    call_fingerprint: Optional[str] = None
     which_guard_fired: Optional[str] = None  # RESERVED (N8) — always None in MVP
     iterations_run: Optional[int] = None  # RESERVED (N8) — always None in MVP
 
@@ -157,6 +189,12 @@ class RunRecord:
     step_states: Dict[str, StepRunState] = field(default_factory=dict)
     started_at: str = ""
     finished_at: Optional[str] = None
+    # Per-run event sequence counter (U2, issue #504). Additive in-memory-only
+    # field — NOT journaled directly as a column; it is the allocator for the
+    # ``workflow_run_event.seq`` ordering key. Advanced by ``_next_event_seq`` at
+    # each emission and re-seeded on a rebuild to
+    # ``max(persisted_high_water, max_event_seq)`` so a resume never reuses a slot.
+    event_seq: int = 0
     # Set by cancel_run to interrupt the CURRENTLY in-flight step wait (issue
     # #409b). Without it, cancel was only observed at the NEXT step boundary — so
     # exactly the runs hung inside a long/never-settling step wait (the codex-IDLE
@@ -259,8 +297,17 @@ def _journal_insert_run(record: RunRecord) -> None:
         logger.warning("journal: insert_run for '%s' failed (run continues): %s", record.run_id, e)
 
 
-def _journal_step(record: RunRecord, step_id: str) -> None:
-    """Best-effort UPDATE of one step's durable state from the in-memory record."""
+def _journal_step(record: RunRecord, step_id: str, error_kind: Optional[str] = None) -> None:
+    """Best-effort UPDATE of one step's durable state from the in-memory record.
+
+    U2 (issue #504) adds the optional ``error_kind`` param (default ``None``):
+    on a failure transition (``step.attempt.failed`` / ``step.failed``) the engine
+    passes the ``StepExecutionError.kind`` so the additive
+    ``workflow_run_step.error_kind`` column (U1) carries the structured kind — a
+    post-restart cold read then surfaces it with no event replay (BR-6). Every
+    non-failure call keeps the default ``None`` (writes NULL), which also clears a
+    stale kind when a retried step later settles, so the projection stays honest.
+    """
     st = record.step_states[step_id]
     try:
         workflow_journal.update_step(
@@ -271,6 +318,7 @@ def _journal_step(record: RunRecord, step_id: str) -> None:
             updated_at=_now(),
             output_json=_output_json(st.output),
             error=st.error,
+            error_kind=error_kind,
         )
     except (
         Exception
@@ -302,7 +350,7 @@ def _journal_run_state(record: RunRecord) -> None:
         )
 
 
-async def _ajournal(fn: Any, *args: Any) -> None:
+async def _ajournal(fn: Any, *args: Any, **kwargs: Any) -> None:
     """Run a sync best-effort journal helper off the event loop.
 
     The journal helpers do blocking sqlite3 I/O; from async engine code they must
@@ -310,8 +358,100 @@ async def _ajournal(fn: Any, *args: Any) -> None:
     so write ordering is preserved; the no-raise promise holds because the
     try/except lives inside the sync helper itself. Sync callers (the
     ``get_run_status`` rebuild path) keep calling the helpers directly.
+
+    ``**kwargs`` are forwarded to the helper (additive for U2's ``_journal_event``,
+    whose ``append_event`` write carries keyword-only fields); the existing
+    positional-only callers are unaffected.
     """
-    await asyncio.to_thread(fn, *args)
+    await asyncio.to_thread(fn, *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# U2 — event emission into the durable event log (issue #504, best-effort, BR-2)
+# ---------------------------------------------------------------------------
+# The engine already write-through-projects each transition to the run/step tables
+# (above). U2 ADDS a second, best-effort emission ALONGSIDE those projections at
+# each transition site: one immutable ``workflow_run_event`` row per transition.
+# The two writes here (high-water then append) are wrapped so neither raises into
+# ``_drive`` (FR-3.2 / BR-2) — an event-append failure degrades only the forensic
+# timeline for that run, never the run itself. ``seq`` is allocated in-memory
+# BEFORE either write, so a swallowed append leaves a permanent, declared gap in
+# the sequence — never a renumber (BR-1). Every caller mutates the in-memory
+# ``RunRecord`` FIRST, then emits (in-memory first, BR-1), so the live-read floor
+# never regresses.
+
+
+def _next_event_seq(record: RunRecord) -> int:
+    """Allocate the next per-run event ``seq`` from the in-memory counter (U1 Algorithm 1).
+
+    Advances ``record.event_seq`` and returns it. Side-effect-free w.r.t. the DB:
+    the counter moves BEFORE any durable write, so a swallowed append leaves a
+    permanent hole in the sequence (a declared gap on read), never a renumber
+    (BR-1). Monotonic within a process; re-seeded across a restart by the rebuild
+    to resume strictly above the recovered high-water.
+    """
+    record.event_seq += 1
+    return record.event_seq
+
+
+async def _journal_event(
+    record: RunRecord,
+    event_type: str,
+    *,
+    step_id: Optional[str] = None,
+    **fields: Any,
+) -> None:
+    """Emit one durable ``workflow_run_event`` for a drive-loop transition (U2).
+
+    Allocates the per-run ``seq``, then persists the high-water BEFORE the append
+    so the common single-fault case still records the allocated slot durably (a
+    rebuild resumes strictly above it, BR-3). Both writes go off the loop through
+    the sequential ``_ajournal(asyncio.to_thread)`` path so per-run event order
+    matches transition order (BR-3). Each write is wrapped best-effort: a raise is
+    logged (WARNING for both — losing the append loses journal CONTENT and is the
+    more consequential of the two) and NEVER propagated
+    into ``_drive`` (FR-3.2 / BR-2), matching the swallow posture of the
+    ``_journal_*`` write-through helpers. ``iteration`` / ``which_guard_fired`` are
+    left unset (NULL, reserved, FR-1.5).
+    """
+    seq = _next_event_seq(record)
+    try:
+        await _ajournal(workflow_journal.persist_high_water, record.run_id, seq)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — event high-water write is best-effort; must NOT raise into _drive (BR-2)
+        logger.warning(
+            "journal: event high-water write for '%s' seq %d failed "
+            "(event durability degraded): %s",
+            record.run_id,
+            seq,
+            e,
+        )
+    try:
+        await _ajournal(
+            workflow_journal.append_event,
+            record.run_id,
+            seq,
+            event_type,
+            event_schema_version=EVENT_SCHEMA_VERSION,
+            ts=_now(),
+            step_id=step_id,
+            **fields,
+        )
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — event append is best-effort; a lost event leaves a declared gap, never raises (BR-2)
+        # WARNING, not DEBUG: losing an actual event is the more consequential
+        # loss of the two best-effort writes on this path (the high-water write
+        # ABOVE degrades durability metadata; this loses journal CONTENT and
+        # punches a hole the reader must declare as a gap).
+        logger.warning(
+            "journal: append_event '%s' seq %d (%s) failed: %s",
+            record.run_id,
+            seq,
+            event_type,
+            e,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +659,17 @@ async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> S
 
     if not st.reprompted:
         st.reprompted = True
+        # U2 emission (BR-1, after the in-memory reprompted mutation): the one
+        # corrective reprompt is being spent for this step.
+        await _journal_event(
+            record,
+            "step.reprompted",
+            step_id=step.id,
+            terminal_id=st.terminal_id,
+            provider=step.provider,
+            agent_profile=step.agent,
+            reason="invalid_or_missing_output",
+        )
         # Re-run on a FRESH terminal with a corrective prompt. A crash here is a
         # run-failure: let the StepExecutionError propagate so the OUTER loop
         # consumes an attempt (Q6=A / Trace C).
@@ -528,6 +679,7 @@ async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> S
             prompt=_reprompt_prompt(step),
             teardown=True,
             timeout=WORKFLOW_STEP_TIMEOUT,
+            engine=step.engine,
             env_vars={
                 "CAO_WORKFLOW_RUN_ID": record.run_id,
                 "CAO_WORKFLOW_STEP_ID": step.id,
@@ -566,6 +718,19 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
     # Awaited sequentially off the loop (blocking sqlite must not stall the engine).
     await _ajournal(_journal_step, record, step.id)
     await _ajournal(_journal_current_step, record)
+    # U2 emission (BR-1, after the in-memory RUNNING mutation): the step went live.
+    await _journal_event(
+        record,
+        "step.started",
+        step_id=step.id,
+        state=st.state.value,
+        provider=step.provider,
+        agent_profile=step.agent,
+    )
+
+    # Track the last StepExecutionError.kind so the terminal step.failed event +
+    # the projection write carry the structured error kind (BR-6).
+    last_error_kind: Optional[str] = None
 
     # OUTER: run-failure retry loop. attempts range 1..n_retries+1.
     for attempt in range(1, n_retries + 2):
@@ -573,6 +738,15 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             return
         st.attempts = attempt
         st.error = None
+        # U2 emission: this attempt is starting (attempt number in fields).
+        await _journal_event(
+            record,
+            "step.attempt.started",
+            step_id=step.id,
+            attempt=attempt,
+            provider=step.provider,
+            agent_profile=step.agent,
+        )
         prompt = _substitute(step.prompt, record)  # §4 templating
         try:
             result = await run_agent_step(
@@ -581,6 +755,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 prompt=prompt,
                 teardown=True,
                 timeout=WORKFLOW_STEP_TIMEOUT,
+                engine=step.engine,
                 env_vars={
                     "CAO_WORKFLOW_RUN_ID": record.run_id,
                     "CAO_WORKFLOW_STEP_ID": step.id,
@@ -588,6 +763,16 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 cancel_event=record.cancel_event,
             )
             st.terminal_id = result.terminal_id
+            # U2 emission: a terminal exists for this step (after the id is bound).
+            await _journal_event(
+                record,
+                "terminal.created",
+                step_id=step.id,
+                attempt=attempt,
+                terminal_id=result.terminal_id,
+                provider=step.provider,
+                agent_profile=step.agent,
+            )
             # Resolve the structured return INSIDE the try so a crash during the
             # reprompt (§3 re-raises StepExecutionError) is caught below and
             # consumes an attempt (Q6=A, Trace C).
@@ -604,6 +789,17 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 st.terminal_id = exc.terminal_id
             st.state = StepState.SKIPPED
             await _ajournal(_journal_step, record, step.id)
+            # U2 emission (BR-7): a cancellation settles the step SKIPPED — NEVER a
+            # failure event. The run converges CANCELLED at the drive-loop finalize.
+            await _journal_event(
+                record,
+                "step.skipped",
+                step_id=step.id,
+                attempt=attempt,
+                state=st.state.value,
+                terminal_id=st.terminal_id,
+                reason="cancelled",
+            )
             logger.info(
                 "run '%s' step '%s' wait interrupted by cancel; converging CANCELLED",
                 record.run_id,
@@ -612,19 +808,89 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             return
         except StepExecutionError as exc:
             st.error = str(exc)
+            last_error_kind = exc.kind
             if exc.terminal_id is not None:
                 st.terminal_id = exc.terminal_id
+            # BR-6: persist the structured error kind onto the step projection now
+            # (still RUNNING between retries) so a cold read mid-retry surfaces it
+            # without event replay; cleared when the step later settles COMPLETED.
+            await _ajournal(_journal_step, record, step.id, exc.kind)
+            # U2 emission: this attempt failed (error_kind distinguishes a crash
+            # from a timeout, FR-1.2 / BR-6).
+            await _journal_event(
+                record,
+                "step.attempt.failed",
+                step_id=step.id,
+                attempt=attempt,
+                state=st.state.value,
+                error_kind=exc.kind,
+                terminal_id=exc.terminal_id,
+                provider=step.provider,
+                agent_profile=step.agent,
+            )
             continue  # consume an attempt, retry the same prompt
         # Settled (COMPLETED or COMPLETED_UNVALIDATED) — neither is a run-failure.
         st.state = outcome
-        # §1: persist settled state + output + attempts
+        # §1: persist settled state + output + attempts (error_kind cleared to NULL).
         await _ajournal(_journal_step, record, step.id)
+        # U2 emission: a validated/collected output was received (validation_result
+        # distinguishes valid from invalid); then the step settled.
+        if st.output is not None:
+            # ``output_ref`` carries a REFERENCE to the step's output, never the
+            # output itself: the compare diff (a_refs/b_refs) and the diagnostic
+            # bundle's references.artifacts are both documented as
+            # reference-level. output_reference() returns a content digest
+            # (``sha256:<16 hex>``) — stable, so compare still detects "this step
+            # produced something different", but revealing nothing and fixed-size
+            # regardless of output size.
+            #
+            # The output TEXT is NOT stored here. It reaches an operator only
+            # through the diagnostic bundle's capture-gated ``excerpts`` section,
+            # which re-reads the capture setting at export time — so turning
+            # capture off actually stops payloads from shipping, instead of
+            # leaving previously-written ones embedded in a "references" field.
+            # Imported lazily inside the function to match the module's other
+            # in-function imports and avoid an import cycle.
+            from cli_agent_orchestrator.services import workflow_retention
+
+            await _journal_event(
+                record,
+                "step.output.received",
+                step_id=step.id,
+                attempt=attempt,
+                validation_result="valid" if st.output.validated else "invalid",
+                terminal_id=st.terminal_id,
+                output_ref=workflow_retention.output_reference(_output_json(st.output)),
+            )
+        await _journal_event(
+            record,
+            "step.completed",
+            step_id=step.id,
+            attempt=attempt,
+            state=st.state.value,
+            terminal_id=st.terminal_id,
+            provider=step.provider,
+            agent_profile=step.agent,
+        )
         return
 
     # Attempts exhausted: every attempt raised StepExecutionError.
     st.state = StepState.FAILED
-    # §1: persist FAILED state + last error + attempts
-    await _ajournal(_journal_step, record, step.id)
+    # §1: persist FAILED state + last error + attempts + the structured error kind
+    # (BR-6, so a cold read surfaces the kind with no event replay).
+    await _ajournal(_journal_step, record, step.id, last_error_kind)
+    # U2 emission: the step is terminally FAILED (carries the last error kind).
+    await _journal_event(
+        record,
+        "step.failed",
+        step_id=step.id,
+        attempt=st.attempts,
+        state=st.state.value,
+        error_kind=last_error_kind,
+        terminal_id=st.terminal_id,
+        provider=step.provider,
+        agent_profile=step.agent,
+    )
     if (step.on_failure or "halt") == "halt":
         # Engine halts; start_run skips the remaining steps (§1). on_failure ==
         # "continue" leaves the run RUNNING and sequencing continues.
@@ -643,6 +909,15 @@ async def _skip_remaining(record: RunRecord, order: List[WorkflowStep], from_ind
         if st.state == StepState.PENDING:
             st.state = StepState.SKIPPED
             await _ajournal(_journal_step, record, step.id)  # §1: persist the skip
+            # U2 emission (BR-1, after the in-memory skip): the halt/cancel reason
+            # distinguishes a halted-successor skip from a cancelled-remainder skip.
+            await _journal_event(
+                record,
+                "step.skipped",
+                step_id=step.id,
+                state=st.state.value,
+                reason=("cancelled" if record.cancelled else "upstream_halt"),
+            )
 
 
 def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
@@ -716,6 +991,12 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
         record.finished_at = _now()
         # Persist the terminal FAILED state (best-effort) before re-raising (§1).
         await _ajournal(_journal_current_step, record)
+        # U2 emission (BR-1, after the in-memory FAILED settle): an engine-internal
+        # invariant violation faulted the run (error_kind "error", not a step
+        # timeout). Emitted before the raise so the forensic timeline records it.
+        # Event BEFORE state, for the same trailing-gap reason as the finalize path
+        # below — see the ORDER IS LOAD-BEARING comment there.
+        await _journal_event(record, "run.failed", state=record.state.value, error_kind="error")
         await _ajournal(_journal_run_state, record)
         logger.error("drive: run '%s' failed with an engine error", record.run_id)
         raise
@@ -732,8 +1013,33 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
         record.state = RunState.COMPLETED
     record.current_step_id = None
     record.finished_at = _now()
-    # Journal the terminal run state + cleared current step (§1, B4-BR-5).
     await _ajournal(_journal_current_step, record)
+    # U2 emission (BR-1, after the in-memory terminal settle): the run reached its
+    # terminal state. Branch on the final state — run.completed for a clean finish,
+    # run.cancelled for a cooperative cancel, run.failed for a halted (on_failure=
+    # halt) run (its error_kind is already carried on the step.failed event).
+    #
+    # ORDER IS LOAD-BEARING: the terminal EVENT is appended BEFORE the terminal
+    # STATE is journaled (PR #526 review, BLOCKING). The reader's trailing-gap
+    # check declares a hole when a TERMINAL run's high-water exceeds its last
+    # stored seq, on the premise that a terminal run can have no append in flight
+    # (see workflow_journal.read_events_with_gaps). With the state written first
+    # that premise was false: every healthy completed run spent the duration of
+    # its final append looking exactly like a lost trailing write, so live
+    # followers were told "1 event(s) lost" on the common success path — and the
+    # web store latches that marker for the session. Appending the event first
+    # closes the window: by the time the run is observably terminal, its last
+    # event has already landed.
+    if record.state == RunState.CANCELLED:
+        await _journal_event(record, "run.cancelled", state=record.state.value)
+    elif record.state == RunState.FAILED:
+        await _journal_event(record, "run.failed", state=record.state.value, error_kind="error")
+    else:
+        await _journal_event(record, "run.completed", state=record.state.value)
+    # Journal the terminal run state last (§1, B4-BR-5). Still best-effort: a lost
+    # state write leaves the run non-terminal in the journal, which the F-1 guard
+    # in _follow_run_events handles — it re-reads state each poll and closes on the
+    # transition, so a follower is not pinned forever.
     await _ajournal(_journal_run_state, record)
 
     # Aggregate the result.
@@ -822,6 +1128,10 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     _active_drives.add(run_id)
     try:
         await _ajournal(_journal_insert_run, record)
+        # U2 emission (BR-1, after the run row + steps are seeded): the run
+        # started. Added ALONGSIDE the existing insert write-through — the engine
+        # register/insert/admission sequence above is unchanged (SEAM #1, BR-5).
+        await _journal_event(record, "run.started", state=record.state.value)
 
         # 5. Deterministic sequencing order.
         order = _topological_order(spec)
@@ -830,6 +1140,37 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         return await _drive(record, order)
     finally:
         _active_drives.discard(run_id)
+
+
+async def start_run_prepared(record: RunRecord) -> WorkflowRunResult:
+    """Drive an already-admitted, already-journaled, already-registered YAML run (U2, ADR-3).
+
+    The DEDICATED prepared entry the async submission path's background task
+    (``_run_in_background``) invokes. It is the EXACT tail of :func:`start_run`
+    (L822-832) with the pre-drive admission/insert/registration REMOVED: the async
+    handler (C1) has already run ``_check_run_id_available``, validated + capped the
+    inputs, run the reserved-mode guard, done the atomic durable insert, and
+    registered the ``record`` in ``run_registry`` BEFORE acking with 202. This
+    entry therefore re-runs NONE of that — it only marks the drive live and drives.
+
+    Re-entering the blocking :func:`start_run` here would be wrong on two counts
+    (ADR-3): it would call ``insert_run`` again (a plain INSERT -> ``IntegrityError``
+    on the already-journaled id) AND ``_check_run_id_available`` would see the id the
+    handler just registered as already-claimed and raise ``KeyError`` (-> 409) on
+    EVERY async YAML run — the double-admission hazard. A ``skip_insert`` flag
+    cannot fix the second problem; only a dedicated drive-only entry can.
+
+    ``_topological_order`` and ``_drive`` are reused UNCHANGED, so the async drive
+    settles the terminal state and per-step write-throughs identically to a blocking
+    run. The ``finally`` clears the ``_active_drives`` liveness mark on EVERY exit
+    path (complete, fail, engine error, cancel), so a settled run stays resumable.
+    """
+    _active_drives.add(record.run_id)
+    try:
+        order = _topological_order(record.spec)
+        return await _drive(record, order)
+    finally:
+        _active_drives.discard(record.run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1004,6 +1345,38 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
                 srow.step_id,
                 e,
             )
+    # U2 re-seed (issue #504, crash-recovery closure): resume above
+    # max(persisted_high_water, max_event_seq) so a resumed run's emissions
+    # continue strictly above any allocated slot — no renumbering across the
+    # restart boundary. Two terms because either write of an emission may have
+    # been swallowed independently: the high-water can lag a durable append (if
+    # the high-water write was lost), and an append can lag the high-water (if the
+    # append was lost) — max() of both recovers the true floor. Both reads are
+    # best-effort and already degrade to 0 on failure (matching the seeded reads
+    # above), so this never raises into the rebuild path.
+    #
+    # THIRD TERM (PR #526 review): both durable reads degrade to 0 on failure, so
+    # a DOUBLE read fault re-seeded the counter to 0 and the next emission
+    # re-allocated seq 1 — colliding with an already-stored (run_id, seq) row on
+    # its PK and losing the event to an IntegrityError. That matters most on the
+    # resume path, which rebuilds over a record ALREADY LIVE in this process: the
+    # cached record's ``event_seq`` is a record of what this process has actually
+    # ALLOCATED, which is exactly the floor a resume must stay above (it is safer
+    # than any value that merely PERSISTED). Flooring against it makes the
+    # counter monotonic across a rebuild even when the journal is unreadable; on
+    # a genuine cold rebuild there is no cached record and the term is 0, so the
+    # normal two-term max is unchanged.
+    # ``run_registry`` is a UNION registry (U4 widened it to hold a script tier's
+    # ``ScriptRunRecord`` too), and a ScriptRunRecord has no ``event_seq`` — so
+    # the floor is read via getattr with a 0 default rather than attribute access
+    # that would AttributeError on a script row sharing this id.
+    live = run_registry.get(run_id)
+    live_floor = int(getattr(live, "event_seq", 0) or 0)
+    record.event_seq = max(
+        workflow_journal.persisted_high_water(run_id),
+        workflow_journal.max_event_seq(run_id),
+        live_floor,
+    )
     return record
 
 

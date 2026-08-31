@@ -141,6 +141,43 @@ def _no_llm_compile_in_tests(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_COMPILE_MODE", "append")
 
 
+@pytest.fixture(autouse=True)
+def _reset_backend_registry():
+    """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
+    from cli_agent_orchestrator.backends import registry
+
+    original = registry._backend
+    registry._backend = None
+    yield
+    registry._backend = original
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_cao_env(monkeypatch, tmp_path):
+    """Keep tests independent of CAO runtime identity and persisted settings.
+
+    Settings reads use a fresh per-test file while ``CAO_HOME_DIR`` stays
+    unchanged, so tests see documented defaults without invalidating assertions
+    about the default home layout. Runtime env vars are removed before each test;
+    tests can still set them explicitly after fixture setup. In particular,
+    stripping ``CAO_TERMINAL_ID`` is load-bearing for vault-recall exclusion
+    tests as well as sender-id defaults.
+    """
+    from cli_agent_orchestrator.services import settings_service
+
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(settings_service, "_server_settings_cache", None)
+    monkeypatch.setattr(settings_service, "_server_settings_mtime_ns", -1)
+
+    # server.py defaults sender_id to "supervisor" when unset
+    monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+    # server.py reads these for workflow_return context detection
+    monkeypatch.delenv("CAO_WORKFLOW_RUN_ID", raising=False)
+    monkeypatch.delenv("CAO_WORKFLOW_STEP_ID", raising=False)
+    # cli/commands/info.py uses this for session detection
+    monkeypatch.delenv("CAO_SESSION_NAME", raising=False)
+
+
 @pytest.fixture
 def isolated_memory_db(tmp_path, monkeypatch):
     """Route default memory sessions to an initialized per-test SQLite database."""

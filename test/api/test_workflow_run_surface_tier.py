@@ -302,6 +302,62 @@ class TestRunTierDispatch:
         assert resp.status_code == 400
 
 
+class TestSubmitTierDispatch:
+    """U2 (issue #505): the async submit route dispatches per tier to the
+    tier-appropriate prepared entry, mirroring the blocking route's tier split.
+    The engine drive is mocked at the prepared entry — no real subprocess."""
+
+    def _script_spec(self, name="scriptwf"):
+        return ScriptSpec(
+            name=name, path=f"/tmp/{name}.py", source=_GOOD_SCRIPT, content_hash="deadbeef"
+        )
+
+    def test_submit_script_tier_journals_script_and_hits_prepared_entry(
+        self, client, monkeypatch, isolated_db
+    ):
+        spec = self._script_spec()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+            lambda name_or_path, scan_dir=None: spec,
+        )
+        workflow_service.run_registry.clear()
+
+        called = {"hit": False}
+
+        async def _prepared(record, spec_path, env):
+            called["hit"] = True
+            workflow_journal.update_run_state(record.run_id, RunState.COMPLETED.value, "t")
+            from cli_agent_orchestrator.models.workflow_runtime import WorkflowRunResult
+
+            return WorkflowRunResult(
+                run_id=record.run_id,
+                workflow_name="wf",
+                state=RunState.COMPLETED,
+                started_at="t",
+            )
+
+        monkeypatch.setattr(script_runner, "run_script_workflow_prepared", _prepared)
+        resp = client.post(
+            "/workflows/runs:submit",
+            json={"name_or_path": "scriptwf", "inputs": {}, "run_id": "sub-scr"},
+        )
+        assert resp.status_code == 202
+        # Durable row is tier=script the instant the 202 returns (INV-1).
+        row = workflow_journal.get_run("sub-scr")
+        assert row is not None and row.tier == "script"
+        # Drive to terminal via the prepared entry.
+        final = None
+        for _ in range(100):
+            client.get("/workflows/runs/sub-scr")
+            r = workflow_journal.get_run("sub-scr")
+            if r is not None and r.state in ("completed", "failed", "cancelled"):
+                final = r.state
+                break
+        assert final == "completed"
+        assert called["hit"] is True
+        workflow_service.run_registry.clear()
+
+
 class TestResumeTierDispatch:
     def _seed_row(self, monkeypatch, tier, run_id="run1"):
         row = workflow_journal.RunRow(
@@ -520,3 +576,173 @@ class TestCancelTierDispatch:
         monkeypatch.setattr(workflow_journal, "get_run", lambda rid: row)
         resp = client.post("/workflows/runs/run1/cancel")
         assert resp.status_code == 409
+
+
+class TestCancellationLifecycle:
+    """U7 (issue #505) — cancel under the async/detached, journal-authoritative
+    lifecycle. These tests exercise the EXISTING cancel handler against a REAL
+    temp journal DB with an EMPTY ``run_registry``, so they FAIL if the
+    journal-fallback path (a detached / post-restart run cancelled from the
+    journal alone) ever regresses. U7 adds no new cancel handler (NR-1) — this is
+    the behavior lock.
+    """
+
+    @pytest.fixture
+    def journal_db(self, tmp_path, monkeypatch):
+        """A real temp journal DB + an EMPTY run_registry. ``workflow_journal``'s
+        ``_connect`` auto-migrates both run tables on first use, so pointing
+        ``DATABASE_FILE`` at a temp path is enough."""
+        db_path = tmp_path / "wf.db"
+        monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+        monkeypatch.setattr(workflow_service, "run_registry", {})
+        return db_path
+
+    def _live_yaml_record(self, run_id, state):
+        """A real RunRecord (not a mock) so the live-registry YAML arm and the real
+        ``cancel_run`` are exercised end to end."""
+        from cli_agent_orchestrator.models.workflow import WorkflowSpec, WorkflowStep
+
+        spec = WorkflowSpec(
+            name="wf",
+            steps=[WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go")],
+        )
+        return workflow_service.RunRecord(
+            run_id=run_id,
+            workflow_name="wf",
+            spec=spec,
+            inputs={},
+            state=state,
+            started_at="2026-07-27T00:00:00Z",
+        )
+
+    # --- CG-1: absent -> 404 (no live record AND no journal row) ---
+    def test_cancel_absent_run_404(self, client, journal_db):
+        resp = client.post("/workflows/runs/ghost/cancel")
+        assert resp.status_code == 404
+
+    # --- CG-3: a live RUNNING record transitions (is flagged) via the live arm ---
+    def test_cancel_live_running_record_flags_cancel(self, client, journal_db):
+        record = self._live_yaml_record("run1", RunState.RUNNING)
+        workflow_service.run_registry["run1"] = record
+        resp = client.post("/workflows/runs/run1/cancel")
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        # cancel_run cooperatively flags the live record (the drive loop settles it).
+        assert record.cancelled is True
+
+    # --- CG-2: a live terminal record -> 409, no cancel attempted ---
+    def test_cancel_live_terminal_record_409(self, client, journal_db):
+        record = self._live_yaml_record("run1", RunState.COMPLETED)
+        workflow_service.run_registry["run1"] = record
+        resp = client.post("/workflows/runs/run1/cancel")
+        assert resp.status_code == 409
+        assert record.cancelled is False  # no mutation on a terminal run
+
+    # --- JA-1/JA-2/JA-3 (MANDATED detached-recovery path): a run journaled RUNNING
+    # with an EMPTY registry still cancels from the journal alone, and the durable
+    # row is actually flipped to CANCELLED. This is the load-bearing test. ---
+    def test_cancel_detached_running_via_journal_fallback(self, client, journal_db):
+        assert workflow_service.run_registry == {}
+        workflow_journal.insert_run(
+            run_id="detached",
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state=RunState.RUNNING.value,
+            started_at="2026-07-27T00:00:00Z",
+        )
+        resp = client.post("/workflows/runs/detached/cancel")
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        # The durable journal row (the only source of truth here) is now CANCELLED,
+        # with a finished_at set — proving the fallback wrote through, not a no-op.
+        row = workflow_journal.get_run("detached")
+        assert row is not None
+        assert row.state == RunState.CANCELLED.value
+        assert row.finished_at is not None
+
+    # --- CG-2 (detached): a journal-only row already terminal -> 409, no mutation ---
+    def test_cancel_detached_terminal_via_journal_409(self, client, journal_db):
+        workflow_journal.insert_run(
+            run_id="done",
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state=RunState.COMPLETED.value,
+            started_at="2026-07-27T00:00:00Z",
+        )
+        workflow_journal.update_run_state("done", RunState.COMPLETED.value, "2026-07-27T00:00:05Z")
+        resp = client.post("/workflows/runs/done/cancel")
+        assert resp.status_code == 409
+        # The row is untouched — still COMPLETED, not flipped to CANCELLED.
+        assert workflow_journal.get_run("done").state == RunState.COMPLETED.value
+
+    # --- CG-4: idempotent outcome — a second cancel of an already-cancelled
+    # detached run is a 409 and the run stays CANCELLED (no double-transition) ---
+    def test_cancel_detached_idempotent_second_cancel_409(self, client, journal_db):
+        workflow_journal.insert_run(
+            run_id="twice",
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state=RunState.RUNNING.value,
+            started_at="2026-07-27T00:00:00Z",
+        )
+        first = client.post("/workflows/runs/twice/cancel")
+        assert first.status_code == 200
+        assert workflow_journal.get_run("twice").state == RunState.CANCELLED.value
+        second = client.post("/workflows/runs/twice/cancel")
+        assert second.status_code == 409
+        # Still CANCELLED after the second (rejected) cancel — no double-transition.
+        assert workflow_journal.get_run("twice").state == RunState.CANCELLED.value
+
+    # --- ID-1: cancel is a state transition, not a new run — the id is unchanged ---
+    def test_cancel_does_not_mint_a_new_run_id(self, client, journal_db):
+        workflow_journal.insert_run(
+            run_id="same-id",
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state=RunState.RUNNING.value,
+            started_at="2026-07-27T00:00:00Z",
+        )
+        resp = client.post("/workflows/runs/same-id/cancel")
+        assert resp.status_code == 200
+        assert resp.json()["run_id"] == "same-id"
+        # No sibling run was minted — the journal still holds exactly one run.
+        assert [r.run_id for r in workflow_journal.list_runs()] == ["same-id"]
+
+    # --- LW-1: the 202 submit body's links.cancel round-trips to the live route ---
+    def test_202_cancel_link_resolves_to_live_cancel_route(self, client, journal_db, monkeypatch):
+        from cli_agent_orchestrator.models.workflow import WorkflowSpec, WorkflowStep
+
+        spec = WorkflowSpec(
+            name="wf",
+            steps=[WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go")],
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+            lambda name_or_path, scan_dir=None: spec,
+        )
+
+        # A no-op prepared drive: the run stays RUNNING (the background task never
+        # settles it), so the cancel link has a live, cancellable run to reach.
+        async def _noop(record):
+            return None
+
+        monkeypatch.setattr(workflow_service, "start_run_prepared", _noop)
+
+        submit = client.post(
+            "/workflows/runs:submit",
+            json={"name_or_path": "wf", "inputs": {}, "run_id": "linked"},
+        )
+        assert submit.status_code == 202
+        cancel_url = submit.json()["links"]["cancel"]
+        assert cancel_url == "/workflows/runs/linked/cancel"
+
+        # POST the EXACT relative URL from the 202 body — it must reach the live
+        # cancel route and cancel that same run (the acknowledged id round-trips).
+        resp = client.post(cancel_url)
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert resp.json()["run_id"] == "linked"

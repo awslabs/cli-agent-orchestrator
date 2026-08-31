@@ -17,13 +17,123 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build wheel and sdist
-    runs-on: ubuntu-latest
+  # ---------------------------------------------------------------------------------------
+  # Per-platform wheels (issue #321, unit `wheel-matrix`). THIS JOB ADDS THIS REPO'S FIRST
+  # NON-LINUX RUNNERS — measured before this change: 25 of 25 `runs-on:` were ubuntu-latest.
+  #
+  # WHY A MATRIX AT ALL: the wheel bundles a compiled `cao-tui` executable. The previous
+  # single-runner build produced a wheel tagged `py3-none-any` carrying a
+  # `Mach-O 64-bit arm64` binary (both read from a real artifact). `py3-none-any` means
+  # "pure Python, runs anywhere", so pip installs it on Linux and Windows where that binary
+  # cannot execute, and the operator only finds out when they run `cao tui`. One wheel per
+  # platform, correctly tagged, makes pip REFUSE an incompatible wheel instead.
+  # ---------------------------------------------------------------------------------------
+  build-wheels:
+    name: Wheel (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    # No job in this repo carried a timeout before (measured: zero `timeout-minutes` across
+    # all 8 workflow files). These jobs compile Rust and, on Linux, run a container build —
+    # a hang must fail fast rather than burn the full 6-hour default.
+    timeout-minutes: 60
+    strategy:
+      # One platform's failure must not cancel the others: knowing WHICH platforms fail is
+      # the entire diagnostic value of a matrix that has never run before.
+      fail-fast: false
+      matrix:
+        include:
+          # `rust-target` is the triple rustup must INSTALL for this leg, and it is empty for
+          # every leg that builds for its own host. It exists because a cross-build needs the
+          # target's std installed BEFORE cargo runs, and the runner images ship
+          # host-target-only rustup — a missing one fails with "target may not be installed",
+          # which no PR check can see because this whole workflow runs only at release time.
+          # It must stay in lock-step with `scripts/build_tui.py`'s `_ARCHFLAGS_TO_RUST_TARGET`;
+          # `test_wheel_matrix.py` asserts that agreement rather than trusting it. (#321)
+          #
+          # `macos-target` is this leg's MACOSX_DEPLOYMENT_TARGET, and it is REQUIRED, not a
+          # tuning knob. `delocate-wheel` compares every bundled Mach-O member's
+          # LC_BUILD_VERSION minimum against the wheel's platform tag and REFUSES a wheel whose
+          # binary floor is higher:
+          #
+          #   DelocationError: Library dependencies do not satisfy target MacOS version 10.9:
+          #     .../cao-tui has a minimum target of 10.12
+          #
+          # That is verbatim what failed v2.5.0's x86_64 leg — at REPAIR time, before the smoke
+          # test that config expected to be the x86_64 gap. That leg is gone now (see below),
+          # but the key stays PER LEG rather than collapsing to one macOS-wide value: rustc's
+          # floor differs by target, so a blanket value correct for one arch puts another BELOW
+          # its own binary's floor. Empty on Linux, where the variable is meaningless. (#321)
+          #
+          # macOS arm64 — native on GitHub's `macos-latest` (arm64 since macOS 14). 11.0 is
+          # cibuildwheel's own arm64 default, pinned here so the pair stays visible and a
+          # future default change cannot silently reintroduce the mismatch above.
+          - os: macos-latest
+            label: macOS arm64
+            archs: arm64
+            rust-target: ''
+            macos-target: '11.0'
+          - os: ubuntu-latest
+            label: Linux x86_64
+            archs: x86_64
+            rust-target: ''
+            macos-target: ''
+          # NO macOS x86_64 (INTEL) LEG. Not because it cannot be BUILT — v2.5.0's cross-build
+          # produced a correctly tagged wheel once the deployment target above was fixed — but
+          # because the wheel cannot be INSTALLED on the platform it targets.
+          #
+          # Measured over every `cryptography` release on PyPI: 48.0.1 and earlier ship
+          # `macosx_10_9_universal2`; 49.0.0 onward ship `macosx_11_0_arm64` and nothing else
+          # for macOS. This project floors at `cryptography>=50.0.0` (49.0.0 fixes
+          # CVE-2026-69249, 50.0.0 fixes CVE-2026-69247, both HIGH, and Trivy's gate is
+          # blocking) — so EVERY version we are permitted to resolve is one with no Intel wheel,
+          # and an Intel Mac must build it from source, which needs OpenSSL headers and a Rust
+          # toolchain.
+          #
+          # That is where v2.5.0's leg actually died: inside cibuildwheel's own test venv, where
+          # pip tried to build cryptography for x86_64 from an arm64 host and `openssl-sys`
+          # reported `pkg-config has not been configured to support cross-compilation`
+          # ($HOST = aarch64-apple-darwin, $TARGET = x86_64-apple-darwin).
+          #
+          # `test-skip` was considered and REJECTED: silencing the test would have published a
+          # wheel whose install fails the same way on the operator's machine, only later and
+          # with no CI record. Dropping the leg means an Intel Mac gets a clean "no matching
+          # distribution" from pip instead. Restoring it needs cryptography to ship Intel wheels
+          # again (or a vendored OpenSSL) AND a native x86_64 runner to execute the result.
+          #
+          # NO WINDOWS LEG. `cli_agent_orchestrator` cannot be IMPORTED on Windows: four
+          # modules import `fcntl` at module scope (services/memory_reconciliation.py,
+          # services/memory_service.py, services/wiki_healer.py, api/main.py — which also
+          # imports `termios`), and `cli/main.py` reaches the first of them through
+          # `cli/commands/init.py`. So every `cao` entry point dies on
+          # `ModuleNotFoundError: No module named 'fcntl'`, not just `cao tui`. Underneath
+          # that, the terminal backend is tmux, which has no native Windows build.
+          #
+          # Windows was therefore never a supported platform; the v2.5.0 matrix asserted one
+          # into existence and the smoke test correctly refused it — the Rust side was clean
+          # (`cao-tui.exe` built, tagged `win_amd64`, 1,110,528 bytes), the Python side was
+          # not. Restoring this leg requires making the package import on Windows AND giving
+          # it a working backend; until then a leg here would only publish a wheel that
+          # installs and then fails, which is the exact outcome #321 exists to prevent.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      - uses: actions/setup-node@v4
+      # REQUIRED by the `Assert TUI binary is inside each wheel` step below, which invokes
+      # `python`. cibuildwheel brings its own interpreters for the BUILD, so this job carried
+      # no setup-python — but that step runs on the HOST, and the macOS runner images provide
+      # only `python3`. The v2.5.0 arm64 leg died on `python: command not found` (exit 127)
+      # AFTER cibuildwheel had already built, repaired, and smoke-tested a good wheel.
+      #
+      # setup-python rather than s/python/python3/: the same bare `python` is what the two
+      # publish jobs already use for scripts/assert_wheel_matrix.py, so making the interpreter
+      # explicit keeps one convention instead of two, and does not depend on which image
+      # happens to ship a `python` shim. It cannot affect the wheels — cibuildwheel ignores
+      # the host interpreter when selecting build Pythons. (#321)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+
+      # The Web UI is built here too so each platform wheel carries it. Without this the
+      # web_ui/** artifacts glob resolves empty and hatchling silently omits it (defect D1).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -36,50 +146,175 @@ jobs:
           npm run build
           # vite.config.ts writes directly to ../src/cli_agent_orchestrator/web_ui/
 
-      - uses: astral-sh/setup-uv@v4
-
-      - name: Build
-        run: uv build
-
-      - uses: actions/upload-artifact@v4
+      # macOS and Windows have no build container, so cibuildwheel's `before-build` runs on
+      # the host and needs cargo on PATH. Linux builds inside the manylinux container, where
+      # `[tool.cibuildwheel.linux] before-all` installs rustup instead — installing it here
+      # would put it on the HOST, which the container cannot see.
+      #
+      # SHA-pinned, not `@stable`: `stable` is a mutable BRANCH on this action's repo, so
+      # `@stable` re-resolves on every run and is unreviewable supply chain. The toolchain
+      # channel is selected by the `toolchain` input, which is what `@stable` really did.
+      #
+      # `targets:` installs the target std a CROSS-BUILD needs before cargo runs; cargo cannot
+      # build for a target whose std is absent, and the failure is "target may not be
+      # installed". EVERY LEG IS CURRENTLY HOST-TARGET, so `matrix.rust-target` is empty
+      # throughout and the action expands the input to nothing.
+      #
+      # The plumbing stays rather than being deleted with the cross-compiled leg it was added
+      # for: `build_tui.py` still maps ARCHFLAGS to `--target <triple>`, so the day a
+      # cross-build returns, omitting this input fails the leg — and because
+      # `publish-testpypi` `needs: build-wheels`, it fails at release time, where no PR check
+      # can see it. `test_wheel_matrix.py` asserts the matrix and the arch map agree.
+      # (Reported by review on PR #547.)
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable @ 2026-07-16
+        if: runner.os != 'Linux'
         with:
-          name: dist
-          path: dist/
+          toolchain: stable
+          targets: ${{ matrix.rust-target }}
+
+      # Builds, repairs, and SMOKE-TESTS one wheel per platform. The smoke test
+      # (`[tool.cibuildwheel] test-command`) installs the wheel and RUNS `cao tui`, so a
+      # wheel whose binary is missing, non-executable, or built for the wrong architecture
+      # fails HERE rather than on an operator's machine (SR-1).
+      - uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
+          # See `macos-target` in the matrix: this is what keeps delocate from rejecting a
+          # macOS wheel whose Rust binary declares a higher minimum than the wheel's tag.
+          # cibuildwheel reads MACOSX_DEPLOYMENT_TARGET from the environment and only supplies
+          # its own default when unset, so an explicit value wins. Empty on Linux, where it is
+          # inert.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos-target }}
+
+      # Belt-and-braces on top of cibuildwheel's own test-command: assert the binary is
+      # inside each produced wheel and within NFR-2's ceiling. Cheap, and it attests the
+      # uploaded artifact rather than the one that happened to be tested.
+      - name: Assert TUI binary is inside each wheel, within the NFR-2 ceiling
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(wheelhouse/*.whl)
+          if [ ${#wheels[@]} -eq 0 ]; then
+            echo "no wheels in wheelhouse/ — a missing artifact is a FAILED check, not a passed one"
+            exit 1
+          fi
+          for w in "${wheels[@]}"; do
+            python scripts/build_tui.py check --wheel "$w" --max-binary-bytes 10485760
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          # Per-platform artifact names, merged by the publish jobs via `pattern:` +
+          # `merge-multiple:`. A shared name would make the legs race each other.
+          name: dist-${{ matrix.os }}-${{ matrix.archs }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # The sdist is platform-independent, so it is built ONCE rather than per platform.
+  # Deliberately built WITHOUT a Rust binary: an sdist ships source, and a native executable
+  # inside one would be both wrong and unusable on any other platform.
+  build-sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build Web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4.2.0
+
+      - name: Build sdist
+        run: uv build --sdist
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   publish-testpypi:
     name: Publish to TestPyPI
     if: github.event_name == 'release' || github.event.inputs.environment == 'testpypi'
-    needs: build
+    needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment:
       name: testpypi
       url: https://test.pypi.org/p/cli-agent-orchestrator
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      # Merge the four platform wheels plus the sdist into ONE dist/ dir. `pattern:` +
+      # `merge-multiple:` is required now that the uploads are per-platform — a single
+      # `name: dist` would only fetch one of them, and the release would ship one platform.
+      # `scripts/assert_wheel_matrix.py` lives in the REPO, and a runner starts with an EMPTY
+      # workspace — `download-artifact` populates only `dist/`. Without this checkout the guard
+      # meant to block a partial or `any`-tagged publish instead fails on its own missing file
+      # (`can't open file '.../scripts/assert_wheel_matrix.py'`), so the release proceeds
+      # UNCHECKED. Worst on `publish-pypi`: a PyPI filename cannot be re-uploaded.
+      # Found by the §12a reviewer for `wheel-matrix`. (#321)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      # Assert all four platform wheels are present BEFORE uploading. Without this, a
+      # matrix leg that silently produced nothing would publish a partial release — and
+      # `fail-fast: false` means the other legs would still have succeeded, so the failure
+      # is easy to miss in a green-looking summary. Also asserts no `*-any.whl` slipped
+      # through: that is issue #321's defect reaching PyPI. (#321)
+      - name: Assert the full platform set is present and none is tagged 'any'
+        run: python scripts/assert_wheel_matrix.py --dist dist/
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
 
   smoke-test:
-    name: Install from TestPyPI and verify entry points
+    name: Smoke test from TestPyPI (${{ matrix.label }})
     # Only runs on Release-triggered publishes. Manual workflow_dispatch
     # skips the smoke-test because we have no tagged version to pin against.
     if: github.event_name == 'release'
     needs: publish-testpypi
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS arm64
+          - os: ubuntu-latest
+            label: Linux x86_64
+          # One leg per PUBLISHED wheel, and no more: there is no Windows or Intel-macOS wheel
+          # to smoke-test, for the reasons given on the `build-wheels` matrix. Keeping this
+          # matrix in step with that one is what makes "every wheel we ship is installed and
+          # executed by CI" true rather than aspirational.
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: '3.12'
 
       - name: Install from TestPyPI (retry while index propagates)
+        # `shell: bash` explicitly. It was added when this job also ran on windows-latest,
+        # where the default shell is PowerShell and none of the parameter expansion or `for`
+        # syntax below would parse. That leg is gone, but the pin stays: it makes the shell
+        # independent of the runner's default, so re-adding a platform cannot silently change
+        # how this script is interpreted.
+        shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           # Install in two steps so TestPyPI never participates in dependency
@@ -111,32 +346,66 @@ jobs:
           exit 1
 
       - name: Verify entry points
+        shell: bash
         run: |
           cao --help
           cao-server --help
           cao-mcp-server --help
           python -c "import cao_workflow; assert cao_workflow.run_step"
 
+      # SR-1, on the artifact an operator would actually receive. The four checks above are
+      # exactly what passed while the wheel shipped a binary that could not run on the host
+      # — `--help` and an import both succeed with no TUI binary present at all, because
+      # hatchling silently drops an artifacts glob that matched nothing (defect D1).
+      #
+      # So this EXECS the bundled binary. It is the only step here that can fail for an
+      # architecture mismatch, and it runs on all three platforms rather than just Linux.
+      # (#321)
+      - name: Verify `cao tui` runs (execs the bundled Rust binary)
+        shell: bash
+        run: |
+          cao tui
+          echo "cao tui exited 0 on ${{ matrix.label }}"
+
   publish-pypi:
     name: Publish to PyPI (maintainer-approved)
-    needs: [build, smoke-test]
+    needs: [build-wheels, build-sdist, smoke-test]
     if: |
       always() &&
-      needs.build.result == 'success' &&
+      needs.build-wheels.result == 'success' &&
+      needs.build-sdist.result == 'success' &&
       (
         (github.event_name == 'release' && needs.smoke-test.result == 'success') ||
         (github.event.inputs.environment == 'pypi' && needs.smoke-test.result == 'skipped')
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment:
       name: pypi
       url: https://pypi.org/p/cli-agent-orchestrator
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      # `scripts/assert_wheel_matrix.py` lives in the REPO, and a runner starts with an EMPTY
+      # workspace — `download-artifact` populates only `dist/`. Without this checkout the guard
+      # meant to block a partial or `any`-tagged publish instead fails on its own missing file
+      # (`can't open file '.../scripts/assert_wheel_matrix.py'`), so the release proceeds
+      # UNCHECKED. Worst on `publish-pypi`: a PyPI filename cannot be re-uploaded.
+      # Found by the §12a reviewer for `wheel-matrix`. (#321)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      # Re-asserted on the PyPI path, not just TestPyPI: this is the last gate before the
+      # artifact is public and irrevocable (PyPI does not allow re-uploading a filename).
+      - name: Assert the full platform set is present and none is tagged 'any'
+        run: python scripts/assert_wheel_matrix.py --dist dist/
+
+      # SHA-pinned (SR-2, interview Q10). `release/v1` is a mutable BRANCH, and this action
+      # holds the OIDC credential path to PyPI — the highest-consequence supply-chain
+      # exposure in this workflow. dc37677b is the commit that `release/v1` and the v1.14.2
+      # tag both pointed at when this was pinned; verified by dereferencing the annotated tag.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2

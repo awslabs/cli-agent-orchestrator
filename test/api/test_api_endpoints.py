@@ -17,6 +17,7 @@ from cli_agent_orchestrator.api.main import (
     inbox_reconciliation_daemon,
     opencode_inbox_delivery_daemon,
 )
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.utils.skills import SkillNameError
@@ -122,7 +123,7 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 9
+        assert len(data) == 12
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
@@ -133,6 +134,9 @@ class TestAgentProviders:
         assert "opencode_cli" in names
         assert "cursor_cli" in names
         assert "antigravity_cli" in names
+        assert "omp" in names
+        assert "grok_cli" in names
+        assert "mcode" in names
         for p in data:
             assert p["installed"] is True
 
@@ -164,6 +168,8 @@ class TestAgentProviders:
         assert providers_dict["kimi_cli"]["installed"] is False
         assert providers_dict["copilot_cli"]["installed"] is False
         assert providers_dict["opencode_cli"]["installed"] is False
+        assert providers_dict["grok_cli"]["installed"] is False
+        assert providers_dict["mcode"]["installed"] is False
 
     def test_list_providers_has_binary_field(self, client):
         """Each provider entry has correct binary name."""
@@ -179,6 +185,9 @@ class TestAgentProviders:
         assert providers_dict["copilot_cli"]["binary"] == "copilot"
         assert providers_dict["opencode_cli"]["binary"] == "opencode"
         assert providers_dict["antigravity_cli"]["binary"] == "agy"
+        assert providers_dict["omp"]["binary"] == "omp"
+        assert providers_dict["grok_cli"]["binary"] == "grok"
+        assert providers_dict["mcode"]["binary"] == "mcode"
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────
@@ -253,6 +262,46 @@ class TestGetSkillContent:
 # ── Sessions CRUD ────────────────────────────────────────────────────
 
 
+class TestValidateResumeSessionId:
+    """Focused tests on the resume_session_id validation boundary.
+
+    This validator guards a string that is later interpolated into the
+    provider shell command (``claude --resume <sid>``); these tests pin the
+    accepted charset so a future regex edit cannot silently widen what
+    reaches the shell command.
+    """
+
+    def test_valid_ids_pass(self):
+        from cli_agent_orchestrator.api.main import _validate_resume_session_id
+
+        for value in [
+            "abcdefgh",  # 8 chars: minimum length
+            "01234567-89ab-cdef-0123-456789abcdef",  # UUID shape
+            "A1.b2_c3-d4",
+            "a" * 64,  # maximum length
+        ]:
+            _validate_resume_session_id(value)  # must not raise
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "abc defg",  # embedded space
+            "abcdefg;",  # shell separator
+            "$(whoami)x",  # command substitution
+            "abcdefg",  # 7 chars: too short
+            "a" * 65,  # 65 chars: too long
+            ".abcdefgh",  # leading dot
+            "abcdefgh\n",  # trailing newline (regex must anchor with \\Z)
+            "",  # empty
+        ],
+    )
+    def test_invalid_ids_raise(self, value):
+        from cli_agent_orchestrator.api.main import _validate_resume_session_id
+
+        with pytest.raises(ValueError):
+            _validate_resume_session_id(value)
+
+
 class TestCreateSession:
     """Tests for POST /sessions endpoint — success and error cases."""
 
@@ -291,7 +340,150 @@ class TestCreateSession:
             allowed_tools=None,
             registry=ANY,
             env_vars=None,
+            engine=None,
+            initial_message=None,
+            initial_message_orchestration_type=None,
+            model=None,
+            resume_session_id=None,
+            group=None,
+            metadata=None,
         )
+
+    def test_create_session_passes_explicit_kiro_engine(self, client):
+        """An explicit engine reaches the session service and the response."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+            engine="kas",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer", "engine": "kas"},
+            )
+
+        assert response.status_code == 201
+        assert response.json()["engine"] == "kas"
+        assert mock_svc.create_session.call_args.kwargs["engine"] == "kas"
+
+    def test_create_session_passes_model_and_initial_message(self, client):
+        """The launch override and first task reach the session service, while
+        the task remains in the JSON body rather than the request URL."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="codex",
+            agent_profile="developer",
+        )
+        initial_message = "Review the current change"
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "codex",
+                    "agent_profile": "developer",
+                    "model": "gpt-5.1-codex",
+                },
+                json={
+                    "initial_message": initial_message,
+                    "initial_message_orchestration_type": "send_message",
+                },
+            )
+
+        assert response.status_code == 201
+        assert initial_message not in str(response.request.url)
+        call_kwargs = mock_svc.create_session.call_args.kwargs
+        assert call_kwargs["model"] == "gpt-5.1-codex"
+        assert call_kwargs["initial_message"] == initial_message
+        assert call_kwargs["initial_message_orchestration_type"] == OrchestrationType.SEND_MESSAGE
+
+    def test_create_session_preserves_env_vars_body_shape(self, client):
+        """Existing cao launch --env callers keep using {"env_vars": {...}}."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"env_vars": {"FEATURE_MODE": "enabled"}},
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["env_vars"] == {"FEATURE_MODE": "enabled"}
+
+    def test_create_session_rejects_malformed_model(self, client):
+        """Malformed model IDs fail before any session is created."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "agent_profile": "developer",
+                    "model": "invalid;model",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "model" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_empty_initial_message(self, client):
+        """An explicitly supplied but undeliverable empty task is not ignored."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"initial_message": ""},
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "initial_message must not be empty"
+        mock_svc.create_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_detail"),
+        [
+            (
+                {"initial_message_orchestration_type": "send_message"},
+                "initial_message_orchestration_type requires initial_message",
+            ),
+            (
+                {
+                    "initial_message": "Review the current change",
+                    "initial_message_orchestration_type": "invalid",
+                },
+                "invalid initial_message_orchestration_type: 'invalid'",
+            ),
+        ],
+    )
+    def test_create_session_rejects_invalid_initial_message_orchestration(
+        self, client, payload, expected_detail
+    ):
+        """Invalid initial-message orchestration fails at the API boundary."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json=payload,
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == expected_detail
+        mock_svc.create_session.assert_not_called()
 
     def test_create_session_with_session_name(self, client):
         """POST /sessions with explicit session_name."""
@@ -573,6 +765,25 @@ class TestDeleteSession:
         assert data["success"] is True
         assert data["deleted"] == ["test-session"]
         mock_svc.delete_session.assert_called_once_with("test-session", registry=ANY)
+
+    def test_delete_session_deferred_cleanup_is_conflict(self, client):
+        """Deferred Grok cleanup must not look like a successful delete."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {
+                "deleted": [],
+                "errors": [
+                    {
+                        "terminal_id": "grok-terminal",
+                        "error": "cleanup deferred; retry delete_session",
+                    }
+                ],
+            }
+
+            response = client.delete("/sessions/test-session")
+
+        assert response.status_code == 409
+        assert "cleanup deferred" in response.json()["detail"]
+        assert "test-session" in response.json()["detail"]
 
     def test_delete_session_not_found(self, client):
         """DELETE /sessions/{name} returns 404 for nonexistent session."""
@@ -942,6 +1153,26 @@ class TestGetTerminalOutput:
         assert response.status_code == 500
         assert "Failed to get output" in response.json()["detail"]
 
+    def test_get_output_last_mode_extraction_failure_is_500(self, client):
+        """A missing response marker is a 500, not a 404 (issue #570).
+
+        mode=last takes the pinned-depth retry path that re-raises as
+        OutputExtractionError; it subclasses ValueError, so without an arm
+        ordered before the ValueError catch below it collapsed back into this
+        route's 404. Same boundary mapping as POST /terminals/run-step.
+        """
+        from cli_agent_orchestrator.providers.base import OutputExtractionError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.side_effect = OutputExtractionError(
+                "No completion marker found after last user message"
+            )
+
+            response = client.get("/terminals/abcd1234/output?mode=last")
+
+        assert response.status_code == 500
+        assert "No completion marker" in response.json()["detail"]
+
 
 class TestDeleteTerminal:
     """Tests for DELETE /terminals/{terminal_id} endpoint."""
@@ -957,6 +1188,17 @@ class TestDeleteTerminal:
         data = response.json()
         assert data["success"] is True
         mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
+
+    def test_delete_terminal_deferred_cleanup_is_conflict(self, client):
+        """HTTP 200 + success:false would hide a still-retryable Grok home."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = False
+
+            response = client.delete("/terminals/abcd1234")
+
+        assert response.status_code == 409
+        assert "cleanup deferred" in response.json()["detail"]
+        assert "abcd1234" in response.json()["detail"]
 
     def test_delete_terminal_not_found(self, client):
         """DELETE /terminals/{id} returns 404 for nonexistent terminal."""
@@ -1162,6 +1404,7 @@ class TestLifespan:
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
+            patch("cli_agent_orchestrator.api.main._seed_default_skills_at_startup") as mock_seed,
             patch(
                 "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
                 return_value=None,
@@ -1186,6 +1429,7 @@ class TestLifespan:
         ):
             async with lifespan(app):
                 # Inside the lifespan — startup completed.
+                mock_seed.assert_called_once_with()
                 # The registry was loaded and stored on app state.
                 mock_load.assert_awaited_once()
                 assert app.state.plugin_registry is not None

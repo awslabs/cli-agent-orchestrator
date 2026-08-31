@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+
 PermissionMode = Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
 
 
@@ -38,6 +40,7 @@ class AgentProfile(BaseModel):
     provider: Optional[str] = None  # Provider override (e.g. "claude_code", "kiro_cli")
     system_prompt: Optional[str] = None  # The markdown content
     role: Optional[str] = None  # "supervisor", "developer", "reviewer"
+    engine: Optional[KiroEngine] = None  # Kiro v2/KAS selection; omitted resolves to v2.
 
     # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name
     # matches one of these patterns (exact name or fnmatch glob, e.g. "ads-*") are
@@ -98,3 +101,19 @@ class AgentProfile(BaseModel):
     # example one created by `hermes profile alias <profile>`). When omitted,
     # the Hermes provider launches the default `hermes` command.
     hermesProfile: Optional[str] = Field(default=None, min_length=1)
+
+    # Claude Code-only. Per-agent Claude Code knobs mapped to CLI flags at
+    # launch: {"effort": "<low|medium|high|xhigh>"} -> `--effort <level>` and
+    # {"fallback_model": "<model>"} -> `--fallback-model <model>`. Lets a
+    # profile set per-agent reasoning effort without relying on the
+    # machine-global `effortLevel` in ~/.claude/settings.json. This is the
+    # Claude analog of codexConfig for the codex provider; the top-level
+    # `model` field still maps to `--model`.
+    claudeConfig: Optional[Dict[str, Any]] = None
+
+    # Grok-only. Explicitly permits Grok's own subagents, workflows, and /goal
+    # engine in this CAO terminal. Omission remains ``None`` so existing profile
+    # API responses do not gain a new false-valued field; Grok resolves None as
+    # disabled because those workers are outside CAO's profile, callback, and
+    # terminal-accounting boundaries.
+    grokNativeWorkflows: Optional[bool] = None

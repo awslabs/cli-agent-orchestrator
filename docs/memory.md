@@ -281,7 +281,38 @@ cao memory export --scope global -o ./bundle --include-history --redact --prune
 cao memory import ./memory-bundle --scope global
 cao memory import ./memory-bundle --scope project --conflict merge
 cao memory import ./memory-bundle --scope global --dry-run   # full pipeline, no writes
+
+# Inspect and curate typed relationships between memories
+cao memory relationships list
+cao memory relationships list --scope project --source-key testing-framework
+cao memory relationships list --status proposal        # the review queue
+cao memory relationships list --stale                 # edges older than their source
+cao memory relationships list --format json
+cao memory relationships inspect <relationship-id>
+cao memory relationships promote <relationship-id>    # proposal -> active
+cao memory relationships reject <relationship-id>     # -> rejected (survives recompute)
 ```
+
+### Typed relationships
+
+Memories are linked by typed, provenance-tagged edges (`relates_to`,
+`contradiction`, `supersedes`) held in a durable store rather than inferred at
+read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
+`legacy_related_keys`, or `external_import` — and a `status`.
+
+Writes are **producer-scoped**: when the compiler or linter recomputes its edges
+for a source memory, it replaces only rows carrying its own origin and type, so a
+human-authored edge on the same memory is never touched.
+
+`reject` is durable curation. A rejected edge is **not** resurrected by a later
+producer recompute, and is not deleted if the producer stops reporting it — the
+operator's verdict outranks the producer, and each refusal is reported back to
+the producer. `promote` refuses to act on a rejected or deleted edge; re-create
+it instead.
+
+`--stale` surfaces edges computed before their source memory was last edited
+(the edge stores the source's `updated_at` at write time), which is the signal
+that a recompute is due.
 
 `cao memory heal` consumes the findings from `cao memory lint` and applies one fix per
 issue type: it deletes orphan pages, resolves contradictions (keeping the newer article),
@@ -297,6 +328,11 @@ instead of skipping the topic), and `--prune` (directory output only — delete 
 topics no longer in the scope). `--format` selects the archive backend (`okf` today).
 The same bundle is available over HTTP via `GET /memory/export` (see
 [docs/api.md](api.md)), which never exports private scopes.
+
+> **Read-only mirror:** OKF exports are generated snapshots of CAO memory.
+> Editing exported files does not update the CAO store, and a later export may
+> overwrite those mirror edits. Import is an explicit ingestion operation, not
+> automatic reverse synchronization.
 
 `cao memory import` reads a bundle directory back into a scope. The bundle is treated as
 untrusted input: target `--scope` is required and limited to `global`/`project`/`federated`,
@@ -461,3 +497,13 @@ Use `memory_recall` to check if you already know something before asking the use
 Note: `memory_store` and `memory_recall` are CAO's cross-provider memory tools, distinct from
 any provider-native memory system.
 ```
+
+## Self-Learning (builds on memory)
+
+The opt-in self-learning loop uses agent-scope memory as its lesson store:
+agents report task outcomes, a retrospector agent distills them into
+agent-scope `feedback` memories with `Applies when:` trigger clauses, and
+recall-reinforced lessons can be promoted into agent profile files. Every
+memory capability on this page — injection, recall/`access_count`, lint,
+retention, the audit log — applies to those lessons unchanged. See
+[Self-Learning](self-learning.md).

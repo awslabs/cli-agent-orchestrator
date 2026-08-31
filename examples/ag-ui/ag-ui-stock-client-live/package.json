@@ -1,0 +1,13 @@
+{
+  "name": "agui-stock-client-live",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AC3 stock-client live demo: pinned @ag-ui/client HttpAgent against /agui/v1/run.",
+  "scripts": {
+    "client": "node client.mjs"
+  },
+  "dependencies": {
+    "@ag-ui/client": "0.0.57"
+  }
+}

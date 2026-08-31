@@ -29,10 +29,13 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "codex",
     "copilot_cli",
     "cursor_cli",
+    "grok_cli",
     "hermes",
     "kimi_cli",
     "kiro_cli",
+    "mcode",
     "opencode_cli",
+    "omp",
 }
 
 # Validation constraints for ``--env`` forwarded vars (mirrored server-side
@@ -101,6 +104,13 @@ def _parse_env_pairs(pairs):
     help=f"Provider to use (default: profile provider or {DEFAULT_PROVIDER})",
 )
 @click.option(
+    "--engine",
+    "engine",
+    type=click.Choice(["v2", "kas"], case_sensitive=True),
+    default=None,
+    help="Explicit Kiro engine (default: profile engine or v2).",
+)
+@click.option(
     "--allowed-tools",
     multiple=True,
     help="Override allowedTools (CAO format: execute_bash, fs_read, @cao-mcp-server). Repeatable.",
@@ -143,6 +153,14 @@ def _parse_env_pairs(pairs):
     "the URL. Blocked prefixes (CLAUDE/CODEX_/__MISE_) and >=2048-byte values "
     "are rejected. See issue #248.",
 )
+@click.option(
+    "--resume-session-id",
+    "resume_session_id",
+    default=None,
+    metavar="SESSION_ID",
+    help="Resume a prior Claude Code conversation in the launched supervisor "
+    "(claude --resume <id>). claude_code provider only.",
+)
 def launch(
     message,
     agents,
@@ -150,12 +168,14 @@ def launch(
     headless,
     is_async,
     provider,
+    engine,
     allowed_tools,
     auto_approve,
     yolo,
     working_directory,
     memory,
     env_pairs,
+    resume_session_id,
 ):
     """Launch cao session with specified agent profile."""
     try:
@@ -222,12 +242,15 @@ def launch(
                     f"  Directory: {display_dir}\n"
                 )
                 if provider == "kiro_cli":
-                    # kiro-cli 2.0.1 TUI blocks on an interactive "Yes, I accept"
-                    # consent dialog when --trust-all-tools is set. CAO cannot
-                    # answer it headlessly, so yolo launches use --legacy-ui.
+                    # The kiro-cli TUI blocks on an interactive "Yes, I accept"
+                    # consent dialog when --trust-all-tools is set. CAO answers
+                    # it automatically after launch (the provider verifies the
+                    # dialog first), so no --legacy-ui suppression is needed —
+                    # and --legacy-ui must not be used, because it selects the
+                    # v1 engine, which serves the agent no MCP tools.
                     click.echo(
-                        "  Note: kiro_cli will launch in --legacy-ui mode so "
-                        "--trust-all-tools can be applied non-interactively.\n"
+                        "  Note: kiro_cli's --trust-all-tools consent dialog will be "
+                        "auto-answered at startup.\n"
                     )
                 elif provider == "opencode_cli":
                     # opencode's TUI has no runtime skip-permissions flag
@@ -276,6 +299,8 @@ def launch(
         }
         if explicit_provider:
             params["provider"] = provider
+        if engine is not None:
+            params["engine"] = engine
         if session_name:
             params["session_name"] = session_name
         if resolved_allowed_tools:
@@ -283,6 +308,8 @@ def launch(
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
         if memory:
             params["memory_manager"] = "true"
+        if resume_session_id:
+            params["resume_session_id"] = resume_session_id
 
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.

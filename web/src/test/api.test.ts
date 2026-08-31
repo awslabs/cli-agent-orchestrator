@@ -18,6 +18,7 @@ describe('API wrapper', () => {
       status,
       statusText: status === 200 ? 'OK' : 'Error',
       json: () => Promise.resolve(data),
+      text: () => Promise.resolve(JSON.stringify(data)),
     })
   }
 
@@ -104,9 +105,17 @@ describe('API wrapper', () => {
   })
 
   it('deleteSession sends DELETE', async () => {
-    mockResponse({ success: true, deleted: [], errors: [] })
+    mockResponse({ success: true, deleted: ['s1'], errors: [] })
     await api.deleteSession('s1')
     expect(mockFetch).toHaveBeenCalledWith('/sessions/s1', expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('deleteSession rejects deferred cleanup payloads', async () => {
+    mockResponse({ success: false, deleted: [], errors: [{ error: 'cleanup deferred; retry delete_session' }] })
+    await expect(api.deleteSession('s1')).rejects.toMatchObject({
+      status: 409,
+      message: 'cleanup deferred; retry delete_session',
+    })
   })
 
   it('sendInput sends POST with message', async () => {
@@ -183,6 +192,51 @@ describe('API wrapper', () => {
     await expect(api.listSessions()).rejects.toThrow('500 Internal Server Error')
   })
 
+  it('preserves string error detail on non-OK response', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      json: () => Promise.resolve({ detail: 'bad graph scope' }),
+    })
+
+    try {
+      await api.getGraph('memory', 'session')
+      throw new Error('expected rejection')
+    } catch (err: any) {
+      expect(err.status).toBe(400)
+      expect(err.detail).toBe('bad graph scope')
+      expect(err.kind).toBeUndefined()
+    }
+  })
+
+  it('preserves object error detail metadata on non-OK response', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 504,
+      statusText: 'Gateway Timeout',
+      json: () => Promise.resolve({
+        detail: {
+          message: 'graph projection timed out after 90 seconds',
+          kind: 'graph_projection_timeout',
+          timeout_s: 90,
+          metadata: { graph_projection_timeout: true },
+        },
+      }),
+    })
+
+    try {
+      await api.getGraph('memory', 'global')
+      throw new Error('expected rejection')
+    } catch (err: any) {
+      expect(err.status).toBe(504)
+      expect(err.detail).toBe('graph projection timed out after 90 seconds')
+      expect(err.kind).toBe('graph_projection_timeout')
+      expect(err.detailMeta.timeout_s).toBe(90)
+      expect(err.detailMeta.metadata.graph_projection_timeout).toBe(true)
+    }
+  })
+
   it('exitTerminal sends POST', async () => {
     mockResponse({ success: true })
     await api.exitTerminal('t1')
@@ -193,6 +247,14 @@ describe('API wrapper', () => {
     mockResponse({ success: true })
     await api.deleteTerminal('t1')
     expect(mockFetch).toHaveBeenCalledWith('/terminals/t1', expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('deleteTerminal rejects deferred cleanup payloads', async () => {
+    mockResponse({ success: false })
+    await expect(api.deleteTerminal('t1')).rejects.toMatchObject({
+      status: 409,
+      message: 'Terminal cleanup is pending; retry delete',
+    })
   })
 
   it('getMemoryStatus fetches /settings/memory', async () => {

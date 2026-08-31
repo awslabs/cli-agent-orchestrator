@@ -1,7 +1,6 @@
 """Tests for skill injection utilities."""
 
 import logging
-import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -147,20 +146,24 @@ class TestRefreshAgentMdPrompt:
         "cli_agent_orchestrator.utils.skill_injection.build_skill_catalog",
         return_value="## Skills",
     )
-    def test_writes_atomically_with_os_replace(self, _mock_catalog, tmp_path):
+    def test_writes_atomically_no_temp_file_left_behind(self, _mock_catalog, tmp_path):
+        """The write goes through locked_atomic_rewrite: no .tmp leftovers,
+        content lands correctly, regardless of the exact temp filename used
+        internally (unique per-call, unlike the old fixed ``.tmp`` suffix).
+        """
         md_path = tmp_path / "developer.agent.md"
         _write_agent_md(md_path, "developer", "Developer", "Body")
-        temp_path = md_path.with_suffix(".md.tmp")
 
         profile = AgentProfile(name="developer", description="Developer", prompt="Prompt")
 
-        with patch(
-            "cli_agent_orchestrator.utils.skill_injection.os.replace", wraps=os.replace
-        ) as mock_replace:
-            skill_injection.refresh_agent_md_prompt(md_path, profile)
+        skill_injection.refresh_agent_md_prompt(md_path, profile)
 
-        mock_replace.assert_called_once_with(temp_path, md_path)
-        assert not temp_path.exists()
+        assert _read_agent_md_body(md_path) == "Prompt\n\n## Skills"
+        # The sidecar ``.lock`` file is expected to persist (it is reused
+        # across calls, not a per-write temp file); only ``.tmp`` files must
+        # never survive.
+        leftover_tmp = [p for p in tmp_path.iterdir() if ".tmp" in p.name]
+        assert leftover_tmp == []
 
     @patch(
         "cli_agent_orchestrator.utils.skill_injection.build_skill_catalog",
@@ -214,6 +217,86 @@ class TestRefreshInstalledAgentForProfile:
         monkeypatch.setattr(skill_injection, "build_skill_catalog", lambda: "")
 
         assert skill_injection.refresh_installed_agent_for_profile("team-developer") == []
+
+    @pytest.mark.parametrize(
+        "resolved_name", ["..\\..\\evil", "a\\b", "C:\\Windows\\evil", "../../evil"]
+    )
+    def test_separator_bearing_name_stays_a_direct_child(
+        self, tmp_path, monkeypatch, resolved_name
+    ):
+        """Security regression (GHSA-6m35-gcf5-xm75): the Copilot filename is
+        derived from the resolved profile name, so a surviving separator would
+        traverse out of COPILOT_AGENTS_DIR. Only ``/`` was folded before the fix,
+        leaving ``\\`` live on Windows."""
+        copilot_dir = tmp_path / "copilot"
+        copilot_dir.mkdir()
+        monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
+        monkeypatch.setattr(
+            skill_injection,
+            "load_agent_profile",
+            lambda name: AgentProfile(name=resolved_name, description="d", prompt="p"),
+        )
+        captured = {}
+
+        def _capture(md_path, profile):
+            captured["path"] = md_path
+            return False  # as the real code does when no file exists
+
+        monkeypatch.setattr(skill_injection, "refresh_agent_md_prompt", _capture)
+
+        skill_injection.refresh_installed_agent_for_profile("some-handle")
+
+        target = captured["path"]
+        assert target.parent == copilot_dir
+        stem = target.name.replace(".agent.md", "")
+        assert "/" not in stem
+        assert "\\" not in stem
+
+
+class TestIsCaoManagedCopilotAgent:
+    """The context-file existence probe validates its segment before joining.
+
+    The name comes from the frontmatter of a file already sitting in the Copilot
+    agents dir, so it is untrusted. An unsafe name is simply not CAO-managed.
+    """
+
+    def test_valid_name_with_context_file_is_managed(self, tmp_path, monkeypatch):
+        context_dir = tmp_path / "context"
+        context_dir.mkdir()
+        (context_dir / "developer.md").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
+
+        assert skill_injection._is_cao_managed_copilot_agent("developer") is True
+
+    def test_valid_name_without_context_file_is_not_managed(self, tmp_path, monkeypatch):
+        context_dir = tmp_path / "context"
+        context_dir.mkdir()
+        monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
+
+        assert skill_injection._is_cao_managed_copilot_agent("developer") is False
+
+    @pytest.mark.parametrize("hostile", ["../../evil", "..", ".", "", "a/b", "a\\b", "a\x00b"])
+    def test_unsafe_name_is_refused(self, tmp_path, monkeypatch, hostile):
+        context_dir = tmp_path / "context"
+        context_dir.mkdir()
+        monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
+
+        assert skill_injection._is_cao_managed_copilot_agent(hostile) is False
+
+    def test_traversal_to_an_existing_file_outside_is_refused(self, tmp_path, monkeypatch):
+        """The case that isolates the segment guard from the existence check.
+
+        Without validation, ``"../evil"`` joins to ``<context>/../evil.md`` — a
+        real file here — so the probe would answer True and treat an agent whose
+        context file lives OUTSIDE the context dir as CAO-managed, feeding it to
+        the refresh path. The guard makes the answer False.
+        """
+        context_dir = tmp_path / "context"
+        context_dir.mkdir()
+        (tmp_path / "evil.md").write_text("outside", encoding="utf-8")
+        monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
+
+        assert skill_injection._is_cao_managed_copilot_agent("../evil") is False
 
 
 class TestRefreshAllCaoManagedAgents:

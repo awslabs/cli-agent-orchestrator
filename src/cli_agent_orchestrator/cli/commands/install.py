@@ -9,10 +9,10 @@ import click
 from cli_agent_orchestrator.constants import (
     CAO_ENV_FILE,
     DEFAULT_PROVIDER,
-    LOCAL_AGENT_STORE_DIR,
     PROVIDERS,
 )
 from cli_agent_orchestrator.services.install_service import install_agent, parse_env_assignment
+from cli_agent_orchestrator.services.profile_store import write_profile
 
 # Profile names are used as filesystem path segments; this matches the stricter
 # validator inside install_service.py (kept duplicated deliberately — the CLI
@@ -51,11 +51,10 @@ def _copy_local_profile_to_store(agent_source: str) -> Optional[str]:
             f"Profile filename stem '{stem}' must match [A-Za-z0-9_-]{{1,64}}."
         )
 
-    LOCAL_AGENT_STORE_DIR.mkdir(parents=True, exist_ok=True)
-    # Build the destination from the validated stem, not from source_path.name,
-    # so nothing from the user-provided string flows into the dest Path.
-    dest_file = LOCAL_AGENT_STORE_DIR / f"{stem}.md"
-    dest_file.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
+    # Pass the validated stem, not source_path.name, so nothing from the
+    # user-provided string reaches the destination path. overwrite=True keeps
+    # the pre-existing re-install behaviour of replacing the stored copy.
+    write_profile(stem, source_path.read_text(encoding="utf-8"), overwrite=True)
     return stem
 
 

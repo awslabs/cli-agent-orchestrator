@@ -1,0 +1,56 @@
+{
+  "skill_name": "cao-mcp-apps",
+  "trigger_evals": [
+    {"query": "How do I enable MCP Apps in CAO? I want to see the fleet dashboard inside Claude Desktop.", "should_trigger": true},
+    {"query": "The ui://cao/dashboard view isn't rendering in my MCP host. How do I debug this?", "should_trigger": true},
+    {"query": "I need to rebuild the MCP Apps frontend bundles after making changes to cao_mcp_apps/", "should_trigger": true},
+    {"query": "I want to add a new ui://cao/memory view that shows the memory wiki in the MCP Apps surface", "should_trigger": true},
+    {"query": "How does the submit_command mutation choke point work in the MCP Apps layer?", "should_trigger": true},
+    {"query": "The CAO web UI at localhost:9889 is showing a blank page", "should_trigger": false},
+    {"query": "How do I set up the Gemini CLI provider in CAO?", "should_trigger": false},
+    {"query": "Create a Discord notification plugin for CAO", "should_trigger": false},
+    {"query": "How do I install a new agent profile with cao install?", "should_trigger": false},
+    {"query": "Write a workflow spec for my CI pipeline", "should_trigger": false}
+  ],
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I just installed CAO and want to enable the MCP Apps surface so I can monitor my agent fleet from Claude Desktop. What do I need to do?",
+      "expected_output": "Step-by-step instructions to enable MCP Apps including setting the CAO_MCP_APPS_ENABLED environment variable, starting cao-server and cao-mcp-server, and configuring the MCP host to connect to cao-mcp-server.",
+      "assertions": [
+        "Instructs setting CAO_MCP_APPS_ENABLED=true environment variable",
+        "Mentions starting cao-server (REST + SSE on port 9889)",
+        "Mentions starting or configuring cao-mcp-server as the MCP endpoint",
+        "References the ui://cao/dashboard resource as the main fleet view",
+        "Mentions that the mcp_apps plugin must be registered/enabled",
+        "Notes that Node.js is NOT required to run the pre-built bundles"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I set CAO_MCP_APPS_ENABLED=true and started both servers, but when I ask Claude Desktop to show ui://cao/dashboard it says the resource isn't available. What's wrong?",
+      "expected_output": "Troubleshooting steps for diagnosing why the MCP Apps views aren't rendering, including checking plugin registration, verifying the environment variable is visible to cao-mcp-server, checking MCP host capability support, and verifying the built bundles exist.",
+      "assertions": [
+        "Checks that CAO_MCP_APPS_ENABLED=true is set in the environment where cao-mcp-server runs (not just cao-server)",
+        "Verifies the mcp_apps plugin loaded by checking server startup logs or plugin list",
+        "Checks whether the MCP host supports the Apps extension (SEP-1865 capability advertisement)",
+        "Suggests verifying built bundle files exist in the expected location under cao_mcp_apps/ or ext_apps/",
+        "Mentions checking cao-mcp-server logs for resource registration errors",
+        "Suggests restarting both cao-server and cao-mcp-server after setting the env var"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I want to add a new ui://cao/logs view to the MCP Apps surface that shows real-time terminal logs. Where do I start and what's the pattern?",
+      "expected_output": "Guidance on adding a new MCP Apps view including creating the React component in cao_mcp_apps/, registering the resource URI, building the bundle, and following the existing patterns from dashboard/agent/event-stream views.",
+      "assertions": [
+        "Points to cao_mcp_apps/ as the directory for view source files",
+        "References existing views (dashboard, agent, event-stream) as patterns to follow",
+        "Explains that the view must be registered as a ui://cao/logs resource in the MCP server",
+        "Mentions running the build command (npm run build or similar) to produce the single-file bundle",
+        "References the resource registration in src/cli_agent_orchestrator/mcp_server/ or ext_apps/",
+        "Mentions the submit_command tool as the mutation path if the view needs to trigger actions"
+      ]
+    }
+  ]
+}

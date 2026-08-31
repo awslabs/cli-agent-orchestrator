@@ -242,6 +242,24 @@ class TestHermesBuildCommand:
         assert "--model deepseek-v4-flash-free" in command
 
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
+    def test_explicit_model_override_wins_over_profile_model(self, mock_load):
+        mock_profile = self._profile("test-worker")
+        mock_profile.model = "deepseek-v4-flash-free"
+        mock_load.return_value = mock_profile
+
+        provider = HermesProvider("tid", "sess", "win", "developer", model="fable-5")
+        command = provider._build_hermes_command()
+
+        assert "--model fable-5" in command
+        assert "--model deepseek-v4-flash-free" not in command
+
+    def test_explicit_model_override_applies_with_no_agent_profile(self):
+        provider = HermesProvider("tid", "sess", "win", None, model="fable-5")
+        command = provider._build_hermes_command()
+
+        assert "--model fable-5" in command
+
+    @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     def test_build_command_quotes_profile_with_spaces_or_shell_metacharacters(self, mock_load):
         mock_load.return_value = self._profile("test worker; rm -rf /")
 
@@ -274,9 +292,9 @@ class TestHermesInitialization:
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.hermes.wait_until_status")
     @patch("cli_agent_orchestrator.providers.hermes.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
+    @patch("cli_agent_orchestrator.providers.hermes.get_backend")
     async def test_initialize_success(
-        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_load
+        self, mock_backend_factory, mock_wait_shell, mock_wait_status, mock_load
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
@@ -286,7 +304,7 @@ class TestHermesInitialization:
         result = await provider.initialize()
 
         assert result is True
-        mock_tmux.send_keys.assert_called_once_with(
+        mock_backend_factory.return_value.send_keys.assert_called_once_with(
             "sess", "win", "test-worker chat --yolo --accept-hooks --source cao"
         )
 
@@ -303,9 +321,9 @@ class TestHermesInitialization:
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.hermes.wait_until_status")
     @patch("cli_agent_orchestrator.providers.hermes.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
+    @patch("cli_agent_orchestrator.providers.hermes.get_backend")
     async def test_initialize_hermes_timeout(
-        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_load
+        self, mock_backend_factory, mock_wait_shell, mock_wait_status, mock_load
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False

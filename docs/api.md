@@ -1,403 +1,335 @@
-# CLI Agent Orchestrator API Documentation
+# API Overview
 
-Base URL: `http://localhost:9889` (default)
+The default base URL is `http://localhost:9889`.
 
-## Health Check
+This page maps the public API by family and gives representative requests.
+When `cao-server` is running, its generated FastAPI OpenAPI schema and schema
+UI are the exhaustive contract for individual HTTP operations. OpenAPI does
+not describe WebSocket behavior; the PTY WebSocket contract is documented
+below.
 
-### GET /health
-Check if the server is running.
+## Representative HTTP usage
 
-**Response:**
-```json
-{
-  "status": "ok",
-  "service": "cli-agent-orchestrator"
-}
+```bash
+curl http://localhost:9889/health
+curl http://localhost:9889/sessions
+curl http://localhost:9889/agents/providers
 ```
 
----
+HTTP errors use standard status codes and generally return a JSON `detail`
+field. Authentication and network behavior depend on server configuration;
+see [Configuration](configuration.md) and [Security](../SECURITY.md).
 
-## Providers
+## HTTP route families
 
-### GET /agents/providers
-List available providers with installation status.
+### Health and auth discovery
 
-**Response:** Array of provider objects
-```json
-[
-  {
-    "name": "kiro_cli",
-    "binary": "kiro-cli",
-    "installed": true
-  },
-  {
-    "name": "claude_code",
-    "binary": "claude",
-    "installed": true
-  },
-  {
-    "name": "codex",
-    "binary": "codex",
-    "installed": true
-  },
-  {
-    "name": "kimi_cli",
-    "binary": "kimi",
-    "installed": false
-  },
-  {
-    "name": "hermes",
-    "binary": "hermes",
-    "installed": true
-  },
-  {
-    "name": "copilot_cli",
-    "binary": "copilot",
-    "installed": false
-  }
-]
+- `GET /health` reports service health.
+- `GET /.well-known/oauth-protected-resource` publishes OAuth protected
+  resource metadata when applicable.
+
+### Events and AG-UI
+
+- `/events` and `/events/history` expose server events.
+- `/agui/v1/stream` and `/agui/v1/emit_ui` provide the AG-UI stream and
+  generative UI input.
+
+See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
+
+### Profiles, providers, and settings
+
+- `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
+  installed profiles.
+- `GET /agents/profiles/search` ranks installed, loadable profiles by capability
+  using the same service as `cao profile find`.
+- `GET /agents/profiles/templates` lists public template metadata (`name` and
+  `description` only); internal template filesystem paths are never returned.
+- `GET /agents/profiles/templates/{category}/{name}/schema` returns a template's
+  JSON-Schema.
+- `POST /agents/profiles/templates/validate` validates a config object against
+  a template's JSON-Schema without writing a profile.
+- `POST /agents/profiles/templates/preview` validates and renders a template to
+  Markdown without writing a profile.
+- `POST /agents/profiles/validate` validates a finished profile's frontmatter
+  against the profile JSON-Schema plus CAO conventions, without writing
+  anything. This is the HTTP equivalent of `cao profile validate`, and is
+  distinct from `templates/validate`, which checks a template *config* against
+  that template's own schema. Findings are severity-tagged (`error` or
+  `warning`); only errors clear the `valid` flag, so warnings are advisory.
+- `GET /agents/profiles/schema` returns the agent profile JSON-Schema, so a
+  client can render create and edit forms from the server's definition instead
+  of duplicating the field list.
+- `POST /agents/profiles/install` installs a profile.
+- `POST /agents/profiles` creates a profile in the local store from a supplied
+  document. Named distinctly from `install`, which takes a bare profile name or
+  an https:// URL rather than the document itself. The request carries `name`
+  and `content`; the two identities of a profile, its storage key and its
+  frontmatter `name`, must agree, so a mismatch is a 400 rather than a silent
+  rename. A conflicting name returns 409. Requires `cao:write` or `cao:admin`.
+- `PUT /agents/profiles/{name}` replaces an existing local-store profile and
+  never creates one. A request naming a built-in or provider-managed profile
+  returns 404 rather than writing a local file that would shadow the original.
+  Requires `cao:write` or `cao:admin`.
+- `DELETE /agents/profiles/{name}` removes a profile from the local store.
+  Requires `cao:write` or `cao:admin`, the same guard as create and replace, so
+  one credential covers the whole create/edit/delete cycle. Scopes are a flat
+  set rather than a hierarchy, so requiring admin here would 403 a caller
+  holding exactly `cao:write`. Built-ins are not deletable, for the same reason
+  they are not replaceable.
+- Both write routes run the profile validator on the exact submitted document
+  before persisting anything, so an invalid profile never reaches disk. Errors
+  reject the request with 400 and the findings attached; warnings do not block
+  the write and are returned in the response so a client can surface them after
+  a successful save.
+- The validator rejects non-string mapping keys. A profile is written as YAML,
+  which allows any scalar as a key, but the format is described by JSON Schema,
+  where object keys are strings. Without this rule `mcpServers: {1: {...}}`
+  validates clean and persists, then fails to load, since the model requires
+  string keys. Note YAML also auto-types an unquoted date, so `2026-01-01:` is a
+  date key rather than a string; quote such keys.
+- A document is rejected up front if it cannot safely be handed to the steps that
+  follow, on any of three grounds: how large it renders, how deeply it nests, or
+  whether it contains a cycle. The reason is that YAML anchors decouple a
+  document's rendered size from its byte count, and the schema step interpolates a
+  rendering of an offending value into every error message it builds. Chained
+  anchors multiply structure, and aliasing one large scalar multiplies content, so
+  a request under the 256 KB `content` cap can render to gigabytes either way. The
+  ceilings are therefore in *rendered bytes*, the unit that cost is paid in: at
+  most 1 MB, about 3.8x the largest request that can arrive and ~2060x the largest
+  bundled profile's 485 bytes, and at most 64 levels of nesting (~21x). Exceeding
+  either is itself an error and nothing further runs, since the later steps are
+  what such a document is expensive in. A cycle is rejected rather than measured:
+  it has no finite rendering, and the providers that consume a profile cannot
+  serialize one, so accepting it would persist a document the runtime cannot
+  install. Individual schema findings are also length-capped before they reach a
+  response, which bounds the case where several fields each render a subtree.
+- Within those bounds, containers already visited are skipped, so each offending
+  mapping key is reported once, at the first path that reaches it. Note that
+  differs from the schema step, which does not memoize and so reports a shared
+  invalid value once per referencing path.
+- An `mcpServers` entry must define either `command`, for a server CAO launches,
+  or `url`, for a remote one whose `type` names its transport. The schema
+  previously required `command` unconditionally, which made the write routes
+  reject url-based servers that the runtime accepts and passes through to the
+  provider unchanged. An entry defining neither is still rejected. `url` is the
+  spelling `resolve_mcp_server_config` documents; an entry naming its endpoint
+  under any other key satisfies neither branch and is rejected.
+- Every 400 from the profile write and source routes uses one `detail` shape,
+  `{"message", "errors"}`, so a client never has to switch on the type of
+  `detail`. `errors` is empty for a failure that is not attributable to a field,
+  but the key is always present. This covers rejected names as well as schema
+  findings. 404 and 409 keep FastAPI's conventional bare-string `detail`, since
+  the status code already discriminates and there are no findings to attach.
+- `GET /agents/profiles/{name}/source` returns a profile's document exactly as
+  stored. Use this, not `GET /agents/profiles/{name}`, when the document is
+  going to be edited and written back: that route returns the *resolved*
+  profile, having applied `${VAR}` substitution from the managed environment
+  file to the raw text before parsing. Round-tripping a resolved document
+  through a write would persist substituted values into a plaintext profile.
+  Requires `cao:read`, `cao:write`, or `cao:admin`, the same guard the profile
+  reads beside it now carry. Gating matters at least as much here as on the parsed
+  route, because this one returns the stored bytes verbatim from every configured
+  store, including documents that fail to parse.
+- Template validation and preview require the selected template to include a
+  `schema.json` file.
+- `/agents/providers` reports provider availability.
+- `/settings/*` exposes supported agent-directory, skill-directory, and memory
+  settings.
+
+See [Agent Profiles](agent-profile.md) and
+[Configuration](configuration.md).
+
+### Skills
+
+- `/skills/{name}` retrieves an installed skill.
+
+See [Skills](skills.md) for discovery, installation, and catalog behavior.
+
+### Sessions and terminals
+
+- `/sessions*` creates, lists, inspects, and deletes sessions.
+- `/sessions/{session_name}/terminals*` creates and lists session terminals.
+  The list is ordered oldest-first, and index 0 is the session's conductor —
+  `cao session status`/`list` rely on that. Sort client-side on `last_active`
+  if you need a different order.
+- `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
+  output and working-directory state, exits providers, and deletes terminals.
+- `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
+  rolling buffer (most recent `state_buffer_max` bytes of streamed output —
+  server setting, 32KB by default, see [Configuration](configuration.md)),
+  not unbounded scrollback. Long sessions are truncated to the tail; use the
+  on-disk terminal log for complete history.
+- Terminal creation accepts `use_worktree` (bool, default `false`, issue #100
+  Phase 1): provisions an isolated `git worktree` on its own branch instead of
+  sharing `working_directory` as given, requiring the resolved directory to be
+  inside a git repository. At deletion, the worktree's working-tree contents
+  are always discarded, but the branch is only deleted if it has no unmerged
+  commits — commit and merge/push results before the terminal is deleted if
+  they need to be kept. See the MCP `handoff`/`assign` tool descriptions for
+  the full behavior.
+- `POST /sessions` accepts optional `group`/`metadata` at creation, opting a
+  session's initial terminal into peer discovery (a mid-session worker uses
+  `PATCH /terminals/{terminal_id}/group`/`metadata` instead — see below).
+  `group` is an ordered, general-to-specific array (e.g.
+  `["tenant_1", "project_5"]`); `metadata` is a free-form JSON object the
+  running agent updates via the `update_metadata` MCP tool. Both PATCH
+  endpoints are whole-value replace, not merge, last-write-wins under
+  concurrent calls, and reject an omitted field with `422` (an explicit
+  `null`/`[]`/`{}` clears the value; omitting it does not).
+- `GET /terminals/{terminal_id}/siblings` lists other terminals sharing a
+  leading prefix of `terminal_id`'s own `group`, optionally narrowed by
+  `depth`; a caller can never see a wider scope than its own group, and a
+  terminal with no `group` set finds no siblings. Session-scoped by default
+  — results are also filtered to the caller's own tmux session unless the
+  explicit `cross_session=true` opt-in is passed. Sibling `metadata` is
+  agent-authored, untrusted content — same trust domain as an inbound
+  `send_message` body. The `list_siblings`/`update_metadata` MCP tools also
+  require the `discovery` entry in `allowedTools` — a separate opt-in from
+  orchestration tools, not bundled into `@cao-mcp-server` — see
+  [Tool Restrictions](tool-restrictions.md) and
+  [Discovery Tool Coexistence](discovery-tool-coexistence.md).
+
+**`group` is an organizational label, not a security boundary.** On a
+default install with auth disabled, a worker already has local shell access
+to this API, so `group`/`discovery`/session-scoping provide no tenant
+isolation or access-control guarantee even used together — do not build a
+security boundary on top of them.
+
+Terminal identifiers used in these routes are eight-character hexadecimal
+strings. See [Control Planes](control-planes.md) for operator-facing choices.
+
+### Inbox
+
+- `/terminals/{terminal_id}/inbox/messages` sends and reads terminal inbox
+  messages.
+
+Agents normally use the in-session
+[supervisor protocols](../skills/cao-supervisor-protocols/SKILL.md) rather
+than calling these routes directly.
+
+### Workflows
+
+- `/workflows*` validates and inspects workflow specifications.
+- `POST /workflows/runs` starts a run **inline** and holds the connection until it
+  finishes, returning the complete result.
+- `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
+  `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
+  the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
+  `events` appears only on a build that serves the events route, so treat it as optional.
+- `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`).
+- `GET /workflows/runs/{run_id}` **inspects** a run: run metadata, current state, and
+  each step's durable projection — including the step's full `output_json` and
+  `error` text. ⚠️ This is the most payload-bearing read on the surface, and the
+  output it returns is **not** gated by `workflow_journal_capture_output`; see the
+  retention note in [Configuration](configuration.md#memory-memory). It is a
+  superset of the older status-snapshot shape, so callers reading only
+  `state`/`current_step_id`/`steps[].{id,state,attempts}` are unaffected.
+- `GET /workflows/runs/{run_id}/result` returns the complete retained result. It is
+  assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
+  run — not only a finished one. No run-level `output` field is returned (run-level output
+  is not journaled); per-step outputs are on `steps[].output`.
+- `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
+  `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
+- `GET /workflows/runs/{run_id}/events` returns the run's ordered event timeline with
+  any **declared** gaps. One content-negotiated path, two arms: send
+  `Accept: text/event-stream` (or `?stream=true`) for a live SSE follow, otherwise a
+  JSON page. `?after_seq=` is the replay cursor and must be `>= 0`; on the SSE arm it
+  takes precedence over `Last-Event-ID`. A gap is data the server declares when an
+  append was lost — never inferred by the client from seq numbering.
+- `GET /workflows/runs/{run_id}/compare?against={other_run_id}` reports per-step
+  differences between two runs. Outputs are compared at the reference level, never by
+  diffing payloads. An unknown id on **either** side is a 404, not a partial compare.
+- `GET /workflows/runs/{run_id}/diagnostics` returns a troubleshooting bundle: spec
+  identifier + content hash, sanitized inputs, the event timeline with declared gaps,
+  step outcomes, provider/agent/engine environment, and terminal/artifact references.
+  Output excerpts appear only when `workflow_journal_capture_output` is on;
+  `capture_enabled` in the body declares which posture produced the bundle.
+- `DELETE /workflows/runs/{run_id}` removes a run and all its retained data (run row,
+  steps, events, seq high-water) in one cascade. Requires a write or admin scope.
+  A **running** run returns 409 — cancel it first; an already-absent run returns 204.
+- `GET /terminals/{id}/output/range?start=&length=` reads a byte-exact window of a
+  terminal's append-only log, for correlating a step with the terminal output it
+  produced. `length` is capped server-side.
+
+All five reads above (inspect, events, compare, diagnostics, and the run list)
+require a `cao:read`, `cao:write`, or `cao:admin` scope **when authentication is
+enabled**. With `CAO_AUTH_ENABLED` unset — the default — that check is inert.
+
+See [Workflows](workflows.md).
+
+### Memory and graph
+
+- `/settings/memory` reports memory enablement (including `learning_enabled`).
+- `/memory*` lists, reads, exports, and deletes memories.
+- `/memory/relationships*` lists, creates, patches, promotes, rejects, and
+  soft-deletes typed relationships between memories. `GET` is read-scoped and
+  capped by `limit` (default 50, max 100); the mutating routes are write-scoped.
+  `DELETE` is a soft-delete — the row is retained with `status=deleted`.
+- `/graph/{provider}*` projects and exports graph views.
+- `/outcomes` records (`POST`, write-scope) and lists (`GET`) workflow
+  outcomes for the self-learning loop. Both return 404 while
+  `memory.learning_enabled` is false.
+
+See [Memory](memory.md), [Self-Learning](self-learning.md), and
+[Knowledge Graph Viewing](knowledge-graph-viewing.md).
+
+### Flows
+
+- `/flows*` creates, lists, reads, deletes, enables, disables, and runs
+  scheduled flows.
+
+See [Flows](flows.md).
+
+## PTY WebSocket
+
+Connect to:
+
+```text
+/terminals/{terminal_id}/ws
 ```
 
-**Note:** The `installed` field checks if the provider binary is available in the system PATH via `shutil.which()`.
+The path must identify an existing terminal. This endpoint is unauthenticated
+and grants full read/write access to that terminal's PTY.
 
----
+### Client access boundary
 
-## Sessions
+By default, only loopback clients identified as `127.0.0.1`, `::1`, or
+`localhost` are allowed. `CAO_WS_ALLOWED_CLIENTS` adds comma-separated client
+IP addresses or hostnames to that allowlist. A literal `*` disables the
+client-IP restriction.
 
-### POST /sessions
-Create a new session with one terminal.
+Adding clients or using `*` gives those clients full PTY read/write access.
+Treat either change as a security-boundary change and do not expose the
+endpoint to untrusted networks. See the
+[network configuration](configuration.md#network-network--env-var-only) for
+related server settings.
 
-**Parameters:**
-- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", "antigravity_cli", "hermes", "kimi_cli", "copilot_cli", "opencode_cli", or "cursor_cli")
-- `agent_profile` (string, required): Agent profile name
-- `session_name` (string, optional): Custom session name
-- `working_directory` (string, optional): Working directory for the agent session
+### Frames and messages
 
-**Response:** Terminal object (201 Created)
+The server sends binary WebSocket frames containing raw PTY bytes.
 
-### GET /sessions
-List all sessions.
+Clients send JSON in text frames:
 
-**Response:** Array of session objects
-
-### GET /sessions/{session_name}
-Get details of a specific session.
-
-**Response:** Session object with terminals list
-
-### DELETE /sessions/{session_name}
-Delete a session and all its terminals.
-
-**Response:**
 ```json
-{
-  "success": true
-}
+{"type":"input","data":"ls -la\n"}
 ```
 
----
+The `input` message writes the UTF-8 string in `data` to the PTY.
 
-## Terminals
-
-**Note:** All `terminal_id` path parameters must be 8-character hexadecimal strings (e.g., "a1b2c3d4").
-
-### POST /sessions/{session_name}/terminals
-Create an additional terminal in an existing session.
-
-**Parameters:**
-- `provider` (string, required): Provider type
-- `agent_profile` (string, required): Agent profile name
-- `working_directory` (string, optional): Working directory for the terminal
-- `allowed_tools` (string, optional): Comma-separated list of allowed CAO tools for the worker.
-- `caller_id` (string, optional): Terminal ID of the creating terminal (8-character hexadecimal). Recorded so `send_message` can default replies to the caller (issue #284).
-- `defer_init` (bool, optional, default `false`): When `true`, return as soon as the tmux window and DB record exist, without waiting for `provider.initialize()` to finish. The provider is still created and initialized — but on a background asyncio task on cao-server, so the HTTP round-trip stays under ~2s regardless of provider startup latency. Used by the MCP `assign` tool to keep tool-call latency well under kiro-cli 2.11's ~60s per-tool client timeout, and to allow multiple concurrent assigns to run their init phases in parallel.
-
-**Request body (optional, JSON):** the deferred-init message payload is sent in the body — not query params — so prompt content is not exposed in HTTP access logs and is not subject to URL-length limits.
-- `initial_message` (string, optional): When `defer_init=true`, this message is delivered to the newly created worker via `send_input` after `provider.initialize()` completes. Ignored if `defer_init=false`. Ordering: init runs first, then message delivery, both on the same background task.
-- `initial_message_orchestration_type` (string, optional): One of `assign` or `handoff`. Passed through to `send_input` for plugin event emission when `initial_message` is delivered.
-
-**Response:** Terminal object (201 Created). When `defer_init=true`, the returned status is `unknown` (the provider is still initializing on a background task); poll `GET /terminals/{id}` for the live status before sending further input.
-
-### GET /sessions/{session_name}/terminals
-List all terminals in a session.
-
-**Response:** Array of terminal objects
-
-### GET /terminals/{terminal_id}
-Get terminal details.
-
-**Response:** Terminal object
 ```json
-{
-  "id": "string",
-  "name": "string",
-  "provider": "kiro_cli|claude_code|codex|antigravity_cli|hermes|kimi_cli|copilot_cli|opencode_cli|cursor_cli",
-  "session_name": "string",
-  "agent_profile": "string",
-  "caller_id": "string|null",
-  "status": "idle|processing|completed|waiting_user_answer|error",
-  "last_active": "timestamp"
-}
+{"type":"resize","rows":24,"cols":80}
 ```
 
-### POST /terminals/{terminal_id}/input
-Send input to a terminal.
+The `resize` message changes the PTY dimensions. Missing values default to 24
+rows and 80 columns.
 
-**Parameters:**
-- `message` (string, required): Message to send
+### Close outcomes
 
-**Response:**
-```json
-{
-  "success": true
-}
-```
+- `4003`: the client is restricted, or terminal/backend target metadata is
+  invalid.
+- `4004`: the terminal does not exist, or the backend cannot attach to it.
+- A normal viewer disconnect detaches that viewer and preserves the session.
 
-### POST /terminals/{terminal_id}/key
-Send a tmux key sequence to a terminal. Use this for interactive prompts that
-require non-text key presses, such as Hermes clarify picker navigation.
-
-The endpoint is generic, but the only in-tree structured consumer today is the
-Hermes path of `answer_user_prompt`. Other providers can use it in the future
-when they expose equivalent prompt states or key-navigation flows.
-
-**Parameters:**
-- `key` (string, required): allowed tmux key name: `Up`, `Down`, `Left`,
-  `Right`, `Enter`, `Tab`, `Escape`, `Space`, a single alphanumeric key, or a
-  `C-`, `M-`, or `S-` modifier combo such as `C-c` or `M-x`
-
-**Response:**
-```json
-{
-  "success": true
-}
-```
-
-### GET /terminals/{terminal_id}/output
-Get terminal output.
-
-**Parameters:**
-- `mode` (string, optional): Output mode - "full" (default), "last", or "tail"
-  - `"full"` returns the StatusMonitor rolling buffer (most recent ~8KB of streamed output), not unbounded scrollback. Long sessions are truncated to the tail; use the on-disk terminal log for complete history.
-
-**Response:**
-```json
-{
-  "output": "string",
-  "mode": "string"
-}
-```
-
-### GET /terminals/{terminal_id}/working-directory
-Get the current working directory of a terminal's pane.
-
-**Response:**
-```json
-{
-  "working_directory": "/home/user/project"
-}
-```
-
-**Note:** Returns `null` if working directory is unavailable.
-
-### POST /terminals/{terminal_id}/exit
-Send provider-specific exit command to terminal.
-
-**Behavior:**
-- Calls the provider's `exit_cli()` method to get the exit command
-- Text commands (e.g., `/exit`, `quit`) are sent as literal text via `send_input()`
-- Key sequences prefixed with `C-` or `M-` (e.g., `C-d` for Ctrl+D) are sent as tmux key sequences via `send_special_key()`, which tmux interprets as actual key presses
-
-| Provider | Exit Command | Type |
-|----------|-------------|------|
-| kiro_cli | `/exit` | Text |
-| claude_code | `/exit` | Text |
-| codex | `/exit` | Text |
-| antigravity_cli | `/exit` | Text |
-| hermes | `/exit` | Text |
-| kimi_cli | `/exit` | Text |
-| copilot_cli | `/exit` | Text |
-
-**Response:**
-```json
-{
-  "success": true
-}
-```
-
-### DELETE /terminals/{terminal_id}
-Delete a terminal.
-
-**Response:**
-```json
-{
-  "success": true
-}
-```
-
----
-
-## Inbox (Terminal-to-Terminal Messaging)
-
-### POST /terminals/{receiver_id}/inbox/messages
-Send a message to another terminal's inbox.
-
-**Parameters:**
-- `sender_id` (string, required): Sender terminal ID
-- `message` (string, required): Message content
-
-**Response:**
-```json
-{
-  "success": true,
-  "message_id": "string",
-  "sender_id": "string",
-  "receiver_id": "string",
-  "created_at": "timestamp"
-}
-```
-
-**Behavior:**
-- Messages are queued and delivered when the receiver terminal is IDLE
-- Messages are delivered in order (oldest first)
-- Delivery is automatic via event-driven status detection
-
----
-
-## Memory
-
-REST mirror of the `cao memory` CLI. All `/memory` endpoints return `404` with
-`"Memory system is disabled"` when `memory.enabled` is false in settings.json;
-use `GET /settings/memory` to discover the enabled state (e.g. for hiding UI).
-
-Keys must match `^[a-z0-9-]{1,60}$` and `scope_id` must match
-`^[a-zA-Z0-9._-]{1,128}$`; malformed values return `422`.
-
-Because the server's working directory is not the user's project, project scope
-is addressed by an explicit `scope_id` query parameter (the resolved project
-ID). This intentionally diverges from the MCP `memory_forget` tool, which
-resolves context from the calling terminal.
-
-Known inconsistency: the internal `GET /terminals/{id}/memory-context` endpoint
-predates this contract and returns an empty `200` (not `404`) when memory is
-disabled.
-
-### GET /settings/memory
-Return whether the memory subsystem is enabled.
-
-**Response:**
-```json
-{
-  "enabled": true
-}
-```
-
-### GET /memory
-List stored memories across all projects (the CLI's `cao memory list --all`).
-
-**Parameters:**
-- `scope` (string, optional): Filter by scope (`global`, `project`, `session`, `agent`)
-- `type` (string, optional): Filter by memory type (`user`, `feedback`, `project`, `reference`)
-- `scope_id` (string, optional): Filter to one project/session/agent
-- `limit` (integer, optional): Max results, 1–100 (default: 50)
-
-**Response:**
-```json
-[
-  {
-    "key": "string",
-    "scope": "string",
-    "scope_id": "string|null",
-    "memory_type": "string",
-    "tags": "string",
-    "created_at": "timestamp",
-    "updated_at": "timestamp"
-  }
-]
-```
-
-`scope_id` is the project ID for project memories, the session/agent ID for
-those scopes, and `null` for global.
-
-### GET /memory/export
-Export one memory scope as an archive bundle (the CLI's `cao memory export`).
-Streams a gzipped tarball of the OKF bundle (topic files plus `index.md` and
-`manifest.md`).
-
-**Parameters:**
-- `scope` (string, required): Scope to export (`global`, `project`, or `federated`; `400` for the private `session`/`agent` scopes — there is no include-private escape hatch over HTTP)
-- `format` (string, optional): Archive format (default: `okf`; `400` on unknown formats)
-- `scope_id` (string): Required for `project` scope (`400` if missing)
-- `include_history` (boolean, optional): Include `history/<key>.md` files (default: `false`)
-- `redact` (boolean, optional): Redact secret matches instead of skipping the topic (default: `false`)
-
-**Response:** `200` with `Content-Type: application/gzip` — the bundle tarball
-as the response body.
-
-When API auth is enabled, this endpoint requires a token carrying at least the
-read scope (`cao:read`, `cao:write`, or `cao:admin`); requests without one are
-`403`'d.
-
-### GET /memory/{key}
-Show a memory by key (first match wins when the same key exists in several
-scopes; narrow with `scope`/`scope_id`).
-
-**Parameters:**
-- `scope` (string, optional): Scope to search in
-- `scope_id` (string, optional): Project/session/agent to search in
-
-**Response:** the list entry shape plus `"content"` (the latest wiki section).
-`404` if no exact key match.
-
-### DELETE /memory/{key}
-Delete a memory by key.
-
-**Parameters:**
-- `scope` (string, optional): Scope of the memory (default: `project`)
-- `scope_id` (string): Required for `project`, `session`, and `agent` scopes (`400` if missing)
-
-**Response:**
-```json
-{
-  "success": true
-}
-```
-
-`404` if the key does not exist in the scope.
-
-### DELETE /memory
-Clear all memories in a scope. Best-effort: deletion continues past
-per-item failures and reports how many were removed.
-
-**Parameters:**
-- `scope` (string, required): Scope to clear
-- `scope_id` (string): Required for `project`, `session`, and `agent` scopes (`400` if missing)
-
-**Response:**
-```json
-{
-  "success": true,
-  "deleted_count": 3
-}
-```
-
----
-
-## Error Responses
-
-All endpoints return standard HTTP status codes:
-
-- `200 OK`: Success
-- `201 Created`: Resource created
-- `400 Bad Request`: Invalid parameters
-- `404 Not Found`: Resource not found
-- `500 Internal Server Error`: Server error
-
-Error response format:
-```json
-{
-  "detail": "Error message"
-}
-```
-
----
+Malformed JSON, missing input data, unsupported message types, and other
+forwarding errors do not currently have a documented stable application close
+code.

@@ -72,6 +72,32 @@ class TerminalBackend(ABC):
         """
         ...
 
+    def session_exists_strict(self, session_name: str) -> bool:
+        """Check if a session exists, RAISING when the lookup cannot be answered.
+
+        Semantics differ from ``session_exists`` only in the error case:
+        ``session_exists`` collapses a lookup error into False ("assume
+        absent"), whereas this must distinguish a confirmed absence (return
+        False) from an inability to tell (raise). Teardown confirmation MUST
+        use this so a transient backend error is never misread as "session
+        gone" (#498).
+
+        Implementations must query in a way that keeps the two apart. That is a
+        real constraint, not a formality: a client library that swallows its own
+        transport errors and reports an empty result set makes a lookup failure
+        LOOK like an absence, and a strict check layered over it fails OPEN no
+        matter what it does with its own exceptions. ``TmuxBackend`` therefore
+        issues its own ``list-sessions`` and classifies the exit status
+        (``clients/tmux.py``) rather than using libtmux's session collection.
+
+        The default implementation delegates to ``session_exists`` for backends
+        that cannot yet make the distinction; those backends therefore retain the
+        old lenient, fail-OPEN behavior, and the teardown guarantee is only as
+        strong as this method. HerdrBackend is in that position — tracked as a
+        follow-up.
+        """
+        return self.session_exists(session_name)
+
     @abstractmethod
     def list_sessions(self) -> List[Dict[str, str]]:
         """List all sessions managed by this backend.
@@ -85,11 +111,20 @@ class TerminalBackend(ABC):
     def kill_session(self, session_name: str) -> bool:
         """Kill/destroy a session.
 
+        Implementations MUST NOT return True on a merely-dispatched kill: session
+        teardown treats True as proof the session is gone and only then drops the
+        matching registry rows, so an optimistic True is what lets tmux and the
+        registry diverge (#498). Confirm the session is actually gone — poll if
+        the kill is asynchronous — before returning True.
+
         Args:
             session_name: Session to kill
 
         Returns:
-            True if session was killed, False if not found
+            True once the session is confirmed gone; False if it was not found
+            OR the kill could not be confirmed within the backend's bound. A
+            caller that must tell those two apart re-checks existence itself via
+            ``session_exists_strict``.
         """
         ...
 
@@ -155,7 +190,14 @@ class TerminalBackend(ABC):
             window_name: Target window
             keys: Text to send
             enter_count: Number of Enter keys to send after the text
-            force_bracketed_paste: If True, wrap in bracketed paste sequences
+            force_bracketed_paste: If True, request bracketed-paste delivery.
+                The herdr backend wraps content in \\x1b[200~...\\x1b[201~
+                itself (it writes raw bytes to the pty, no sanitization). The
+                tmux backend hand-crafts the same wrap on tmux < 3.7 but must
+                delegate to ``paste-buffer -p`` on >= 3.7, where pasted
+                buffers are vis(3)-sanitized and raw ESC bytes would arrive
+                as literal "^[[200~" (issue #413); -p emits markers only when
+                the pane enabled DECSET 2004.
             submit_delay: Seconds to wait after pasting before sending Enter, so
                 a TUI (e.g. Claude Code's Ink renderer) finishes processing the
                 paste before submission. Backends without a paste step may ignore.

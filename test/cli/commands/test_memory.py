@@ -322,6 +322,43 @@ class TestMemoryLint:
 
     @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    @patch(
+        "cli_agent_orchestrator.services.settings_service.is_memory_lint_enabled",
+        return_value=False,
+    )
+    def test_lint_disabled_table_skips_expensive_work(
+        self, mock_lint_enabled, mock_get_svc, mock_run_lint
+    ):
+        runner = CliRunner()
+        result = runner.invoke(lint_cmd, [])
+
+        assert result.exit_code == 0
+        assert "Memory lint is disabled by configuration" in result.stdout
+        mock_get_svc.assert_not_called()
+        mock_run_lint.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    @patch(
+        "cli_agent_orchestrator.services.settings_service.is_memory_lint_enabled",
+        return_value=False,
+    )
+    def test_lint_disabled_json_stdout_remains_parseable(
+        self, mock_lint_enabled, mock_get_svc, mock_run_lint
+    ):
+        import json
+
+        runner = CliRunner()
+        result = runner.invoke(lint_cmd, ["--format", "json"])
+
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == []
+        assert "Memory lint is disabled by configuration" in result.stderr
+        mock_get_svc.assert_not_called()
+        mock_run_lint.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
     def test_lint_json_stdout_is_pure_json(self, mock_get_svc, mock_run_lint):
         """The completion line must not pollute stdout under --format json."""
         import json
@@ -405,6 +442,54 @@ class TestMemoryLint:
 
 class TestMemoryHeal:
     """cao memory heal — dry-run default, --apply gate, poison dual-gate."""
+
+    @patch("cli_agent_orchestrator.services.wiki_healer.heal", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    @patch(
+        "cli_agent_orchestrator.services.settings_service.is_memory_lint_enabled",
+        return_value=False,
+    )
+    def test_heal_disabled_dry_run_skips_lint_and_heal(
+        self, mock_lint_enabled, mock_get_svc, mock_run_lint, mock_heal
+    ):
+        runner = CliRunner()
+        result = runner.invoke(heal_cmd, ["--scope", "project"])
+
+        assert result.exit_code == 0
+        assert "Memory lint is disabled by configuration" in result.stdout
+        mock_get_svc.assert_not_called()
+        mock_run_lint.assert_not_called()
+        mock_heal.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.wiki_healer.heal", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    @patch(
+        "cli_agent_orchestrator.services.settings_service.is_memory_lint_enabled",
+        return_value=False,
+    )
+    def test_heal_disabled_apply_skips_lint_and_heal(
+        self, mock_lint_enabled, mock_get_svc, mock_run_lint, mock_heal
+    ):
+        runner = CliRunner()
+        result = runner.invoke(heal_cmd, ["--scope", "project", "--apply"])
+
+        assert result.exit_code == 0
+        assert "Memory lint is disabled by configuration" in result.stdout
+        mock_get_svc.assert_not_called()
+        mock_run_lint.assert_not_called()
+        mock_heal.assert_not_called()
+
+    def test_lint_and_heal_do_not_define_force_override(self):
+        lint_options = {opt.name for opt in lint_cmd.params}
+        heal_options = {opt.name for opt in heal_cmd.params}
+        runner = CliRunner()
+
+        assert "force" not in lint_options
+        assert "force" not in heal_options
+        assert "--force" not in runner.invoke(lint_cmd, ["--help"]).output
+        assert "--force" not in runner.invoke(heal_cmd, ["--help"]).output
 
     @patch("cli_agent_orchestrator.services.wiki_healer.heal", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)

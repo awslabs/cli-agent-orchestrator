@@ -209,13 +209,40 @@ class TestPrimitivePath:
             _record(
                 "handoff",
                 terminal_id="r",
-                detail={"sender": "s", "receiver": "r", "orchestration_type": "handoff"},
+                detail={"sender": "s", "receiver": "r", "orchestration_type": "send_message"},
             )
         )
         assert agui_type == AGUI_TEXT_MESSAGE_CONTENT
         assert data["role"] == "assistant"
         assert data["message_id"] == "r"
         assert data["delta"] == ""
+
+    def test_handoff_orchestration_type_handoff_maps_to_tool_call_start(self) -> None:
+        agui_type, data = to_agui_event(
+            _record(
+                "handoff",
+                terminal_id="r",
+                detail={"sender": "s", "receiver": "r", "orchestration_type": "handoff"},
+            )
+        )
+        assert agui_type == AGUI_TOOL_CALL_START
+        assert data["tool_call_id"] == "evt-1"
+        assert data["tool_call_name"] == "handoff"
+        assert data["metadata"]["sender"] == "s"
+        assert data["metadata"]["receiver"] == "r"
+
+    def test_handoff_orchestration_type_assign_maps_to_tool_call_start(self) -> None:
+        agui_type, data = to_agui_event(
+            _record(
+                "handoff",
+                terminal_id="r",
+                detail={"sender": "s", "receiver": "r", "orchestration_type": "assign"},
+            )
+        )
+        assert agui_type == AGUI_TOOL_CALL_START
+        assert data["tool_call_id"] == "evt-1"
+        assert data["tool_call_name"] == "assign"
+        assert data["metadata"]["orchestration_type"] == "assign"
 
     def test_a2a_delegation_maps_to_tool_call_start(self) -> None:
         agui_type, data = to_agui_event(
@@ -254,8 +281,17 @@ class TestPrimitivePath:
 
     def test_handoff_never_leaks_body_even_if_detail_has_one(self) -> None:
         # The publisher never puts bodies in detail, but assert defensively.
+        # send_message orchestration_type -> TEXT_MESSAGE_CONTENT.
         agui_type, data = to_agui_event(
-            _record("handoff", terminal_id="r", detail={"receiver": "r", "message": "SECRET-BODY"})
+            _record(
+                "handoff",
+                terminal_id="r",
+                detail={
+                    "receiver": "r",
+                    "message": "SECRET-BODY",
+                    "orchestration_type": "send_message",
+                },
+            )
         )
         assert agui_type == AGUI_TEXT_MESSAGE_CONTENT
         assert "SECRET-BODY" not in str(data)

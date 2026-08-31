@@ -59,7 +59,7 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         path.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+        "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
         local_store_dir,
     )
     monkeypatch.setattr(
@@ -266,6 +266,27 @@ class TestInstallAgent:
         entry = kiro_config["mcpServers"]["cao-mcp-server"]
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
+
+    def test_install_rejects_kas_profile_before_writing_kiro_config(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        profile_path = install_paths["local_store_dir"] / "kas-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-agent\n"
+            "description: KAS agent\n"
+            "engine: kas\n"
+            "allowedTools: [fs_read]\n"
+            "---\n"
+            "KAS profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-agent", "kiro_cli")
+
+        assert result.success is False
+        assert "Cedar" in result.message
+        assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
 
     def test_install_sets_env_vars_before_profile_loading(
         self, install_paths: dict[str, Path]
@@ -616,7 +637,7 @@ class TestInstallSkillCatalogBaking:
             d.mkdir()
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             local_store_dir,
         )
         monkeypatch.setattr(
@@ -1013,3 +1034,15 @@ class TestInjectKiroMcpTimeout:
 
         assert _inject_kiro_mcp_timeout(None) is None
         assert _inject_kiro_mcp_timeout({}) == {}
+
+
+def test_install_omp_writes_context_only(install_paths: dict[str, Path]) -> None:
+    profile = install_paths["local_store_dir"] / "omp-agent.md"
+    profile.write_text(_profile_text(name="omp-agent"), encoding="utf-8")
+
+    result = install_agent("omp-agent", "omp")
+
+    assert result.success is True
+    assert result.provider == "omp"
+    assert result.agent_file is None
+    assert (install_paths["context_dir"] / "omp-agent.md").exists()

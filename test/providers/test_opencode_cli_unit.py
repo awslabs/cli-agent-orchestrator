@@ -535,6 +535,16 @@ class TestMiscInterface:
         """extraction_tail_lines must be large enough for long-response agents."""
         assert make_provider().extraction_tail_lines == 2000
 
+    def test_paste_submit_delay_is_1_0(self):
+        """paste_submit_delay must exceed BaseProvider's 0.3s default to reduce
+        Enter-swallowing after bracketed paste (see #479 and #496)."""
+        assert make_provider().paste_submit_delay == 1.0
+
+    def test_supports_direct_status_probe_is_true(self):
+        """The deferred-init retry loop uses this opt-in flag to gate the
+        capture-pane direct status probe; only OpenCode currently sets it."""
+        assert make_provider().supports_direct_status_probe is True
+
 
 # ---------------------------------------------------------------------------
 # Provider manager registration

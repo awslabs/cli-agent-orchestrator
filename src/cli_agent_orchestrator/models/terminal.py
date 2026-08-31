@@ -1,9 +1,10 @@
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
 
 # Terminal ID validation (8 character hex string)
@@ -21,6 +22,56 @@ class TerminalStatus(str, Enum):
     ERROR = "error"
 
 
+class TerminalInputBlockedError(Exception):
+    """Raised when a terminal is alive but blocked on an interactive prompt that needs a human
+    (or an explicit answer_user_prompt call) to proceed -- never auto-answered.
+
+    Defined here (not in services/terminal_service.py, its original home) because
+    providers/claude_code.py (and any other provider) needs to raise it from initialize() and
+    services/terminal_service.py already imports providers/manager.py, which imports the concrete
+    provider modules -- a provider importing back from terminal_service would be a circular
+    import. models/terminal.py has no such dependency. terminal_service.py re-exports this name
+    unchanged so every existing `from cli_agent_orchestrator.services.terminal_service import
+    TerminalInputBlockedError` caller keeps working without edits.
+
+    Three distinct raise sites share this one exception:
+    1. services/terminal_service.py's send_input(): the terminal's provider process has exited
+       (status ERROR) -- refuse to type into what is now a bare shell, since queued input would
+       execute as arbitrary commands.
+    2. services/terminal_service.py's send_input(), separately: an orchestrated (assign/handoff)
+       message would answer a prompt still showing WAITING_USER_ANSWER -- refuse, since only a
+       real answer_user_prompt call (or the operator themselves) should resolve it. This guard
+       only actually fires for a given provider once that provider's own
+       ``blocks_orchestrated_input_while_waiting_user_answer`` property opts in (see
+       providers/base.py) -- claude_code did not opt in until PR #539's round-2 fix, so before
+       that an orchestrated message reaching a claude_code terminal parked on
+       WAITING_USER_ANSWER was NOT refused here; it was pasted straight into the live prompt.
+    3. providers/*.py's own initialize(): the CLI reached a real, alive, interactive state that
+       isn't {IDLE, COMPLETED} but IS a recognized "something is asking a question" signal
+       (WAITING_USER_ANSWER) -- or, for the outermost fallback, genuinely never resolved within
+       the init timeout despite the terminal staying alive and producing output the whole time.
+    All three are "this terminal needs a human, not a teardown" -- see terminal_service.py's own
+    _schedule_deferred_init, which catches this exception specifically to leave the terminal
+    running instead of tearing it down the way any other exception from initialize() (or from the
+    send_input it triggers on the deferred-init path) would.
+    """
+
+
+class TerminalLimitError(Exception):
+    """Raised when creating a terminal would exceed this node's tracked-terminal cap.
+
+    The cap comes from ``settings_service.get_max_terminals()`` (the
+    ``CAO_MAX_TERMINALS`` env var / ``server.max_terminals`` setting; unset =
+    unlimited, preserving pre-cap behavior). It exists for the one-agent-per-pod
+    Kubernetes topology: worker pods set ``CAO_MAX_TERMINALS=1`` so each pod
+    hosts exactly one agent and a second placement is rejected loudly instead
+    of silently oversubscribing the pod. Deliberately NOT a ``ValueError``
+    subclass — the API layer maps ValueError from terminal creation to 404
+    ("session not found"), whereas a capacity rejection must surface as its own
+    status (429) so a scheduler/supervisor can retry on a different node.
+    """
+
+
 class Terminal(BaseModel):
     """Terminal model - represents a tmux window."""
 
@@ -35,8 +86,22 @@ class Terminal(BaseModel):
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
+    engine: Optional[KiroEngine] = Field(None, description="Resolved Kiro engine")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
+    )
+    group: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Ordered, general-to-specific grouping array (e.g. "
+            '["tenant_1", "project_5", "folder_12"]). CAO does ordered-prefix '
+            "matching only; consumers own what the levels mean. None = this "
+            "terminal participates in no group-based discovery (see "
+            "list_siblings)."
+        ),
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        None, description="Free-form, consumer-defined JSON describing what this terminal is doing"
     )
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"

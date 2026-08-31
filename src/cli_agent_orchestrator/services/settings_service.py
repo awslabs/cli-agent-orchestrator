@@ -16,10 +16,13 @@ SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
 # Default agent directories per provider
 _DEFAULTS = {
     "kiro_cli": str(Path.home() / ".kiro" / "agents"),
-    "claude_code": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "codex": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "cao_installed": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context"),
+    "claude_code": str(CAO_HOME_DIR / "agent-store"),
+    "codex": str(CAO_HOME_DIR / "agent-store"),
+    "cao_installed": str(CAO_HOME_DIR / "agent-context"),
 }
+
+_BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def _load() -> Dict[str, Any]:
@@ -166,6 +169,20 @@ _SERVER_DEFAULTS = {
     "event_bus_max_queue_size": 1024,
     "provider_init_timeout": 60,
     "startup_prompt_handler_timeout": 20,
+    # Rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+    # status detection and GET /terminals/{id}/output (mode=full) — see
+    # StatusMonitor._process_chunk. The old fixed 8192 was measured too small
+    # against the pyte screen geometry this buffer has to outlive: a single
+    # full-screen repaint of a 220x50 viewport is already ~11,000 visible
+    # characters before per-line/per-cell ANSI escapes are added on top, so
+    # one repaint alone could exceed the old cap. A long, chatty session with
+    # several such repaints (status-bar refreshes, spinner frames, full menu
+    # redraws) could evict a still-pending prompt from the buffer before it
+    # was ever read back. 32KB covers several trailing repaints instead of a
+    # fraction of one, while staying a deliberately bounded trade-off (not
+    # unbounded scrollback) — configurable rather than a second blind guess,
+    # since the "safe" size is provider/workload-dependent, not one constant.
+    "state_buffer_max": 32768,
 }
 
 # Env-var overrides for server settings. Precedence: env var > settings.json > default.
@@ -174,6 +191,7 @@ _SERVER_ENV_VARS = {
     "event_bus_max_queue_size": "CAO_EVENT_BUS_MAX_QUEUE_SIZE",
     "provider_init_timeout": "CAO_PROVIDER_INIT_TIMEOUT",
     "startup_prompt_handler_timeout": "CAO_STARTUP_PROMPT_HANDLER_TIMEOUT",
+    "state_buffer_max": "CAO_STATE_BUFFER_MAX",
 }
 
 
@@ -197,6 +215,9 @@ def get_server_settings() -> Dict[str, Any]:
         prompt; it stops once no new prompt appears for this many seconds (so a
         dialog a cold/containerized start renders late is still handled). Total
         time is bounded by provider_init_timeout.
+      - state_buffer_max (32768): Bytes of raw terminal output StatusMonitor
+        keeps per terminal for raw-path status detection and
+        GET /terminals/{id}/output (mode=full)
 
     Values can be set via CAO_* environment variables or in
     ~/.aws/cli-agent-orchestrator/settings.json under the "server" key:
@@ -206,7 +227,8 @@ def get_server_settings() -> Dict[str, Any]:
             "mcp_request_timeout": 120,
             "event_bus_max_queue_size": 8192,
             "provider_init_timeout": 90,
-            "startup_prompt_handler_timeout": 5
+            "startup_prompt_handler_timeout": 5,
+            "state_buffer_max": 65536
           }
         }
     """
@@ -242,27 +264,95 @@ def get_server_settings() -> Dict[str, Any]:
     # Validate types and ranges; coerce to int for queue size
     for key, default in _SERVER_DEFAULTS.items():
         val = result[key]
-        if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
+        # int(val), not val <= 0: a float in (0, 1) (e.g. a settings.json
+        # value of 0.5) passes val <= 0 but truncates to 0 once coerced to
+        # int below (state_buffer_max) or by Queue(maxsize=...)
+        # (event_bus_max_queue_size), reintroducing the same
+        # unbounded-buffer/unbounded-queue failure mode this validation
+        # exists to prevent. isinstance(val, (int, float)) above guarantees
+        # int(val) cannot itself raise here.
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or int(val) <= 0:
             logger.warning(f"Invalid server setting {key}={val!r}, using default {default}")
             result[key] = default
     result["event_bus_max_queue_size"] = int(result["event_bus_max_queue_size"])
+    # buffer[-state_buffer_max:] requires an int -- a float survives the
+    # generic isinstance(val, (int, float)) check above (e.g. a settings.json
+    # value of 32768.0), and a float slice bound raises TypeError.
+    result["state_buffer_max"] = int(result["state_buffer_max"])
     _server_settings_cache = result
     _server_settings_mtime_ns = mtime_ns
     return dict(result)
 
 
+def get_max_terminals() -> Optional[int]:
+    """Max terminals this node will track, or None for unlimited.
+
+    Precedence: ``CAO_MAX_TERMINALS`` env var > ``server.max_terminals`` in
+    settings.json > None (unlimited — the pre-cap default, so existing
+    deployments are unaffected).
+
+    Used by ``terminal_service.create_terminal`` to reject creation when the
+    node is full. The one-agent-per-pod Kubernetes topology sets
+    ``CAO_MAX_TERMINALS=1`` on worker pods so each pod hosts exactly one agent.
+
+    Counts TRACKED terminals, meaning rows in the terminals table, not probed
+    liveness: a terminal row is only removed by an explicit ``delete_terminal``,
+    so a terminal whose process died without cleanup still occupies a slot. That
+    is harmless in the topology the cap exists for (a worker pod is a disposable
+    Job, so its rows die with it) but an operator who sets ``server.max_terminals``
+    on a long-lived node may have to delete a stale row by hand. Deliberately not
+    probed here: this check runs before anything is allocated precisely so it can
+    stay cheap, and per-row liveness probing would put tmux calls in that path.
+
+    Not folded into ``_SERVER_DEFAULTS`` because that table's validation forces
+    every key to a positive int default; this setting's default is "absent"
+    (unlimited), which that machinery cannot represent. Invalid or non-positive
+    values are ignored with a warning (unlimited) rather than treated as 0,
+    which would brick all terminal creation on a typo.
+    """
+    raw = os.environ.get("CAO_MAX_TERMINALS")
+    source = "CAO_MAX_TERMINALS"
+    if raw is None or raw.strip() == "":
+        saved = _load().get("server", {})
+        raw = saved.get("max_terminals") if isinstance(saved, dict) else None
+        source = "server.max_terminals"
+        if raw is None:
+            return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Ignoring invalid {source}={raw!r} (expected int); terminals unlimited")
+        return None
+    if value <= 0:
+        logger.warning(f"Ignoring non-positive {source}={value}; terminals unlimited")
+        return None
+    return value
+
+
 def get_memory_settings() -> Dict[str, Any]:
     """Get memory-related settings.
 
-    Precedence per key: CAO_* env var > settings.json > built-in default.
+    Precedence for most keys: CAO_* env var > settings.json > built-in
+    default. ``memory.lint_enabled`` intentionally uses
+    ``is_memory_lint_enabled()`` fail-closed semantics instead: any explicit
+    false in persisted settings or ``CAO_MEMORY_LINT_ENABLED`` disables lint.
 
     ``enabled`` defaults to ``True`` (opt-out) to preserve current shipping
     behavior. Setting it to ``False`` disables all memory subsystem
     operations — see ``is_memory_enabled()``.
     """
     settings = _load()
-    defaults: Dict[str, Any] = {"enabled": True, "flush_threshold": 0.85}
+    defaults: Dict[str, Any] = {
+        "enabled": True,
+        "flush_threshold": 0.85,
+        "lint_enabled": True,
+        "learning_enabled": False,
+        "instruction_promotion_enabled": False,
+    }
     saved = settings.get("memory", {})
+    if not isinstance(saved, dict):
+        logger.warning("Invalid settings.memory=%r (expected object); using defaults", saved)
+        saved = {}
     result = dict(defaults)
     result.update(saved)
 
@@ -270,6 +360,20 @@ def get_memory_settings() -> Dict[str, Any]:
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
     if env_enabled is not None and env_enabled.strip() != "":
         result["enabled"] = env_enabled.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_LEARNING_ENABLED beats settings.json
+    env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
+    if env_learning is not None and env_learning.strip() != "":
+        result["learning_enabled"] = env_learning.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED beats settings.json
+    env_promotion = os.environ.get("CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED")
+    if env_promotion is not None and env_promotion.strip() != "":
+        result["instruction_promotion_enabled"] = env_promotion.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
     # Env-var overlay: CAO_MEMORY_FLUSH_THRESHOLD beats settings.json
     env_threshold = os.environ.get("CAO_MEMORY_FLUSH_THRESHOLD")
@@ -289,7 +393,54 @@ def get_memory_settings() -> Dict[str, Any]:
                 f"(expected float); using file/default"
             )
 
+    result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
     return result
+
+
+def _coerce_optional_bool(value: Any, *, label: str) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "":
+            return None
+        if normalized in _BOOL_TRUE_VALUES:
+            return True
+        if normalized in _BOOL_FALSE_VALUES:
+            return False
+    logger.warning("Ignoring invalid %s=%r (expected bool); using file/default", label, value)
+    return None
+
+
+def _explicit_false(value: Any, *, label: str) -> bool:
+    return _coerce_optional_bool(value, label=label) is False
+
+
+def is_memory_lint_enabled(settings: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True unless persisted settings or env explicitly disable lint.
+
+    This is intentionally not normal env precedence: either explicit false
+    source disables lint, so env true cannot override persisted false and
+    persisted true cannot override env false.
+    """
+    try:
+        data = settings if settings is not None else _load()
+        saved = data.get("memory", {}) if isinstance(data, dict) else {}
+        if not isinstance(saved, dict):
+            saved = {}
+
+        if _explicit_false(saved.get("lint_enabled", True), label="memory.lint_enabled"):
+            return False
+
+        raw_env = os.environ.get("CAO_MEMORY_LINT_ENABLED")
+        if raw_env is not None and raw_env.strip() != "":
+            coerced = _coerce_optional_bool(raw_env, label="CAO_MEMORY_LINT_ENABLED")
+            if coerced is False:
+                return False
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to read memory.lint_enabled, defaulting to True: {e}")
+        return True
 
 
 def is_memory_enabled() -> bool:
@@ -304,6 +455,94 @@ def is_memory_enabled() -> bool:
         logger.warning(f"Failed to read memory.enabled, defaulting to True: {e}")
         return True
     return bool(value)
+
+
+def is_learning_enabled() -> bool:
+    """Return True when workflow self-learning (outcome capture) is enabled.
+
+    Precedence: CAO_MEMORY_LEARNING_ENABLED env var > memory.learning_enabled
+    in settings.json > default (False — learning is opt-in).
+
+    Learning is a child of the memory subsystem: lessons distilled from
+    outcomes are stored via memory, so a disabled memory subsystem disables
+    learning regardless of this flag. Read errors default to False (opt-in
+    features fail closed, mirroring the default).
+    """
+    try:
+        settings = get_memory_settings()
+        return bool(settings.get("enabled", True)) and bool(settings.get("learning_enabled", False))
+    except Exception as e:
+        logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
+        return False
+
+
+def is_workflow_approval_required() -> bool:
+    """Return True when an unapproved script-tier workflow run must be refused (issue #583 FR-8).
+
+    Default is **False**: enforcement is opt-in. A ``plan_id`` does not exist until run start, so a
+    plan that has never run cannot have been approved and its first run is refused by design. Making
+    that the default would break every existing script-tier caller one Bolt before the authoring
+    sequence that presents a plan and takes approval BEFORE running.
+
+    PRECEDENCE IS DELIBERATELY ASYMMETRIC, AND THIS IS NOT AN OVERSIGHT. Every sibling setting here
+    resolves ``CAO_* env var > settings.json > default`` — see :func:`is_memory_enabled`. This one
+    does NOT:
+
+        ``CAO_WORKFLOW_REQUIRE_APPROVAL`` may turn the gate **ON**.
+        Only ``settings.json`` can turn it **OFF**.
+
+    The reason is that this setting is a CONTROL, not a feature toggle. Under the house precedence,
+    anything able to set an environment variable could switch the approval gate off while the
+    operator's settings file still read as configured on — which would make the weakest
+    configuration mechanism in the system the one that decides whether runs are authorised. The
+    asymmetry is monotonic in the safe direction: nothing that merely influences an environment can
+    weaken the gate, while enabling it for a single test or trial stays a one-liner.
+
+    Read failure resolves to the default (disabled) with a warning, which is the ONE place this
+    mechanism is deliberately not fail-closed. Treating an unreadable settings file as "gate on"
+    would refuse every script run in the installation on the strength of a JSON typo. Resolving to
+    disabled makes the unreadable case behave like the unconfigured case, and the asymmetry above
+    bounds the residual: an operator who enabled the gate via the environment is unaffected by a
+    corrupt file.
+    """
+    env = os.environ.get("CAO_WORKFLOW_REQUIRE_APPROVAL")
+    if env is not None and env.strip().lower() in ("1", "true", "yes"):
+        # Enable-only: a falsy env value is NOT consulted, so it cannot override an enabling
+        # settings.json below. Returning early on truthy is what makes the precedence asymmetric.
+        return True
+    try:
+        workflow_settings = _load().get("workflow", {})
+        if not isinstance(workflow_settings, dict):
+            return False
+        return bool(workflow_settings.get("require_approval", False))
+    except Exception as e:
+        logger.warning(
+            "Failed to read workflow.require_approval, defaulting to False (gate disabled): %s", e
+        )
+        return False
+
+
+def is_instruction_promotion_enabled() -> bool:
+    """Return True when learned-lesson promotion into profile files is enabled.
+
+    Precedence: CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED env var >
+    memory.instruction_promotion_enabled in settings.json > default (False).
+
+    Promotion is the highest-risk learning tier — it mutates agent profile
+    markdown shared by every session — so it nests inside learning:
+    promotion ⊂ learning ⊂ memory. Any parent off forces it off. Read
+    errors default to False (fail closed).
+    """
+    try:
+        if not is_learning_enabled():
+            return False
+        settings = get_memory_settings()
+        return bool(settings.get("instruction_promotion_enabled", False))
+    except Exception as e:
+        logger.warning(
+            f"Failed to read memory.instruction_promotion_enabled, defaulting to False: {e}"
+        )
+        return False
 
 
 def get_compile_mode() -> str:
@@ -354,25 +593,80 @@ def get_compile_timeout_s() -> float:
         return 120.0
 
 
+# Workflow-journal retention/capture settings (issue #504, U7). Namespaced under
+# the "memory" block like ``audit_log_day_cap_bytes``; written through
+# ``set_memory_setting`` and read via ``get_memory_settings().get(<key>, <default>)``.
+# ``workflow_journal_capture_output`` is a bool gate (default False, NFR-SEC-2); the
+# other three are non-negative ints (byte cap / age / count) validated on write.
+_WORKFLOW_JOURNAL_BOOL_KEYS = frozenset({"workflow_journal_capture_output"})
+_WORKFLOW_JOURNAL_INT_KEYS = frozenset(
+    {
+        "workflow_journal_output_cap_bytes",
+        "workflow_journal_retention_days",
+        "workflow_journal_retention_count",
+    }
+)
+
+
 def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
     """Update a single memory setting.
 
     Supported keys:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
+        ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
+        ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
+        ``instruction_promotion_enabled`` (bool) — learned-lesson promotion
+        into agent profile files (requires learning_enabled).
+        ``workflow_journal_capture_output`` (bool) — opt-in workflow output capture
+            (issue #504, U7; default False, NFR-SEC-2).
+        ``workflow_journal_output_cap_bytes`` (int > 0) — per-output byte cap when
+            capture is enabled (U7; default 8192, NFR-SEC-4).
+        ``workflow_journal_retention_days`` (int ≥ 0) — run-age retention bound
+            (U7; default 30, NFR-SEC-3).
+        ``workflow_journal_retention_count`` (int ≥ 0) — most-recent run-count
+            retention bound (U7; default 100, NFR-SEC-3).
     """
     settings = _load()
     memory = settings.get("memory", {})
+    if not isinstance(memory, dict):
+        memory = {}
 
     if key == "enabled":
         if not isinstance(value, bool):
             raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "lint_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"lint_enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "learning_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"learning_enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "instruction_promotion_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"instruction_promotion_enabled must be a bool, got {type(value).__name__}"
+            )
         memory[key] = value
     elif key == "flush_threshold":
         fval = float(value)
         if not (0.0 < fval <= 1.0):
             raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {fval}")
         memory[key] = fval
+    elif key in _WORKFLOW_JOURNAL_BOOL_KEYS:
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key in _WORKFLOW_JOURNAL_INT_KEYS:
+        # bool is an int subclass — reject it so True/False can't masquerade as 1/0.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key} must be an int, got {type(value).__name__}")
+        min_value = 1 if key == "workflow_journal_output_cap_bytes" else 0
+        if value < min_value:
+            raise ValueError(f"{key} must be >= {min_value}, got {value}")
+        memory[key] = value
     else:
         raise ValueError(f"Unknown memory setting: {key}")
 

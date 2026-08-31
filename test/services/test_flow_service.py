@@ -7,8 +7,11 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
+from pydantic import ValidationError
 
 from cli_agent_orchestrator.models.flow import Flow
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.flow_service import (
     _get_next_run_time,
@@ -102,6 +105,78 @@ Prompt with [[variable]].
             assert metadata["script"] == "./check.sh"
             assert "[[variable]]" in content
 
+    @patch("cli_agent_orchestrator.services.flow_service.db_create_flow")
+    def test_add_flow_validates_explicit_engine_during_model_construction(self, mock_db_create):
+        mock_db_create.return_value = Flow(
+            name="kas-flow",
+            file_path="/path/to/flow.md",
+            schedule="0 * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            next_run=datetime.now(),
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("""---
+name: kas-flow
+schedule: "0 * * * *"
+agent_profile: developer
+engine: kas
+---
+
+Prompt.
+""")
+            f.flush()
+
+            flow = add_flow(f.name)
+
+        assert flow.engine == KiroEngine.KAS
+        mock_db_create.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.flow_service.db_create_flow")
+    def test_add_flow_omitted_engine_remains_none(self, mock_db_create):
+        mock_db_create.return_value = Flow(
+            name="v2-default-flow",
+            file_path="/path/to/flow.md",
+            schedule="0 * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            next_run=datetime.now(),
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("""---
+name: v2-default-flow
+schedule: "0 * * * *"
+agent_profile: developer
+---
+
+Prompt.
+""")
+            f.flush()
+
+            flow = add_flow(f.name)
+
+        assert flow.engine is None
+        mock_db_create.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.flow_service.db_create_flow")
+    def test_add_flow_rejects_invalid_engine_before_registration(self, mock_db_create):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("""---
+name: invalid-engine-flow
+schedule: "0 * * * *"
+agent_profile: developer
+engine: v3
+---
+
+Prompt.
+""")
+            f.flush()
+
+            with pytest.raises(ValidationError, match="engine"):
+                add_flow(f.name)
+
+        mock_db_create.assert_not_called()
+
 
 class TestAddFlow:
     """Tests for add_flow function."""
@@ -135,6 +210,41 @@ Test prompt.
 
             assert result.name == "test-flow"
             mock_db_create.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.flow_service.db_create_flow")
+    def test_add_flow_accepts_api_safe_dump_frontmatter(self, mock_db_create, tmp_path):
+        """A flow file serialized with yaml.safe_dump (the API's new format)
+        registers cleanly with a single-line schedule and no script key."""
+        mock_db_create.return_value = Flow(
+            name="safe-flow",
+            file_path="/path/to/flow.md",
+            schedule="0 * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            next_run=datetime.now(),
+        )
+        file_path = tmp_path / "safe.flow.md"
+        file_path.write_text(
+            "---\n"
+            + yaml.safe_dump(
+                {
+                    "name": "safe-flow",
+                    "schedule": "0 * * * *",
+                    "agent_profile": "developer",
+                    "provider": "kiro_cli",
+                },
+                sort_keys=False,
+            )
+            + "---\n"
+            + "Prompt body."
+        )
+
+        flow = add_flow(str(file_path))
+
+        assert flow.name == "safe-flow"
+        assert flow.schedule == "0 * * * *"
+        assert flow.script == ""
+        mock_db_create.assert_called_once()
 
     def test_add_flow_missing_required_field(self):
         """Test that missing required field raises error."""
@@ -250,6 +360,38 @@ class TestListFlows:
 
         assert result == []
 
+    @patch("cli_agent_orchestrator.services.flow_service.db_list_flows")
+    def test_list_flows_isolates_invalid_engine_metadata(self, mock_db_list, tmp_path, caplog):
+        """Invalid engine metadata must not prevent other flows from loading."""
+        flows = []
+        for name, engine in (
+            ("v2-flow", "v2"),
+            ("invalid-flow", "v3"),
+            ("kas-flow", "kas"),
+        ):
+            file_path = tmp_path / f"{name}.md"
+            file_path.write_text(f"---\nname: {name}\nengine: {engine}\n---\nPrompt for {name}.\n")
+            flows.append(
+                Flow(
+                    name=name,
+                    file_path=str(file_path),
+                    schedule="0 * * * *",
+                    agent_profile="developer",
+                    provider="kiro_cli",
+                    next_run=datetime.now(),
+                )
+            )
+        mock_db_list.return_value = flows
+
+        result = list_flows()
+
+        assert [(flow.name, flow.engine) for flow in result] == [
+            ("v2-flow", KiroEngine.V2),
+            ("invalid-flow", None),
+            ("kas-flow", KiroEngine.KAS),
+        ]
+        assert "Ignoring invalid engine metadata for flow invalid-flow" in caplog.text
+
 
 class TestGetFlow:
     """Tests for get_flow function."""
@@ -364,6 +506,53 @@ class TestEnableFlow:
 
 class TestExecuteFlow:
     """Tests for execute_flow function."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_execute_flow_rejects_invalid_engine_instead_of_running_v2(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_get_backend,
+        mock_create_terminal,
+        mock_send_input,
+    ):
+        """A flow file hand-edited to an invalid engine fails rather than
+        silently degrading to the v2 default (listing stays tolerant)."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("""---
+name: bad-engine-flow
+schedule: "* * * * *"
+agent_profile: developer
+engine: kasx
+---
+
+Prompt body.
+""")
+            f.flush()
+            flow_path = f.name
+
+        mock_db_get.return_value = Flow(
+            name="bad-engine-flow",
+            file_path=flow_path,
+            schedule="* * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            script="",
+            enabled=True,
+            next_run=datetime.now(),
+        )
+        mock_get_backend.return_value.session_exists.return_value = False
+
+        with pytest.raises(ValueError, match="Invalid Kiro engine"):
+            await execute_flow("bad-engine-flow")
+
+        mock_create_terminal.assert_not_called()
+        mock_send_input.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
@@ -668,6 +857,70 @@ Prompt.
         mock_get_backend.return_value.kill_session.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_busy_check_consults_the_conductor_not_a_worker(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_status_monitor,
+        mock_create_terminal,
+        mock_send_input,
+    ):
+        """The busy check must read index 0, the conductor — not any other terminal.
+
+        This is the consumer of ``list_terminals_by_session``'s oldest-first
+        contract with real blast radius. If the read's order changed so that a
+        quiet WORKER landed at index 0, the busy check would consult the worker,
+        pass, and let the ``kill_session`` below tear down a session whose
+        conductor is mid-run. A busy conductor followed by an idle worker is the
+        arrangement that catches it: asserting only "skips when busy" would pass
+        even if the wrong terminal were consulted, so this pins WHICH id is read.
+        """
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(
+                "---\nname: conductor-flow\nschedule: '* * * * *'\n"
+                "agent_profile: supervisor\n---\nPrompt.\n"
+            )
+            f.flush()
+            mock_flow = Flow(
+                name="conductor-flow",
+                file_path=f.name,
+                schedule="* * * * *",
+                agent_profile="supervisor",
+                provider="kiro_cli",
+                script="",
+                enabled=True,
+                next_run=datetime.now(),
+            )
+        mock_db_get.return_value = mock_flow
+        mock_get_backend.return_value.session_exists.return_value = True
+        # Oldest first: the conductor, then a worker it spawned.
+        mock_list_terminals.return_value = [
+            {"id": "conductor", "agent_profile": "supervisor"},
+            {"id": "worker", "agent_profile": "developer"},
+        ]
+        busy_by_id = {"conductor": TerminalStatus.PROCESSING, "worker": TerminalStatus.IDLE}
+        mock_status_monitor.get_status.side_effect = lambda tid: busy_by_id[tid]
+
+        result = await execute_flow("conductor-flow")
+
+        assert result is False, "a busy conductor must block flow recycling"
+        mock_get_backend.return_value.kill_session.assert_not_called()
+        # The whole point: the conductor's id was consulted, and ONLY it --
+        # assert_called_once_with also pins the docstring's "only check the
+        # first (conductor) terminal", which an index into call_args_list would
+        # miss, and it does not break if the call ever becomes keyword-style.
+        mock_status_monitor.get_status.assert_called_once_with("conductor")
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
@@ -713,13 +966,111 @@ Prompt.
         mock_terminal = MagicMock()
         mock_terminal.id = "terminal-123"
         mock_create_terminal.return_value = mock_terminal
+        lifecycle: list[str] = []
+        mock_get_backend.return_value.kill_session.side_effect = lambda *_: lifecycle.append("kill")
+        mock_provider_manager.cleanup_provider.side_effect = lambda *_: lifecycle.append("cleanup")
 
         result = await execute_flow("idle-flow")
 
         assert result is True
         mock_get_backend.return_value.kill_session.assert_called_once()
         mock_provider_manager.cleanup_provider.assert_called_once_with("t1")
+        assert lifecycle == ["kill", "cleanup"]
         mock_create_terminal.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_execute_flow_retains_rows_when_cleanup_is_deferred(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_status_monitor,
+        mock_provider_manager,
+        mock_create_terminal,
+        mock_send_input,
+        mock_delete_terminals,
+    ):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(
+                "---\nname: deferred-cleanup-flow\nschedule: '* * * * *'\nagent_profile: developer\n---\nPrompt.\n"
+            )
+            f.flush()
+            mock_flow = Flow(
+                name="deferred-cleanup-flow",
+                file_path=f.name,
+                schedule="* * * * *",
+                agent_profile="developer",
+                provider="grok_cli",
+                script="",
+                enabled=True,
+                next_run=datetime.now(),
+            )
+        mock_db_get.return_value = mock_flow
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_list_terminals.return_value = [{"id": "grok-worker"}]
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_provider_manager.cleanup_provider.return_value = False
+
+        assert await execute_flow("deferred-cleanup-flow") is False
+        mock_delete_terminals.assert_not_called()
+        mock_create_terminal.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_execute_flow_retries_retained_rows_before_recreating_missing_session(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_status_monitor,
+        mock_provider_manager,
+        mock_create_terminal,
+        mock_send_input,
+        mock_delete_terminals,
+    ):
+        """A vanished flow session must not orphan a deferred Grok cleanup row."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(
+                "---\nname: retry-flow\nschedule: '* * * * *'\nagent_profile: developer\n---\nPrompt.\n"
+            )
+            f.flush()
+            mock_db_get.return_value = Flow(
+                name="retry-flow",
+                file_path=f.name,
+                schedule="* * * * *",
+                agent_profile="developer",
+                provider="grok_cli",
+                script="",
+                enabled=True,
+                next_run=datetime.now(),
+            )
+        mock_get_backend.return_value.session_exists.return_value = False
+        mock_list_terminals.return_value = [{"id": "retained-grok"}]
+        mock_provider_manager.cleanup_provider.return_value = False
+
+        assert await execute_flow("retry-flow") is False
+        mock_provider_manager.cleanup_provider.assert_called_once_with("retained-grok")
+        mock_delete_terminals.assert_not_called()
+        mock_create_terminal.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")

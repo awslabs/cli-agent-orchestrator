@@ -1,11 +1,14 @@
 """Claude Code provider implementation."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import shlex
+import stat
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -15,7 +18,7 @@ if TYPE_CHECKING:
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -24,6 +27,13 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# Serializes concurrent _ensure_skip_bypass_prompt_setting() read-modify-writes to
+# ~/.claude/settings.json -- after the async conversion, N concurrent inits can run this
+# in N threads (via asyncio.to_thread), and an unlocked read-modify-write can race: one
+# thread reads while another is mid-write, decodes a truncated file, falls back to {}, and
+# clobbers the user's global settings with just the one key.
+_SETTINGS_WRITE_LOCK = threading.Lock()
 
 # Sentinel so _build_claude_command can tell "caller passed no profile, load it"
 # from "caller explicitly passed None" (native/missing profile). initialize()
@@ -119,11 +129,55 @@ THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
     re.MULTILINE,
 )
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
-WAITING_USER_ANSWER_PATTERN = (
-    r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
-)
+# Broadened beyond the original arrow-key-navigate footer to also catch the "Enter to confirm ·
+# Esc to cancel" footer Ink's Select component renders for a plain numbered/lettered choice --
+# confirmed live via a real, deterministic repro (CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1, the CLI's
+# own env var for forcing its "Try the new fullscreen renderer?" first-run upsell, found via
+# `strings` on the installed binary) that this exact footer text is what a brand-new,
+# never-before-seen CLI prompt used, distinct wording from the arrow-navigable case. This is
+# deliberately generic CHROME text, not any one prompt's own wording -- the point is to classify a
+# FUTURE, still-unrecognized choice-type prompt as WAITING_USER_ANSWER too, not just the specific
+# prompts this file happens to already special-case by name below. Confirmed this does not
+# overlap PLAN_APPROVAL_PATTERN's own dialog below: that dialog's real footer is "shift+tab to
+# approve with feedback" (see test_plan_approval_active_with_option_markers_is_waiting), not this
+# text, and PLAN_APPROVAL_PATTERN's own bottom_region check only runs once this check has already
+# missed. TRUST_PROMPT_PATTERN/BYPASS_PROMPT_PATTERN are explicitly excluded below so the
+# trust/bypass dialogs -- which this file DOES actively dismiss, in _handle_startup_prompts -- are
+# never reported as WAITING_USER_ANSWER while still unaccepted.
+#
+# "Enter to confirm" is anchored to the "[ \t]*·" that follows it in both live-captured footers
+# (e.g. "Enter to confirm · Esc to cancel") rather than matching the bare prose. A settled/completed
+# turn whose response TEXT happens to contain "...press Enter to confirm your changes..." within
+# the bottom_chrome window (get_status's last-6-lines anchor) is not followed by that chrome
+# separator, so it no longer false-matches as WAITING_USER_ANSWER (see
+# test_get_status_completed_response_mentioning_enter_to_confirm_is_not_waiting). Anchored to
+# same-line whitespace only (round-3 review nit, gutosantos82) -- a bare "\s*" also matches
+# newlines, so a completed turn whose bottom-chrome window happens to end "...Enter to confirm"
+# with the next line starting "·" would still false-match; real footers always render the
+# separator on the same line, so "[ \t]*" is strictly tighter with no loss of real-footer coverage.
+# The "↑/↓ to navigate" arm has the same class of false-positive risk from agent prose (see the
+# existing xfail test_agent_prose_with_nav_text_in_footer_false_waiting) but is left as-is here --
+# out of scope for this fix, which only addresses the "Enter to confirm" case flagged in review.
+WAITING_USER_ANSWER_PATTERN = r"↑/↓ to navigate|Enter to confirm[ \t]*·"
+PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
+# Bedrock model-upgrade nudge, e.g.
+#
+#   Newer Opus model available
+#   Currently pinned: Opus 4.6
+#   Latest available: Opus 5 (au.anthropic.claude-opus-5)
+#   Update settings to use Opus 5? Claude Code will restart to apply.
+#   ❯ 1. Yes
+#     2. No
+#
+# Shown once per tier when the pinned ANTHROPIC_*_MODEL is older than the CLI's
+# own default AND the account can actually invoke that newer model, so it is
+# specific to Bedrock deployments that pin their models — exactly what a
+# containerized fleet does. The title is matched (not the option labels) because
+# the tier name varies and up to three of these can queue up back to back.
+MODEL_UPGRADE_PROMPT_PATTERN = r"Newer \S+ model available"
+_DIALOG_BOTTOM_LINES = 15
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
 # "✶ Cultivated for 12s". Unlike the active spinner (PROCESSING_PATTERN, which
@@ -203,6 +257,8 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
+    _TAIL_HASH_LINES = 30
+
     def __init__(
         self,
         terminal_id: str,
@@ -211,13 +267,64 @@ class ClaudeCodeProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        resume_session_id: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # When set, the launched claude process resumes this Claude Code
+        # session id (--resume <sid>) instead of starting a fresh
+        # conversation. Used to re-open a supervisor conversation inside a
+        # new CAO session (durable-orchestra recovery).
+        self._resume_session_id = resume_session_id
+        # Explicit per-call override for profile.model (see launch()'s own
+        # --model resolution below) -- e.g. a handoff/assign caller pinning a
+        # specific model for one worker without needing a dedicated profile.
+        self._model = model
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
+        self._input_generation: int = 0
+        self._snapshot_tail_hash: Optional[str] = None
+        self._snapshot_last_response: Optional[str] = None
+        self._snapshot_response_count: int = 0
+
+    @staticmethod
+    def _tail_hash(output: str, n: int = 30) -> str:
+        """Hash the ANSI-stripped last *n* lines of *output*."""
+        clean = re.sub(ANSI_CODE_PATTERN, "", output)
+        tail = "\n".join(clean.split("\n")[-n:])
+        return hashlib.md5(tail.encode()).hexdigest()
+
+    @staticmethod
+    def _strip_effort_footer_lines(clean: str) -> str:
+        """Drop own-line effort-footer lines ("● high · /effort") before marker
+        counting/extraction — their glyph is not a response marker (GH #459)."""
+        return "\n".join(
+            line for line in clean.split("\n") if not EFFORT_FOOTER_LINE_PATTERN.match(line)
+        )
+
+    @staticmethod
+    def _extract_last_response_text(output: str) -> Optional[str]:
+        """Extract the text of the last response marker (⏺/●) in *output*, ANSI-stripped."""
+        clean = ClaudeCodeProvider._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
+        matches = list(re.finditer(r"[⏺●]\s+", clean))
+        if not matches:
+            return None
+        last = matches[-1]
+        remaining = clean[last.end() :]
+        lines = remaining.split("\n")
+        response_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if re.match(r"^[>❯]\s", stripped):
+                break
+            if re.search(r"─{20,}", stripped):
+                break
+            response_lines.append(stripped)
+        text = "\n".join(response_lines).strip()
+        return text if text else None
 
     def _load_profile(self) -> Optional["AgentProfile"]:
         """Load this terminal's CAO agent profile from disk, if any.
@@ -282,11 +389,26 @@ class ClaudeCodeProvider(BaseProvider):
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
 
+        # Resume a prior Claude Code conversation. Applied for every profile
+        # branch below -- resume is orthogonal to profile decomposition; the
+        # session id was validated at the API boundary.
+        if self._resume_session_id:
+            command_parts.extend(["--resume", self._resume_session_id])
+
         # Route based on profile state
         native = getattr(profile, "native_agent", None) if profile else None
         if profile is not None and isinstance(native, str) and native:
             # Thin wrapper: CAO profile maps to a native Claude Code agent.
-            # Let Claude Code handle all config (MCP servers, hooks, tools, model).
+            # Let Claude Code handle all config (MCP servers, hooks, tools, model)
+            # -- self._model (whether sourced from an explicit per-call override
+            # or from this same profile's own model field, see
+            # terminal_service.create_terminal's own precedence resolution) is
+            # deliberately NOT applied here, same as it was never applied for
+            # profile.model alone before this parameter existed. Not warned on:
+            # by the time this runs, self._model can no longer be distinguished
+            # from "this profile's own model field, nothing to do with a caller
+            # override at all" -- warning here would misattribute ordinary
+            # profile config as an ignored explicit request.
             # CAO_TERMINAL_ID propagates via tmux pane env inheritance.
             command_parts.extend(["--agent", native])
         elif self._agent_profile is not None and profile is None:
@@ -294,10 +416,33 @@ class ClaudeCodeProvider(BaseProvider):
             # native agent store (~/.claude/agents/). Same thin-orchestrator
             # pattern as the Kiro CLI provider.
             command_parts.extend(["--agent", self._agent_profile])
+            if self._model:
+                command_parts.extend(["--model", self._model])
         elif profile is not None:
-            # Full CAO profile with config decomposition
-            if profile.model:
-                command_parts.extend(["--model", profile.model])
+            # Full CAO profile with config decomposition. self._model is an
+            # explicit per-call override (handoff/assign's own `model`
+            # parameter) and wins over the profile's own static model field
+            # when both are given -- a caller pinning a one-off model for a
+            # single worker shouldn't need a dedicated agent profile just to
+            # do it.
+            resolved_model = self._model or profile.model
+            if resolved_model:
+                command_parts.extend(["--model", resolved_model])
+
+            # Apply Claude Code-only per-agent knobs from claudeConfig:
+            #   effort         -> --effort <level>
+            #   fallback_model -> --fallback-model <model>
+            # Claude analog of codexConfig: per-agent reasoning effort without
+            # depending on the machine-global effortLevel in
+            # ~/.claude/settings.json.
+            claude_config = getattr(profile, "claudeConfig", None)
+            if isinstance(claude_config, dict):
+                effort = claude_config.get("effort")
+                if effort:
+                    command_parts.extend(["--effort", str(effort)])
+                fallback_model = claude_config.get("fallback_model")
+                if fallback_model:
+                    command_parts.extend(["--fallback-model", str(fallback_model)])
 
             # Add system prompt - escape newlines to prevent tmux chunking issues
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
@@ -391,38 +536,84 @@ class ClaudeCodeProvider(BaseProvider):
         ``skipDangerousModePermissionPrompt: true`` is persisted in
         ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
         so the confirmation is redundant and blocks initialization.
+
+        After the async conversion, N concurrent inits may run this
+        read-modify-write in N threads. ``_SETTINGS_WRITE_LOCK`` serializes
+        our own threads (in-process only: a second cao-server process, or
+        Claude Code itself, writing between our read and ``os.replace`` is
+        still a last-writer-wins lost update); ``os.replace`` only guarantees
+        no torn reads for anything outside CAO.
         """
         settings_path = Path.home() / ".claude" / "settings.json"
-        settings: dict = {}
-        if settings_path.exists():
+        with _SETTINGS_WRITE_LOCK:
+            settings: dict = {}
+            existing_mode: Optional[int] = None
+            if settings_path.exists():
+                existing_mode = stat.S_IMODE(os.stat(settings_path).st_mode)
+                try:
+                    with open(settings_path) as f:
+                        settings = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            if settings.get("skipDangerousModePermissionPrompt") is True:
+                return
+
+            settings["skipDangerousModePermissionPrompt"] = True
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            # PID-suffixed so a stale tmp file from a prior crashed process
+            # can never collide with -- or be clobbered by -- this write.
+            tmp_path = settings_path.with_suffix(f".json.tmp.{os.getpid()}")
             try:
-                with open(settings_path) as f:
-                    settings = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        if settings.get("skipDangerousModePermissionPrompt") is True:
-            return
-
-        settings["skipDangerousModePermissionPrompt"] = True
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(settings_path, "w") as f:
-            json.dump(settings, f, indent=2)
+                # Preserve the existing file's mode (or default to 0600 for a
+                # freshly-created settings file, since it may carry `env`/
+                # `apiKeyHelper` secrets) -- the tmp file would otherwise pick
+                # up the process umask (typically 0644) and os.replace would
+                # make the target adopt that on every launch that toggles
+                # this flag.
+                with open(tmp_path, "w") as f:
+                    json.dump(settings, f, indent=2)
+                os.chmod(tmp_path, existing_mode if existing_mode is not None else 0o600)
+                os.replace(tmp_path, settings_path)
+            except BaseException:
+                # An exception between tmp-file creation and the replace
+                # (e.g. a chmod/disk-full failure) would otherwise orphan
+                # the tmp file indefinitely.
+                tmp_path.unlink(missing_ok=True)
+                raise
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 
-    def _handle_startup_prompts(
+    async def _handle_startup_prompts(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
-        """Auto-accept startup prompts that may appear before the REPL is ready.
+        """Answer startup prompts that may appear before the REPL is ready.
 
-        Claude Code may show up to two prompts during startup:
+        Claude Code may show up to three prompts during startup:
 
         1. **Bypass permissions confirmation** (``--dangerously-skip-permissions``)
            – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
            The settings-based fix (``_ensure_skip_bypass_prompt_setting``) prevents
            this in most cases; this handler is a defensive fallback.
-        2. **Workspace trust dialog** – shows "Yes, I trust this folder";
-           requires ``Enter``.
+        2. **Workspace trust dialog** – shows "Yes, I trust this folder".
+           Older releases preselect "Yes"; v2.1.250 preselects "No, exit".
+           The handler moves to "Yes" only when needed, then presses ``Enter``.
+        3. **Bedrock model-upgrade nudge** – offers to repoint a pinned
+           ``ANTHROPIC_*_MODEL`` at a newer default. DECLINED with ``Esc``, and
+           this is the one prompt here that is not auto-accepted. Its default
+           selection is "1. Yes", so the blind ``Enter`` that clears the other two
+           would silently rewrite the deployment's model pins and restart the CLI
+           mid-init. Declining is also the only safe answer without asking the
+           operator: the pins may be deliberate (cost, or an account entitled to
+           4.6 but not to the newer model the probe found on some other tier),
+           and CAO cannot tell an intentional pin from a stale one. ``Esc`` maps
+           to the dialog's own cancel path, which persists the refusal in
+           ``bedrockDeclinedUpgrades``, so it is asked at most once per
+           tier-transition rather than on every launch.
+
+        Note that only the FIRST of these is prevented by config. The trust
+        dialog and the upgrade nudge are dismissed here, at the TUI, because
+        both are keyed on state this provider does not own — the trust dialog on
+        the working directory, the nudge on which models the account can invoke.
 
         Idle-gap semantics (see issue #400): a cold or containerized start can
         render these dialogs LATE and in sequence, past the old fixed ~20s
@@ -442,6 +633,13 @@ class ClaudeCodeProvider(BaseProvider):
         any prompt has been observed, only ``outer_timeout`` can end the loop;
         the idle-gap clock starts only once a prompt has actually been handled.
 
+        This method is awaited directly from initialize(), which runs on
+        cao-server's single asyncio event loop. Every tmux-backed call here
+        is offloaded via ``asyncio.to_thread`` and every sleep is
+        ``asyncio.sleep`` (see #451): a blocking ``time.sleep``/subprocess
+        exec here would freeze the WHOLE OS thread, serializing every other
+        in-flight request for as long as this loop ran.
+
         Args:
             idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
                 to the ``startup_prompt_handler_timeout`` setting.
@@ -458,6 +656,13 @@ class ClaudeCodeProvider(BaseProvider):
         last_prompt_time = time.monotonic()
         any_prompt_handled = False
         bypass_accepted = False
+        trust_accepted = False
+        # Keyed on the matched title ("Newer Opus model available"), not a bool:
+        # one nudge can be shown PER TIER, so a single flag would swallow the
+        # second and third and leave init blocked behind an unanswered dialog.
+        # Keying on the title also stops the dismissed dialog's own text, which
+        # stays in the capture buffer, from being answered again forever.
+        upgrade_declined: set[str] = set()
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -466,9 +671,11 @@ class ClaudeCodeProvider(BaseProvider):
             if any_prompt_handled and now - last_prompt_time >= idle_gap:
                 return  # no new prompt within the idle gap — startup settled
 
-            output = get_backend().get_history(self.session_name, self.window_name)
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
             if not output:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
@@ -481,28 +688,104 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Bypass permissions prompt detected, auto-accepting")
                 # Send Down arrow to move cursor to "Yes, I accept", then Enter.
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_keys(
-                    self.session_name, self.window_name, "\x1b[B", enter_count=0
+                await asyncio.to_thread(
+                    get_backend().send_special_key,
+                    self.session_name,
+                    self.window_name,
+                    "Down",
                 )
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 bypass_accepted = True
                 any_prompt_handled = True
                 last_prompt_time = time.monotonic()  # reset idle timer — trust prompt may follow
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
-            # 2) Handle workspace trust prompt
-            if re.search(TRUST_PROMPT_PATTERN, clean_output):
+            # 2) Handle workspace trust prompt.
+            #    Guarded and `continue`d rather than returned: the trust dialog is
+            #    not necessarily the LAST one — the model-upgrade nudge below
+            #    renders after it — and returning here left that nudge sitting
+            #    unanswered until init timed out. The guard is what makes the
+            #    `continue` safe, since the accepted dialog's text stays in the
+            #    capture buffer and would otherwise be re-answered every second.
+            if not trust_accepted and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Workspace trust prompt detected, auto-accepting")
+                # Claude Code used to preselect "Yes", but v2.1.250 changed the
+                # default to "No, exit". Inspect the latest matching option line
+                # so we remain compatible with both layouts. The prompt's prior
+                # rendering can remain in scrollback, hence rfind rather than
+                # examining the first occurrence.
+                trust_pos = clean_output.rfind("Yes, I trust this folder")
+                line_start = clean_output.rfind("\n", 0, trust_pos) + 1
+                line_end = clean_output.find("\n", trust_pos)
+                if line_end == -1:
+                    line_end = len(clean_output)
+                trust_line = clean_output[line_start:line_end]
+                yes_selected = (
+                    re.search(r"[>❯]", trust_line[: trust_pos - line_start]) is not None
+                    or "No, exit" not in clean_output
+                )
+                if not yes_selected:
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    await asyncio.to_thread(
+                        get_backend().send_special_key,
+                        self.session_name,
+                        self.window_name,
+                        "Down",
+                    )
+                    await asyncio.sleep(0.5)
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
-                return
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
+                trust_accepted = True
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()  # reset — upgrade nudge may follow
+                await asyncio.sleep(1.0)
+                continue
 
-            # 3) Claude Code fully started — no prompts needed.
+            # 3) Decline the Bedrock model-upgrade nudge. Checked BEFORE the
+            #    banner below because this dialog renders in place of the banner,
+            #    not alongside it — the REPL only draws once it is answered.
+            #    finditer, not search: a second tier's nudge renders BELOW the
+            #    already-answered first one, which stays in the capture buffer.
+            #    re.search would keep returning that stale first title, find it
+            #    in upgrade_declined, and skip — leaving the live dialog
+            #    unanswered until init timed out. The LAST unanswered match is
+            #    taken because the live dialog is the bottom-most one.
+            title = next(
+                (
+                    m.group(0)
+                    for m in reversed(list(re.finditer(MODEL_UPGRADE_PROMPT_PATTERN, clean_output)))
+                    if m.group(0) not in upgrade_declined
+                ),
+                None,
+            )
+            if title is not None:
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info("Model upgrade nudge detected (%s), declining", title)
+                # Esc, NOT Enter: "1. Yes" is the pre-selected option, so Enter
+                # would accept the upgrade and restart the CLI. Esc is also
+                # preferred over Down+Enter because it does not depend on the
+                # option ordering staying "Yes" first.
+                status_monitor.notify_input_sent(self.terminal_id)
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Escape"
+                )
+                upgrade_declined.add(title)
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()  # reset — another tier may follow
+                await asyncio.sleep(1.0)
+                continue
+
+            # 4) Claude Code fully started — no prompts needed.
             #    The version banner is the ONLY reliable "ready" signal here: it
             #    renders only once the REPL is up and cannot appear in the echoed
             #    launch command. The old bare IDLE_PROMPT_PATTERN ("> "/"❯ ") check
@@ -519,7 +802,7 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Claude Code started without prompts")
                 return
 
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
     async def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
@@ -536,35 +819,69 @@ class ClaudeCodeProvider(BaseProvider):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
-        self._ensure_skip_bypass_prompt_setting()
+        # This does blocking file I/O (~/.claude/settings.json read+write)
+        # directly on the event loop this coroutine runs on -- small in
+        # practice, but offloaded for the same reason as the calls below (#451).
+        # Not exhaustive: wait_for_shell's own backend polling, _load_profile(),
+        # and _build_claude_command's temp-file I/O above/below are still
+        # loop-side -- tens of ms each, not the multi-second pileup #451 fixes.
+        await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
 
         # Build properly escaped command string
         command = self._build_claude_command(profile)
 
         # Send Claude Code command using the backend. Arm the StatusMonitor
         # stickiness gate so the launching command can drive a fresh
-        # PROCESSING transition past any stale ready latch.
+        # PROCESSING transition past any stale ready latch. Offloaded to a
+        # thread (see _handle_startup_prompts' own docstring, #451) so this
+        # single subprocess exec can't add to the same event-loop-blocking
+        # pileup under concurrent session creation.
         status_monitor.notify_input_sent(self.terminal_id)
-        get_backend().send_keys(self.session_name, self.window_name, command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         # Handle startup prompts (bypass permissions + workspace trust).
         # Pass the resolved timeout as the outer cap so a containerized profile's
         # longer init budget also governs the startup-prompt handler.
-        self._handle_startup_prompts(outer_timeout=init_timeout)
+        await self._handle_startup_prompts(outer_timeout=init_timeout)
 
         # Wait for Claude Code prompt to be ready.
-        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # Accept IDLE, COMPLETED, and WAITING_USER_ANSWER — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         # The StatusMonitor push pipeline (FifoReader -> get_status(buffer))
         # drives wait_until_status; it only fires once the provider's own
         # get_status returns IDLE/COMPLETED on Claude-rendered content, so the
         # old stale-zsh-prompt false-IDLE guard is no longer needed.
+        #
+        # WAITING_USER_ANSWER added to this accept-set on purpose. Before this change, ANY
+        # interactive choice-type prompt this file doesn't explicitly dismiss (bypass/trust above)
+        # was structurally indistinguishable from a genuinely hung/broken launch: both left the
+        # terminal sitting outside {IDLE, COMPLETED} until init_timeout, at which point
+        # `create_terminal`'s own except-block tore the whole session down (kill_session, FIFO
+        # stop, DB row deleted) -- so the operator never even got a CHANCE to see and answer it.
+        # Confirmed live and 100% reproducible on an unpatched build via
+        # CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1. WAITING_USER_ANSWER is CAO's own existing,
+        # positive-evidence-only status (never a default/fallback -- see get_status()'s own
+        # WAITING_USER_ANSWER_PATTERN check above), so accepting it here cannot make initialize()
+        # return early on a blank/still-launching terminal the way accepting UNKNOWN would.
         if not await wait_until_status(
             self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=init_timeout,
             polling_interval=1.0,
         ):
+            # Bare TimeoutError here, not TerminalInputBlockedError (round-3 review fix,
+            # call-me-ram): this is the genuine "never reached any recognized status" case --
+            # IDLE/COMPLETED/WAITING_USER_ANSWER all missed within the timeout window. The
+            # keep-worker-alive signal for a *recognized* WAITING_USER_ANSWER prompt no longer
+            # needs to flow through this raise site as of the round-2 fix -- it now comes from
+            # send_input's own guard (ClaudeCodeProvider.blocks_orchestrated_input_while_waiting_user_answer),
+            # which fires independently of what exception initialize() raises. Keeping this
+            # fallback a TimeoutError instead restores main's clean teardown for a genuinely
+            # broken/unrecognized launch, rather than leaving an unreapable worker alive in
+            # UNKNOWN status that answer_user_prompt would hard-refuse to touch (it only accepts
+            # WAITING_USER_ANSWER) and that no watchdog reaps.
             raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
 
         # The status wait fires as soon as the input box RENDERS, but the Ink
@@ -660,6 +977,16 @@ class ClaudeCodeProvider(BaseProvider):
         if not output.strip():
             return TerminalStatus.UNKNOWN
 
+        # Issue #407: content-based staleness guard. The tmux sliding window
+        # (-S -200) is NOT monotonically growing — Ink composer-collapse and
+        # short-line eviction can shrink it. Instead of raw length, compare a
+        # hash of the tail region: while unchanged since mark_input_received,
+        # the screen hasn't updated yet → PROCESSING.
+        if self._input_generation > 0 and self._snapshot_tail_hash is not None:
+            current_hash = self._tail_hash(output, self._TAIL_HASH_LINES)
+            if current_hash == self._snapshot_tail_hash:
+                return TerminalStatus.PROCESSING
+
         # PRIMARY PROCESSING check: walk backwards from the *last* separator.
         _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
         _sep_positions = [m.start() for m in _sep_re.finditer(output)]
@@ -725,13 +1052,64 @@ class ClaudeCodeProvider(BaseProvider):
             if last_idle is None or last_processing.start() > last_idle.start():
                 return TerminalStatus.PROCESSING
 
-        # Check for waiting user answer via the active Ink selection footer.
+        # Anchor dialog detection to the bottom region only. Dialog chrome is
+        # always rendered at the bottom; matching the full buffer false-positives
+        # on stale scrollback containing "↑/↓ to navigate" (issue #405).
+        lines = output.split("\n")
+        bottom_region = "\n".join(lines[-_DIALOG_BOTTOM_LINES:])
+        # AskUserQuestion footer can be pushed down by notes-hint, error banner,
+        # or IDE status line — use a 6-line anchor.
+        # Deliberately asymmetric window sizes (round-3 review, gutosantos82): the trust/bypass
+        # exclusion below reads the wider 15-line bottom_region while the WAITING match itself
+        # reads only the narrower 6-line bottom_chrome. This is fail-closed, not a bug -- the
+        # exclusion window being a strict superset of the match window means a trust/bypass dialog
+        # can only ever be excluded MORE often, never less, so it can't accidentally let a real
+        # trust/bypass dialog through as WAITING_USER_ANSWER.
+        bottom_chrome = "\n".join(lines[-6:])
+
         if (
-            re.search(WAITING_USER_ANSWER_PATTERN, output)
-            and not re.search(TRUST_PROMPT_PATTERN, output)
-            and not re.search(BYPASS_PROMPT_PATTERN, output)
+            not re.search(TRUST_PROMPT_PATTERN, bottom_region)
+            and not re.search(BYPASS_PROMPT_PATTERN, bottom_region)
+            # Same reason as trust/bypass: _handle_startup_prompts declines this
+            # one itself, so surfacing it as WAITING_USER_ANSWER would ask an
+            # operator to answer a dialog that is about to answer itself. Its
+            # footer is "Enter to confirm · Esc to cancel", which the WAITING
+            # match below would otherwise hit.
+            and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, bottom_region)
         ):
-            return TerminalStatus.WAITING_USER_ANSWER
+            # AskUserQuestion: "↑/↓ to navigate" in bottom chrome (last 6 lines).
+            # Known residual: agent prose containing this exact string in the
+            # 6-line footer window of an idle prompt will false-positive as
+            # WAITING. Full fix needs structural composer detection (out of scope).
+            if re.search(WAITING_USER_ANSWER_PATTERN, bottom_chrome):
+                return TerminalStatus.WAITING_USER_ANSWER
+            # Plan-approval: "Would you like to proceed?" with no nav footer.
+            # Guard against dismissed dialog in scrollback: only classify as
+            # WAITING if option markers appear AFTER the plan text AND neither
+            # a separator (────) nor a response marker (⏺/●) follows them —
+            # either indicates the agent proceeded past the dialog.
+            plan_match = re.search(PLAN_APPROVAL_PATTERN, bottom_region)
+            if plan_match:
+                after_plan = bottom_region[plan_match.end() :]
+                has_option_markers = re.search(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE)
+                sep_after_plan = re.search(r"─{20,}", after_plan)
+                response_after_options = False
+                if has_option_markers:
+                    last_option = None
+                    for m in re.finditer(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE):
+                        last_option = m
+                    if last_option:
+                        after_options = after_plan[last_option.end() :]
+                        # EXTRACTION_RESPONSE_PATTERN (not RESPONSE_PATTERN):
+                        # the newest TUI's response marker is ● which
+                        # RESPONSE_PATTERN deliberately excludes, and its
+                        # effort-footer lookahead keeps a "● high · /effort"
+                        # line from counting as dismissal evidence.
+                        response_after_options = bool(
+                            EXTRACTION_RESPONSE_PATTERN.search(after_options)
+                        )
+                if has_option_markers and not sep_after_plan and not response_after_options:
+                    return TerminalStatus.WAITING_USER_ANSWER
 
         # New Claude Code TUI PROCESSING: the input prompt is BOXED between two
         # separators, and the live spinner renders on the line DIRECTLY ABOVE the
@@ -818,6 +1196,16 @@ class ClaudeCodeProvider(BaseProvider):
             or last_sol_response is not None
             or last_response is not None
         ):
+            # Issue #407 paste-echo guard: when tail-hash differs but the
+            # extracted last-response text matches the snapshot, block COMPLETED
+            # unless the response marker count changed (proving new activity).
+            if self._input_generation > 0 and self._snapshot_last_response is not None:
+                current_response = self._extract_last_response_text(output)
+                if current_response == self._snapshot_last_response:
+                    clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
+                    current_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
+                    if current_count == self._snapshot_response_count:
+                        return TerminalStatus.PROCESSING
             return TerminalStatus.COMPLETED
 
         # IDLE: shell prompt visible but no response yet (e.g. just initialized).
@@ -875,6 +1263,7 @@ class ClaudeCodeProvider(BaseProvider):
             re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
             and not re.search(TRUST_PROMPT_PATTERN, joined)
             and not re.search(BYPASS_PROMPT_PATTERN, joined)
+            and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, joined)
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 
@@ -937,6 +1326,42 @@ class ClaudeCodeProvider(BaseProvider):
         isn't ready to accept input even though get_status() sees PROCESSING.
         """
         return self._initialized
+
+    @property
+    def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+        """Claude Code's Ink Select/choice dialogs consume pasted text as the answer.
+
+        initialize() now succeeds (rather than timing out) when startup lands on a
+        recognized choice-prompt, classifying it WAITING_USER_ANSWER instead of
+        tearing the session down (see the WAITING_USER_ANSWER acceptance in
+        initialize() above). Without this override, the deferred-init path
+        (_schedule_deferred_init -> send_input(initial_message)) would proceed
+        straight through send_input's guard (services/terminal_service.py) — which
+        only fires when this property is True — and paste the assigned task text
+        plus Enter into the live widget, auto-confirming whichever option happens
+        to be highlighted. That is exactly the "auto-answer a prompt a human should
+        see" behavior issue #538 deliberately rejected; pre-#539 the same scenario
+        at least ended in a clean teardown + notification rather than a silent
+        wrong answer. Opting in here (matching antigravity_cli/hermes) makes
+        send_input raise TerminalInputBlockedError instead, so
+        _schedule_deferred_init's existing WAITING_USER_ANSWER handling leaves the
+        worker alive for answer_user_prompt rather than auto-pasting into it.
+        """
+        return True
+
+    def mark_input_received(self) -> None:
+        """Capture content-based snapshots for the staleness guard (issue #407).
+
+        Uses tail-hash instead of raw length because the tmux sliding window
+        is not monotonically growing.
+        """
+        output = get_backend().get_history(self.session_name, self.window_name) or ""
+        self._snapshot_tail_hash = self._tail_hash(output, self._TAIL_HASH_LINES)
+        self._snapshot_last_response = self._extract_last_response_text(output)
+        clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
+        self._snapshot_response_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
+        self._input_generation += 1
+        super().mark_input_received()
 
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""

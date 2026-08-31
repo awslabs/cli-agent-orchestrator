@@ -1,0 +1,13 @@
+{
+  "active_sessions": 0,
+  "counts": {
+    "sessions": 0,
+    "terminals": 0
+  },
+  "by_provider": {},
+  "waiting_terminals": [],
+  "last_activity": {
+    "timestamp": "2026-07-20T21:55:17.011705+00:00",
+    "event_id": "a901b5bf-5d3b-4abd-9309-357185520426"
+  }
+}

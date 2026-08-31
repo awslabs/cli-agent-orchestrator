@@ -10,6 +10,27 @@ CLI flag  >  CAO_* environment variable  >  settings.json  >  built-in default
 
 > `.env` file handling (`utils/env.py`, forwarded provider env vars) is a separate, out-of-scope surface — unaffected by this doc.
 
+## Data directory (`CAO_HOME_DIR`)
+
+All CAO state lives under a single base directory, `~/.aws/cli-agent-orchestrator` by default: the SQLite DB, logs, FIFOs, memory, the `agent-store` / `agent-context` profile dirs, skills, workflow scratch, and `settings.json` itself.
+
+Set the `CAO_HOME_DIR` environment variable to relocate that entire tree:
+
+```bash
+export CAO_HOME_DIR="$HOME/.cli-agent-orchestrator"
+```
+
+Every derived path resolves from this value, so one override moves everything — with two exceptions noted below. `CAO_HOME_DIR` is read once, when CAO's `constants` module is first imported (the same convention as `CAO_AGENTS_DIR`), so export it **before** starting `cao-server`, the MCP servers, or any `cao` command. All CAO processes must resolve the same location. Empty or whitespace-only values are treated as unset, and tilde (`~`) is expanded.
+
+**When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place.
+
+**Security note.** When relocating outside `~/.aws`, choose a dedicated directory that is not world-readable or shared with other users. CAO creates its base directory and log/FIFO subdirectories with owner-only permissions (mode `0700`), and applies a best-effort `chmod` to an existing base directory, but the chosen parent path should also be private since terminal logs can capture secrets and tokens.
+
+**Exceptions.** Two categories of provider-specific config directories do **not** follow `CAO_HOME_DIR`:
+
+- `~/.aws/opencode` (OpenCode provider config, managed via `OPENCODE_CONFIG_DIR` in `constants.py`) — OpenCode is told its config location at launch via env vars; a follow-up can repoint this.
+- Provider-native agent directories (`~/.kiro/agents`, `~/.copilot/agents`) — intentionally separate since each provider manages its own agent install path independently of CAO's data tree.
+
 ## settings.json schema
 
 ```json
@@ -32,7 +53,8 @@ CLI flag  >  CAO_* environment variable  >  settings.json  >  built-in default
     "mcp_request_timeout": 30,
     "event_bus_max_queue_size": 1024,
     "provider_init_timeout": 60,
-    "startup_prompt_handler_timeout": 20
+    "startup_prompt_handler_timeout": 20,
+    "state_buffer_max": 32768
   },
   "memory": {
     "enabled": true,
@@ -118,6 +140,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `event_bus_max_queue_size` | `1024` | Max events buffered per subscriber queue in the internal event bus. |
 | `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity) may run. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). |
 | `startup_prompt_handler_timeout` | `20` | Idle gap, in seconds, between consecutive startup prompts (e.g. workspace trust / bypass dialogs, Kimi's upgrade dialog, Antigravity's trust/survey dialogs). The handler polls and resets this timer each time it answers a prompt; it only starts counting once the FIRST prompt has been handled, so a first dialog arriving later than this value (e.g. a cold/containerized start) is still caught — before any prompt is seen, only `provider_init_timeout` bounds the wait. Once at least one prompt has been handled, the handler exits after this many seconds pass with no further prompt. |
+| `state_buffer_max` | `32768` | Bytes of raw terminal output `StatusMonitor` keeps per terminal for raw-path status detection and `GET /terminals/{id}/output` (`mode=full`). Not unbounded scrollback — a long, chatty session is truncated to this trailing window; raise it if a still-pending prompt is getting evicted before it's read back. |
 
 ### Memory (`memory`)
 
@@ -127,6 +150,41 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |
+| `learning_enabled` | `false` | Opt-in switch for workflow self-learning (outcome capture via `report_outcome` / `/outcomes`). Requires `enabled=true` — a disabled memory subsystem forces learning off. Env override: `CAO_MEMORY_LEARNING_ENABLED`. See [Self-Learning](self-learning.md). |
+| `instruction_promotion_enabled` | `false` | Opt-in switch for promoting reinforced lessons into agent profile files (`cao memory promote --apply`). Requires `learning_enabled=true` (promotion ⊂ learning ⊂ memory). Env override: `CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED`. ⚠️ Promoted lesson text is agent-generated: review every promote diff as an untrusted-instruction change before applying — see [Self-Learning](self-learning.md#phase-2--instruction-promotion). |
+| `workflow_journal_capture_output` | `false` | ⚠️ **Security-relevant opt-in, but narrower than it sounds — read the note below this table.** Governs exactly two surfaces: the **event log's** output digest, and the **diagnostics bundle's** output excerpts. Turning it ON adds step output text to those two. It does **not** control the `workflow_run_step` projection, which retains output unconditionally either way. Retained text is size-capped (below) and cleaned through the shared `audit_log` sanitizer — transport hygiene (control-character stripping, size limiting), **not** secret redaction: a credential in a step's output is retained verbatim. |
+| `workflow_journal_output_cap_bytes` | `8192` | Per-output byte cap applied when `workflow_journal_capture_output` is on; anything longer is truncated with the shared `[…truncated]` marker. Deliberately above `audit_log`'s 4 KiB per-field cap because a worker step's output is materially larger than a single audit field. Must be `>= 1`. |
+| `workflow_journal_retention_days` | `30` | Age bound for the startup retention sweep: a run whose `started_at` is older than this many days is pruned (run row, steps, events, and seq high-water, in one cascade). **`0` DISABLES the age bound** (unlimited) — it does not mean "expire everything". Must be `>= 0`. |
+| `workflow_journal_retention_count` | `100` | Run-count bound for the same sweep: runs beyond the most-recent N are pruned. Pruning is the **union** of the two bounds — whichever matches a run first removes it. **`0` DISABLES the count bound** (unlimited) — it does not mean "keep zero runs"; both bounds at `0` makes the sweep a no-op. To remove a specific run, use `DELETE /workflows/runs/{id}` instead. Must be `>= 0`. |
+
+> #### ⚠️ Step output is retained regardless of `workflow_journal_capture_output`
+>
+> Turning that flag **off does not stop the journal from storing step output.** The
+> `workflow_run_step` projection persists each step's full `output_json` and `error`
+> text on every state transition, unconditionally, because the resume path and
+> `{{steps.<id>.output.<field>}}` templating read them back — gating them would
+> break both. The flag governs only the event-log output digest and the diagnostics
+> bundle's excerpts.
+>
+> That retained text is served, in full, by `GET /workflows/runs/{run_id}`. Its only
+> protection is a scope requirement (`cao:read`/`cao:write`/`cao:admin`), and that
+> requirement is **inert unless you enable authentication**: with `CAO_AUTH_ENABLED`
+> unset — the default — the dependency returns the full scope set and enforces
+> nothing. A default local CAO server therefore serves step output and error text to
+> anything that can reach its port.
+>
+> Practical consequences:
+>
+> - Treat a step's output and error text as **retained and readable**, not as gated
+>   by a setting. A credential echoed by a step is stored verbatim and returned
+>   verbatim; the `audit_log` sanitizer caps size and strips control characters, it
+>   does not detect secrets.
+> - To limit exposure, enable auth (so the scope gate becomes real), keep the
+>   retention bounds tight, and delete runs you no longer need with
+>   `DELETE /workflows/runs/{run_id}`.
+> - An earlier revision of this table claimed the journal stored "execution metadata
+>   only … never prompt text or step output" when the flag was off. That was wrong in
+>   the security-relevant direction and is corrected above.
 
 ### Terminal backend (`terminal`)
 
@@ -163,7 +221,7 @@ Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_age
 
 ### Network (`network`) — env-var only
 
-> **`network.*` keys in `settings.json` are schema-only and have no runtime effect yet.** `constants.py` builds `CORS_ORIGINS` / `ALLOWED_HOSTS` / `WS_ALLOWED_CLIENTS` as module-level lists at import time, and Starlette's CORS/TrustedHost middleware are instantiated once at server startup holding a reference to those exact list objects (`add_local_cors_origins` depends on this reference semantics). Only the `CAO_ALLOWED_HOSTS` / `CAO_CORS_ORIGINS` / `CAO_WS_ALLOWED_CLIENTS` / `CAO_FORWARDED_ALLOW_IPS` env vars are read — directly in `constants.py`, not through `ConfigService`. Routing these through the unified config would require either a live-invalidation path for the middleware's list references or restructuring how the middleware is wired; both are out of scope for this PR.
+> **`network.*` keys in `settings.json` are schema-only and have no runtime effect yet.** `constants.py` builds `CORS_ORIGINS` / `ALLOWED_HOSTS` / `WS_ALLOWED_CLIENTS` as module-level lists at import time, and Starlette's CORS/TrustedHost middleware are instantiated once at server startup holding a reference to those exact list objects (`add_local_cors_origins` depends on this reference semantics). Only the `CAO_ALLOWED_HOSTS` / `CAO_CORS_ORIGINS` / `CAO_WS_ALLOWED_CLIENTS` / `CAO_WS_ALLOWED_ORIGINS` / `CAO_FORWARDED_ALLOW_IPS` env vars are read — directly in `constants.py`, not through `ConfigService`. Routing these through the unified config would require either a live-invalidation path for the middleware's list references or restructuring how the middleware is wired; both are out of scope for this PR.
 
 `cao-server` is a local-only service by default. These env vars **extend** (not replace) the loopback-only built-in defaults, so loopback access is preserved even when set.
 
@@ -172,8 +230,11 @@ Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_age
 | `CAO_ALLOWED_HOSTS` | `ALLOWED_HOSTS` (Host header allowlist for `TrustedHostMiddleware`) | Fronting cao-server with a reverse proxy at a non-localhost hostname. |
 | `CAO_CORS_ORIGINS` | `CORS_ORIGINS` (browser origins permitted by CORS) | Serving the web UI from a non-default port or origin. |
 | `CAO_WS_ALLOWED_CLIENTS` | `WS_ALLOWED_CLIENTS` (client IPs permitted to attach to the PTY WebSocket) | Running `cao-server` inside Docker (host browser arrives via a bridge IP). |
+| `CAO_WS_ALLOWED_ORIGINS` | `WS_ALLOWED_ORIGINS` (extra browser `Origin`s permitted to attach to the PTY WebSocket) | Serving the terminal viewer from a page whose origin **differs** from the cao-server host (a separate reverse-proxy hostname or dashboard). |
 
 > **Security note:** the WebSocket PTY endpoint is unauthenticated. Only add client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS` — anyone reaching the listener at one of those IPs gets full PTY access to running agent terminals.
+>
+> The endpoint also enforces an **Origin** check to block cross-site WebSocket hijacking (CWE-1385): a browser page that is not same-origin with the cao-server host (and not in `CAO_WS_ALLOWED_ORIGINS`) is refused. Same-origin viewers — including the bundled UI, imported-app deployments (`uvicorn cli_agent_orchestrator.api.main:app`), and dynamic reverse-proxy / Codespaces hostnames — work with no configuration, because the check accepts any `Origin` whose authority equals the request `Host` (itself validated by `TrustedHostMiddleware`). `CAO_WS_ALLOWED_ORIGINS` is only for *genuinely cross-origin* viewers; a literal `*` disables the Origin check. Note that `CAO_CORS_ORIGINS="*"` does **not** disable it — PTY access is more sensitive than ordinary CORS reads, so the escape hatch is the dedicated `CAO_WS_ALLOWED_ORIGINS="*"`.
 
 ### Auth (`auth`) — env-var only
 
@@ -228,10 +289,15 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 | `CAO_ALLOWED_HOSTS` | `network.allowed_hosts` | comma-separated list |
 | `CAO_CORS_ORIGINS` | `network.cors_origins` | comma-separated list |
 | `CAO_WS_ALLOWED_CLIENTS` | `network.ws_allowed_clients` | comma-separated list |
+| `CAO_WS_ALLOWED_ORIGINS` | `network.ws_allowed_origins` | comma-separated list |
 
 ### Not yet routed through ConfigService
 
 A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TERMINAL_ID`, `CAO_SESSION_NAME`, `CAO_WORKFLOW_RUN_ID`; provider-tuning vars like `CAO_HERMES_*`, `CAO_AGENTS_DIR`, `CAO_API_HOST`/`CAO_API_PORT`, `CAO_PYTE_STATUS`, `CAO_EAGER_INBOX_DELIVERY`; and `CAO_AUTH_LOCAL_TOKEN`) are still read ad hoc via `os.getenv` at their call sites, mostly in `constants.py`, `mcp_server/server.py`, `security/auth.py`, and the `providers/*` modules. These were deliberately left out of this pass to keep the diff scoped to the two surfaces issue #357 named explicitly (`settings.json` + `config.json`); folding them into the registry is a natural follow-up but not required for config unification.
+
+| Env var | Default | Type | Purpose |
+|---|---|---|---|
+| `CAO_HOME_DIR` | `~/.aws/cli-agent-orchestrator` | str (path) | Base directory for all CAO state. See [Data directory](#data-directory-cao_home_dir) above. |
 
 The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
 

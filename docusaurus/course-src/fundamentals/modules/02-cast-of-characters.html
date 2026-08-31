@@ -1,0 +1,235 @@
+<section class="module" id="module-2">
+  <div class="module-content">
+    <div class="module-header animate-in">
+      <span class="module-number">02</span>
+      <h1 class="module-title">The Cast of Characters</h1>
+      <p class="module-subtitle">Five components, each with a single job. Together they turn one CLI command into a fleet of cooperating agents.</p>
+    </div>
+
+    <!-- Screen 1: Architecture at a Glance -->
+    <div class="screen animate-in" id="screen-2-1">
+      <h2 class="screen-heading">Architecture at a Glance</h2>
+      <p>Five components, three layers. Your commands flow down; agent results flow back up.</p>
+
+      <div style="margin-top: var(--space-6); border: 1px solid var(--color-border); border-radius: var(--radius-md); overflow: hidden;">
+
+        <!-- User Layer -->
+        <div style="background: var(--color-accent-light); padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--color-border);">
+          <div style="display: flex; align-items: center; gap: var(--space-3);">
+            <div class="icon-circle" style="background: #3b82f6; color: white; flex-shrink:0; width: 36px; height: 36px; font-size: var(--text-sm);">C</div>
+            <div>
+              <strong style="font-size: var(--text-base);">cao CLI</strong>
+              <span style="color: var(--color-text-muted); font-size: var(--text-sm);"> — your terminal. Sends HTTP requests to the server.</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Service Layer -->
+        <div style="padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--color-border); display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4);">
+          <div style="display: flex; align-items: flex-start; gap: var(--space-3);">
+            <div class="icon-circle" style="background: var(--color-actor-2); color: white; flex-shrink:0; width: 36px; height: 36px; font-size: var(--text-sm);">S</div>
+            <div>
+              <strong>cao-server</strong>
+              <p style="margin: var(--space-1) 0 0; font-size: var(--text-sm); color: var(--color-text-muted);">FastAPI on :9889. Sessions, terminals, inbox, SQLite.</p>
+            </div>
+          </div>
+          <div style="display: flex; align-items: flex-start; gap: var(--space-3);">
+            <div class="icon-circle" style="background: var(--color-actor-3); color: white; flex-shrink:0; width: 36px; height: 36px; font-size: var(--text-sm);">M</div>
+            <div>
+              <strong>cao-mcp-server</strong>
+              <p style="margin: var(--space-1) 0 0; font-size: var(--text-sm); color: var(--color-text-muted);">Agent tools: handoff, assign, send_message, memory.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Infrastructure Layer -->
+        <div style="padding: var(--space-4) var(--space-5); background: var(--color-surface); display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4);">
+          <div style="display: flex; align-items: flex-start; gap: var(--space-3);">
+            <div class="icon-circle" style="background: var(--color-actor-5); color: white; flex-shrink:0; width: 36px; height: 36px; font-size: var(--text-sm);">T</div>
+            <div>
+              <strong>tmux</strong>
+              <p style="margin: var(--space-1) 0 0; font-size: var(--text-sm); color: var(--color-text-muted);">One window per agent. Output captured via pipe-pane.</p>
+            </div>
+          </div>
+          <div style="display: flex; align-items: flex-start; gap: var(--space-3);">
+            <div class="icon-circle" style="background: var(--color-actor-4); color: white; flex-shrink:0; width: 36px; height: 36px; font-size: var(--text-sm);">E</div>
+            <div>
+              <strong>Event Bus</strong>
+              <p style="margin: var(--space-1) 0 0; font-size: var(--text-sm); color: var(--color-text-muted);">Pub/sub glue. Drives status detection and message delivery.</p>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="callout callout-info" style="margin-top: var(--space-5);">
+        <div class="callout-icon">&#128218;</div>
+        <div class="callout-content">
+          <span class="callout-title">Persistent Memory</span>
+          <p>Agents also have access to a <strong>memory system</strong> — a persistent store that survives across sessions. Agents call <code>memory_store</code> to save learnings and <code>memory_recall</code> to retrieve them later. Memory is scoped (global, project, session, or per-agent) so knowledge stays organized. Think of it as the team's shared notebook.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Screen 2: Meet Each Component -->
+    <div class="screen animate-in" id="screen-2-2">
+      <h2 class="screen-heading">Meet Each Component</h2>
+
+      <div class="pattern-cards stagger-children">
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-accent-light); color: var(--color-accent);">&#9000;</div>
+          <h3 class="pattern-title">cao CLI</h3>
+          <p class="pattern-desc">User interface. Click-based Python CLI with commands like <code>launch</code>, <code>session</code>, <code>profile</code>, <code>shutdown</code>.</p>
+          <span style="display:block; margin-top:var(--space-2); font-family:var(--font-mono); font-size:var(--text-xs); color:var(--color-text-muted);">src/cli_agent_orchestrator/cli/</span>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-info-light); color: var(--color-info);">&#9881;</div>
+          <h3 class="pattern-title">cao-server</h3>
+          <p class="pattern-desc">State manager. FastAPI on port 9889 handling sessions, terminals, inbox, and the SQLite database.</p>
+          <span style="display:block; margin-top:var(--space-2); font-family:var(--font-mono); font-size:var(--text-xs); color:var(--color-text-muted);">src/cli_agent_orchestrator/api/</span>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: #F3EAFF; color: var(--color-actor-3);">&#9878;</div>
+          <h3 class="pattern-title">cao-mcp-server</h3>
+          <p class="pattern-desc">Agent toolbox. Exposes <code>handoff</code>, <code>assign</code>, <code>send_message</code>, <code>memory_*</code>, <code>load_skill</code> via FastMCP.</p>
+          <span style="display:block; margin-top:var(--space-2); font-family:var(--font-mono); font-size:var(--text-xs); color:var(--color-text-muted);">src/cli_agent_orchestrator/mcp_server/</span>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: #FFF8E6; color: var(--color-actor-4);">&#9638;</div>
+          <h3 class="pattern-title">tmux backend</h3>
+          <p class="pattern-desc">Process isolation. Creates sessions/windows per agent, runs <code>pipe-pane</code> to capture output into FIFOs.</p>
+          <span style="display:block; margin-top:var(--space-2); font-family:var(--font-mono); font-size:var(--text-xs); color:var(--color-text-muted);">src/cli_agent_orchestrator/clients/tmux.py</span>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-success-light); color: var(--color-success);">&#8644;</div>
+          <h3 class="pattern-title">Event Bus</h3>
+          <p class="pattern-desc">Async glue. Pub/sub connecting FifoReader, StatusMonitor, and InboxService without polling.</p>
+          <span style="display:block; margin-top:var(--space-2); font-family:var(--font-mono); font-size:var(--text-xs); color:var(--color-text-muted);">src/cli_agent_orchestrator/services/event_bus.py</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Screen 3: How They Connect -->
+    <div class="screen animate-in" id="screen-2-3">
+      <h2 class="screen-heading">How They Connect</h2>
+      <p>Module 1 showed the high-level steps. Now let's see the same launch at the <em>component level</em> — which piece talks to which, and in what order:</p>
+
+      <div class="chat-window" id="chat-launch">
+        <div class="chat-messages">
+          <div class="chat-message" data-sender="cli" style="display:none">
+            <div class="chat-avatar" style="background: var(--color-actor-1)">Y</div>
+            <div class="chat-bubble">
+              <span class="chat-sender" style="color: var(--color-actor-1)">You (CLI)</span>
+              <p><code>cao launch --agents code_supervisor --provider claude_code</code></p>
+            </div>
+          </div>
+          <div class="chat-message" data-sender="server" style="display:none">
+            <div class="chat-avatar" style="background: var(--color-actor-2)">S</div>
+            <div class="chat-bubble">
+              <span class="chat-sender" style="color: var(--color-actor-2)">cao-server</span>
+              <p>Creating session <code>cao-my-session</code>, spawning tmux window...</p>
+            </div>
+          </div>
+          <div class="chat-message" data-sender="server" style="display:none">
+            <div class="chat-avatar" style="background: var(--color-actor-2)">S</div>
+            <div class="chat-bubble">
+              <span class="chat-sender" style="color: var(--color-actor-2)">cao-server</span>
+              <p>Launching <code>claude_code</code> provider with profile system prompt</p>
+            </div>
+          </div>
+          <div class="chat-message" data-sender="tmux" style="display:none">
+            <div class="chat-avatar" style="background: var(--color-actor-4)">T</div>
+            <div class="chat-bubble">
+              <span class="chat-sender" style="color: var(--color-actor-4)">tmux</span>
+              <p>Window ready. <code>pipe-pane</code> connected to FIFO.</p>
+            </div>
+          </div>
+          <div class="chat-message" data-sender="eventbus" style="display:none">
+            <div class="chat-avatar" style="background: var(--color-actor-5)">E</div>
+            <div class="chat-bubble">
+              <span class="chat-sender" style="color: var(--color-actor-5)">Event Bus</span>
+              <p>Publishing <code>terminal.a1b2c3d4.output</code> (agent is initializing)</p>
+            </div>
+          </div>
+          <div class="chat-message" data-sender="monitor" style="display:none">
+            <div class="chat-avatar" style="background: var(--color-actor-3)">M</div>
+            <div class="chat-bubble">
+              <span class="chat-sender" style="color: var(--color-actor-3)">StatusMonitor</span>
+              <p>Status &rarr; <strong>IDLE</strong>. Agent ready for input.</p>
+            </div>
+          </div>
+          <div class="chat-message" data-sender="server" style="display:none">
+            <div class="chat-avatar" style="background: var(--color-actor-2)">S</div>
+            <div class="chat-bubble">
+              <span class="chat-sender" style="color: var(--color-actor-2)">cao-server</span>
+              <p>Attaching your terminal to the tmux session. You're in!</p>
+            </div>
+          </div>
+        </div>
+        <div class="chat-typing" style="display:none">
+          <div class="chat-avatar" style="background: var(--color-actor-2); width:28px; height:28px; font-size: 0.7rem;">?</div>
+          <div class="chat-typing-dots">
+            <span class="typing-dot"></span>
+            <span class="typing-dot"></span>
+            <span class="typing-dot"></span>
+          </div>
+        </div>
+        <div class="chat-controls">
+          <button class="btn btn-primary chat-next-btn">Next</button>
+          <button class="btn chat-all-btn">Play All</button>
+          <button class="btn chat-reset-btn">Reset</button>
+          <span class="chat-progress">0 / 7 messages</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Screen 4: Code — The CLI Entry Point -->
+    <div class="screen animate-in" id="screen-2-4">
+      <h2 class="screen-heading">Code: The CLI Entry Point</h2>
+
+      <div class="translation-block">
+        <div class="translation-code">
+          <span class="translation-label">cli/main.py (abridged)</span>
+<span class="code-line"><span class="code-keyword">import</span> click</span>
+<span class="code-line"></span>
+<span class="code-line"><span class="code-keyword">from</span> cli_agent_orchestrator.cli.commands.launch <span class="code-keyword">import</span> launch</span>
+<span class="code-line"><span class="code-keyword">from</span> cli_agent_orchestrator.cli.commands.session <span class="code-keyword">import</span> session</span>
+<span class="code-line"><span class="code-comment"># ... one import per command module</span></span>
+<span class="code-line"></span>
+<span class="code-line"><span class="code-function">@click.group</span>()</span>
+<span class="code-line"><span class="code-function">@click.version_option</span>(__version__, <span class="code-string">"-V"</span>, <span class="code-string">"--version"</span>)</span>
+<span class="code-line"><span class="code-keyword">def</span> <span class="code-function">cli</span>():</span>
+<span class="code-line">    <span class="code-string">"""CLI Agent Orchestrator."""</span></span>
+<span class="code-line"></span>
+<span class="code-line">cli.<span class="code-function">add_command</span>(profile)</span>
+<span class="code-line">cli.<span class="code-function">add_command</span>(launch)</span>
+<span class="code-line">cli.<span class="code-function">add_command</span>(session)</span>
+<span class="code-line"><span class="code-comment"># ... 17 commands registered in total</span></span>
+        </div>
+        <div class="translation-english">
+          <span class="translation-label">Plain English</span>
+          <div class="translation-lines">
+            <div class="tl">Import the <code>click</code> library for building CLI commands.</div>
+            <div class="tl">Pull in each command from separate files in the <code>commands/</code> folder.</div>
+            <div class="tl">Create the top-level <code>cao</code> command group.</div>
+            <div class="tl">Register each subcommand. Adding a new command (like <code>cao deploy</code>) means creating a file in <code>commands/</code> and adding one <code>add_command</code> line here.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout callout-info">
+        <span class="callout-icon">&#128161;</span>
+        <div class="callout-content">
+          <span class="callout-title">Key Insight</span>
+          <p>Each command is a separate file in <code>cli/commands/</code>. The main file only wires them together. This means you can add new CLI commands without touching existing ones.</p>
+        </div>
+      </div>
+    </div>
+
+
+  </div>
+</section>

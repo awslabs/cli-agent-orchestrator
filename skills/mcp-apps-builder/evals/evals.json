@@ -1,0 +1,56 @@
+{
+  "skill_name": "mcp-apps-builder",
+  "trigger_evals": [
+    {"query": "build a new MCP App with an interactive chart that shows real-time metrics", "should_trigger": true},
+    {"query": "add a ui:// view to my existing MCP server that displays query results", "should_trigger": true},
+    {"query": "I want to create an interactive MCP App from scratch with a form UI", "should_trigger": true},
+    {"query": "migrate my OpenAI Apps SDK application to MCP Apps", "should_trigger": true},
+    {"query": "turn my existing React dashboard into a hybrid MCP App that also works standalone", "should_trigger": true},
+    {"query": "build a regular Express.js REST API with a React frontend", "should_trigger": false},
+    {"query": "create a CAO plugin that sends messages to Slack", "should_trigger": false},
+    {"query": "add a new provider for Kimi CLI to CAO", "should_trigger": false},
+    {"query": "write a SKILL.md file for my testing conventions", "should_trigger": false},
+    {"query": "launch a CAO session with code_supervisor and two developer workers", "should_trigger": false}
+  ],
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I want to create a new MCP App from scratch that visualizes API response times as a live-updating line chart. The server should expose a tool to fetch metrics and a ui:// resource to render the chart. Use the MCP Apps SDK.",
+      "expected_output": "A complete MCP App project with server-side tool registration, ui:// resource registration, and a React-based interactive chart UI following MCP Apps SDK patterns",
+      "assertions": [
+        "create-mcp-app skill is loaded or its patterns are followed",
+        "server registers a ui:// resource with proper metadata (_meta.ui with csp, permissions, domain)",
+        "MCP Apps SDK (@modelcontextprotocol/ext-apps) is used for the client-side UI",
+        "tool is registered that the UI can call to fetch metrics data",
+        "UI component renders inside the host sandbox (no JIT constructs like eval/new Function)",
+        "build and test commands are provided (npm run build, npm test)"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I have an existing MCP server at src/my-server/server.ts that already exposes 3 tools (query_db, list_tables, describe_table). I want to add an interactive UI view that lets users browse tables and run queries visually. Add MCP App support without breaking the existing tools.",
+      "expected_output": "The existing server is extended with a ui:// resource registration and a single-file UI bundle, preserving all existing tool functionality",
+      "assertions": [
+        "add-app-to-server skill is loaded or its patterns are followed",
+        "existing tools (query_db, list_tables, describe_table) are preserved unchanged",
+        "a ui:// resource is registered on the server with proper _meta.ui metadata",
+        "UI bundle is added that can call the existing tools via the MCP Apps SDK context",
+        "the UI handles the tool call results and renders them interactively",
+        "no eval() or new Function() in the UI bundle (JIT-free requirement for host CSP)"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I have an existing OpenAI Apps SDK app that uses window.openai.createChatCompletion and outputTemplate for rendering. I need to migrate it to MCP Apps so it works in Claude Desktop and VS Code Copilot. The app is at apps/my-assistant/.",
+      "expected_output": "The OpenAI Apps SDK app is migrated to MCP Apps SDK, replacing window.openai APIs with MCP Apps SDK equivalents, outputTemplate with ui:// resources, and skybridge with MCP tool calls",
+      "assertions": [
+        "migrate-oai-app skill is loaded or its patterns are followed",
+        "window.openai API calls are replaced with MCP Apps SDK equivalents",
+        "outputTemplate is replaced with ui:// resource registration",
+        "skybridge/postMessage patterns are replaced with MCP tool calls",
+        "the migrated app targets the MCP Apps client matrix (Claude Desktop, VS Code Copilot, ChatGPT)",
+        "build commands are updated for the new SDK (npm install @modelcontextprotocol/ext-apps)"
+      ]
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 """Tests for the Kiro CLI memory-injection plugin."""
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from cli_agent_orchestrator.plugins.builtin.kiro_cli_memory import (
     STEERING_SUBDIR,
     KiroCliMemoryPlugin,
 )
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 
 
 def _event(provider: str = "kiro_cli", terminal_id: str = "t1") -> PostCreateTerminalEvent:
@@ -30,9 +32,15 @@ def _install_metadata_and_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
             "id": terminal_id,
         },
     )
+
+    # Mock get_backend() to return a fake backend with get_pane_working_directory
+    class FakeBackend:
+        def get_pane_working_directory(self, session: str, window: str) -> str:
+            return str(tmp_path)
+
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(tmp_path),
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_backend",
+        lambda: FakeBackend(),
     )
 
 
@@ -254,9 +262,15 @@ async def test_path_containment_guard_rejects_symlink_escape(
             "id": terminal_id,
         },
     )
+
+    # Mock get_backend() to return a fake backend with get_pane_working_directory
+    class FakeBackend:
+        def get_pane_working_directory(self, session: str, window: str) -> str:
+            return str(real_cwd)
+
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(real_cwd),
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_backend",
+        lambda: FakeBackend(),
     )
 
     class FakeMemoryService:
@@ -305,9 +319,15 @@ async def test_missing_working_dir_does_not_escape_handler(
             "id": terminal_id,
         },
     )
+
+    # Mock get_backend() to return a fake backend with get_pane_working_directory
+    class FakeBackend:
+        def get_pane_working_directory(self, session: str, window: str) -> str:
+            return "/nonexistent-cao-dir-xyz123/sub"
+
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: "/nonexistent-cao-dir-xyz123/sub",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_backend",
+        lambda: FakeBackend(),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
@@ -348,3 +368,110 @@ async def test_steering_write_is_atomic_no_tmp_left_behind(
     assert "<cao-memory>X</cao-memory>" in target.read_text(encoding="utf-8")
     leftovers = [p for p in target.parent.iterdir() if p.suffix == ".tmp"]
     assert leftovers == []
+
+
+def test_concurrent_steering_writes_never_collide_on_temp_file(tmp_path: Path) -> None:
+    """caom-47e defect A for the whole-file overwrite path.
+
+    Kiro's steering target is a FIXED path per working directory
+    (``<cwd>/.kiro/steering/cao-memory.md``), so two terminals sharing a cwd
+    write the same file. The lost-update race (defect B) does not apply — the
+    file is overwritten whole — but the old fixed ``target + ".tmp"`` idiom
+    was still exposed to defect A: one writer's ``finally``-unlink could
+    delete the other's live temp file, surfacing as ``FileNotFoundError`` on
+    ``os.replace``. Now that the plugin routes through ``locked_atomic_rewrite``
+    (unique per-call temp + inter-process lock) many concurrent overwrites
+    must complete without any writer raising, and the final file must be one
+    intact block (never a truncated/interleaved temp).
+    """
+    target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
+
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def overwrite(i: int) -> None:
+        try:
+            # Mirrors the plugin's write path: whole-file overwrite via the
+            # shared locked helper, ignoring existing content by design.
+            locked_atomic_rewrite(
+                target, lambda _existing, i=i: f"<cao-memory>writer-{i}</cao-memory>\n"
+            )
+        except BaseException as exc:  # noqa: BLE001 - captured for the assertion
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=overwrite, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    file_not_found = [e for e in errors if isinstance(e, FileNotFoundError)]
+    assert file_not_found == [], f"defect A shape reproduced: {file_not_found}"
+    assert errors == [], f"no writer should raise at all: {errors}"
+
+    # Exactly one intact writer's content survives — no interleaving/truncation.
+    final = target.read_text(encoding="utf-8")
+    assert final.count("<cao-memory>") == 1
+    assert final.count("</cao-memory>") == 1
+    leftovers = [p for p in target.parent.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
+
+
+@pytest.mark.asyncio
+async def test_writes_via_configured_backend_not_tmux_directly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: the cwd lookup must go through the CONFIGURED backend.
+
+    The plugin used to call ``tmux_client.get_pane_working_directory`` directly,
+    so on a non-tmux backend (herdr) the lookup returned None and the steering
+    file was silently never written. This drives the real backend registry via
+    ``set_backend`` instead of patching the plugin's ``get_backend`` name, so a
+    plugin that bypasses the abstraction never consults this backend and fails
+    the write assertion below.
+    """
+
+    from cli_agent_orchestrator.backends.registry import set_backend
+
+    resolved_for: list[tuple[str, str]] = []
+
+    class RecordingBackend:
+        """Stands in for a non-tmux backend (e.g. HerdrBackend)."""
+
+        def get_pane_working_directory(self, session: str, window: str) -> str:
+            resolved_for.append((session, window))
+            return str(tmp_path)
+
+    set_backend(RecordingBackend())
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+
+    class FakeMemoryService:
+        def get_memory_context_for_terminal(self, terminal_id: str) -> str:
+            return "<cao-memory>\n## Context\n- routed via backend\n</cao-memory>"
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
+        lambda: FakeMemoryService(),
+    )
+
+    plugin = KiroCliMemoryPlugin()
+    await plugin.setup()
+    await plugin.on_post_create_terminal(_event())
+    await plugin.teardown()
+
+    # The configured backend was actually consulted, with the metadata identifiers.
+    assert resolved_for == [("cao-test-session", "developer-abcd")]
+
+    # And the steering file landed under the cwd that backend reported.
+    target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
+    assert target.exists(), "steering file must be written on a non-tmux backend"
+    assert "routed via backend" in target.read_text(encoding="utf-8")

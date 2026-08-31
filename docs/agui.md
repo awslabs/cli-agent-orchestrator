@@ -30,15 +30,25 @@ to a build without the feature.
 `GET /agui/v1/stream` maps CAO's six normalized event primitives onto AG-UI
 typed events:
 
-| CAO primitive | AG-UI event(s) |
-|---|---|
-| session / terminal launch | `RUN_STARTED` / `STEP_STARTED` |
-| completion | `RUN_FINISHED` / `STEP_FINISHED` |
-| handoff / delegation | `TOOL_CALL_START` / `TOOL_CALL_END` |
-| message delivery | `TEXT_MESSAGE_CONTENT` (metadata only) |
-| file modification | `STATE_DELTA` (RFC 6902) against a fleet `STATE_SNAPSHOT` |
-| error | `RUN_ERROR` |
-| agent-authored UI | `GENERATIVE_UI` |
+| CAO primitive | AG-UI event(s) | Notes |
+|---|---|---|
+| session / terminal launch | `RUN_STARTED` / `STEP_STARTED` | |
+| completion | `RUN_FINISHED` / `STEP_FINISHED` | Also triggers synthesized `TOOL_CALL_END` for open receivers |
+| handoff (`orchestration_type=handoff\|assign`) | `TOOL_CALL_START` | Agent-to-agent task delegation [1] |
+| handoff (`orchestration_type=send_message` or absent) | `TEXT_MESSAGE_CONTENT` (metadata only) | Simple message dispatch |
+| a2a_delegation | `TOOL_CALL_START` | Cross-agent A2A task; closer also synthesizes `TOOL_CALL_RESULT` |
+| file modification | `STATE_DELTA` (RFC 6902) against a fleet `STATE_SNAPSHOT` | |
+| error | `RUN_ERROR` | |
+| agent-authored UI | `GENERATIVE_UI` | |
+
+[1] **L1 Cleanup A (TOOL_CALL lifecycle):** Handoff records with
+`orchestration_type` of `handoff` or `assign` now map to `TOOL_CALL_START`
+(previously all handoffs mapped to `TEXT_MESSAGE_CONTENT`). The
+`ToolCallLifecycleTracker` correlates these opens with receiver terminal
+completions and synthesizes exactly one `TOOL_CALL_END` per open. For
+`a2a_delegation` opens, a `TOOL_CALL_RESULT` is also synthesized before the
+`TOOL_CALL_END`. This ensures AG-UI clients see a well-formed tool-call
+lifecycle (open/result/end) rather than orphaned starts.
 
 On connect the server emits a full `STATE_SNAPSHOT` so any client hydrates its
 projection, then keeps it current with minimal RFC 6902 `STATE_DELTA` patches
@@ -106,6 +116,59 @@ reconnects automatically and the dropped records are replayed exactly once via
 ring buffer (`event_log_service`). (The MCP-Apps `/events` stream keeps its
 legacy drop-on-slow behaviour and backfills via `cao_fetch_history`.)
 
+## Replay contract (full specification)
+
+The replay mechanism is deterministic and designed for safe, idempotent reconnects:
+
+### Cursor precedence
+
+1. **`?since=<ISO-8601>`** -- explicit timestamp lower bound. Must be a valid
+   ISO-8601 string; malformed values produce HTTP 400 before any streaming starts.
+2. **`Last-Event-ID` header** -- native EventSource automatic cursor. Used only
+   when `?since=` is absent.
+3. **Neither** -- no replay; only the live stream is emitted.
+
+### Validation
+
+The `?since=` parameter is validated as ISO-8601 using `datetime.fromisoformat()`
+**before** the streaming response begins. Invalid values return `400 Bad Request`
+with a descriptive error. This prevents malformed cursors from being silently
+swallowed inside the failure-isolated replay block.
+
+### Over-delivery and deduplication (Seen-Set Dedup)
+
+The live subscription is registered **before** history replay begins. This means
+events published during the replay-to-live handoff are buffered in the subscriber
+queue. The stream maintains a `replayed_ids` set to deduplicate the overlap:
+events that appear in both the replay batch and the live queue are emitted only
+once (from replay). This guarantees neither gaps nor duplicates.
+
+### Snapshot ordering
+
+On every connection (fresh or reconnect), the server emits a full
+`STATE_SNAPSHOT` after the replay batch and before the first live `STATE_DELTA`.
+A client must receive the snapshot to hydrate its projection before it can
+correctly apply RFC-6902 patches.
+
+### Tool-call lifecycle across reconnects
+
+The `ToolCallLifecycleTracker` is instantiated per-connection. On reconnect with
+replay, the tracker processes replayed records first (rebuilding its open-call
+map), then continues with live events. Because the tracker is deterministic
+(same inputs produce same outputs), a replay produces the same synthesized frames
+as the original stream -- no duplicate closers, no orphan frames.
+
+### CAO extension status
+
+| Feature | Status | Notes |
+|---|---|---|
+| `?since=` ISO-8601 validation | Shipped | 400 on malformed |
+| `Last-Event-ID` replay | Shipped | Native EventSource compatible |
+| Seen-Set dedup | Shipped | Zero duplicates on reconnect |
+| Overflow-as-gap signal | Shipped | Stream closes; client reconnects |
+| `TOOL_CALL_END` lifecycle synthesis | Shipped | Deterministic under replay |
+| Short-lived ticket handshake | Follow-up | `POST /agui/v1/ticket` TBD |
+
 ## Generative UI
 
 Any agent in the fleet — regardless of provider — can author a UI intent and
@@ -142,7 +205,7 @@ falling back to an inert placeholder for anything unknown.
 
 ### Live proof
 
-[`examples/agui-dashboard/`](../examples/agui-dashboard) is a credentials-free,
+[`examples/ag-ui/ag-ui-dashboard/`](../examples/ag-ui/ag-ui-dashboard) is a credentials-free,
 runnable demonstration: `run.sh` starts a `cao-server` with the surface enabled
 and `showcase.sh` drives all six allow-listed components plus an off-list
 refusal through `emit_ui`, gating on the `GENERATIVE_UI` frames actually
@@ -151,12 +214,212 @@ an agent the component vocabulary with the bundled
 [`agui-author`](../skills/agui-author/SKILL.md) skill.
 
 A **stock browser client** rendering the stream — the dependency-free
-[`examples/agui-eventsource-viewer/`](../examples/agui-eventsource-viewer) — is the
+[`examples/ag-ui/ag-ui-eventsource-viewer/`](../examples/ag-ui/ag-ui-eventsource-viewer) — is the
 adapter-level proof. Its demo GIF is **generated by the build** (shift-left): the
 recorder drives the six components + the off-list refusal and asserts each renders
 before exporting the GIF, so CI fails if the stream→component contract drifts.
 
-![AG-UI EventSource viewer rendering the six generative-UI components live](media/agui-eventsource-viewer-demo.gif)
+![AG-UI EventSource viewer rendering the six generative-UI components live](media/ag-ui-eventsource-viewer-demo.gif)
+
+## Two-plane model
+
+CAO exposes its AG-UI surface through two complementary planes that differ in
+wire dialect, consumer shape, and intended use:
+
+### Ambient dialect (GET /agui/v1/stream)
+
+The **ambient plane** is the `GET /agui/v1/stream` SSE endpoint. It speaks
+CAO's own AG-UI dialect: `event:` + `data:` frames with UPPER_SNAKE event types
+(`STATE_SNAPSHOT`, `STATE_DELTA`, `STEP_STARTED`, `GENERATIVE_UI`, etc.) and an
+`id:` cursor for replay. Any `EventSource`-compatible client (browser-native or
+library-based) connects, hydrates from the initial `STATE_SNAPSHOT`, then folds
+live frames into its projection.
+
+This plane is optimized for long-lived dashboard consumers and the L2 construct
+library. No request body is required; the client is a pure observer. Replay is
+`Last-Event-ID`-based (browser-automatic) or `?since=`-based (explicit).
+
+### Stock run plane (POST /agui/v1/run)
+
+The **run plane** is the `POST /agui/v1/run` endpoint. It speaks the stock
+[ag-ui-protocol](https://github.com/ag-ui-protocol/ag-ui) wire dialect:
+`data:`-only camelCase JSON frames with a `type` field, produced by the official
+`EventEncoder`. This is what CopilotKit, the AG-UI Dojo, and other stock AG-UI
+clients expect.
+
+A client POSTs a `RunAgentInput` (threadId, runId, optional resume[]) and
+receives a lifecycle-legal stream: `RUN_STARTED` then `STATE_SNAPSHOT` then live
+projection frames (`STATE_DELTA`, `STEP_STARTED/FINISHED`, `TOOL_CALL_START/END`,
+`CUSTOM`) then `RUN_FINISHED`. If open approval interrupts exist, the stream
+closes with a `RUN_FINISHED` whose outcome is `{type: "interrupt", interrupts: [...]}`,
+and the client re-POSTs with a `resume[]` array to resolve them.
+
+The run plane requires the `[agui]` optional extra (`ag-ui-protocol` package).
+Without it the endpoint returns HTTP 501.
+
+### Choosing a plane
+
+| Use case | Plane | Why |
+|---|---|---|
+| Long-lived supervisory dashboard | Ambient | EventSource auto-reconnect, replay, no request body |
+| CopilotKit / AG-UI Dojo integration | Run | Stock wire dialect, interrupt/resume lifecycle |
+| L2 construct composition (Python) | Ambient | AguiStreamReader + fold constructs |
+| Raw HTTP client proving connectivity | Run | Single POST, verifiable frame output |
+| CI smoke tests | Either | Both exit non-zero on unmet preconditions |
+
+---
+
+## L2 construct library
+
+The `services/agui/` package provides fold-based constructs that compose on top
+of the ambient stream. Each construct consumes AG-UI frames (via `handle_frame`)
+and derives a `projection()` view without I/O.
+
+### Foundation
+
+| Class | Role |
+|---|---|
+| `AguiConstruct` | Abstract base: `handle_frame`, `projection`, `emit` (validated) |
+| `UiEmitter` / `RecordingUiEmitter` / `InProcessUiEmitter` / `HttpUiEmitter` | Emitter family (protocol + implementations) |
+| `AguiStreamReader` | `requests`-based SSE reader yielding `(event_id, agui_type, data)` tuples |
+| `ToolCallLifecycleTracker` | Correlates TOOL_CALL opens with terminal completions |
+| `apply_json_patch_strict` | Pure RFC-6902 subset (add/remove/replace), never mutates inputs |
+
+### Fold-based constructs
+
+#### SupervisorDashboardStream
+
+Folds `STATE_SNAPSHOT` and `STATE_DELTA` frames to maintain a local copy of the
+fleet topology. Derives:
+
+- `hierarchy()`: session-name keyed dict with terminal lists and counts
+- `supervisor_snapshot()`: active sessions, provider distribution, waiting terminals, rollup counters
+
+**Frames folded:** STATE_SNAPSHOT, STATE_DELTA, STEP_STARTED/FINISHED,
+RUN_STARTED/FINISHED, TOOL_CALL_START/END/RESULT (rollup counters).
+
+**Seen-Set Dedup:** id-bearing frames already processed are skipped; state
+frames (event_id=None) are always folded.
+
+#### MultiAgentSessionTimeline
+
+Tracks delegations and messages as an ordered timeline:
+
+- `TOOL_CALL_START` opens a delegation entry (keyed by tool_call_id)
+- `TOOL_CALL_END`/`TOOL_CALL_RESULT` closes matching entries
+- `TEXT_MESSAGE_CONTENT` appends message entries (metadata only, no body)
+
+**Projection:** `entries()` returns `TimelineEntry` list sorted by `(started_at, id)`.
+
+**Retention cap:** configurable (default 1000), evicts oldest first.
+
+#### CrossProviderStateSync
+
+Maintains a shared state view by folding snapshots/deltas:
+
+- `shared_state()`: the current state (or None before first snapshot)
+- `providers_seen()`: sorted list of unique providers from terminals
+- `converges_with(authoritative)`: deep-equality check against a reference
+
+Useful for verifying that a client-side projection has converged with the
+server's authoritative state.
+
+#### AgentHandoffWithApproval
+
+Human-in-the-loop approval lifecycle:
+
+- `on_provider_waiting(terminal_id, provider, raw_prompt)`: classifies the
+  prompt via `classify_reason` and creates an `Interrupt` record
+- `resume(interrupt_id, decision, edited_text)`: lock-guarded exactly-once
+  resolution with per-provider answer translation
+- `expire(terminal_id)`: zero-keystroke expiration on state transition
+- `pending()`: list of unresolved interrupts
+
+**Interrupt options** derive from the classified reason (permission_request gets
+approve/deny/edit; trust_prompt gets approve/deny).
+
+### Subclass extension points
+
+All constructs expose their state through `projection()` (JSON-serializable dict).
+Subclasses can:
+
+1. Override `handle_frame` to fold additional frame types
+2. Call `self.emit(component, props)` to author generative-UI intents (validated
+   against the allow-list and 8 KB size bound)
+3. Call `self.assert_no_body(data)` to enforce the metadata-only contract
+4. Access `self._emitter` for custom transport needs
+
+### Composition pattern
+
+```python
+from cli_agent_orchestrator.services.agui import (
+    AguiStreamReader,
+    RecordingUiEmitter,
+    SupervisorDashboardStream,
+)
+
+reader = AguiStreamReader("http://localhost:9889")
+emitter = RecordingUiEmitter()
+dashboard = SupervisorDashboardStream(emitter)
+
+for event_id, agui_type, data in reader.frames():
+    dashboard.handle_frame(agui_type, data, event_id)
+
+print(dashboard.hierarchy())
+print(dashboard.supervisor_snapshot())
+```
+
+### Runnable examples
+
+Each construct has a runnable example in `examples/`:
+
+- [`agui-supervisor-dashboard/`](../examples/ag-ui/ag-ui-supervisor-dashboard/) - SupervisorDashboardStream composition
+- [`agui-session-timeline/`](../examples/ag-ui/ag-ui-session-timeline/) - MultiAgentSessionTimeline delegation tracking
+- [`agui-handoff-approval/`](../examples/ag-ui/ag-ui-handoff-approval/) - Human-in-the-loop approval (CI + live procedure)
+- [`agui-cross-provider-sync/`](../examples/ag-ui/ag-ui-cross-provider-sync/) - CrossProviderStateSync convergence
+- [`agui-stock-client-live/`](../examples/ag-ui/ag-ui-stock-client-live/) - Stock AG-UI run plane (POST /agui/v1/run)
+
+### Shift-left video evidence (per feature)
+
+Each new L2 construct ships a **gated** demo recording — proof-of-work, not
+decoration. The recorder in
+[`examples/ag-ui/ag-ui-construct-demos/tools/`](../examples/ag-ui/ag-ui-construct-demos/tools/)
+runs the construct's own asserting example (the `run.sh` above, in
+offline/synthetic mode — no live provider, network, or secrets), and **only**
+produces a GIF if the example exits `0` and prints its `PASS` marker. If a
+construct regresses, the example exits non-zero, the recorder fails, and CI goes
+red (see the `AG-UI construct demos (shift-left recordings)` job) — so a broken
+construct cannot yield a green recording. Regenerate locally with:
+
+```sh
+cd examples/ag-ui/ag-ui-construct-demos/tools
+npm ci && npm run playwright:install && npm run record   # ONLY=<slug> for one
+```
+
+The GIFs are committed under [`docs/media/`](media/) and re-generated + uploaded
+as CI artifacts (`agui-construct-demos`) on every run.
+
+**SupervisorDashboardStream** — folds `STATE_SNAPSHOT`/`STATE_DELTA` into a live
+fleet view (active sessions, provider distribution, waiting terminals):
+
+![SupervisorDashboardStream example asserting its fold logic](media/ag-ui-supervisor-dashboard-demo.gif)
+
+**MultiAgentSessionTimeline** — reconstructs the delegation + message timeline
+from tool-call frames and closes entries on `TOOL_CALL_END`/`RESULT`:
+
+![MultiAgentSessionTimeline example asserting delegation tracking](media/ag-ui-session-timeline-demo.gif)
+
+**AgentHandoffWithApproval** — human-in-the-loop lifecycle: classify the prompt,
+raise an interrupt, resume exactly-once (idempotent), and expire on transition:
+
+![AgentHandoffWithApproval example asserting the approval lifecycle](media/ag-ui-handoff-approval-demo.gif)
+
+**CrossProviderStateSync** — convergent shared state across `claude_code`,
+`kiro_cli`, and `codex`, verified with `converges_with()` before and after a delta:
+
+![CrossProviderStateSync example asserting convergence](media/ag-ui-cross-provider-sync-demo.gif)
+
+---
 
 ## Privacy boundary
 

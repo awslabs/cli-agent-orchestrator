@@ -18,6 +18,7 @@ from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.skills import skills
 from cli_agent_orchestrator.cli.commands.terminal import terminal
+from cli_agent_orchestrator.cli.commands.tui import tui
 from cli_agent_orchestrator.cli.commands.update import update
 from cli_agent_orchestrator.cli.commands.workflow import workflow
 
@@ -51,6 +52,7 @@ cli.add_command(session)
 cli.add_command(terminal)
 cli.add_command(workflow)
 cli.add_command(update)
+cli.add_command(tui)  # bundled Rust terminal UI (issue #321)
 
 
 if __name__ == "__main__":

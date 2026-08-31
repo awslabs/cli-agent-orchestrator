@@ -1,4 +1,4 @@
-"""Shared native-status (herdr backend) tests across all herdr-capable providers.
+"""Shared native-status (herdr backend) tests across all registered providers.
 
 Every provider's ``get_status()`` must consult the backend's native agent state
 before parsing its output buffer, because on the herdr backend ``pipe_pane`` is a
@@ -14,8 +14,9 @@ the None fall-through to buffer parsing on the tmux backend.
 
 ``claude_code`` keeps its own detailed suite (``TestClaudeCodeProviderNativeStatus``
 in test_claude_code_unit.py); it is included here for breadth alongside the
-providers that previously had no native-status coverage. ``q_cli`` and
-``gemini_cli`` are out of scope for the herdr backend and excluded.
+providers that previously had no native-status coverage. The credential-free
+``mock_cli`` provider is included too because it is a registered provider used
+by orchestration tests and must obey the same backend contract.
 """
 
 import time
@@ -29,14 +30,20 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
+from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
+from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+from cli_agent_orchestrator.providers.omp import OmpProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
 
 def _make(provider_cls):
     """Construct a provider with the minimal args each constructor requires."""
+    if provider_cls is MockCliProvider:
+        return provider_cls("test1234", "test-session", "window-0")
     return provider_cls("test1234", "test-session", "window-0", "developer")
 
 
@@ -48,10 +55,14 @@ PROVIDERS = [
     pytest.param(CopilotCliProvider, None, id="copilot_cli"),
     pytest.param(KimiCliProvider, "_has_received_input", id="kimi_cli"),
     pytest.param(OpenCodeCliProvider, None, id="opencode_cli"),
+    pytest.param(OmpProvider, "_turns", id="omp"),
     pytest.param(CursorCliProvider, "_turns", id="cursor_cli"),
     pytest.param(AntigravityCliProvider, "_turns", id="antigravity_cli"),
     pytest.param(HermesProvider, None, id="hermes"),
     pytest.param(ClaudeCodeProvider, None, id="claude_code"),
+    pytest.param(GrokCliProvider, "_turns", id="grok_cli"),
+    pytest.param(MiniMaxCodeProvider, "_has_received_input", id="mcode"),
+    pytest.param(MockCliProvider, None, id="mock_cli"),
 ]
 
 
@@ -106,6 +117,9 @@ class TestSharedNativeStatus:
     def test_native_idle_dispatched_flushes_then_completed(self, mock_backend, provider_cls, _flag):
         """herdr 'idle' after dispatch: PROCESSING within 10s flush, COMPLETED after."""
         mock_backend.get_native_status.return_value = TerminalStatus.IDLE
+        # claude_code's mark_input_received snapshots get_history() for the
+        # staleness guard (#407); stub it so the hash sees a string.
+        mock_backend.get_history.return_value = ""
         provider = _make(provider_cls)
         provider.mark_input_received()
 
@@ -119,6 +133,7 @@ class TestSharedNativeStatus:
     def test_native_done_dispatched_flushes_then_completed(self, mock_backend, provider_cls, _flag):
         """herdr 'done' after dispatch: PROCESSING within 10s flush, COMPLETED after."""
         mock_backend.get_native_status.return_value = TerminalStatus.COMPLETED
+        mock_backend.get_history.return_value = ""
         provider = _make(provider_cls)
         provider.mark_input_received()
 
@@ -175,8 +190,10 @@ class TestSharedNativeStatus:
         provider._last_dispatch_time = time.time() - 300.0  # would have been "stale" pre-fix
         assert provider.get_status("") == self._empty_output_default(provider_cls)
 
-    def test_mark_input_received_sets_dispatch_flags(self, provider_cls, _flag):
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_mark_input_received_sets_dispatch_flags(self, mock_backend, provider_cls, _flag):
         """mark_input_received() sets shared _task_dispatched AND the provider's own flag."""
+        mock_backend.get_history.return_value = ""
         provider = _make(provider_cls)
         assert provider._task_dispatched is False
         provider.mark_input_received()

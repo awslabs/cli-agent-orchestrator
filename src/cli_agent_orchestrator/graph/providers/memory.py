@@ -8,12 +8,12 @@ ABC, no edits to memory_service/wiki_lint) and awaiting
 
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from cli_agent_orchestrator.graph.cache import GraphViewCache, make_meta
 from cli_agent_orchestrator.graph.models import Edge, EdgeType, GraphView, Node
 from cli_agent_orchestrator.graph.providers.base import GraphProvider, register_provider
-from cli_agent_orchestrator.services import wiki_lint
+from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,13 @@ class MemoryGraphProvider(GraphProvider):
     never cross the (scope, scope_id) boundary (FR-9).
     """
 
-    def __init__(self, memory_service: Optional[MemoryService] = None) -> None:
+    def __init__(
+        self,
+        memory_service: Optional[MemoryService] = None,
+        lint_enabled: Optional[Callable[[], bool]] = None,
+    ) -> None:
         self._svc = memory_service or MemoryService()
+        self._lint_enabled = lint_enabled or settings_service.is_memory_lint_enabled
 
     async def project(self, **filters: Any) -> GraphView:
         """Return this scope's GraphView, served from cache when fresh.
@@ -57,8 +62,12 @@ class MemoryGraphProvider(GraphProvider):
         raw_scope_id = filters.get("scope_id")
         scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
 
-        key = ("memory", scope, scope_id)
-        view, cached, as_of = await _CACHE.get_or_build(key, lambda: self._build(scope, scope_id))
+        lint_enabled = self._lint_enabled()
+        key = ("memory", scope, scope_id, lint_enabled)
+        view, cached, as_of = await _CACHE.get_or_build(
+            key,
+            lambda: self._build(scope, scope_id, lint_enabled),
+        )
         # Re-wrap with fresh cache provenance without mutating the cached
         # instance's own meta (the same GraphView object is served to every hit).
         return GraphView(
@@ -67,9 +76,23 @@ class MemoryGraphProvider(GraphProvider):
             meta=make_meta(view.meta, cached=cached, as_of=as_of),
         )
 
-    async def _build(self, scope: str, scope_id: Optional[str]) -> GraphView:
+    async def _build(self, scope: str, scope_id: Optional[str], lint_enabled: bool) -> GraphView:
         """Project the scope's wiki into a GraphView (the uncached, ~148s path)."""
         meta: dict[str, Any] = {"provider": "memory", "scope": scope, "scope_id": scope_id}
+        if not lint_enabled:
+            meta.update(
+                {
+                    "lint_enabled": False,
+                    "lint_enrichment": "disabled",
+                    "disabled_enrichments": [
+                        "orphan_page",
+                        "contradiction",
+                        "stale_claim",
+                        "poison_frequency",
+                        "graph_density",
+                    ],
+                }
+            )
 
         # Resolve + parse the scope's index. A scope with no wiki on disk
         # (or an unresolvable scope/scope_id) is an empty graph, not an error.
@@ -101,37 +124,81 @@ class MemoryGraphProvider(GraphProvider):
         nodes: dict[str, Node] = {key: Node(id=key, kind="topic", label=key) for key in keys}
         edges: list[Edge] = []
 
-        # related_keys edges (FR-7a). related_keys carries no relevance
-        # score, so edge attrs stay score-free. A target outside this
-        # scope's key set is dropped — never a cross-scope edge (FR-9).
-        related_raw = self._svc._related_keys_lookup(keys, scope, scope_id)
-        for key in keys:
-            for target in MemoryService._parse_related_keys(related_raw.get(key), scope):
-                if target not in nodes or target == key:
-                    continue
-                edges.append(
-                    Edge(
-                        source=key,
-                        target=target,
-                        type=EdgeType.RELATES_TO,
-                        attrs={"source": "related_keys"},
-                    )
-                )
+        # Typed relationship edges from the STORE (issue #511, FR-4.3). The
+        # provider projects ACTIVE relationships (relates_to + contradiction +
+        # supersedes) read through the single service — NOT from related_keys and
+        # NOT from projection-time lint. Edge attrs carry provenance (the row's
+        # origin) and NO invented score/relevance. A target outside this scope's
+        # node set is dropped (never a cross-scope edge, FR-9). Multiple edge
+        # types between one pair remain distinct Edges (FR-4.4).
+        _TYPE_MAP = {
+            "relates_to": EdgeType.RELATES_TO,
+            "contradiction": EdgeType.CONTRADICTION,
+            "supersedes": EdgeType.SUPERSEDES,
+        }
 
-        # Lint findings — awaited directly in-request (ADR-7); no SQL or LLM
-        # calls beyond what run_lint itself performs (FR-7, C-1). A lint
-        # failure degrades to a lint-free graph rather than a 500.
+        issues = []
+        if lint_enabled:
+            # Lint findings may run expensive detectors. A failure degrades to
+            # a lint-free graph rather than a 500.
+            try:
+                # project_hash arg is only used for run_lint's audit log, not
+                # lookup — `project()` has no cwd/terminal_context to resolve
+                # the real project id (resolve_project_id), so this is a
+                # placeholder.
+                issues = await wiki_lint.run_lint(scope_id or scope, scope=scope)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
+                meta["lint_error"] = type(e).__name__
+
+        # ORDERING (human review, PR #524): the relationship read MUST come after
+        # run_lint. run_lint persists its contradiction findings into this same
+        # store (wiki_lint._persist_contradictions), so reading first meant a
+        # contradiction detected during THIS projection was absent from the graph
+        # it produced — invisible for a full cache window, and reappearing later
+        # with no apparent cause. Reading after makes the projection reflect the
+        # lint run it just performed.
         try:
-            # project_hash arg is only used for run_lint's audit log, not for
-            # lookup — `project()` has no cwd/terminal_context to resolve the
-            # real project id (resolve_project_id), so this is a placeholder.
-            issues = await wiki_lint.run_lint(scope_id or scope, scope=scope)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
-            meta["lint_error"] = type(e).__name__
-            issues = []
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            # Bound the query to THIS projection's node set. Without
+            # source_keys the read loads every active relationship in the
+            # (scope, scope_id) and discards the out-of-set rows in Python,
+            # where the pre-#511 related_keys read was naturally bounded to
+            # the current keys.
+            #
+            # This bounds the SOURCE side only. The both-endpoints check below
+            # is still required and must NOT be removed: a source inside the
+            # node set may legitimately point at a target outside it, and
+            # dropping that edge is what enforces FR-9 (never a cross-scope
+            # edge) and keeps GraphView's endpoint validation satisfied.
+            active = MemoryRelationshipService().list_relationships(
+                scope, scope_id, status="active", source_keys=keys
+            )
+        except Exception as e:  # degrade to a relationship-free graph, never 500
+            logger.warning("memory graph provider: relationship read failed: %r", e)
+            meta["relationship_error"] = type(e).__name__
+            active = []
+        for rel in active:
+            edge_type = _TYPE_MAP.get(rel.type)
+            if edge_type is None:
+                continue
+            if rel.source_key not in nodes or rel.target_key not in nodes:
+                continue
+            if rel.source_key == rel.target_key:
+                continue
+            edges.append(
+                Edge(
+                    source=rel.source_key,
+                    target=rel.target_key,
+                    type=edge_type,
+                    attrs={"source": rel.origin},
+                )
+            )
 
         for issue in issues:
             if issue.issue_type == "orphan_page":
@@ -153,19 +220,11 @@ class MemoryGraphProvider(GraphProvider):
                 node = nodes.get(issue.key)
                 if node is not None:
                     node.attrs["is_hub"] = True
-            elif issue.issue_type == "contradiction":
-                if issue.scope_id != scope_id or issue.related_key is None:
-                    continue
-                if issue.key not in nodes or issue.related_key not in nodes:
-                    continue
-                edges.append(
-                    Edge(
-                        source=issue.key,
-                        target=issue.related_key,
-                        type=EdgeType.CONTRADICTION,
-                        attrs={"source": "wiki_lint", "summary": issue.description},
-                    )
-                )
+            # contradiction: NO LONGER projected from live lint here (issue #511).
+            # Contradiction edges now come from the durable store above (persisted
+            # by the wiki_lint producer with origin=wiki_lint), so projecting them
+            # again from the in-request lint run would double-source them. Lint
+            # still runs for the orphan_page/graph_density NODE attrs above.
             # stale_claim / poison_frequency / lint_error → dropped (ADR-2).
 
         return GraphView(nodes=list(nodes.values()), edges=edges, meta=meta)

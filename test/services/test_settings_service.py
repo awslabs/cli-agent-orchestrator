@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.settings_service import (
     _DEFAULTS,
     _load,
@@ -21,8 +22,21 @@ from cli_agent_orchestrator.services.settings_service import (
 
 @pytest.fixture
 def settings_file(tmp_path):
-    """Patch SETTINGS_FILE and CAO_HOME_DIR to use a temp directory."""
+    """Patch SETTINGS_FILE and CAO_HOME_DIR to use a temp directory.
+
+    Also resets get_server_settings()'s module-global cache
+    (_server_settings_cache/_server_settings_mtime_ns), which is keyed only
+    on SETTINGS_FILE's st_mtime_ns. Without this reset, back-to-back tests
+    that each write their own tmp_path/settings.json can collide on a
+    coarse-clock filesystem (two writes to DIFFERENT files landing on the
+    same st_mtime_ns tick) and a test would silently read the PRIOR test's
+    cached settings instead of its own -- flaky (~3-4 failures per run on
+    WSL2), not reproducible on every host, and each failing test passes in
+    isolation, which is exactly what a stale-cache bug looks like.
+    """
     fake_settings = tmp_path / "settings.json"
+    settings_service._server_settings_cache = None
+    settings_service._server_settings_mtime_ns = -1
     with (
         patch(
             "cli_agent_orchestrator.services.settings_service.SETTINGS_FILE",
@@ -34,6 +48,8 @@ def settings_file(tmp_path):
         ),
     ):
         yield fake_settings
+    settings_service._server_settings_cache = None
+    settings_service._server_settings_mtime_ns = -1
 
 
 class TestLoad:
@@ -289,6 +305,7 @@ class TestGetServerSettings:
             "event_bus_max_queue_size": 1024,
             "provider_init_timeout": 60,
             "startup_prompt_handler_timeout": 20,
+            "state_buffer_max": 32768,
         }
 
     def test_reads_custom_values(self, settings_file):
@@ -327,3 +344,246 @@ class TestGetServerSettings:
         _save({"server": {"provider_init_timeout": -5}})
         result = get_server_settings()
         assert result["provider_init_timeout"] == 60
+
+    def test_state_buffer_max_reads_custom_value(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 65536}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+
+    def test_state_buffer_max_is_int(self, settings_file):
+        """A settings.json float (e.g. 32768.0) must come back as int -- it's
+        used as a slice bound (``buffer[-state_buffer_max:]``), which raises
+        TypeError on a float."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 65536.0}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+        assert isinstance(result["state_buffer_max"], int)
+
+    def test_state_buffer_max_zero_falls_back_to_default(self, settings_file):
+        """0 must not silently disable truncation: ``buffer[-0:]`` is the
+        whole buffer (``-0 == 0``, and ``s[0:]`` is everything), not an empty
+        slice -- unbounded per-terminal memory from a config typo."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 0}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_negative_falls_back_to_default(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": -1}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_fractional_below_one_falls_back_to_default(self, settings_file):
+        """0.5 passes the naive ``val <= 0`` check (0.5 > 0) but truncates to
+        0 once coerced to int for the slice bound -- ``buffer[-0:]`` is the
+        same unbounded-buffer failure mode as the zero case above, just
+        reached through the float door instead. The guard must check
+        ``int(val) <= 0``, not ``val <= 0``."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 0.5}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_invalid_type_falls_back_to_default(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": "not_a_number"}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_env_override(self, settings_file, monkeypatch):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        # Write the (empty) file so SETTINGS_FILE.exists() is True and this
+        # test's mtime is distinct from a prior test's -- get_server_settings()
+        # caches purely on file mtime, and a nonexistent file always hashes to
+        # mtime_ns=-1, so two tests that never call _save() could otherwise
+        # collide on the cache and silently return a stale prior result.
+        _save({})
+        monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "65536")
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+
+    def test_state_buffer_max_env_override_beats_settings_file(self, settings_file, monkeypatch):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 16384}})
+        monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "65536")
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+
+    def test_state_buffer_max_env_zero_falls_back_to_default(self, settings_file, monkeypatch):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({})  # see test_state_buffer_max_env_override for why
+        monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "0")
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+
+# ===========================================================================
+# PR 526 human review — IMPORTANT: the four workflow_journal_* settings had ZERO
+# write-path test coverage.
+#
+# set_memory_setting validates these keys (bool-vs-int discrimination, per-key
+# minimums), but every retention test monkeypatches get_memory_settings to a plain
+# dict, so the REAL write path — validate, persist, read back — was never
+# exercised. A regression that dropped the bool guard, or the >= 1 minimum on
+# output_cap_bytes, would have gone unnoticed.
+#
+# These drive set_memory_setting directly against the isolated tmp settings file
+# (the `settings_file` fixture patches SETTINGS_FILE + CAO_HOME_DIR and resets the
+# get_server_settings cache), so no test here can read or write a real ~/.cao.
+# ===========================================================================
+_WF_INT_KEYS = [
+    "workflow_journal_output_cap_bytes",
+    "workflow_journal_retention_days",
+    "workflow_journal_retention_count",
+]
+# Hard-coded rather than derived from the production constants under test: a
+# fixture sourced from `_WORKFLOW_JOURNAL_INT_KEYS` would follow a bad rename and
+# stay green. Minimums are likewise literal — 1 for the cap (a 0-byte cap would
+# truncate every output to just the marker), 0 for the two retention bounds
+# (where 0 means "bound disabled").
+_WF_INT_MINIMUMS = {
+    "workflow_journal_output_cap_bytes": 1,
+    "workflow_journal_retention_days": 0,
+    "workflow_journal_retention_count": 0,
+}
+_WF_BOOL_KEY = "workflow_journal_capture_output"
+
+
+def test_literal_key_tables_still_match_the_production_frozensets():
+    """The literals above are the point — but they must still COVER production.
+
+    Keeping them literal stops a rename from dragging the tests along silently.
+    The gap that leaves (PR #526 review fix cycle 1): if a key were DELETED from
+    the production frozenset, every rejection test would still pass — for the
+    wrong reason, via the ``else: raise ValueError("Unknown memory setting")``
+    branch, which raises the same exception type the tests assert on. This
+    equality check closes that hole without weakening the literals: it is the one
+    place allowed to compare against the production value, and it asserts
+    coverage, not behaviour.
+    """
+    assert set(_WF_INT_KEYS) == settings_service._WORKFLOW_JOURNAL_INT_KEYS
+    assert set(_WF_INT_MINIMUMS) == set(_WF_INT_KEYS)
+    assert {_WF_BOOL_KEY} == settings_service._WORKFLOW_JOURNAL_BOOL_KEYS
+
+
+class TestWorkflowJournalSettingsWritePath:
+    """set_memory_setting validation + persistence for the four #504 keys."""
+
+    def test_the_four_keys_are_accepted_by_the_write_path(self, settings_file):
+        """All four are in the allow-list — an unknown key raises, these do not."""
+        settings_service.set_memory_setting(_WF_BOOL_KEY, True)
+        for key in _WF_INT_KEYS:
+            settings_service.set_memory_setting(key, 7)
+        stored = settings_service.get_memory_settings()
+        assert stored[_WF_BOOL_KEY] is True
+        for key in _WF_INT_KEYS:
+            assert stored[key] == 7
+
+    def test_round_trip_persists_to_disk_not_just_memory(self, settings_file):
+        """The value survives a re-read of the file — a real persisted write."""
+        settings_service.set_memory_setting("workflow_journal_retention_days", 45)
+        on_disk = json.loads(settings_file.read_text())
+        assert on_disk["memory"]["workflow_journal_retention_days"] == 45
+        assert settings_service.get_memory_settings()["workflow_journal_retention_days"] == 45
+
+    @pytest.mark.parametrize("key", _WF_INT_KEYS)
+    def test_int_key_rejects_a_string(self, settings_file, key):
+        with pytest.raises(ValueError, match="must be an int"):
+            settings_service.set_memory_setting(key, "30")
+
+    @pytest.mark.parametrize("key", _WF_INT_KEYS)
+    @pytest.mark.parametrize("bad", [True, False])
+    def test_int_key_rejects_a_bool_masquerading_as_an_int(self, settings_file, key, bad):
+        """bool is an int SUBCLASS, so a naive isinstance(value, int) would admit
+        True/False and persist 1/0 for a retention bound. The guard must reject it
+        by type, not coerce it."""
+        with pytest.raises(ValueError, match="must be an int"):
+            settings_service.set_memory_setting(key, bad)
+
+    @pytest.mark.parametrize("key", _WF_INT_KEYS)
+    def test_int_key_rejects_a_float(self, settings_file, key):
+        with pytest.raises(ValueError, match="must be an int"):
+            settings_service.set_memory_setting(key, 30.5)
+
+    @pytest.mark.parametrize("key", _WF_INT_KEYS)
+    def test_int_key_rejects_a_value_below_its_minimum(self, settings_file, key):
+        """One below each key's own floor must be rejected, and the rejection must
+        leave NOTHING persisted (a partial write would be worse than the error)."""
+        below = _WF_INT_MINIMUMS[key] - 1
+        with pytest.raises(ValueError, match="must be >="):
+            settings_service.set_memory_setting(key, below)
+        assert key not in settings_service.get_memory_settings()
+
+    @pytest.mark.parametrize("key", _WF_INT_KEYS)
+    def test_int_key_accepts_exactly_its_minimum(self, settings_file, key):
+        """The boundary is inclusive: 1 for the cap, 0 for the two retention
+        bounds (0 = bound disabled, which sweep_runs honours as a no-op)."""
+        minimum = _WF_INT_MINIMUMS[key]
+        settings_service.set_memory_setting(key, minimum)
+        assert settings_service.get_memory_settings()[key] == minimum
+
+    def test_output_cap_bytes_rejects_zero_but_retention_accepts_it(self, settings_file):
+        """The asymmetry is deliberate and load-bearing, so pin it directly: a
+        0-byte output cap is meaningless, while 0 on a retention bound means
+        'unlimited'. A single shared minimum would break one of the two."""
+        with pytest.raises(ValueError, match="must be >= 1"):
+            settings_service.set_memory_setting("workflow_journal_output_cap_bytes", 0)
+        settings_service.set_memory_setting("workflow_journal_retention_days", 0)
+        settings_service.set_memory_setting("workflow_journal_retention_count", 0)
+        stored = settings_service.get_memory_settings()
+        assert stored["workflow_journal_retention_days"] == 0
+        assert stored["workflow_journal_retention_count"] == 0
+
+    @pytest.mark.parametrize("bad", [1, 0, "true", None, 1.0])
+    def test_bool_key_rejects_a_non_bool(self, settings_file, bad):
+        """capture_output gates whether payloads are retained at all, so a truthy
+        1 or "true" must NOT be coerced into enabling capture."""
+        with pytest.raises(ValueError, match="must be a bool"):
+            settings_service.set_memory_setting(_WF_BOOL_KEY, bad)
+        assert _WF_BOOL_KEY not in settings_service.get_memory_settings()
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_bool_key_round_trips_both_values(self, settings_file, value):
+        settings_service.set_memory_setting(_WF_BOOL_KEY, value)
+        assert settings_service.get_memory_settings()[_WF_BOOL_KEY] is value
+
+    def test_retention_getters_read_the_persisted_values(self, settings_file):
+        """The seam the retention tests monkeypatch away: prove the real write path
+        feeds workflow_retention's getters, so a persisted value actually takes
+        effect end-to-end."""
+        from cli_agent_orchestrator.services import workflow_retention
+
+        settings_service.set_memory_setting("workflow_journal_retention_days", 12)
+        settings_service.set_memory_setting("workflow_journal_retention_count", 34)
+        settings_service.set_memory_setting("workflow_journal_output_cap_bytes", 2048)
+        settings_service.set_memory_setting(_WF_BOOL_KEY, True)
+
+        assert workflow_retention.retention_days() == 12
+        assert workflow_retention.retention_count() == 34
+        assert workflow_retention.output_cap_bytes() == 2048
+        assert workflow_retention.capture_enabled() is True
+
+    def test_a_rejected_write_leaves_a_previously_stored_value_intact(self, settings_file):
+        """A failed validation must not clobber what was already persisted."""
+        settings_service.set_memory_setting("workflow_journal_retention_days", 30)
+        with pytest.raises(ValueError):
+            settings_service.set_memory_setting("workflow_journal_retention_days", -5)
+        assert settings_service.get_memory_settings()["workflow_journal_retention_days"] == 30
+
+    def test_an_unknown_workflow_journal_like_key_is_still_rejected(self, settings_file):
+        """The allow-list is exact, not a prefix match — a typo'd key must raise
+        rather than being silently persisted as an unread setting."""
+        with pytest.raises(ValueError, match="Unknown memory setting"):
+            settings_service.set_memory_setting("workflow_journal_retention_dayz", 30)

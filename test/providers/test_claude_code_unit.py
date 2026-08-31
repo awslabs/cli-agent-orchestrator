@@ -1,7 +1,11 @@
 """Unit tests for Claude Code provider."""
 
 import json
+import os
+import re
 import shlex
+import stat
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
@@ -13,7 +17,7 @@ from cli_agent_orchestrator.models.agent_profile import (
     ContainerConfig,
     ContainerPathMap,
 )
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
 
 
@@ -94,7 +98,15 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
-        """Test initialization timeout when no Claude markers appear."""
+        """Test initialization timeout when no Claude markers appear.
+
+        Round-3 review fix (call-me-ram): reverted back to a bare TimeoutError -- the
+        keep-worker-alive signal for a *recognized* WAITING_USER_ANSWER prompt no longer needs to
+        flow through this raise site as of the round-2 fix (it now comes from send_input's own
+        guard), so this genuinely-unrecognized-status fallback goes back to TimeoutError, matching
+        main's clean teardown behavior for a broken launch instead of leaking an unreapable
+        UNKNOWN-status worker. The message text is unchanged.
+        """
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
         # Snapshot and loop return the same content → no new Claude markers
@@ -819,6 +831,193 @@ class TestClaudeCodeProviderStatusDetection:
         assert provider.get_status(output) == TerminalStatus.IDLE
 
 
+class TestClaudeCodeDialogDetection:
+    """Tests for dialog detection anchoring and plan-approval (issue #405)."""
+
+    def test_plan_dialog_many_options_detected_as_waiting(self):
+        """Plan dialog with ~9 options (scrolled beyond old 10-line window) → WAITING."""
+        output = (
+            "⏺ I've analyzed the codebase and prepared a plan.\n"
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. No, refine with Ultraplan\n"
+            "  4. Tell Claude what to change\n"
+            "  5. Save plan and exit\n"
+            "  6. Show plan details\n"
+            "  7. Edit plan in editor\n"
+            "  8. Run with different model\n"
+            "  9. Run with constraints\n"
+            "     shift+tab to approve with this feedback\n"
+            "ctrl+g to edit in  Nvim  · ~/.claude/plans/my-plan.md"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_dialog_dismissed_with_response_marker_not_waiting(self):
+        """Dismissed plan dialog + response marker (⏺) after options → COMPLETED."""
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "⏺ Done implementing the feature.\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_plan_dialog_dismissed_with_new_tui_marker_not_waiting(self):
+        """Dismissed plan dialog + newest-TUI response marker (●) → not WAITING.
+
+        The newest TUI renders responses with ● (U+25CF) instead of ⏺; the
+        dismissal guard must accept it as dismissal evidence or the terminal
+        stays falsely WAITING and inbox delivery stalls.
+        """
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "● Done implementing the feature.\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_dialog_effort_footer_is_not_dismissal_evidence(self):
+        """A '● high · /effort' footer below a LIVE plan dialog must not count
+        as a response marker — the dialog is still open → WAITING."""
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. No, tell Claude what to change\n"
+            "● high · /effort"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_dialog_dismissed_with_separator_not_waiting(self):
+        """Dismissed plan dialog + separator after options → COMPLETED."""
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "⏺ Proceeding with option 1\n"
+            "⏺ Done implementing the changes.\n"
+            "────────────────────────\n"
+            "❯ Ask a question or describe a task"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_nav_footer_in_scrollback_with_idle_at_bottom_not_waiting(self):
+        """'↑/↓ to navigate' in scrollback but NOT in bottom 6 lines → not WAITING."""
+        scrollback_lines = ["line %d of output" % i for i in range(25)]
+        scrollback_lines[5] = "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        scrollback_lines.append("⏺ Here is the result")
+        scrollback_lines.append("────────────────────────")
+        scrollback_lines.append("❯ ")
+        output = "\n".join(scrollback_lines)
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_ask_user_question_with_notes_hint_and_error_banner(self):
+        """AskUserQuestion footer pushed down by notes-hint + error → still WAITING."""
+        output = (
+            "❯ 1. Option one\n"
+            "  2. Option two\n"
+            "  3. Option three\n"
+            "n to add notes\n"
+            "⚠ Please select a valid option\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_approval_active_with_option_markers_is_waiting(self):
+        """Active plan-approval dialog (option markers present) → WAITING."""
+        output = (
+            "Claude has a plan. Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. No, refine\n"
+            "  4. Tell Claude what to change\n"
+            "     shift+tab to approve with feedback"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_text_far_in_scrollback_no_option_markers_in_bottom(self):
+        """Plan text far in scrollback, no option markers in bottom → not WAITING."""
+        lines = ["line %d" % i for i in range(20)]
+        lines[2] = "Would you like to proceed?"
+        lines[3] = "❯ 1. Yes"
+        lines[4] = "  2. No"
+        lines.extend(
+            [
+                "⏺ Completed the work",
+                "────────────────────────",
+                "❯ ",
+            ]
+        )
+        output = "\n".join(lines)
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_dismissed_plan_response_marker_no_separator(self):
+        """Response marker after options WITHOUT separator still dismisses the plan."""
+        output = (
+            "Would you like to proceed?\n" "  1. Yes\n" "  2. No\n" "⏺ Here is the response\n" "> "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.COMPLETED
+
+    @pytest.mark.xfail(
+        reason="Known limitation: agent prose containing '↑/↓ to navigate' "
+        "in the 6-line footer window causes false WAITING. Full fix needs "
+        "structural composer detection.",
+        strict=True,
+    )
+    def test_agent_prose_with_nav_text_in_footer_false_waiting(self):
+        """KNOWN LIMITATION: agent prose echoing '↑/↓ to navigate' in the
+        bottom 6 lines of an idle prompt false-positives as WAITING."""
+        output = (
+            "⏺ The dialog shows:\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        # This SHOULD be COMPLETED but will be WAITING due to the known limitation
+        assert status == TerminalStatus.COMPLETED
+
+
 class TestClaudeCodeProviderNativeStatus:
     """Tests for get_status() native-first path (herdr backend)."""
 
@@ -979,6 +1178,8 @@ class TestClaudeCodeProviderNativeStatus:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_mark_input_received_resets_detection_flags(self, mock_backend):
         """mark_input_received() sets _task_dispatched=True and resets detection flags."""
+        mock_backend.get_history.return_value = "❯ "
+
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._done_first_detected = 999.0
         provider._idle_first_detected = 999.0
@@ -1215,6 +1416,26 @@ class TestClaudeCodeProviderMisc:
         assert "claude --dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
+    def test_build_claude_command_with_resume_session_id(self):
+        """resume_session_id maps to `claude --resume <sid>` (durable-orchestra
+        recovery: re-open a prior supervisor conversation in a new CAO session)."""
+        provider = ClaudeCodeProvider(
+            "test123",
+            "test-session",
+            "window-0",
+            resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+        )
+        command = provider._build_claude_command()
+
+        assert "--resume 11d55034-bb41-46ca-8686-59a9dbff16b5" in command
+
+    def test_build_claude_command_no_resume_by_default(self):
+        """Without resume_session_id the command must not carry --resume."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        command = provider._build_claude_command()
+
+        assert "--resume" not in command
+
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
         """Test building Claude command with system prompt."""
@@ -1424,6 +1645,118 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--model" not in command
 
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_explicit_model_override_wins_over_profile_model(self, mock_load):
+        """An explicit per-call model (handoff/assign's own `model` param)
+        takes precedence over the profile's own static model field."""
+        mock_profile = MagicMock()
+        mock_profile.model = "sonnet"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
+        command = provider._build_claude_command()
+
+        assert "--model fable-5" in command
+        assert "--model sonnet" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_explicit_model_override_applies_with_no_profile_model(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
+        command = provider._build_claude_command()
+
+        assert "--model fable-5" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_model_override_ignored_for_native_agent_profile(self, mock_load):
+        """A profile that maps to a native Claude Code agent handles its own
+        model config -- an explicit override is not applied there (by
+        design, see the provider's own comment), and does not appear in the
+        launch command at all."""
+        mock_profile = MagicMock()
+        mock_profile.native_agent = "my-claude-agent"
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
+        command = provider._build_claude_command()
+
+        assert "--agent my-claude-agent" in command
+        assert "--model" not in command
+
+    def test_no_agent_profile_still_honors_explicit_model(self):
+        """No CAO profile exists (agent_profile passed straight through to
+        Claude Code's own native agent store) -- an explicit model override
+        still applies since there's no profile.model to conflict with."""
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
+        # profile is None on this path (agent_profile has no CAO profile file).
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--agent agent" in command
+        assert "--model fable-5" in command
+
+
+class TestClaudeCodeProviderClaudeConfig:
+    """Tests that profile.claudeConfig maps to Claude Code CLI flags."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_appends_effort_from_claude_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = {"effort": "xhigh"}
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--effort xhigh" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_appends_fallback_model_from_claude_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = {"fallback_model": "sonnet"}
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--fallback-model sonnet" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_omits_effort_when_claude_config_absent(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_profile.claudeConfig = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--effort" not in command
+
 
 class TestClaudeCodeProviderPermissionMode:
 
@@ -1535,41 +1868,87 @@ class TestClaudeCodeProviderYoloRootRegression:
         assert "--dangerously-skip-permissions" not in command
 
 
-class TestClaudeCodeProviderStartupPrompts:
-    """Tests for Claude Code startup prompt handling (trust + bypass)."""
+# Live capture from a pod running claude 2.1.235 on Bedrock with every
+# ANTHROPIC_*_MODEL pinned to Opus 4.6, in an account entitled to Opus 5.
+# Reproduced verbatim (including the pre-selected "❯ 1. Yes") because the
+# handler's whole reason for sending Esc rather than Enter is that ordering.
+_UPGRADE_NUDGE_FRAME = (
+    "Newer Opus model available\n"
+    "Currently pinned: Opus 4.6\n"
+    "Latest available: Opus 5 (au.anthropic.claude-opus-5)\n"
+    "Update settings to use Opus 5? Claude Code will restart to apply.\n"
+    "❯ 1. Yes\n"
+    "  2. No\n"
+    "Enter to confirm · Esc to cancel\n"
+)
 
+
+class TestClaudeCodeProviderStartupPrompts:
+    """Tests for Claude Code startup prompt handling (trust + bypass + upgrade nudge)."""
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
-        """Test that trust prompt is detected and auto-accepted."""
+    async def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
+        """An older trust prompt with Yes preselected needs only Enter."""
         mock_tmux.get_history.return_value = (
             "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=2.0)
+        await provider._handle_startup_prompts(idle_gap=2.0)
 
+        mock_tmux.send_keys.assert_not_called()
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_not_needed(self, mock_tmux):
+    async def test_handle_startup_prompts_moves_from_no_to_trust(self, mock_tmux):
+        """Claude Code 2.1.250 preselects No, so CAO must move to Yes."""
+        mock_tmux.get_history.side_effect = [
+            "Accessing workspace: /home/cao/workspace\n"
+            "❯ No, exit\n"
+            "  Yes, I trust this folder\n"
+            "Enter to confirm · Esc to cancel\n",
+            "Welcome to Claude Code v2.1.250",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_startup_prompts_not_needed(self, mock_tmux):
         """Test early return when Claude Code starts without prompts."""
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=2.0)
+        await provider._handle_startup_prompts(idle_gap=2.0)
 
         mock_tmux.send_special_key.assert_not_called()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_timeout(self, mock_tmux, mock_time, mock_settings):
+    async def test_handle_startup_prompts_timeout(
+        self, mock_tmux, mock_time, mock_sleep, mock_settings
+    ):
         """Handler gives up gracefully at the outer cap when no prompt ever appears.
 
         should-fix-3: the idle-gap exit does not apply until a first prompt has
         been handled, so with only "Loading..." ever showing, the loop runs
         until the outer cap (provider_init_timeout=60) rather than the old
-        20s idle-gap boundary.
+        20s idle-gap boundary. harness-control#215: the loop's own sleep is
+        now asyncio.sleep (mocked here to keep the test instant), and the
+        blocking get_history call is offloaded via asyncio.to_thread — both
+        transparent to this test since it mocks the backend/time layer, not
+        asyncio.to_thread itself.
         """
         mock_settings.return_value = {
             "provider_init_timeout": 60,
@@ -1581,28 +1960,32 @@ class TestClaudeCodeProviderStartupPrompts:
         # iter-2 now (still no prompt -> idle-gap check skipped), iter-3 now
         # (61s >= 60s outer cap -> return).
         mock_time.monotonic.side_effect = [0.0, 0.0, 0.0, 25.0, 61.0]
-        mock_time.sleep = MagicMock()
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=20.0)
+        await provider._handle_startup_prompts(idle_gap=20.0)
 
         mock_tmux.send_special_key.assert_not_called()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
+    async def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
         """Test trust prompt detection after initially empty output."""
+        # Banner frame last: accepting trust keeps the loop polling (the
+        # model-upgrade nudge can follow it), so the banner is what ends it.
         mock_tmux.get_history.side_effect = [
             "",
             "❯ 1. Yes, I trust this folder\n  2. No",
+            "Welcome to Claude Code v2.1.235",
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=5.0)
+        await provider._handle_startup_prompts(idle_gap=5.0)
 
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux):
+    async def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux):
         """Test that bypass permissions prompt is detected and auto-accepted."""
         # First poll: bypass prompt; second poll: welcome banner (after dismissal)
         mock_tmux.get_history.side_effect = [
@@ -1612,28 +1995,98 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=5.0)
+        await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Verify Down arrow sent via send_keys and Enter via send_special_key
-        mock_tmux.send_keys.assert_called_once()
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        # Verify the menu receives real tmux key names, not pasted escape bytes.
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_bypass_then_trust_prompt(self, mock_tmux):
+    async def test_handle_bypass_then_trust_prompt(self, mock_tmux):
         """Test that bypass prompt is handled, then trust prompt follows."""
-        # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed)
+        # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed);
+        # Poll 3: banner, which is now what ends the loop — accepting trust only
+        # continues it, since the model-upgrade nudge may render next.
         mock_tmux.get_history.side_effect = [
             "WARNING: Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n",
             "❯ 1. Yes, I trust this folder\n  2. No",
+            "Welcome to Claude Code v2.1.235",
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=5.0)
+        await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Bypass: send_keys (Down) + send_special_key (Enter)
-        # Trust: send_special_key (Enter) — called twice total
-        assert mock_tmux.send_keys.call_count == 1  # Down arrow for bypass
-        assert mock_tmux.send_special_key.call_count == 2  # Enter for bypass + Enter for trust
+        # Bypass: Down + Enter. Trust (older layout): Enter.
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+            "Enter",
+        ]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_model_upgrade_nudge_declined_with_escape(self, mock_tmux):
+        """The Bedrock model-upgrade nudge is DECLINED, and with Esc specifically.
+
+        Live-captured frame. "1. Yes" is pre-selected, so the Enter that clears
+        the trust/bypass dialogs would instead accept the upgrade: Claude Code
+        would rewrite the deployment's ANTHROPIC_*_MODEL pins and restart itself
+        mid-initialization.
+        """
+        mock_tmux.get_history.side_effect = [
+            _UPGRADE_NUDGE_FRAME,
+            "Welcome to Claude Code v2.1.235",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Escape")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_model_upgrade_nudge_per_tier(self, mock_tmux):
+        """One nudge per TIER, so a second must still be answered.
+
+        The dismissed dialog's text stays in the capture buffer, which is why
+        the handler tracks declined titles rather than a single bool — a bool
+        would swallow the Sonnet dialog here and leave init blocked on it, while
+        no tracking at all would re-send Esc at every poll forever.
+        """
+        sonnet_frame = _UPGRADE_NUDGE_FRAME.replace("Opus", "Sonnet")
+        mock_tmux.get_history.side_effect = [
+            _UPGRADE_NUDGE_FRAME,
+            # Both frames present: the Opus dialog has been answered but is still
+            # in the scrollback below the new Sonnet one.
+            _UPGRADE_NUDGE_FRAME + sonnet_frame,
+            _UPGRADE_NUDGE_FRAME + sonnet_frame,
+            "Welcome to Claude Code v2.1.235",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        # Twice, not once (missed tier) and not four times (re-answered scrollback).
+        assert mock_tmux.send_special_key.call_count == 2
+        assert all(
+            call.args == ("test-session", "window-0", "Escape")
+            for call in mock_tmux.send_special_key.call_args_list
+        )
+
+    def test_get_status_model_upgrade_nudge_not_waiting_user_answer(self):
+        """The nudge must not surface as WAITING_USER_ANSWER.
+
+        Its footer is "Enter to confirm · Esc to cancel", which
+        WAITING_USER_ANSWER_PATTERN matches — but the handler answers this
+        dialog itself, exactly like trust/bypass, so reporting it would ask an
+        operator to answer something that is about to answer itself.
+        """
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        assert provider.get_status(_UPGRADE_NUDGE_FRAME) != TerminalStatus.WAITING_USER_ANSWER
 
     def test_get_status_trust_prompt_not_waiting_user_answer(self):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""
@@ -1674,13 +2127,93 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
-        mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
+        mock_tmux.get_history.side_effect = [
+            "",
+            trust_output,
+            "Welcome to Claude Code v2.1.235",
+        ]
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
             result = await provider.initialize()
 
         assert result is True
         mock_tmux.send_special_key.assert_called_with("test-session", "window-0", "Enter")
+
+    def test_get_status_waiting_user_answer_generic_confirm_footer(self):
+        """WAITING_USER_ANSWER_PATTERN broadened beyond the original arrow-key-navigate footer to
+        also catch "Enter to confirm" -- the footer chrome a plain numbered/lettered Ink choice
+        menu renders (confirmed live against the real "Try the new fullscreen renderer?" upsell).
+        A future, still-unrecognized choice-type prompt sharing this same generic footer must
+        classify as WAITING_USER_ANSWER too, not UNKNOWN -- see initialize()'s broadened
+        accept-set."""
+        output = (
+            "Some future unrecognized prompt this file has no special case for\n\n"
+            "  ❯ 1. Option one\n    2. Option two\n\n  Enter to confirm · Esc to cancel"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_completed_response_mentioning_enter_to_confirm_is_not_waiting(self):
+        """PR #539 review (call-me-ram): a settled/completed turn whose response TEXT happens to
+        contain the bare prose "Enter to confirm" within the bottom_chrome window (get_status's
+        last-6-lines anchor) must NOT misclassify as WAITING_USER_ANSWER. Only the real Ink footer
+        -- "Enter to confirm" immediately followed by the "·" chrome separator, e.g. "Enter to
+        confirm · Esc to cancel" (see test_get_status_real_fullscreen_upsell_prompt_is_waiting_user_answer
+        above, which still matches) -- should trigger WAITING_USER_ANSWER. This is a real ⏺
+        response marker + idle prompt, i.e. a genuinely finished turn, so it must read COMPLETED."""
+        output = "⏺ Please press Enter to confirm your changes were saved.\n❯ "
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.COMPLETED
+
+    def test_get_status_real_fullscreen_upsell_prompt_is_waiting_user_answer(self):
+        """The real, live-captured "Try the new fullscreen renderer?" onboarding upsell must
+        classify as WAITING_USER_ANSWER, not UNKNOWN -- the exact status initialize()'s
+        wait_until_status call now also accepts as a real, alive, non-failure outcome. Nothing in
+        this file answers the prompt on the operator's behalf -- this only lets CAO recognize the
+        terminal is alive and blocked on something a human needs to see."""
+        output = (
+            "Try the new fullscreen renderer?\n\n  ❯ 1. Yes, try it\n    2. Not now\n\n"
+            "  Enter to confirm · Esc to cancel"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.asyncio
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_initialize_accepts_waiting_user_answer_status(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+    ):
+        """initialize() must succeed (not raise TimeoutError) when the terminal settles on
+        WAITING_USER_ANSWER -- a genuinely unrecognized-but-alive interactive prompt is a real,
+        legitimate terminal state, not a failed launch. Before this fix, ONLY {IDLE, COMPLETED}
+        were accepted, so this exact scenario always timed out and CAO's own
+        terminal_service.create_terminal tore the session down before the operator ever saw it."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.211"
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = await provider.initialize()
+
+        assert result is True
+        accepted_statuses = mock_wait_status.call_args.args[1]
+        assert accepted_statuses == {
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+            TerminalStatus.WAITING_USER_ANSWER,
+        }
 
 
 class TestClaudeCodeProviderSettings:
@@ -1743,6 +2276,102 @@ class TestClaudeCodeProviderSettings:
 
         result = json.loads(settings_file.read_text())
         assert result["skipDangerousModePermissionPrompt"] is True
+
+    def test_ensure_skip_bypass_prompt_preserves_file_mode(self, tmp_path):
+        """Regression test (review finding on PR #451): the atomic
+        tmp-file + os.replace write must not downgrade an existing
+        settings.json's permissions to the process umask."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(json.dumps({"permissions": {"allow": []}}))
+        settings_file.chmod(0o600)
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+
+    def test_ensure_skip_bypass_prompt_new_file_defaults_to_0600(self, tmp_path):
+        """A freshly-created settings.json (no prior file to inherit a mode
+        from) should default to 0600, not the process umask -- it may carry
+        `env`/`apiKeyHelper` secrets."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+
+    def test_ensure_skip_bypass_prompt_concurrent_writes_preserve_keys(self, tmp_path):
+        """Regression test (review finding on PR #451): N concurrent
+        initializers must not race the settings.json read-modify-write and
+        drop pre-existing keys. Pre-lock, a thread reading mid-write would
+        JSON-decode-fail, fall back to {}, and clobber every other key."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        seed = {f"key{i}": f"value{i}" for i in range(6)}
+        settings_file.write_text(json.dumps(seed))
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            threads = [
+                threading.Thread(target=ClaudeCodeProvider._ensure_skip_bypass_prompt_setting)
+                for _ in range(32)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        result = json.loads(settings_file.read_text())
+        for key, value in seed.items():
+            assert result[key] == value
+        assert result["skipDangerousModePermissionPrompt"] is True
+        assert list(settings_file.parent.glob("*.json.tmp.*")) == []
+
+    def test_ensure_skip_bypass_prompt_uses_atomic_replace(self, tmp_path):
+        """Pin the atomic-write mechanics: os.replace must be the mechanism
+        that lands the tmp file onto settings.json (contrast
+        test_skill_injection.py:158, which pins its own atomic write the
+        same way)."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+
+        with (
+            patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls,
+            patch(
+                "cli_agent_orchestrator.providers.claude_code.os.replace", wraps=os.replace
+            ) as mock_replace,
+        ):
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        mock_replace.assert_called_once()
+        tmp_arg = mock_replace.call_args[0][0]
+        # PID-suffixed (e.g. "settings.json.tmp.12345") so a stale tmp file
+        # from a prior crashed process can never collide with this write.
+        assert re.search(r"\.json\.tmp\.\d+$", str(tmp_arg))
 
 
 class TestClaudeCodeMcpCallNotCompleted:
@@ -2118,3 +2747,18 @@ class TestWaitUntilInputReady:
 
         provider = ClaudeCodeProvider("t5", "sess", "win")
         assert await BaseProvider.wait_until_input_ready(provider) is True
+
+
+class TestBlocksOrchestratedInputWhileWaitingUserAnswer:
+    """PR #539 review (call-me-ram, gutosantos82), BLOCKING: initialize() now
+    succeeds (WAITING_USER_ANSWER) on a recognized startup choice-prompt instead
+    of timing out. Without opting in here, send_input's orchestrated-input guard
+    (services/terminal_service.py) never fires for claude_code, so a deferred-init
+    assign/handoff would paste the task straight into the live Ink Select widget
+    and auto-confirm whichever option is highlighted -- exactly what issue #538
+    says was deliberately rejected. Same opt-in pattern as antigravity_cli/hermes.
+    """
+
+    def test_blocks_orchestrated_input_while_waiting_user_answer(self):
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.blocks_orchestrated_input_while_waiting_user_answer is True

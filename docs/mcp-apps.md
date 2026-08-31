@@ -243,3 +243,23 @@ recorded here because they shape how the MCP Apps surface should evolve.
     (v1.7.4) · [API reference](https://apps.extensions.modelcontextprotocol.io/api/index.html) ·
     [repo](https://github.com/modelcontextprotocol/ext-apps)
   - Provenance / discussion: [SEP-1865 PR #1865](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1865)
+
+## Open follow-ups
+
+Small items noted during the MCP Apps security review. Resolved items are marked;
+open items are tracked here for visibility.
+
+- **`pause`/`resume` gestures.** Open (frontend). `TaskControl` renders these
+  buttons but `submit_command` returns `unsupported` (no Backplane route); hide or
+  disable them in `cao_mcp_apps/` until routes exist.
+- **`topology.js` reconnect.** Open (frontend). Reconnect with capped backoff after
+  a dropped SSE stream; add a restrictive CSP / `frame-ancestors` to
+  `topology.html`.
+- **Unused `requires_scopes` decorator.** Open. `security/decorators.py` is not
+  wired into the production tool path (the `submit_command` choke point does its
+  own inline scope pre-check) — wire it or remove it.
+- **Reserved primitives.** Open. `file_mod` and `error` are in the `PRIMITIVES`
+  vocabulary but `normalize_kind` never emits them; document as reserved or wire
+  producing events.
+- **`submit_command` audit trail (optional).** Open enhancement. The choke point
+  does not emit an audit record today; add one if an audit trail is desired.

@@ -34,12 +34,15 @@ from typing import List
 # Keep this in sync with the repo-root ``skills/`` directories intended to ship.
 SHIPPED_SKILLS: List[str] = [
     "agui-author",
+    "cao-agent-routing",
     "cao-mcp-apps",
     "mcp-apps-builder",
     "cao-session-management",
+    "cao-session-liveness",
     "cao-supervisor-protocols",
     "cao-worker-protocols",
     "cao-memory",
+    "cao-learning",
     "cao-workflow",
     "cao-plugin",
     "cao-provider",

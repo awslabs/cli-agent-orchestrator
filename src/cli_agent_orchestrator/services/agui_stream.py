@@ -69,6 +69,8 @@ AGUI_STEP_STARTED = "STEP_STARTED"
 AGUI_STEP_FINISHED = "STEP_FINISHED"
 AGUI_TEXT_MESSAGE_CONTENT = "TEXT_MESSAGE_CONTENT"
 AGUI_TOOL_CALL_START = "TOOL_CALL_START"
+AGUI_TOOL_CALL_END = "TOOL_CALL_END"
+AGUI_TOOL_CALL_RESULT = "TOOL_CALL_RESULT"
 AGUI_STATE_DELTA = "STATE_DELTA"
 AGUI_STATE_SNAPSHOT = "STATE_SNAPSHOT"
 AGUI_GENERATIVE_UI = "GENERATIVE_UI"
@@ -153,8 +155,23 @@ def _from_primitive(event: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         return AGUI_STEP_FINISHED, data
 
     if kind == "handoff":
-        # Message dispatch between agents. Body is intentionally redacted — the
+        # Message dispatch between agents. Body is intentionally redacted -- the
         # detail is metadata-only (routing) by the EventLogPublisher contract.
+        orchestration_type = detail.get("orchestration_type")
+        if orchestration_type in ("handoff", "assign"):
+            # These orchestration types represent agent-to-agent task delegation,
+            # so they map to TOOL_CALL_START (the receiver is starting a tool call).
+            data.update(
+                tool_call_id=event.get("id"),
+                tool_call_name=orchestration_type,
+                metadata={
+                    "sender": detail.get("sender"),
+                    "receiver": detail.get("receiver"),
+                    "orchestration_type": orchestration_type,
+                },
+            )
+            return AGUI_TOOL_CALL_START, data
+        # send_message or absent orchestration_type: metadata-only text content.
         data.update(
             message_id=detail.get("receiver"),
             role="assistant",
@@ -162,7 +179,7 @@ def _from_primitive(event: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
             metadata={
                 "sender": detail.get("sender"),
                 "receiver": detail.get("receiver"),
-                "orchestration_type": detail.get("orchestration_type"),
+                "orchestration_type": orchestration_type,
             },
         )
         return AGUI_TEXT_MESSAGE_CONTENT, data
@@ -384,6 +401,8 @@ __all__ = [
     "AGUI_GENERATIVE_UI",
     "AGUI_STEP_STARTED",
     "AGUI_TEXT_MESSAGE_CONTENT",
+    "AGUI_TOOL_CALL_END",
+    "AGUI_TOOL_CALL_RESULT",
     "AGUI_TOOL_CALL_START",
     "GENERATIVE_UI_COMPONENTS",
     "state_delta_frame",

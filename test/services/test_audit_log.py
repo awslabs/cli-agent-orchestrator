@@ -416,6 +416,12 @@ class TestT9SyncVsNowait:
                 "compile_stale_dropped",
                 "compile_error",
                 "find_related_completed",
+                # Self-learning instruction promotion (CLI/apply path).
+                "instruction_promotion",
+                # Typed memory relationship store (issue #511) — content-free
+                # mutation audit, emitted by the synchronous relationship service
+                # via write_audit_nowait (same path as the memory_* events).
+                "relationship_mutation",
             }
         )
 

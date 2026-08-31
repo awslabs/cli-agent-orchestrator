@@ -43,6 +43,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH,
     WORKFLOW_SHIPPED_UNITS,
 )
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 
 # Re-exported from the light runtime module so existing
 # ``from ...models.workflow import StepState / WorkflowIndexRow / ...`` call
@@ -50,6 +51,7 @@ from cli_agent_orchestrator.constants import (
 # imports no jsonschema/yaml) so the MCP server can consume ``ReturnAck`` without
 # pulling this grammar module's heavy deps onto the HTTP seam.
 from cli_agent_orchestrator.models.workflow_runtime import (  # noqa: F401
+    RecoveryDecision,
     ReturnAck,
     RunState,
     RunStatus,
@@ -59,6 +61,7 @@ from cli_agent_orchestrator.models.workflow_runtime import (  # noqa: F401
     StepStatus,
     WorkflowIndexRow,
     WorkflowRunResult,
+    parse_decision,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,6 +118,40 @@ class LoopGuard(str, Enum):
     UNTIL_SATISFIED = "until_satisfied"
 
 
+class RecoveryPolicy(str, Enum):
+    """What a step's author declares about re-running it (issue #583, FR-5/FR-7).
+
+    A DECLARATION about the step, never a permission and never inferred (SR-2/SR-3):
+    CAO has no mechanism to prove a step's external effects and is not required to.
+
+    Absence is NOT a member — it is ``None`` (BR-1/BR-2). "Undeclared" and ``MANUAL``
+    behave identically wherever the alternative is re-execution, and differently where a
+    verified replay is available: ``MANUAL`` halts anyway because a human asked to see the
+    step; undeclared replays, because replay executes nothing.
+    """
+
+    IDEMPOTENT = "idempotent"
+    RECONCILE = "reconcile"
+    MANUAL = "manual"
+
+
+def parse_policy(value: Optional[str]) -> Optional[RecoveryPolicy]:
+    """Parse a declared recovery policy. Total: returns or raises (INV-1).
+
+    ``None``/``""`` -> ``None`` (not declared — a distinct state, NEVER coerced to
+    ``MANUAL``, BR-2). Any other value must be one of the three; anything else raises
+    ``ValueError`` so a typo becomes a 422 rather than a silent downgrade to undeclared
+    (BR-3). No case-folding, no stripping, no aliasing (BR-4).
+
+    NOTE ON REACHABILITY (TD-1): the run-step route does NOT call this — ``recovery`` is
+    typed as the enum on ``RunStepRequest``, so Pydantic validates at the boundary. This
+    function serves in-process callers.
+    """
+    if value is None or value == "":
+        return None
+    return RecoveryPolicy(value)
+
+
 class NotBuiltYetError(Exception):
     """Raised by the run engine (N5+) when sequencing reaches a reserved
     construct whose implementing unit has not shipped.
@@ -151,6 +188,7 @@ class WorkflowStep(BaseModel):
     provider: str
     agent: str
     prompt: str
+    engine: Optional[KiroEngine] = None
     output_schema: Optional[Dict[str, Any]] = None
     # RESERVED — conditional execution (no MVP unit). Validates, never runs.
     when: Optional[str] = None
@@ -299,9 +337,35 @@ class LintFinding(BaseModel):
 
     Every finding carries all four fields; ``line`` is a REQUIRED 1-based
     source anchor (FR-2.3 — no finding may omit it).
+
+    ``rule_id`` is a CLOSED set, and it GATES the linter's rule catalogue:
+    ``script_lint.py`` cannot emit an id that is not listed here. **Adding a
+    lint rule therefore means widening this ``Literal`` in the same change as
+    the rule itself** — the prose catalogue in ``script_lint.py``'s module
+    docstring describes the rules, but this is what admits them.
+
+    Getting that wrong does not fail gracefully. ``LintFinding(...)`` raises
+    ``ValidationError`` for an unlisted id, and it is constructed inside
+    ``_walk_tree``, which runs OUTSIDE ``lint_script``'s ``try`` — so the raise
+    escapes a function contracted never to raise on input content, as a 500 on
+    the validate route (``api/main.py``) and in place of the intended
+    ``ScriptLintError`` at the run-path lint gate (``script_runner.py``).
+
+    Do not reuse an existing id to avoid widening: ``workflow_spec_service``
+    treats ``rule_id == "syntax"`` as "no parseable AST" and zeroes
+    ``spec.inputs``, so borrowing that id silently drops INPUTS extraction.
     """
 
-    rule_id: Literal["syntax", "disallowed-import", "nondeterminism", "dynamic-import"]
+    rule_id: Literal[
+        "syntax",
+        "disallowed-import",
+        "nondeterminism",
+        "dynamic-import",
+        # issue #583 — the recovery-policy rules (script_lint.py's catalogue).
+        "missing-recovery-policy",
+        "unverifiable-recovery-policy",
+        "unenforced-recovery-policy",
+    ]
     severity: Literal["error", "warning"]
     line: int
     message: str
@@ -362,6 +426,40 @@ class ScriptValidationResult(ValidationResult):
 
     tier: Literal["script"] = "script"
     findings: List[LintFinding] = Field(default_factory=list)
+
+
+class StepResultEnvelope(BaseModel):
+    """The durable record of what a step produced — the only thing replay returns (#583, FR-1).
+
+    Written UNCONDITIONALLY at settle (BR-1), which is what makes its absence on a settled
+    row FR-4's guard-2 signal. Distinct from ``output_json``, which is legitimately NULL
+    whenever a worker returned nothing structured (BR-9) — conflating them would destroy
+    guard 2, because "settled with no envelope" would then describe almost every ordinary
+    step.
+
+    ``truncated``/``redacted`` self-report (BR-4): FR-12 asks a later agent to reconstruct
+    events from persisted evidence alone, and evidence that hides its own lossiness is worse
+    than none — a reader cannot otherwise tell a short message from a shortened one.
+
+    ``redacted`` is a BOOLEAN and nothing more (SR-4). The pattern names ``redact_secrets``
+    reports are deliberately NOT stored: redaction cascades, so a later pattern can match an
+    earlier ``[REDACTED:<name>]`` marker, and a stored name list would look like precise
+    evidence of which credential type was present while not being that.
+
+    ``terminal_id`` names a DEAD terminal by replay time and is retained anyway (BR-6): it
+    links a replayed result back to the original run's evidence, which FR-12 wants.
+    ADR-583-13's ``replayed`` flag on the response is what stops a consumer treating the id
+    as live. ``None`` is a legal value (a handoff caller may reuse a terminal).
+
+    Built and read exclusively through ``services/step_result.py``; this model holds no
+    logic of its own.
+    """
+
+    last_message: str
+    status: str
+    terminal_id: Optional[str] = None
+    truncated: bool = False
+    redacted: bool = False
 
 
 # ---------------------------------------------------------------------------

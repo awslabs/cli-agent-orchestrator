@@ -7,15 +7,21 @@ fixture in test/graph/conftest.py, so registering the test sink here does not
 leak into other tests.
 """
 
+import asyncio
 import inspect
+import threading
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from cli_agent_orchestrator.api import main as api_main
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.graph.models import GraphView, Node
+from cli_agent_orchestrator.graph.providers import base as providers_base
+from cli_agent_orchestrator.graph.providers.base import GraphProvider
 from cli_agent_orchestrator.graph.sinks import base as sinks_base
 from cli_agent_orchestrator.graph.sinks.base import GraphSink
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -139,6 +145,75 @@ def test_get_graph_private_scope_refused_400(client, auth_on, scope):
     assert "private" in resp.json()["detail"]
 
 
+def test_get_graph_private_scope_refused_before_provider_resolution(client, auth_on, monkeypatch):
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    get_provider_spy = MagicMock()
+    monkeypatch.setattr(api_main, "get_provider", get_provider_spy)
+
+    resp = client.get("/graph/memory?scope=session")
+
+    assert resp.status_code == 400
+    get_provider_spy.assert_not_called()
+
+
+def test_graph_projection_timeout_returns_structured_504(client, monkeypatch):
+    assert api_main.GRAPH_PROJECTION_TIMEOUT_S == 90.0
+
+    @providers_base.register_provider("slow-provider")
+    class _SlowProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            await asyncio.sleep(1.0)
+            return GraphView(nodes=[], edges=[])
+
+    original = api_main._project_graph_with_timeout
+
+    async def _short_timeout(inst, filters, *, provider, timeout_s=90.0):
+        return await original(inst, filters, provider=provider, timeout_s=0.01)
+
+    monkeypatch.setattr(api_main, "_project_graph_with_timeout", _short_timeout)
+
+    resp = client.get("/graph/slow-provider")
+
+    assert resp.status_code == 504
+    detail = resp.json()["detail"]
+    assert detail["kind"] == "graph_projection_timeout"
+    assert detail["provider"] == "slow-provider"
+    assert detail["timeout_s"] == 0.01
+    assert detail["metadata"]["graph_projection_timeout"] is True
+
+
+def test_health_responds_while_slow_graph_projection_in_flight(client, monkeypatch):
+    @providers_base.register_provider("slow-health-provider")
+    class _SlowHealthProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            await asyncio.sleep(1.0)
+            return GraphView(nodes=[], edges=[])
+
+    original = api_main._project_graph_with_timeout
+
+    async def _short_timeout(inst, filters, *, provider, timeout_s=90.0):
+        return await original(inst, filters, provider=provider, timeout_s=0.3)
+
+    monkeypatch.setattr(api_main, "_project_graph_with_timeout", _short_timeout)
+    graph_response = {}
+
+    def _call_graph() -> None:
+        graph_response["resp"] = client.get("/graph/slow-health-provider")
+
+    thread = threading.Thread(target=_call_graph)
+    thread.start()
+    time.sleep(0.05)
+
+    started = time.monotonic()
+    health = client.get("/health")
+    elapsed = time.monotonic() - started
+
+    thread.join(timeout=1.0)
+    assert health.status_code == 200
+    assert elapsed < 0.5
+    assert graph_response["resp"].status_code == 504
+
+
 # ── POST /graph/{provider}/export ────────────────────────────────────────
 
 
@@ -157,6 +232,36 @@ def test_post_export_happy_path(client, stub_test_sink):
     }
     # provider projected + sink.export called exactly once.
     assert stub_test_sink.call_count == 1
+
+
+def test_post_export_projection_timeout_returns_structured_504_without_exporting(
+    client, stub_test_sink, monkeypatch
+):
+    @providers_base.register_provider("slow-export-provider")
+    class _SlowExportProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            await asyncio.sleep(1.0)
+            return GraphView(nodes=[], edges=[])
+
+    original = api_main._project_graph_with_timeout
+
+    async def _short_timeout(inst, filters, *, provider, timeout_s=90.0):
+        return await original(inst, filters, provider=provider, timeout_s=0.01)
+
+    monkeypatch.setattr(api_main, "_project_graph_with_timeout", _short_timeout)
+
+    resp = client.post(
+        "/graph/slow-export-provider/export",
+        json={"sink": "stub-test-sink", "dest": "/tmp/x", "options": {}},
+    )
+
+    assert resp.status_code == 504
+    detail = resp.json()["detail"]
+    assert detail["kind"] == "graph_projection_timeout"
+    assert detail["provider"] == "slow-export-provider"
+    assert detail["timeout_s"] == 0.01
+    assert detail["metadata"]["graph_projection_timeout"] is True
+    stub_test_sink.assert_not_called()
 
 
 def test_post_export_unregistered_sink_404(client):

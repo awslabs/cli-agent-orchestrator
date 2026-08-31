@@ -1,6 +1,6 @@
 """Tests for TmuxClient.send_keys paste-buffer implementation."""
 
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -27,15 +27,51 @@ def mock_uuid():
         yield mock
 
 
+@pytest.fixture(autouse=True)
+def reset_version_cache():
+    """Keep the class-level tmux-version cache from leaking across tests."""
+    TmuxClient._paste_buffer_sanitizes = None
+    yield
+    TmuxClient._paste_buffer_sanitizes = None
+
+
+def payload_calls(mock_subprocess):
+    """The paste pipeline minus the copy-mode cancels.
+
+    Every send_keys call cancels any active pane mode before the paste and
+    again immediately before each submitting Enter, so a wheel-scrolled pane
+    sitting in copy mode cannot eat the delivery or the submission (#654);
+    those guards are pinned by their own tests in test_tmux_client.py. The
+    tests here assert the payload pipeline threaded between them, at the
+    same indices as before the guards existed.
+    """
+    return [c for c in mock_subprocess.run.call_args_list if c[0][0][-2:] != ["-X", "cancel"]]
+
+
+@pytest.fixture
+def sanitizing_tmux():
+    """Host tmux >= 3.7 (vis(3)-sanitizes pasted buffers)."""
+    with patch.object(TmuxClient, "_paste_buffer_sanitizes", True):
+        yield
+
+
+@pytest.fixture
+def legacy_tmux():
+    """Host tmux < 3.7 (buffer bytes pass through unchanged)."""
+    with patch.object(TmuxClient, "_paste_buffer_sanitizes", False):
+        yield
+
+
 class TestSendKeys:
     """Tests for the paste-buffer based send_keys implementation."""
 
     def test_basic_message(self, client, mock_subprocess, mock_uuid):
-        """Sends load-buffer, paste-buffer -p, send-keys Enter, delete-buffer."""
+        """Sends copy-mode cancel, load-buffer, paste-buffer -p, another
+        cancel, send-keys Enter, delete-buffer."""
         client.send_keys("sess", "win", "hello")
 
-        assert mock_subprocess.run.call_count == 4
-        calls = mock_subprocess.run.call_args_list
+        assert mock_subprocess.run.call_count == 6
+        calls = payload_calls(mock_subprocess)
 
         # load-buffer with unique name and message as stdin
         assert calls[0] == call(
@@ -64,7 +100,7 @@ class TestSendKeys:
         msg = "line 1\nline 2\nline 3"
         client.send_keys("sess", "win", msg)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call == call(
             ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
             input=msg.encode(),
@@ -76,20 +112,21 @@ class TestSendKeys:
         msg = """He said "hello" and ran `cmd` with $VAR"""
         client.send_keys("sess", "win", msg)
 
-        load_call = mock_subprocess.run.call_args_list[0]
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == msg.encode()
 
     def test_empty_message(self, client, mock_subprocess, mock_uuid):
         """Empty string still goes through the full pipeline."""
         client.send_keys("sess", "win", "")
 
-        assert mock_subprocess.run.call_count == 4
-        load_call = mock_subprocess.run.call_args_list[0]
+        assert mock_subprocess.run.call_count == 6
+        load_call = payload_calls(mock_subprocess)[0]
         assert load_call[1]["input"] == b""
 
     def test_buffer_cleanup_on_error(self, client, mock_subprocess, mock_uuid):
         """Buffer is deleted even when paste-buffer fails."""
         mock_subprocess.run.side_effect = [
+            None,  # copy-mode cancel
             None,  # load-buffer succeeds
             Exception("paste failed"),  # paste-buffer fails
             None,  # delete-buffer in finally
@@ -115,17 +152,20 @@ class TestSendKeys:
             client.send_keys("sess", "win", "msg2")
 
         calls = mock_subprocess.run.call_args_list
-        # First call uses cao_aaaa1111
-        assert calls[0][0][0][3] == "cao_aaaa1111"
-        # Second call (index 4, after 4 calls from first send_keys) uses cao_cccc2222
-        assert calls[4][0][0][3] == "cao_cccc2222"
+        # First send's load-buffer (index 1, after its leading copy-mode
+        # cancel) uses cao_aaaa1111
+        assert calls[1][0][0][3] == "cao_aaaa1111"
+        # Second send's load-buffer (index 7, after 6 calls from the first
+        # send_keys and the second's leading cancel) uses cao_cccc2222
+        assert calls[7][0][0][3] == "cao_cccc2222"
 
     def test_double_enter(self, client, mock_subprocess, mock_uuid):
         """When enter_count=2, two Enter keys are sent after pasting."""
         client.send_keys("sess", "win", "hello", enter_count=2)
 
-        assert mock_subprocess.run.call_count == 5  # load + paste + 2 Enter + delete
-        calls = mock_subprocess.run.call_args_list
+        # cancel + load + paste + 2 x (cancel + Enter) + delete
+        assert mock_subprocess.run.call_count == 8
+        calls = payload_calls(mock_subprocess)
         # Both Enters
         assert calls[2] == call(
             ["tmux", "send-keys", "-t", "sess:win", "Enter"],
@@ -141,10 +181,271 @@ class TestSendKeys:
         msg = "X" * 50000
         client.send_keys("sess", "win", msg)
 
-        # Still exactly 4 subprocess calls — no chunking
-        assert mock_subprocess.run.call_count == 4
-        load_call = mock_subprocess.run.call_args_list[0]
+        # Still exactly 6 subprocess calls — no chunking
+        assert mock_subprocess.run.call_count == 6
+        load_call = payload_calls(mock_subprocess)[0]
         assert len(load_call[1]["input"]) == 50000
+
+
+class TestSendKeysNoHandCraftedMarkersOnModernTmux:
+    """Regression tests for issue #413 (tmux >= 3.7).
+
+    tmux >= 3.7 sanitizes pasted buffer content through vis(3), turning raw
+    ESC (0x1b) bytes into the literal characters "^[". On those versions
+    send_keys must never hand-craft \\x1b[200~/\\x1b[201~ markers in the
+    buffer; it must let tmux emit them conditionally via paste-buffer -p.
+    -r (raw, used by the legacy force_bracketed_paste path) and -S (would
+    bypass the vis(3) hardening) are both forbidden.
+    """
+
+    def test_buffer_content_has_no_escape_bytes(
+        self, client, mock_subprocess, mock_uuid, sanitizing_tmux
+    ):
+        """Loaded buffer contains only raw message bytes — no ESC, no markers."""
+        client.send_keys("sess", "win", "hello world", force_bracketed_paste=True)
+
+        load_call = payload_calls(mock_subprocess)[0]
+        buf_content = load_call[1]["input"]
+        assert b"\x1b" not in buf_content
+        assert b"[200~" not in buf_content
+        assert b"[201~" not in buf_content
+        assert buf_content == b"hello world"
+
+    def test_paste_uses_p_flag_not_r_or_S(
+        self, client, mock_subprocess, mock_uuid, sanitizing_tmux
+    ):
+        """paste-buffer is invoked with -p and never -r or -S."""
+        client.send_keys("sess", "win", "hello", force_bracketed_paste=True)
+
+        paste_call = payload_calls(mock_subprocess)[1]
+        paste_argv = paste_call[0][0]
+        assert paste_argv[:2] == ["tmux", "paste-buffer"]
+        assert "-p" in paste_argv
+        assert "-r" not in paste_argv
+        assert "-S" not in paste_argv
+
+    def test_force_bracketed_paste_multiline_content_unmodified(
+        self, client, mock_subprocess, mock_uuid, sanitizing_tmux
+    ):
+        """Multi-line message delivery loads the content byte-for-byte."""
+        msg = "line 1\nline 2\n\nline 4 with \x03 control char"
+        client.send_keys("sess", "win", msg, force_bracketed_paste=True)
+
+        load_call = payload_calls(mock_subprocess)[0]
+        assert load_call == call(
+            ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
+            input=msg.encode(),
+            check=True,
+        )
+
+    def test_force_flag_delivery_identical_to_default(
+        self, client, mock_subprocess, mock_uuid, sanitizing_tmux
+    ):
+        """On >= 3.7 force_bracketed_paste does not alter the tmux command sequence."""
+        client.send_keys("sess", "win", "same message", force_bracketed_paste=True)
+        forced_calls = list(mock_subprocess.run.call_args_list)
+        mock_subprocess.run.reset_mock()
+
+        client.send_keys("sess", "win", "same message", force_bracketed_paste=False)
+        default_calls = list(mock_subprocess.run.call_args_list)
+
+        assert forced_calls == default_calls
+
+
+class TestSendKeysLegacyWrapOnOldTmux:
+    """On tmux < 3.7 the pre-#413 contract is preserved byte-for-byte.
+
+    paste-buffer -p only emits markers when the pane enabled DECSET 2004 and
+    some TUIs (e.g. kiro-cli) never do, so forced delivery keeps the
+    hand-crafted wrap + -r (no LF->CR conversion) that #230 introduced —
+    safe there because pre-3.7 tmux passes buffer bytes through unchanged.
+    """
+
+    def test_forced_paste_wraps_and_uses_r(self, client, mock_subprocess, mock_uuid, legacy_tmux):
+        msg = "task line 1\n\n[Assigned by terminal abc]"
+        client.send_keys("sess", "win", msg, force_bracketed_paste=True)
+
+        calls = payload_calls(mock_subprocess)
+        assert calls[0] == call(
+            ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
+            input=b"\x1b[200~" + msg.encode() + b"\x1b[201~",
+            check=True,
+        )
+        assert calls[1] == call(
+            ["tmux", "paste-buffer", "-r", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+    def test_unforced_paste_stays_raw_with_p(self, client, mock_subprocess, mock_uuid, legacy_tmux):
+        """Init-time shell commands keep the raw + -p path on every version."""
+        client.send_keys("sess", "win", "ls -la", force_bracketed_paste=False)
+
+        calls = payload_calls(mock_subprocess)
+        assert calls[0][1]["input"] == b"ls -la"
+        assert calls[1] == call(
+            ["tmux", "paste-buffer", "-p", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+
+class TestSendKeysForcedBracketedPasteShellDetection:
+    """force_bracketed_paste=True skips bracket-wrapping (and the -p flag)
+    when the pane's live foreground command is a known shell -- issue: a
+    resumed/woken terminal whose original TUI already exited via its own
+    quit command left the pane at a bare shell prompt that doesn't
+    understand \\x1b[200~/\\x1b[201~, corrupting the first token of
+    whatever's sent next."""
+
+    def test_wraps_when_pane_runs_a_real_tui(self, client, mock_subprocess, mock_uuid, legacy_tmux):
+        """Baseline: an actual TUI (e.g. Claude Code, running as `node`) on
+        tmux < 3.7 still gets the existing unconditional bracket-wrap + -r
+        delivery (the manual wrap is only valid pre-#413; see
+        TestSendKeysNoHandCraftedMarkersOnModernTmux for the >= 3.7 case,
+        which this class's shell-detection check takes priority over)."""
+        with patch.object(client, "get_pane_current_command", return_value="node"):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        paste_call = payload_calls(mock_subprocess)[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-r", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+        load_call = payload_calls(mock_subprocess)[0]
+        assert load_call[1]["input"] == b"\x1b[200~claude --continue\x1b[201~"
+
+    @pytest.mark.parametrize("shell", ["sh", "dash", "bash", "zsh", "fish"])
+    def test_skips_bracket_wrap_when_pane_is_a_bare_shell(
+        self, client, mock_subprocess, mock_uuid, shell
+    ):
+        """A bare shell prompt gets the plain command, with NEITHER the
+        manual \\x1b[200~ wrap NOR the -p flag (the latter's own bracket
+        decision depends on tmux's per-pane ?2004h tracking, which can be
+        stale from a TUI that used to run in this exact pane -- so it's not
+        a safe fallback either)."""
+        with patch.object(client, "get_pane_current_command", return_value=shell):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        load_call = payload_calls(mock_subprocess)[0]
+        assert load_call[1]["input"] == b"claude --continue"
+        paste_call = payload_calls(mock_subprocess)[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+    def test_fails_closed_to_wrapped_when_pane_command_lookup_fails(
+        self, client, mock_subprocess, mock_uuid, legacy_tmux
+    ):
+        """An unresolvable pane command (tmux error, race with window
+        teardown, ...) preserves the existing wrap-unconditionally behavior
+        rather than guessing -- an unknown foreground process might still be
+        a real TUI expecting bracketed paste. Pinned to tmux < 3.7: on
+        >= 3.7 the "wrapped" fallback is -p with no manual markers (#413),
+        covered by TestSendKeysNoHandCraftedMarkersOnModernTmux."""
+        with patch.object(client, "get_pane_current_command", return_value=None):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        load_call = payload_calls(mock_subprocess)[0]
+        assert load_call[1]["input"] == b"\x1b[200~claude --continue\x1b[201~"
+
+    def test_non_forced_calls_are_unaffected_by_shell_detection(
+        self, client, mock_subprocess, mock_uuid
+    ):
+        """force_bracketed_paste=False (the default, used for shell-command
+        delivery during provider initialization) keeps its existing -p
+        behavior regardless of what the pane is running -- this fix is
+        scoped to the force_bracketed_paste=True path only."""
+        with patch.object(client, "get_pane_current_command", return_value="bash") as mock_get:
+            client.send_keys("sess", "win", "echo ready")
+
+        mock_get.assert_not_called()
+        paste_call = payload_calls(mock_subprocess)[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-p", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+
+class TestSendKeysShellDetectionCrossedWithTmuxVersion:
+    """The bare-shell check and the tmux-version check are two independent
+    axes of the same `if/elif/else` in send_keys -- both interactions need
+    direct coverage, not just each axis tested in isolation with the other
+    implicitly defaulted."""
+
+    def test_bare_shell_skips_wrap_on_modern_tmux_too(
+        self, client, mock_subprocess, mock_uuid, sanitizing_tmux
+    ):
+        """A bare shell must never get bracketed-paste markers or -p,
+        regardless of tmux version -- the shell-detection check takes
+        priority over the tmux-version branch, not the other way around."""
+        with patch.object(client, "get_pane_current_command", return_value="bash"):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        load_call = payload_calls(mock_subprocess)[0]
+        assert load_call[1]["input"] == b"claude --continue"
+        paste_call = payload_calls(mock_subprocess)[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+    def test_real_tui_on_modern_tmux_gets_p_flag_not_manual_wrap(
+        self, client, mock_subprocess, mock_uuid, sanitizing_tmux
+    ):
+        """A real TUI on tmux >= 3.7 must still get the #413 fix (-p, no
+        hand-crafted markers) even when force_bracketed_paste=True -- the
+        shell-detection feature must not regress the vis(3)-sanitization
+        fix for the non-shell case."""
+        with patch.object(client, "get_pane_current_command", return_value="node"):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        load_call = payload_calls(mock_subprocess)[0]
+        assert load_call[1]["input"] == b"claude --continue"
+        assert b"\x1b" not in load_call[1]["input"]
+        paste_call = payload_calls(mock_subprocess)[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-p", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+
+class TestTmuxSanitizationDetection:
+    """Version probe behind the tmux >= 3.7 vis(3) gate."""
+
+    @pytest.mark.parametrize(
+        "version_output,expected",
+        [
+            ("tmux 3.3a\n", False),
+            ("tmux 3.4\n", False),
+            ("tmux 3.6\n", False),
+            ("tmux 3.7\n", True),
+            ("tmux 3.7a\n", True),
+            ("tmux 3.10\n", True),
+            ("tmux 4.0\n", True),
+            ("tmux next-3.8\n", True),
+            ("tmux master\n", True),  # unparseable -> assume sanitizing
+        ],
+    )
+    def test_version_parsing(self, mock_subprocess, version_output, expected):
+        mock_subprocess.run.return_value = MagicMock(stdout=version_output)
+
+        assert TmuxClient._tmux_sanitizes_paste_buffers() is expected
+        mock_subprocess.run.assert_called_once_with(
+            ["tmux", "-V"], capture_output=True, text=True, check=True
+        )
+
+    def test_probe_failure_assumes_sanitizing(self, mock_subprocess):
+        """If tmux -V fails, prefer raw + -p: never garbage, worst case per-line."""
+        mock_subprocess.run.side_effect = Exception("tmux not found")
+
+        assert TmuxClient._tmux_sanitizes_paste_buffers() is True
+
+    def test_result_is_cached(self, mock_subprocess):
+        mock_subprocess.run.return_value = MagicMock(stdout="tmux 3.4\n")
+
+        assert TmuxClient._tmux_sanitizes_paste_buffers() is False
+        assert TmuxClient._tmux_sanitizes_paste_buffers() is False
+        assert mock_subprocess.run.call_count == 1
 
 
 class TestSendKeysLogRedaction:

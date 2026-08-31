@@ -1,6 +1,7 @@
 ---
 name: cao-mcp-apps
-description: Enable, operate, and extend CAO's MCP Apps surface — the sandboxed host-rendered fleet UI (SEP-1865) with the ui://cao/* views, the topology widget, the submit_command mutation choke point, SEP-2133 capability advertisement, and the default-off OAuth scope layer. Use whenever the user wants to turn on the MCP Apps UI, observe/steer a CAO fleet from inside an MCP App host (Claude / Claude Desktop, ChatGPT, VS Code GitHub Copilot, Microsoft 365 Copilot, Goose, Postman, MCPJam, Archestra.AI), debug why the views don't render, build the frontend bundles, or extend the surface (new view, tool, or command kind).
+description: Enable, operate, and extend CAO's MCP Apps surface — the host-rendered fleet dashboard visible inside MCP App hosts (Claude Desktop, ChatGPT, VS Code Copilot, Goose, Postman). Use when the user says "enable MCP Apps in CAO", "the ui://cao views aren't rendering", "rebuild MCP Apps bundles", "add a new ui://cao/* view", or "configure the MCP Apps OAuth scope layer". Operates on the CAO_MCP_APPS_ENABLED surface and cao_mcp_apps/ build system. Not for the localhost:9889 browser dashboard, not for plugins, providers, or session management.
+compatibility: Requires CAO_MCP_APPS_ENABLED=true, cao-server running, and an MCP App-capable host (SEP-1865).
 ---
 
 # CAO MCP Apps
@@ -45,6 +46,7 @@ capability — best-effort and default-off, so nothing changes when the flag is 
 All mutations flow through `submit_command(kind, payload)` — kinds:
 `send_message`, `assign`, `create_session` (standard); `interrupt`, `pause`,
 `resume` (lifecycle); `shutdown_session` (destructive).
+For full payload schemas and scope requirements per kind, see [references/submit-command-kinds.md](references/submit-command-kinds.md).
 
 ## Full capability scope (what the views use)
 
@@ -65,7 +67,9 @@ Beyond `tools/call`, the views exercise the spec's bidirectional channel:
 `_meta.ui` fields (the spec sizes via `containerDimensions` +
 `ui/notifications/size-changed`); CAO requests **no** elevated `permissions`.
 
-## Troubleshooting
+See [assets/mcp-apps-example.md](assets/mcp-apps-example.md) for a worked MCP Apps integration example.
+
+## Gotchas
 
 - **Host doesn't offer the views** → confirm `CAO_MCP_APPS_ENABLED=true` and that
   `initialize` advertises `io.modelcontextprotocol/ui` (the host must speak
@@ -82,6 +86,9 @@ Beyond `tools/call`, the views exercise the spec's bidirectional channel:
 
 ## Extending the surface
 
+- **Agents emitting UI intents into this surface?** Load the **`agui-author`** skill
+  — it teaches how to call `emit_ui` with the six allow-listed components. Your
+  `emit_ui` intents feed the L2 constructs that these views render.
 - **Building or migrating an MCP App? Load the `mcp-apps-builder` skill first.**
   It equips the official ext-apps Agent Skills (`create-mcp-app`,
   `add-app-to-server`, `migrate-oai-app`, `convert-web-app`) and the build guide.
@@ -92,6 +99,7 @@ Beyond `tools/call`, the views exercise the spec's bidirectional channel:
 - **New view** → add a `ui://cao/<name>` resource in `ext_apps/apps.py` + an entry
   point under `cao_mcp_apps/`, build it, and tag the rendering tool with
   `ui_meta(...)`.
+  For the full step-by-step view creation procedure, see [references/extending-views.md](references/extending-views.md).
 - **New host-delegated action** → add a thin method on the `McpApp` bridge
   (`cao_mcp_apps/src/shared/mcpApp.ts`) that issues the spec `ui/*` request
   (e.g. `openLink` → `ui/open-link`, `requestDisplayMode` →
@@ -101,3 +109,25 @@ Beyond `tools/call`, the views exercise the spec's bidirectional channel:
   guard test (`test/test_http_only_boundary.py`) enforces it.
 - **Keep bundles JIT-free** → no `eval`/`new Function` (host CSP forbids it); the
   CI scan fails the build otherwise.
+
+## Recording & Verification
+
+After building or modifying views, regenerate the demo media:
+
+```bash
+cd cao_mcp_apps && npm run build:all && npm run demo
+```
+
+This runs `scripts/record-demo.mjs` which:
+1. Boots the E2E harness server (serves built bundles in a real MCP-host iframe)
+2. Drives Chromium through: dashboard → agent detail → unified → event-stream
+3. Records video (`docs/media/mcp-apps-demo.webm`)
+4. Captures screenshots (`docs/media/mcp-apps-{dashboard,agent,unified,event-stream}.png`)
+5. Generates an optimized GIF (`docs/media/mcp-apps-demo.gif`) when ffmpeg is available
+
+The GIF is referenced in `README.md` and `docs/mcp-apps.md` — always regenerate after
+view changes so docs stay current.
+
+**Env overrides:** `CHROMIUM_BIN` (path to Chrome), `FFMPEG_BIN` (for GIF), `DEMO_PORT`.
+
+For a worked example of the full MCP Apps surface in action, see [assets/mcp-apps-example.md](assets/mcp-apps-example.md).

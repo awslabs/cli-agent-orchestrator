@@ -5,7 +5,6 @@ does not need prompt-based catalog baking or refresh-on-skill-change.
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Iterator, List, Optional
 
@@ -17,6 +16,11 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+from cli_agent_orchestrator.utils.path_validation import (
+    flatten_path_separators,
+    validate_path_component,
+)
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 
 logger = logging.getLogger(__name__)
@@ -57,34 +61,40 @@ def refresh_agent_md_prompt(md_path: Path, profile: AgentProfile) -> bool:
 
     Preserves the YAML frontmatter (name, description) while replacing the
     Markdown body with the composed prompt (profile base prompt + skill catalog).
+
+    The whole load-recompute-replace cycle runs under the same
+    inter-process lock ``locked_atomic_rewrite`` uses for ``md_path``, so a
+    concurrent refresh of the same file (another CLI invocation, or
+    cao-server handling two profile-change events back to back) can never
+    interleave temp files or publish a half-written file — the same failure
+    mode fixed for the memory plugins in ``plugins/builtin/*_memory.py``.
     """
     if not md_path.exists():
         return False
 
-    post = frontmatter.load(md_path)
+    def compute_new_content(_existing: str) -> str:
+        # Re-read via frontmatter.load() (not `_existing`) because we need the
+        # parsed YAML frontmatter structure, not raw text, and the read must
+        # happen inside the lock to avoid racing a concurrent writer's replace.
+        post = frontmatter.load(md_path)
+        system_prompt = profile.system_prompt.strip() if profile.system_prompt else ""
+        base = system_prompt or (profile.prompt.strip() if profile.prompt else "")
+        new_body = compose_agent_prompt(profile, base_prompt=base)
+        post.content = (new_body or "").rstrip()
+        return frontmatter.dumps(post)
 
-    # Copilot prompt resolution: system_prompt takes priority over prompt
-    system_prompt = profile.system_prompt.strip() if profile.system_prompt else ""
-    base = system_prompt or (profile.prompt.strip() if profile.prompt else "")
-
-    new_body = compose_agent_prompt(profile, base_prompt=base)
-    post.content = (new_body or "").rstrip()
-
-    temp_path = md_path.with_suffix(md_path.suffix + ".tmp")
-    try:
-        temp_path.write_text(frontmatter.dumps(post), encoding="utf-8")
-        os.replace(temp_path, md_path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
-
+    locked_atomic_rewrite(md_path, compute_new_content)
     return True
 
 
 def refresh_installed_agent_for_profile(profile_name: str) -> List[Path]:
     """Refresh installed Copilot agents for one source profile."""
     profile = load_agent_profile(profile_name)
-    safe_name = profile.name.replace("/", "__")
+    # Flatten both separators (see install_service): this filename derives from
+    # the attacker-controlled resolved profile name, and a backslash is a
+    # separator on Windows. Defence in depth — install now rejects a
+    # separator-bearing name, so such a profile cannot have been installed.
+    safe_name = flatten_path_separators(profile.name)
     refreshed_paths: List[Path] = []
 
     copilot_path = COPILOT_AGENTS_DIR / f"{safe_name}.agent.md"
@@ -135,6 +145,17 @@ def _iter_installed_copilot_agents() -> Iterator[Path]:
 
 
 def _is_cao_managed_copilot_agent(name: str) -> bool:
-    """Return True when a corresponding CAO context file exists for this agent name."""
-    context_file = AGENT_CONTEXT_DIR / f"{name}.md"
+    """Return True when a corresponding CAO context file exists for this agent name.
+
+    ``name`` comes from the frontmatter of a file already sitting in the Copilot
+    agents directory, so it is not trusted. Validate it as a single path segment
+    before joining: an unsafe name simply is not CAO-managed (install would have
+    refused to write its context copy), so returning False is both correct and
+    keeps a traversal out of the join.
+    """
+    try:
+        safe_name = validate_path_component(name, description="agent name")
+    except ValueError:
+        return False
+    context_file = AGENT_CONTEXT_DIR / f"{safe_name}.md"
     return context_file.exists()

@@ -14,11 +14,11 @@ from cli_agent_orchestrator.constants import (
     PYTE_QUIESCENCE_DELAY_S,
     PYTE_SCREEN_COLS,
     PYTE_SCREEN_ROWS,
-    STATE_BUFFER_MAX,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # StatusMonitor will not regress to PROCESSING until ``notify_input_sent``
 # is called (signalling that a new processing cycle is starting).
 #
-# Why: the event-driven pipeline derives status from a rolling 8KB buffer,
+# Why: the event-driven pipeline derives status from a rolling state buffer,
 # and TUI redraws (cursor positioning, status-bar refreshes) routinely
 # evict the idle/response markers that the per-provider get_status() relies
 # on. That makes status flap rapidly between IDLE/COMPLETED and PROCESSING
@@ -60,6 +60,12 @@ class StatusMonitor:
         # be consumed by a decision taken against stale state.
         self._lock = threading.RLock()
         self._buffers: Dict[str, str] = {}
+        # Monotonic per-terminal byte-buffer generation.  A provider that
+        # remembers positions across get_status() calls needs an explicit reset
+        # boundary when send_input discards the old rolling buffer; content
+        # overlap alone cannot distinguish a fresh, byte-identical turn from a
+        # stale screen redraw.
+        self._buffer_epochs: Dict[str, int] = {}
         self._last_status: Dict[str, TerminalStatus] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
@@ -126,8 +132,9 @@ class StatusMonitor:
         """Append chunk to the rolling buffer and (re)detect status.
 
         Two detection paths share one latch/publish backend (_apply_detection):
-        - RAW (default, every provider): regex over the rolling 8KB byte
-          buffer, run on every chunk. Unchanged legacy behavior.
+        - RAW (default, every provider): regex over the rolling state buffer
+          (``state_buffer_max`` bytes, server setting), run on every chunk.
+          Unchanged legacy behavior.
         - SCREEN (pyte): when CAO_PYTE_STATUS is on AND the provider opts in
           via supports_screen_detection, the chunk is fed to a per-terminal
           pyte screen and detection runs only on the rising edge (output
@@ -140,11 +147,12 @@ class StatusMonitor:
             and provider is not None
             and getattr(provider, "supports_screen_detection", False)
         )
+        state_buffer_max = get_server_settings()["state_buffer_max"]
 
         with self._lock:
             buffer = self._buffers.get(terminal_id, "") + chunk
-            if len(buffer) > STATE_BUFFER_MAX:
-                buffer = buffer[-STATE_BUFFER_MAX:]
+            if len(buffer) > state_buffer_max:
+                buffer = buffer[-state_buffer_max:]
             self._buffers[terminal_id] = buffer
             if use_screen:
                 self._feed_screen_locked(terminal_id, chunk)
@@ -463,7 +471,7 @@ class StatusMonitor:
             except RuntimeError:
                 pass  # loop already closed during shutdown — the timer is moot
 
-    def notify_input_sent(self, terminal_id: str) -> None:
+    def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
         """Arm the next PROCESSING transition.
 
         Call before any send_keys / paste that initiates a new processing
@@ -473,8 +481,10 @@ class StatusMonitor:
         """
         with self._lock:
             self._allow_processing_revert[terminal_id] = True
+        if assume_processing:
+            self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
 
-    def clear_rolling_buffer(self, terminal_id: str) -> None:
+    def clear_rolling_buffer(self, terminal_id: str, provider=None) -> None:
         """Clear ONLY the rolling byte buffer for a terminal — preserves
         ``_last_status`` and ``_allow_processing_revert``.
 
@@ -484,9 +494,19 @@ class StatusMonitor:
         rendered its processing indicator. Unlike ``reset_buffer``, this does
         NOT wipe the sticky-latch state, so the arm set by ``notify_input_sent``
         survives and the subsequent IDLE→PROCESSING transition is honored.
+
+        When the active provider is supplied, it is synchronously notified of
+        the new monotonically increasing byte-buffer epoch while this monitor's
+        lock is held.  That makes the boundary atomic with respect to the
+        output-consumer thread, which otherwise could parse the fresh first
+        chunk against state from the discarded buffer.
         """
         with self._lock:
             self._buffers[terminal_id] = ""
+            epoch = self._buffer_epochs.get(terminal_id, 0) + 1
+            self._buffer_epochs[terminal_id] = epoch
+            if provider is not None:
+                provider.notify_status_buffer_reset(epoch)
 
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""
@@ -504,6 +524,7 @@ class StatusMonitor:
         """Free buffer and status for a deleted terminal."""
         with self._lock:
             self._buffers.pop(terminal_id, None)
+            self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)

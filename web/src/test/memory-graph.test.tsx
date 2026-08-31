@@ -102,6 +102,15 @@ const GRAPH = {
   meta: {},
 }
 
+const LINT_DISABLED_GRAPH = {
+  ...GRAPH,
+  meta: {
+    lint_enabled: false,
+    lint_enrichment: 'disabled',
+    disabled_enrichments: ['orphan_page', 'contradiction'],
+  },
+}
+
 describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
   const mockFetch = vi.fn()
 
@@ -140,6 +149,7 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
         status,
         statusText: status === 200 ? 'OK' : 'Error',
         json: () => Promise.resolve(body),
+        text: () => Promise.resolve(JSON.stringify(body)),
       })
     })
   }
@@ -200,6 +210,23 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
       expect(Number.isFinite(graph.getNodeAttribute(n, 'x'))).toBe(true)
       expect(Number.isFinite(graph.getNodeAttribute(n, 'y'))).toBe(true)
     })
+  })
+
+  it('renders disabled-lint metadata while still showing graph topology', async () => {
+    routeFetch(url => {
+      if (url.startsWith('/graph/')) return { status: 200, body: LINT_DISABLED_GRAPH }
+      return { status: 200, body: [] }
+    })
+    render(<MemoryPanel />)
+    await screen.findByText('No memories stored.')
+    fireEvent.click(screen.getByRole('tab', { name: /graph/i }))
+    selectGlobalScope()
+
+    expect(await screen.findByText(/Memory lint enrichment is disabled/i)).toBeInTheDocument()
+    await waitFor(() => expect(getLastSigma()).toBeDefined())
+    const graph = getLastSigma()!.graph as import('graphology').default
+    expect(graph.hasNode('hub1')).toBe(true)
+    expect(graph.hasEdge('hub1', 'n3')).toBe(true)
   })
 
   it('clicking a node calls api.getMemory and shows its content as plain text', async () => {
@@ -436,6 +463,34 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
     expect(errBox.textContent).not.toMatch(/9894/)
   })
 
+  it('a server-side graph projection timeout renders 504-specific copy', async () => {
+    routeFetch(url => {
+      if (url.startsWith('/graph/')) {
+        return {
+          status: 504,
+          body: {
+            detail: {
+              message: 'graph projection timed out after 90 seconds',
+              kind: 'graph_projection_timeout',
+              timeout_s: 90,
+              metadata: { graph_projection_timeout: true },
+            },
+          },
+        }
+      }
+      return { status: 200, body: [] }
+    })
+    render(<MemoryPanel />)
+    await screen.findByText('No memories stored.')
+    fireEvent.click(screen.getByRole('tab', { name: /graph/i }))
+    selectGlobalScope()
+
+    const errBox = await screen.findByTestId('graph-error')
+    expect(errBox.textContent).toMatch(/timed out on the server/i)
+    expect(errBox.textContent).toMatch(/90s/)
+    expect(errBox.textContent).not.toMatch(/waited 120s/)
+  })
+
   it('a stale graph fetch (scope switched mid-flight) does NOT overwrite the current view', async () => {
     // Two graphs so we can tell which scope's data landed. The FIRST fetch
     // (project) is held open until AFTER the second (global) resolves, so the
@@ -458,12 +513,13 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
           status: 200,
           statusText: 'OK',
           json: () => Promise.resolve(PROJECT_GRAPH),
+          text: () => Promise.resolve(JSON.stringify(PROJECT_GRAPH)),
         }))
       }
       if (u.startsWith('/graph/memory?scope=global')) {
-        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH) })
+        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH), text: () => Promise.resolve(JSON.stringify(GRAPH)) })
       }
-      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES) })
+      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES), text: () => Promise.resolve(JSON.stringify(MEMORIES)) })
     })
 
     render(<MemoryPanel />)
@@ -517,12 +573,13 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
           status: 500,
           statusText: 'Server Error',
           json: () => Promise.resolve({ detail: 'boom' }),
+          text: () => Promise.resolve(JSON.stringify({ detail: 'boom' })),
         }))
       }
       if (u.startsWith('/graph/memory?scope=global')) {
-        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH) })
+        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH), text: () => Promise.resolve(JSON.stringify(GRAPH)) })
       }
-      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES) })
+      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES), text: () => Promise.resolve(JSON.stringify(MEMORIES)) })
     })
 
     render(<MemoryPanel />)
@@ -574,12 +631,13 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
           status: 200,
           statusText: 'OK',
           json: () => Promise.resolve(GRAPH),
+          text: () => Promise.resolve(JSON.stringify(GRAPH)),
         }))
       }
       if (u.startsWith('/graph/memory?scope=global')) {
         return globalGate
       }
-      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES) })
+      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES), text: () => Promise.resolve(JSON.stringify(MEMORIES)) })
     })
 
     render(<MemoryPanel />)

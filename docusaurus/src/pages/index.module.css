@@ -1,0 +1,553 @@
+/* =========================================================================
+   CAO homepage
+   Light theme  — soft sky-blue gradients, white cards
+   Dark  theme  — black canvas, vibrant pink/purple/blue gradients
+   Both palettes share one DOM; the dark variant lives under
+   [data-theme='dark'] so the navbar colour-mode toggle switches the whole page.
+   ========================================================================= */
+
+/* ===== Hero Section ===== */
+.hero {
+  position: relative;
+  padding: 6rem 0 4rem;
+  overflow: hidden;
+  background: linear-gradient(180deg, #f0f9ff 0%, #ffffff 100%);
+  text-align: center;
+}
+
+[data-theme='dark'] .hero {
+  background: #000;
+}
+
+.heroDecoration {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.blob1 {
+  position: absolute;
+  top: -10%;
+  left: -5%;
+  width: 500px;
+  height: 500px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(14, 165, 233, 0.15) 0%, transparent 70%);
+  animation: float 14s ease-in-out infinite;
+}
+
+.blob2 {
+  position: absolute;
+  top: 20%;
+  right: -10%;
+  width: 400px;
+  height: 400px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(6, 182, 212, 0.12) 0%, transparent 70%);
+  animation: float 10s ease-in-out infinite reverse;
+}
+
+.blob3 {
+  position: absolute;
+  bottom: -20%;
+  left: 30%;
+  width: 600px;
+  height: 600px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(56, 189, 248, 0.08) 0%, transparent 60%);
+  animation: float 18s ease-in-out infinite 2s;
+}
+
+/* Dark: swap the cool blue blobs for Framer-style vibrant gradients */
+[data-theme='dark'] .blob1 {
+  top: 10%;
+  left: 5%;
+  background: radial-gradient(circle, rgba(255, 0, 128, 0.18) 0%, transparent 60%);
+}
+
+[data-theme='dark'] .blob2 {
+  top: 5%;
+  right: 0%;
+  background: radial-gradient(circle, rgba(120, 0, 255, 0.18) 0%, transparent 60%);
+}
+
+[data-theme='dark'] .blob3 {
+  bottom: -10%;
+  left: 25%;
+  background: radial-gradient(circle, rgba(0, 100, 255, 0.14) 0%, transparent 55%);
+}
+
+/* Respect users who ask for reduced motion: the decorative blobs are purely
+   cosmetic, so stop them rather than animating indefinitely. */
+@media (prefers-reduced-motion: reduce) {
+  .blob1,
+  .blob2,
+  .blob3 {
+    animation: none;
+  }
+}
+
+@keyframes float {
+  0%, 100% {
+    transform: translate(0, 0) scale(1);
+  }
+  50% {
+    transform: translate(20px, -20px) scale(1.05);
+  }
+}
+
+.heroContainer {
+  position: relative;
+  z-index: 2;
+}
+
+/* Badge */
+.badge {
+  display: inline-block;
+  padding: 0.5rem 1.25rem;
+  border-radius: 9999px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #0284c7;
+  background: linear-gradient(135deg, #e0f2fe, #cffafe);
+  border: 1px solid rgba(14, 165, 233, 0.25);
+  margin-bottom: 1.5rem;
+}
+
+[data-theme='dark'] .badge {
+  color: #f0c4ff;
+  background: linear-gradient(135deg, rgba(255, 0, 128, 0.2), rgba(120, 0, 255, 0.2));
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+/* Title, set as the logo lockup rather than text. The h1 is a plain wrapper:
+   every visual property belongs to the image, and the light/dark swap is done
+   by ThemedImage in index.tsx, not here. */
+.heroLogo {
+  margin: 0 0 1.25rem;
+}
+
+.heroLockup {
+  display: block;
+  width: 100%;
+  max-width: 600px;
+  height: auto;
+  margin: 0 auto;
+}
+
+/* Tagline */
+.heroTagline {
+  font-size: 1.35rem;
+  color: #475569;
+  max-width: 520px;
+  margin: 0 auto 2.5rem;
+  line-height: 1.6;
+  font-weight: 400;
+}
+
+[data-theme='dark'] .heroTagline {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+/* Buttons */
+.heroButtons {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 3rem;
+}
+
+.btnPrimary {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.875rem 2rem;
+  border-radius: 9999px;
+  font-size: 1rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, #0ea5e9, #06b6d4);
+  color: white;
+  text-decoration: none;
+  /* Transparent border keeps this the same height as .btnSecondary,
+     which carries a visible 2px border. */
+  border: 2px solid transparent;
+  transition: all 0.2s ease;
+  box-shadow: 0 4px 14px rgba(14, 165, 233, 0.35);
+}
+
+.btnPrimary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(14, 165, 233, 0.45);
+  color: white;
+  text-decoration: none;
+}
+
+[data-theme='dark'] .btnPrimary {
+  background: linear-gradient(135deg, #ff0080, #7928ca);
+  box-shadow: none;
+}
+
+[data-theme='dark'] .btnPrimary:hover {
+  box-shadow: 0 8px 30px rgba(255, 0, 128, 0.4);
+}
+
+.btnSecondary {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.875rem 2rem;
+  border-radius: 9999px;
+  font-size: 1rem;
+  font-weight: 700;
+  background: white;
+  color: #0f172a;
+  text-decoration: none;
+  border: 2px solid #e2e8f0;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+
+.btnSecondary:hover {
+  transform: translateY(-2px);
+  border-color: #0ea5e9;
+  color: #0ea5e9;
+  text-decoration: none;
+  box-shadow: 0 4px 16px rgba(14, 165, 233, 0.15);
+}
+
+[data-theme='dark'] .btnSecondary {
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  box-shadow: none;
+}
+
+[data-theme='dark'] .btnSecondary:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: #fff;
+  box-shadow: none;
+}
+
+/* Providers */
+.providers {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.6rem;
+}
+
+.providerPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 1rem;
+  border-radius: 9999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #334155;
+  background: white;
+  border: 1.5px solid #e2e8f0;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.providerPill:hover {
+  border-color: var(--pill-color);
+  box-shadow: 0 2px 8px rgba(14, 165, 233, 0.12);
+  transform: translateY(-1px);
+}
+
+[data-theme='dark'] .providerPill {
+  color: rgba(255, 255, 255, 0.8);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: none;
+}
+
+[data-theme='dark'] .providerPill:hover {
+  border-color: var(--pill-color);
+  background: rgba(255, 255, 255, 0.09);
+  box-shadow: none;
+}
+
+.providerDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--pill-color);
+}
+
+/* ===== Terminal Section ===== */
+.terminalSection {
+  padding: 0 0 5rem;
+  background: white;
+}
+
+[data-theme='dark'] .terminalSection {
+  background: #000;
+}
+
+.terminalWrapper {
+  max-width: 680px;
+  margin: -2rem auto 0;
+  position: relative;
+  z-index: 3;
+}
+
+.terminal {
+  border-radius: 20px;
+  overflow: hidden;
+  background: #0f172a;
+  box-shadow:
+    0 25px 60px rgba(15, 23, 42, 0.2),
+    0 0 0 1px rgba(14, 165, 233, 0.1);
+}
+
+[data-theme='dark'] .terminal {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 24px;
+  box-shadow: none;
+}
+
+.terminalBar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 14px 18px;
+  background: #1e293b;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+[data-theme='dark'] .terminalBar {
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom-color: rgba(255, 255, 255, 0.06);
+}
+
+.dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.dot[data-c="red"] { background: #ef4444; }
+.dot[data-c="yellow"] { background: #eab308; }
+.dot[data-c="green"] { background: #22c55e; }
+
+.terminalLabel {
+  margin-left: auto;
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.3);
+  font-family: 'SF Mono', 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+.terminalCode {
+  margin: 0;
+  padding: 1.5rem 1.75rem;
+  font-size: 0.85rem;
+  line-height: 2;
+  font-family: 'SF Mono', 'JetBrains Mono', 'Fira Code', monospace;
+  color: #e2e8f0;
+  background: transparent;
+  overflow-x: auto;
+}
+
+.prompt {
+  color: #38bdf8;
+  font-weight: 700;
+  margin-right: 0.5rem;
+}
+
+[data-theme='dark'] .prompt {
+  color: #a855f7;
+}
+
+.cmd {
+  color: #67e8f9;
+  font-weight: 600;
+}
+
+.flag {
+  color: #a78bfa;
+}
+
+.val {
+  color: #fbbf24;
+}
+
+.str {
+  color: #34d399;
+}
+
+.success {
+  color: #4ade80;
+  font-weight: 600;
+}
+
+/* ===== Features Section ===== */
+.features {
+  padding: 5rem 0 6rem;
+  background: #fafcff;
+}
+
+[data-theme='dark'] .features {
+  background: #000;
+}
+
+.sectionHeading {
+  text-align: center;
+  font-size: 2.75rem;
+  font-weight: 900;
+  letter-spacing: -0.035em;
+  margin-bottom: 0.75rem;
+  color: #0f172a;
+}
+
+[data-theme='dark'] .sectionHeading {
+  color: #fff;
+}
+
+.sectionSub {
+  text-align: center;
+  font-size: 1.15rem;
+  color: #64748b;
+  margin-bottom: 3.5rem;
+  max-width: 480px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+[data-theme='dark'] .sectionSub {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.featuresGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.5rem;
+}
+
+.featureCard {
+  padding: 2rem;
+  border-radius: 20px;
+  background: var(--card-bg);
+  border: 1px solid rgba(14, 165, 233, 0.08);
+  transition: all 0.25s ease;
+}
+
+.featureCard:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 16px 40px rgba(14, 165, 233, 0.1);
+}
+
+/* Dark: drop the pastel gradient for a near-black card with a gradient edge */
+[data-theme='dark'] .featureCard {
+  background: #0a0a0a;
+  border: 1px solid transparent;
+  border-radius: 22px;
+  background-image:
+    linear-gradient(#0a0a0a, #0a0a0a),
+    linear-gradient(135deg, #ff0080, #7928ca, #0070f3, #ff4500);
+  background-origin: border-box;
+  background-clip: padding-box, border-box;
+}
+
+[data-theme='dark'] .featureCard:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 16px 40px rgba(255, 0, 128, 0.15);
+}
+
+.featureEmoji {
+  font-size: 2rem;
+  margin-bottom: 1rem;
+  width: 56px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(4px);
+}
+
+[data-theme='dark'] .featureEmoji {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.featureTitle {
+  font-size: 1.1rem;
+  font-weight: 800;
+  margin-bottom: 0.6rem;
+  color: #0f172a;
+  letter-spacing: -0.01em;
+}
+
+[data-theme='dark'] .featureTitle {
+  color: #fff;
+}
+
+.featureDesc {
+  margin: 0;
+  font-size: 0.875rem;
+  color: #475569;
+  line-height: 1.7;
+}
+
+[data-theme='dark'] .featureDesc {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/* ===== Responsive ===== */
+@media (max-width: 996px) {
+  .featuresGrid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 768px) {
+  .hero {
+    padding: 4rem 0 3rem;
+  }
+
+  /* Hold the lockup back on phones so it does not tower over the tagline. */
+  .heroLockup {
+    max-width: 440px;
+  }
+
+  .heroTagline {
+    font-size: 1.1rem;
+  }
+
+  .heroButtons {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .btnPrimary,
+  .btnSecondary {
+    width: 100%;
+    max-width: 280px;
+    justify-content: center;
+  }
+
+  .terminalWrapper {
+    margin-top: -1rem;
+  }
+
+  .terminalCode {
+    font-size: 0.72rem;
+    padding: 1rem 1.25rem;
+  }
+
+  .featuresGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .sectionHeading {
+    font-size: 2rem;
+  }
+}

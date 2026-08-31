@@ -64,7 +64,10 @@ npm install && npm run build   # Outputs to src/cli_agent_orchestrator/web_ui/
 uv tool install . --reinstall
 ```
 
-> **Custom host/port:** `cao-server --host 0.0.0.0 --port 9889` exposes the server to the network — see [Security](../README.md#security) in the root README before doing this.
+> **Custom host/port:** `cao-server --host 0.0.0.0 --port 9889` exposes the
+> server to the network. Review the
+> [network configuration and PTY WebSocket guidance](configuration.md#network-network--env-var-only)
+> before doing this.
 
 ## Remote machine access
 

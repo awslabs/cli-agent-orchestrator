@@ -112,6 +112,7 @@ test/
 │   ├── test_kimi_cli_unit.py
 │   ├── test_copilot_cli_unit.py
 │   ├── test_kiro_cli_unit.py
+│   ├── test_omp_unit.py
 │   ├── test_provider_manager_unit.py
 │   └── test_cursor_cli_unit.py
 ├── services/                 # Service tests
@@ -138,7 +139,7 @@ The project aims for >90% test coverage for core modules.
 - `constants.py` - Configuration constants
 - `mcp_server/models.py`, `mcp_server/utils.py` - MCP models and utilities
 - `models/` - All Pydantic models
-- `providers/` - All provider implementations (claude_code, codex, antigravity_cli, kiro_cli, kimi_cli, copilot_cli, opencode_cli, cursor_cli)
+- `providers/` - All provider implementations (claude_code, codex, antigravity_cli, kiro_cli, kimi_cli, copilot_cli, opencode_cli, omp, cursor_cli)
 - `services/inbox_service.py`, `services/session_service.py` - Core services
 - `utils/` - All utility modules (agent_profiles, logging, template, terminal)
 

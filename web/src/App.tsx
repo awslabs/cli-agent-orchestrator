@@ -7,17 +7,20 @@ import { AgentPanel } from './components/AgentPanel'
 import { FlowsPanel } from './components/FlowsPanel'
 import { MemoryPanel } from './components/MemoryPanel'
 import { SettingsPanel } from './components/SettingsPanel'
-import { Bot, Home, Clock, Settings, Brain, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
+import { WorkflowsPanel } from './components/WorkflowsPanel'
+import { CaoMark } from './components/CaoMark'
+import { Bot, Home, Clock, Settings, Brain, Workflow, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
 
-type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory'
+type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows'
 
-// Memory appended last so Alt+N numbering of existing tabs never shifts
+// Workflows + Memory appended last so Alt+N numbering of existing tabs never shifts
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'home', label: 'Home', icon: <Home size={16} /> },
   { key: 'agents', label: 'Agents', icon: <Bot size={16} /> },
   { key: 'flows', label: 'Flows', icon: <Clock size={16} /> },
   { key: 'settings', label: 'Settings', icon: <Settings size={16} /> },
   { key: 'memory', label: 'Memory', icon: <Brain size={16} /> },
+  { key: 'workflows', label: 'Workflows', icon: <Workflow size={16} /> },
 ]
 
 function Snackbar() {
@@ -86,9 +89,7 @@ export default function App() {
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
-              <Bot size={18} className="text-white" />
-            </div>
+            <CaoMark size={32} />
             <h1 className="text-lg font-bold text-white">CLI Agent Orchestrator</h1>
           </div>
           <div className="flex items-center gap-4">
@@ -146,6 +147,7 @@ export default function App() {
             {tab === 'flows' && <FlowsPanel />}
             {tab === 'settings' && <SettingsPanel />}
             {tab === 'memory' && <MemoryPanel />}
+            {tab === 'workflows' && <WorkflowsPanel />}
           </Suspense>
         </ErrorBoundary>
       </main>

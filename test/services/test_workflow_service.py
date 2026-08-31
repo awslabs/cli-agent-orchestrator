@@ -136,6 +136,27 @@ async def test_trace_a_clean_run(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_workflow_step_forwards_explicit_engine(monkeypatch):
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    spec = _spec(
+        steps=[
+            WorkflowStep(
+                id="s1",
+                provider="kiro_cli",
+                agent="dev",
+                prompt="go",
+                engine="kas",
+            )
+        ]
+    )
+
+    await ws.start_run(spec, {}, "engine-run")
+
+    assert mock.await_args.kwargs["engine"] == "kas"
+
+
+@pytest.mark.asyncio
 async def test_trace_b_worker_crashes_twice_then_succeeds(monkeypatch):
     """Trace B: two StepExecutionErrors, third attempt COMPLETED -> attempts=3."""
     calls = {"n": 0}
@@ -690,3 +711,157 @@ def test_validate_inputs_yaml_behavior_unchanged_regression():
     # And the same rejection semantics hold for the YAML tier.
     with pytest.raises(ValueError, match="unknown input"):
         ws._validate_inputs(spec, {"topic": "t", "extra": 1})
+
+
+# ---------------------------------------------------------------------------
+# U2 (issue #505) — start_run_prepared: the drive-only YAML async entry (ADR-3)
+# ---------------------------------------------------------------------------
+def _prepared_record(run_id: str, spec=None) -> "ws.RunRecord":
+    """Build a RunRecord exactly as the async submit handler (C1) does at step 6."""
+    spec = spec or _spec()
+    return ws.RunRecord(
+        run_id=run_id,
+        workflow_name=spec.name,
+        spec=spec,
+        inputs={},
+        state=RunState.RUNNING,
+        current_step_id=None,
+        cancelled=False,
+        step_states={step.id: ws.StepRunState(step_id=step.id) for step in spec.steps},
+        started_at=ws._now(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_run_prepared_drives_to_terminal(monkeypatch):
+    """CR-2/FR-2.6: the prepared entry drives an already-registered record to a
+    terminal state via the SAME shared drive loop as a blocking run."""
+
+    async def _side(*a, **kw):
+        _put_valid(kw["env_vars"]["CAO_WORKFLOW_RUN_ID"], kw["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    record = _prepared_record("run-prep", _spec(schema=_SCHEMA))
+    # C1 registered the record BEFORE scheduling the drive; the prepared entry
+    # does NOT register it.
+    ws.run_registry["run-prep"] = record
+
+    res = await ws.start_run_prepared(record)
+    assert res.state == RunState.COMPLETED
+    assert res.steps[0].state == StepState.COMPLETED
+    # DR-2: liveness mark cleared on exit (finally discard).
+    assert "run-prep" not in ws._active_drives
+
+
+@pytest.mark.asyncio
+async def test_start_run_prepared_does_not_readmit_or_reinsert(monkeypatch):
+    """DR-1/DR-2 (the double-admission regression): the prepared entry must NOT call
+    ``_check_run_id_available`` (which would 409 on the already-registered id) nor
+    ``_journal_insert_run`` (which would IntegrityError on the already-journaled
+    id). Contrast: re-entering blocking ``start_run`` WOULD 409 here."""
+
+    async def _side(*a, **kw):
+        _put_valid(kw["env_vars"]["CAO_WORKFLOW_RUN_ID"], kw["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    def _fail_admission(run_id):
+        raise AssertionError("start_run_prepared must not call _check_run_id_available")
+
+    def _fail_insert(record):
+        raise AssertionError("start_run_prepared must not re-insert the run row")
+
+    monkeypatch.setattr(ws, "_check_run_id_available", _fail_admission)
+    monkeypatch.setattr(ws, "_journal_insert_run", _fail_insert)
+
+    record = _prepared_record("run-prep-2", _spec(schema=_SCHEMA))
+    ws.run_registry["run-prep-2"] = record  # already registered by C1
+
+    res = await ws.start_run_prepared(record)
+    assert res.state == RunState.COMPLETED
+
+    # Control: restore the real admission and prove that re-entering the blocking
+    # path on the same already-registered id WOULD raise KeyError (-> 409). This is
+    # exactly the double-admission the prepared entry avoids by skipping the check.
+    monkeypatch.undo()
+    with pytest.raises(KeyError):
+        ws._check_run_id_available("run-prep-2")
+
+
+@pytest.mark.asyncio
+async def test_start_run_prepared_marks_then_clears_active_drive(monkeypatch):
+    """The run is present in ``_active_drives`` WHILE driving and absent after —
+    the liveness truth the crash-remnant / resume logic relies on."""
+    observed = {"live_during_drive": False}
+
+    async def _side(*a, **kw):
+        observed["live_during_drive"] = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"] in ws._active_drives
+        _put_valid(kw["env_vars"]["CAO_WORKFLOW_RUN_ID"], kw["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    record = _prepared_record("run-prep-3", _spec(schema=_SCHEMA))
+    ws.run_registry["run-prep-3"] = record
+    await ws.start_run_prepared(record)
+    assert observed["live_during_drive"] is True
+    assert "run-prep-3" not in ws._active_drives
+
+
+# ---------------------------------------------------------------------------
+# U9 (issue #505): the drive's journal write-through supplies the substrate that
+# ``_resolve_error_kind`` infers over on the journal-only path (JP-1). These tests
+# drive a real run to a terminal FAILED/CANCELLED state, then resolve the kind from
+# get_run + get_steps alone (empty-registry read) — proving the service drive and
+# U9's read-surface resolver agree end to end.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_drive_failure_journals_error_that_resolver_infers_timeout(monkeypatch):
+    """U9 (RP-3 / JP-1): a run whose step fails with a timeout-flavored error journals
+    that error text; ``_resolve_error_kind`` over the journal rows infers 'timeout'."""
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+    from cli_agent_orchestrator.services import workflow_journal
+
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(
+            side_effect=StepExecutionError(
+                "step Timeout after 60s", kind="timeout", terminal_id="td"
+            )
+        ),
+    )
+    res = await ws.start_run(_spec(on_failure="halt", retries=0), {}, "u9-timeout")
+    assert res.state == RunState.FAILED
+
+    # Resolve from the DURABLE journal rows alone (the detached-path substrate), not
+    # the live result object — the empty-registry read U9's result route performs.
+    row = workflow_journal.get_run("u9-timeout")
+    steps = workflow_journal.get_steps("u9-timeout")
+    assert any(s.error and "Timeout" in s.error for s in steps)
+    assert _resolve_error_kind(row, steps) == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_drive_failure_journals_generic_error_resolver_infers_error(monkeypatch):
+    """U9 (RP-3 / JP-1): a non-timeout step failure journals its error; the resolver
+    infers the generic 'error' kind from the journal rows."""
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+    from cli_agent_orchestrator.services import workflow_journal
+
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(
+            side_effect=StepExecutionError("provider returned 500", kind="error", terminal_id="te")
+        ),
+    )
+    res = await ws.start_run(_spec(on_failure="halt", retries=0), {}, "u9-error")
+    assert res.state == RunState.FAILED
+
+    row = workflow_journal.get_run("u9-error")
+    steps = workflow_journal.get_steps("u9-error")
+    assert _resolve_error_kind(row, steps) == "error"

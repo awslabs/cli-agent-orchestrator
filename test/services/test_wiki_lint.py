@@ -1181,3 +1181,219 @@ class TestT10PartialRunSummary:
             if i.issue_type == "lint_error" and "graph_density did not complete" in i.description
         ]
         assert per_det
+
+
+# ===========================================================================
+# Human review (PR #524) — contradiction RETRACTION
+# ===========================================================================
+
+
+class TestContradictionRetraction:
+    """``_persist_contradictions`` must retract a source's LAST contradiction.
+
+    The docstring always promised "stale contradictions are retracted on
+    re-lint", but the function grouped only sources that had a finding in THIS
+    run and returned early on ``if not grouped``. A source whose contradictions
+    were all resolved therefore never reached ``replace_set``, so its final edge
+    persisted forever — the one case where retraction actually matters.
+    """
+
+    def _bind(self, db_engine, monkeypatch):
+        from cli_agent_orchestrator.clients import database as db_mod
+        from cli_agent_orchestrator.services import memory_relationship_service as mrs_mod
+
+        Session = sessionmaker(bind=db_engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", Session)
+        monkeypatch.setattr(mrs_mod, "SessionLocal", Session)
+        return mrs_mod.MemoryRelationshipService()
+
+    def _seed(self, db_engine, *keys):
+        Session = sessionmaker(bind=db_engine)
+        s = Session()
+        try:
+            for k in keys:
+                s.add(
+                    MemoryMetadataModel(
+                        key=k,
+                        memory_type="project",
+                        scope="global",
+                        scope_id=None,
+                        file_path=f"/{k}.md",
+                        tags="t",
+                        token_estimate=0,
+                    )
+                )
+            s.commit()
+        finally:
+            s.close()
+
+    def _seed_with_paths(self, db_engine, svc, keys):
+        """Seed metadata rows whose file_path points at the REAL wiki file, so
+        run_lint loads a non-empty body and the keys are genuine candidates."""
+        Session = sessionmaker(bind=db_engine)
+        s = Session()
+        try:
+            for k in keys:
+                s.add(
+                    MemoryMetadataModel(
+                        key=k,
+                        memory_type="project",
+                        scope="global",
+                        scope_id=None,
+                        file_path=str(svc.get_wiki_path("global", None, k)),
+                        tags="t",
+                        token_estimate=0,
+                    )
+                )
+            s.commit()
+        finally:
+            s.close()
+
+    def test_last_contradiction_is_retracted_when_source_is_clean(self, db_engine, monkeypatch):
+        """a→b existed; this run examined "a" and found NOTHING. The edge must go."""
+        rel = self._bind(db_engine, monkeypatch)
+        self._seed(db_engine, "a", "b")
+        rel.create("global", None, "a", "b", "contradiction", "wiki_lint")
+        assert rel.active_targets("global", None, "a", type="contradiction") == ["b"]
+
+        # No contradiction issues this run, but "a" WAS examined.
+        wiki_lint._persist_contradictions([], "global", linted_sources={(None, "a")})
+
+        assert (
+            rel.active_targets("global", None, "a", type="contradiction") == []
+        ), "a source examined with no finding must have its last contradiction retracted"
+
+    def test_no_retraction_when_the_detector_did_not_complete(self, db_engine, monkeypatch):
+        """Guards the fix against over-reach: with ``linted_sources=None`` (a
+        timed-out or LLM-disabled pass) there is no evidence of absence, so a
+        real edge must SURVIVE. A fix that retracted unconditionally would
+        silently wipe the store whenever the LLM was unavailable."""
+        rel = self._bind(db_engine, monkeypatch)
+        self._seed(db_engine, "a", "b")
+        rel.create("global", None, "a", "b", "contradiction", "wiki_lint")
+
+        wiki_lint._persist_contradictions([], "global", linted_sources=None)
+
+        assert rel.active_targets("global", None, "a", type="contradiction") == [
+            "b"
+        ], "an incomplete detector pass must not retract anything"
+
+    def test_unexamined_source_is_not_retracted(self, db_engine, monkeypatch):
+        """Only EXAMINED sources are retractable. "a" holds an edge but was not
+        in this run's examined set (too short a body, or no tag), so it is left
+        alone even though the run reported no findings for it."""
+        rel = self._bind(db_engine, monkeypatch)
+        self._seed(db_engine, "a", "b", "z")
+        rel.create("global", None, "a", "b", "contradiction", "wiki_lint")
+
+        wiki_lint._persist_contradictions([], "global", linted_sources={(None, "z")})
+
+        assert rel.active_targets("global", None, "a", type="contradiction") == ["b"]
+
+    def test_candidates_mirror_build_pairs_filters(self):
+        """``_contradiction_candidates`` must not claim a source ``_build_pairs``
+        would have skipped — otherwise retraction fires on evidence the detector
+        never gathered. Short bodies and tagless rows are excluded."""
+        rows = [
+            _row("long_tagged", content="x" * 60, tags="t"),
+            _row("too_short", content="x" * 10, tags="t"),
+            _row("untagged", content="x" * 60, tags=""),
+        ]
+        got = wiki_lint._contradiction_candidates(rows)
+        assert (None, "long_tagged") in got
+        assert (None, "too_short") not in got
+        assert (None, "untagged") not in got
+
+    def test_pass_is_not_exhaustive_when_llm_is_unavailable(self):
+        """The gate that makes retraction safe. ``completion["contradiction"]``
+        is True even with NO LLM provider — the detector returns normally after
+        emitting a ``detector disabled`` lint_error. Gating on completion alone
+        would therefore treat an unadjudicated wiki as "clean" and retract EVERY
+        contradiction edge the moment the LLM was unavailable.
+        """
+        disabled = [
+            LintIssue(
+                issue_type="lint_error",
+                key="contradiction",
+                description="contradiction detector disabled (no LLM provider configured)",
+                severity="warning",
+            )
+        ]
+        assert wiki_lint._contradiction_pass_was_exhaustive(disabled) is False
+
+    def test_pass_is_not_exhaustive_when_pairs_were_capped(self):
+        """A ``max_pairs`` truncation also returns normally, leaving some sources
+        unexamined — so it must not license retraction either."""
+        capped = [
+            LintIssue(
+                issue_type="lint_error",
+                key="contradiction",
+                description="contradiction pass capped at 200 pairs (had 900)",
+                severity="warning",
+            )
+        ]
+        assert wiki_lint._contradiction_pass_was_exhaustive(capped) is False
+
+    def test_clean_pass_is_exhaustive(self):
+        """Control: a run with no degradation markers IS exhaustive, so the
+        retraction path stays reachable (a gate that always returned False would
+        silently disable the fix)."""
+        clean = [
+            LintIssue(issue_type="orphan_page", key="x", severity="warning"),
+            LintIssue(
+                issue_type="lint_error",
+                key="run_lint",
+                description="lint_run_completed: 5/5",
+                severity="info",
+            ),
+        ]
+        assert wiki_lint._contradiction_pass_was_exhaustive(clean) is True
+
+    def test_run_lint_with_no_llm_does_not_retract_existing_edges(
+        self, svc, tmp_path, db_engine, monkeypatch
+    ):
+        """END-TO-END form of the same guarantee, through real ``run_lint``.
+
+        Seeds a live wiki_lint contradiction edge, then runs the full lint with
+        NO LLM provider. The edge must survive: an unadjudicated pass is not
+        evidence the contradiction was resolved.
+        """
+        from cli_agent_orchestrator.clients import database as db_mod
+        from cli_agent_orchestrator.services import memory_relationship_service as mrs_mod
+        from cli_agent_orchestrator.services import settings_service
+
+        Session = sessionmaker(bind=db_engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", Session)
+        monkeypatch.setattr(mrs_mod, "SessionLocal", Session)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.memory_service.MemoryService",
+            lambda *a, **kw: svc,
+        )
+        monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: True)
+        monkeypatch.setattr(wiki_lint, "_build_llm_client", lambda: None)
+
+        # The rows must be REAL contradiction candidates, else this test passes
+        # vacuously: run_lint fills `content` from the wiki FILE, so a row with
+        # no file on disk has an empty body, fails _build_pairs' 50-char floor,
+        # and is never a candidate — the retraction path would be unreachable
+        # regardless of the gate. Write the files and assert candidacy below.
+        body = "a long enough article body to clear the fifty character floor" + " filler" * 10
+        for k in ("a", "b"):
+            p = svc.get_wiki_path("global", None, k)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+        self._seed_with_paths(db_engine, svc, ("a", "b"))
+        rel = mrs_mod.MemoryRelationshipService()
+        rel.create("global", None, "a", "b", "contradiction", "wiki_lint")
+
+        # PRE-ASSERTION: "a" really is examinable, so "the edge survived" is a
+        # claim about the GATE and not about an empty candidate set.
+        assert (None, "a") in wiki_lint._contradiction_candidates(
+            [_row("a", content=body, tags="t")]
+        )
+
+        _run(wiki_lint.run_lint("global", scope="global"))
+
+        assert rel.active_targets("global", None, "a", type="contradiction") == [
+            "b"
+        ], "run_lint with no LLM must not retract a real contradiction edge"

@@ -65,6 +65,7 @@ class MemoryConfig(BaseModel):
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
+    lint_enabled: bool = True
 
 
 class TerminalConfig(BaseModel):
@@ -87,13 +88,15 @@ class NetworkConfig(BaseModel):
     Rewiring them through ConfigService would require either mutating those
     lists after settings.json changes (no invalidation mechanism exists yet)
     or restructuring the middleware wiring — out of scope for this PR. Only
-    the ``CAO_ALLOWED_HOSTS``/``CAO_CORS_ORIGINS``/``CAO_WS_ALLOWED_CLIENTS``
-    env vars are read (in ``constants.py``, not through this schema).
+    the ``CAO_ALLOWED_HOSTS``/``CAO_CORS_ORIGINS``/``CAO_WS_ALLOWED_CLIENTS``/
+    ``CAO_WS_ALLOWED_ORIGINS`` env vars are read (in ``constants.py``, not
+    through this schema).
     """
 
     allowed_hosts: List[str] = Field(default_factory=list)
     cors_origins: List[str] = Field(default_factory=list)
     ws_allowed_clients: List[str] = Field(default_factory=list)
+    ws_allowed_origins: List[str] = Field(default_factory=list)
 
 
 class AuthConfig(BaseModel):
@@ -158,6 +161,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "network.allowed_hosts": [],
     "network.cors_origins": [],
     "network.ws_allowed_clients": [],
+    "network.ws_allowed_origins": [],
 }
 
 # Env-var registry: every CAO_* var this schema recognizes, mapped to its
@@ -176,7 +180,9 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_ALLOWED_HOSTS": ("network.allowed_hosts", "list", []),
     "CAO_CORS_ORIGINS": ("network.cors_origins", "list", []),
     "CAO_WS_ALLOWED_CLIENTS": ("network.ws_allowed_clients", "list", []),
+    "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
+    "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
     "CAO_MCP_REQUEST_TIMEOUT": ("server.mcp_request_timeout", "int", 30),
@@ -187,6 +193,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         "int",
         20,
     ),
+    "CAO_STATE_BUFFER_MAX": ("server.state_buffer_max", "int", 32768),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -329,6 +336,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "enabled":
             return settings_service.is_memory_enabled()
+        if key == "lint_enabled":
+            return settings_service.is_memory_lint_enabled()
         if key == "compile_mode":
             return settings_service.get_compile_mode()
         if key == "compile_timeout_s":
@@ -350,6 +359,11 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
     """
     if override is not None:
         return override
+
+    if path == "memory.lint_enabled":
+        from cli_agent_orchestrator.services import settings_service
+
+        return settings_service.is_memory_lint_enabled()
 
     env_name = _PATH_TO_ENV.get(path)
     if env_name is not None:
@@ -442,6 +456,7 @@ _ALL_PATHS = sorted(
         "server.provider_init_timeout",
         "server.startup_prompt_handler_timeout",
         "memory.enabled",
+        "memory.lint_enabled",
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
@@ -504,6 +519,7 @@ class ConfigService:
             ),
             memory=MemoryConfig(
                 enabled=_get_value("memory.enabled", default=True),
+                lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
                 compile_timeout_s=_get_value("memory.compile_timeout_s", default=120.0),
