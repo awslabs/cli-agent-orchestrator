@@ -43,9 +43,10 @@ logger = logging.getLogger(__name__)
 _delivery_registry_guard = threading.Lock()
 _delivery_locks: Dict[str, Tuple[threading.Lock, int]] = {}
 
-# terminal_id -> monotonic time of the last dispatch not yet confirmed by a
-# real status transition. The lock above serializes deliver_pending calls but
-# does not stop a queued caller from proceeding once it is its turn:
+# terminal_id -> (monotonic time of the last dispatch not yet confirmed by a
+# real status transition, status_monitor's transition generation at the
+# moment of that dispatch). The lock above serializes deliver_pending calls
+# but does not stop a queued caller from proceeding once it is its turn:
 # status_monitor.get_status() still returns the cached IDLE/COMPLETED from
 # before the first send, because notify_input_sent() only arms the next
 # PROCESSING detection, it does not flip the cached status itself, and the
@@ -54,20 +55,35 @@ _delivery_locks: Dict[str, Tuple[threading.Lock, int]] = {}
 # own message into a terminal that has not started working on the first one
 # yet (reviewer-reproduced on #709: two IDLE checks and two sends in one
 # cycle). This marker closes that window: it is set right after a successful
-# send and normally cleared the instant InboxService.run() observes the next
-# status event for that terminal. INBOX_DISPATCH_COALESCE_WINDOW_S is only the
-# fallback for a terminal that stops producing status transitions entirely
-# after the dispatch, so this can never wedge deliver_pending shut against the
+# send and normally cleared once InboxService.run() observes a status event
+# whose generation is strictly newer than the one recorded at dispatch time.
+# The generation check matters because run()'s queue can already hold an
+# older, stale event at dispatch time (the immediate API, OpenCode poller and
+# reconcile paths all call deliver_pending() outside this consumer): clearing
+# on ANY event, rather than only a genuinely later one, would let that stale
+# event wipe the marker before the real post-dispatch transition arrives,
+# reopening the exact window the marker exists to close (#709 third review
+# round). INBOX_DISPATCH_COALESCE_WINDOW_S is only the fallback for a
+# terminal that stops producing status transitions entirely after the
+# dispatch, so this can never wedge deliver_pending shut against the
 # reconcile sweep the way an un-expiring flag would.
 _dispatch_active_guard = threading.Lock()
-_dispatch_active: Dict[str, float] = {}
+_dispatch_active: Dict[str, Tuple[float, int]] = {}
 
 
-def _clear_dispatch_active(terminal_id: str) -> None:
-    """Drop the busy marker: the real status pipeline has moved past the
-    cached ready value that authorized the last dispatch."""
+def _clear_dispatch_active(terminal_id: str, event_generation: int) -> None:
+    """Drop the busy marker, but only if this status event postdates the
+    dispatch it would confirm. An event generation at or below the one
+    recorded at dispatch time is one InboxService.run() had already queued
+    (or is a duplicate of one already accounted for) and proves nothing about
+    what happened after the send (#709)."""
     with _dispatch_active_guard:
-        _dispatch_active.pop(terminal_id, None)
+        entry = _dispatch_active.get(terminal_id)
+        if entry is None:
+            return
+        _dispatched_at, generation_at_dispatch = entry
+        if event_generation > generation_at_dispatch:
+            del _dispatch_active[terminal_id]
 
 
 def _is_dispatch_active(terminal_id: str) -> bool:
@@ -76,9 +92,10 @@ def _is_dispatch_active(terminal_id: str) -> bool:
     place so a terminal that never produces another status transition does
     not stay wedged shut forever."""
     with _dispatch_active_guard:
-        dispatched_at = _dispatch_active.get(terminal_id)
-        if dispatched_at is None:
+        entry = _dispatch_active.get(terminal_id)
+        if entry is None:
             return False
+        dispatched_at, _generation_at_dispatch = entry
         if time.monotonic() - dispatched_at < INBOX_DISPATCH_COALESCE_WINDOW_S:
             return True
         del _dispatch_active[terminal_id]
@@ -86,8 +103,9 @@ def _is_dispatch_active(terminal_id: str) -> bool:
 
 
 def _mark_dispatch_active(terminal_id: str) -> None:
+    generation = status_monitor.get_status_generation(terminal_id)
     with _dispatch_active_guard:
-        _dispatch_active[terminal_id] = time.monotonic()
+        _dispatch_active[terminal_id] = (time.monotonic(), generation)
 
 
 @contextmanager
@@ -128,14 +146,19 @@ class InboxService:
             try:
                 event = await queue.get()
                 status_value = event["data"]["status"]
+                event_generation = event["data"]["generation"]
                 terminal_id = terminal_id_from_topic(event["topic"])
-                # Any published status event means _apply_detection ran a genuine
-                # transition for this terminal (it dedupes no-op repeats), so the
-                # cached value a concurrent deliver_pending call would have seen is
-                # now stale. Clear the busy marker before deciding whether to
-                # deliver, so a real ready event right behind a dispatch is never
-                # starved by its own dispatch (#709).
-                _clear_dispatch_active(terminal_id)
+                # A published status event means _apply_detection ran a genuine
+                # transition for this terminal (it dedupes no-op repeats), so a
+                # cached value a concurrent deliver_pending call saw BEFORE this
+                # transition is now stale. Clear the busy marker before deciding
+                # whether to deliver, so a real ready event right behind a
+                # dispatch is never starved by its own dispatch (#709), but only
+                # when the event is newer than the dispatch it would confirm: this
+                # queue can already hold an older event at dispatch time, and
+                # clearing on that one would reopen the same window from the other
+                # side (#709 third review round).
+                _clear_dispatch_active(terminal_id, event_generation)
                 if status_value in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
                     # deliver_pending does blocking DB + tmux I/O. Offload it to a
                     # worker thread so this consumer keeps yielding to the event loop

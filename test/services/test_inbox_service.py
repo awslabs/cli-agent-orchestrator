@@ -352,6 +352,7 @@ class TestConcurrentDeliverySerialization:
             patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
         ):
             mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            mock_monitor.get_status_generation.return_value = 0
             svc = InboxService()
 
             svc.deliver_pending("term-1")
@@ -364,8 +365,9 @@ class TestConcurrentDeliverySerialization:
 
             # A later status event for the terminal (any value: run() clears
             # the marker before deciding whether to deliver) proves the real
-            # pipeline moved past the cached status the first send used.
-            inbox_service_module._clear_dispatch_active("term-1")
+            # pipeline moved past the cached status the first send used. Its
+            # generation (1) is newer than the one recorded at dispatch (0).
+            inbox_service_module._clear_dispatch_active("term-1", 1)
 
             svc.deliver_pending("term-1")
             assert mock_term.send_input.call_count == 2
@@ -627,7 +629,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.abc123.status",
-                "data": {"status": TerminalStatus.IDLE.value},
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 1},
             }
         )
 
@@ -657,7 +659,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.xyz789.status",
-                "data": {"status": TerminalStatus.COMPLETED.value},
+                "data": {"status": TerminalStatus.COMPLETED.value, "generation": 1},
             }
         )
 
@@ -683,7 +685,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.abc123.status",
-                "data": {"status": TerminalStatus.PROCESSING.value},
+                "data": {"status": TerminalStatus.PROCESSING.value, "generation": 1},
             }
         )
 
@@ -705,8 +707,13 @@ class TestRun:
         """A PROCESSING event does not trigger delivery, but it is exactly the
         real pipeline catching up on a prior dispatch (#709): it must still
         clear the busy marker so the terminal is not coalescing against a
-        cached status that has already moved on."""
-        inbox_service_module._mark_dispatch_active("abc123")
+        cached status that has already moved on, as long as it postdates
+        the dispatch. status_monitor is patched (not the real singleton,
+        which other test modules also exercise against this same terminal
+        id) so the dispatch-time generation is pinned to a known value."""
+        with patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor:
+            mock_monitor.get_status_generation.return_value = 0
+            inbox_service_module._mark_dispatch_active("abc123")
 
         svc = InboxService()
         svc.deliver_pending = MagicMock()
@@ -715,7 +722,90 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.abc123.status",
-                "data": {"status": TerminalStatus.PROCESSING.value},
+                "data": {"status": TerminalStatus.PROCESSING.value, "generation": 1},
+            }
+        )
+
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
+
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert inbox_service_module._is_dispatch_active("abc123") is False
+
+    @pytest.mark.asyncio
+    async def test_stale_queued_event_does_not_clear_dispatch_active(self):
+        """Reviewer-reproduced third-round finding on #709: a status event can
+        already be sitting in run()'s queue when a dispatch happens (the
+        immediate API, OpenCode poller, and reconcile paths all call
+        deliver_pending() outside this consumer). If run() then clears the
+        marker on that stale, already-superseded event, a queued contender
+        reads the still-cached ready status and dispatches into the same
+        cycle, the exact bug the busy marker exists to prevent. The event's
+        generation (1) does not postdate the dispatch's own generation
+        snapshot (1, i.e. taken after that same transition already landed),
+        so the marker must survive."""
+        with patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor:
+            # The transition that produced the queued event has already
+            # happened by the time deliver_pending dispatches and marks busy,
+            # so get_status_generation reflects it (1), not the pre-transition
+            # value (0) run() has not consumed yet.
+            mock_monitor.get_status_generation.return_value = 1
+            inbox_service_module._mark_dispatch_active("abc123")
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+
+        queue = asyncio.Queue()
+        # The event already queued before the dispatch above.
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 1},
+            }
+        )
+
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
+
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # The marker must still be active: the queued event did not postdate
+        # the dispatch, so clearing it here would let a concurrent contender
+        # read the still-stale cached status.
+        assert inbox_service_module._is_dispatch_active("abc123") is True
+
+    @pytest.mark.asyncio
+    async def test_genuinely_newer_event_still_clears_dispatch_active(self):
+        """The mirror of the stale-event case: once a REAL post-dispatch
+        transition arrives (generation strictly greater than the one
+        recorded at dispatch time), the marker must still clear: the fix
+        for the stale-event bug must not regress into never clearing at
+        all."""
+        with patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor:
+            mock_monitor.get_status_generation.return_value = 1
+            inbox_service_module._mark_dispatch_active("abc123")
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 2},
             }
         )
 
@@ -746,7 +836,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.abc123.status",
-                "data": {"status": TerminalStatus.IDLE.value},
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 1},
             }
         )
 
@@ -777,7 +867,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.abc123.status",
-                "data": {"status": TerminalStatus.IDLE.value},
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 1},
             }
         )
 

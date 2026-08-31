@@ -67,6 +67,15 @@ class StatusMonitor:
         # stale screen redraw.
         self._buffer_epochs: Dict[str, int] = {}
         self._last_status: Dict[str, TerminalStatus] = {}
+        # Monotonic per-terminal count of genuine published status transitions
+        # (incremented in _apply_detection, alongside _last_status). A caller
+        # that captures this value at some point in time and later sees a
+        # STRICTLY GREATER value knows a real transition happened after that
+        # point; equal or lower means the observed transition is the same one
+        # or an older one already accounted for. InboxService uses this to
+        # tell a status event that predates a dispatch from one that follows
+        # it (#709).
+        self._status_generations: Dict[str, int] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
         # external input is sent to the terminal (paste-bombed by send_input
@@ -225,9 +234,15 @@ class StatusMonitor:
             elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
                 self._allow_processing_revert[terminal_id] = False
 
+            generation = self._status_generations.get(terminal_id, 0) + 1
+            self._status_generations[terminal_id] = generation
+
         # Publish outside the lock — subscribers must never be able to
         # re-enter StatusMonitor while the latch state is mid-update.
-        bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
+        bus.publish(
+            f"terminal.{terminal_id}.status",
+            {"status": detected.value, "generation": generation},
+        )
         logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
 
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
@@ -612,6 +627,17 @@ class StatusMonitor:
         """Get accumulated output buffer for a terminal."""
         with self._lock:
             return self._buffers.get(terminal_id, "")
+
+    def get_status_generation(self, terminal_id: str) -> int:
+        """Current value of the per-terminal transition counter.
+
+        Lets a caller record "no genuine transition has happened yet" (by
+        snapshotting this value) and later tell a status event that predates
+        that snapshot from one that follows it, without racing the event
+        queue itself (#709).
+        """
+        with self._lock:
+            return self._status_generations.get(terminal_id, 0)
 
 
 # Module-level singleton
